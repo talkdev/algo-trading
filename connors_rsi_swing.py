@@ -219,56 +219,96 @@ CSV_SUMMARY_COLUMNS: Final[List[str]] = [
 # --- nsearchives.nseindia.com ind_nifty50list.csv, retrieved 2026-08-29).
 # --- High-liquidity names chosen to keep bid-ask slippage negligible.
 UNIVERSE_TICKERS: Final[List[str]] = [
-    "NSE_EQ|INE423A01024",  # ADANIENT   - Adani Enterprises
-    "NSE_EQ|INE742F01042",  # ADANIPORTS - Adani Ports & SEZ
-    "NSE_EQ|INE437A01024",  # APOLLOHOSP - Apollo Hospitals
-    "NSE_EQ|INE021A01026",  # ASIANPAINT - Asian Paints
-    "NSE_EQ|INE238A01034",  # AXISBANK   - Axis Bank
-    "NSE_EQ|INE917I01010",  # BAJAJ-AUTO - Bajaj Auto
-    "NSE_EQ|INE296A01032",  # BAJFINANCE - Bajaj Finance
-    "NSE_EQ|INE918I01026",  # BAJAJFINSV - Bajaj Finserv
-    "NSE_EQ|INE263A01024",  # BEL        - Bharat Electronics
-    "NSE_EQ|INE397D01024",  # BHARTIARTL - Bharti Airtel
-    "NSE_EQ|INE059A01026",  # CIPLA      - Cipla
-    "NSE_EQ|INE522F01014",  # COALINDIA  - Coal India
-    "NSE_EQ|INE089A01031",  # DRREDDY    - Dr. Reddy's Labs
-    "NSE_EQ|INE066A01021",  # EICHERMOT  - Eicher Motors
-    "NSE_EQ|INE758T01015",  # ETERNAL    - Eternal (ex-Zomato)
-    "NSE_EQ|INE047A01021",  # GRASIM     - Grasim Industries
-    "NSE_EQ|INE860A01027",  # HCLTECH    - HCL Technologies
-    "NSE_EQ|INE040A01034",  # HDFCBANK   - HDFC Bank
-    "NSE_EQ|INE795G01014",  # HDFCLIFE   - HDFC Life Insurance
-    "NSE_EQ|INE038A01020",  # HINDALCO   - Hindalco Industries
-    "NSE_EQ|INE030A01027",  # HINDUNILVR - Hindustan Unilever
-    "NSE_EQ|INE090A01021",  # ICICIBANK  - ICICI Bank
-    "NSE_EQ|INE154A01025",  # ITC        - ITC Ltd
-    "NSE_EQ|INE009A01021",  # INFY       - Infosys
-    "NSE_EQ|INE646L01027",  # INDIGO     - InterGlobe Aviation
-    "NSE_EQ|INE019A01038",  # JSWSTEEL   - JSW Steel
-    "NSE_EQ|INE758E01017",  # JIOFIN     - Jio Financial Services
-    "NSE_EQ|INE237A01036",  # KOTAKBANK  - Kotak Mahindra Bank
-    "NSE_EQ|INE018A01030",  # LT         - Larsen & Toubro
-    "NSE_EQ|INE101A01026",  # M&M        - Mahindra & Mahindra
-    "NSE_EQ|INE585B01010",  # MARUTI     - Maruti Suzuki
-    "NSE_EQ|INE027H01010",  # MAXHEALTH  - Max Healthcare
-    "NSE_EQ|INE733E01010",  # NTPC       - NTPC
-    "NSE_EQ|INE239A01024",  # NESTLEIND  - Nestle India
-    "NSE_EQ|INE213A01029",  # ONGC       - Oil & Natural Gas Corp
-    "NSE_EQ|INE752E01010",  # POWERGRID  - Power Grid Corp
     "NSE_EQ|INE002A01018",  # RELIANCE   - Reliance Industries
-    "NSE_EQ|INE123W01016",  # SBILIFE    - SBI Life Insurance
-    "NSE_EQ|INE721A01047",  # SHRIRAMFIN - Shriram Finance
+    "NSE_EQ|INE040A01034",  # HDFCBANK   - HDFC Bank
+    "NSE_EQ|INE090A01021",  # ICICIBANK  - ICICI Bank
     "NSE_EQ|INE062A01020",  # SBIN       - State Bank of India
-    "NSE_EQ|INE044A01036",  # SUNPHARMA  - Sun Pharmaceutical
+    "NSE_EQ|INE238A01034",  # AXISBANK   - Axis Bank
+    "NSE_EQ|INE237A01028",  # KOTAKBANK  - Kotak Mahindra Bank
+    "NSE_EQ|INE095A01012",  # INDUSINDBK - IndusInd Bank
+    "NSE_EQ|INE028A01039",  # BANKBARODA - Bank of Baroda
+    "NSE_EQ|INE160A01022",  # PNB        - Punjab National Bank
+    "NSE_EQ|INE476A01022",  # CANBK      - Canara Bank
     "NSE_EQ|INE467B01029",  # TCS        - Tata Consultancy Services
-    "NSE_EQ|INE192A01025",  # TATACONSUM - Tata Consumer Products
-    "NSE_EQ|INE155A01022",  # TMPV       - Tata Motors Passenger Vehicles
-    "NSE_EQ|INE081A01020",  # TATASTEEL  - Tata Steel
+    "NSE_EQ|INE009A01021",  # INFY       - Infosys
+    "NSE_EQ|INE075A01022",  # WIPRO      - Wipro
     "NSE_EQ|INE669C01036",  # TECHM      - Tech Mahindra
+    "NSE_EQ|INE860A01027",  # HCLTECH    - HCL Technologies
+    "NSE_EQ|INE262H01021",  # PERSISTENT - Persistent Systems
+    "NSE_EQ|INE591G01017",  # COFORGE    - Coforge
+    "NSE_EQ|INE356A01018",  # MPHASIS    - Mphasis
+    "NSE_EQ|INE018A01030",  # LT         - Larsen & Toubro
+    "NSE_EQ|INE481G01011",  # ULTRACEMCO - UltraTech Cement
+    "NSE_EQ|INE047A01021",  # GRASIM     - Grasim Industries
+    "NSE_EQ|INE070A01015",  # SHREECEM   - Shree Cement
+    "NSE_EQ|INE079A01024",  # AMBUJACEM  - Ambuja Cements
+    "NSE_EQ|INE012A01025",  # ACC        - ACC
+    "NSE_EQ|INE585B01010",  # MARUTI     - Maruti Suzuki
+    "NSE_EQ|INE066A01021",  # EICHERMOT  - Eicher Motors
+    "NSE_EQ|INE208A01029",  # ASHOKLEY   - Ashok Leyland
+    "NSE_EQ|INE917I01010",  # BAJAJ-AUTO - Bajaj Auto
+    "NSE_EQ|INE494B01023",  # TVSMOTOR   - TVS Motor Company
+    "NSE_EQ|INE158A01026",  # HEROMOTOCO - Hero MotoCorp
+    "NSE_EQ|INE044A01036",  # SUNPHARMA  - Sun Pharmaceutical
+    "NSE_EQ|INE089A01023",  # DRREDDY    - Dr. Reddy's Laboratories
+    "NSE_EQ|INE059A01026",  # CIPLA      - Cipla
+    "NSE_EQ|INE361B01024",  # DIVISLAB   - Divi's Laboratories
+    "NSE_EQ|INE326A01037",  # LUPIN      - Lupin
+    "NSE_EQ|INE406A01037",  # AUROPHARMA - Aurobindo Pharma
+    "NSE_EQ|INE010B01027",  # ZYDUSLIFE  - Zydus Lifesciences
+    "NSE_EQ|INE685A01028",  # TORNTPHARM - Torrent Pharmaceuticals
+    "NSE_EQ|INE397D01024",  # BHARTIARTL - Bharti Airtel
+    "NSE_EQ|INE669E01016",  # IDEA       - Vodafone Idea
+    "NSE_EQ|INE030A01027",  # HINDUNILVR - Hindustan Unilever
+    "NSE_EQ|INE154A01025",  # ITC        - ITC
+    "NSE_EQ|INE239A01024",  # NESTLEIND  - Nestle India
+    "NSE_EQ|INE216A01030",  # BRITANNIA  - Britannia Industries
+    "NSE_EQ|INE016A01026",  # DABUR      - Dabur India
+    "NSE_EQ|INE102D01028",  # GODREJCP   - Godrej Consumer Products
+    "NSE_EQ|INE259A01022",  # COLPAL     - Colgate-Palmolive India
+    "NSE_EQ|INE196A01026",  # MARICO     - Marico
     "NSE_EQ|INE280A01028",  # TITAN      - Titan Company
     "NSE_EQ|INE849A01020",  # TRENT      - Trent
-    "NSE_EQ|INE481G01011",  # ULTRACEMCO - UltraTech Cement
-    "NSE_EQ|INE075A01022",  # WIPRO      - Wipro
+    "NSE_EQ|INE192R01011",  # DMART      - Avenue Supermarts
+    "NSE_EQ|INE200M01021",  # VBL        - Varun Beverages
+    "NSE_EQ|INE423A01024",  # ADANIENT   - Adani Enterprises
+    "NSE_EQ|INE742F01042",  # ADANIPORTS - Adani Ports & SEZ
+    "NSE_EQ|INE814H01029",  # ADANIPOWER - Adani Power
+    "NSE_EQ|INE931S01010",  # ADANIENSOL - Adani Energy Solutions
+    "NSE_EQ|INE364U01010",  # ADANIGREEN - Adani Green Energy
+    "NSE_EQ|INE081A01020",  # TATASTEEL  - Tata Steel
+    "NSE_EQ|INE019A01038",  # JSWSTEEL   - JSW Steel
+    "NSE_EQ|INE038A01020",  # HINDALCO   - Hindalco Industries
+    "NSE_EQ|INE749Y01014",  # JINDALSTEL - Jindal Steel & Power
+    "NSE_EQ|INE114A01011",  # SAIL       - Steel Authority of India
+    "NSE_EQ|INE584A01010",  # NMDC       - NMDC
+    "NSE_EQ|INE205A01025",  # VEDL       - Vedanta
+    "NSE_EQ|INE139A01034",  # NATIONALUM - National Aluminium Company
+    "NSE_EQ|INE213A01029",  # ONGC       - Oil & Natural Gas Corporation
+    "NSE_EQ|INE522F01014",  # COALINDIA  - Coal India
+    "NSE_EQ|INE029A01011",  # BPCL       - Bharat Petroleum
+    "NSE_EQ|INE242A01010",  # IOC        - Indian Oil Corporation
+    "NSE_EQ|INE094A01027",  # HINDPETRO  - Hindustan Petroleum
+    "NSE_EQ|INE274J01014",  # OIL        - Oil India
+    "NSE_EQ|INE129A01019",  # GAIL       - GAIL India
+    "NSE_EQ|INE752E01010",  # POWERGRID  - Power Grid Corporation
+    "NSE_EQ|INE733E01010",  # NTPC       - NTPC
+    "NSE_EQ|INE245A01021",  # TATAPOWER  - Tata Power
+    "NSE_EQ|INE296A01032",  # BAJFINANCE - Bajaj Finance
+    "NSE_EQ|INE918I01026",  # BAJAJFINSV - Bajaj Finserv
+    "NSE_EQ|INE121A01024",  # CHOLAFIN   - Cholamandalam Investment & Finance
+    "NSE_EQ|INE721A01047",  # SHRIRAMFIN - Shriram Finance
+    "NSE_EQ|INE115A01026",  # LICHSGFIN  - LIC Housing Finance
+    "NSE_EQ|INE646L01027",  # INDIGO     - InterGlobe Aviation
+    "NSE_EQ|INE335Y01020",  # IRCTC      - Indian Railway Catering & Tourism
+    "NSE_EQ|INE415G01027",  # RVNL       - Rail Vikas Nigam
+    "NSE_EQ|INE263A01024",  # BEL        - Bharat Electronics
+    "NSE_EQ|INE066F01020",  # HAL        - Hindustan Aeronautics
+    "NSE_EQ|INE257A01026",  # BHEL       - Bharat Heavy Electricals
+    "NSE_EQ|INE003A01024",  # SIEMENS    - Siemens
+    "NSE_EQ|INE117A01022",  # ABB        - ABB India
+    "NSE_EQ|INE067A01029",  # CGPOWER    - CG Power & Industrial Solutions
+    "NSE_EQ|INE935N01020",  # DIXON      - Dixon Technologies
 ]
 
 # --- Session calendar (IST) ---------------------------------------------------
