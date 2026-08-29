@@ -74,19 +74,34 @@ import os
 import signal
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, date, time as dtime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-import aiohttp
-import requests  # only used for pre-websocket bootstrap; v2 only
+try:
+    import aiohttp
+    import requests  # only used for pre-websocket bootstrap; v2 only
 
-# Upstox SDK — used for MarketDataStreamerV3 and v2 order place during
-# bootstrap. After the websocket connects, ALL further REST goes through
-# our aiohttp worker so the event loop is never blocked.
-import upstox_client
-from upstox_client import MarketDataStreamerV3
+    # Upstox SDK — used for MarketDataStreamerV3 and v2 order place during
+    # bootstrap. After the websocket connects, ALL further REST goes through
+    # our aiohttp worker so the event loop is never blocked.
+    import upstox_client
+    from upstox_client import MarketDataStreamerV3
+except ImportError as e:
+    print("=" * 74)
+    print("MISSING DEPENDENCY: %s" % e)
+    print("This script needs these Python packages:")
+    print("    upstox_client   ->  pip install upstox-python")
+    print("    aiohttp         ->  pip install aiohttp")
+    print("    requests        ->  pip install requests")
+    print("Install everything at once with:")
+    print("    pip install upstox-python aiohttp requests")
+    print("If the packages are installed but the import still fails, check")
+    print("your upstox-python version - MarketDataStreamerV3 needs a recent release.")
+    print("=" * 74)
+    sys.exit(1)
 
 
 # ============================================================================
@@ -170,7 +185,7 @@ LOT_SIZE = 25
 # All four keys are loaded so the OAuth flow can use them later, but
 # only UPSTOX_ACCESS_TOKEN is required for running the script as-is
 # (it authorises v2 order placement and the v3 websocket).
-UPSTOX_ACCESS_TOKEN: str = _require_env(_ENV, "UPSTOX_ACCESS_TOKEN")
+UPSTOX_ACCESS_TOKEN: str = _ENV.get("UPSTOX_ACCESS_TOKEN", "")
 UPSTOX_API_KEY: str = _ENV.get("UPSTOX_API_KEY", "")
 UPSTOX_API_SECRET: str = _ENV.get("UPSTOX_API_SECRET", "")
 GEMINI_API_KEY: str = _ENV.get("GEMINI_API_KEY", "")
@@ -278,6 +293,9 @@ CSV_FILE = os.path.join(LOG_DIR, "fills.csv")
 MTM_LOG_FILE = os.path.join(LOG_DIR, "mtm.log")
 PAPER_TRADE_LOG_CSV = os.path.join(LOG_DIR, "paper_trading_log.csv")
 PAPER_TRADE_SUMMARY_CSV = os.path.join(LOG_DIR, "paper_trading_summary.csv")
+# Plain-English daily scoreboard: one row per trading day, appended forever.
+# This is the file to check to see how the strategy is doing over time.
+PERFORMANCE_CSV = os.path.join(LOG_DIR, "strategy_performance.csv")
 
 # CSV schema (single source of truth for the paper trade log)
 CSV_LOG_COLUMNS = [
@@ -310,14 +328,44 @@ CSV_SUMMARY_COLUMNS = [
     "exit_reason",
 ]
 
+# Layman-friendly daily PnL report — the "scoreboard" file. One row per
+# trading session, appended cumulatively across days (never overwritten).
+# Plain-English column names so it can be read by anyone in Excel/Sheets.
+PERFORMANCE_CSV_COLUMNS = [
+    "Date",
+    "Day",
+    "Entry VIX",
+    "NIFTY Spot",
+    "Sold CE Strike",
+    "Sold PE Strike",
+    "Hedge CE Strike",
+    "Hedge PE Strike",
+    "Premium Collected (Rs)",
+    "Hedge Cost (Rs)",
+    "Net Credit (Rs)",
+    "Day PnL (Rs)",
+    "Result",
+    "Cumulative PnL (Rs)",
+    "Win Rate (%)",
+    "Exit Reason",
+    "Notes",
+]
+
+try:
+    _file_handler = logging.FileHandler(LOG_FILE, mode="a")
+except OSError:
+    _file_handler = None
+    print("WARNING: could not open log file %s - logging to console only." % LOG_FILE)
+
+_handlers = [logging.StreamHandler(sys.stdout)]
+if _file_handler is not None:
+    _handlers.insert(0, _file_handler)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE, mode="a"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=_handlers,
 )
 log = logging.getLogger("trader")
 
@@ -336,17 +384,88 @@ def _ensure_csv_with_header(path: str, header: List[str]) -> None:
 
 def append_log_row(csv_path: str, row: Dict[str, Any]) -> None:
     """Append a single row to the given CSV log, creating header if missing."""
-    _ensure_csv_with_header(csv_path, CSV_LOG_COLUMNS)
-    with open(csv_path, "a", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([row.get(col, "") for col in CSV_LOG_COLUMNS])
+    try:
+        _ensure_csv_with_header(csv_path, CSV_LOG_COLUMNS)
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([row.get(col, "") for col in CSV_LOG_COLUMNS])
+    except OSError:
+        log.warning("Could not write to CSV log %s - audit row skipped.", csv_path)
 
 
 def append_summary_row(csv_path: str, row: Dict[str, Any]) -> None:
-    _ensure_csv_with_header(csv_path, CSV_SUMMARY_COLUMNS)
-    with open(csv_path, "a", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([row.get(col, "") for col in CSV_SUMMARY_COLUMNS])
+    try:
+        _ensure_csv_with_header(csv_path, CSV_SUMMARY_COLUMNS)
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([row.get(col, "") for col in CSV_SUMMARY_COLUMNS])
+    except OSError:
+        log.warning("Could not write to summary CSV %s - row skipped.", csv_path)
+
+
+# ============================================================================
+# Layman-friendly performance report ("scoreboard") helpers
+# ============================================================================
+def _to_float(value: Any) -> float:
+    """Safely parse a numeric string to float; 0.0 on failure."""
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _layman_exit_reason(reason: str) -> str:
+    """Translate the internal exit_reason into plain English."""
+    r = (reason or "").lower()
+    if not r or r == "session_end":
+        return "Session ended"
+    if "time_exit" in r:
+        return "Square-off at 3:15 PM (normal close)"
+    if "max_daily_loss" in r:
+        return "Daily loss limit hit"
+    if "trail" in r:
+        return "Trailing profit lock triggered"
+    if "feed_disconnected" in r:
+        return "Market feed disconnected"
+    if "ws_reconnect" in r:
+        return "Market feed connection failed"
+    if "entry_window_closed" in r:
+        return "Entry window closed (started too late)"
+    return reason or "Session ended"
+
+
+def _load_performance_totals() -> Tuple[float, int, int]:
+    """Read existing strategy_performance.csv and return
+    (cumulative_pnl, days_traded, win_days) from all previous rows.
+    """
+    total = 0.0
+    days = 0
+    wins = 0
+    if not os.path.exists(PERFORMANCE_CSV):
+        return total, days, wins
+    try:
+        with open(PERFORMANCE_CSV, "r", newline="") as f:
+            for row in csv.DictReader(f):
+                total += _to_float(row.get("Day PnL (Rs)", ""))
+                result = (row.get("Result") or "").strip().upper()
+                if result in ("PROFIT", "LOSS", "BREAKEVEN"):
+                    days += 1
+                    if result == "PROFIT":
+                        wins += 1
+    except Exception:
+        log.warning("Could not read %s for cumulative totals.", PERFORMANCE_CSV)
+    return total, days, wins
+
+
+def _append_performance_row(row: Dict[str, Any]) -> None:
+    """Append one day's row to strategy_performance.csv (cumulative file)."""
+    try:
+        _ensure_csv_with_header(PERFORMANCE_CSV, PERFORMANCE_CSV_COLUMNS)
+        with open(PERFORMANCE_CSV, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([row.get(col, "") for col in PERFORMANCE_CSV_COLUMNS])
+    except OSError:
+        log.warning("Could not write to performance CSV %s - row skipped.", PERFORMANCE_CSV)
 
 
 # ============================================================================
@@ -372,21 +491,24 @@ def _ensure_csv() -> None:
 
 
 def write_fill(leg: "Leg", tag: str) -> None:
-    _ensure_csv()
-    with open(CSV_FILE, "a", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(
-            [
-                datetime.now().isoformat(timespec="seconds"),
-                leg.leg_id,
-                leg.order_id or "",
-                leg.instrument_key,
-                leg.side.value,
-                leg.qty,
-                f"{leg.fill_price:.2f}" if leg.fill_price is not None else "",
-                tag,
-            ]
-        )
+    try:
+        _ensure_csv()
+        with open(CSV_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    datetime.now().isoformat(timespec="seconds"),
+                    leg.leg_id,
+                    leg.order_id or "",
+                    leg.instrument_key,
+                    leg.side.value,
+                    leg.qty,
+                    f"{leg.fill_price:.2f}" if leg.fill_price is not None else "",
+                    tag,
+                ]
+            )
+    except OSError:
+        log.warning("Could not write to fills CSV %s - row skipped.", CSV_FILE)
 
 
 # ============================================================================
@@ -469,6 +591,61 @@ class LegPair:
 
 
 # ============================================================================
+# Friendly error type + HTTP helper
+# ============================================================================
+class TradingError(Exception):
+    """An expected, user-facing failure (network, auth, data, schedule).
+
+    main() catches TradingError and prints its message WITHOUT a traceback,
+    so the script reports a clear message instead of crashing with an error.
+    """
+
+
+def _http_get(url, params=None, headers=None, timeout=30, retries=1, backoff=2.0):
+    """requests.get that turns common failures into clear TradingError messages.
+
+    - No internet / timeout / 5xx / 429  ->  retried, then a clear message
+    - HTTP 401                            ->  "regenerate your access token"
+    - Other 4xx                           ->  message with the response body
+    Never raises a raw requests exception to the caller.
+    """
+    params = params or {}
+    headers = headers or {}
+    attempt = 0
+    while True:
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        except requests.exceptions.Timeout:
+            msg = "TIMEOUT: %s did not respond within %d seconds." % (url, timeout)
+        except requests.exceptions.ConnectionError as e:
+            msg = "NETWORK ERROR: cannot reach %s - check your internet connection. (%s)" % (url, e)
+        except requests.exceptions.RequestException as e:
+            msg = "NETWORK ERROR: request to %s failed. (%s)" % (url, e)
+        else:
+            if r.status_code == 401:
+                raise TradingError(
+                    "AUTH ERROR: Upstox rejected the access token (HTTP 401). "
+                    "Generate a fresh token and update UPSTOX_ACCESS_TOKEN in env.txt."
+                )
+            if r.status_code == 429:
+                msg = "RATE LIMIT: Upstox rate limit hit on %s (HTTP 429)." % url
+            elif r.status_code >= 500:
+                msg = "SERVER ERROR: Upstox returned HTTP %d on %s." % (r.status_code, url)
+            elif r.status_code >= 400:
+                raise TradingError(
+                    "API ERROR: %s returned HTTP %d - %s"
+                    % (url, r.status_code, r.text[:300])
+                )
+            else:
+                return r
+        if attempt >= retries:
+            raise TradingError("%s (tried %d time(s))" % (msg, attempt + 1))
+        log.warning("%s - retrying (%d/%d) in %.1fs", msg, attempt + 1, retries, backoff)
+        time.sleep(backoff)
+        attempt += 1
+
+
+# ============================================================================
 # Upstox v2/v3 REST helpers
 # ============================================================================
 def _v2_headers() -> Dict[str, str]:
@@ -489,13 +666,12 @@ def _v3_headers() -> Dict[str, str]:
 def fetch_instrument_master() -> List[Dict[str, Any]]:
     """Fetch option contracts specifically for Nifty 50."""
     log.info("Downloading NIFTY 50 contracts from %s", INSTRUMENTS_URL)
-    r = requests.get(
-        INSTRUMENTS_URL, 
-        params={"instrument_key": "NSE_INDEX|Nifty 50"}, 
-        headers=_v2_headers(), 
-        timeout=30
+    r = _http_get(
+        INSTRUMENTS_URL,
+        params={"instrument_key": "NSE_INDEX|Nifty 50"},
+        headers=_v2_headers(),
+        timeout=30,
     )
-    r.raise_for_status()
     data = r.json().get("data", [])
     log.info("Instrument master rows: %d", len(data))
     return data
@@ -504,9 +680,9 @@ def fetch_index_instrument_master() -> List[Dict[str, Any]]:
     """Return a mocked row for India VIX to satisfy the resolver."""
     # Bypasses the invalid NSE_INDEX call by supplying the known static key directly
     return [{
-        "name": "India VIX", 
-        "tradingsymbol": "India VIX", 
-        "instrument_key": "NSE_INDEX|India VIX", 
+        "name": "India VIX",
+        "tradingsymbol": "India VIX",
+        "instrument_key": "NSE_INDEX|India VIX",
         "exchange": "NSE"
     }]
 
@@ -518,7 +694,7 @@ def fetch_nifty_weekly_expiry(instruments: List[Dict[str, Any]]) -> Tuple[str, s
     """
     today = datetime.now().date()
     expiries = set()
-    
+
     for row in instruments:
         try:
             # We already narrowed the list to Nifty 50 contracts only.
@@ -528,23 +704,26 @@ def fetch_nifty_weekly_expiry(instruments: List[Dict[str, Any]]) -> Tuple[str, s
                 expiries.add(exp)
         except Exception:
             continue
-            
+
     if not expiries:
-        raise RuntimeError("No NIFTY expiries found in the downloaded contracts")
-        
+        raise TradingError(
+            "NO EXPIRIES: no NIFTY expiry dates were found in the downloaded "
+            "contract list. Is the instrument master empty or the market closed?"
+        )
+
     # Pick nearest expiry in current week, else nearest overall.
     week_end = today + timedelta(days=(4 - today.weekday()) % 7)  # Friday
     valid_expiries = sorted(list(expiries))
-    
+
     this_week = [e for e in valid_expiries if e <= week_end]
     chosen_exp = this_week[0] if this_week else valid_expiries[0]
-    
+
     chosen_expiry_str = chosen_exp.strftime("%Y-%m-%d")
     underlying_key = "NSE_INDEX|Nifty 50"
-    
+
     log.info(
-        "Selected NIFTY weekly expiry=%s instrument_key=%s", 
-        chosen_expiry_str, 
+        "Selected NIFTY weekly expiry=%s instrument_key=%s",
+        chosen_expiry_str,
         underlying_key
     )
     return underlying_key, chosen_expiry_str
@@ -564,19 +743,26 @@ def resolve_vix_instrument_key(instruments: List[Dict[str, Any]]) -> str:
                 row.get("instrument_key"),
             )
             return row["instrument_key"]
-    raise RuntimeError("Could not resolve India VIX instrument_key from master")
+    raise TradingError(
+        "VIX KEY NOT FOUND: could not resolve the India VIX instrument key "
+        "from the instrument master."
+    )
 
 
 def fetch_vix_ltp_sync(vix_key: str) -> float:
     """Pre-websocket bootstrap LTP fetch."""
-    r = requests.get(
+    r = _http_get(
         MARKET_QUOTE_LTP_URL,
         params={"instrument_key": vix_key},
         headers=_v2_headers(),
         timeout=15,
     )
-    r.raise_for_status()
     data = r.json().get("data", {})
+    if not data:
+        raise TradingError(
+            "VIX LTP EMPTY: Upstox returned no LTP for %s. The India VIX "
+            "instrument key may be wrong, or the market is closed." % vix_key
+        )
     # Safely extract the first item's price to ignore '|' vs ':' formatting
     last = list(data.values())[0]["last_price"]
     log.info("entry_vix = %.2f", float(last))
@@ -584,14 +770,17 @@ def fetch_vix_ltp_sync(vix_key: str) -> float:
 
 def fetch_nifty50_spot_sync(nifty_key: str) -> float:
     """Pre-websocket bootstrap NIFTY 50 spot LTP fetch."""
-    r = requests.get(
+    r = _http_get(
         MARKET_QUOTE_LTP_URL,
         params={"instrument_key": nifty_key},
         headers=_v2_headers(),
         timeout=15,
     )
-    r.raise_for_status()
     data = r.json().get("data", {})
+    if not data:
+        raise TradingError(
+            "SPOT LTP EMPTY: Upstox returned no LTP for %s." % nifty_key
+        )
     # Safely extract the first item's price
     last = list(data.values())[0]["last_price"]
     log.info("entry_spot = %.2f", float(last))
@@ -602,24 +791,18 @@ def fetch_option_greeks_batched(keys: List[str]) -> Dict[str, Dict[str, float]]:
     """Batched /v3/market-quote/option-greek call. Returns {key: {delta, ltp}}."""
     if not keys:
         return {}
-        
+
     out: Dict[str, Dict[str, float]] = {}
     chunk_size = 50
-    
+
     for i in range(0, len(keys), chunk_size):
         chunk = keys[i : i + chunk_size]
         params = {"instrument_key": ",".join(chunk)}
-        
-        r = requests.get(
-            OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20
+
+        r = _http_get(
+            OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20,
+            retries=1, backoff=2.0,
         )
-        if r.status_code == 429:
-            log.warning("option-greek 429 — backing off 2s and retrying once")
-            time.sleep(2.0)
-            r = requests.get(
-                OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20
-            )
-        r.raise_for_status()
 
         raw = r.json().get("data", {})
         if not raw:
@@ -631,13 +814,13 @@ def fetch_option_greeks_batched(keys: List[str]) -> Dict[str, Dict[str, float]]:
         for k, v in raw.items():
             # FIX: Normalize the response key from 'NSE_FO:123' back to 'NSE_FO|123'
             normalized_key = k.replace(":", "|")
-            
+
             g = v.get("option_greeks") or {}
             out[normalized_key] = {
                 "delta": float(g.get("delta") or 0.0),
                 "ltp": float(v.get("last_price") or 0.0),
             }
-            
+
     return out
 
 
@@ -645,7 +828,7 @@ def fetch_option_chain_for_expiry(
     nifty_key: str, expiry: str
 ) -> List[Dict[str, Any]]:
     """v2 option-chain call. Returns CE/PE rows for the given expiry."""
-    r = requests.get(
+    r = _http_get(
         OPTION_CHAIN_URL,
         params={
             "instrument_key": nifty_key,
@@ -654,7 +837,6 @@ def fetch_option_chain_for_expiry(
         headers=_v2_headers(),
         timeout=20,
     )
-    r.raise_for_status()
     rows: List[Dict[str, Any]] = []
     for row in r.json().get("data", []):
         co = row.get("call_options") or {}
@@ -1128,12 +1310,18 @@ class StateStore:
         self.num_reentries: int = 0
         self.num_hedge_aborts: int = 0
         self.exit_reason: str = ""
-        self._mtm_log_fh = open(MTM_LOG_FILE, "a", buffering=1)
+        try:
+            self._mtm_log_fh = open(MTM_LOG_FILE, "a", buffering=1)
+        except OSError:
+            log.warning("Could not open %s for writing - MTM logging disabled.", MTM_LOG_FILE)
+            self._mtm_log_fh = None
 
     def log_state(self, msg: str) -> None:
         log.info(msg)
 
     def log_mtm(self) -> None:
+        if self._mtm_log_fh is None:
+            return
         stale_legs = []
         legs: List[Leg] = []
         if self.pair:
@@ -1148,10 +1336,11 @@ class StateStore:
         )
 
     def close(self) -> None:
-        try:
-            self._mtm_log_fh.close()
-        except Exception:
-            pass
+        if self._mtm_log_fh is not None:
+            try:
+                self._mtm_log_fh.close()
+            except Exception:
+                pass
 
     def compute_mtm(self) -> float:
         """total_mtm from live LTP marks for every open leg, refreshed on each tick batch."""
@@ -1414,7 +1603,7 @@ class Engine:
             n_usable_greeks, len(greeks),
         )
         if n_usable_greeks == 0:
-            raise RuntimeError(
+            raise TradingError(
                 "ABORT:greeks_unavailable — option-greek API returned no usable "
                 "deltas (is NSE open today? token valid?). Refusing to select "
                 "strikes."
@@ -1424,7 +1613,7 @@ class Engine:
         pe_core = pick_core_strike(Side.PE, chain, greeks, self.store.entry_vix)
         if not ce_core or not pe_core:
             sides_missing = (["CE"] if not ce_core else []) + (["PE"] if not pe_core else [])
-            raise RuntimeError(
+            raise TradingError(
                 "ABORT:delta_band_unmet for side(s) %s — no strike fell inside the "
                 "VIX-adaptive delta band; see WARN lines above for observed "
                 "delta range and nearest strikes" % ",".join(sides_missing)
@@ -1433,7 +1622,7 @@ class Engine:
         ce_hedge = pick_hedge_strike(Side.CE, chain, ce_core["strike"], ltp_for)
         pe_hedge = pick_hedge_strike(Side.PE, chain, pe_core["strike"], ltp_for)
         if not ce_hedge or not pe_hedge:
-            raise RuntimeError("ABORT:no_valid_hedge for one or both sides")
+            raise TradingError("ABORT:no_valid_hedge for one or both sides")
 
         pair = LegPair(
             pair_id=f"PAIR-{int(time.time())}",
@@ -1863,18 +2052,27 @@ class Engine:
 
         async def run_side(side_label: str, hedge: Leg, core: Leg) -> bool:
             cache = self._bootstrap_cache
-            ltp = 0.0
+            hedge_ltp = 0.0
+            core_ltp = 0.0
             for r in cache["chain"]:
                 if r["instrument_key"] == hedge.instrument_key:
-                    ltp = r.get("ltp") or 0.0
-                    break
-            if ltp <= 0:
-                ltp = HEDGE_TARGET_PREMIUM
-            hedge.last_ltp = ltp
-            core.last_ltp = ltp
+                    hedge_ltp = r.get("ltp") or 0.0
+                elif r["instrument_key"] == core.instrument_key:
+                    core_ltp = r.get("ltp") or 0.0
+            if hedge_ltp <= 0:
+                hedge_ltp = HEDGE_TARGET_PREMIUM
+            if core_ltp <= 0:
+                # Fall back to the batched greeks LTP for the core leg.
+                g = cache["greeks"].get(core.instrument_key)
+                core_ltp = (g.get("ltp") or 0.0) if g else 0.0
+            if core_ltp <= 0:
+                # Last-resort fallback so the leg still has a reference price.
+                core_ltp = hedge_ltp
+            hedge.last_ltp = hedge_ltp
+            core.last_ltp = core_ltp
 
             ok = await self._place_limit_buy_with_timeout(
-                hedge, ref_price=ltp,
+                hedge, ref_price=hedge_ltp,
                 slippage_ticks=HEDGE_LIMIT_SLIPPAGE_TICKS,
                 timeout_sec=HEDGE_FILL_TIMEOUT_SEC,
                 retry_ticks=HEDGE_LIMIT_SLIPPAGE_TICKS_RETRY,
@@ -2225,6 +2423,21 @@ class Engine:
             session_date=self.store.pair.session_date if self.store.pair else "",
         )
 
+    async def _shutdown_worker(self, worker_task: "asyncio.Task") -> None:
+        """Cancel the order worker and drain its queue on early-exit paths.
+
+        Prevents 'Task was destroyed but it is pending!' noise at shutdown.
+        """
+        if self.worker:
+            try:
+                await asyncio.wait_for(self.worker.q.join(), timeout=5.0)
+            except asyncio.TimeoutError:
+                log.warning("worker queue did not drain within 5s")
+            self.worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
     # ------------------------------------------------------------------ main loop
     async def run(self) -> None:
         # Trading-day guard, checked BEFORE any time-gate/API work: when NSE
@@ -2235,18 +2448,20 @@ class Engine:
         # NOT protect us — they are deliberately skip-if-late, and on a closed
         # day the target times are always "already passed".
         today = datetime.now().date()
+        now_time = datetime.now().time()
+
         if not is_nse_trading_day(today):
             if not ALLOW_NON_TRADING_DAY_RUN:
-                log.error(
-                    "NON_TRADING_DAY: %s is not an NSE trading day (weekend or "
-                    "listed in NSE_MARKET_HOLIDAYS). The option-greek API returns "
-                    "no usable deltas when the market is closed and the tick "
-                    "engine would see no ticks, so strike selection can only "
-                    "abort. Next trading day ~= %s. Set "
-                    "ALLOW_NON_TRADING_DAY_RUN=True to force a run for offline "
-                    "testing (API calls will still behave as market-closed).",
-                    today, next_nse_trading_day(today),
-                )
+                msg = (
+                    "NOT A TRADING DAY: %s is not an NSE trading day (weekend "
+                    "or listed in NSE_MARKET_HOLIDAYS). The market is closed, so "
+                    "there are no live greeks or ticks to trade on. Next trading "
+                    "day is ~%s. No orders were placed; the script is exiting "
+                    "cleanly. (Set ALLOW_NON_TRADING_DAY_RUN=True only for "
+                    "offline testing.)"
+                ) % (today, next_nse_trading_day(today))
+                log.warning(msg)
+                print(msg)
                 return
             log.warning(
                 "NON_TRADING_DAY_OVERRIDE: %s is not an NSE trading day but "
@@ -2254,6 +2469,27 @@ class Engine:
                 "(expect empty/zero greeks and no ticks)",
                 today,
             )
+
+        # Entry-window guard: this strategy ONLY enters trades between
+        # EXEC_START_TIME (09:19:30) and EXEC_END_TIME (09:20:30). If the
+        # script is launched after that window, say so clearly and exit -
+        # never place late orders, never crash.
+        if now_time > EXEC_END_TIME:
+            msg = (
+                "ENTRY WINDOW CLOSED: it is now %s, but this strategy only "
+                "enters trades between %s and %s. No orders were placed. "
+                "Start the script before %s on a trading day - it will wait "
+                "on its own for 09:15 (bootstrap), 09:19 (delta/strike checks) "
+                "and 09:19:30 (entry)."
+            ) % (
+                now_time.strftime("%H:%M:%S"),
+                EXEC_START_TIME.strftime("%H:%M:%S"),
+                EXEC_END_TIME.strftime("%H:%M:%S"),
+                EXEC_END_TIME.strftime("%H:%M:%S"),
+            )
+            log.warning(msg)
+            print(msg)
+            return
 
         # Time-gate bootstrap to ENTRY_VIX_TIME. Without this gate, capturing
         # entry_vix + chain + greeks at process start (e.g. 08:45) would
@@ -2264,8 +2500,16 @@ class Engine:
         await self._wait_until_or_skip(ENTRY_VIX_TIME, label="ENTRY_VIX_TIME(09:15)")
         try:
             self.bootstrap()
+        except TradingError as e:
+            log.error("BOOTSTRAP FAILED: %s", e)
+            print("ERROR: %s" % e)
+            print("Bootstrap could not complete, so no orders were placed. "
+                  "Fix the issue above and re-run.")
+            return
         except Exception:
-            log.exception("bootstrap failed")
+            log.exception("bootstrap failed (unexpected error)")
+            print("ERROR: bootstrap failed with an unexpected error. "
+                  "Full details are in %s. No orders were placed." % LOG_FILE)
             return
 
         async with AsyncRestClient(ACCESS_TOKEN) as self.rest:
@@ -2281,27 +2525,42 @@ class Engine:
             )
             try:
                 self.select_strikes()
+            except TradingError as e:
+                log.error("STRIKE SELECTION FAILED: %s", e)
+                print("ERROR: %s" % e)
+                print("Strike selection (delta checks) could not complete, so no "
+                      "orders were placed.")
+                await self._shutdown_worker(worker_task)
+                return
             except Exception:
-                log.exception("strike selection failed")
-                # The worker run() task was created above and nothing else
-                # will stop/cancel it on this early exit — without this the
-                # loop closes with it still pending ("Task was destroyed but
-                # it is pending!" / UNHANDLED_ASYNC noise at shutdown).
-                if self.worker:
-                    try:
-                        await asyncio.wait_for(self.worker.q.join(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        log.warning("worker queue did not drain within 5s")
-                    self.worker.stop()
-                worker_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await worker_task
+                log.exception("strike selection failed (unexpected error)")
+                print("ERROR: strike selection failed with an unexpected error. "
+                      "Full details are in %s. No orders were placed." % LOG_FILE)
+                await self._shutdown_worker(worker_task)
                 return
 
             await self._wait_until(EXEC_START_TIME)
+
+            # If bootstrap + strike selection were slow and we slipped past the
+            # end of the entry window, do not enter late - report and exit.
+            if datetime.now().time() > EXEC_END_TIME:
+                msg = (
+                    "ENTRY WINDOW CLOSED: the clock is now past %s, so entry is "
+                    "skipped. No orders were placed." % EXEC_END_TIME.strftime("%H:%M:%S")
+                )
+                log.warning(msg)
+                print(msg)
+                self.store.exit_reason = "entry_window_closed"
+                await self._shutdown_worker(worker_task)
+                return
+
             entry_ok = await self.execute_entry()
             if not entry_ok:
-                log.error("ENTRY_ABORTED — one or more leg pairs did not enter")
+                log.error(
+                    "ENTRY ABORTED — one or more leg pairs did not enter. "
+                    "Any legs that did enter carry their hedge + broker SL; "
+                    "see fills.csv / the audit log for per-leg detail."
+                )
 
             instruments: List[str] = []
             if self.store.pair:
@@ -2500,8 +2759,14 @@ class Engine:
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker_task
 
+        # Final MTM refresh before persisting summaries — this also covers the
+        # edge case where the feed never delivered any ticks, so the report
+        # still shows the PnL implied by fill prices vs. the last known price.
+        self.store.compute_mtm()
         # Persist the per-session summary.
         self._write_paper_summary()
+        # Layman-friendly daily scoreboard (cumulative across days).
+        self._write_performance_report()
 
     def _write_paper_summary(self) -> None:
         if not PAPER_TRADING_MODE:
@@ -2526,6 +2791,94 @@ class Engine:
                 "trail_lock_final": f"{self.store.trail_lock:.2f}",
                 "exit_reason": self.store.exit_reason or "session_end",
             },
+        )
+
+    def _write_performance_report(self) -> None:
+        """Append one plain-English row to strategy_performance.csv.
+
+        Written at the end of every session (paper AND live) so the file
+        doubles as a running scoreboard: each day's strikes, premium
+        collected, hedge cost, net credit, day PnL, plus a cumulative PnL
+        and win rate across all days so far. Rows are appended and never
+        overwritten — delete the file to start a fresh scoreboard.
+        """
+        if not self.store.pair:
+            return
+        pair = self.store.pair
+        qty = LOT_SIZE
+
+        def _prem(leg: Leg) -> Optional[float]:
+            return round(leg.fill_price * qty, 2) if leg.fill_price is not None else None
+
+        ce_prem = _prem(pair.ce_short)
+        pe_prem = _prem(pair.pe_short)
+        ce_cost = _prem(pair.ce_hedge)
+        pe_cost = _prem(pair.pe_hedge)
+
+        traded = any(p is not None for p in (ce_prem, pe_prem, ce_cost, pe_cost))
+
+        premium_collected = (ce_prem or 0.0) + (pe_prem or 0.0)
+        hedge_cost = (ce_cost or 0.0) + (pe_cost or 0.0)
+        net_credit = premium_collected - hedge_cost
+        day_pnl = round(self.store.total_mtm, 2)
+
+        if not traded:
+            result = "NO TRADE"
+        elif day_pnl > 0:
+            result = "PROFIT"
+        elif day_pnl < 0:
+            result = "LOSS"
+        else:
+            result = "BREAKEVEN"
+
+        prior_total, prior_days, prior_wins = _load_performance_totals()
+        cumulative = round(prior_total + day_pnl, 2)
+        days = prior_days + (1 if traded else 0)
+        wins = prior_wins + (1 if traded and day_pnl > 0 else 0)
+        win_rate = f"{wins / days * 100:.1f}" if days > 0 else ""
+
+        notes: List[str] = []
+        reentries = pair.ce_short.reentry_count + pair.pe_short.reentry_count
+        if reentries:
+            notes.append(f"re-entries: {reentries}")
+        sl_legs = [
+            lg.leg_id for lg in (pair.ce_short, pair.pe_short)
+            if lg.sl_broker_triggered or lg.sl_triggered_at is not None
+        ]
+        if sl_legs:
+            notes.append("stop-loss hit on " + ", ".join(sl_legs))
+        if self.store.num_hedge_aborts:
+            notes.append(f"hedge aborts: {self.store.num_hedge_aborts}")
+
+        try:
+            session_day = date.fromisoformat(pair.session_date).strftime("%A")
+        except ValueError:
+            session_day = ""
+
+        _append_performance_row(
+            {
+                "Date": pair.session_date,
+                "Day": session_day,
+                "Entry VIX": f"{self.store.entry_vix:.2f}",
+                "NIFTY Spot": f"{self.store.entry_spot:.2f}" if self.store.entry_spot else "",
+                "Sold CE Strike": f"{pair.ce_short.strike:.0f}",
+                "Sold PE Strike": f"{pair.pe_short.strike:.0f}",
+                "Hedge CE Strike": f"{pair.ce_hedge.strike:.0f}",
+                "Hedge PE Strike": f"{pair.pe_hedge.strike:.0f}",
+                "Premium Collected (Rs)": f"{premium_collected:.2f}" if traded else "",
+                "Hedge Cost (Rs)": f"{hedge_cost:.2f}" if traded else "",
+                "Net Credit (Rs)": f"{net_credit:.2f}" if traded else "",
+                "Day PnL (Rs)": f"{day_pnl:.2f}",
+                "Result": result,
+                "Cumulative PnL (Rs)": f"{cumulative:.2f}",
+                "Win Rate (%)": win_rate,
+                "Exit Reason": _layman_exit_reason(self.store.exit_reason),
+                "Notes": "; ".join(notes),
+            }
+        )
+        log.info(
+            "PERFORMANCE_ROW: date=%s result=%s day_pnl=%.2f cumulative=%.2f -> %s",
+            pair.session_date, result, day_pnl, cumulative, PERFORMANCE_CSV,
         )
 
     async def _wait_until(self, t: dtime) -> None:
@@ -2580,12 +2933,31 @@ def _async_exception_handler(loop, context):  # noqa: ANN001
 def main() -> None:
     global _engine_ref
 
+    # Friendly config check BEFORE anything else: a missing token would
+    # otherwise fail deep inside the first API call with a confusing error.
+    if not UPSTOX_ACCESS_TOKEN:
+        print("=" * 74)
+        print("CONFIG ERROR: UPSTOX_ACCESS_TOKEN is missing or empty.")
+        print("Create a file named 'env.txt' next to this script containing:")
+        print()
+        print("    UPSTOX_ACCESS_TOKEN=eyJ0eXAiOiJKV1Q...")
+        print()
+        print("Other keys (UPSTOX_API_KEY, UPSTOX_API_SECRET, GEMINI_API_KEY)")
+        print("are optional for running the script as-is. You can point the")
+        print("script at a different file with the UPSTOX_ENV_FILE variable.")
+        print("=" * 74)
+        sys.exit(1)
+
     # Mode dispatch — strictly on hardcoded booleans, no runtime input.
     if PAPER_TRADING_MODE:
         log.info("=== RUN MODE: PAPER TRADING ===")
-        log.info("Outputs: %s, %s", PAPER_TRADE_LOG_CSV, PAPER_TRADE_SUMMARY_CSV)
+        log.info(
+            "Outputs: %s, %s, %s",
+            PAPER_TRADE_LOG_CSV, PAPER_TRADE_SUMMARY_CSV, PERFORMANCE_CSV,
+        )
     else:
         log.info("=== RUN MODE: LIVE ===")
+        log.info("Scoreboard: %s", PERFORMANCE_CSV)
 
     engine = Engine()
     _engine_ref = engine
@@ -2605,8 +2977,19 @@ def main() -> None:
         loop.run_until_complete(engine.run())
     except KeyboardInterrupt:
         log.warning("KeyboardInterrupt — shutting down")
-    except Exception:
-        log.exception("fatal exception in main loop")
+        print("Interrupted by user - shutting down cleanly.")
+    except TradingError as e:
+        log.error("FATAL: %s", e)
+        print("ERROR: %s" % e)
+    except Exception as e:
+        log.error("FATAL: unexpected error — %s", e)
+        print("FATAL: unexpected error — %s" % e)
+        print("Full details were written to: %s" % LOG_FILE)
+        try:
+            with open(LOG_FILE, "a") as _f:
+                traceback.print_exc(file=_f)
+        except Exception:
+            pass
         if not PAPER_TRADING_MODE and engine.rest:
             try:
                 loop.run_until_complete(exit_all_positions(engine.rest))
