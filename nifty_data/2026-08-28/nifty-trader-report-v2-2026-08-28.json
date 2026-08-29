@@ -1,0 +1,351 @@
+{
+  "decision": "WAIT / NO TRADE",
+  "snapshot": {
+    "schema_version": "2.1.0",
+    "snapshot_id": "20260828_152903_001",
+    "capture_timestamp": "2026-08-28T15:29:03+05:30",
+    "source_timestamp": "2026-08-28T15:29:03+05:30",
+    "expiry": "2026-09-01",
+    "spot": "24142.45",
+    "current_atm": "24150",
+    "session_anchor_atm": "24150",
+    "range_low": "23550",
+    "range_high": "24750",
+    "rows_captured": "25",
+    "source_is_stale": "False",
+    "nifty_futures": "",
+    "futures_vwap": "",
+    "india_vix": "10.58",
+    "range_ce_oi": "1815273.0",
+    "range_pe_oi": "1488978.0",
+    "range_oi_pcr": "0.8203",
+    "range_ce_exchange_change_oi": "248879.0",
+    "range_pe_exchange_change_oi": "447591.0",
+    "range_exchange_change_oi_pcr": "1.7984",
+    "range_ce_interval_oi_change": "-14446.0",
+    "range_pe_interval_oi_change": "-11322.0",
+    "range_ce_interval_volume": "116134.0",
+    "range_pe_interval_volume": "129427.0",
+    "max_ce_oi_strike": "24300",
+    "max_ce_oi": "235810.0",
+    "max_pe_oi_strike": "24100",
+    "max_pe_oi": "200686.0",
+    "max_ce_interval_add_strike": "24700",
+    "max_ce_interval_add": "262.0",
+    "max_pe_interval_add_strike": "23900",
+    "max_pe_interval_add": "1401.0",
+    "atm_ce_ltp": "139.4",
+    "atm_pe_ltp": "49.3",
+    "atm_straddle_ltp": "188.7",
+    "atm_ce_bid": "138.15",
+    "atm_ce_ask": "138.6",
+    "atm_pe_bid": "49.3",
+    "atm_pe_ask": "49.5",
+    "atm_straddle_bid": "187.45",
+    "atm_straddle_ask": "188.1",
+    "atm_straddle_mid": "187.775",
+    "atm_ce_iv": "12.76",
+    "atm_pe_iv": "5.78",
+    "atm_quotes_executable": "True",
+    "true_futures_context_available": "False",
+    "trade_ready_data": "True",
+    "quality_notes": "true one-minute NIFTY futures OHLCV/VWAP unavailable; scheduled-event status not supplied"
+  },
+  "market": {
+    "latest_spot": 24142.45,
+    "3m": {
+      "high": 24142.45,
+      "low": 24142.45,
+      "range": 0.0,
+      "net_change": 0.0,
+      "observations": 5
+    },
+    "5m": {
+      "high": 24142.45,
+      "low": 24142.45,
+      "range": 0.0,
+      "net_change": 0.0,
+      "observations": 7
+    },
+    "10m": {
+      "high": 24142.45,
+      "low": 24142.45,
+      "range": 0.0,
+      "net_change": 0.0,
+      "observations": 12
+    },
+    "15m": {
+      "high": 24142.45,
+      "low": 24142.45,
+      "range": 0.0,
+      "net_change": 0.0,
+      "observations": 16
+    },
+    "30m": {
+      "high": 24153.95,
+      "low": 24106.35,
+      "range": 47.60000000000218,
+      "net_change": 16.799999999999272,
+      "observations": 31
+    },
+    "price_state": "compression"
+  },
+  "levels": {
+    "nearest_confirmed_floor": 24116.8,
+    "nearest_confirmed_ceiling": 24153.95,
+    "nearest_high_below": 24138.85,
+    "nearest_low_above": null,
+    "floor_distance": 25.650000000001455,
+    "ceiling_distance": 11.5,
+    "floor_stop_usable": true,
+    "ceiling_stop_usable": true,
+    "provisional_floor_10": 24142.45,
+    "provisional_ceiling_10": 24142.45,
+    "swing_high_count": 20,
+    "swing_low_count": 21
+  },
+  "enhanced_features": {
+    "observations_used": 256,
+    "atr_proxy_points": 0.0,
+    "ema": {
+      "3": 24142.45,
+      "5": 24142.45,
+      "8": 24142.34,
+      "13": 24141.5,
+      "21": 24139.29
+    },
+    "ema_5_minus_13": 0.95,
+    "regime": "range_or_compression",
+    "candidate_options": [
+      {
+        "direction": "PUT",
+        "strike": 24150,
+        "entry_ask": 49.5,
+        "exit_bid": 49.3,
+        "mid": 49.4,
+        "spread_pct": 0.004048582995951474,
+        "oi": 117214.0,
+        "interval_volume": 16282.0,
+        "selection_score": 39.76
+      },
+      {
+        "direction": "CALL",
+        "strike": 24150,
+        "entry_ask": 138.6,
+        "exit_bid": 138.15,
+        "mid": 138.375,
+        "spread_pct": 0.0032520325203251213,
+        "oi": 86688.0,
+        "interval_volume": 10958.0,
+        "selection_score": 38.66
+      },
+      {
+        "direction": "PUT",
+        "strike": 24100,
+        "entry_ask": 35.85,
+        "exit_bid": 35.7,
+        "mid": 35.775,
+        "spread_pct": 0.00419287211740038,
+        "oi": 200686.0,
+        "interval_volume": 21686.0,
+        "selection_score": 37.59
+      },
+      {
+        "direction": "CALL",
+        "strike": 24200,
+        "entry_ask": 107.0,
+        "exit_bid": 106.7,
+        "mid": 106.85,
+        "spread_pct": 0.002807674309780039,
+        "oi": 178012.0,
+        "interval_volume": 22200.0,
+        "selection_score": 36.75
+      },
+      {
+        "direction": "PUT",
+        "strike": 24200,
+        "entry_ask": 67.75,
+        "exit_bid": 67.6,
+        "mid": 67.675,
+        "spread_pct": 0.0022164758034725627,
+        "oi": 142069.0,
+        "interval_volume": 20463.0,
+        "selection_score": 36.37
+      },
+      {
+        "direction": "CALL",
+        "strike": 24100,
+        "entry_ask": 175.35,
+        "exit_bid": 174.85,
+        "mid": 175.1,
+        "spread_pct": 0.0028555111364934323,
+        "oi": 88502.0,
+        "interval_volume": 6650.0,
+        "selection_score": 34.4
+      }
+    ],
+    "quality_flags": [
+      "source_age_unavailable",
+      "futures_ohlcv_vwap_missing",
+      "scheduled_event_status_unverified"
+    ],
+    "non_predictive_note": "Features describe current evidence; they do not predict or guarantee future movement."
+  },
+  "directional_evidence_score": {
+    "bullish": 50.0,
+    "bearish": 65.0,
+    "conflicting": false,
+    "role": "advisory_display_only",
+    "interpretation": "evidence score, not probability of profit; the decision is made by the breakout/flow/EMA/geometry gates, not by this score"
+  },
+  "risk_geometry": null,
+  "option_candidate": null,
+  "reasons": [
+    "BLOCKING: no confirmed two-observation breakout/retest with matching persistent OI flow",
+    "BLOCKING: 50-pt target exceeds session p95 directional move of 29.85 pts over 10-min windows with 0.9 min left; observed volatility provides insufficient evidence for a 50-point move (and no fresh range expansion)",
+    "ADVISORY: bearish break rejected: EMA5 above EMA13 and not falling (counter-trend)",
+    "ADVISORY: opening window (374.1 min since open): interval-OI flow confirmation de-weighted",
+    "ADVISORY: nearest ceiling 24153.95 leaves less than 50 points of upside room",
+    "ADVISORY: nearest floor 24116.8 leaves less than 50 points of downside room",
+    "ADVISORY: inverted IV skew (-4.53): call IV above put IV — unusual vs NIFTY's structural put skew; crowded-long regime, sharp reversals possible — caution for fresh longs",
+    "ADVISORY: sectoral: Bank -0.14% / IT +3.45% vs NIFTY +0.21%; breadth 3U/7D",
+    "ADVISORY: sector leader: it (+3.45%)"
+  ],
+  "limitations": {
+    "futures_available": false,
+    "scheduled_event_data_available": false,
+    "premium_geometry_modeled": false,
+    "premium_geometry_note": "Stops/targets are in underlying points; option P&L, theta, and costs are not modelled here"
+  },
+  "tail_stats": {
+    "available": true,
+    "abs_1m_change_mean": 2.53,
+    "abs_1m_change_p90": 5.51,
+    "abs_1m_change_max": 26.0,
+    "drawdown_10m": {
+      "mean": 7.87,
+      "max": 43.45,
+      "p95": 28.85
+    },
+    "drawdown_10m_ge21_count": 33,
+    "drawdown_10m_windows": 246,
+    "runup_10m": {
+      "mean": 7.09,
+      "max": 47.6,
+      "p95": 20.89
+    },
+    "range_15m": {
+      "mean": 19.37,
+      "max": 51.55,
+      "p95": 45.15
+    },
+    "range_15m_ge50_count": 1,
+    "range_20m": {
+      "mean": 22.59,
+      "max": 65.4,
+      "p95": 47.6
+    },
+    "abs_net_move_10m": {
+      "mean": 9.86,
+      "max": 44.9,
+      "p95": 29.85
+    },
+    "abs_net_move_15m": {
+      "mean": 11.39,
+      "max": 51.55,
+      "p95": 35.65
+    },
+    "abs_net_move_20m": {
+      "mean": 12.19,
+      "max": 65.4,
+      "p95": 36.81
+    },
+    "abs_net_move_30m": {
+      "mean": 13.91,
+      "max": 59.7,
+      "p95": 41.84
+    },
+    "abs_net_move_45m": {
+      "mean": 16.17,
+      "max": 81.1,
+      "p95": 54.1
+    },
+    "abs_net_move_60m": {
+      "mean": 16.66,
+      "max": 78.45,
+      "p95": 53.74
+    },
+    "flush_risk_flag": true,
+    "data_holes_gaps_gt_300s": 0,
+    "window_basis": "observation_counts",
+    "window_basis_note": "Window sizes (10/15/20/30/45/60) count OBSERVATIONS. With irregular capture cadence or sub-minute prints, an N-observation window spans more than N minutes; treat 'm' suffixes as approximate.",
+    "fresh_extreme_basis_note": "new_high_30/new_low_30 compare against the previous 30 OBSERVATIONS, not 30 minutes.",
+    "tail_asymmetry": "downside_heavy",
+    "non_predictive_note": "Tail statistics describe historical frequency, not a prediction."
+  },
+  "chain_gap_seconds": 0.0,
+  "microstructure": {
+    "available": true,
+    "ceiling_touches": 2,
+    "ceiling_rejections": 1,
+    "floor_touches": 1,
+    "floor_rejections": 0,
+    "triple_ceiling_rejection": false,
+    "triple_floor_rejection": false
+  },
+  "premium_flow": {
+    "available": true,
+    "atm_ce_obs_delta_up": null,
+    "atm_pe_obs_delta_down": null,
+    "ce_iv_change_last5": -0.35,
+    "pe_iv_change_last5": -0.06,
+    "ce_premium_bid": false,
+    "pe_premium_bid": false,
+    "note": "Observed premium elasticity from synchronized snapshots; not a Greek model."
+  },
+  "coil": {
+    "available": true,
+    "coil_position": 0.76,
+    "coil_zone": "top",
+    "pcr_drift_last5": 0.009,
+    "flow_lean": "neutral",
+    "resolution_lean": "neutral"
+  },
+  "options_behaviour": {
+    "available": true,
+    "windowed": true,
+    "windowed_max_pain": 24200,
+    "windowed_max_pain_distance": -57.5,
+    "windowed_max_pain_shift_30m": 0,
+    "max_pain": 24200,
+    "max_pain_distance": -57.5,
+    "max_pain_shift_30m": 0,
+    "pinning_zone": false,
+    "skew_otm_put_minus_call": -4.53,
+    "skew_change_30m": -1.73,
+    "skew_reversal": false,
+    "skew_inverted": true,
+    "pcr_z": 1.25,
+    "pcr_regime": "neutral",
+    "volume_concentration_atm2": 0.547,
+    "windowed_volume_concentration_atm2": 0.547,
+    "windowed_pcr_z": 1.25,
+    "window_note": "max pain, PCR and volume concentration are computed from the captured strike window (ATM +/- ~1000), not the full NIFTY chain",
+    "days_to_expiry": 2,
+    "expiry_week": true,
+    "evidence_grades": {
+      "pcr_extremes": "practitioner consensus, not peer-reviewed",
+      "max_pain": "mixed academic record; modest expiry-week pull",
+      "skew": "peer-reviewed for NIFTY (Shaikh & Padhi 2014, 2016)"
+    },
+    "non_predictive_note": "Behavioural patterns weight evidence; they never trigger a trade."
+  },
+  "mode_b": {
+    "enabled": true,
+    "decision": "WAIT / NO TRADE",
+    "direction": null,
+    "blocking": [
+      "candidate quotes not executable"
+    ]
+  }
+}
