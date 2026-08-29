@@ -288,14 +288,14 @@ TICK_SIZE = 0.05
 
 # Logging — file + stdout, every state transition captured.
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(LOG_DIR, "trading_audit.log")
-CSV_FILE = os.path.join(LOG_DIR, "fills.csv")
-MTM_LOG_FILE = os.path.join(LOG_DIR, "mtm.log")
-PAPER_TRADE_LOG_CSV = os.path.join(LOG_DIR, "paper_trading_log.csv")
-PAPER_TRADE_SUMMARY_CSV = os.path.join(LOG_DIR, "paper_trading_summary.csv")
+LOG_FILE = os.path.join(LOG_DIR, "nifty_short_straddle_trading_audit.log")
+CSV_FILE = os.path.join(LOG_DIR, "nifty_short_straddle_fills.csv")
+MTM_LOG_FILE = os.path.join(LOG_DIR, "nifty_short_straddle_mtm.log")
+PAPER_TRADE_LOG_CSV = os.path.join(LOG_DIR, "nifty_short_straddle_paper_trading_log.csv")
+PAPER_TRADE_SUMMARY_CSV = os.path.join(LOG_DIR, "nifty_short_straddle_paper_trading_summary.csv")
 # Plain-English daily scoreboard: one row per trading day, appended forever.
 # This is the file to check to see how the strategy is doing over time.
-PERFORMANCE_CSV = os.path.join(LOG_DIR, "strategy_performance.csv")
+PERFORMANCE_CSV = os.path.join(LOG_DIR, "nifty_short_straddle_strategy_performance.csv")
 
 # CSV schema (single source of truth for the paper trade log)
 CSV_LOG_COLUMNS = [
