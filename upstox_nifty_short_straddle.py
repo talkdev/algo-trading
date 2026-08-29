@@ -463,59 +463,67 @@ def _v3_headers() -> Dict[str, str]:
 
 
 def fetch_instrument_master() -> List[Dict[str, Any]]:
-    """Pre-websocket bootstrap call. Returns parsed JSON list of NSE_FO/INDEX rows."""
-    log.info("Downloading instrument master from %s", INSTRUMENTS_URL)
-    r = requests.get(INSTRUMENTS_URL, params={"instrument_key": "NSE_FO"}, timeout=30)
+    """Fetch option contracts specifically for Nifty 50."""
+    log.info("Downloading NIFTY 50 contracts from %s", INSTRUMENTS_URL)
+    r = requests.get(
+        INSTRUMENTS_URL, 
+        params={"instrument_key": "NSE_INDEX|Nifty 50"}, 
+        headers=_v2_headers(), 
+        timeout=30
+    )
     r.raise_for_status()
     data = r.json().get("data", [])
     log.info("Instrument master rows: %d", len(data))
     return data
 
-
 def fetch_index_instrument_master() -> List[Dict[str, Any]]:
-    """NSE_INDEX segment of the master — used to resolve India VIX."""
-    r = requests.get(INSTRUMENTS_URL, params={"instrument_key": "NSE_INDEX"}, timeout=30)
-    r.raise_for_status()
-    return r.json().get("data", [])
+    """Return a mocked row for India VIX to satisfy the resolver."""
+    # Bypasses the invalid NSE_INDEX call by supplying the known static key directly
+    return [{
+        "name": "India VIX", 
+        "tradingsymbol": "India VIX", 
+        "instrument_key": "NSE_INDEX|India VIX", 
+        "exchange": "NSE"
+    }]
 
 
 def fetch_nifty_weekly_expiry(instruments: List[Dict[str, Any]]) -> Tuple[str, str]:
     """
-    Find the current active NIFTY weekly expiry under NSE_FO.
-    Returns (instrument_key, expiry_yyyy_mm_dd) for the weekly contract.
-    Falls back to the nearest expiry if the current-week weekly is missing.
+    Find the current active NIFTY weekly expiry from the contract list.
+    Returns the underlying index key and the expiry date string.
     """
     today = datetime.now().date()
-    candidates: List[Tuple[datetime, str, str]] = []
+    expiries = set()
+    
     for row in instruments:
-        name = (row.get("name") or "").upper()
-        sym = (row.get("tradingsymbol") or "").upper()
-        if "NIFTY" not in name or "NIFTY" not in sym:
-            continue
         try:
+            # We already narrowed the list to Nifty 50 contracts only.
+            # Just extract valid >= today expiry dates.
             exp = datetime.strptime(row["expiry"], "%Y-%m-%d").date()
+            if exp >= today:
+                expiries.add(exp)
         except Exception:
             continue
-        if exp < today:
-            continue
-        candidates.append(
-            (datetime.combine(exp, dtime.min), row["instrument_key"], row["expiry"])
-        )
-    if not candidates:
-        raise RuntimeError("No NIFTY NSE_FO instruments found in master")
-
+            
+    if not expiries:
+        raise RuntimeError("No NIFTY expiries found in the downloaded contracts")
+        
     # Pick nearest expiry in current week, else nearest overall.
     week_end = today + timedelta(days=(4 - today.weekday()) % 7)  # Friday
-    this_week = [c for c in candidates if c[0].date() <= week_end]
-    pool = this_week or candidates
-    pool.sort(key=lambda c: c[0])
-    chosen = pool[0]
+    valid_expiries = sorted(list(expiries))
+    
+    this_week = [e for e in valid_expiries if e <= week_end]
+    chosen_exp = this_week[0] if this_week else valid_expiries[0]
+    
+    chosen_expiry_str = chosen_exp.strftime("%Y-%m-%d")
+    underlying_key = "NSE_INDEX|Nifty 50"
+    
     log.info(
-        "Selected NIFTY weekly expiry=%s instrument_key=%s",
-        chosen[2],
-        chosen[1],
+        "Selected NIFTY weekly expiry=%s instrument_key=%s", 
+        chosen_expiry_str, 
+        underlying_key
     )
-    return chosen[1], chosen[2]
+    return underlying_key, chosen_expiry_str
 
 
 def resolve_vix_instrument_key(instruments: List[Dict[str, Any]]) -> str:
@@ -544,16 +552,14 @@ def fetch_vix_ltp_sync(vix_key: str) -> float:
         timeout=15,
     )
     r.raise_for_status()
-    last = r.json()["data"][vix_key]["last_price"]
-    log.info("entry_vix = %.2f", last)
+    data = r.json().get("data", {})
+    # Safely extract the first item's price to ignore '|' vs ':' formatting
+    last = list(data.values())[0]["last_price"]
+    log.info("entry_vix = %.2f", float(last))
     return float(last)
 
-
 def fetch_nifty50_spot_sync(nifty_key: str) -> float:
-    """Pre-websocket bootstrap NIFTY 50 spot LTP fetch. Needed for the
-    VIX-adaptive SL_LIMIT_BUFFER_POINTS calculation; entry_spot is
-    stored on LegPair at strike selection and read at every SL placement.
-    """
+    """Pre-websocket bootstrap NIFTY 50 spot LTP fetch."""
     r = requests.get(
         MARKET_QUOTE_LTP_URL,
         params={"instrument_key": nifty_key},
@@ -561,34 +567,47 @@ def fetch_nifty50_spot_sync(nifty_key: str) -> float:
         timeout=15,
     )
     r.raise_for_status()
-    last = r.json()["data"][nifty_key]["last_price"]
-    log.info("entry_spot = %.2f", last)
+    data = r.json().get("data", {})
+    # Safely extract the first item's price
+    last = list(data.values())[0]["last_price"]
+    log.info("entry_spot = %.2f", float(last))
     return float(last)
 
 
 def fetch_option_greeks_batched(keys: List[str]) -> Dict[str, Dict[str, float]]:
-    """SINGLE batched /v3/market-quote/option-greek call. Returns {key: {delta, ltp}}."""
+    """Batched /v3/market-quote/option-greek call. Returns {key: {delta, ltp}}."""
     if not keys:
         return {}
-    params = {"instrument_key": ",".join(keys)}
-    r = requests.get(
-        OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20
-    )
-    if r.status_code == 429:
-        log.warning("option-greek 429 — backing off 2s and retrying once")
-        time.sleep(2.0)
+        
+    out: Dict[str, Dict[str, float]] = {}
+    chunk_size = 50
+    
+    for i in range(0, len(keys), chunk_size):
+        chunk = keys[i : i + chunk_size]
+        params = {"instrument_key": ",".join(chunk)}
+        
         r = requests.get(
             OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20
         )
-    r.raise_for_status()
-    raw = r.json().get("data", {})
-    out: Dict[str, Dict[str, float]] = {}
-    for k, v in raw.items():
-        g = v.get("option_greeks") or {}
-        out[k] = {
-            "delta": float(g.get("delta") or 0.0),
-            "ltp": float(v.get("last_price") or 0.0),
-        }
+        if r.status_code == 429:
+            log.warning("option-greek 429 — backing off 2s and retrying once")
+            time.sleep(2.0)
+            r = requests.get(
+                OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20
+            )
+        r.raise_for_status()
+        
+        raw = r.json().get("data", {})
+        for k, v in raw.items():
+            # FIX: Normalize the response key from 'NSE_FO:123' back to 'NSE_FO|123'
+            normalized_key = k.replace(":", "|")
+            
+            g = v.get("option_greeks") or {}
+            out[normalized_key] = {
+                "delta": float(g.get("delta") or 0.0),
+                "ltp": float(v.get("last_price") or 0.0),
+            }
+            
     return out
 
 
