@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-08-28T11:58:25+05:30",
+  "escalation": "execute",
+  "snapshot_id": "20260828_115803_000",
+  "spot": "24077.6",
+  "model": "gemini-2.5-flash",
+  "finish_reason": "STOP",
+  "decision": "WAIT / NO TRADE",
+  "summary": "DECISION: WAIT / NO TRADE\nDIRECTION: NONE\nENTRY: N/A | STOP: N/A | T1: N/A | T2: N/A\nOPTION: N/A\nR:R: N/A\nREASONS: Mode B blocking: no structural stop within 5.0-10.0 pts of nearest ceiling.\nBLOCKING: No structural stop within 5.0-10.0 pts (nearest ceiling 24103.25).\nCONFIDENCE: Low\nAGREEMENT: DISAGREE with the engine; a blocking reason from Mode B prevents a trade.",
+  "raw_response": "DECISION: WAIT / NO TRADE\nDIRECTION: NONE\nENTRY: N/A | STOP: N/A | T1: N/A | T2: N/A\nOPTION: N/A\nR:R: N/A\nREASONS: Mode B blocking: no structural stop within 5.0-10.0 pts of nearest ceiling.\nBLOCKING: No structural stop within 5.0-10.0 pts (nearest ceiling 24103.25).\nCONFIDENCE: Low\nAGREEMENT: DISAGREE with the engine; a blocking reason from Mode B prevents a trade."
+}

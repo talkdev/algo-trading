@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-08-28T10:56:19+05:30",
+  "escalation": "execute",
+  "snapshot_id": "20260828_105603_001",
+  "spot": "24151.2",
+  "model": "gemini-2.5-flash",
+  "finish_reason": "STOP",
+  "decision": "WAIT / NO TRADE",
+  "summary": "DECISION: WAIT / NO TRADE\nDIRECTION: NONE\nENTRY: N/A | STOP: N/A | T1: N/A | T2: N/A\nOPTION: N/A\nR:R: N/A\nREASONS: Missing EMA data for trigger. Price not at a fresh 30-observation extreme. Broad market not confirming down move.\nBLOCKING: Missing EMA data; Price not at 30-obs extreme; Engine's Mode B explicitly blocks trade.\nCONFIDENCE: low\nAGREEMENT: DISAGREE with the engine; multiple critical ga",
+  "raw_response": "DECISION: WAIT / NO TRADE\nDIRECTION: NONE\nENTRY: N/A | STOP: N/A | T1: N/A | T2: N/A\nOPTION: N/A\nR:R: N/A\nREASONS: Missing EMA data for trigger. Price not at a fresh 30-observation extreme. Broad market not confirming down move.\nBLOCKING: Missing EMA data; Price not at 30-obs extreme; Engine's Mode B explicitly blocks trade.\nCONFIDENCE: low\nAGREEMENT: DISAGREE with the engine; multiple critical gates failed or could not be verified."
+}

@@ -1,0 +1,5 @@
+{"ts":"2026-08-28T11:13:10+05:30","snapshot_id":"20260828_111310_089","escalation":"armed","decision":"WAIT / NO TRADE","decision_grade":"journal","spot":"24158.7","minutes_to_close":256.8,"trigger_age_seconds":null}
+{"ts":"2026-08-28T11:24:03+05:30","snapshot_id":"20260828_112403_001","escalation":"execute","decision":"BUY PUT NOW","decision_grade":"execution_candidate","spot":"24140.6","minutes_to_close":245.9,"trigger_age_seconds":0.5}
+{"ts":"2026-08-28T11:25:03+05:30","snapshot_id":"20260828_112503_000","escalation":"armed","decision":"WAIT / NO TRADE","decision_grade":"journal","spot":"24139.95","minutes_to_close":244.9,"trigger_age_seconds":0.4}
+{"ts":"2026-08-28T11:58:03+05:30","snapshot_id":"20260828_115803_000","escalation":"execute","decision":"BUY PUT NOW","decision_grade":"execution_candidate","spot":"24077.6","minutes_to_close":211.9,"trigger_age_seconds":0.7}
+{"ts":"2026-08-28T11:59:03+05:30","snapshot_id":"20260828_115903_000","escalation":"armed","decision":"WAIT / NO TRADE","decision_grade":"journal","spot":"24085.0","minutes_to_close":210.9,"trigger_age_seconds":null}

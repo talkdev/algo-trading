@@ -1,0 +1,2 @@
+date,trades,open_trades,wins,losses,win_rate_pct,total_pnl_points,total_pnl_rupees,avg_win_rupees,avg_loss_rupees,profit_factor,best_rupees,worst_rupees,generated_at
+2026-08-28,2,0,1,1,50.0,47.4,1865.5,2392.0,526.5,4.54,2392.0,-526.5,2026-08-28T12:05:03+05:30
