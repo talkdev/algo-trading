@@ -14,6 +14,10 @@ Strategy
 - 09:19:  VIX-adaptive strike selection. Pull greeks in a SINGLE batched
   /v3/market-quote/option-greek call. Delta is the primary filter; premium
   band is a tiebreaker, never a hard filter.
+- Non-trading days (weekends / NSE_MARKET_HOLIDAYS) are refused up front:
+  strike selection needs *live* greeks and the tick engine needs live ticks,
+  neither of which exists when NSE is closed. Set ALLOW_NON_TRADING_DAY_RUN
+  = True to bypass the guard for offline testing.
 - 09:19:30 - 09:20:30: Hedged execution. Place hedge long legs first
   (LIMIT BUY @ ask + slippage). If a hedge leg does not fill within
   HEDGE_FILL_TIMEOUT_SEC, cancel, re-price once, retry once; on second
@@ -140,6 +144,26 @@ _ENV = _load_env_file(ENV_FILE_PATH)
 # CONFIG (no runtime inputs — all hardcoded as required)
 # ============================================================================
 PAPER_TRADING_MODE = True
+
+# Trading-day guard. The strategy needs live option greeks (strike
+# selection) and live ticks (tick engine); when NSE is closed the
+# option-greek endpoint returns no usable deltas and the whole session
+# aborts with misleading "delta_band_unmet" errors. Refuse to run on
+# non-trading days by default. For deliberate offline testing (e.g.
+# wiring/logging dry-runs), flip this to True — but orders/greeks will
+# still fail against a closed market.
+ALLOW_NON_TRADING_DAY_RUN = False
+
+# NSE trading holidays, as ISO "YYYY-MM-DD" strings. Upstox does not expose
+# a full exchange-holiday calendar through a stable public endpoint and a
+# hardcoded list goes stale, so this set is intentionally small and
+# user-maintained: update it once a year when the NSE holiday list is
+# published. Weekends are always refused regardless of this set. Mid-week
+# holidays NOT listed here are still caught by the greeks guard inside
+# pick_core_strike (ABORT:greeks_unavailable) — they just take a few
+# seconds longer to detect.
+NSE_MARKET_HOLIDAYS: frozenset = frozenset()
+
 LOT_SIZE = 25
 
 # Secrets (loaded from env.txt — see _load_env_file above)
@@ -596,8 +620,14 @@ def fetch_option_greeks_batched(keys: List[str]) -> Dict[str, Dict[str, float]]:
                 OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20
             )
         r.raise_for_status()
-        
+
         raw = r.json().get("data", {})
+        if not raw:
+            log.warning(
+                "option-greek returned EMPTY data for chunk %d-%d of %d keys "
+                "(market closed or keys not entitled?)",
+                i, i + len(chunk), len(keys),
+            )
         for k, v in raw.items():
             # FIX: Normalize the response key from 'NSE_FO:123' back to 'NSE_FO|123'
             normalized_key = k.replace(":", "|")
@@ -896,6 +926,27 @@ async def exit_all_positions(rest: AsyncRestClient) -> None:
 # ============================================================================
 # Strategy helpers
 # ============================================================================
+def is_nse_trading_day(day: date) -> bool:
+    """Weekends and user-maintained NSE_MARKET_HOLIDAYS are non-trading days.
+
+    Weekday() is 0=Monday .. 6=Sunday. Only the local calendar is consulted —
+    no network call — so this guard can never fail open because an API is
+    down. Mid-week holidays missing from NSE_MARKET_HOLIDAYS are caught
+    downstream by the greeks-unavailability abort in pick_core_strike.
+    """
+    if day.weekday() >= 5:  # Saturday / Sunday
+        return False
+    return day.isoformat() not in NSE_MARKET_HOLIDAYS
+
+
+def next_nse_trading_day(day: date) -> date:
+    """First trading day strictly after `day` (for diagnostic log output)."""
+    nxt = day + timedelta(days=1)
+    while not is_nse_trading_day(nxt):
+        nxt += timedelta(days=1)
+    return nxt
+
+
 def select_delta_premium_bands(vix: float) -> Tuple[float, float, float, float]:
     """Return (min_delta, max_delta, min_premium, max_premium) for this vix regime."""
     if vix < LOW_VIX_THRESHOLD:
@@ -940,11 +991,22 @@ def pick_core_strike(
 
     candidates = [r for r in chain_rows if r["side"] == side]
     enriched: List[Dict[str, Any]] = []
+    n_missing_greeks = 0
+    n_zero_delta = 0
+    observed_deltas: List[float] = []
     for r in candidates:
         g = greeks.get(r["instrument_key"])
         if not g:
+            n_missing_greeks += 1
             continue
         d = abs(g["delta"])
+        # A literal 0.0 delta means the greek feed had nothing for this
+        # contract (market closed / API silently blanked "option_greeks"),
+        # not "deep OTM" (real deep-OTM deltas are tiny, not exactly zero).
+        if d == 0.0:
+            n_zero_delta += 1
+            continue
+        observed_deltas.append(d)
         ltp = g["ltp"] or r["ltp"]
         if min_d <= d <= max_d:
             enriched.append(
@@ -958,7 +1020,40 @@ def pick_core_strike(
                 }
             )
     if not enriched:
-        log.warning("WARN:delta_band_unmet for side=%s (band=%.2f-%.2f)", side.value, min_d, max_d)
+        if not observed_deltas:
+            log.warning(
+                "WARN:greeks_unavailable side=%s — %d chain rows, %d missing greeks, "
+                "%d with delta=0.0, 0 with a usable delta. The option-greek API "
+                "returned no usable greeks (market closed? token/entitlement "
+                "issue?). Refusing to pick a strike.",
+                side.value, len(candidates), n_missing_greeks, n_zero_delta,
+            )
+            return None
+        observed = sorted(observed_deltas)
+        log.warning(
+            "WARN:delta_band_unmet for side=%s (band=%.2f-%.2f) — "
+            "rows=%d with_greeks=%d observed_delta=[%.3f..%.3f] "
+            "median=%.3f nearest strike diagnostics below",
+            side.value, min_d, max_d,
+            len(candidates), len(observed),
+            observed[0], observed[-1], observed[len(observed) // 2],
+        )
+        # Log the 5 strikes closest to the band mid so the log shows *why*
+        # nothing qualified (e.g. all liquid strikes far ITM/OTM).
+        probe = []
+        for r in candidates:
+            g = greeks.get(r["instrument_key"])
+            if not g or g["delta"] == 0.0:
+                continue
+            d = abs(g["delta"])
+            probe.append((abs(d - delta_mid), r["strike"], d, g["ltp"] or r["ltp"]))
+        probe.sort(key=lambda t: t[0])
+        for dist, strike, d, ltp in probe[:5]:
+            log.warning(
+                "delta_band_unmet detail: side=%s strike=%.0f delta=%.3f ltp=%.2f "
+                "dist_to_mid=%.3f",
+                side.value, strike, d, ltp, dist,
+            )
         return None
     in_band = [r for r in enriched if r["in_premium_band"]]
     if in_band:
@@ -1308,10 +1403,32 @@ class Engine:
                     return r["ltp"]
             return 0.0
 
+        # Up-front feasibility check: if the batched greek fetch came back
+        # empty or all-zero (closed market / silent API failure), every
+        # delta-band evaluation below fails with a misleading "band unmet"
+        # warning. Fail fast with the actual cause instead — strike selection
+        # without real greeks would pick arbitrary strikes.
+        n_usable_greeks = sum(1 for g in greeks.values() if g.get("delta"))
+        log.info(
+            "greek coverage: %d/%d option contracts returned a non-zero delta",
+            n_usable_greeks, len(greeks),
+        )
+        if n_usable_greeks == 0:
+            raise RuntimeError(
+                "ABORT:greeks_unavailable — option-greek API returned no usable "
+                "deltas (is NSE open today? token valid?). Refusing to select "
+                "strikes."
+            )
+
         ce_core = pick_core_strike(Side.CE, chain, greeks, self.store.entry_vix)
         pe_core = pick_core_strike(Side.PE, chain, greeks, self.store.entry_vix)
         if not ce_core or not pe_core:
-            raise RuntimeError("ABORT:delta_band_unmet for one or both core sides")
+            sides_missing = (["CE"] if not ce_core else []) + (["PE"] if not pe_core else [])
+            raise RuntimeError(
+                "ABORT:delta_band_unmet for side(s) %s — no strike fell inside the "
+                "VIX-adaptive delta band; see WARN lines above for observed "
+                "delta range and nearest strikes" % ",".join(sides_missing)
+            )
 
         ce_hedge = pick_hedge_strike(Side.CE, chain, ce_core["strike"], ltp_for)
         pe_hedge = pick_hedge_strike(Side.PE, chain, pe_core["strike"], ltp_for)
@@ -2110,6 +2227,34 @@ class Engine:
 
     # ------------------------------------------------------------------ main loop
     async def run(self) -> None:
+        # Trading-day guard, checked BEFORE any time-gate/API work: when NSE
+        # is closed the option-greek endpoint returns no usable deltas and the
+        # websocket carries no ticks, so every downstream stage can only fail
+        # with misleading errors (observed: ABORT:delta_band_unmet from a
+        # Saturday run). Refuse cleanly here instead. The time-gates below do
+        # NOT protect us — they are deliberately skip-if-late, and on a closed
+        # day the target times are always "already passed".
+        today = datetime.now().date()
+        if not is_nse_trading_day(today):
+            if not ALLOW_NON_TRADING_DAY_RUN:
+                log.error(
+                    "NON_TRADING_DAY: %s is not an NSE trading day (weekend or "
+                    "listed in NSE_MARKET_HOLIDAYS). The option-greek API returns "
+                    "no usable deltas when the market is closed and the tick "
+                    "engine would see no ticks, so strike selection can only "
+                    "abort. Next trading day ~= %s. Set "
+                    "ALLOW_NON_TRADING_DAY_RUN=True to force a run for offline "
+                    "testing (API calls will still behave as market-closed).",
+                    today, next_nse_trading_day(today),
+                )
+                return
+            log.warning(
+                "NON_TRADING_DAY_OVERRIDE: %s is not an NSE trading day but "
+                "ALLOW_NON_TRADING_DAY_RUN=True — proceeding for testing "
+                "(expect empty/zero greeks and no ticks)",
+                today,
+            )
+
         # Time-gate bootstrap to ENTRY_VIX_TIME. Without this gate, capturing
         # entry_vix + chain + greeks at process start (e.g. 08:45) would
         # return values 30+ minutes stale by 09:19:30 hedge execution —
@@ -2138,6 +2283,19 @@ class Engine:
                 self.select_strikes()
             except Exception:
                 log.exception("strike selection failed")
+                # The worker run() task was created above and nothing else
+                # will stop/cancel it on this early exit — without this the
+                # loop closes with it still pending ("Task was destroyed but
+                # it is pending!" / UNHANDLED_ASYNC noise at shutdown).
+                if self.worker:
+                    try:
+                        await asyncio.wait_for(self.worker.q.join(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        log.warning("worker queue did not drain within 5s")
+                    self.worker.stop()
+                worker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker_task
                 return
 
             await self._wait_until(EXEC_START_TIME)
