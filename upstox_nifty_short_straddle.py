@@ -10,7 +10,7 @@ Run modes (set ONLY by editing source, no runtime flag):
 Strategy
 --------
 - 09:15: Download instrument master; resolve current NIFTY weekly expiry under
-  NSE_FO and India VIX instrument key dynamically.
+  NSE_FO; use the stable Upstox India VIX index key.
 - 09:19:  VIX-adaptive strike selection. Pull greeks in a SINGLE batched
   /v3/market-quote/option-greek call. Delta is the primary filter; premium
   band is a tiebreaker, never a hard filter.
@@ -55,12 +55,10 @@ quotes. Lines starting with # are comments. Example:
     UPSTOX_ACCESS_TOKEN=eyJ0eXAiOiJKV1Q...
     UPSTOX_API_KEY=ee2e4f16-0691-42d9-9a35-3f841ec29cbc
     UPSTOX_API_SECRET=d3rr2a0uib
-    GEMINI_API_KEY=AIzaSyBsI2fQduE9GEMnbrucUn3OJAn5p9zQXFo
 
 The file must NOT be committed to source control. Add it to .gitignore
 and rotate tokens if the file is ever leaked (Upstox access tokens can
-be revoked from https://account.upstox.com/, Gemini keys from
-https://aistudio.google.com/app/apikey).
+be revoked from https://account.upstox.com/).
 """
 
 from __future__ import annotations
@@ -170,25 +168,30 @@ PAPER_TRADING_MODE = True
 ALLOW_NON_TRADING_DAY_RUN = False
 
 # NSE trading holidays, as ISO "YYYY-MM-DD" strings. Upstox does not expose
-# a full exchange-holiday calendar through a stable public endpoint and a
-# hardcoded list goes stale, so this set is intentionally small and
-# user-maintained: update it once a year when the NSE holiday list is
-# published. Weekends are always refused regardless of this set. Mid-week
-# holidays NOT listed here are still caught by the greeks guard inside
-# pick_core_strike (ABORT:greeks_unavailable) — they just take a few
-# seconds longer to detect.
-NSE_MARKET_HOLIDAYS: frozenset = frozenset()
+# a full exchange-holiday calendar through a stable public endpoint, so this
+# calendar starts with NSE/CMTR/71775 (12-Dec-2025) and includes subsequent
+# ad-hoc closures announced by NSE, including 15-Jan-2026 (Maharashtra civic
+# elections; NSE/CMTR/72260). Review NSE circulars at least weekly because
+# election/emergency closures can amend the annual list at short notice.
+# Special live-trading sessions override weekends.
+NSE_MARKET_HOLIDAYS: frozenset = frozenset({
+    "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31",
+    "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28",
+    "2026-06-26", "2026-09-14", "2026-10-02", "2026-10-20",
+    "2026-11-10", "2026-11-24", "2026-12-25",
+})
+NSE_SPECIAL_TRADING_DAYS: frozenset = frozenset({"2026-02-01"})
 
-LOT_SIZE = 25
+# Emergency validation fallback only. Actual quantity is resolved from the
+# selected expiry's contract rows; never size an order from this constant.
+EXPECTED_NIFTY_LOT_SIZE = 65
 
 # Secrets (loaded from env.txt — see _load_env_file above)
-# All four keys are loaded so the OAuth flow can use them later, but
 # only UPSTOX_ACCESS_TOKEN is required for running the script as-is
 # (it authorises v2 order placement and the v3 websocket).
 UPSTOX_ACCESS_TOKEN: str = _ENV.get("UPSTOX_ACCESS_TOKEN", "")
 UPSTOX_API_KEY: str = _ENV.get("UPSTOX_API_KEY", "")
 UPSTOX_API_SECRET: str = _ENV.get("UPSTOX_API_SECRET", "")
-GEMINI_API_KEY: str = _ENV.get("GEMINI_API_KEY", "")
 
 # Backward-compat alias — the rest of the script uses ACCESS_TOKEN.
 ACCESS_TOKEN = UPSTOX_ACCESS_TOKEN
@@ -207,6 +210,7 @@ HEDGE_PREMIUM_TOLERANCE = 2.0
 HEDGE_LIMIT_SLIPPAGE_TICKS = 2
 HEDGE_LIMIT_SLIPPAGE_TICKS_RETRY = 5
 HEDGE_FILL_TIMEOUT_SEC = 20
+ORDER_FILL_TIMEOUT_SEC = 15
 
 # Risk
 SL_PERCENT = 0.30
@@ -263,6 +267,7 @@ MAX_FEED_DOWNTIME_SEC = 30
 MAX_RECONNECT_ATTEMPTS = 5
 
 PAPER_SLIPPAGE_MODEL_BPS = 8  # 8 bps simulated slippage in paper mode
+MARGIN_SAFETY_MULTIPLIER = 1.10  # require 10% headroom over broker estimate
 
 # Session timing (24h)
 ENTRY_VIX_TIME = dtime(9, 15)
@@ -282,6 +287,8 @@ PLACE_ORDER_URL = "https://api.upstox.com/v2/order/place"
 CANCEL_ORDER_URL = "https://api.upstox.com/v2/order/cancel"
 ORDER_HISTORY_URL = "https://api.upstox.com/v2/order/history"
 EXIT_ALL_URL = "https://api.upstox.com/v2/order/positions"
+MARGIN_DETAILS_URL = "https://api.upstox.com/v2/charges/margin"
+FUNDS_MARGIN_URL = "https://api.upstox.com/v2/user/get-funds-and-margin"
 
 # Upstox option tick size used for "ask + N ticks" reprice
 TICK_SIZE = 0.05
@@ -499,7 +506,7 @@ def write_fill(leg: "Leg", tag: str) -> None:
                 [
                     datetime.now().isoformat(timespec="seconds"),
                     leg.leg_id,
-                    leg.order_id or "",
+                    (leg.exit_order_id if "EXIT" in tag else leg.order_id) or "",
                     leg.instrument_key,
                     leg.side.value,
                     leg.qty,
@@ -570,6 +577,13 @@ class Leg:
     # Re-entry
     reentry_count: int = 0
 
+    # Realized accounting. Re-entry reuses this Leg object, so prior-cycle PnL
+    # must survive resetting fill_price for the next entry.
+    realized_pnl: float = 0.0
+    exit_price: Optional[float] = None
+    exit_order_id: Optional[str] = None
+    entry_value_total: float = 0.0  # includes every re-entry cycle
+
     # Live mark
     last_ltp: Optional[float] = None
     last_ltp_at: Optional[float] = None  # epoch seconds
@@ -588,6 +602,19 @@ class LegPair:
     entry_vix: float
     entry_spot: float
     session_date: str  # ISO date "YYYY-MM-DD"
+
+
+@dataclass
+class ExitAllResult:
+    """Best-effort global square-off result; this object is always returned."""
+
+    fills: Dict[str, Tuple[str, float]]
+    failures: List[str]
+    remaining_positions: Dict[str, int]
+
+    @property
+    def broker_flat(self) -> bool:
+        return not self.remaining_positions
 
 
 # ============================================================================
@@ -677,8 +704,9 @@ def fetch_instrument_master() -> List[Dict[str, Any]]:
     return data
 
 def fetch_index_instrument_master() -> List[Dict[str, Any]]:
-    """Return a mocked row for India VIX to satisfy the resolver."""
-    # Bypasses the invalid NSE_INDEX call by supplying the known static key directly
+    """Return the stable Upstox India VIX key (not a dynamic API lookup)."""
+    # Upstox's option-contract endpoint is scoped to the NIFTY underlying and
+    # does not return index rows, so the documented stable index key is explicit.
     return [{
         "name": "India VIX",
         "tradingsymbol": "India VIX",
@@ -730,7 +758,7 @@ def fetch_nifty_weekly_expiry(instruments: List[Dict[str, Any]]) -> Tuple[str, s
 
 
 def resolve_vix_instrument_key(instruments: List[Dict[str, Any]]) -> str:
-    """Resolve India VIX instrument key from the master — never hardcode."""
+    """Resolve India VIX from supplied rows (currently includes one static row)."""
     needles = {"india vix", "indiavix", "vix"}
     for row in instruments:
         ts = (row.get("tradingsymbol") or "").strip().lower()
@@ -1060,6 +1088,24 @@ async def place_order_via_upstox(
     return await rest.post(PLACE_ORDER_URL, payload)
 
 
+async def fetch_ltps_async(
+    rest: AsyncRestClient, instrument_keys: List[str]
+) -> Dict[str, float]:
+    """Fetch a fresh batched LTP snapshot and normalize ':' response keys."""
+    payload = await rest.get(
+        MARKET_QUOTE_LTP_URL,
+        params={"instrument_key": ",".join(instrument_keys)},
+    )
+    out: Dict[str, float] = {}
+    for key, value in (payload.get("data", {}) or {}).items():
+        if not isinstance(value, dict):
+            continue
+        price = float(value.get("last_price") or 0.0)
+        if price > 0:
+            out[key.replace(":", "|")] = price
+    return out
+
+
 async def cancel_order_via_upstox(rest: AsyncRestClient, order_id: str) -> Dict[str, Any]:
     if PAPER_TRADING_MODE:
         log.info("[PAPER] would CANCEL order %s", order_id)
@@ -1073,25 +1119,75 @@ async def get_order_status(rest: AsyncRestClient, order_id: str) -> Dict[str, An
     return await rest.get(ORDER_HISTORY_URL, params={"order_id": order_id})
 
 
-async def exit_all_positions(rest: AsyncRestClient) -> None:
-    """Square off every open position via v2 market order (live) or paper log."""
+def _order_snapshot(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize Upstox order-history responses (data may be dict or list)."""
+    data = response.get("data", {}) if isinstance(response, dict) else {}
+    if isinstance(data, list):
+        return data[-1] if data and isinstance(data[-1], dict) else {}
+    return data if isinstance(data, dict) else {}
+
+
+async def wait_for_order_fill(
+    rest: AsyncRestClient, order_id: str, timeout_sec: float = ORDER_FILL_TIMEOUT_SEC
+) -> Optional[float]:
+    """Wait for a terminal fill and return its broker average price."""
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        snap = _order_snapshot(await get_order_status(rest, order_id))
+        status = str(snap.get("status") or "").lower()
+        if status in ("complete", "filled", "traded"):
+            px = float(snap.get("average_price") or 0.0)
+            return px if px > 0 else None
+        if status in ("rejected", "cancelled", "canceled"):
+            raise TradingError(f"Order {order_id} ended with status={status}")
+        await asyncio.sleep(0.4)
+    raise TradingError(f"Timed out waiting for fill of order {order_id}")
+
+
+async def exit_all_positions(rest: AsyncRestClient) -> ExitAllResult:
+    """Best-effort square-off that isolates per-position failures.
+
+    Every close is launched concurrently. One failed placement/confirmation
+    cannot discard successful fills from the other legs. Timed-out orders are
+    cancelled best-effort before a caller may retry, reducing over-close risk.
+    The broker position book is fetched again before returning, so callers can
+    distinguish an unconfirmed fill from a genuinely open position.
+    """
     if PAPER_TRADING_MODE:
         log.info("[PAPER] would EXIT ALL positions via market orders")
-        return
+        return ExitAllResult({}, [], {})
+
+    fills: Dict[str, Tuple[str, float]] = {}
+    submitted: Dict[str, str] = {}
+    failures: List[str] = []
+
     try:
         payload = await rest.get(EXIT_ALL_URL)
-        for pos in payload.get("data", []):
-            if int(pos.get("quantity", 0)) == 0:
-                continue
-            side = "SELL" if int(pos["quantity"]) > 0 else "BUY"
-            qty = abs(int(pos["quantity"]))
-            await rest.post(
+        positions = payload.get("data", []) or []
+    except Exception as exc:  # noqa: BLE001
+        msg = f"could not fetch positions before square-off: {exc}"
+        log.critical("EXIT_ALL failure: %s", msg)
+        return ExitAllResult({}, [msg], {"<position-book-unavailable>": 1})
+
+    async def close_position(pos: Dict[str, Any]) -> Optional[Tuple[str, str, float]]:
+        quantity = int(pos.get("quantity", 0) or 0)
+        if quantity == 0:
+            return None
+        instrument = str(
+            pos.get("instrument_token") or pos.get("instrument_key") or ""
+        ).replace(":", "|")
+        if not instrument:
+            raise TradingError("Open broker position has no instrument token")
+        side = "SELL" if quantity > 0 else "BUY"
+        order_id: Optional[str] = None
+        try:
+            response = await rest.post(
                 PLACE_ORDER_URL,
                 {
-                    "quantity": qty,
+                    "quantity": abs(quantity),
                     "product": "I",
                     "validity": "DAY",
-                    "instrument_token": pos["instrument_token"],
+                    "instrument_token": instrument,
                     "order_type": "MARKET",
                     "transaction_type": side,
                     "tag": "EXIT_ALL",
@@ -1101,24 +1197,102 @@ async def exit_all_positions(rest: AsyncRestClient) -> None:
                     "is_amo": False,
                 },
             )
-    except Exception:
-        log.exception("exit_all_positions failed")
+            order_id = response.get("data", {}).get("order_id")
+            if not order_id:
+                raise TradingError(f"No order_id returned for EXIT_ALL {instrument}")
+            order_id = str(order_id)
+            submitted[instrument] = order_id
+            fill = await wait_for_order_fill(rest, order_id)
+            if fill is None:
+                raise TradingError(
+                    f"No average fill returned for EXIT_ALL {instrument}"
+                )
+            log.info(
+                "EXIT_ALL_FILLED: instrument=%s order_id=%s average_price=%.2f",
+                instrument, order_id, fill,
+            )
+            return instrument, order_id, fill
+        except Exception:  # noqa: BLE001
+            # If confirmation timed out, cancel before any later retry. A race
+            # where the order filled first is harmless: cancellation fails and
+            # the post-attempt position reconciliation below sees quantity=0.
+            if order_id:
+                with contextlib.suppress(Exception):
+                    await cancel_order_via_upstox(rest, order_id)
+            raise
+
+    results = await asyncio.gather(
+        *(close_position(pos) for pos in positions),
+        return_exceptions=True,
+    )
+    for item in results:
+        if isinstance(item, BaseException):
+            failures.append(f"{type(item).__name__}: {item}")
+        elif item is not None:
+            fills[item[0]] = (item[1], item[2])
+
+    # A fill can race with the timeout/cancel path. Recover its actual average
+    # price once more before declaring it merely unconfirmed.
+    for instrument, order_id in submitted.items():
+        if instrument in fills:
+            continue
+        try:
+            snap = _order_snapshot(await get_order_status(rest, order_id))
+            status = str(snap.get("status") or "").lower()
+            average = float(snap.get("average_price") or 0.0)
+            if status in ("complete", "filled", "traded") and average > 0:
+                fills[instrument] = (order_id, average)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(
+                f"final status check failed for {instrument}/{order_id}: {exc}"
+            )
+
+    try:
+        await asyncio.sleep(0.5)  # allow broker position book to settle
+        after = await rest.get(EXIT_ALL_URL)
+        remaining: Dict[str, int] = {}
+        for pos in after.get("data", []) or []:
+            quantity = int(pos.get("quantity", 0) or 0)
+            if quantity == 0:
+                continue
+            key = str(
+                pos.get("instrument_token") or pos.get("instrument_key") or ""
+            ).replace(":", "|")
+            remaining[key or "<missing-instrument-key>"] = quantity
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"post-exit position reconciliation failed: {exc}")
+        remaining = {"<position-book-unavailable>": 1}
+
+    if failures:
+        log.critical(
+            "EXIT_ALL partial failure: %d operation(s): %s",
+            len(failures), failures,
+        )
+    if remaining:
+        log.critical("EXIT_ALL broker still has open positions: %s", remaining)
+    elif failures:
+        log.warning(
+            "EXIT_ALL had confirmation errors but broker position book is flat"
+        )
+
+    return ExitAllResult(fills, failures, remaining)
 
 
 # ============================================================================
 # Strategy helpers
 # ============================================================================
 def is_nse_trading_day(day: date) -> bool:
-    """Weekends and user-maintained NSE_MARKET_HOLIDAYS are non-trading days.
+    """Apply the pinned NSE calendar, including announced special sessions.
 
-    Weekday() is 0=Monday .. 6=Sunday. Only the local calendar is consulted —
-    no network call — so this guard can never fail open because an API is
-    down. Mid-week holidays missing from NSE_MARKET_HOLIDAYS are caught
-    downstream by the greeks-unavailability abort in pick_core_strike.
+    Weekday() is 0=Monday .. 6=Sunday. Only the local calendar is consulted,
+    so this guard cannot fail open because an API is unavailable.
     """
+    iso = day.isoformat()
+    if iso in NSE_SPECIAL_TRADING_DAYS:
+        return True
     if day.weekday() >= 5:  # Saturday / Sunday
         return False
-    return day.isoformat() not in NSE_MARKET_HOLIDAYS
+    return iso not in NSE_MARKET_HOLIDAYS
 
 
 def next_nse_trading_day(day: date) -> date:
@@ -1300,6 +1474,7 @@ class StateStore:
         self.pair: Optional[LegPair] = None
         self.entry_vix: float = 0.0
         self.original_entry_vix: float = 0.0
+        self.current_vix: float = 0.0
         self.entry_spot: float = 0.0  # NIFTY 50 spot LTP at bootstrap, used by SL buffer
         self.total_mtm: float = 0.0
         self.max_drawdown_mtm: float = 0.0  # tracks lowest (most-negative) MTM seen
@@ -1349,7 +1524,10 @@ class StateStore:
         total = 0.0
         now = time.time()
         for lg in [self.pair.ce_short, self.pair.pe_short, self.pair.ce_hedge, self.pair.pe_hedge]:
+            total += lg.realized_pnl
             if lg.state in (LegState.PENDING, LegState.HEDGE_PLACED, LegState.ABORTED):
+                continue
+            if lg.state == LegState.CLOSED:
                 continue
             if lg.fill_price is None or lg.last_ltp is None:
                 continue
@@ -1459,16 +1637,6 @@ class WsAdapter:
         cfg = upstox_client.Configuration()
         cfg.access_token = ACCESS_TOKEN
         api_client = upstox_client.ApiClient(cfg)
-        auth = upstox_client.WebsocketApi(api_client)
-        try:
-            uri_resp = auth.get_market_data_feed_authorize_v3()
-            uri = uri_resp.data.authorize
-        except Exception:
-            try:
-                uri = uri_resp["data"]["authorize"]  # type: ignore[index]
-            except Exception:
-                log.exception("authorize failed")
-                raise
         self.streamer = MarketDataStreamerV3(
             api_client=api_client,
             instrumentKeys=self.instruments,
@@ -1539,6 +1707,8 @@ class Engine:
         self.ws: Optional[WsAdapter] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._stopped = False
+        self._kill_switch_done = asyncio.Event()
+        self._kill_switch_error: Optional[Exception] = None
         self._bootstrap_cache: Dict[str, Any] = {}
         # Paper CSV paths (used when PAPER_TRADING_MODE)
         self.paper_log_csv = PAPER_TRADE_LOG_CSV
@@ -1551,9 +1721,30 @@ class Engine:
         idx = fetch_index_instrument_master()
 
         nifty_key, expiry = fetch_nifty_weekly_expiry(fo)
+        expiry_lots = {
+            int(float(row.get("lot_size", 0)))
+            for row in fo
+            if row.get("expiry") == expiry
+            and float(row.get("lot_size", 0) or 0) > 0
+        }
+        if len(expiry_lots) != 1:
+            raise TradingError(
+                f"LOT SIZE INVALID: expected one positive lot_size for expiry {expiry}, "
+                f"got {sorted(expiry_lots)}. Refusing to size orders."
+            )
+        lot_size = expiry_lots.pop()
+        if lot_size != EXPECTED_NIFTY_LOT_SIZE:
+            log.warning(
+                "NIFTY_LOT_SIZE_CHANGED: contract master says %d (expected %d); "
+                "using broker contract master value",
+                lot_size, EXPECTED_NIFTY_LOT_SIZE,
+            )
+        else:
+            log.info("Resolved NIFTY lot size=%d from contract master", lot_size)
         vix_key = resolve_vix_instrument_key(fo + idx)
         self.store.entry_vix = fetch_vix_ltp_sync(vix_key)
         self.store.original_entry_vix = self.store.entry_vix
+        self.store.current_vix = self.store.entry_vix
         # NIFTY 50 spot LTP — required for the VIX-adaptive SL buffer
         # (buffer = K * vix * spot / 100). Falls back to 0 if the call
         # fails; _compute_sl_buffer handles the fallback by returning
@@ -1573,6 +1764,7 @@ class Engine:
             "chain": chain,
             "greeks": greeks,
             "vix_key": vix_key,
+            "lot_size": lot_size,
         }
         log.info("Bootstrap complete: expiry=%s candidates=%d", expiry, len(candidate_keys))
 
@@ -1628,19 +1820,19 @@ class Engine:
             pair_id=f"PAIR-{int(time.time())}",
             ce_short=Leg(
                 leg_id="CE_SHORT", kind=LegKind.CORE_SHORT, side=Side.CE,
-                instrument_key=ce_core["instrument_key"], strike=ce_core["strike"], qty=LOT_SIZE,
+                instrument_key=ce_core["instrument_key"], strike=ce_core["strike"], qty=int(cache["lot_size"]),
             ),
             pe_short=Leg(
                 leg_id="PE_SHORT", kind=LegKind.CORE_SHORT, side=Side.PE,
-                instrument_key=pe_core["instrument_key"], strike=pe_core["strike"], qty=LOT_SIZE,
+                instrument_key=pe_core["instrument_key"], strike=pe_core["strike"], qty=int(cache["lot_size"]),
             ),
             ce_hedge=Leg(
                 leg_id="CE_HEDGE", kind=LegKind.HEDGE_LONG, side=Side.CE,
-                instrument_key=ce_hedge["instrument_key"], strike=ce_hedge["strike"], qty=LOT_SIZE,
+                instrument_key=ce_hedge["instrument_key"], strike=ce_hedge["strike"], qty=int(cache["lot_size"]),
             ),
             pe_hedge=Leg(
                 leg_id="PE_HEDGE", kind=LegKind.HEDGE_LONG, side=Side.PE,
-                instrument_key=pe_hedge["instrument_key"], strike=pe_hedge["strike"], qty=LOT_SIZE,
+                instrument_key=pe_hedge["instrument_key"], strike=pe_hedge["strike"], qty=int(cache["lot_size"]),
             ),
             entry_vix=self.store.entry_vix,
             entry_spot=self.store.entry_spot,
@@ -1672,6 +1864,7 @@ class Engine:
             await asyncio.sleep(0.05)
             sim_fill = paper_fill("BUY", ref_price)
             leg.fill_price = sim_fill
+            leg.entry_value_total += sim_fill * leg.qty
             leg.state = LegState.HEDGE_FILLED
             leg.filled_at = time.time()
             log.info(
@@ -1707,11 +1900,16 @@ class Engine:
             deadline = time.time() + timeout_sec
             while time.time() < deadline:
                 status = await get_order_status(self.rest, oid)
-                d = status.get("data", {})
+                d = _order_snapshot(status)
                 s = (d.get("status") or "").lower()
                 if s in ("complete", "filled", "traded"):
+                    fill_px = float(d.get("average_price") or 0.0)
+                    if fill_px <= 0:
+                        raise TradingError(
+                            f"Hedge {oid} completed without average_price"
+                        )
                     result["filled"] = True
-                    result["px"] = float(d.get("average_price") or price)
+                    result["px"] = fill_px
                     return
                 if s in ("rejected", "cancelled", "canceled"):
                     return
@@ -1731,6 +1929,7 @@ class Engine:
 
         if result["filled"]:
             leg.fill_price = result["px"]
+            leg.entry_value_total += leg.fill_price * leg.qty
             leg.state = LegState.HEDGE_FILLED
             leg.filled_at = time.time()
             log.info("HEDGE_FILLED: leg=%s order_id=%s fill=%.2f",
@@ -1762,8 +1961,17 @@ class Engine:
             )
             return False
 
+        fresh = await fetch_ltps_async(self.rest, [leg.instrument_key])
+        retry_ref = fresh.get(leg.instrument_key)
+        if retry_ref is None:
+            leg.state = LegState.ABORTED
+            self.store.num_hedge_aborts += 1
+            log.error("ABORT:no_fresh_hedge_quote_for_retry leg=%s", leg.leg_id)
+            return False
+        leg.last_ltp = retry_ref
+        leg.last_ltp_at = time.time()
         return await self._place_limit_buy_with_timeout(
-            leg, ref_price, retry_ticks, timeout_sec=timeout_sec, retry_ticks=None,
+            leg, retry_ref, retry_ticks, timeout_sec=timeout_sec, retry_ticks=None,
         )
 
     async def _place_market_sell(self, leg: Leg) -> bool:
@@ -1775,6 +1983,8 @@ class Engine:
             ref = leg.last_ltp or 0.0
             sim_fill = paper_fill("SELL", ref) if ref > 0 else 0.0
             leg.fill_price = sim_fill
+            leg.entry_value_total += sim_fill * leg.qty
+            leg.exit_price = None
             leg.state = LegState.CORE_FILLED
             leg.filled_at = time.time()
             log.info("CORE_FILLED: leg=%s order_id=%s fill=%.2f (paper, ref=%.2f)",
@@ -1800,8 +2010,14 @@ class Engine:
                 tag=f"CORE_{leg.leg_id}",
             )
             leg.order_id = resp["data"]["order_id"]
-            d = resp["data"]
-            leg.fill_price = float(d.get("average_price") or 0.0)
+            fill = await wait_for_order_fill(self.rest, leg.order_id)
+            if fill is None:
+                raise TradingError(
+                    f"Broker reported core fill without average price: {leg.order_id}"
+                )
+            leg.fill_price = fill
+            leg.entry_value_total += fill * leg.qty
+            leg.exit_price = None
             leg.state = LegState.CORE_FILLED
             leg.filled_at = time.time()
             result["ok"] = True
@@ -1935,7 +2151,7 @@ class Engine:
                             # both legs polling simultaneously.
                             try:
                                 status = await get_order_status(self.rest, _oid)
-                                d = status.get("data", {}) if isinstance(status, dict) else {}
+                                d = _order_snapshot(status)
                                 s = (d.get("status") or "").lower()
                             except Exception:  # noqa: BLE001
                                 await asyncio.sleep(IDLE_POLL_INTERVAL_SEC)
@@ -1943,7 +2159,12 @@ class Engine:
                             poll_count += 1
                             if s in ("complete", "filled", "traded"):
                                 _leg.sl_broker_triggered = True
-                                _leg.state = LegState.CLOSED
+                                exit_px = float(d.get("average_price") or _leg.last_ltp or 0.0)
+                                if exit_px > 0:
+                                    self._record_leg_exit(_leg, exit_px)
+                                else:
+                                    _leg.state = LegState.CLOSED
+                                    log.error("SL fill has no average price for %s", _leg.leg_id)
                                 log.info(
                                     "SL_BROKER_FILLED_IDLE: leg=%s order_id=%s "
                                     "(caught during idle poll — no local trigger fired)",
@@ -1988,7 +2209,7 @@ class Engine:
                             return
                         try:
                             status = await get_order_status(self.rest, _oid)
-                            d = status.get("data", {}) if isinstance(status, dict) else {}
+                            d = _order_snapshot(status)
                             s = (d.get("status") or "").lower()
                         except Exception:  # noqa: BLE001
                             await asyncio.sleep(1.0)
@@ -1997,7 +2218,12 @@ class Engine:
                         if s in ("complete", "filled", "traded"):
                             if not _leg.sl_broker_triggered:
                                 _leg.sl_broker_triggered = True
-                                _leg.state = LegState.CLOSED
+                                exit_px = float(d.get("average_price") or _leg.last_ltp or 0.0)
+                                if exit_px > 0:
+                                    self._record_leg_exit(_leg, exit_px)
+                                else:
+                                    _leg.state = LegState.CLOSED
+                                    log.error("SL fill has no average price for %s", _leg.leg_id)
                                 log.info(
                                     "SL_BROKER_FILLED_WATCHER: leg=%s order_id=%s",
                                     _leg.leg_id, _oid,
@@ -2044,32 +2270,84 @@ class Engine:
         except asyncio.TimeoutError:
             log.error("SL_PLACE_TIMEOUT: leg=%s", leg.leg_id)
 
+    async def _validate_entry_margin(
+        self, legs: List[Leg], prices: Dict[str, float]
+    ) -> None:
+        """Fail closed unless available SEC margin covers basket estimate + buffer."""
+        if PAPER_TRADING_MODE:
+            log.info("[PAPER] margin preflight skipped (no broker capital at risk)")
+            return
+        assert self.rest
+        instruments = []
+        for leg in legs:
+            instruments.append({
+                "instrument_key": leg.instrument_key,
+                "quantity": leg.qty,
+                "product": "I",
+                "transaction_type": (
+                    "SELL" if leg.kind == LegKind.CORE_SHORT else "BUY"
+                ),
+                "price": prices[leg.instrument_key],
+            })
+        estimate, funds = await asyncio.gather(
+            self.rest.post(MARGIN_DETAILS_URL, {"instruments": instruments}),
+            self.rest.get(FUNDS_MARGIN_URL, params={"segment": "SEC"}),
+        )
+        margin_data = estimate.get("data", {}) or {}
+        required = float(
+            margin_data.get("final_margin")
+            or margin_data.get("required_margin")
+            or 0.0
+        )
+        available = float(
+            ((funds.get("data", {}) or {}).get("equity", {}) or {}).get(
+                "available_margin", 0.0
+            )
+        )
+        minimum = required * MARGIN_SAFETY_MULTIPLIER
+        if required <= 0 or available <= 0:
+            raise TradingError(
+                "MARGIN CHECK FAILED: broker returned missing/zero required or "
+                f"available margin (required={required}, available={available})"
+            )
+        if available < minimum:
+            raise TradingError(
+                "INSUFFICIENT MARGIN: available Rs %.2f; basket estimate Rs %.2f; "
+                "required with %.0f%% safety buffer Rs %.2f"
+                % (
+                    available, required,
+                    (MARGIN_SAFETY_MULTIPLIER - 1.0) * 100.0, minimum,
+                )
+            )
+        log.info(
+            "MARGIN_CHECK_OK: available=%.2f estimated=%.2f buffered=%.2f",
+            available, required, minimum,
+        )
+
     async def execute_entry(self) -> bool:
         log.info("=== 09:19:30 EXECUTION WINDOW OPEN ===")
         assert self.store.pair
         pair = self.store.pair
         results: Dict[str, bool] = {}
+        legs = [pair.ce_short, pair.pe_short, pair.ce_hedge, pair.pe_hedge]
+        fresh_ltps = await fetch_ltps_async(
+            self.rest, [leg.instrument_key for leg in legs]
+        )
+        missing = [leg.leg_id for leg in legs if fresh_ltps.get(leg.instrument_key, 0) <= 0]
+        if missing:
+            raise TradingError(
+                "ABORT:fresh_entry_quotes_missing for " + ",".join(missing)
+            )
+        quote_time = time.time()
+        for leg in legs:
+            leg.last_ltp = fresh_ltps[leg.instrument_key]
+            leg.last_ltp_at = quote_time
+            leg.data_stale = False
+        log.info("Fresh execution quotes captured for all four legs")
+        await self._validate_entry_margin(legs, fresh_ltps)
 
         async def run_side(side_label: str, hedge: Leg, core: Leg) -> bool:
-            cache = self._bootstrap_cache
-            hedge_ltp = 0.0
-            core_ltp = 0.0
-            for r in cache["chain"]:
-                if r["instrument_key"] == hedge.instrument_key:
-                    hedge_ltp = r.get("ltp") or 0.0
-                elif r["instrument_key"] == core.instrument_key:
-                    core_ltp = r.get("ltp") or 0.0
-            if hedge_ltp <= 0:
-                hedge_ltp = HEDGE_TARGET_PREMIUM
-            if core_ltp <= 0:
-                # Fall back to the batched greeks LTP for the core leg.
-                g = cache["greeks"].get(core.instrument_key)
-                core_ltp = (g.get("ltp") or 0.0) if g else 0.0
-            if core_ltp <= 0:
-                # Last-resort fallback so the leg still has a reference price.
-                core_ltp = hedge_ltp
-            hedge.last_ltp = hedge_ltp
-            core.last_ltp = core_ltp
+            hedge_ltp = float(hedge.last_ltp or 0.0)
 
             ok = await self._place_limit_buy_with_timeout(
                 hedge, ref_price=hedge_ltp,
@@ -2103,6 +2381,10 @@ class Engine:
         now = time.time()
         if not self.store.pair:
             return
+        vix_key = self._bootstrap_cache.get("vix_key")
+        vix_tick = ltp_map.get(vix_key) if vix_key else None
+        if vix_tick is not None and vix_tick > 0:
+            self.store.current_vix = float(vix_tick)
         for leg in [
             self.store.pair.ce_short,
             self.store.pair.pe_short,
@@ -2247,14 +2529,10 @@ class Engine:
                         "between cancel and place", leg.leg_id,
                     )
                     return
-                await place_order_via_upstox(
-                    self.rest,
-                    instrument_key=leg.instrument_key, side="BUY", qty=leg.qty,
-                    order_type="MARKET", price=0.0, trigger_price=None,
-                    tag=f"EXIT_LOCALSL_{leg.leg_id}",
+                exit_fill = await self._exit_leg_market(
+                    leg, tag=f"EXIT_LOCALSL_{leg.leg_id}"
                 )
-                leg.state = LegState.CLOSED
-                log.info("EXIT_LOCALSL: leg=%s order_id=%s", leg.leg_id, leg.order_id)
+                log.info("EXIT_LOCALSL: leg=%s fill=%.2f", leg.leg_id, exit_fill)
                 log_event(
                     self.paper_log_csv, "SL_LOCAL_FIRED", leg,
                     order_side="BUY", simulated_price=leg.last_ltp, ltp_at_event=leg.last_ltp,
@@ -2284,6 +2562,132 @@ class Engine:
             self.store.pair.session_date if self.store.pair else "",
         )
 
+    def _record_leg_exit(self, leg: Leg, exit_price: float) -> None:
+        """Freeze an actual/simulated exit and transfer cycle PnL to realized."""
+        if leg.state == LegState.CLOSED or leg.fill_price is None:
+            return
+        sign = -1 if leg.kind == LegKind.CORE_SHORT else 1
+        leg.realized_pnl += sign * leg.qty * (exit_price - leg.fill_price)
+        leg.exit_price = exit_price
+        leg.last_ltp = exit_price
+        leg.last_ltp_at = time.time()
+        leg.data_stale = False
+        leg.state = LegState.CLOSED
+
+    async def _exit_leg_market(self, leg: Leg, tag: str) -> float:
+        """Place one closing MARKET order and return the confirmed fill."""
+        assert self.rest
+        side = "BUY" if leg.kind == LegKind.CORE_SHORT else "SELL"
+        if PAPER_TRADING_MODE:
+            ref = float(leg.last_ltp or leg.fill_price or 0.0)
+            if ref <= 0:
+                raise TradingError(f"No paper exit reference for {leg.leg_id}")
+            fill = paper_fill(side, ref)
+        else:
+            response = await place_order_via_upstox(
+                self.rest, leg.instrument_key, side, leg.qty,
+                "MARKET", 0.0, None, tag,
+            )
+            order_id = response.get("data", {}).get("order_id")
+            if not order_id:
+                raise TradingError(f"No order_id returned while exiting {leg.leg_id}")
+            leg.exit_order_id = str(order_id)
+            fill = await wait_for_order_fill(self.rest, order_id)
+            if fill is None:
+                raise TradingError(f"No average exit fill for {leg.leg_id}")
+        self._record_leg_exit(leg, fill)
+        write_fill(leg, tag)
+        return fill
+
+    def _apply_exit_fills(self, result: ExitAllResult) -> List[str]:
+        """Apply every confirmed fill without discarding partial successes."""
+        if not self.store.pair:
+            return []
+        missing: List[str] = []
+        for leg in (
+            self.store.pair.ce_short, self.store.pair.pe_short,
+            self.store.pair.ce_hedge, self.store.pair.pe_hedge,
+        ):
+            if leg.state in (LegState.CLOSED, LegState.ABORTED, LegState.PENDING):
+                continue
+            if PAPER_TRADING_MODE:
+                ref = float(leg.last_ltp or leg.fill_price or 0.0)
+                side = "BUY" if leg.kind == LegKind.CORE_SHORT else "SELL"
+                fill = paper_fill(side, ref)
+            else:
+                broker_fill = result.fills.get(leg.instrument_key)
+                if broker_fill is None:
+                    missing.append(leg.leg_id)
+                    continue
+                leg.exit_order_id, fill = broker_fill
+            self._record_leg_exit(leg, fill)
+            write_fill(leg, "EXIT_ALL_FILL")
+
+        # If the reconciled broker book is flat, no position remains at risk.
+        # A missing average price is then an accounting problem, not an open
+        # position. Freeze that leg at its last mark and flag the estimate.
+        if not PAPER_TRADING_MODE and result.broker_flat and missing:
+            for leg in (
+                self.store.pair.ce_short, self.store.pair.pe_short,
+                self.store.pair.ce_hedge, self.store.pair.pe_hedge,
+            ):
+                if leg.leg_id not in missing or leg.state == LegState.CLOSED:
+                    continue
+                estimate = float(leg.last_ltp or leg.fill_price or 0.0)
+                if estimate > 0:
+                    log.critical(
+                        "EXIT_FILL_PRICE_UNAVAILABLE: broker flat for %s; "
+                        "using last mark %.2f for accounting only",
+                        leg.leg_id, estimate,
+                    )
+                    self._record_leg_exit(leg, estimate)
+            missing = [
+                leg.leg_id
+                for leg in (
+                    self.store.pair.ce_short, self.store.pair.pe_short,
+                    self.store.pair.ce_hedge, self.store.pair.pe_hedge,
+                )
+                if leg.state not in (
+                    LegState.CLOSED, LegState.ABORTED, LegState.PENDING
+                )
+            ]
+        self.store.compute_mtm()
+        return missing
+
+    async def _square_off_all(self, context: str) -> None:
+        """Cancel protective SLs, square off, reconcile, and retry safely."""
+        assert self.rest
+        if self.store.pair:
+            for leg in (self.store.pair.ce_short, self.store.pair.pe_short):
+                if leg.sl_order_id and leg.state != LegState.CLOSED:
+                    with contextlib.suppress(Exception):
+                        await cancel_order_via_upstox(self.rest, leg.sl_order_id)
+
+        last_result = ExitAllResult({}, [], {})
+        attempts = 1 if PAPER_TRADING_MODE else 3
+        for attempt in range(1, attempts + 1):
+            last_result = await exit_all_positions(self.rest)
+            missing = self._apply_exit_fills(last_result)
+            if last_result.broker_flat:
+                if missing:
+                    log.critical(
+                        "%s: broker flat but %d leg(s) lack usable exit marks: %s",
+                        context, len(missing), missing,
+                    )
+                log.info("%s: broker position reconciliation is flat", context)
+                return
+            log.critical(
+                "%s: square-off attempt %d/%d left positions=%s",
+                context, attempt, attempts, last_result.remaining_positions,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(1.0)
+
+        raise TradingError(
+            f"{context}: broker still reports open positions after {attempts} "
+            f"attempts: {last_result.remaining_positions}"
+        )
+
     def _trigger_kill_switch(self, reason: str) -> None:
         if self.store.kill_switch_triggered:
             return
@@ -2300,14 +2704,19 @@ class Engine:
         )
 
         async def task():
-            assert self.rest
-            await exit_all_positions(self.rest)
-            if self.store.pair:
-                for leg in [self.store.pair.ce_short, self.store.pair.pe_short]:
-                    if leg.sl_order_id:
-                        with contextlib.suppress(Exception):
-                            await cancel_order_via_upstox(self.rest, leg.sl_order_id)
-            log.info("KILL_SWITCH_COMPLETE")
+            try:
+                await self._square_off_all("KILL_SWITCH")
+                log.info("KILL_SWITCH_COMPLETE")
+            except Exception as exc:  # noqa: BLE001
+                self._kill_switch_error = exc
+                log.critical(
+                    "KILL_SWITCH_SQUARE_OFF_FAILED: %s — emergency fallback required",
+                    exc,
+                    exc_info=True,
+                )
+                raise
+            finally:
+                self._kill_switch_done.set()
 
         if self.worker:
             self.worker.submit(OrderTask(name="kill_switch", coro_factory=task))
@@ -2362,7 +2771,10 @@ class Engine:
                 continue
             if leg.reentry_count >= MAX_REENTRIES_PER_LEG:
                 continue
-            current_vix = self.store.entry_vix
+            current_vix = self.store.current_vix
+            if self.store.original_entry_vix <= 0 or current_vix <= 0:
+                log.warning("REENTRY_SKIPPED: no current VIX for leg=%s", leg.leg_id)
+                continue
             if (current_vix - self.store.original_entry_vix) / self.store.original_entry_vix > REENTRY_VIX_GUARD_PCT:
                 log.warning("REENTRY_SKIPPED: vix_spike leg=%s vix_now=%.2f vix_orig=%.2f",
                             leg.leg_id, current_vix, self.store.original_entry_vix)
@@ -2375,6 +2787,13 @@ class Engine:
                 )
                 continue
             if leg.fill_price is None or leg.last_ltp is None:
+                continue
+            if (
+                leg.data_stale
+                or leg.last_ltp_at is None
+                or time.time() - leg.last_ltp_at > STALE_TICK_TIMEOUT_SEC
+            ):
+                log.warning("REENTRY_SKIPPED: stale data for leg=%s", leg.leg_id)
                 continue
             threshold = leg.fill_price * (1 - REENTRY_MOMENTUM_DISCOUNT)
             if leg.last_ltp < threshold:
@@ -2408,12 +2827,7 @@ class Engine:
             return
         log.info("TIME_EXIT 15:15 — squaring off")
         assert self.rest
-        await exit_all_positions(self.rest)
-        for leg in [self.store.pair.ce_short, self.store.pair.pe_short]:
-            if leg.sl_order_id and not PAPER_TRADING_MODE:
-                with contextlib.suppress(Exception):
-                    await cancel_order_via_upstox(self.rest, leg.sl_order_id)
-            leg.state = LegState.CLOSED
+        await self._square_off_all("TIME_EXIT")
         self.store.exit_reason = "time_exit_15:15"
         log.info("TIME_EXIT_COMPLETE")
         log_event(
@@ -2569,6 +2983,7 @@ class Engine:
                     self.store.pair.pe_short.instrument_key,
                     self.store.pair.ce_hedge.instrument_key,
                     self.store.pair.pe_hedge.instrument_key,
+                    self._bootstrap_cache["vix_key"],
                 ]
 
             self.loop = asyncio.get_running_loop()
@@ -2724,14 +3139,13 @@ class Engine:
                                         if _leg.state == LegState.CLOSED or _leg.sl_broker_triggered:
                                             return
                                         try:
-                                            await place_order_via_upstox(
-                                                self.rest,
-                                                instrument_key=_leg.instrument_key, side="BUY", qty=_leg.qty,
-                                                order_type="MARKET", price=0.0, trigger_price=None,
-                                                tag=f"SL_ESCALATE_{_leg.leg_id}",
+                                            exit_fill = await self._exit_leg_market(
+                                                _leg, tag=f"SL_ESCALATE_{_leg.leg_id}"
                                             )
-                                            _leg.state = LegState.CLOSED
-                                            log.info("SL_ESCALATED_TO_MARKET: leg=%s", _leg.leg_id)
+                                            log.info(
+                                                "SL_ESCALATED_TO_MARKET: leg=%s fill=%.2f",
+                                                _leg.leg_id, exit_fill,
+                                            )
                                         except Exception as e:  # noqa: BLE001
                                             log.exception("SL_ESCALATE_FAILED: leg=%s err=%s", _leg.leg_id, e)
                                         finally:
@@ -2749,6 +3163,25 @@ class Engine:
                 ws_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await ws_task
+                if self.store.kill_switch_triggered:
+                    try:
+                        await asyncio.wait_for(
+                            self._kill_switch_done.wait(),
+                            timeout=ORDER_FILL_TIMEOUT_SEC * 4 + 15.0,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        self._kill_switch_error = exc
+                        log.critical("Kill-switch square-off did not finish before shutdown")
+                    if self._kill_switch_error is not None:
+                        try:
+                            await self._square_off_all("KILL_SWITCH_FINAL_RETRY")
+                            self._kill_switch_error = None
+                        except Exception as exc:  # noqa: BLE001
+                            self._kill_switch_error = exc
+                            log.critical(
+                                "Final in-session square-off retry failed: %s", exc,
+                                exc_info=True,
+                            )
                 if self.worker:
                     try:
                         await asyncio.wait_for(self.worker.q.join(), timeout=5.0)
@@ -2758,6 +3191,11 @@ class Engine:
                 worker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker_task
+                if self._kill_switch_error is not None:
+                    raise TradingError(
+                        "Kill-switch could not confirm a flat broker position book: "
+                        f"{self._kill_switch_error}"
+                    )
 
         # Final MTM refresh before persisting summaries — this also covers the
         # edge case where the feed never delivered any ticks, so the report
@@ -2805,10 +3243,10 @@ class Engine:
         if not self.store.pair:
             return
         pair = self.store.pair
-        qty = LOT_SIZE
-
         def _prem(leg: Leg) -> Optional[float]:
-            return round(leg.fill_price * qty, 2) if leg.fill_price is not None else None
+            if leg.entry_value_total > 0:
+                return round(leg.entry_value_total, 2)
+            return round(leg.fill_price * leg.qty, 2) if leg.fill_price is not None else None
 
         ce_prem = _prem(pair.ce_short)
         pe_prem = _prem(pair.pe_short)
@@ -2925,9 +3363,40 @@ def _async_exception_handler(loop, context):  # noqa: ANN001
     # Live mode only — paper mode never had real positions
     if not PAPER_TRADING_MODE and _engine_ref and _engine_ref.rest:
         try:
-            asyncio.create_task(exit_all_positions(_engine_ref.rest))
+            asyncio.create_task(emergency_square_off_with_fresh_client())
         except Exception:
             log.exception("failed to schedule emergency exit on async exception")
+
+
+async def emergency_square_off_with_fresh_client() -> bool:
+    """Last-resort square-off using a new HTTP session.
+
+    `Engine.run()` owns its normal AsyncRestClient via `async with`, so by the
+    time an exception reaches `main()` that session may already be closed.
+    Emergency handling must therefore create a fresh authenticated client.
+    """
+    if PAPER_TRADING_MODE:
+        return True
+    async with AsyncRestClient(ACCESS_TOKEN) as rest:
+        last = ExitAllResult({}, [], {"<not-attempted>": 1})
+        for attempt in range(1, 4):
+            last = await exit_all_positions(rest)
+            if last.broker_flat:
+                log.critical(
+                    "EMERGENCY_SQUARE_OFF_CONFIRMED_FLAT on attempt %d", attempt
+                )
+                return True
+            log.critical(
+                "EMERGENCY_SQUARE_OFF attempt %d/3 still open: %s",
+                attempt, last.remaining_positions,
+            )
+            if attempt < 3:
+                await asyncio.sleep(1.0)
+        log.critical(
+            "EMERGENCY_SQUARE_OFF_FAILED: broker still reports %s",
+            last.remaining_positions,
+        )
+        return False
 
 
 def main() -> None:
@@ -2942,8 +3411,8 @@ def main() -> None:
         print()
         print("    UPSTOX_ACCESS_TOKEN=eyJ0eXAiOiJKV1Q...")
         print()
-        print("Other keys (UPSTOX_API_KEY, UPSTOX_API_SECRET, GEMINI_API_KEY)")
-        print("are optional for running the script as-is. You can point the")
+        print("UPSTOX_API_KEY and UPSTOX_API_SECRET are optional for this script.")
+        print("You can point the")
         print("script at a different file with the UPSTOX_ENV_FILE variable.")
         print("=" * 74)
         sys.exit(1)
@@ -2965,9 +3434,37 @@ def main() -> None:
     asyncio.set_event_loop(loop)
     loop.set_exception_handler(_async_exception_handler)
 
+    def _strategy_may_have_positions() -> bool:
+        pair = engine.store.pair
+        if pair is None:
+            return False
+        return any(
+            leg.state not in (LegState.CLOSED, LegState.PENDING)
+            and (leg.order_id is not None or leg.fill_price is not None)
+            for leg in (pair.ce_short, pair.pe_short, pair.ce_hedge, pair.pe_hedge)
+        )
+
+    def _run_emergency_square_off() -> None:
+        if PAPER_TRADING_MODE or not _strategy_may_have_positions():
+            return
+        try:
+            ok = loop.run_until_complete(emergency_square_off_with_fresh_client())
+            if not ok:
+                log.critical(
+                    "MANUAL INTERVENTION REQUIRED: broker positions remain open"
+                )
+        except Exception:
+            log.exception("emergency square-off also failed")
+            log.critical(
+                "MANUAL INTERVENTION REQUIRED: verify and close broker positions"
+            )
+
     def _sigterm(*_):
         log.warning("SIGTERM received — initiating shutdown")
-        engine._stopped = True
+        if not PAPER_TRADING_MODE and engine.rest and engine.worker:
+            engine._trigger_kill_switch("signal_shutdown")
+        else:
+            engine._stopped = True
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError, ValueError):
@@ -2977,10 +3474,12 @@ def main() -> None:
         loop.run_until_complete(engine.run())
     except KeyboardInterrupt:
         log.warning("KeyboardInterrupt — shutting down")
-        print("Interrupted by user - shutting down cleanly.")
+        print("Interrupted by user - initiating emergency square-off.")
+        _run_emergency_square_off()
     except TradingError as e:
         log.error("FATAL: %s", e)
         print("ERROR: %s" % e)
+        _run_emergency_square_off()
     except Exception as e:
         log.error("FATAL: unexpected error — %s", e)
         print("FATAL: unexpected error — %s" % e)
@@ -2990,11 +3489,7 @@ def main() -> None:
                 traceback.print_exc(file=_f)
         except Exception:
             pass
-        if not PAPER_TRADING_MODE and engine.rest:
-            try:
-                loop.run_until_complete(exit_all_positions(engine.rest))
-            except Exception:
-                log.exception("emergency square-off also failed")
+        _run_emergency_square_off()
     finally:
         try:
             engine.store.close()
