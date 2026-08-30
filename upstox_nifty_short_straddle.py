@@ -11,9 +11,9 @@ Strategy
 --------
 - 09:15: Download instrument master; resolve current NIFTY weekly expiry under
   NSE_FO; use the stable Upstox India VIX index key.
-- 09:19:  VIX-adaptive strike selection. Pull greeks in a SINGLE batched
-  /v3/market-quote/option-greek call. Delta is the primary filter; premium
-  band is a tiebreaker, never a hard filter.
+- 09:19: VIX-adaptive core selection and delta-targeted protective hedges.
+  Pull greeks through batched /v3/market-quote/option-greek calls. Core delta
+  is the primary filter; premium band is a tiebreaker, never a hard filter.
 - Non-trading days (weekends / NSE_MARKET_HOLIDAYS) are refused up front:
   strike selection needs *live* greeks and the tick engine needs live ticks,
   neither of which exists when NSE is closed. Set ALLOW_NON_TRADING_DAY_RUN
@@ -28,19 +28,22 @@ Strategy
 
 Engineering guarantees
 ----------------------
-- All REST after websocket connect runs through an asyncio.Queue worker
-  using aiohttp (non-blocking). The Upstox SDK is only used for
-  MarketDataStreamerV3 (where it is required) and v2 order placement
-  during the pre-websocket bootstrap phase.
-- v2 strictly for orders/option-chain; v3 strictly for streamer.
-  No v1 anywhere.
+- All REST, including bootstrap, uses non-blocking aiohttp. Order tasks are
+  tracked and cancellable; the Upstox SDK is used only for MarketDataStreamerV3.
+- v2 is used for orders, positions, quotes and option-chain; v3 for option
+  greeks and MarketDataStreamerV3. No v1 endpoints are used.
 - Paper mode simulates fills against current tick with
   PAPER_SLIPPAGE_MODEL_BPS, never zero slippage, and writes
   paper_trading_log.csv + paper_trading_summary.csv.
+- CSV writes and high-frequency MTM/state persistence run off-loop. Active
+  leg/risk state is cached in SQLite for crash diagnostics and restart guards.
+- Live mode verifies host-clock offset against multiple NTP servers and all
+  exchange gates use an explicit Asia/Kolkata timezone.
+- Websocket buffering is bounded; on overload the oldest queued tick is
+  discarded so fresh risk data is preferred without unbounded memory growth.
 - Every state transition logs timestamp, leg id, order_id, and rule fired.
-- Graceful shutdown via try/except/finally, asyncio.run wrapper, and
-  loop.set_exception_handler so unhandled async exceptions still trigger
-  emergency square-off in live mode.
+- Graceful shutdown via try/except/finally and a loop exception handler;
+  unhandled async exceptions trigger emergency square-off in live mode.
 
 NOTE: Replace ACCESS_TOKEN before running, and verify Upstox v2/v3
 endpoints/SDK method names against the release you have installed — the
@@ -70,17 +73,21 @@ import json
 import logging
 import os
 import signal
+import socket
+import struct
+import sqlite3
 import sys
 import time
+import threading
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, date, time as dtime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 try:
     import aiohttp
-    import requests  # only used for pre-websocket bootstrap; v2 only
 
     # Upstox SDK — used for MarketDataStreamerV3 and v2 order place during
     # bootstrap. After the websocket connects, ALL further REST goes through
@@ -93,9 +100,8 @@ except ImportError as e:
     print("This script needs these Python packages:")
     print("    upstox_client   ->  pip install upstox-python")
     print("    aiohttp         ->  pip install aiohttp")
-    print("    requests        ->  pip install requests")
     print("Install everything at once with:")
-    print("    pip install upstox-python aiohttp requests")
+    print("    pip install upstox-python aiohttp")
     print("If the packages are installed but the import still fails, check")
     print("your upstox-python version - MarketDataStreamerV3 needs a recent release.")
     print("=" * 74)
@@ -181,6 +187,8 @@ NSE_MARKET_HOLIDAYS: frozenset = frozenset({
     "2026-11-10", "2026-11-24", "2026-12-25",
 })
 NSE_SPECIAL_TRADING_DAYS: frozenset = frozenset({"2026-02-01"})
+HOLIDAY_CALENDAR_REVIEWED_ON = date(2026, 8, 30)
+HOLIDAY_CALENDAR_MAX_AGE_DAYS = 7
 
 # Emergency validation fallback only. Actual quantity is resolved from the
 # selected expiry's contract rows; never size an order from this constant.
@@ -205,12 +213,15 @@ MIN_DELTA_HIVIX, MAX_DELTA_HIVIX = 0.15, 0.20
 MIN_PREMIUM, MAX_PREMIUM = 75.0, 130.0
 
 # Hedge parameters
-HEDGE_TARGET_PREMIUM = 5.0
-HEDGE_PREMIUM_TOLERANCE = 2.0
-HEDGE_LIMIT_SLIPPAGE_TICKS = 2
-HEDGE_LIMIT_SLIPPAGE_TICKS_RETRY = 5
+HEDGE_TARGET_DELTA = 0.05
+HEDGE_DELTA_TOLERANCE = 0.025
+HEDGE_LIMIT_SLIPPAGE_TICKS = 5
+HEDGE_LIMIT_SLIPPAGE_TICKS_RETRY = 10
 HEDGE_FILL_TIMEOUT_SEC = 20
 ORDER_FILL_TIMEOUT_SEC = 15
+SL_IDLE_POLL_INTERVAL_SEC = 10.0
+REENTRY_COOLDOWN_SEC = 300
+REENTRY_MAX_SPOT_MOVE_PCT = 0.01
 
 # Risk
 SL_PERCENT = 0.30
@@ -220,9 +231,7 @@ MAX_REENTRIES_PER_LEG = 1
 
 MAX_DAILY_LOSS = -3000
 TRAIL_START_PROFIT = 2000
-TRAIL_LOCK_PROFIT = 1000
-TRAIL_STEP = 500
-TRAIL_STEP_INCREMENT = 1000
+TRAIL_RETAIN_PCT = 0.50  # continuously lock 50% of peak MTM profit
 
 SL_LIMIT_BUFFER_POINTS_MIN = 5.0   # hard floor — never less than 5 points
 # VIX-adaptive buffer. Earlier version used `PCT * (fill * SL_PERCENT)`
@@ -258,7 +267,10 @@ SL_LIMIT_BUFFER_POINTS_MIN = 5.0   # hard floor — never less than 5 points
 # ~10-15 points for ATM-ish options at vix=14. K=0.0036 gives 12.1
 # points at vix=14, spot=24000, which is the right magnitude.
 SL_LIMIT_BUFFER_VIX_K = 0.0036
-SL_LIMIT_BUFFER_POINTS_MAX = 30.0
+# No arbitrary hard ceiling: in an extreme VIX regime the volatility formula
+# is allowed to widen the executable SL-L range. The local fast-market exit
+# remains the primary fallback when a live tick gaps beyond the limit.
+SL_LIMIT_BUFFER_POINTS_MAX = float("inf")
 # Deprecated alias kept for any external code that imports it.
 SL_LIMIT_BUFFER_POINTS = SL_LIMIT_BUFFER_POINTS_MIN
 SL_L_FILL_TIMEOUT_SEC = 8
@@ -266,8 +278,13 @@ STALE_TICK_TIMEOUT_SEC = 10
 MAX_FEED_DOWNTIME_SEC = 30
 MAX_RECONNECT_ATTEMPTS = 5
 
-PAPER_SLIPPAGE_MODEL_BPS = 8  # 8 bps simulated slippage in paper mode
+PAPER_SLIPPAGE_MODEL_BPS = 20  # conservative default for weekly option spreads
 MARGIN_SAFETY_MULTIPLIER = 1.10  # require 10% headroom over broker estimate
+WS_FEED_QUEUE_MAXSIZE = 5000
+NTP_SERVERS = ("0.in.pool.ntp.org", "1.in.pool.ntp.org", "time.google.com")
+NTP_QUERY_TIMEOUT_SEC = 3.0
+NTP_MAX_CLOCK_OFFSET_SEC = 0.5
+NTP_MAX_RTT_SEC = 1.5
 
 # Session timing (24h)
 ENTRY_VIX_TIME = dtime(9, 15)
@@ -292,6 +309,80 @@ FUNDS_MARGIN_URL = "https://api.upstox.com/v2/user/get-funds-and-margin"
 
 # Upstox option tick size used for "ask + N ticks" reprice
 TICK_SIZE = 0.05
+MARKET_TZ = ZoneInfo("Asia/Kolkata")
+NTP_UNIX_EPOCH_DELTA = 2_208_988_800
+
+
+def market_now() -> datetime:
+    """Timezone-explicit exchange time; never depend on the host timezone."""
+    return datetime.now(MARKET_TZ)
+
+
+def _query_ntp_server(server: str) -> Tuple[float, float, str]:
+    """Return (clock_offset_seconds, RTT_seconds, server) via minimal SNTP."""
+    request = bytearray(48)
+    request[0] = 0x1B  # LI=0, version=3, client mode
+    addresses = socket.getaddrinfo(server, 123, type=socket.SOCK_DGRAM)
+    if not addresses:
+        raise OSError(f"no address found for {server}")
+    response = b""
+    sent_at = 0.0
+    received_at = 0.0
+    last_error: Optional[Exception] = None
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        try:
+            with socket.socket(family, socktype, proto) as client:
+                client.settimeout(NTP_QUERY_TIMEOUT_SEC)
+                sent_at = time.time()
+                client.sendto(request, sockaddr)
+                response, _ = client.recvfrom(512)
+                received_at = time.time()
+            break
+        except OSError as exc:
+            last_error = exc
+    if len(response) < 48:
+        raise OSError(f"invalid NTP response from {server}: {last_error}")
+    leap = (response[0] >> 6) & 0x03
+    stratum = response[1]
+    if leap == 3 or not 1 <= stratum <= 15:
+        raise OSError(f"unsynchronised NTP response from {server}")
+    fields = struct.unpack("!12I", response[:48])
+    server_time = (
+        fields[10] - NTP_UNIX_EPOCH_DELTA + fields[11] / float(2**32)
+    )
+    midpoint = (sent_at + received_at) / 2.0
+    return server_time - midpoint, received_at - sent_at, server
+
+
+async def verify_clock_sync() -> None:
+    """Fail closed in live mode if independent NTP time is unavailable/bad."""
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_query_ntp_server, server) for server in NTP_SERVERS),
+        return_exceptions=True,
+    )
+    samples = [
+        item for item in results
+        if isinstance(item, tuple) and item[1] <= NTP_MAX_RTT_SEC
+    ]
+    if not samples:
+        errors = [str(item) for item in results if isinstance(item, BaseException)]
+        raise TradingError(
+            "CLOCK CHECK FAILED: no valid low-latency NTP response; "
+            f"errors={errors}. Ensure chrony/systemd-timesyncd and UDP/123 access."
+        )
+    offsets = sorted(sample[0] for sample in samples)
+    offset = offsets[len(offsets) // 2]
+    if abs(offset) > NTP_MAX_CLOCK_OFFSET_SEC:
+        raise TradingError(
+            "CLOCK DRIFT TOO LARGE: local clock differs from NTP by "
+            f"{offset:+.3f}s (limit {NTP_MAX_CLOCK_OFFSET_SEC:.3f}s). "
+            "Synchronize the host clock before trading."
+        )
+    log.info(
+        "CLOCK_SYNC_OK: offset=%+.3fs samples=%d best_rtt=%.3fs market_tz=%s",
+        offset, len(samples), min(sample[1] for sample in samples), MARKET_TZ,
+    )
+
 
 # Logging — file + stdout, every state transition captured.
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -303,6 +394,7 @@ PAPER_TRADE_SUMMARY_CSV = os.path.join(LOG_DIR, "nifty_short_straddle_paper_trad
 # Plain-English daily scoreboard: one row per trading day, appended forever.
 # This is the file to check to see how the strategy is doing over time.
 PERFORMANCE_CSV = os.path.join(LOG_DIR, "nifty_short_straddle_strategy_performance.csv")
+STATE_DB_FILE = os.path.join(LOG_DIR, "nifty_short_straddle_state.sqlite3")
 
 # CSV schema (single source of truth for the paper trade log)
 CSV_LOG_COLUMNS = [
@@ -376,6 +468,31 @@ logging.basicConfig(
 )
 log = logging.getLogger("trader")
 
+_FILE_IO_LOCK = threading.Lock()
+_PENDING_FILE_TASKS: "set[asyncio.Task[Any]]" = set()
+
+
+def _dispatch_file_io(operation: Callable[[], None]) -> None:
+    """Keep CSV/file writes off the event loop and serialize them by a lock."""
+    def locked() -> None:
+        with _FILE_IO_LOCK:
+            operation()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        locked()
+        return
+    task: "asyncio.Task[Any]" = asyncio.create_task(asyncio.to_thread(locked))
+    _PENDING_FILE_TASKS.add(task)
+    task.add_done_callback(_PENDING_FILE_TASKS.discard)
+
+
+async def flush_file_io() -> None:
+    pending = list(_PENDING_FILE_TASKS)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
 
 # ============================================================================
 # CSV audit writers
@@ -390,24 +507,36 @@ def _ensure_csv_with_header(path: str, header: List[str]) -> None:
 
 
 def append_log_row(csv_path: str, row: Dict[str, Any]) -> None:
-    """Append a single row to the given CSV log, creating header if missing."""
-    try:
-        _ensure_csv_with_header(csv_path, CSV_LOG_COLUMNS)
-        with open(csv_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([row.get(col, "") for col in CSV_LOG_COLUMNS])
-    except OSError:
-        log.warning("Could not write to CSV log %s - audit row skipped.", csv_path)
+    """Queue a CSV audit row without blocking the asyncio event loop."""
+    snapshot = dict(row)
+
+    def write() -> None:
+        try:
+            _ensure_csv_with_header(csv_path, CSV_LOG_COLUMNS)
+            with open(csv_path, "a", newline="") as file_obj:
+                csv.writer(file_obj).writerow(
+                    [snapshot.get(col, "") for col in CSV_LOG_COLUMNS]
+                )
+        except OSError:
+            log.warning("Could not write to CSV log %s - row skipped.", csv_path)
+
+    _dispatch_file_io(write)
 
 
 def append_summary_row(csv_path: str, row: Dict[str, Any]) -> None:
-    try:
-        _ensure_csv_with_header(csv_path, CSV_SUMMARY_COLUMNS)
-        with open(csv_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([row.get(col, "") for col in CSV_SUMMARY_COLUMNS])
-    except OSError:
-        log.warning("Could not write to summary CSV %s - row skipped.", csv_path)
+    snapshot = dict(row)
+
+    def write() -> None:
+        try:
+            _ensure_csv_with_header(csv_path, CSV_SUMMARY_COLUMNS)
+            with open(csv_path, "a", newline="") as file_obj:
+                csv.writer(file_obj).writerow(
+                    [snapshot.get(col, "") for col in CSV_SUMMARY_COLUMNS]
+                )
+        except OSError:
+            log.warning("Could not write summary CSV %s - row skipped.", csv_path)
+
+    _dispatch_file_io(write)
 
 
 # ============================================================================
@@ -465,14 +594,20 @@ def _load_performance_totals() -> Tuple[float, int, int]:
 
 
 def _append_performance_row(row: Dict[str, Any]) -> None:
-    """Append one day's row to strategy_performance.csv (cumulative file)."""
-    try:
-        _ensure_csv_with_header(PERFORMANCE_CSV, PERFORMANCE_CSV_COLUMNS)
-        with open(PERFORMANCE_CSV, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([row.get(col, "") for col in PERFORMANCE_CSV_COLUMNS])
-    except OSError:
-        log.warning("Could not write to performance CSV %s - row skipped.", PERFORMANCE_CSV)
+    """Queue one day's scoreboard row."""
+    snapshot = dict(row)
+
+    def write() -> None:
+        try:
+            _ensure_csv_with_header(PERFORMANCE_CSV, PERFORMANCE_CSV_COLUMNS)
+            with open(PERFORMANCE_CSV, "a", newline="") as file_obj:
+                csv.writer(file_obj).writerow(
+                    [snapshot.get(col, "") for col in PERFORMANCE_CSV_COLUMNS]
+                )
+        except OSError:
+            log.warning("Could not write performance CSV %s.", PERFORMANCE_CSV)
+
+    _dispatch_file_io(write)
 
 
 # ============================================================================
@@ -498,24 +633,31 @@ def _ensure_csv() -> None:
 
 
 def write_fill(leg: "Leg", tag: str) -> None:
-    try:
-        _ensure_csv()
-        with open(CSV_FILE, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(
-                [
-                    datetime.now().isoformat(timespec="seconds"),
-                    leg.leg_id,
-                    (leg.exit_order_id if "EXIT" in tag else leg.order_id) or "",
-                    leg.instrument_key,
-                    leg.side.value,
-                    leg.qty,
-                    f"{leg.fill_price:.2f}" if leg.fill_price is not None else "",
-                    tag,
-                ]
-            )
-    except OSError:
-        log.warning("Could not write to fills CSV %s - row skipped.", CSV_FILE)
+    is_exit = "EXIT" in tag or tag.startswith("SL_BROKER_FILL")
+    row = [
+        market_now().isoformat(timespec="seconds"),
+        leg.leg_id,
+        (leg.exit_order_id if is_exit else leg.order_id) or "",
+        leg.instrument_key,
+        leg.side.value,
+        leg.qty,
+        (
+            f"{(leg.exit_price if is_exit else leg.fill_price):.2f}"
+            if (leg.exit_price if is_exit else leg.fill_price) is not None
+            else ""
+        ),
+        tag,
+    ]
+
+    def write() -> None:
+        try:
+            _ensure_csv()
+            with open(CSV_FILE, "a", newline="") as file_obj:
+                csv.writer(file_obj).writerow(row)
+        except OSError:
+            log.warning("Could not write fills CSV %s - row skipped.", CSV_FILE)
+
+    _dispatch_file_io(write)
 
 
 # ============================================================================
@@ -564,6 +706,7 @@ class Leg:
     sl_order_id: Optional[str] = None
     sl_triggered_at: Optional[float] = None  # when local SL first observed breach
     sl_broker_triggered: bool = False  # set when watch_sl REST poller sees fill
+    sl_fill_pending: bool = False  # broker reports triggered/open, not terminal
     sl_escalation_in_flight: bool = False  # dedup SL-escalate-to-MARKET
     sl_trigger_price: Optional[float] = None  # broker SL-L trigger level
     sl_limit_price: Optional[float] = None  # broker SL-L limit level (trigger + adaptive buffer)
@@ -576,6 +719,7 @@ class Leg:
 
     # Re-entry
     reentry_count: int = 0
+    closed_at: Optional[float] = None
 
     # Realized accounting. Re-entry reuses this Leg object, so prior-cycle PnL
     # must survive resetting fill_price for the next entry.
@@ -628,80 +772,15 @@ class TradingError(Exception):
     """
 
 
-def _http_get(url, params=None, headers=None, timeout=30, retries=1, backoff=2.0):
-    """requests.get that turns common failures into clear TradingError messages.
-
-    - No internet / timeout / 5xx / 429  ->  retried, then a clear message
-    - HTTP 401                            ->  "regenerate your access token"
-    - Other 4xx                           ->  message with the response body
-    Never raises a raw requests exception to the caller.
-    """
-    params = params or {}
-    headers = headers or {}
-    attempt = 0
-    while True:
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        except requests.exceptions.Timeout:
-            msg = "TIMEOUT: %s did not respond within %d seconds." % (url, timeout)
-        except requests.exceptions.ConnectionError as e:
-            msg = "NETWORK ERROR: cannot reach %s - check your internet connection. (%s)" % (url, e)
-        except requests.exceptions.RequestException as e:
-            msg = "NETWORK ERROR: request to %s failed. (%s)" % (url, e)
-        else:
-            if r.status_code == 401:
-                raise TradingError(
-                    "AUTH ERROR: Upstox rejected the access token (HTTP 401). "
-                    "Generate a fresh token and update UPSTOX_ACCESS_TOKEN in env.txt."
-                )
-            if r.status_code == 429:
-                msg = "RATE LIMIT: Upstox rate limit hit on %s (HTTP 429)." % url
-            elif r.status_code >= 500:
-                msg = "SERVER ERROR: Upstox returned HTTP %d on %s." % (r.status_code, url)
-            elif r.status_code >= 400:
-                raise TradingError(
-                    "API ERROR: %s returned HTTP %d - %s"
-                    % (url, r.status_code, r.text[:300])
-                )
-            else:
-                return r
-        if attempt >= retries:
-            raise TradingError("%s (tried %d time(s))" % (msg, attempt + 1))
-        log.warning("%s - retrying (%d/%d) in %.1fs", msg, attempt + 1, retries, backoff)
-        time.sleep(backoff)
-        attempt += 1
 
 
 # ============================================================================
 # Upstox v2/v3 REST helpers
 # ============================================================================
-def _v2_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
 
 
-def _v3_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Accept": "application/json",
-    }
 
 
-def fetch_instrument_master() -> List[Dict[str, Any]]:
-    """Fetch option contracts specifically for Nifty 50."""
-    log.info("Downloading NIFTY 50 contracts from %s", INSTRUMENTS_URL)
-    r = _http_get(
-        INSTRUMENTS_URL,
-        params={"instrument_key": "NSE_INDEX|Nifty 50"},
-        headers=_v2_headers(),
-        timeout=30,
-    )
-    data = r.json().get("data", [])
-    log.info("Instrument master rows: %d", len(data))
-    return data
 
 def fetch_index_instrument_master() -> List[Dict[str, Any]]:
     """Return the stable Upstox India VIX key (not a dynamic API lookup)."""
@@ -720,7 +799,7 @@ def fetch_nifty_weekly_expiry(instruments: List[Dict[str, Any]]) -> Tuple[str, s
     Find the current active NIFTY weekly expiry from the contract list.
     Returns the underlying index key and the expiry date string.
     """
-    today = datetime.now().date()
+    today = market_now().date()
     expiries = set()
 
     for row in instruments:
@@ -777,117 +856,95 @@ def resolve_vix_instrument_key(instruments: List[Dict[str, Any]]) -> str:
     )
 
 
-def fetch_vix_ltp_sync(vix_key: str) -> float:
-    """Pre-websocket bootstrap LTP fetch."""
-    r = _http_get(
-        MARKET_QUOTE_LTP_URL,
-        params={"instrument_key": vix_key},
-        headers=_v2_headers(),
-        timeout=15,
-    )
-    data = r.json().get("data", {})
-    if not data:
-        raise TradingError(
-            "VIX LTP EMPTY: Upstox returned no LTP for %s. The India VIX "
-            "instrument key may be wrong, or the market is closed." % vix_key
-        )
-    # Safely extract the first item's price to ignore '|' vs ':' formatting
-    last = list(data.values())[0]["last_price"]
-    log.info("entry_vix = %.2f", float(last))
-    return float(last)
-
-def fetch_nifty50_spot_sync(nifty_key: str) -> float:
-    """Pre-websocket bootstrap NIFTY 50 spot LTP fetch."""
-    r = _http_get(
-        MARKET_QUOTE_LTP_URL,
-        params={"instrument_key": nifty_key},
-        headers=_v2_headers(),
-        timeout=15,
-    )
-    data = r.json().get("data", {})
-    if not data:
-        raise TradingError(
-            "SPOT LTP EMPTY: Upstox returned no LTP for %s." % nifty_key
-        )
-    # Safely extract the first item's price
-    last = list(data.values())[0]["last_price"]
-    log.info("entry_spot = %.2f", float(last))
-    return float(last)
 
 
-def fetch_option_greeks_batched(keys: List[str]) -> Dict[str, Dict[str, float]]:
-    """Batched /v3/market-quote/option-greek call. Returns {key: {delta, ltp}}."""
-    if not keys:
-        return {}
-
-    out: Dict[str, Dict[str, float]] = {}
-    chunk_size = 50
-
-    for i in range(0, len(keys), chunk_size):
-        chunk = keys[i : i + chunk_size]
-        params = {"instrument_key": ",".join(chunk)}
-
-        r = _http_get(
-            OPTION_GREEK_URL, params=params, headers=_v3_headers(), timeout=20,
-            retries=1, backoff=2.0,
-        )
-
-        raw = r.json().get("data", {})
-        if not raw:
-            log.warning(
-                "option-greek returned EMPTY data for chunk %d-%d of %d keys "
-                "(market closed or keys not entitled?)",
-                i, i + len(chunk), len(keys),
-            )
-        for k, v in raw.items():
-            # FIX: Normalize the response key from 'NSE_FO:123' back to 'NSE_FO|123'
-            normalized_key = k.replace(":", "|")
-
-            g = v.get("option_greeks") or {}
-            out[normalized_key] = {
-                "delta": float(g.get("delta") or 0.0),
-                "ltp": float(v.get("last_price") or 0.0),
-            }
-
-    return out
 
 
-def fetch_option_chain_for_expiry(
-    nifty_key: str, expiry: str
+
+
+
+async def fetch_instrument_master_async(
+    rest: "AsyncRestClient",
 ) -> List[Dict[str, Any]]:
-    """v2 option-chain call. Returns CE/PE rows for the given expiry."""
-    r = _http_get(
+    payload = await rest.get(
+        INSTRUMENTS_URL,
+        params={"instrument_key": "NSE_INDEX|Nifty 50"},
+        timeout_sec=30.0,
+        retries=1,
+    )
+    rows = payload.get("data", []) or []
+    log.info("Instrument master rows: %d", len(rows))
+    return rows
+
+
+async def fetch_single_ltp_async(
+    rest: "AsyncRestClient", instrument_key: str, label: str
+) -> float:
+    payload = await rest.get(
+        MARKET_QUOTE_LTP_URL,
+        params={"instrument_key": instrument_key},
+        timeout_sec=15.0,
+        retries=1,
+    )
+    data = payload.get("data", {}) or {}
+    if not data:
+        raise TradingError(f"{label} LTP EMPTY for {instrument_key}")
+    price = float(next(iter(data.values())).get("last_price") or 0.0)
+    if price <= 0:
+        raise TradingError(f"{label} LTP invalid for {instrument_key}: {price}")
+    return price
+
+
+async def fetch_option_chain_async(
+    rest: "AsyncRestClient", nifty_key: str, expiry: str
+) -> List[Dict[str, Any]]:
+    payload = await rest.get(
         OPTION_CHAIN_URL,
-        params={
-            "instrument_key": nifty_key,
-            "expiry_date": expiry,
-        },
-        headers=_v2_headers(),
-        timeout=20,
+        params={"instrument_key": nifty_key, "expiry_date": expiry},
+        timeout_sec=20.0,
+        retries=1,
     )
     rows: List[Dict[str, Any]] = []
-    for row in r.json().get("data", []):
-        co = row.get("call_options") or {}
-        po = row.get("put_options") or {}
-        if co.get("instrument_key"):
-            rows.append(
-                {
-                    "side": Side.CE,
+    for row in payload.get("data", []) or []:
+        for side, option_name in (
+            (Side.CE, "call_options"), (Side.PE, "put_options")
+        ):
+            option = row.get(option_name) or {}
+            if option.get("instrument_key"):
+                rows.append({
+                    "side": side,
                     "strike": float(row["strike_price"]),
-                    "instrument_key": co["instrument_key"],
-                    "ltp": float(co.get("market_data", {}).get("ltp", 0.0) or 0.0),
-                }
-            )
-        if po.get("instrument_key"):
-            rows.append(
-                {
-                    "side": Side.PE,
-                    "strike": float(row["strike_price"]),
-                    "instrument_key": po["instrument_key"],
-                    "ltp": float(po.get("market_data", {}).get("ltp", 0.0) or 0.0),
-                }
-            )
+                    "instrument_key": option["instrument_key"],
+                    "ltp": float(
+                        option.get("market_data", {}).get("ltp", 0.0) or 0.0
+                    ),
+                })
     return rows
+
+
+async def fetch_option_greeks_async(
+    rest: "AsyncRestClient", keys: List[str]
+) -> Dict[str, Dict[str, float]]:
+    chunks = [keys[offset:offset + 50] for offset in range(0, len(keys), 50)]
+
+    async def fetch_chunk(chunk: List[str]) -> Dict[str, Any]:
+        return await rest.get(
+            OPTION_GREEK_URL,
+            params={"instrument_key": ",".join(chunk)},
+            timeout_sec=20.0,
+            retries=1,
+        )
+
+    payloads = await asyncio.gather(*(fetch_chunk(chunk) for chunk in chunks))
+    out: Dict[str, Dict[str, float]] = {}
+    for payload in payloads:
+        for key, value in (payload.get("data", {}) or {}).items():
+            greeks = value.get("option_greeks") or {}
+            out[key.replace(":", "|")] = {
+                "delta": float(greeks.get("delta") or 0.0),
+                "ltp": float(value.get("last_price") or 0.0),
+            }
+    return out
 
 
 # ============================================================================
@@ -924,11 +981,29 @@ class AsyncRestClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout_sec: float = 20.0,
+        retries: int = 0,
+    ) -> Dict[str, Any]:
+        """Non-blocking GET with bounded retry/backoff."""
         assert self._session
-        async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
-            r.raise_for_status()
-            return await r.json()
+        for attempt in range(retries + 1):
+            try:
+                async with self._session.get(
+                    url,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                ) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except Exception:
+                if attempt >= retries:
+                    raise
+                await asyncio.sleep(min(2.0 ** attempt, 4.0))
+        raise AssertionError("unreachable")
 
     async def post(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         assert self._session
@@ -955,86 +1030,119 @@ class OrderTask:
 
 
 class OrderWorker:
-    """Dispatches order tasks concurrently on the running event loop.
+    """Queue-backed concurrent dispatcher with standard `Queue.join()`.
 
-    The original design was a strict single-consumer FIFO. That serialised
-    CE and PE leg operations through one coroutine, which is wrong: since
-    AsyncRestClient uses aiohttp, every order call is non-blocking already.
-    A single-consumer queue just adds latency and risk (e.g. the hedge
-    fill poll for the second leg can starve while waiting for the first
-    leg's poll to time out).
-
-    We keep the same `submit()` / `q.join()` API so existing callers don't
-    change, but each submit() now spawns an independent asyncio.Task that
-    runs the coro_factory and fires on_done / on_error. `q.join()` waits
-    on a simple counter instead of the asyncio.Queue.
+    The consumer only dispatches work; it never awaits a long broker poll, so
+    CE/PE orders and SL watchers remain concurrent. The task returned by
+    `submit()` owns a completion future: cancelling it also cancels the actual
+    execution task once dispatched.
     """
 
     def __init__(self, rest: AsyncRestClient):
         self.rest = rest
-        self._inflight = 0
-        self._all_done = asyncio.Event()
-        self._all_done.set()  # initially nothing in flight
+        self.q: "asyncio.Queue[Tuple[OrderTask, asyncio.Future[Any]]]" = asyncio.Queue()
+        self._executing: "set[asyncio.Task[Any]]" = set()
+        self._waiters: "set[asyncio.Task[Any]]" = set()
         self._stop = False
-        self._tasks: "set[asyncio.Task]" = set()
 
-    def submit(self, task: OrderTask) -> None:
-        if self._inflight == 0:
-            self._all_done.clear()
-        self._inflight += 1
-        # task_done is exposed so caller can use it as a no-op.
-        task.task_done = lambda: None  # type: ignore[attr-defined]
-        t = asyncio.create_task(self._run_one(task))
-        self._tasks.add(t)
-        t.add_done_callback(self._tasks.discard)
+    def submit(self, spec: OrderTask) -> "asyncio.Task[Any]":
+        loop = asyncio.get_running_loop()
+        completion: "asyncio.Future[Any]" = loop.create_future()
+        self.q.put_nowait((spec, completion))
 
-    async def _run_one(self, task: OrderTask) -> None:
+        async def wait_for_completion() -> Any:
+            return await completion
+
+        waiter: "asyncio.Task[Any]" = asyncio.create_task(wait_for_completion())
+        self._waiters.add(waiter)
+        waiter.add_done_callback(self._waiters.discard)
+
+        def propagate_cancel(done: "asyncio.Task[Any]") -> None:
+            if done.cancelled() and not completion.done():
+                completion.cancel()
+
+        waiter.add_done_callback(propagate_cancel)
+        return waiter
+
+    async def _execute(self, spec: OrderTask) -> Any:
         try:
-            result = await task.coro_factory()
-            if task.on_done:
+            result = await spec.coro_factory()
+            if spec.on_done:
                 try:
-                    await task.on_done(result)
+                    await spec.on_done(result)
                 except Exception:  # noqa: BLE001
-                    log.exception("on_done handler failed for %s", task.name)
+                    log.exception("on_done handler failed for %s", spec.name)
+            return result
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001
-            log.exception("order worker task %s failed: %s", task.name, e)
-            if task.on_error:
+        except Exception as exc:  # noqa: BLE001
+            log.exception("order worker task %s failed: %s", spec.name, exc)
+            if spec.on_error:
                 try:
-                    await task.on_error(e)
+                    await spec.on_error(exc)
                 except Exception:  # noqa: BLE001
                     log.exception("on_error handler also failed")
-        finally:
-            self._inflight -= 1
-            if self._inflight <= 0:
-                self._inflight = 0
-                self._all_done.set()
+            return None
 
     async def run(self) -> None:
-        # No-op: tasks are spawned on submit() in the current event loop.
-        # Kept for backward compat — Engine wires self.worker.run() as a
-        # long-lived background task. We just wait until stop().
         while not self._stop:
             try:
-                await asyncio.sleep(1.0)
+                spec, completion = await self.q.get()
             except asyncio.CancelledError:
                 break
+            if completion.cancelled():
+                self.q.task_done()
+                continue
+
+            execution: "asyncio.Task[Any]" = asyncio.create_task(self._execute(spec))
+            self._executing.add(execution)
+
+            def cancel_execution(
+                done: "asyncio.Future[Any]", task: "asyncio.Task[Any]" = execution
+            ) -> None:
+                if done.cancelled() and not task.done():
+                    task.cancel()
+
+            completion.add_done_callback(cancel_execution)
+
+            def finish(
+                task: "asyncio.Task[Any]",
+                future: "asyncio.Future[Any]" = completion,
+            ) -> None:
+                self._executing.discard(task)
+                self.q.task_done()
+                if future.done():
+                    return
+                if task.cancelled():
+                    future.cancel()
+                    return
+                error = task.exception()
+                if error is not None:
+                    future.set_exception(error)
+                else:
+                    future.set_result(task.result())
+
+            execution.add_done_callback(finish)
 
     def stop(self) -> None:
         self._stop = True
-        # Cancel any in-flight order tasks.
-        for t in list(self._tasks):
-            if not t.done():
-                t.cancel()
-
-    @property
-    def q(self):
-        """Compat shim: expose a fake .q with .join() for shutdown code."""
-        return self
+        while True:
+            try:
+                _spec, completion = self.q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not completion.done():
+                completion.cancel()
+            self.q.task_done()
+        for task in list(self._executing):
+            if not task.done():
+                task.cancel()
+        for waiter in list(self._waiters):
+            if not waiter.done():
+                waiter.cancel()
 
     async def join(self) -> None:
-        await self._all_done.wait()
+        await self.q.join()
 
 
 # ============================================================================
@@ -1314,24 +1422,27 @@ def select_delta_premium_bands(vix: float) -> Tuple[float, float, float, float]:
 
 def update_trail(store: "StateStore", mtm: float, log_csv_path: str,
                  session_date: str) -> None:
-    """Pure function — increments the trail lock based on new mtm.
-    Used identically by the live and paper Engine so the trail logic is
-    exactly the same in both modes.
-    """
-    if mtm >= TRAIL_START_PROFIT:
-        steps = int((mtm - TRAIL_START_PROFIT) // TRAIL_STEP_INCREMENT) + 1
-        new_lock = TRAIL_LOCK_PROFIT + (steps - 1) * TRAIL_STEP
-        if new_lock > store.trail_lock:
-            old = store.trail_lock
-            store.trail_lock = new_lock
-            log.info("TRAIL_STEP: lock %.2f -> %.2f (mtm=%.2f)", old, new_lock, mtm)
-            log_event(
-                log_csv_path, "TRAIL_STEP", None,
-                ltp_at_event=None, entry_vix=store.entry_vix,
-                running_total_mtm=mtm, trail_lock=new_lock,
-                notes=f"previous_lock={old:.2f}",
-                session_date=session_date,
-            )
+    """Continuously ratchet the lock to a percentage of peak MTM profit."""
+    if mtm < TRAIL_START_PROFIT or mtm <= store.peak_mtm:
+        return
+    old_peak = store.peak_mtm
+    old_lock = store.trail_lock
+    store.peak_mtm = mtm
+    new_lock = mtm * TRAIL_RETAIN_PCT
+    if new_lock <= store.trail_lock:
+        return
+    store.trail_lock = new_lock
+    log.info(
+        "TRAIL_CONTINUOUS: peak %.2f -> %.2f lock %.2f -> %.2f",
+        old_peak, mtm, old_lock, new_lock,
+    )
+    log_event(
+        log_csv_path, "TRAIL_CONTINUOUS", None,
+        ltp_at_event=None, entry_vix=store.entry_vix,
+        running_total_mtm=mtm, trail_lock=new_lock,
+        notes=f"retain_pct={TRAIL_RETAIN_PCT:.2f};previous_peak={old_peak:.2f}",
+        session_date=session_date,
+    )
 
 
 def pick_core_strike(
@@ -1429,36 +1540,45 @@ def pick_core_strike(
 def pick_hedge_strike(
     side: Side,
     chain_rows: List[Dict[str, Any]],
+    greeks: Dict[str, Dict[str, float]],
     ref_strike: float,
-    chain_ltp_fetcher: Callable[[str], float],
 ) -> Optional[Dict[str, Any]]:
-    """OTM leg closest to HEDGE_TARGET_PREMIUM. Returns None if nothing in tolerance."""
-    candidates = [
-        r
-        for r in chain_rows
-        if r["side"] == side
-        and (
-            (side == Side.CE and r["strike"] > ref_strike)
-            or (side == Side.PE and r["strike"] < ref_strike)
+    """Pick an OTM hedge by absolute delta, giving stable risk across VIX."""
+    candidates: List[Dict[str, Any]] = []
+    for row in chain_rows:
+        if row["side"] != side:
+            continue
+        is_otm = (
+            side == Side.CE and row["strike"] > ref_strike
+        ) or (
+            side == Side.PE and row["strike"] < ref_strike
         )
-    ]
-    best: Optional[Dict[str, Any]] = None
-    best_dist: float = float("inf")
-    for r in candidates:
-        ltp = r.get("ltp") or 0.0
-        if ltp <= 0:
-            ltp = chain_ltp_fetcher(r["instrument_key"])
-        d = abs(ltp - HEDGE_TARGET_PREMIUM)
-        if d < best_dist:
-            best_dist = d
-            best = {**r, "ltp": ltp, "ltp_distance": d}
-    if best is None or best_dist > HEDGE_PREMIUM_TOLERANCE:
+        if not is_otm:
+            continue
+        greek = greeks.get(row["instrument_key"])
+        if not greek:
+            continue
+        delta = abs(float(greek.get("delta") or 0.0))
+        if delta <= 0:
+            continue
+        ltp = float(greek.get("ltp") or row.get("ltp") or 0.0)
+        candidates.append({
+            **row,
+            "delta": delta,
+            "ltp": ltp,
+            "delta_distance": abs(delta - HEDGE_TARGET_DELTA),
+        })
+    if not candidates:
+        log.warning("ABORT:no_hedge_greeks side=%s", side.value)
+        return None
+    candidates.sort(key=lambda row: row["delta_distance"])
+    best = candidates[0]
+    if best["delta_distance"] > HEDGE_DELTA_TOLERANCE:
         log.warning(
-            "ABORT:no_valid_hedge side=%s ref_strike=%.0f best_dist=%.2f tol=%.2f",
-            side.value,
-            ref_strike,
-            best_dist if best else float("inf"),
-            HEDGE_PREMIUM_TOLERANCE,
+            "ABORT:no_valid_hedge_delta side=%s best_delta=%.4f target=%.4f "
+            "tolerance=%.4f",
+            side.value, best["delta"], HEDGE_TARGET_DELTA,
+            HEDGE_DELTA_TOLERANCE,
         )
         return None
     return best
@@ -1475,21 +1595,133 @@ class StateStore:
         self.entry_vix: float = 0.0
         self.original_entry_vix: float = 0.0
         self.current_vix: float = 0.0
-        self.entry_spot: float = 0.0  # NIFTY 50 spot LTP at bootstrap, used by SL buffer
+        self.entry_spot: float = 0.0
+        self.current_spot: float = 0.0  # NIFTY 50 spot LTP at bootstrap, used by SL buffer
         self.total_mtm: float = 0.0
         self.max_drawdown_mtm: float = 0.0  # tracks lowest (most-negative) MTM seen
         self.trail_lock: float = float("-inf")
+        self.peak_mtm: float = 0.0
         self.kill_switch_triggered: bool = False
         self.kill_switch_reason: Optional[str] = None
         self.feed_disconnected_at: Optional[float] = None
         self.num_reentries: int = 0
         self.num_hedge_aborts: int = 0
         self.exit_reason: str = ""
+        self._last_state_persist_at: float = 0.0
+        self.unresolved_cached_state: bool = False
+        self._init_state_db()
+        self._warn_if_unresolved_snapshot()
         try:
             self._mtm_log_fh = open(MTM_LOG_FILE, "a", buffering=1)
         except OSError:
             log.warning("Could not open %s for writing - MTM logging disabled.", MTM_LOG_FILE)
             self._mtm_log_fh = None
+
+    def _init_state_db(self) -> None:
+        try:
+            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=3.0)) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS state_snapshot (
+                           id INTEGER PRIMARY KEY CHECK (id = 1),
+                           updated_at TEXT NOT NULL,
+                           session_date TEXT,
+                           active INTEGER NOT NULL,
+                           payload_json TEXT NOT NULL
+                       )"""
+                )
+                conn.commit()
+        except sqlite3.Error:
+            log.exception("Could not initialize state cache %s", STATE_DB_FILE)
+
+    def _warn_if_unresolved_snapshot(self) -> None:
+        try:
+            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=3.0)) as conn:
+                row = conn.execute(
+                    "SELECT updated_at, session_date, payload_json "
+                    "FROM state_snapshot WHERE id=1 AND active=1"
+                ).fetchone()
+            if row:
+                self.unresolved_cached_state = True
+                log.critical(
+                    "UNRESOLVED_STATE_CACHE: prior active snapshot updated=%s "
+                    "session=%s. Broker positions must be reconciled before entry. "
+                    "Cached state=%s",
+                    row[0], row[1], row[2],
+                )
+        except sqlite3.Error:
+            log.exception("Could not read state cache %s", STATE_DB_FILE)
+
+    def persist_state(self, force: bool = False) -> None:
+        """Persist a crash-recovery snapshot; safe to call via to_thread()."""
+        now = time.time()
+        if not force and now - self._last_state_persist_at < 1.0:
+            return
+        pair = self.pair
+        legs: List[Leg] = []
+        if pair:
+            legs = [pair.ce_short, pair.pe_short, pair.ce_hedge, pair.pe_hedge]
+        active_states = {
+            LegState.HEDGE_PLACED, LegState.HEDGE_FILLED,
+            LegState.CORE_PLACED, LegState.CORE_FILLED, LegState.SL_PLACED,
+        }
+        active = any(leg.state in active_states for leg in legs)
+        payload = {
+            "entry_vix": self.entry_vix,
+            "current_vix": self.current_vix,
+            "entry_spot": self.entry_spot,
+            "current_spot": self.current_spot,
+            "total_mtm": self.total_mtm,
+            "peak_mtm": self.peak_mtm,
+            "trail_lock": (
+                None if self.trail_lock == float("-inf") else self.trail_lock
+            ),
+            "kill_switch_triggered": self.kill_switch_triggered,
+            "kill_switch_reason": self.kill_switch_reason,
+            "exit_reason": self.exit_reason,
+            "legs": [
+                {
+                    "leg_id": leg.leg_id,
+                    "kind": leg.kind.value,
+                    "side": leg.side.value,
+                    "instrument_key": leg.instrument_key,
+                    "strike": leg.strike,
+                    "qty": leg.qty,
+                    "state": leg.state.value,
+                    "order_id": leg.order_id,
+                    "sl_order_id": leg.sl_order_id,
+                    "fill_price": leg.fill_price,
+                    "exit_price": leg.exit_price,
+                    "realized_pnl": leg.realized_pnl,
+                    "reentry_count": leg.reentry_count,
+                    "last_ltp": leg.last_ltp,
+                    "last_ltp_at": leg.last_ltp_at,
+                }
+                for leg in legs
+            ],
+        }
+        try:
+            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=3.0)) as conn:
+                conn.execute(
+                    """INSERT INTO state_snapshot
+                           (id, updated_at, session_date, active, payload_json)
+                       VALUES (1, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           updated_at=excluded.updated_at,
+                           session_date=excluded.session_date,
+                           active=excluded.active,
+                           payload_json=excluded.payload_json""",
+                    (
+                        market_now().isoformat(timespec="seconds"),
+                        pair.session_date if pair else None,
+                        1 if active else 0,
+                        json.dumps(payload, separators=(",", ":"), default=str),
+                    ),
+                )
+                conn.commit()
+            self._last_state_persist_at = now
+        except sqlite3.Error:
+            log.exception("Could not persist state cache %s", STATE_DB_FILE)
 
     def log_state(self, msg: str) -> None:
         log.info(msg)
@@ -1505,7 +1737,7 @@ class StateStore:
             if lg.data_stale:
                 stale_legs.append(lg.leg_id)
         self._mtm_log_fh.write(
-            f"{datetime.now().isoformat(timespec='seconds')} "
+            f"{market_now().isoformat(timespec='seconds')} "
             f"mtm={self.total_mtm:.2f} trail_lock={self.trail_lock:.2f} "
             f"stale_legs={stale_legs}\n"
         )
@@ -1570,7 +1802,11 @@ class WsAdapter:
         # updates arrive on a separate Portfolio Stream websocket
         # (which we don't connect to), or via the v2 order history
         # REST endpoint (which is what watch_sl polls).
-        self._feed_queue: "asyncio.Queue[Any]" = asyncio.Queue()
+        self._feed_queue: "asyncio.Queue[Any]" = asyncio.Queue(
+            maxsize=WS_FEED_QUEUE_MAXSIZE
+        )
+        self._dropped_feed_items: int = 0
+        self._last_drop_log_at: float = 0.0
         self.streamer: Optional[MarketDataStreamerV3] = None
 
     def _on_open(self) -> None:
@@ -1581,6 +1817,29 @@ class WsAdapter:
             self.streamer.subscribe(self.instruments, "ltpc")  # type: ignore[attr-defined]
         except Exception:
             log.exception("subscribe failed")
+
+    def _enqueue_latest_feed_item(self, item: Any) -> None:
+        """Loop-thread callback: bound memory and preserve the newest ticks."""
+        if self._feed_queue.full():
+            try:
+                self._feed_queue.get_nowait()  # discard the globally oldest tick
+            except asyncio.QueueEmpty:
+                pass
+            self._dropped_feed_items += 1
+            now = time.monotonic()
+            if now - self._last_drop_log_at >= 5.0:
+                log.warning(
+                    "WS_FEED_BACKPRESSURE: dropped_oldest total=%d queue=%d/%d",
+                    self._dropped_feed_items,
+                    self._feed_queue.qsize(),
+                    WS_FEED_QUEUE_MAXSIZE,
+                )
+                self._last_drop_log_at = now
+        try:
+            self._feed_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # Only possible if another loop callback filled the one freed slot.
+            self._dropped_feed_items += 1
 
     def _on_message(self, message: Any) -> None:
         self.last_tick_at = time.time()
@@ -1616,7 +1875,7 @@ class WsAdapter:
                 continue
             if any(k in payload for k in ("ltpc", "fullFeed", "firstLevelWithGreeks")):
                 self.loop.call_soon_threadsafe(
-                    self._feed_queue.put_nowait,
+                    self._enqueue_latest_feed_item,
                     ("ltpc", instrument_key, payload),
                 )
             else:
@@ -1653,7 +1912,7 @@ class WsAdapter:
 # CSV event helpers (used by both live and paper)
 # ============================================================================
 def session_date_str() -> str:
-    return datetime.now().date().isoformat()
+    return market_now().date().isoformat()
 
 
 def log_event(
@@ -1677,7 +1936,7 @@ def log_event(
     append_log_row(
         csv_path,
         {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": market_now().isoformat(timespec="seconds"),
             "session_date": session_date,
             "leg_id": leg.leg_id if leg else "",
             "instrument_key": leg.instrument_key if leg else "",
@@ -1715,9 +1974,9 @@ class Engine:
         self.paper_summary_csv = PAPER_TRADE_SUMMARY_CSV
 
     # ------------------------------------------------------------------ bootstrap
-    def bootstrap(self) -> None:
-        log.info("=== 09:15 BOOTSTRAP ===")
-        fo = fetch_instrument_master()
+    async def bootstrap(self, rest: AsyncRestClient) -> None:
+        log.info("=== 09:15 ASYNC BOOTSTRAP ===")
+        fo = await fetch_instrument_master_async(rest)
         idx = fetch_index_instrument_master()
 
         nifty_key, expiry = fetch_nifty_weekly_expiry(fo)
@@ -1742,22 +2001,38 @@ class Engine:
         else:
             log.info("Resolved NIFTY lot size=%d from contract master", lot_size)
         vix_key = resolve_vix_instrument_key(fo + idx)
-        self.store.entry_vix = fetch_vix_ltp_sync(vix_key)
+
+        # Independent bootstrap calls run concurrently so a slow quote does
+        # not serialize VIX, spot and option-chain latency.
+        vix_result, spot_result, chain_result = await asyncio.gather(
+            fetch_single_ltp_async(rest, vix_key, "VIX"),
+            fetch_single_ltp_async(rest, nifty_key, "NIFTY SPOT"),
+            fetch_option_chain_async(rest, nifty_key, expiry),
+            return_exceptions=True,
+        )
+        if isinstance(vix_result, BaseException):
+            raise TradingError(f"VIX bootstrap failed: {vix_result}")
+        if isinstance(chain_result, BaseException):
+            raise TradingError(f"option-chain bootstrap failed: {chain_result}")
+        self.store.entry_vix = float(vix_result)
         self.store.original_entry_vix = self.store.entry_vix
         self.store.current_vix = self.store.entry_vix
-        # NIFTY 50 spot LTP — required for the VIX-adaptive SL buffer
-        # (buffer = K * vix * spot / 100). Falls back to 0 if the call
-        # fails; _compute_sl_buffer handles the fallback by returning
-        # the static MIN.
-        try:
-            self.store.entry_spot = fetch_nifty50_spot_sync(nifty_key)
-        except Exception:
-            log.exception("entry_spot fetch failed; SL buffer will use static MIN")
+        if isinstance(spot_result, BaseException):
+            log.error(
+                "entry_spot fetch failed; SL buffer will use static MIN: %s",
+                spot_result,
+            )
             self.store.entry_spot = 0.0
+            self.store.current_spot = 0.0
+            self.store.current_spot_at = None
+        else:
+            self.store.entry_spot = float(spot_result)
+            self.store.current_spot = self.store.entry_spot
+            self.store.current_spot_at = time.time()
 
-        chain = fetch_option_chain_for_expiry(nifty_key, expiry)
+        chain = chain_result
         candidate_keys = [r["instrument_key"] for r in chain]
-        greeks = fetch_option_greeks_batched(candidate_keys)
+        greeks = await fetch_option_greeks_async(rest, candidate_keys)
         self._bootstrap_cache = {
             "nifty_key": nifty_key,
             "expiry": expiry,
@@ -1775,14 +2050,7 @@ class Engine:
         chain = cache["chain"]
         greeks = cache["greeks"]
 
-        def ltp_for(key: str) -> float:
-            g = greeks.get(key)
-            if g and g.get("ltp"):
-                return g["ltp"]
-            for r in chain:
-                if r["instrument_key"] == key and r.get("ltp"):
-                    return r["ltp"]
-            return 0.0
+
 
         # Up-front feasibility check: if the batched greek fetch came back
         # empty or all-zero (closed market / silent API failure), every
@@ -1811,8 +2079,8 @@ class Engine:
                 "delta range and nearest strikes" % ",".join(sides_missing)
             )
 
-        ce_hedge = pick_hedge_strike(Side.CE, chain, ce_core["strike"], ltp_for)
-        pe_hedge = pick_hedge_strike(Side.PE, chain, pe_core["strike"], ltp_for)
+        ce_hedge = pick_hedge_strike(Side.CE, chain, greeks, ce_core["strike"])
+        pe_hedge = pick_hedge_strike(Side.PE, chain, greeks, pe_core["strike"])
         if not ce_hedge or not pe_hedge:
             raise TradingError("ABORT:no_valid_hedge for one or both sides")
 
@@ -1901,7 +2169,7 @@ class Engine:
             while time.time() < deadline:
                 status = await get_order_status(self.rest, oid)
                 d = _order_snapshot(status)
-                s = (d.get("status") or "").lower()
+                s = " ".join(str(d.get("status") or "").lower().replace("_", " ").split())
                 if s in ("complete", "filled", "traded"):
                     fill_px = float(d.get("average_price") or 0.0)
                     if fill_px <= 0:
@@ -1918,7 +2186,7 @@ class Engine:
         async def on_done(_): done.set()
         async def on_err(_): done.set()
 
-        self.worker.submit(
+        order_task = self.worker.submit(
             OrderTask(name=f"hedge_{leg.leg_id}", coro_factory=place_and_poll,
                       on_done=on_done, on_error=on_err)
         )
@@ -1926,6 +2194,9 @@ class Engine:
             await asyncio.wait_for(done.wait(), timeout=timeout_sec + 2.0)
         except asyncio.TimeoutError:
             log.error("HEDGE_POLL_TIMEOUT: worker stalled for leg=%s", leg.leg_id)
+            order_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await order_task
 
         if result["filled"]:
             leg.fill_price = result["px"]
@@ -1985,6 +2256,7 @@ class Engine:
             leg.fill_price = sim_fill
             leg.entry_value_total += sim_fill * leg.qty
             leg.exit_price = None
+            leg.closed_at = None
             leg.state = LegState.CORE_FILLED
             leg.filled_at = time.time()
             log.info("CORE_FILLED: leg=%s order_id=%s fill=%.2f (paper, ref=%.2f)",
@@ -2018,6 +2290,7 @@ class Engine:
             leg.fill_price = fill
             leg.entry_value_total += fill * leg.qty
             leg.exit_price = None
+            leg.closed_at = None
             leg.state = LegState.CORE_FILLED
             leg.filled_at = time.time()
             result["ok"] = True
@@ -2035,14 +2308,19 @@ class Engine:
         async def on_done(_): done.set()
         async def on_err(_): done.set()
 
-        self.worker.submit(
+        order_task = self.worker.submit(
             OrderTask(name=f"place_core_{leg.leg_id}", coro_factory=place,
                       on_done=on_done, on_error=on_err)
         )
         try:
-            await asyncio.wait_for(done.wait(), timeout=10.0)
+            await asyncio.wait_for(
+                done.wait(), timeout=ORDER_FILL_TIMEOUT_SEC + 2.0
+            )
         except asyncio.TimeoutError:
             log.error("CORE_PLACE_TIMEOUT: leg=%s", leg.leg_id)
+            order_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await order_task
         return result["ok"]
 
     async def _place_broker_sl(self, leg: Leg) -> None:
@@ -2110,17 +2388,17 @@ class Engine:
                     #
                     # Two phases:
                     #   PHASE 1 (idle, pre-trigger):
-                    #     Poll every IDLE_POLL_INTERVAL_SEC (60s) while
+                    #     Poll every SL_IDLE_POLL_INTERVAL_SEC (10s) while
                     #     the local SL hasn't fired. This is the
                     #     catch-up path for the case the audit called
                     #     out: if the websocket drops and
                     #     _evaluate_local_sl never runs, sl_triggered_at
                     #     never gets set, and the local SL path is
-                    #     unreachable. The 60s idle poll gives us an
+                    #     unreachable. The 10s idle poll gives us an
                     #     independent check on the broker SL-L order
-                    #     every minute so a broker-only fill during a
-                    #     feed outage is still caught within ~60s.
-                    #     Budget: 1/60s × 2 legs × 6h = 720 calls,
+                    #     promptly so a broker-only fill during a
+                    #     feed outage is caught within ~10s.
+                    #     Budget: 1/10s × 2 legs = 12 calls/minute,
                     #     well under 500/min and 2000/30min.
                     #
                     #   PHASE 2 (triggered):
@@ -2138,27 +2416,32 @@ class Engine:
                     #
                     # MAX_POLLS_PER_LEG is a hard cap as a final
                     # backstop against runaway polling.
-                    IDLE_POLL_INTERVAL_SEC = 60.0
-                    MAX_POLLS_PER_LEG = 50
+                    IDLE_POLL_INTERVAL_SEC = SL_IDLE_POLL_INTERVAL_SEC
+                    MAX_POLLS_PER_LEG = 3000
                     triggered_deadline: Optional[float] = None
                     poll_count = 0
                     while poll_count < MAX_POLLS_PER_LEG:
                         if _leg.state in (LegState.CLOSED, LegState.ABORTED):
                             return
                         if _leg.sl_triggered_at is None:
-                            # PHASE 1: idle polling. 60s is well under
+                            # PHASE 1: idle polling. 10s is well under
                             # the 50/s and 500/min budgets even with
                             # both legs polling simultaneously.
                             try:
                                 status = await get_order_status(self.rest, _oid)
                                 d = _order_snapshot(status)
-                                s = (d.get("status") or "").lower()
+                                s = " ".join(str(d.get("status") or "").lower().replace("_", " ").split())
                             except Exception:  # noqa: BLE001
                                 await asyncio.sleep(IDLE_POLL_INTERVAL_SEC)
                                 continue
                             poll_count += 1
+                            _leg.sl_fill_pending = s in ("open", "pending", "triggered")
+                            if s == "trigger pending":
+                                _leg.sl_fill_pending = False
                             if s in ("complete", "filled", "traded"):
                                 _leg.sl_broker_triggered = True
+                                _leg.sl_fill_pending = False
+                                _leg.exit_order_id = _oid
                                 exit_px = float(d.get("average_price") or _leg.last_ltp or 0.0)
                                 if exit_px > 0:
                                     self._record_leg_exit(_leg, exit_px)
@@ -2183,6 +2466,7 @@ class Engine:
                                 )
                                 return
                             if s in ("rejected", "cancelled", "canceled"):
+                                _leg.sl_fill_pending = False
                                 log.warning("SL_BROKER_TERMINAL: leg=%s status=%s",
                                             _leg.leg_id, s)
                                 return
@@ -2210,14 +2494,19 @@ class Engine:
                         try:
                             status = await get_order_status(self.rest, _oid)
                             d = _order_snapshot(status)
-                            s = (d.get("status") or "").lower()
+                            s = " ".join(str(d.get("status") or "").lower().replace("_", " ").split())
                         except Exception:  # noqa: BLE001
                             await asyncio.sleep(1.0)
                             continue
                         poll_count += 1
+                        _leg.sl_fill_pending = s in ("open", "pending", "triggered")
+                        if s == "trigger pending":
+                            _leg.sl_fill_pending = False
                         if s in ("complete", "filled", "traded"):
+                            _leg.sl_fill_pending = False
                             if not _leg.sl_broker_triggered:
                                 _leg.sl_broker_triggered = True
+                                _leg.exit_order_id = _oid
                                 exit_px = float(d.get("average_price") or _leg.last_ltp or 0.0)
                                 if exit_px > 0:
                                     self._record_leg_exit(_leg, exit_px)
@@ -2241,6 +2530,7 @@ class Engine:
                                 )
                             return
                         if s in ("rejected", "cancelled", "canceled"):
+                            _leg.sl_fill_pending = False
                             log.warning("SL_BROKER_TERMINAL: leg=%s status=%s",
                                         _leg.leg_id, s)
                             return
@@ -2261,14 +2551,19 @@ class Engine:
         async def on_err(_): done.set()
 
         assert self.worker
-        self.worker.submit(
+        order_task = self.worker.submit(
             OrderTask(name=f"sl_{leg.leg_id}", coro_factory=place,
                       on_done=on_done, on_error=on_err)
         )
         try:
-            await asyncio.wait_for(done.wait(), timeout=10.0)
+            await asyncio.wait_for(
+                done.wait(), timeout=ORDER_FILL_TIMEOUT_SEC
+            )
         except asyncio.TimeoutError:
             log.error("SL_PLACE_TIMEOUT: leg=%s", leg.leg_id)
+            order_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await order_task
 
     async def _validate_entry_margin(
         self, legs: List[Leg], prices: Dict[str, float]
@@ -2377,7 +2672,7 @@ class Engine:
         return ce_ok and pe_ok
 
     # ------------------------------------------------------------------ tick engine
-    def _on_tick_local(self, ltp_map: Dict[str, float]) -> None:
+    async def _on_tick_local(self, ltp_map: Dict[str, float]) -> None:
         now = time.time()
         if not self.store.pair:
             return
@@ -2385,6 +2680,11 @@ class Engine:
         vix_tick = ltp_map.get(vix_key) if vix_key else None
         if vix_tick is not None and vix_tick > 0:
             self.store.current_vix = float(vix_tick)
+        nifty_key = self._bootstrap_cache.get("nifty_key")
+        spot_tick = ltp_map.get(nifty_key) if nifty_key else None
+        if spot_tick is not None and spot_tick > 0:
+            self.store.current_spot = float(spot_tick)
+            self.store.current_spot_at = now
         for leg in [
             self.store.pair.ce_short,
             self.store.pair.pe_short,
@@ -2400,7 +2700,10 @@ class Engine:
         mtm = self.store.compute_mtm()
         update_trail(self.store, mtm, self.paper_log_csv,
                      self.store.pair.session_date if self.store.pair else "")
-        self.store.log_mtm()
+        await asyncio.gather(
+            asyncio.to_thread(self.store.log_mtm),
+            asyncio.to_thread(self.store.persist_state),
+        )
         if mtm <= self.store.trail_lock or mtm <= MAX_DAILY_LOSS:
             self._trigger_kill_switch(
                 reason=(
@@ -2413,7 +2716,10 @@ class Engine:
     def _compute_sl_buffer(self, leg: Leg) -> float:
         """Adaptive SL-L limit buffer in points, scaled by VIX.
 
-        buffer = max(MIN, min(K * vix * spot / 100, MAX))
+        buffer = max(MIN, K * vix * spot / 100)
+
+        There is no arbitrary maximum cap; extreme VIX values may widen the
+        SL-L executable range. Exchange price-band rules still apply.
 
         where spot is the entry spot (a constant for the session) and
         vix is the entry_vix (also constant for the session). The
@@ -2426,13 +2732,13 @@ class Engine:
         the buffer at the 5-pt floor.
 
         For entry_vix=14, entry_spot=24000, K=0.0036:
-          buffer = max(5, min(12.1, 30)) = 12.1
+          buffer = max(5, 12.1) = 12.1
         For entry_vix=12, entry_spot=24000, K=0.0036:
-          buffer = max(5, min(10.4, 30)) = 10.4
+          buffer = max(5, 10.4) = 10.4
         For entry_vix=20, entry_spot=24000, K=0.0036:
-          buffer = max(5, min(17.3, 30)) = 17.3
+          buffer = max(5, 17.3) = 17.3
         For entry_vix=14, entry_spot=18000, K=0.0036:
-          buffer = max(5, min(9.1, 30)) = 9.1
+          buffer = max(5, 9.1) = 9.1
 
         All of these give 9-17 points of headroom for the typical
         12-20 VIX band, which is enough to absorb a 1-2 sigma 1-min
@@ -2489,6 +2795,68 @@ class Engine:
                     )
                 self._enqueue_exit_due_to_local_sl(leg)
 
+    async def _cancel_sl_or_confirm_fill(self, leg: Leg) -> bool:
+        """Resolve the SL order before placing any duplicate closing order.
+
+        Returns True when the broker SL already filled (the leg is recorded as
+        closed), and False only after cancellation/rejection is confirmed.
+        An ambiguous/open order raises instead of risking an over-close.
+        """
+        if not leg.sl_order_id or PAPER_TRADING_MODE:
+            return False
+        assert self.rest
+
+        async def inspect() -> str:
+            response = await get_order_status(self.rest, leg.sl_order_id)
+            snap = _order_snapshot(response)
+            status = " ".join(
+                str(snap.get("status") or "").lower().replace("_", " ").split()
+            )
+            if status in ("complete", "filled", "traded"):
+                average = float(snap.get("average_price") or 0.0)
+                if average <= 0:
+                    raise TradingError(
+                        f"SL {leg.sl_order_id} filled without average_price"
+                    )
+                leg.sl_broker_triggered = True
+                leg.sl_fill_pending = False
+                leg.exit_order_id = leg.sl_order_id
+                self._record_leg_exit(leg, average)
+                write_fill(leg, "SL_BROKER_FILL")
+                return "filled"
+            if status in ("cancelled", "canceled", "rejected"):
+                leg.sl_fill_pending = False
+                return "cancelled"
+            # `trigger pending` means the stop is still waiting for its
+            # trigger; it is intermediate but not evidence of a near-fill.
+            # `open`/`pending`/`triggered` after a breach is treated as an
+            # in-flight fill and blocks duplicate market exits until cancel
+            # reaches a terminal state.
+            leg.sl_fill_pending = status in ("open", "pending", "triggered")
+            return "intermediate"
+
+        state = await inspect()
+        if state == "filled":
+            return True
+        if state == "cancelled":
+            return False
+
+        with contextlib.suppress(Exception):
+            await cancel_order_via_upstox(self.rest, leg.sl_order_id)
+
+        deadline = time.monotonic() + min(5.0, ORDER_FILL_TIMEOUT_SEC)
+        while time.monotonic() < deadline:
+            state = await inspect()
+            if state == "filled":
+                return True
+            if state == "cancelled":
+                return False
+            await asyncio.sleep(0.25)
+        raise TradingError(
+            f"SL {leg.sl_order_id} remained non-terminal after cancel; "
+            "refusing duplicate market exit"
+        )
+
     def _enqueue_exit_due_to_local_sl(self, leg: Leg) -> None:
         # Dedup: a fast breach can generate several ticks within the
         # ~100-500ms REST round trip window before the first exit task
@@ -2513,16 +2881,16 @@ class Engine:
                     log.info("EXIT_LOCALSL_SKIPPED: leg=%s broker already closed", leg.leg_id)
                     return
                 if leg.sl_order_id:
-                    with contextlib.suppress(Exception):
-                        await cancel_order_via_upstox(self.rest, leg.sl_order_id)
-                # CRITICAL re-check after the await above. watch_sl runs as
-                # a concurrent worker.submit task and can call
-                # get_order_status, see the cancel settle, and flip
-                # leg.state=CLOSED between our cancel and our place. If we
-                # don't re-check here, we'd submit a second MARKET BUY on
-                # a leg the broker has just filled. Same per-leg Lock
-                # would also work but a re-check is simpler and zero-cost
-                # in the common case.
+                    already_filled = await self._cancel_sl_or_confirm_fill(leg)
+                    if already_filled:
+                        log.info(
+                            "EXIT_LOCALSL_RACE_SKIPPED: leg=%s broker SL "
+                            "already filled", leg.leg_id,
+                        )
+                        return
+                # The helper above only returns False after broker cancellation
+                # is terminal. Keep the shared-state re-check for a watcher
+                # callback that may have completed concurrently.
                 if leg.sl_broker_triggered or leg.state == LegState.CLOSED:
                     log.info(
                         "EXIT_LOCALSL_RACE_SKIPPED: leg=%s broker closed "
@@ -2572,6 +2940,8 @@ class Engine:
         leg.last_ltp = exit_price
         leg.last_ltp_at = time.time()
         leg.data_stale = False
+        leg.closed_at = time.time()
+        leg.sl_fill_pending = False
         leg.state = LegState.CLOSED
 
     async def _exit_leg_market(self, leg: Leg, tag: str) -> float:
@@ -2660,8 +3030,7 @@ class Engine:
         if self.store.pair:
             for leg in (self.store.pair.ce_short, self.store.pair.pe_short):
                 if leg.sl_order_id and leg.state != LegState.CLOSED:
-                    with contextlib.suppress(Exception):
-                        await cancel_order_via_upstox(self.rest, leg.sl_order_id)
+                    await self._cancel_sl_or_confirm_fill(leg)
 
         last_result = ExitAllResult({}, [], {})
         attempts = 1 if PAPER_TRADING_MODE else 3
@@ -2735,7 +3104,7 @@ class Engine:
     def _on_feed_disconnect_async(self) -> None:
         if self.store.feed_disconnected_at is None:
             self.store.feed_disconnected_at = time.time()
-            log.warning("FEED_DISCONNECTED at %s", datetime.now().isoformat(timespec="seconds"))
+            log.warning("FEED_DISCONNECTED at %s", market_now().isoformat(timespec="seconds"))
             log_event(
                 self.paper_log_csv, "FEED_DISCONNECT", None,
                 entry_vix=self.store.entry_vix, running_total_mtm=self.store.total_mtm,
@@ -2763,13 +3132,49 @@ class Engine:
             self.store.feed_disconnected_at = None
 
     # ------------------------------------------------------------------ re-entry
-    def _maybe_reenter(self) -> None:
+    async def _maybe_reenter(self) -> None:
         if not self.store.pair:
             return
         for leg in [self.store.pair.ce_short, self.store.pair.pe_short]:
             if leg.state != LegState.CLOSED:
                 continue
             if leg.reentry_count >= MAX_REENTRIES_PER_LEG:
+                continue
+            if (
+                leg.closed_at is not None
+                and time.time() - leg.closed_at < REENTRY_COOLDOWN_SEC
+            ):
+                continue
+            nifty_key = self._bootstrap_cache.get("nifty_key")
+            spot_stale = (
+                self.store.current_spot_at is None
+                or time.time() - self.store.current_spot_at > STALE_TICK_TIMEOUT_SEC
+            )
+            if spot_stale and self.rest and self.ws and self.ws.connected and nifty_key:
+                try:
+                    spot_quote = await fetch_ltps_async(self.rest, [nifty_key])
+                    if spot_quote.get(nifty_key, 0) > 0:
+                        self.store.current_spot = float(spot_quote[nifty_key])
+                        self.store.current_spot_at = time.time()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("REENTRY spot REST refresh failed: %s", exc)
+            entry_spot = self.store.entry_spot
+            current_spot = self.store.current_spot
+            if (
+                entry_spot <= 0
+                or current_spot <= 0
+                or self.store.current_spot_at is None
+                or time.time() - self.store.current_spot_at > STALE_TICK_TIMEOUT_SEC
+            ):
+                log.warning("REENTRY_SKIPPED: no current spot for leg=%s", leg.leg_id)
+                continue
+            spot_move = abs(current_spot - entry_spot) / entry_spot
+            if spot_move > REENTRY_MAX_SPOT_MOVE_PCT:
+                log.warning(
+                    "REENTRY_SKIPPED: spot boundary leg=%s move=%.2f%% max=%.2f%%",
+                    leg.leg_id, spot_move * 100.0,
+                    REENTRY_MAX_SPOT_MOVE_PCT * 100.0,
+                )
                 continue
             current_vix = self.store.current_vix
             if self.store.original_entry_vix <= 0 or current_vix <= 0:
@@ -2793,8 +3198,36 @@ class Engine:
                 or leg.last_ltp_at is None
                 or time.time() - leg.last_ltp_at > STALE_TICK_TIMEOUT_SEC
             ):
-                log.warning("REENTRY_SKIPPED: stale data for leg=%s", leg.leg_id)
-                continue
+                # A one-shot REST quote is acceptable only while the websocket
+                # is globally connected. During a full feed outage, re-entry
+                # would create a new position without continuous monitoring.
+                if not self.rest or not self.ws or not self.ws.connected:
+                    log.warning(
+                        "REENTRY_SKIPPED: stale data and feed disconnected for leg=%s",
+                        leg.leg_id,
+                    )
+                    continue
+                try:
+                    fresh = await fetch_ltps_async(self.rest, [leg.instrument_key])
+                    fresh_ltp = fresh.get(leg.instrument_key)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "REENTRY_SKIPPED: REST quote failed for leg=%s: %s",
+                        leg.leg_id, exc,
+                    )
+                    continue
+                if fresh_ltp is None or fresh_ltp <= 0:
+                    log.warning(
+                        "REENTRY_SKIPPED: REST quote empty for leg=%s", leg.leg_id
+                    )
+                    continue
+                leg.last_ltp = float(fresh_ltp)
+                leg.last_ltp_at = time.time()
+                leg.data_stale = False
+                log.info(
+                    "REENTRY_REST_REFRESH: leg=%s ltp=%.2f",
+                    leg.leg_id, leg.last_ltp,
+                )
             threshold = leg.fill_price * (1 - REENTRY_MOMENTUM_DISCOUNT)
             if leg.last_ltp < threshold:
                 log.info("REENTRY: leg=%s prior_order_id=%s ltp=%.2f threshold=%.2f",
@@ -2854,6 +3287,14 @@ class Engine:
 
     # ------------------------------------------------------------------ main loop
     async def run(self) -> None:
+        # Live orders require both timezone-explicit exchange time and a host
+        # clock verified against independent NTP sources. Paper mode avoids a
+        # hard dependency on outbound UDP/123 but still uses Asia/Kolkata.
+        if PAPER_TRADING_MODE:
+            log.info("CLOCK_CHECK: skipped in paper mode; market timezone=%s", MARKET_TZ)
+        else:
+            await verify_clock_sync()
+
         # Trading-day guard, checked BEFORE any time-gate/API work: when NSE
         # is closed the option-greek endpoint returns no usable deltas and the
         # websocket carries no ticks, so every downstream stage can only fail
@@ -2861,8 +3302,31 @@ class Engine:
         # Saturday run). Refuse cleanly here instead. The time-gates below do
         # NOT protect us — they are deliberately skip-if-late, and on a closed
         # day the target times are always "already passed".
-        today = datetime.now().date()
-        now_time = datetime.now().time()
+        today = market_now().date()
+        now_time = market_now().time()
+
+        if self.store.unresolved_cached_state:
+            message = (
+                "UNRESOLVED ACTIVE STATE: the SQLite cache indicates a prior "
+                "session ended with active legs. Reconcile broker positions, then "
+                "delete/clear nifty_short_straddle_state.sqlite3 before a new trade."
+            )
+            if not PAPER_TRADING_MODE:
+                raise TradingError(message)
+            log.warning("%s Continuing because this is paper mode.", message)
+
+        calendar_age = (today - HOLIDAY_CALENDAR_REVIEWED_ON).days
+        if calendar_age > HOLIDAY_CALENDAR_MAX_AGE_DAYS:
+            msg = (
+                "HOLIDAY CALENDAR REVIEW OVERDUE: last reviewed %s (%d days ago). "
+                "Check new NSE circulars, update NSE_MARKET_HOLIDAYS / "
+                "NSE_SPECIAL_TRADING_DAYS and HOLIDAY_CALENDAR_REVIEWED_ON. "
+                "Refusing to trade because ad-hoc closures may amend the annual list."
+                % (HOLIDAY_CALENDAR_REVIEWED_ON, calendar_age)
+            )
+            if not ALLOW_NON_TRADING_DAY_RUN:
+                raise TradingError(msg)
+            log.warning("%s Override enabled for testing.", msg)
 
         if not is_nse_trading_day(today):
             if not ALLOW_NON_TRADING_DAY_RUN:
@@ -2913,7 +3377,8 @@ class Engine:
         # wait: stale-by-30-min is worse than stale-by-0.
         await self._wait_until_or_skip(ENTRY_VIX_TIME, label="ENTRY_VIX_TIME(09:15)")
         try:
-            self.bootstrap()
+            async with AsyncRestClient(ACCESS_TOKEN) as bootstrap_rest:
+                await self.bootstrap(bootstrap_rest)
         except TradingError as e:
             log.error("BOOTSTRAP FAILED: %s", e)
             print("ERROR: %s" % e)
@@ -2957,7 +3422,7 @@ class Engine:
 
             # If bootstrap + strike selection were slow and we slipped past the
             # end of the entry window, do not enter late - report and exit.
-            if datetime.now().time() > EXEC_END_TIME:
+            if market_now().time() > EXEC_END_TIME:
                 msg = (
                     "ENTRY WINDOW CLOSED: the clock is now past %s, so entry is "
                     "skipped. No orders were placed." % EXEC_END_TIME.strftime("%H:%M:%S")
@@ -2969,6 +3434,7 @@ class Engine:
                 return
 
             entry_ok = await self.execute_entry()
+            await asyncio.to_thread(self.store.persist_state, True)
             if not entry_ok:
                 log.error(
                     "ENTRY ABORTED — one or more leg pairs did not enter. "
@@ -2984,6 +3450,7 @@ class Engine:
                     self.store.pair.ce_hedge.instrument_key,
                     self.store.pair.pe_hedge.instrument_key,
                     self._bootstrap_cache["vix_key"],
+                    self._bootstrap_cache["nifty_key"],
                 ]
 
             self.loop = asyncio.get_running_loop()
@@ -3067,7 +3534,7 @@ class Engine:
                             self._trigger_kill_switch(reason=f"feed_disconnected_for_{MAX_FEED_DOWNTIME_SEC}s")
                             break
 
-                    if datetime.now().time() >= TIME_EXIT:
+                    if market_now().time() >= TIME_EXIT:
                         await self.time_exit()
                         break
 
@@ -3096,8 +3563,8 @@ class Engine:
                         # websocket does not carry order updates. SL fills
                         # are confirmed by the watch_sl REST poller.
                     if ltp_map:
-                        self._on_tick_local(ltp_map)
-                        self._maybe_reenter()
+                        await self._on_tick_local(ltp_map)
+                        await self._maybe_reenter()
 
                     if self.ws._feed_queue.empty():
                         await asyncio.sleep(0.05)
@@ -3131,11 +3598,11 @@ class Engine:
                                         if _leg.sl_broker_triggered or _leg.state == LegState.CLOSED:
                                             return
                                         if _leg.sl_order_id:
-                                            with contextlib.suppress(Exception):
-                                                await cancel_order_via_upstox(self.rest, _leg.sl_order_id)
-                                        # Final guard before MARKET: only flip
-                                        # the state to CLOSED if we have a
-                                        # fresh fill confirmation.
+                                            already_filled = await self._cancel_sl_or_confirm_fill(_leg)
+                                            if already_filled:
+                                                return
+                                        # Final guard before MARKET: the SL
+                                        # must be terminal-cancelled or filled.
                                         if _leg.state == LegState.CLOSED or _leg.sl_broker_triggered:
                                             return
                                         try:
@@ -3201,10 +3668,12 @@ class Engine:
         # edge case where the feed never delivered any ticks, so the report
         # still shows the PnL implied by fill prices vs. the last known price.
         self.store.compute_mtm()
+        await asyncio.to_thread(self.store.persist_state, True)
         # Persist the per-session summary.
         self._write_paper_summary()
         # Layman-friendly daily scoreboard (cumulative across days).
         self._write_performance_report()
+        await flush_file_io()
 
     def _write_paper_summary(self) -> None:
         if not PAPER_TRADING_MODE:
@@ -3320,7 +3789,7 @@ class Engine:
         )
 
     async def _wait_until(self, t: dtime) -> None:
-        while datetime.now().time() < t:
+        while market_now().time() < t:
             await asyncio.sleep(0.5)
 
     async def _wait_until_or_skip(self, t: dtime, label: str = "") -> None:
@@ -3336,7 +3805,7 @@ class Engine:
         already fetched, and delaying execution makes the strategy miss
         the next timing window.
         """
-        now = datetime.now().time()
+        now = market_now().time()
         if now >= t:
             log.warning(
                 "TIME_GATE_SKIPPED: %s already passed (now=%s target=%s) — "
@@ -3345,7 +3814,7 @@ class Engine:
             )
             return
         log.info("TIME_GATE: waiting until %s (now=%s)", label or t, now)
-        while datetime.now().time() < t:
+        while market_now().time() < t:
             await asyncio.sleep(0.5)
 
 
@@ -3491,6 +3960,11 @@ def main() -> None:
             pass
         _run_emergency_square_off()
     finally:
+        try:
+            if not loop.is_closed():
+                loop.run_until_complete(flush_file_io())
+        except Exception:
+            log.exception("Could not flush pending file writes")
         try:
             engine.store.close()
         except Exception:
