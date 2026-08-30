@@ -21,10 +21,12 @@ Strategy
 - 09:19:30 - 09:20:30: Hedged execution. Place hedge long legs first
   (LIMIT BUY @ ask + slippage). If a hedge leg does not fill within
   HEDGE_FILL_TIMEOUT_SEC, cancel, re-price once, retry once; on second
-  timeout ABORT the leg pair (never naked short).
+  timeout ABORT the leg pair (never naked short). Core shorts also use
+  crossing LIMIT orders with one fresh-quote chase; entries never use MARKET.
 - 09:20:30 onward: Tick engine via MarketDataStreamerV3. Broker-side SL-L
   stop with local fast-acting duplicate. MTM trailing lock. Kill-switch on
-  loss, trail breach, sustained feed outage, or 15:15 time exit.
+  loss, trail breach, sustained feed outage, 15:00 expiry-day exit, or 15:15
+  exit on other sessions.
 
 Engineering guarantees
 ----------------------
@@ -33,7 +35,7 @@ Engineering guarantees
 - v2 is used for orders, positions, quotes and option-chain; v3 for option
   greeks and MarketDataStreamerV3. No v1 endpoints are used.
 - Paper mode simulates fills against current tick with
-  PAPER_SLIPPAGE_MODEL_BPS, never zero slippage, and writes
+  leg-specific core/hedge slippage with a minimum hedge tick cost and writes
   paper_trading_log.csv + paper_trading_summary.csv.
 - CSV writes and high-frequency MTM/state persistence run off-loop. Active
   leg/risk state is cached in SQLite for crash diagnostics and restart guards.
@@ -218,23 +220,31 @@ HEDGE_DELTA_TOLERANCE = 0.025
 HEDGE_LIMIT_SLIPPAGE_TICKS = 5
 HEDGE_LIMIT_SLIPPAGE_TICKS_RETRY = 10
 HEDGE_FILL_TIMEOUT_SEC = 20
+CORE_LIMIT_SLIPPAGE_TICKS = 5
+CORE_LIMIT_SLIPPAGE_TICKS_RETRY = 10
+CORE_FILL_TIMEOUT_SEC = 10
 ORDER_FILL_TIMEOUT_SEC = 15
 SL_IDLE_POLL_INTERVAL_SEC = 10.0
+SL_CANCEL_CONFIRM_TIMEOUT_SEC = 30.0
+SL_CANCEL_RETRY_INTERVAL_SEC = 2.0
 REENTRY_COOLDOWN_SEC = 300
 REENTRY_MAX_SPOT_MOVE_PCT = 0.01
 
 # Risk
-SL_PERCENT = 0.30
-REENTRY_MOMENTUM_DISCOUNT = 0.03
+SL_BASE_PERCENT = 0.30
+SL_REFERENCE_VIX = 14.0
+SL_MIN_PERCENT = 0.18
+SL_MAX_PERCENT = 0.40
+REENTRY_MOMENTUM_DISCOUNT = 0.10
 REENTRY_VIX_GUARD_PCT = 0.15
 MAX_REENTRIES_PER_LEG = 1
 
 MAX_DAILY_LOSS = -3000
 TRAIL_START_PROFIT = 2000
-TRAIL_RETAIN_PCT = 0.50  # continuously lock 50% of peak MTM profit
+TRAIL_RETAIN_PCT = 0.65  # continuously lock 50% of peak MTM profit
 
 SL_LIMIT_BUFFER_POINTS_MIN = 5.0   # hard floor — never less than 5 points
-# VIX-adaptive buffer. Earlier version used `PCT * (fill * SL_PERCENT)`
+# VIX-adaptive buffer. Earlier version used `PCT * stop_gap`
 # but the user's audit correctly identified that for our selection band
 # (premium 75-130) the PCT*gap term was <5, so the floor won and the
 # adaptive scaling was dead weight in practice.
@@ -278,13 +288,23 @@ STALE_TICK_TIMEOUT_SEC = 10
 MAX_FEED_DOWNTIME_SEC = 30
 MAX_RECONNECT_ATTEMPTS = 5
 
-PAPER_SLIPPAGE_MODEL_BPS = 20  # conservative default for weekly option spreads
-MARGIN_SAFETY_MULTIPLIER = 1.10  # require 10% headroom over broker estimate
+PAPER_CORE_SLIPPAGE_BPS = 20
+PAPER_HEDGE_SLIPPAGE_BPS = 100
+PAPER_HEDGE_MIN_SLIPPAGE_TICKS = 1
+MARGIN_SAFETY_MULTIPLIER_BASE = 1.10
+MARGIN_SAFETY_MULTIPLIER_MAX = 1.30
+MARGIN_SAFETY_VIX_REFERENCE = 14.0
+MARGIN_SAFETY_PER_VIX_POINT = 0.01
 WS_FEED_QUEUE_MAXSIZE = 5000
 NTP_SERVERS = ("0.in.pool.ntp.org", "1.in.pool.ntp.org", "time.google.com")
 NTP_QUERY_TIMEOUT_SEC = 3.0
 NTP_MAX_CLOCK_OFFSET_SEC = 0.5
 NTP_MAX_RTT_SEC = 1.5
+RATE_LIMIT_MAX_COOLDOWN_SEC = 60.0
+SQLITE_BUSY_TIMEOUT_SEC = 0.25
+RECONNECT_STABLE_UPTIME_SEC = 120.0
+RECONNECT_FLAP_WINDOW_SEC = 300.0
+MAX_RECONNECT_FLAPS_IN_WINDOW = 5
 
 # Session timing (24h)
 ENTRY_VIX_TIME = dtime(9, 15)
@@ -292,6 +312,7 @@ STRIKE_SELECT_TIME = dtime(9, 19)
 EXEC_START_TIME = dtime(9, 19, 30)
 EXEC_END_TIME = dtime(9, 20, 30)
 TIME_EXIT = dtime(15, 15)
+EXPIRY_DAY_TIME_EXIT = dtime(15, 0)
 
 # REST endpoints (v2/v3 only — no v1 anywhere)
 UPSTOX_BASE_V2 = "https://api.upstox.com/v2"
@@ -555,6 +576,8 @@ def _layman_exit_reason(reason: str) -> str:
     r = (reason or "").lower()
     if not r or r == "session_end":
         return "Session ended"
+    if "time_exit_1500" in r:
+        return "Expiry-day square-off at 3:00 PM"
     if "time_exit" in r:
         return "Square-off at 3:15 PM (normal close)"
     if "max_daily_loss" in r:
@@ -709,6 +732,7 @@ class Leg:
     sl_fill_pending: bool = False  # broker reports triggered/open, not terminal
     sl_escalation_in_flight: bool = False  # dedup SL-escalate-to-MARKET
     sl_trigger_price: Optional[float] = None  # broker SL-L trigger level
+    sl_percent: Optional[float] = None  # VIX-scaled trigger percentage
     sl_limit_price: Optional[float] = None  # broker SL-L limit level (trigger + adaptive buffer)
     sl_limit_buffer: Optional[float] = None  # adaptive buffer that was applied at SL placement
     exit_in_flight: bool = False  # dedup _enqueue_exit_due_to_local_sl — see
@@ -950,12 +974,20 @@ async def fetch_option_greeks_async(
 # ============================================================================
 # Paper trading slippage
 # ============================================================================
-def paper_fill(side: str, ref_price: float, slip_bps: int = PAPER_SLIPPAGE_MODEL_BPS) -> float:
-    """Simulate a fill with slippage against the current tick price."""
-    slip = ref_price * (slip_bps / 10_000.0)
+def paper_fill(
+    side: str,
+    ref_price: float,
+    slip_bps: int = PAPER_CORE_SLIPPAGE_BPS,
+    min_slippage_ticks: int = 0,
+) -> float:
+    """Simulate adverse fill slippage with an optional absolute tick floor."""
+    slip = max(
+        ref_price * (slip_bps / 10_000.0),
+        min_slippage_ticks * TICK_SIZE,
+    )
     if side.upper() in ("BUY", "LONG"):
         return round(ref_price + slip, 2)
-    return round(ref_price - slip, 2)
+    return round(max(TICK_SIZE, ref_price - slip), 2)
 
 
 # ============================================================================
@@ -967,6 +999,8 @@ class AsyncRestClient:
     def __init__(self, token: str):
         self._token = token
         self._session: Optional[aiohttp.ClientSession] = None
+        self._rate_limited_until: float = 0.0
+        self._rate_limit_strikes: int = 0
 
     async def __aenter__(self) -> "AsyncRestClient":
         self._session = aiohttp.ClientSession(
@@ -981,6 +1015,36 @@ class AsyncRestClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _wait_for_rate_limit_circuit(self) -> None:
+        delay = self._rate_limited_until - time.monotonic()
+        if delay > 0:
+            log.warning("REST_RATE_LIMIT_CIRCUIT_OPEN: sleeping %.2fs", delay)
+            await asyncio.sleep(delay)
+
+    def _trip_rate_limit_circuit(self, response: Any) -> float:
+        self._rate_limit_strikes += 1
+        retry_after = 0.0
+        try:
+            retry_after = float(response.headers.get("Retry-After", "0") or 0)
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        cooldown = min(
+            RATE_LIMIT_MAX_COOLDOWN_SEC,
+            max(retry_after, 2.0 ** min(self._rate_limit_strikes, 6)),
+        )
+        self._rate_limited_until = max(
+            self._rate_limited_until, time.monotonic() + cooldown
+        )
+        log.critical(
+            "REST_HTTP_429: circuit opened for %.1fs strike=%d",
+            cooldown, self._rate_limit_strikes,
+        )
+        return cooldown
+
+    def _record_rest_success(self) -> None:
+        if time.monotonic() >= self._rate_limited_until:
+            self._rate_limit_strikes = 0
+
     async def get(
         self,
         url: str,
@@ -988,17 +1052,29 @@ class AsyncRestClient:
         timeout_sec: float = 20.0,
         retries: int = 0,
     ) -> Dict[str, Any]:
-        """Non-blocking GET with bounded retry/backoff."""
+        """Non-blocking GET with retries and a shared HTTP-429 circuit."""
         assert self._session
         for attempt in range(retries + 1):
+            await self._wait_for_rate_limit_circuit()
             try:
                 async with self._session.get(
                     url,
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=timeout_sec),
                 ) as response:
+                    if response.status == 429:
+                        cooldown = self._trip_rate_limit_circuit(response)
+                        if attempt >= retries:
+                            raise TradingError(
+                                f"Upstox HTTP 429; REST circuit open for {cooldown:.1f}s"
+                            )
+                        continue
                     response.raise_for_status()
-                    return await response.json()
+                    payload = await response.json()
+                    self._record_rest_success()
+                    return payload
+            except TradingError:
+                raise
             except Exception:
                 if attempt >= retries:
                     raise
@@ -1007,17 +1083,37 @@ class AsyncRestClient:
 
     async def post(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         assert self._session
+        await self._wait_for_rate_limit_circuit()
         async with self._session.post(
             url, json=payload, timeout=aiohttp.ClientTimeout(total=20)
-        ) as r:
-            r.raise_for_status()
-            return await r.json()
+        ) as response:
+            if response.status == 429:
+                cooldown = self._trip_rate_limit_circuit(response)
+                raise TradingError(
+                    f"Upstox HTTP 429 on POST; circuit open for {cooldown:.1f}s"
+                )
+            response.raise_for_status()
+            result = await response.json()
+            self._record_rest_success()
+            return result
 
-    async def delete(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def delete(
+        self, url: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         assert self._session
-        async with self._session.delete(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
-            r.raise_for_status()
-            return await r.json()
+        await self._wait_for_rate_limit_circuit()
+        async with self._session.delete(
+            url, params=params, timeout=aiohttp.ClientTimeout(total=20)
+        ) as response:
+            if response.status == 429:
+                cooldown = self._trip_rate_limit_circuit(response)
+                raise TradingError(
+                    f"Upstox HTTP 429 on DELETE; circuit open for {cooldown:.1f}s"
+                )
+            response.raise_for_status()
+            result = await response.json()
+            self._record_rest_success()
+            return result
 
 
 @dataclass
@@ -1389,6 +1485,16 @@ async def exit_all_positions(rest: AsyncRestClient) -> ExitAllResult:
 # ============================================================================
 # Strategy helpers
 # ============================================================================
+def register_reconnect_flap(timestamps: List[float], now: float) -> bool:
+    """Record a disconnect and report whether the rolling flap limit broke."""
+    timestamps[:] = [
+        stamp for stamp in timestamps
+        if now - stamp <= RECONNECT_FLAP_WINDOW_SEC
+    ]
+    timestamps.append(now)
+    return len(timestamps) > MAX_RECONNECT_FLAPS_IN_WINDOW
+
+
 def is_nse_trading_day(day: date) -> bool:
     """Apply the pinned NSE calendar, including announced special sessions.
 
@@ -1418,6 +1524,25 @@ def select_delta_premium_bands(vix: float) -> Tuple[float, float, float, float]:
     if vix > HIGH_VIX_THRESHOLD:
         return MIN_DELTA_HIVIX, MAX_DELTA_HIVIX, MIN_PREMIUM, MAX_PREMIUM
     return MIN_DELTA, MAX_DELTA, MIN_PREMIUM, MAX_PREMIUM
+
+
+def margin_safety_multiplier_for_vix(vix: float) -> float:
+    """Increase capital headroom as VIX rises, capped at 30%."""
+    if vix <= 0:
+        return MARGIN_SAFETY_MULTIPLIER_MAX
+    extra = max(0.0, vix - MARGIN_SAFETY_VIX_REFERENCE)
+    return min(
+        MARGIN_SAFETY_MULTIPLIER_MAX,
+        MARGIN_SAFETY_MULTIPLIER_BASE + extra * MARGIN_SAFETY_PER_VIX_POINT,
+    )
+
+
+def stop_loss_percent_for_vix(vix: float) -> float:
+    """Inverse-VIX SL trigger, clamped to prevent pathological thresholds."""
+    if vix <= 0:
+        raise TradingError(f"Cannot calculate stop percentage from VIX={vix}")
+    scaled = SL_BASE_PERCENT * SL_REFERENCE_VIX / vix
+    return max(SL_MIN_PERCENT, min(scaled, SL_MAX_PERCENT))
 
 
 def update_trail(store: "StateStore", mtm: float, log_csv_path: str,
@@ -1619,7 +1744,7 @@ class StateStore:
 
     def _init_state_db(self) -> None:
         try:
-            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=3.0)) as conn:
+            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_SEC)) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(
                     """CREATE TABLE IF NOT EXISTS state_snapshot (
@@ -1636,7 +1761,7 @@ class StateStore:
 
     def _warn_if_unresolved_snapshot(self) -> None:
         try:
-            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=3.0)) as conn:
+            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_SEC)) as conn:
                 row = conn.execute(
                     "SELECT updated_at, session_date, payload_json "
                     "FROM state_snapshot WHERE id=1 AND active=1"
@@ -1690,6 +1815,8 @@ class StateStore:
                     "state": leg.state.value,
                     "order_id": leg.order_id,
                     "sl_order_id": leg.sl_order_id,
+                    "sl_percent": leg.sl_percent,
+                    "sl_trigger_price": leg.sl_trigger_price,
                     "fill_price": leg.fill_price,
                     "exit_price": leg.exit_price,
                     "realized_pnl": leg.realized_pnl,
@@ -1701,7 +1828,7 @@ class StateStore:
             ],
         }
         try:
-            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=3.0)) as conn:
+            with contextlib.closing(sqlite3.connect(STATE_DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_SEC)) as conn:
                 conn.execute(
                     """INSERT INTO state_snapshot
                            (id, updated_at, session_date, active, payload_json)
@@ -1968,10 +2095,33 @@ class Engine:
         self._stopped = False
         self._kill_switch_done = asyncio.Event()
         self._kill_switch_error: Optional[Exception] = None
+        self._state_persist_task: Optional[asyncio.Task[Any]] = None
         self._bootstrap_cache: Dict[str, Any] = {}
         # Paper CSV paths (used when PAPER_TRADING_MODE)
         self.paper_log_csv = PAPER_TRADE_LOG_CSV
         self.paper_summary_csv = PAPER_TRADE_SUMMARY_CSV
+
+    def _schedule_state_persist(self) -> None:
+        """Coalesce snapshots so SQLite contention never stalls tick handling."""
+        if self._state_persist_task and not self._state_persist_task.done():
+            return
+        self._state_persist_task = asyncio.create_task(
+            asyncio.to_thread(self.store.persist_state)
+        )
+
+        def report_failure(task: "asyncio.Task[Any]") -> None:
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                log.error("Background state persistence failed: %s", error)
+
+        self._state_persist_task.add_done_callback(report_failure)
+
+    async def _flush_state_persist(self) -> None:
+        if self._state_persist_task and not self._state_persist_task.done():
+            await self._state_persist_task
+        await asyncio.to_thread(self.store.persist_state, True)
 
     # ------------------------------------------------------------------ bootstrap
     async def bootstrap(self, rest: AsyncRestClient) -> None:
@@ -2018,17 +2168,17 @@ class Engine:
         self.store.original_entry_vix = self.store.entry_vix
         self.store.current_vix = self.store.entry_vix
         if isinstance(spot_result, BaseException):
-            log.error(
-                "entry_spot fetch failed; SL buffer will use static MIN: %s",
-                spot_result,
+            raise TradingError(
+                "NIFTY spot bootstrap failed; adaptive SL protection cannot be "
+                f"sized safely, so entry is refused: {spot_result}"
             )
-            self.store.entry_spot = 0.0
-            self.store.current_spot = 0.0
-            self.store.current_spot_at = None
-        else:
-            self.store.entry_spot = float(spot_result)
-            self.store.current_spot = self.store.entry_spot
-            self.store.current_spot_at = time.time()
+        self.store.entry_spot = float(spot_result)
+        if self.store.entry_spot <= 0:
+            raise TradingError(
+                f"NIFTY spot bootstrap returned invalid value {self.store.entry_spot}"
+            )
+        self.store.current_spot = self.store.entry_spot
+        self.store.current_spot_at = time.time()
 
         chain = chain_result
         candidate_keys = [r["instrument_key"] for r in chain]
@@ -2130,21 +2280,28 @@ class Engine:
             leg.state = LegState.HEDGE_PLACED
             leg.order_id = f"PAPER-{leg.leg_id}-{int(time.time() * 1000)}"
             await asyncio.sleep(0.05)
-            sim_fill = paper_fill("BUY", ref_price)
+            sim_fill = min(price, paper_fill(
+                    "BUY", ref_price,
+                    slip_bps=PAPER_HEDGE_SLIPPAGE_BPS,
+                    min_slippage_ticks=PAPER_HEDGE_MIN_SLIPPAGE_TICKS,
+                ))
             leg.fill_price = sim_fill
             leg.entry_value_total += sim_fill * leg.qty
             leg.state = LegState.HEDGE_FILLED
             leg.filled_at = time.time()
             log.info(
                 "HEDGE_FILLED: leg=%s order_id=%s fill=%.2f (paper, ref=%.2f slip_bps=%d)",
-                leg.leg_id, leg.order_id, sim_fill, ref_price, PAPER_SLIPPAGE_MODEL_BPS,
+                leg.leg_id, leg.order_id, sim_fill, ref_price, PAPER_HEDGE_SLIPPAGE_BPS,
             )
             write_fill(leg, "HEDGE_FILL")
             log_event(
                 self.paper_log_csv, "HEDGE_FILL", leg,
                 order_side="BUY", simulated_price=sim_fill, ltp_at_event=ref_price,
                 entry_vix=self.store.entry_vix, running_total_mtm=self.store.total_mtm,
-                trail_lock=self.store.trail_lock, notes=f"slip_bps={PAPER_SLIPPAGE_MODEL_BPS}",
+                trail_lock=self.store.trail_lock, notes=(
+                    f"slip_bps={PAPER_HEDGE_SLIPPAGE_BPS};"
+                    f"min_ticks={PAPER_HEDGE_MIN_SLIPPAGE_TICKS}"
+                ),
                 session_date=self.store.pair.session_date if self.store.pair else "",
             )
             return True
@@ -2245,95 +2402,224 @@ class Engine:
             leg, retry_ref, retry_ticks, timeout_sec=timeout_sec, retry_ticks=None,
         )
 
-    async def _place_market_sell(self, leg: Leg) -> bool:
-        assert self.rest
+    async def _place_limit_sell_with_timeout(
+        self,
+        leg: Leg,
+        ref_price: float,
+        slippage_ticks: int = CORE_LIMIT_SLIPPAGE_TICKS,
+        timeout_sec: int = CORE_FILL_TIMEOUT_SEC,
+        retry_ticks: Optional[int] = CORE_LIMIT_SLIPPAGE_TICKS_RETRY,
+    ) -> bool:
+        """Crossing LIMIT SELL with one fresh-quote chase; never MARKET entry."""
+        assert self.rest and self.worker
+        price = max(TICK_SIZE, round(ref_price - slippage_ticks * TICK_SIZE, 2))
+
         if PAPER_TRADING_MODE:
             leg.placed_at = time.time()
             leg.state = LegState.CORE_PLACED
             leg.order_id = f"PAPER-{leg.leg_id}-{int(time.time() * 1000)}"
-            ref = leg.last_ltp or 0.0
-            sim_fill = paper_fill("SELL", ref) if ref > 0 else 0.0
+            sim_fill = (
+                max(price, paper_fill("SELL", ref_price))
+                if ref_price > 0 else 0.0
+            )
+            if sim_fill <= 0:
+                return False
             leg.fill_price = sim_fill
             leg.entry_value_total += sim_fill * leg.qty
             leg.exit_price = None
             leg.closed_at = None
             leg.state = LegState.CORE_FILLED
             leg.filled_at = time.time()
-            log.info("CORE_FILLED: leg=%s order_id=%s fill=%.2f (paper, ref=%.2f)",
-                     leg.leg_id, leg.order_id, sim_fill, ref)
-            write_fill(leg, "CORE_FILL")
+            log.info(
+                "CORE_LIMIT_FILLED: leg=%s order_id=%s fill=%.2f "
+                "(paper, limit=%.2f ref=%.2f)",
+                leg.leg_id, leg.order_id, sim_fill, price, ref_price,
+            )
+            write_fill(leg, "CORE_LIMIT_FILL")
             log_event(
-                self.paper_log_csv, "CORE_FILL", leg,
-                order_side="SELL", simulated_price=sim_fill, ltp_at_event=ref,
-                entry_vix=self.store.entry_vix, running_total_mtm=self.store.total_mtm,
+                self.paper_log_csv, "CORE_LIMIT_FILL", leg,
+                order_side="SELL", simulated_price=sim_fill,
+                ltp_at_event=ref_price, entry_vix=self.store.entry_vix,
+                running_total_mtm=self.store.total_mtm,
                 trail_lock=self.store.trail_lock,
                 session_date=self.store.pair.session_date if self.store.pair else "",
             )
             return True
 
+        result: Dict[str, Any] = {
+            "filled": False, "px": 0.0, "oid": None, "cancelled": False
+        }
         done = asyncio.Event()
-        result: Dict[str, Any] = {"ok": False}
 
-        async def place():
-            resp = await place_order_via_upstox(
-                self.rest,
-                instrument_key=leg.instrument_key, side="SELL", qty=leg.qty,
-                order_type="MARKET", price=0.0, trigger_price=None,
-                tag=f"CORE_{leg.leg_id}",
+        async def place_and_poll() -> None:
+            response = await place_order_via_upstox(
+                self.rest, leg.instrument_key, "SELL", leg.qty,
+                "LIMIT", price, None, f"CORE_LIMIT_{leg.leg_id}",
             )
-            leg.order_id = resp["data"]["order_id"]
-            fill = await wait_for_order_fill(self.rest, leg.order_id)
-            if fill is None:
-                raise TradingError(
-                    f"Broker reported core fill without average price: {leg.order_id}"
+            order_id = response.get("data", {}).get("order_id")
+            if not order_id:
+                raise TradingError(f"No order_id for core LIMIT {leg.leg_id}")
+            order_id = str(order_id)
+            result["oid"] = order_id
+            leg.order_id = order_id
+            leg.placed_at = time.time()
+            leg.state = LegState.CORE_PLACED
+            log.info(
+                "CORE_LIMIT_PLACED: leg=%s order_id=%s limit=%.2f ref=%.2f",
+                leg.leg_id, order_id, price, ref_price,
+            )
+            deadline = time.monotonic() + timeout_sec
+            while time.monotonic() < deadline:
+                snapshot = _order_snapshot(
+                    await get_order_status(self.rest, order_id)
                 )
-            leg.fill_price = fill
-            leg.entry_value_total += fill * leg.qty
+                status = " ".join(
+                    str(snapshot.get("status") or "").lower()
+                    .replace("_", " ").split()
+                )
+                if status in ("complete", "filled", "traded"):
+                    average = float(snapshot.get("average_price") or 0.0)
+                    if average <= 0:
+                        raise TradingError(
+                            f"Core LIMIT {order_id} filled without average_price"
+                        )
+                    result["filled"] = True
+                    result["px"] = average
+                    return
+                if status in ("cancelled", "canceled", "rejected"):
+                    result["cancelled"] = True
+                    return
+                await asyncio.sleep(0.4)
+
+        async def on_done(_: Any) -> None:
+            done.set()
+
+        async def on_error(_: Exception) -> None:
+            done.set()
+
+        order_task = self.worker.submit(OrderTask(
+            name=f"core_limit_{leg.leg_id}",
+            coro_factory=place_and_poll,
+            on_done=on_done,
+            on_error=on_error,
+        ))
+        try:
+            await asyncio.wait_for(done.wait(), timeout=timeout_sec + 2.0)
+        except asyncio.TimeoutError:
+            log.error("CORE_LIMIT_TASK_TIMEOUT: leg=%s", leg.leg_id)
+            order_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await order_task
+
+        order_id = result.get("oid")
+        if not result["filled"] and order_id and not result["cancelled"]:
+            # A retry is safe only after the prior sell is confirmed cancelled.
+            with contextlib.suppress(Exception):
+                await cancel_order_via_upstox(self.rest, order_id)
+            cancel_deadline = time.monotonic() + ORDER_FILL_TIMEOUT_SEC
+            while time.monotonic() < cancel_deadline:
+                try:
+                    snapshot = _order_snapshot(
+                        await get_order_status(self.rest, order_id)
+                    )
+                    status = " ".join(
+                        str(snapshot.get("status") or "").lower()
+                        .replace("_", " ").split()
+                    )
+                    if status in ("complete", "filled", "traded"):
+                        average = float(snapshot.get("average_price") or 0.0)
+                        if average <= 0:
+                            raise TradingError(
+                                f"Core LIMIT {order_id} filled without average_price"
+                            )
+                        result["filled"] = True
+                        result["px"] = average
+                        break
+                    if status in ("cancelled", "canceled", "rejected"):
+                        result["cancelled"] = True
+                        break
+                except TradingError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "CORE_LIMIT_CANCEL_STATUS_RETRY: order=%s error=%s",
+                        order_id, exc,
+                    )
+                await asyncio.sleep(0.25)
+            if not result["filled"] and not result["cancelled"]:
+                raise TradingError(
+                    f"Core LIMIT {order_id} remained non-terminal; refusing "
+                    "a duplicate sell retry"
+                )
+
+        if result["filled"]:
+            leg.fill_price = float(result["px"])
+            leg.entry_value_total += leg.fill_price * leg.qty
             leg.exit_price = None
             leg.closed_at = None
             leg.state = LegState.CORE_FILLED
             leg.filled_at = time.time()
-            result["ok"] = True
-            log.info("CORE_FILLED: leg=%s order_id=%s fill=%.2f",
-                     leg.leg_id, leg.order_id, leg.fill_price)
-            write_fill(leg, "CORE_FILL")
+            log.info(
+                "CORE_LIMIT_FILLED: leg=%s order_id=%s fill=%.2f",
+                leg.leg_id, leg.order_id, leg.fill_price,
+            )
+            write_fill(leg, "CORE_LIMIT_FILL")
             log_event(
-                self.paper_log_csv, "CORE_FILL", leg,
-                order_side="SELL", simulated_price=leg.fill_price, ltp_at_event=leg.last_ltp,
-                entry_vix=self.store.entry_vix, running_total_mtm=self.store.total_mtm,
+                self.paper_log_csv, "CORE_LIMIT_FILL", leg,
+                order_side="SELL", simulated_price=leg.fill_price,
+                ltp_at_event=ref_price, entry_vix=self.store.entry_vix,
+                running_total_mtm=self.store.total_mtm,
                 trail_lock=self.store.trail_lock,
                 session_date=self.store.pair.session_date if self.store.pair else "",
             )
+            return True
 
-        async def on_done(_): done.set()
-        async def on_err(_): done.set()
-
-        order_task = self.worker.submit(
-            OrderTask(name=f"place_core_{leg.leg_id}", coro_factory=place,
-                      on_done=on_done, on_error=on_err)
-        )
-        try:
-            await asyncio.wait_for(
-                done.wait(), timeout=ORDER_FILL_TIMEOUT_SEC + 2.0
+        if retry_ticks is None:
+            leg.state = LegState.ABORTED
+            log.warning(
+                "ABORT:core_limit_unfilled leg=%s order_id=%s", leg.leg_id, order_id
             )
-        except asyncio.TimeoutError:
-            log.error("CORE_PLACE_TIMEOUT: leg=%s", leg.leg_id)
-            order_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await order_task
-        return result["ok"]
+            return False
+
+        fresh = await fetch_ltps_async(self.rest, [leg.instrument_key])
+        retry_ref = fresh.get(leg.instrument_key)
+        if retry_ref is None or retry_ref <= 0:
+            leg.state = LegState.ABORTED
+            log.error("ABORT:no_fresh_core_quote_for_retry leg=%s", leg.leg_id)
+            return False
+        leg.last_ltp = float(retry_ref)
+        leg.last_ltp_at = time.time()
+        leg.data_stale = False
+        return await self._place_limit_sell_with_timeout(
+            leg,
+            ref_price=float(retry_ref),
+            slippage_ticks=retry_ticks,
+            timeout_sec=timeout_sec,
+            retry_ticks=None,
+        )
 
     async def _place_broker_sl(self, leg: Leg) -> None:
         """Broker-side SL-L (NSE rejects SL-M on options).
-        Buffer is adaptive: scales with the trigger-to-fill gap, so a
-        flash crash that gaps the option through 5 points can still hit
-        a wider limit. See SL_LIMIT_BUFFER_POINTS_MIN/PCT/MAX in config.
+        Trigger percentage scales inversely with VIX and the SL-L limit
+        buffer scales with VIX × spot. Both values are frozen on the leg.
         """
         if leg.kind != LegKind.CORE_SHORT or leg.fill_price is None:
             return
         assert self.rest
-        trigger = round(leg.fill_price * (1 + SL_PERCENT), 2)
-        buffer = self._compute_sl_buffer(leg)
+        risk_vix = self.store.current_vix or self.store.entry_vix
+        sl_percent = stop_loss_percent_for_vix(risk_vix)
+        trigger = round(leg.fill_price * (1 + sl_percent), 2)
+        leg.sl_percent = sl_percent
+        try:
+            buffer = self._compute_sl_buffer(leg)
+        except TradingError:
+            log.critical(
+                "SL_BUFFER_INVALID: immediately closing newly entered leg=%s",
+                leg.leg_id,
+                exc_info=True,
+            )
+            await self._exit_leg_market(leg, f"EXIT_SL_BUFFER_INVALID_{leg.leg_id}")
+            raise
         limit = round(trigger + buffer, 2)
         leg.sl_trigger_price = trigger
         leg.sl_limit_buffer = buffer  # type: ignore[attr-defined]
@@ -2342,15 +2628,15 @@ class Engine:
         if PAPER_TRADING_MODE:
             leg.sl_order_id = f"PAPER-SL-{leg.leg_id}-{int(time.time() * 1000)}"
             leg.state = LegState.SL_PLACED
-            log.info("[PAPER] SL_PLACED: leg=%s trigger=%.2f limit=%.2f buffer=%.2f",
-                     leg.leg_id, trigger, limit, buffer)
+            log.info("[PAPER] SL_PLACED: leg=%s trigger=%.2f limit=%.2f buffer=%.2f sl_pct=%.1f%%",
+                     leg.leg_id, trigger, limit, buffer, sl_percent * 100.0)
             log_event(
                 self.paper_log_csv, "SL_PLACED", leg,
                 order_side="BUY", simulated_price=limit, ltp_at_event=leg.last_ltp,
                 entry_vix=self.store.entry_vix, sl_trigger_price=trigger,
                 running_total_mtm=self.store.total_mtm, trail_lock=self.store.trail_lock,
                 session_date=self.store.pair.session_date if self.store.pair else "",
-                notes=f"buffer={buffer:.2f}pts",
+                notes=f"buffer={buffer:.2f}pts;sl_pct={sl_percent:.4f}",
             )
             return
 
@@ -2365,15 +2651,16 @@ class Engine:
             )
             leg.sl_order_id = resp["data"]["order_id"]
             leg.state = LegState.SL_PLACED
-            log.info("SL_PLACED: leg=%s order_id=%s trigger=%.2f limit=%.2f buffer=%.2f",
-                     leg.leg_id, leg.sl_order_id, trigger, limit, buffer)
+            log.info("SL_PLACED: leg=%s order_id=%s trigger=%.2f limit=%.2f buffer=%.2f sl_pct=%.1f%%",
+                     leg.leg_id, leg.sl_order_id, trigger, limit, buffer,
+                     sl_percent * 100.0)
             log_event(
                 self.paper_log_csv, "SL_PLACED", leg,
                 order_side="BUY", simulated_price=limit, ltp_at_event=leg.last_ltp,
                 entry_vix=self.store.entry_vix, sl_trigger_price=trigger,
                 running_total_mtm=self.store.total_mtm, trail_lock=self.store.trail_lock,
                 session_date=self.store.pair.session_date if self.store.pair else "",
-                notes=f"buffer={buffer:.2f}pts",
+                notes=f"buffer={buffer:.2f}pts;sl_pct={sl_percent:.4f}",
             )
             # Kick off the broker SL fill watcher. Two-phase polling,
             # rate-limit aware (see comment block on the watcher below).
@@ -2566,9 +2853,12 @@ class Engine:
                 await order_task
 
     async def _validate_entry_margin(
-        self, legs: List[Leg], prices: Dict[str, float]
+        self,
+        legs: List[Leg],
+        prices: Dict[str, float],
+        context: str = "ENTRY",
     ) -> None:
-        """Fail closed unless available SEC margin covers basket estimate + buffer."""
+        """Fail closed unless available margin covers a VIX-buffered estimate."""
         if PAPER_TRADING_MODE:
             log.info("[PAPER] margin preflight skipped (no broker capital at risk)")
             return
@@ -2599,7 +2889,9 @@ class Engine:
                 "available_margin", 0.0
             )
         )
-        minimum = required * MARGIN_SAFETY_MULTIPLIER
+        risk_vix = self.store.current_vix or self.store.entry_vix
+        multiplier = margin_safety_multiplier_for_vix(risk_vix)
+        minimum = required * multiplier
         if required <= 0 or available <= 0:
             raise TradingError(
                 "MARGIN CHECK FAILED: broker returned missing/zero required or "
@@ -2611,18 +2903,24 @@ class Engine:
                 "required with %.0f%% safety buffer Rs %.2f"
                 % (
                     available, required,
-                    (MARGIN_SAFETY_MULTIPLIER - 1.0) * 100.0, minimum,
+                    (multiplier - 1.0) * 100.0, minimum,
                 )
             )
         log.info(
-            "MARGIN_CHECK_OK: available=%.2f estimated=%.2f buffered=%.2f",
-            available, required, minimum,
+            "MARGIN_CHECK_OK: context=%s vix=%.2f multiplier=%.3f "
+            "available=%.2f estimated=%.2f buffered=%.2f",
+            context, risk_vix, multiplier, available, required, minimum,
         )
 
     async def execute_entry(self) -> bool:
         log.info("=== 09:19:30 EXECUTION WINDOW OPEN ===")
         assert self.store.pair
         pair = self.store.pair
+        if pair.entry_spot <= 0 or pair.entry_vix <= 0:
+            raise TradingError(
+                "ABORT:risk_reference_missing — valid NIFTY spot and VIX are "
+                "required before any hedge/core order is placed"
+            )
         results: Dict[str, bool] = {}
         legs = [pair.ce_short, pair.pe_short, pair.ce_hedge, pair.pe_hedge]
         fresh_ltps = await fetch_ltps_async(
@@ -2655,9 +2953,18 @@ class Engine:
                 hedge.state = LegState.ABORTED
                 core.state = LegState.ABORTED
                 return False
-            ok2 = await self._place_market_sell(core)
+            ok2 = await self._place_limit_sell_with_timeout(
+                core, ref_price=float(core.last_ltp or 0.0)
+            )
             if not ok2:
-                log.warning("ABORT:core_failed side=%s", side_label)
+                log.warning(
+                    "ABORT:core_limit_unfilled side=%s; unwinding orphan hedge",
+                    side_label,
+                )
+                await self._exit_leg_market(
+                    hedge, tag=f"EXIT_ORPHAN_HEDGE_{hedge.leg_id}"
+                )
+                core.state = LegState.ABORTED
                 return False
             await self._place_broker_sl(core)
             return True
@@ -2700,10 +3007,8 @@ class Engine:
         mtm = self.store.compute_mtm()
         update_trail(self.store, mtm, self.paper_log_csv,
                      self.store.pair.session_date if self.store.pair else "")
-        await asyncio.gather(
-            asyncio.to_thread(self.store.log_mtm),
-            asyncio.to_thread(self.store.persist_state),
-        )
+        self._schedule_state_persist()
+        await asyncio.to_thread(self.store.log_mtm)
         if mtm <= self.store.trail_lock or mtm <= MAX_DAILY_LOSS:
             self._trigger_kill_switch(
                 reason=(
@@ -2746,7 +3051,7 @@ class Engine:
         that gets blown through by a single 10-pt underlying tick.
         """
         if leg.fill_price is None:
-            return SL_LIMIT_BUFFER_POINTS_MIN
+            raise TradingError(f"Cannot size SL buffer without fill for {leg.leg_id}")
         spot = 0.0
         vix = 0.0
         # Prefer the LegPair copy (closer to the data; same value as
@@ -2755,10 +3060,9 @@ class Engine:
             spot = self.store.pair.entry_spot or 0.0
             vix = self.store.pair.entry_vix or 0.0
         if spot <= 0 or vix <= 0:
-            # Fallback if entry data missing (e.g. paper mode never
-            # populated entry_spot). Use the static MIN so the system
-            # still has SOME headroom.
-            return SL_LIMIT_BUFFER_POINTS_MIN
+            raise TradingError(
+                f"Cannot size adaptive SL for {leg.leg_id}: spot={spot}, vix={vix}"
+            )
         raw = SL_LIMIT_BUFFER_VIX_K * vix * spot / 100.0
         return max(
             SL_LIMIT_BUFFER_POINTS_MIN,
@@ -2773,7 +3077,10 @@ class Engine:
                 continue
             if leg.fill_price is None or leg.last_ltp is None:
                 continue
-            threshold = leg.fill_price * (1 + SL_PERCENT)
+            threshold = leg.sl_trigger_price
+            if threshold is None:
+                risk_vix = self.store.current_vix or self.store.entry_vix
+                threshold = leg.fill_price * (1 + stop_loss_percent_for_vix(risk_vix))
             if leg.last_ltp >= threshold:
                 # Flash-crash check: if the LTP has gapped PAST the
                 # broker SL's limit price, the broker SL-L cannot
@@ -2835,26 +3142,78 @@ class Engine:
             leg.sl_fill_pending = status in ("open", "pending", "triggered")
             return "intermediate"
 
-        state = await inspect()
-        if state == "filled":
-            return True
-        if state == "cancelled":
-            return False
-
-        with contextlib.suppress(Exception):
-            await cancel_order_via_upstox(self.rest, leg.sl_order_id)
-
-        deadline = time.monotonic() + min(5.0, ORDER_FILL_TIMEOUT_SEC)
+        deadline = time.monotonic() + SL_CANCEL_CONFIRM_TIMEOUT_SEC
+        next_cancel_at = 0.0
+        last_error: Optional[Exception] = None
         while time.monotonic() < deadline:
-            state = await inspect()
-            if state == "filled":
-                return True
-            if state == "cancelled":
-                return False
+            try:
+                state = await inspect()
+                last_error = None
+                if state == "filled":
+                    return True
+                if state == "cancelled":
+                    return False
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                log.warning(
+                    "SL_CANCEL_STATUS_RETRY: leg=%s order=%s error=%s",
+                    leg.leg_id, leg.sl_order_id, exc,
+                )
+
+            now = time.monotonic()
+            if now >= next_cancel_at:
+                try:
+                    await cancel_order_via_upstox(self.rest, leg.sl_order_id)
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    log.warning(
+                        "SL_CANCEL_RETRY: leg=%s order=%s error=%s",
+                        leg.leg_id, leg.sl_order_id, exc,
+                    )
+                next_cancel_at = now + SL_CANCEL_RETRY_INTERVAL_SEC
             await asyncio.sleep(0.25)
+
+        # Do not blindly send a MARKET order while the SL may still be live:
+        # that can over-close into a new long. Reconcile the broker position
+        # book first. A zero quantity proves there is no remaining exposure.
+        try:
+            positions = await self.rest.get(EXIT_ALL_URL)
+            quantity: Optional[int] = None
+            for position in positions.get("data", []) or []:
+                key = str(
+                    position.get("instrument_token")
+                    or position.get("instrument_key")
+                    or ""
+                ).replace(":", "|")
+                if key == leg.instrument_key:
+                    quantity = int(position.get("quantity", 0) or 0)
+                    break
+            if quantity is None:
+                quantity = 0  # absent from position book means flat
+            if quantity == 0:
+                estimate = float(leg.last_ltp or leg.fill_price or 0.0)
+                if estimate <= 0:
+                    raise TradingError(
+                        f"Broker is flat for {leg.leg_id}, but no exit mark is available"
+                    )
+                log.critical(
+                    "SL_CANCEL_RECONCILED_FLAT: leg=%s; using %.2f as an "
+                    "accounting estimate because average fill is unavailable",
+                    leg.leg_id, estimate,
+                )
+                leg.sl_broker_triggered = True
+                leg.sl_fill_pending = False
+                self._record_leg_exit(leg, estimate)
+                return True
+        except TradingError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+
         raise TradingError(
-            f"SL {leg.sl_order_id} remained non-terminal after cancel; "
-            "refusing duplicate market exit"
+            f"SL {leg.sl_order_id} remained non-terminal for "
+            f"{SL_CANCEL_CONFIRM_TIMEOUT_SEC:.0f}s; broker still shows exposure. "
+            f"No duplicate market exit was sent. Last error: {last_error}"
         )
 
     def _enqueue_exit_due_to_local_sl(self, leg: Leg) -> None:
@@ -2952,7 +3311,18 @@ class Engine:
             ref = float(leg.last_ltp or leg.fill_price or 0.0)
             if ref <= 0:
                 raise TradingError(f"No paper exit reference for {leg.leg_id}")
-            fill = paper_fill(side, ref)
+            fill = paper_fill(
+                side, ref,
+                slip_bps=(
+                    PAPER_HEDGE_SLIPPAGE_BPS
+                    if leg.kind == LegKind.HEDGE_LONG
+                    else PAPER_CORE_SLIPPAGE_BPS
+                ),
+                min_slippage_ticks=(
+                    PAPER_HEDGE_MIN_SLIPPAGE_TICKS
+                    if leg.kind == LegKind.HEDGE_LONG else 0
+                ),
+            )
         else:
             response = await place_order_via_upstox(
                 self.rest, leg.instrument_key, side, leg.qty,
@@ -2983,7 +3353,18 @@ class Engine:
             if PAPER_TRADING_MODE:
                 ref = float(leg.last_ltp or leg.fill_price or 0.0)
                 side = "BUY" if leg.kind == LegKind.CORE_SHORT else "SELL"
-                fill = paper_fill(side, ref)
+                fill = paper_fill(
+                    side, ref,
+                    slip_bps=(
+                        PAPER_HEDGE_SLIPPAGE_BPS
+                        if leg.kind == LegKind.HEDGE_LONG
+                        else PAPER_CORE_SLIPPAGE_BPS
+                    ),
+                    min_slippage_ticks=(
+                        PAPER_HEDGE_MIN_SLIPPAGE_TICKS
+                        if leg.kind == LegKind.HEDGE_LONG else 0
+                    ),
+                )
             else:
                 broker_fill = result.fills.get(leg.instrument_key)
                 if broker_fill is None:
@@ -3230,6 +3611,17 @@ class Engine:
                 )
             threshold = leg.fill_price * (1 - REENTRY_MOMENTUM_DISCOUNT)
             if leg.last_ltp < threshold:
+                try:
+                    await self._validate_entry_margin(
+                        [leg], {leg.instrument_key: float(leg.last_ltp)},
+                        context=f"REENTRY_{leg.leg_id}",
+                    )
+                except TradingError as exc:
+                    log.warning(
+                        "REENTRY_SKIPPED: margin preflight failed leg=%s: %s",
+                        leg.leg_id, exc,
+                    )
+                    continue
                 log.info("REENTRY: leg=%s prior_order_id=%s ltp=%.2f threshold=%.2f",
                          leg.leg_id, leg.order_id, leg.last_ltp, threshold)
                 leg.reentry_count += 1
@@ -3237,7 +3629,18 @@ class Engine:
                 leg.state = LegState.PENDING
                 leg.order_id = None
                 leg.fill_price = None
+                leg.exit_order_id = None
+                leg.exit_price = None
                 leg.sl_order_id = None
+                leg.sl_triggered_at = None
+                leg.sl_broker_triggered = False
+                leg.sl_fill_pending = False
+                leg.sl_escalation_in_flight = False
+                leg.sl_trigger_price = None
+                leg.sl_percent = None
+                leg.sl_limit_price = None
+                leg.sl_limit_buffer = None
+                leg.exit_in_flight = False
                 log_event(
                     self.paper_log_csv, "REENTRY", leg,
                     order_side="SELL", ltp_at_event=leg.last_ltp,
@@ -3248,25 +3651,37 @@ class Engine:
                 )
                 if self.worker and self.rest:
                     async def task(_leg=leg):
-                        ok = await self._place_market_sell(_leg)
+                        ok = await self._place_limit_sell_with_timeout(
+                            _leg, ref_price=float(_leg.last_ltp or 0.0)
+                        )
                         if ok:
                             await self._place_broker_sl(_leg)
 
                     self.worker.submit(OrderTask(name=f"reentry_{leg.leg_id}", coro_factory=task))
 
     # ------------------------------------------------------------------ time exit
+    def _scheduled_time_exit(self) -> dtime:
+        """Exit earlier on the selected contract's actual expiry date."""
+        expiry = self._bootstrap_cache.get("expiry")
+        if expiry and expiry == market_now().date().isoformat():
+            return EXPIRY_DAY_TIME_EXIT
+        return TIME_EXIT
+
     async def time_exit(self) -> None:
         if not self.store.pair:
             return
-        log.info("TIME_EXIT 15:15 — squaring off")
+        scheduled = self._scheduled_time_exit()
+        label = scheduled.strftime("%H:%M")
+        log.info("TIME_EXIT %s — squaring off", label)
         assert self.rest
         await self._square_off_all("TIME_EXIT")
-        self.store.exit_reason = "time_exit_15:15"
-        log.info("TIME_EXIT_COMPLETE")
+        self.store.exit_reason = f"time_exit_{label.replace(':', '')}"
+        log.info("TIME_EXIT_COMPLETE scheduled=%s", label)
         log_event(
             self.paper_log_csv, "TIME_EXIT", None,
             entry_vix=self.store.entry_vix, running_total_mtm=self.store.total_mtm,
-            trail_lock=self.store.trail_lock, notes="15:15 square-off",
+            trail_lock=self.store.trail_lock,
+            notes=f"scheduled square-off {label}",
             session_date=self.store.pair.session_date if self.store.pair else "",
         )
 
@@ -3434,7 +3849,7 @@ class Engine:
                 return
 
             entry_ok = await self.execute_entry()
-            await asyncio.to_thread(self.store.persist_state, True)
+            await self._flush_state_persist()
             if not entry_ok:
                 log.error(
                     "ENTRY ABORTED — one or more leg pairs did not enter. "
@@ -3465,7 +3880,25 @@ class Engine:
                 """
                 backoff = 1.0
                 attempt = 0
-                healthy_threshold = 10.0
+                healthy_threshold = RECONNECT_STABLE_UPTIME_SEC
+                flap_times: List[float] = []
+
+                def flap_budget_exhausted() -> bool:
+                    if not register_reconnect_flap(
+                        flap_times, time.monotonic()
+                    ):
+                        return False
+                    log.critical(
+                        "WS_FLAP_CIRCUIT: %d disconnects in %.0fs; kill-switching",
+                        len(flap_times), RECONNECT_FLAP_WINDOW_SEC,
+                    )
+                    self.loop.call_soon_threadsafe(
+                        self._trigger_kill_switch,
+                        f"ws_flapping_{len(flap_times)}_in_"
+                        f"{int(RECONNECT_FLAP_WINDOW_SEC)}s",
+                    )
+                    return True
+
                 while not self._stopped:
                     connected_at = time.monotonic()
                     try:
@@ -3475,6 +3908,8 @@ class Engine:
                     except Exception:
                         log.exception("ws connect failed; backing off %.1fs", backoff)
                         self._on_feed_disconnect()
+                        if flap_budget_exhausted():
+                            return
                         time.sleep(backoff)
                         backoff = min(backoff * 2, 30.0)
                         attempt += 1
@@ -3509,9 +3944,10 @@ class Engine:
                     log.warning("ws disconnected; reconnect attempt %d/%d in %.1fs",
                                 attempt, MAX_RECONNECT_ATTEMPTS, backoff)
                     self._on_feed_disconnect()
+                    if flap_budget_exhausted():
+                        return
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
-                    self._on_feed_reconnect()
 
             ws_task = asyncio.create_task(asyncio.to_thread(ws_runner))
 
@@ -3525,6 +3961,13 @@ class Engine:
                     # gate, MAX_FEED_DOWNTIME_SEC (30s) would expire
                     # mid-handshake on a slow connect and fire the
                     # kill-switch spuriously.
+                    if (
+                        self.ws
+                        and self.ws.connected
+                        and self.store.feed_disconnected_at is not None
+                    ):
+                        self._on_feed_reconnect_async()
+
                     if (self.ws
                             and self.ws.ever_connected
                             and not self.ws.connected):
@@ -3534,7 +3977,7 @@ class Engine:
                             self._trigger_kill_switch(reason=f"feed_disconnected_for_{MAX_FEED_DOWNTIME_SEC}s")
                             break
 
-                    if market_now().time() >= TIME_EXIT:
+                    if market_now().time() >= self._scheduled_time_exit():
                         await self.time_exit()
                         break
 
@@ -3668,7 +4111,7 @@ class Engine:
         # edge case where the feed never delivered any ticks, so the report
         # still shows the PnL implied by fill prices vs. the last known price.
         self.store.compute_mtm()
-        await asyncio.to_thread(self.store.persist_state, True)
+        await self._flush_state_persist()
         # Persist the per-session summary.
         self._write_paper_summary()
         # Layman-friendly daily scoreboard (cumulative across days).
