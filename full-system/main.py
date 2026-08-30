@@ -1,792 +1,968 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# ============ FILE: main.py ============
 """
-================================================================================
- NIFTY REGIME-BASED OPTIONS TRADING ENGINE — merged entrypoint (main.py)
-================================================================================
- This module merges the original single files  config.py + clock.py + main.py
- (see README for the full merge map):
-
-   * SECTION 1 — CONFIG   (originally config.py): every hardcoded parameter —
-     flags, paths, thresholds, NSE holidays, session times, Upstox endpoints,
-     rate limits, transaction-cost model.
-   * SECTION 2 — CLOCK    (originally clock.py): IST timezone, Clock,
-     VirtualClock (offline accelerated demo clock).
-   * SECTION 3 — ORCHESTRATOR (originally main.py): scheduler loop, entry
-     window, regime-change handling, position management, console report,
-     graceful shutdown.
-
- Run:   python3 main.py                   # offline demo, paper trading
-        python3 main.py --once            # single detection cycle
-        python3 main.py --data upstox     # real Upstox quotes + paper fills
-================================================================================
+Orchestrator — starts and manages all components.
+Handles pre-flight checks, main trading loop, graceful shutdown,
+and real-time console display.
 """
-import argparse
-import json
+
+import asyncio
 import signal
 import sys
-import time
-import types
-from datetime import date, datetime, timedelta, time as dtime
-
-# The sibling modules do `import main as C` / `from main import ...` for the
-# config + clock symbols.  When this file is executed directly it lives in
-# sys.modules as "__main__", so alias it so those imports resolve to this module.
-import sys as _sys
-_sys.modules.setdefault("main", _sys.modules[__name__])
-
-# The merged config lives in THIS module — keep the familiar `C.` alias.
-C = _sys.modules[__name__]
-
-# =====================================================================
-# SECTION 1 — HARDCODED CONFIGURATION (merged from config.py)
-# =====================================================================
-
-
-
-# ----------------------------------------------------------------------------
-# 1. FLAGS & PATHS
-# ----------------------------------------------------------------------------
-PAPER_TRADING_MODE = True          # True = simulated fills (never touches a real
-                                   #         brokerage account).
-                                   # False = real orders via Upstox (LIVE).
-DATA_SOURCE = "simulated"          # "simulated" -> offline DemoProvider feed
-                                   # "upstox"    -> real Upstox REST + WebSocket
-                                   # Use "upstox" only if env.txt is present with
-                                   # a valid UPSTOX_ACCESS_TOKEN.
-
-ALLOW_NON_TRADING_DAY_RUN = False  # For testing only (demo mode forces True with a warning)
-
-ENV_FILE = "env.txt"               # UPSTOX_API_KEY / UPSTOX_API_SECRET / UPSTOX_ACCESS_TOKEN
-
-LOG_DIR = "./data"                 # relative to script root
-STATE_DB = "state.db"              # SQLite checkpoint / recovery store
-TRADE_ANALYSIS_CSV = "trade_analysis.csv"   # one row per CLOSED trade
-AUDIT_LOG_CSV = "audit_log.csv"             # daily-rotated (gzip), JSONL
-REGIME_LOG_CSV = "regime_log.csv"           # one row per detection cycle
-REGIME_STATE_JSON = "regime_state.json"     # backward-compatible JSON snapshot
-EVENTS_FILE = "events.json"                # macro calendar for Step-6 override
-SEED_STATE_JSON = "regime_state_seed.json" # optional skew-history seed (ignored if absent)
-
-# ----------------------------------------------------------------------------
-# 2. VIX & DELTA BANDS
-# ----------------------------------------------------------------------------
-LOW_VIX = 12.0
-HIGH_VIX = 18.0
-
-MIN_DELTA_LOWVIX, MAX_DELTA_LOWVIX = 0.22, 0.28
-MIN_DELTA, MAX_DELTA = 0.20, 0.25
-MIN_DELTA_HIVIX, MAX_DELTA_HIVIX = 0.15, 0.20
-MIN_PREMIUM, MAX_PREMIUM = 75.0, 130.0
-
-# ----------------------------------------------------------------------------
-# 3. EDGE & TREND THRESHOLDS
-# ----------------------------------------------------------------------------
-EDGE_RICH = 5.0          # IV_ATM - RV > 5%  -> seller edge (+1)
-EDGE_CHEAP = 0.0         # IV_ATM - RV < 0%  -> buyer edge (-1)
-TREND_ADX = 25.0         # ADX above this + EMA slope -> trending
-RANGE_ADX = 22.0         # ADX below this -> range-bound
-EMA_SLOPE_MIN_PCT = 0.05 # |EMA50 - EMA50(20 bars ago)| > 0.05% of spot
-
-# regime detector plumbing
-RV_WINDOW = 20                    # trading days for realised vol
-RV_ANNUALISE = 252
-SKEW_HISTORY_DAYS = 30            # z-score lookback for 25-delta skew
-SKEW_MIN_DAYS = 10                # min history before skew z is trusted
-SKEW_Z_STEEP = 1.5                # z >  1.5 -> fear      -> Skew_Score -1
-SKEW_Z_FLAT = -1.0                # z < -1.0 -> complacent -> Skew_Score +1
-TERM_THRESHOLD = 0.5              # V_fwd - V_spot > 0.5 contango / < -0.5 backwardation
-TREND_BARS_REQUIRED = 75          # EMA50 + slope window + ADX warmup
-SPREAD_AVG_MIN = 60               # minutes of spread history for baseline
-SPREAD_SPAN_MIN = 20              # min span (min) before baseline is trusted
-FLOW_MIN_AGE = 600                # reference OI snapshot min age (s)  ~10 min
-FLOW_TARGET_AGE = 900             # target age (s)                    ~15 min
-FLOW_MAX_AGE = 1800               # max age (s)                       ~30 min
-MIN_OI = 50.0                     # quality filter: min OI (lots) / bid > 0
-RISK_FREE = 6.5 / 100.0           # risk-free rate for BS fallback greeks
-HIST_DAYS_5M = 8                  # calendar days of 5-min candles to fetch
-
-WEIGHTS = {"vol": 0.30, "edge": 0.30, "trend": 0.25, "flow": 0.15}
-
-REGIME_STRONG_SELL, REGIME_MILD_SELL, REGIME_NEUTRAL, REGIME_BUY, REGIME_STRONG_BUY = (
-    "STRONG_SELL_VOL", "MILD_SELL_VOL", "NEUTRAL", "BUY_VOL", "STRONG_BUY_VOL")
-REGIME_EVENT_HEDGE = "EVENT_HEDGE"
-
-REGIME_ACTION = {
-    REGIME_STRONG_SELL: "Deploy max size on Short Straddles / Iron Condors.",
-    REGIME_MILD_SELL: "Deploy moderate size; prefer credit spreads over naked straddles.",
-    REGIME_NEUTRAL: "Hold current positions; do not initiate new entries.",
-    REGIME_BUY: "Reduce short size by 60%; consider long Put hedges.",
-    REGIME_STRONG_BUY: "Flatten all short positions; deploy Long Straddles / Strangles.",
-    REGIME_EVENT_HEDGE: "MACRO OVERRIDE: flatten shorts, switch to long-gamma or sit flat.",
-}
-
-# ----------------------------------------------------------------------------
-# 4. POSITION SIZING & RISK
-# ----------------------------------------------------------------------------
-INITIAL_CAPITAL = 2_000_000.0      # paper starting capital (₹) for % sizing
-MAX_RISK_PER_TRADE = 0.02          # 2% of capital
-MAX_COMBINED_RISK = 0.04           # 4% of capital
-MAX_DAILY_LOSS = -3000             # points (circuit breaker)
-TRAIL_START_PROFIT = 2000          # points
-TRAIL_RETAIN_PCT = 0.65
-SL_BASE_PERCENT = 0.30             # base stop as % of premium
-SL_REFERENCE_VIX = 14.0
-SL_MIN_PERCENT = 0.18
-SL_MAX_PERCENT = 0.40
-
-# ----------------------------------------------------------------------------
-# 5. STATIC STOP & PROFIT TARGETS
-# ----------------------------------------------------------------------------
-STATIC_STOP_PCT = 0.10             # 10% spot stop for short straddle
-PROFIT_TARGET_PCT = 0.50           # close at 50% of max credit
-IRON_CONDOR_WING_WIDTH = 300       # points
-MIN_CREDIT = 100                   # min credit for Iron Condor / Credit Spreads
-STRADDLE_DAY_HOLD = 3              # long ATM straddle hold (calendar days)
-TIME_EXIT_DAYS_STRADDLE = 21       # exit short straddle 21 days to expiry
-TIME_EXIT_DAYS_CONDOR = 7          # exit condor / credit spreads 7 days to expiry
-RATIO_TIME_EXIT_DAYS = 14          # exit ratio spreads 14 days to expiry
-LONG_STRADDLE_MAX_DEBIT_PCT = 0.025  # max debit <= 2.5% of spot
-LONG_STRADDLE_TIME_EXIT_DAY = 3    # 3rd calendar day close at 15:15
-BACKSPREAD_MAX_DEBIT = 30.0        # net debit <= 30 points
-BACKSPREAD_MIN_WIDTH = 100         # 25d-10d strike width >= 100 pts
-BUTTERFLY_MAX_DEBIT = 20.0         # net debit <= 20 pts
-BUTTERFLY_MIN_RR = 4.0             # max profit / max loss >= 4:1
-HEDGE_REDUCE_PCT = 0.60            # reduce shorts by 60% on BUY_VOL
-GAMMA_LIMIT_PCT = 0.50             # gamma exposure trigger (>50% of limit -> F)
-SPOT_200_EMA_DAYS = 200            # days for 200-EMA filter
-VIX_SMA_FAST = 5                   # 5-period VIX SMA
-VIX_SMA_SLOW = 10                  # 10-period VIX SMA
-
-# ----------------------------------------------------------------------------
-# 6. ORDER TIMEOUTS (seconds)
-# ----------------------------------------------------------------------------
-ORDER_FILL_TIMEOUT = 60            # total for all legs (multi-leg)
-HEDGE_FILL_TIMEOUT = 30
-CORE_FILL_TIMEOUT = 30
-SL_FILL_TIMEOUT = 30
-PARTIAL_FILL_CANCEL = True         # cancel remaining on partial fill
-STAGGER_MS = 200                   # delay between order placements / status polls
-
-# ----------------------------------------------------------------------------
-# 7. NSE HOLIDAYS  (reviewed as of 2026-08-30 per spec)
-# ----------------------------------------------------------------------------
-NSE_MARKET_HOLIDAYS = frozenset({
-    "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31",
-    "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28",
-    "2026-06-26", "2026-09-14", "2026-10-02", "2026-10-20",
-    "2026-11-10", "2026-11-24", "2026-12-25",
-})
-NSE_SPECIAL_TRADING_DAYS = frozenset({"2026-02-01"})
-HOLIDAY_CALENDAR_REVIEWED_ON = date(2026, 8, 30)
-
-# ----------------------------------------------------------------------------
-# 8. SESSION TIMING (Asia/Kolkata)
-# ----------------------------------------------------------------------------
-ENTRY_VIX_TIME = dtime(9, 15)
-STRIKE_SELECT_TIME = dtime(9, 19)
-EXEC_START_TIME = dtime(9, 19, 30)
-EXEC_END_TIME = dtime(9, 20, 30)
-TIME_EXIT_NORMAL = dtime(15, 15)
-TIME_EXIT_EXPIRY = dtime(15, 0)
-TIME_LAST_IGNORE = dtime(14, 45)    # ignore regime changes after this
-EXPIRY_SQUARE_OFF = dtime(14, 45)   # force square-off on expiry day
-
-# ----------------------------------------------------------------------------
-# 9. UPSTOX API & RATE LIMITS
-# ----------------------------------------------------------------------------
-UPSTOX_BASE_V2 = "https://api.upstox.com/v2"
-UPSTOX_BASE_V3 = "https://api.upstox.com/v3"
-INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
-RATE_LIMIT_PER_SEC = 50
-RATE_LIMIT_BURST = 10
-RETRY_BACKOFF_BASE = 1.0
-RETRY_MAX_BACKOFF = 60.0
-WS_URL_V3 = "wss://api.upstox.com/v3/feed/market-data-feed"
-WS_FEED_STALE_SEC = 30             # kill-switch if feed silent this long
-
-KEY_NIFTY = "NSE_INDEX|Nifty 50"
-KEY_VIX = "NSE_INDEX|India VIX"
-NIFTY_LOT_SIZE = 65                # fallback; real value read from instrument master
-
-# ----------------------------------------------------------------------------
-# 10. MACRO OVERRIDE WINDOW (Step 6)
-# ----------------------------------------------------------------------------
-EVENT_PRE_HOURS = 6                # 6h before ...
-EVENT_POST_HOURS = 2               # ... 2h after a high-impact event
-
-# ----------------------------------------------------------------------------
-# 11. DEMO / TEST MODE
-# ----------------------------------------------------------------------------
-DEMO_CYCLE_SECONDS = 4             # wall-clock sleep between demo cycles
-DEMO_VIRTUAL_STEP_MIN = 5          # each demo cycle advances virtual clock 5 min
-DEMO_ENTRY_ANYTIME = True          # demo: allow entries outside 09:19:30-09:20:30
-DEMO_STRICT_VALIDATION = False     # demo: lenient strategy validations
-DEMO_ACCOUNT_CAPITAL = 2_000_000.0
-
-# ----------------------------------------------------------------------------
-# 12. TRANSACTION COST ESTIMATOR (paper accounting)
-# ----------------------------------------------------------------------------
-COST_BROKERAGE_OPTION = 20.0       # ₹ per order (Upstox flat)
-COST_STT_OPTION_SELL_PCT = 0.001   # 0.1% of premium on sell side (post Oct-2024)
-COST_STT_EXERCISE_PCT = 0.00125
-COST_EXCHANGE_PCT = 0.0005         # NSE options transaction charge ~0.05%
-COST_SEBI_PCT = 0.000001           # ₹10/crore
-COST_STAMP_PCT = 0.00003           # 0.003% on buy side
-COST_GST_PCT = 0.18                # 18% GST on (brokerage + exchange + sebi)
-
-# ----------------------------------------------------------------------------
-# derived helpers
-# ----------------------------------------------------------------------------
-DAILY_LOG_MAX_BYTES = 25 * 1024 * 1024   # rotate audit log above this
-CHECKPOINT_HEARTBEAT_S = 10              # state checkpoint every 10 s
-
-def is_trading_day(d: date) -> bool:
-    """Weekday, not a hardcoded NSE holiday (special trading days allowed)."""
-    if d.weekday() >= 5:
-        return False
-    iso = d.isoformat()
-    if iso in NSE_MARKET_HOLIDAYS:
-        return False
-    return True
-
-def is_expiry_day(d: date) -> bool:
-    """Weekly NIFTY expiry = Thursday, unless a holiday shifts it (approx)."""
-    return d.weekday() == 3
-
-# =====================================================================
-# SECTION 2 — TIME SOURCES (merged from clock.py)
-# =====================================================================
-
-from datetime import datetime, timedelta
-
-try:
-    from zoneinfo import ZoneInfo
-    IST = ZoneInfo("Asia/Kolkata")
-    _HAS_ZONEINFO = True
-except Exception:                      # pragma: no cover - py<3.9 fallback
-    from datetime import timezone
-    IST = timezone(timedelta(hours=5, minutes=30), name="IST")
-    _HAS_ZONEINFO = False
-
-def now_ist() -> datetime:
-    return datetime.now(IST)
-
-class Clock:
-    """Base clock — real wall time in IST."""
-    def now(self) -> datetime:
-        return now_ist()
-
-    def sleep_seconds(self, s: float):
-        import time
-        time.sleep(s)
-
-class VirtualClock(Clock):
-    """Deterministic clock for offline demo/testing. Starts at the configured
-    IST datetime and advances by `step` every `advance()` call."""
-    def __init__(self, start: datetime, step: timedelta = timedelta(minutes=5)):
-        self._t = start
-        self._step = step
-
-    def now(self) -> datetime:
-        return self._t
-
-    def advance(self, minutes: int = None) -> datetime:
-        self._t += (timedelta(minutes=minutes) if minutes is not None else self._step)
-        return self._t
-
-    def set(self, dt: datetime):
-        self._t = dt
-
-    def sleep_seconds(self, s: float):
-        # in virtual mode wall-clock sleeps are handled by the orchestrator;
-        # expose a tiny real sleep so polling loops still yield
-        import time
-        time.sleep(min(s, 0.05))
-
-# ---- sibling modules (they import config/clock symbols from this module) ----
-from storage import (Loggers, StateStore, enable_color, g, r, y, cy, mg, bo, dim, fx)
-from execution import (Feed, UpstoxClient, PaperBroker, LiveBroker, DemoProvider,
-                       MarketDataStreamerV3, OrderExecutor, RiskManager,
-                       pick_expiries, load_env_file)
-from regime_engine import RegimeDetector, StrategySelector, load_events
-
-# =====================================================================
-# SECTION 3 — ORCHESTRATOR (merged from main.py)
-# =====================================================================
-
-# =====================================================================
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-================================================================================
- NIFTY REGIME-BASED OPTIONS TRADING ENGINE  —  main.py (orchestrator)
-================================================================================
- Per the system spec:
-
-  * PAPER_TRADING_MODE = True by default (config.py). No real orders unless
-    you explicitly flip it to False AND supply a valid UPSTOX_ACCESS_TOKEN.
-  * No runtime input: everything is hardcoded in config.py.
-  * State is checkpointed to SQLite (state.db) on every fill, every regime
-    change and every 10 s heartbeat -> crash recovery guaranteed.
-  * All closed trades are logged to trade_analysis.csv (one row per strategy
-    execution).
-  * Regime detection runs every 5 minutes (Steps 0-8); strategy entry is
-    gated to the 09:19:30-09:20:30 IST window; positions are managed every
-    cycle; regime transitions A-E are applied on confirmed regime changes.
-
- USAGE
- -----
-   python main.py                 # demo/simulated feed, paper trading
-   python main.py --demo          # same as default
-   python main.py --once          # single cycle then exit
-   python main.py --data upstox   # real Upstox data + paper fills (needs env.txt)
-   python main.py --no-color      # plain console output
-================================================================================
-"""
-import argparse
+import os
+import logging
+import traceback
+import aiohttp
+import numpy as np
+import sqlite3
 import json
-import signal
-import sys
-import time
-import types
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
+from typing import Optional
+import pytz
+import config
+from data_manager import DataManager
+from regime_engine import RegimeEngine
+from strategy_engine import StrategyEngine
 
-W = 88
+logger = logging.getLogger(__name__)
 
-def rule(ch="─"):
-    return dim(ch * W)
 
-def header_line(txt):
-    return cy(" " + txt) + " " + dim("─" * max(0, W - 2 - len(txt)))
+def setup_logging() -> logging.Logger:
+    """Configure file and console logging with IST timestamps."""
+    IST = pytz.timezone(config.TZ)
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
 
-def parse_args():
-    p = argparse.ArgumentParser(description="NIFTY regime-based options trading engine")
-    p.add_argument("--demo", action="store_true", help="offline simulated feed (default when --data is omitted)")
-    p.add_argument("--data", choices=["simulated", "upstox"], default=C.DATA_SOURCE,
-                   help="market data source (default from config.py)")
-    p.add_argument("--env", default=C.ENV_FILE, help="env file with UPSTOX_* keys")
-    p.add_argument("--interval", type=int, default=None,
-                   help="override detection interval in seconds (default 300)")
-    p.add_argument("--once", action="store_true", help="run a single cycle and exit")
-    p.add_argument("--no-color", action="store_true")
-    p.add_argument("--virtual-step", type=int, default=C.DEMO_VIRTUAL_STEP_MIN,
-                   help="demo: virtual minutes per cycle")
-    p.add_argument("--demo-start", default=None,
-                   help="demo: virtual start 'YYYY-MM-DD HH:MM' (IST), default next trading day 09:14")
-    return p.parse_args()
-
-# ---------------------------------------------------------------------------
-# console report
-# ---------------------------------------------------------------------------
-def market_phase(now):
-    if now.weekday() >= 5:
-        return "CLOSED (weekend)", y
-    if not C.is_trading_day(now.date()):
-        return "CLOSED (NSE holiday)", y
-    t = now.hour * 60 + now.minute
-    if 9 * 60 + 15 <= t <= 15 * 60 + 30:
-        return "OPEN", g
-    if t < 9 * 60 + 15:
-        return "PRE-OPEN", y
-    return "CLOSED (after hours)", y
-
-def build_report(cyc, res, selector, executor, clock, phase, entry_state, meta):
-    L = []
-    now = res.ts
-    L.append(bo(cy("╔" + "═" * (W - 2) + "╗")))
-    title = "NIFTY REGIME OPTIONS ENGINE  ·  " + now.strftime("%a %d-%b-%Y %H:%M:%S IST")
-    L.append(bo(cy("║" + title.center(W - 2) + "║")))
-    L.append(bo(cy("╚" + "═" * (W - 2) + "╝")))
-    phase_txt, phase_c = phase
-    L.append(f"  Cycle #{cyc}  ·  {phase_c(phase_txt)}  ·  data: {meta['data_source']}  ·  "
-             f"paper: {bo(str(meta['paper']))}  ·  Ctrl+C to stop")
-    L.append(rule())
-
-    L.append(header_line("MARKET SNAPSHOT"))
-    L.append(f"   NIFTY 50   {bo(fx(res.spot))}   VIX {fx(res.vix)}   "
-             f"RV{C.RV_WINDOW} {fx(res.rv)}%  IV_atm {fx(res.iv_atm)}%")
-    L.append(f"   near expiry {res.near_expiry} · monthly {res.monthly_expiry} · "
-             f"PCR {fx(res.pcr, 2)} · fut basis {fx(res.fut_basis, 2)}")
-    L.append(rule())
-
-    L.append(header_line("MODULE SCORES  (raw -> confirmed)"))
-    labels = {"vol": "[1] VOL SURFACE ", "edge": "[2] VOL EDGE    ",
-              "trend": "[3] TREND       ", "flow": "[4] ORDER FLOW  "}
-    for m in ("vol", "edge", "trend", "flow"):
-        mr = getattr(res, m)
-        conf_s = _sc(mr.confirmed)
-        raw_s = _sc(mr.raw)
-        note = getattr(mr, "notes", [])
-        L.append(f"   {labels[m]} {mr.detail}")
-        L.append(f"   {' ' * len(labels[m])} score: {raw_s} -> {conf_s}   {dim('')}")
-    L.append(rule())
-
-    L.append(header_line("AGGREGATION (Steps 5-8)"))
-    terms = " + ".join(f"{w}·({res.confirmed_scores[k]:+g})" for k, w in C.WEIGHTS.items())
-    L.append(f"   Composite = {terms} = {bo(f'{res.composite:+.3f}')}")
-    if res.override:
-        L.append("   Macro: " + r(bo(res.macro_text)))
-    else:
-        L.append("   Macro override: OFF  (" + res.macro_text + ")")
-    L.append(rule())
-
-    col = g if res.composite > 0.15 else (r if res.composite < -0.15 else y)
-    reg = bo(mg("EVENT_HEDGE")) if res.regime == C.REGIME_EVENT_HEDGE else bo(col(res.regime))
-    L.append("  " + bo("★ CONFIRMED REGIME: ") + reg)
-    L.append("    Action : " + C.REGIME_ACTION.get(res.regime, ""))
-    if entry_state.get("msg"):
-        L.append("    " + entry_state["msg"])
-    L.append(rule())
-
-    L.append(header_line("POSITIONS"))
-    if not executor.open_trades:
-        L.append("   no open trades")
-    for tid, t in executor.open_trades.items():
-        status = t.get("status", "?")
-        nlegs = len(t["legs"])
-        L.append(f"   {t['strategy_name']:<22} {status:<8} legs {nlegs}  "
-                 f"entry {t['entry_ts'][:16]}  spot {fx(t.get('entry_spot'))}")
-    L.append(rule())
-
-    if res.notes:
-        L.append(dim("   notes: " + " | ".join(res.notes)))
-    if selector.last and selector.last.rationale:
-        L.append(dim("   selection: " + selector.last.rationale))
-    if meta.get("last_cycle_seconds") is not None:
-        L.append(dim(f"   cycle time {meta['last_cycle_seconds']*1000:.0f} ms · "
-                     f"day pnl {meta.get('day_pnl', 0.0):+.0f} pts"))
-    return "\n".join(L)
-
-def _sc(v):
-    if v is None:
-        return dim("n/a")
-    s = f"{v:+g}"
-    return g(s) if v > 0 else (r(s) if v < 0 else y(s))
-
-# ---------------------------------------------------------------------------
-# bootstrap helpers
-# ---------------------------------------------------------------------------
-def resolve_data_source(args):
-    """-> (client, master, streamer_or_None, note)"""
-    if args.data == "upstox":
-        env = load_env_file(args.env)
-        token = env.get("UPSTOX_ACCESS_TOKEN", "")
-        if not token:
-            print(r("ERROR: --data upstox requires UPSTOX_ACCESS_TOKEN in " + args.env))
-            sys.exit(2)
-        client = UpstoxClient(token)
-        master = client.instrument_master(cache_dir=C.LOG_DIR)
-        streamer = None
-        if C.PAPER_TRADING_MODE:
-            note = "upstox data + PAPER fills"
-        else:
-            note = "LIVE upstox data + LIVE orders"
-        return client, master, streamer, note
-    # simulated
-    demo = DemoProvider(clock=_global_clock)
-    master = demo.instruments()
-    return demo, master, None, "simulated feed (offline)"
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-def main():
-    args = parse_args()
-    enable_color(not args.no_color)
-    if args.demo:
-        args.data = "simulated"
-
-    print(bo(cy("═" * W)))
-    print(bo(cy(" NIFTY REGIME-BASED OPTIONS TRADING ENGINE — starting up")))
-    print(bo(cy("═" * W)))
-    print(f"  paper trading : {bo('TRUE') if C.PAPER_TRADING_MODE else bo(r('FALSE — LIVE'))}")
-    print(f"  data source   : {args.data}")
-    if C.PAPER_TRADING_MODE and args.data == "upstox":
-        print(y("  NOTE: paper fills with real Upstox quotes — no real orders."))
-    if not C.PAPER_TRADING_MODE and args.data == "simulated":
-        print(r("  FATAL: LIVE mode requires --data upstox. Aborting."))
-        sys.exit(2)
-
-    # --------------------------------------------------------------- clock
-    use_virtual = args.data == "simulated"
-    if use_virtual:
-        start = None
-        if args.demo_start:
-            try:
-                start = datetime.strptime(args.demo_start, "%Y-%m-%d %H:%M").replace(tzinfo=IST)
-            except ValueError:
-                print(r(f"bad --demo-start {args.demo_start} (use YYYY-MM-DD HH:MM)"))
-                sys.exit(2)
-        if start is None:
-            d = now_ist().date()
-            while not C.is_trading_day(d):
-                d += timedelta(days=1)
-            start = datetime(d.year, d.month, d.day, 9, 14, 0).replace(tzinfo=now_ist().tzinfo)
-        clock = VirtualClock(start, timedelta(minutes=args.virtual_step))
-        print(y(f"  virtual clock starts {start:%a %d-%b-%Y %H:%M} IST "
-                f"(+{args.virtual_step} min/cycle)"))
-    else:
-        clock = Clock()
-    global _global_clock
-    _global_clock = clock
-
-    # ------------------------------------------------------- trading-day gate
-    today = clock.now().date()
-    if not C.is_trading_day(today):
-        if C.ALLOW_NON_TRADING_DAY_RUN or use_virtual:
-            print(y(f"  WARNING: {today} is not an NSE trading day — continuing "
-                    f"({('test override' if C.ALLOW_NON_TRADING_DAY_RUN else 'virtual clock')})."))
-        else:
-            print(r(f"  {today} is not an NSE trading day (holiday/weekend). Refusing to run."))
-            sys.exit(0)
-
-    # ------------------------------------------------------------- plumbing
-    loggers = Loggers()
-    state = StateStore(C.STATE_DB)
-    events, ev_err = load_events(C.EVENTS_FILE)
-
-    client, master, streamer, ds_note = resolve_data_source(args)
-    feed = Feed(client, streamer)
-    if use_virtual:
-        broker = PaperBroker(feed, capital=C.DEMO_ACCOUNT_CAPITAL)
-    else:
-        broker = PaperBroker(feed) if C.PAPER_TRADING_MODE else LiveBroker(client)
-
-    ctx = types.SimpleNamespace(
-        feed=feed, broker=broker, clock=clock, state=state, loggers=loggers,
-        risk=None, lot_size=master.get("lot_size", C.NIFTY_LOT_SIZE),
-        last_spot=None, last_vix=None, last_regime=None,
-        demo=use_virtual,
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
-    risk = RiskManager(broker, state, loggers, capital=broker.cash)
-    ctx.risk = risk
 
-    detector = RegimeDetector(feed, state, clock, events=events, loggers=loggers)
-    detector.futs = master.get("futs", [])
-    selector = StrategySelector(ctx, detector)
-    executor = OrderExecutor(ctx)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(
+        getattr(logging, config.LOG_LEVEL, logging.INFO)
+    )
 
-    # ---- demo warm-up: pre-seed skew history + relax flow warm-up ------------
-    if use_virtual:
-        import random
-        if not state.skew_series(limit=1):
-            rng = random.Random(9)
-            base = clock.now().date()
-            for i in range(25, 0, -1):
-                state.record_skew(round(rng.gauss(1.6, 0.8), 3),
-                                  (base - timedelta(days=i)).isoformat())
-            print(y(f"  demo warm-up: seeded 25 days of skew history"))
-        C.FLOW_MIN_AGE = max(2 * args.virtual_step * 60, 4.0)
-        C.FLOW_TARGET_AGE = max(3 * args.virtual_step * 60, 6.0)
-        C.FLOW_MAX_AGE = max(12 * args.virtual_step * 60, 30.0)
-        C.SPREAD_SPAN_MIN = max(2 * args.virtual_step, 0.05)
-        C.SPREAD_AVG_MIN = max(12 * args.virtual_step, 1.0)
+    # Console handler — WARNING and above only
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(fmt)
+    root_logger.addHandler(console_handler)
 
-    if args.interval is not None:
-        interval = args.interval
-    elif use_virtual:
-        interval = C.DEMO_CYCLE_SECONDS
-    else:
-        interval = 300
+    # File handler — all levels
+    audit_file = os.path.join(
+        config.LOG_DIR,
+        f"audit_log_{today_str}.log"
+    )
+    file_handler = logging.FileHandler(
+        audit_file, mode="a", encoding="utf-8"
+    )
+    file_handler.setLevel(
+        getattr(logging, config.LOG_LEVEL, logging.INFO)
+    )
+    file_handler.setFormatter(fmt)
+    root_logger.addHandler(file_handler)
 
-    near_exp, monthly_exp = pick_expiries(master, clock.now().date())
-    if use_virtual:
-        near_exp = master["expiries"][0]["date"]
-        monthlies = [e["date"] for e in master["expiries"] if not e["weekly"]]
-        monthly_exp = monthlies[0] if monthlies else None
-    if not near_exp:
-        print(r("ERROR: could not determine any NIFTY option expiry."))
-        sys.exit(2)
+    # Suppress noisy third-party loggers
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
 
-    print(f"  near expiry : {near_exp}   monthly (V_fwd): {monthly_exp or 'n/a'}"
-          f"   [{master.get('source', '')}]  lot {ctx.lot_size}")
-    print(f"  interval    : {interval}s   state: {C.STATE_DB}   log dir: {C.LOG_DIR}")
-    n_high = sum(1 for e in events if e["high"])
-    print(f"  calendar    : {len(events)} events ({n_high} high-impact)"
-          + (y(f"  [{ev_err}]") if ev_err else ""))
-    print(dim("  algo: Vol(0.30)+Edge(0.30)+Trend(0.25)+Flow(0.15) · persistence 3x · "
-              "macro override 6h/-2h · entry window 09:19:30-09:20:30"))
+    module_logger = logging.getLogger(__name__)
+    module_logger.info(f"Logging initialized: {audit_file}")
+    return module_logger
 
-    # ------------------------------------------------------- graceful shutdown
-    stopping = {"flag": False}
 
-    def _shutdown(sig, frame):
-        if stopping["flag"]:
-            sys.exit(1)
-        stopping["flag"] = True
-        print("\n" + r(bo("  SHUTDOWN REQUESTED — squaring off all positions (live-safe).")))
-        try:
-            executor.square_off_all("MANUAL")
-        except Exception as e:
-            print(r(f"  square-off error: {e}"))
-        state.close()
-        loggers.audit("SHUTDOWN", signal=sig)
-        print(bo(cy("═" * W)))
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    # ------------------------------------------------------------ main loop
-    cyc = 0
-    entered_today = False
-    entry_msg = ""
-    last_heartbeat = time.monotonic()
-    last_cycle_t = time.monotonic()
+def _load_access_token() -> Optional[str]:
+    """Load Upstox access token from env.txt file."""
     try:
-        while True:
-            now = clock.now()
-            cyc += 1
-            cycle_start = time.monotonic()
-            risk._roll_day(clock)
+        with open(config.TOKEN_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("UPSTOX_ACCESS_TOKEN="):
+                    token = line.split("=", 1)[1].strip()
+                    if token:
+                        logger.info("Access token loaded successfully")
+                        return token
+        logger.critical(
+            f"Token not found in {config.TOKEN_FILE} — "
+            f"ensure line: UPSTOX_ACCESS_TOKEN=your_token"
+        )
+        return None
+    except FileNotFoundError:
+        logger.critical(
+            f"env.txt not found at {config.TOKEN_FILE} — "
+            f"create file with UPSTOX_ACCESS_TOKEN=your_token"
+        )
+        return None
+    except Exception as e:
+        logger.critical(f"Token load error: {e}")
+        return None
 
-            # ---- run detection ------------------------------------------
-            try:
-                res = detector.run_cycle(near_exp, monthly_exp)
-            except Exception as e:
-                print(r(f"  cycle {cyc} failed: {e} — retrying next interval"))
-                res = detector.last_result
-                if res is None:
-                    if args.once:
-                        break
-                    clock.sleep_seconds(interval)
-                    continue
 
-            ctx.last_spot, ctx.last_vix = res.spot, res.vix
-            ctx.last_regime = res.regime
+async def _run_preflight_checks(access_token: str) -> bool:
+    """Run all pre-flight validation checks before starting engine."""
+    checks_passed = True
+    IST = pytz.timezone(config.TZ)
 
-            # ---- regime change -> transitions A-E -------------------------
-            confirmed = detector.prev_confirmed_regime
-            if confirmed and confirmed != getattr(ctx, "_applied_regime", None):
-                old = getattr(ctx, "_applied_regime", None)
-                if old:
-                    executor.apply_transitions(old, confirmed, selector.build_env(res))
-                    loggers.audit("REGIME_CHANGE", from_regime=old, to_regime=confirmed,
-                                  composite=res.composite)
-                ctx._applied_regime = confirmed
+    # CHECK 1 — Trading day
+    today = date.today()
+    today_str = today.strftime("%Y-%m-%d")
 
-            # ---- entry window gate ----------------------------------------
-            tnow = now.time()
-            entry_state = {"msg": ""}
-            if use_virtual and C.DEMO_ENTRY_ANYTIME:
-                # demo: enter on the first eligible cycle of the day after the
-                # strike-selection time (the 30-s window cannot be sampled by
-                # 5-minute virtual steps)
-                allow_entry = tnow >= C.EXEC_START_TIME and tnow <= C.TIME_EXIT_NORMAL
+    if today_str in config.NSE_MARKET_HOLIDAYS:
+        if not config.ALLOW_NON_TRADING_DAY_RUN:
+            logger.critical(
+                f"Today {today_str} is an NSE holiday — "
+                f"set ALLOW_NON_TRADING_DAY_RUN=True to override"
+            )
+            return False
+        else:
+            logger.warning(
+                f"Running on holiday {today_str} "
+                f"(ALLOW_NON_TRADING_DAY_RUN=True)"
+            )
+
+    if today.weekday() >= 5:
+        if today_str not in config.NSE_SPECIAL_TRADING_DAYS:
+            if not config.ALLOW_NON_TRADING_DAY_RUN:
+                logger.critical(
+                    f"Weekend ({today.strftime('%A')}) — "
+                    f"market closed"
+                )
+                return False
             else:
-                allow_entry = C.EXEC_START_TIME <= tnow <= C.EXEC_END_TIME
-            if not entered_today and allow_entry:
-                sel = selector.evaluate(res)
-                if sel.plan is not None:
-                    scores = {"composite": res.composite, **res.confirmed_scores}
-                    tid = executor.execute_entry(sel.plan, sel.env, res.regime, scores=scores)
-                    if tid:
-                        entry_msg = (f"ENTRY: {sel.strategy_name} (tid {tid}) — "
-                                     f"entered today, no re-entry until next session")
-                        entered_today = True
-                    else:
-                        entry_msg = f"ENTRY ABORTED — {sel.rationale}"
+                logger.warning("Running on weekend (test mode)")
+
+    # CHECK 2 — NTP clock sync (live mode only)
+    if not config.PAPER_TRADING_MODE:
+        try:
+            import ntplib
+            client = ntplib.NTPClient()
+            response = client.request(config.NTP_SERVER, version=3)
+            offset = abs(response.offset)
+            if offset > config.NTP_MAX_OFFSET_SEC:
+                logger.critical(
+                    f"Clock offset {offset:.3f}s > "
+                    f"max {config.NTP_MAX_OFFSET_SEC}s — "
+                    f"sync system clock before trading"
+                )
+                return False
+            logger.info(f"NTP sync OK: offset={offset:.3f}s")
+        except ImportError:
+            logger.warning("ntplib not installed — skipping NTP check")
+        except Exception as e:
+            logger.warning(f"NTP check failed: {e} — proceeding")
+
+    # CHECK 3 — Token validation
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                config.UPSTOX_BASE_V2 + config.EP_PROFILE,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    name = (
+                        data.get("data", {}).get("name", "Unknown") or
+                        data.get("name", "Unknown")
+                    )
+                    logger.info(f"Token valid — User: {name}")
+                elif resp.status == 401:
+                    logger.critical(
+                        "Token expired or invalid — "
+                        "generate new token from Upstox"
+                    )
+                    return False
                 else:
-                    entry_msg = f"NO ENTRY: {sel.rationale}"
-            elif entered_today:
-                entry_msg = "entry already executed today — no new entries until next session"
-            elif not allow_entry and tnow >= C.EXEC_END_TIME:
-                entry_msg = "ENTRY WINDOW CLOSED (after 09:20:30 IST)"
-            elif tnow < C.EXEC_START_TIME:
-                entry_msg = "awaiting entry window (09:19:30-09:20:30 IST)"
+                    logger.warning(
+                        f"Profile check returned {resp.status} — "
+                        f"proceeding with caution"
+                    )
+    except Exception as e:
+        logger.warning(f"Token validation error: {e} — proceeding")
 
-            # ---- manage open positions ------------------------------------
-            env = selector.build_env(res)
-            executor.manage_positions(res, env, now)
+    # CHECK 4 — Execution window check
+    now_time = datetime.now(IST).time()
+    if now_time > config.EXEC_END_TIME and now_time < config.MARKET_CLOSE:
+        logger.warning(
+            f"Entry window {config.EXEC_START_TIME}-{config.EXEC_END_TIME} "
+            f"already closed for today — monitoring only"
+        )
 
-            # ---- heartbeat checkpoint (every 10 s) ------------------------
-            if time.monotonic() - last_heartbeat >= C.CHECKPOINT_HEARTBEAT_S:
-                state.checkpoint({"spot": res.spot, "vix": res.vix,
-                                  "scores": res.confirmed_scores,
-                                  "composite": res.composite,
-                                  "regime": res.regime}, reason="heartbeat")
-                last_heartbeat = time.monotonic()
+    # CHECK 5 — Log directory
+    if not os.path.exists(config.LOG_DIR):
+        os.makedirs(config.LOG_DIR, exist_ok=True)
+        logger.info(f"Created log directory: {config.LOG_DIR}")
 
-            # ---- console + csv log -----------------------------------------
-            phase = market_phase(now)
-            meta = {"data_source": args.data, "paper": C.PAPER_TRADING_MODE,
-                    "last_cycle_seconds": time.monotonic() - cycle_start,
-                    "day_pnl": risk.day_pnl_points}
-            entry_state["msg"] = entry_msg
-            print("\n" + build_report(cyc, res, selector, executor, clock, phase,
-                                      entry_state, meta))
-            loggers.regime_csv.append([now.isoformat(timespec="seconds"),
-                                       f"{res.composite:+.3f}", res.regime,
-                                       res.vol.raw, res.vol.confirmed,
-                                       res.edge.raw, res.edge.confirmed,
-                                       res.trend.raw, res.trend.confirmed,
-                                       res.flow.raw, res.flow.confirmed,
-                                       res.spot, res.vix, int(res.override)])
+    # CHECK 6 — Holiday calendar review date
+    days_since_review = (today - config.HOLIDAY_CALENDAR_REVIEWED_ON).days
+    if days_since_review > 180:
+        logger.warning(
+            f"Holiday calendar last reviewed {days_since_review} days ago — "
+            f"please update NSE_MARKET_HOLIDAYS in config.py"
+        )
 
-            if args.once:
-                break
+    # CHECK 7 — High impact events today
+    if today_str in config.HIGH_IMPACT_EVENTS:
+        event_name = config.HIGH_IMPACT_EVENTS[today_str]
+        logger.warning(
+            f"HIGH IMPACT EVENT TODAY: {event_name} — "
+            f"EVENT_HEDGE regime may activate"
+        )
 
-            # ---- sleep (real) or advance (virtual) --------------------------
-            if use_virtual:
-                clock.advance(args.virtual_step)
-                n2 = clock.now()
-                # roll to fresh expiries when the current one has passed
-                last_exp = monthly_exp or near_exp
-                if last_exp:
-                    from datetime import datetime as _dt
-                    try:
-                        exp_d = _dt.strptime(last_exp, "%Y-%m-%d").date()
-                        if n2.date() > exp_d:
-                            master = client.instruments()      # regenerate expiries
-                            near_exp = master["expiries"][0]["date"]
-                            monthlies = [e["date"] for e in master["expiries"] if not e["weekly"]]
-                            monthly_exp = monthlies[0] if monthlies else None
-                            detector.futs = master.get("futs", [])
-                            print(y(f"  --- rolled to new expiry set: near {near_exp} "
-                                    f"monthly {monthly_exp} ---"))
-                    except (ValueError, TypeError):
-                        pass
-                # after the session, jump straight to the next trading day 09:14
-                if n2.time() >= C.TIME_EXIT_NORMAL or n2.time() < C.ENTRY_VIX_TIME:
-                    d = n2.date() + timedelta(days=1)
-                    while not C.is_trading_day(d):
-                        d += timedelta(days=1)
-                    n2 = datetime(d.year, d.month, d.day, 9, 14, 0).replace(tzinfo=n2.tzinfo)
-                    clock.set(n2)
-                    print(y(f"  --- next trading day {d} ({n2:%a}) ---"))
-                if clock.now().date() != now.date():
-                    entered_today = False
-                    entry_msg = ""
-                clock.sleep_seconds(0.15)
-            else:
-                clock.sleep_seconds(interval)
+    logger.info(
+        f"Pre-flight checks completed — "
+        f"mode={'PAPER' if config.PAPER_TRADING_MODE else 'LIVE'}"
+    )
+    return checks_passed
 
-    except KeyboardInterrupt:
+
+async def _wait_for_market_open(
+    shutdown_event: asyncio.Event
+) -> None:
+    """Wait until market opens at MARKET_OPEN time."""
+    IST = pytz.timezone(config.TZ)
+
+    while not shutdown_event.is_set():
+        now = datetime.now(IST)
+        now_time = now.time()
+
+        if now_time >= config.MARKET_OPEN:
+            logger.info(
+                f"Market open — starting engine "
+                f"(time={now_time})"
+            )
+            return
+
+        market_open_dt = datetime.combine(
+            now.date(), config.MARKET_OPEN
+        ).replace(tzinfo=IST)
+        wait_sec = (market_open_dt - now).total_seconds()
+
+        if wait_sec > 0:
+            logger.info(
+                f"Waiting {wait_sec:.0f}s for market open "
+                f"at {config.MARKET_OPEN}"
+            )
+            while wait_sec > 0 and not shutdown_event.is_set():
+                sleep_chunk = min(30.0, wait_sec)
+                await asyncio.sleep(sleep_chunk)
+                wait_sec -= sleep_chunk
+        else:
+            return
+
+
+async def _end_of_day(
+    se: StrategyEngine,
+    dm: DataManager
+) -> None:
+    """Execute end-of-day procedures."""
+    IST = pytz.timezone(config.TZ)
+    logger.info("=" * 60)
+    logger.info("END OF DAY PROCEDURES STARTING")
+    logger.info("=" * 60)
+
+    for position in list(se.open_positions):
+        regime = se.re.confirmed_regime
+        try:
+            expiry = datetime.strptime(
+                position.expiry_date, "%Y-%m-%d"
+            ).date()
+            dte = (expiry - date.today()).days
+        except (ValueError, TypeError):
+            dte = 0
+
+        should_close = True
+
+        if (regime in [config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL] and
+                dte > 5 and
+                position.strategy_name in [
+                    config.STRAT_SHORT_STRADDLE,
+                    config.STRAT_IRON_CONDOR,
+                    config.STRAT_CREDIT_SPREADS
+                ]):
+            should_close = False
+            logger.info(
+                f"Keeping overnight: {position.strategy_name} "
+                f"trade_id={position.trade_id[:8]} dte={dte}"
+            )
+
+        if should_close:
+            await se._close_position(
+                position, config.EXIT_REASONS["EOD"]
+            )
+
+    _generate_eod_report(se, dm)
+
+    dm.save_state_to_sqlite({
+        "timestamp":       datetime.now(IST).isoformat(),
+        "spot":            dm.spot,
+        "vix":             dm.vix,
+        "iv_atm":          dm.iv_atm,
+        "rv_20d":          dm.rv_20d,
+        "skew":            dm.skew,
+        "adx":             dm.adx,
+        "ema_50":          dm.ema_50,
+        "composite_score": se.re.raw_composite,
+        "regime":          se.re.confirmed_regime
+    })
+    se.re.save_buffers_to_sqlite()
+
+    logger.info("EOD procedures complete")
+
+
+async def _expiry_day_close_all(se: StrategyEngine) -> None:
+    """Force close all expiring positions on expiry day."""
+    logger.info("EXPIRY DAY: Force closing all expiring positions")
+
+    for position in list(se.open_positions):
+        try:
+            expiry = datetime.strptime(
+                position.expiry_date, "%Y-%m-%d"
+            ).date()
+        except (ValueError, TypeError):
+            continue
+
+        if expiry == date.today():
+            await se._close_position(
+                position,
+                config.EXIT_REASONS["EXPIRY"],
+                use_market=True
+            )
+            logger.info(
+                f"Expiry closed: {position.strategy_name} "
+                f"trade_id={position.trade_id[:8]}"
+            )
+
+    logger.info("Expiry day close complete")
+
+
+async def _graceful_shutdown(
+    se: StrategyEngine,
+    dm: DataManager,
+    shutdown_event: asyncio.Event
+) -> None:
+    """Execute graceful shutdown with position square-off."""
+    IST = pytz.timezone(config.TZ)
+    logger.info("=" * 60)
+    logger.info("GRACEFUL SHUTDOWN INITIATED")
+    logger.info("=" * 60)
+
+    if not config.PAPER_TRADING_MODE:
+        logger.info("Live mode: squaring off all open positions")
+        for position in list(se.open_positions):
+            try:
+                await se._close_position(
+                    position,
+                    config.EXIT_REASONS["MANUAL"],
+                    use_market=True
+                )
+            except Exception as e:
+                logger.error(
+                    f"Shutdown close error for "
+                    f"{position.trade_id[:8]}: {e}"
+                )
+    else:
+        logger.info("Paper mode: logging open positions at shutdown")
+        for position in se.open_positions:
+            logger.info(
+                f"Open at shutdown: {position.strategy_name} "
+                f"trade_id={position.trade_id[:8]} "
+                f"pnl=₹{position.realized_pnl:,.2f}"
+            )
+
+    # Close WebSocket
+    if dm.ws is not None and dm.ws_connected:
+        try:
+            await dm.ws.close()
+            logger.info("WebSocket closed")
+        except Exception as e:
+            logger.warning(f"WebSocket close error: {e}")
+
+    # Close aiohttp session
+    if dm.session is not None and not dm.session.closed:
+        try:
+            await dm.session.close()
+            logger.info("HTTP session closed")
+        except Exception as e:
+            logger.warning(f"HTTP session close error: {e}")
+
+    # Final state save
+    try:
+        dm.save_state_to_sqlite({
+            "timestamp":       datetime.now(IST).isoformat(),
+            "spot":            dm.spot,
+            "vix":             dm.vix,
+            "iv_atm":          dm.iv_atm,
+            "rv_20d":          dm.rv_20d,
+            "skew":            dm.skew,
+            "adx":             dm.adx,
+            "ema_50":          dm.ema_50,
+            "composite_score": se.re.raw_composite,
+            "regime":          se.re.confirmed_regime
+        })
+        se.re.save_buffers_to_sqlite()
+    except Exception as e:
+        logger.warning(f"Final state save error: {e}")
+
+    _generate_eod_report(se, dm)
+
+    logger.info("Shutdown complete")
+    shutdown_event.set()
+
+
+def _display_console(
+    dm: DataManager,
+    re: RegimeEngine,
+    se: StrategyEngine
+) -> None:
+    """Render real-time console display."""
+    IST = pytz.timezone(config.TZ)
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+    COLORS = {
+        config.REGIME_STRONG_SELL: "\033[92m",
+        config.REGIME_MILD_SELL:   "\033[32m",
+        config.REGIME_NEUTRAL:     "\033[93m",
+        config.REGIME_BUY_VOL:     "\033[91m",
+        config.REGIME_STRONG_BUY:  "\033[31m",
+        config.REGIME_EVENT:       "\033[95m",
+    }
+    RESET = "\033[0m"
+    regime = re.confirmed_regime
+    color = COLORS.get(regime, "")
+
+    greeks = se._get_portfolio_greeks()
+
+    spot_str = f"{dm.spot:>10.2f}" if dm.spot else "       N/A"
+    vix_str = f"{dm.vix:>6.2f}" if dm.vix else "   N/A"
+    iv_atm_str = f"{dm.iv_atm:>10.4f}" if dm.iv_atm else "       N/A"
+    rv_str = f"{dm.rv_20d:>6.4f}" if dm.rv_20d else "   N/A"
+    adx_str = f"{dm.adx:>10.2f}" if dm.adx else "       N/A"
+    skew_str = f"{dm.skew:>6.4f}" if dm.skew else "   N/A"
+
+    try:
+        print("\033[2J\033[H", end="", flush=True)
+    except Exception:
         pass
 
-    # --------------------------------------------------------------- teardown
-    print("\n" + bo(cy("═" * W)))
-    print(bo(cy(" Engine stopped.")))
-    print(f"  cycles run : {cyc}")
-    print(f"  open trades: {len(executor.open_trades)}")
-    if executor.open_trades:
-        print(y("  NOTE: open trades are persisted in state.db — re-run to resume management."))
-    if args.once or not executor.open_trades:
-        try:
-            executor.square_off_all("MANUAL")
-        except Exception:
-            pass
-    loggers.audit("STOPPED", cycles=cyc)
-    state.close()
-    print(bo(cy("═" * W)))
-    return 0
+    print("=" * 65)
+    print(
+        f" NIFTY OPTIONS ALGO — "
+        f"{'PAPER TRADING' if config.PAPER_TRADING_MODE else '*** LIVE TRADING ***'}"
+    )
+    print("=" * 65)
+    print(f" Time    : {now_str}")
+    print(f" Spot    : {spot_str}  VIX  : {vix_str}")
+    print(f" IV_ATM  : {iv_atm_str}  RV   : {rv_str}")
+    print(f" ADX     : {adx_str}  Skew : {skew_str}")
+    print("-" * 65)
+    print(
+        f" Vol     : {re.confirmed_vol:>+6.2f}  "
+        f"Edge : {re.confirmed_edge:>+6.2f}  "
+        f"Trend: {re.confirmed_trend:>+6.2f}  "
+        f"Flow : {re.confirmed_flow:>+6.2f}"
+    )
+    print(f" Composite Score : {re.raw_composite:>+8.4f}")
+    print(
+        f" Regime  : {color}{regime}{RESET}  "
+        f"(persist={re.persistence_count})"
+    )
+    print(f" Action  : {re.get_regime_action_description()}")
+    print("-" * 65)
+    print(
+        f" Positions: {len(se.open_positions)}  "
+        f"Daily P&L: ₹{se.daily_pnl:>10,.2f}  "
+        f"Capital: ₹{se.current_capital:>12,.2f}"
+    )
+    print(
+        f" Delta  : {greeks['delta']:>8.3f}  "
+        f"Gamma: {greeks['gamma']:>10.5f}"
+    )
+    print(
+        f" Vega   : ₹{greeks['vega']:>8,.0f}  "
+        f"Theta: ₹{greeks['theta']:>8,.0f}/day"
+    )
+    print("-" * 65)
 
-_global_clock = Clock()
+    if se.open_positions:
+        print(" OPEN POSITIONS:")
+        for pos in se.open_positions:
+            pnl_color = (
+                "\033[92m" if pos.realized_pnl >= 0 else "\033[91m"
+            )
+            print(
+                f"  {pos.strategy_name:<25} "
+                f"Entry: {pos.entry_spot:>8.2f}  "
+                f"P&L: {pnl_color}₹{pos.realized_pnl:>8,.2f}{RESET}"
+            )
+    else:
+        print(" No open positions")
+
+    print("-" * 65)
+
+    alerts = []
+    if se.daily_trading_halted:
+        alerts.append(" \033[91m⚠ DAILY TRADING HALTED (CB L2)\033[0m")
+    if se.kill_switch_active:
+        alerts.append(" \033[91m⚠ KILL SWITCH ACTIVE (CB L4)\033[0m")
+    if dm.kill_switch_triggered:
+        alerts.append(" \033[91m⚠ WEBSOCKET KILL SWITCH\033[0m")
+    if se.cooling_period_end:
+        IST = pytz.timezone(config.TZ)
+        if datetime.now(IST) < se.cooling_period_end:
+            alerts.append(
+                f" \033[93m⚠ COOLING PERIOD ACTIVE until "
+                f"{se.cooling_period_end.strftime('%H:%M:%S')}\033[0m"
+            )
+
+    for alert in alerts:
+        print(alert)
+
+    if not alerts:
+        print(" System: \033[92mOPERATIONAL\033[0m")
+
+    print("=" * 65)
+
+
+def _generate_eod_report(
+    se: StrategyEngine,
+    dm: DataManager
+) -> None:
+    """Generate and log end-of-day performance report."""
+    IST = pytz.timezone(config.TZ)
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+    total_trades = len(se.closed_positions)
+    winning = [p for p in se.closed_positions if p.realized_pnl > 0]
+    losing = [p for p in se.closed_positions if p.realized_pnl <= 0]
+
+    win_rate = (
+        len(winning) / total_trades * 100
+        if total_trades > 0 else 0.0
+    )
+    total_pnl = sum(p.realized_pnl for p in se.closed_positions)
+    avg_win = (
+        float(np.mean([p.realized_pnl for p in winning]))
+        if winning else 0.0
+    )
+    avg_loss = (
+        float(np.mean([p.realized_pnl for p in losing]))
+        if losing else 0.0
+    )
+    drawdown = se.peak_capital - se.current_capital
+
+    report = (
+        f"\n{'=' * 60}\n"
+        f"END OF DAY REPORT — {now_str}\n"
+        f"{'=' * 60}\n"
+        f"Mode           : {'PAPER' if config.PAPER_TRADING_MODE else 'LIVE'}\n"
+        f"Total Trades   : {total_trades}\n"
+        f"Winning Trades : {len(winning)}\n"
+        f"Losing Trades  : {len(losing)}\n"
+        f"Win Rate       : {win_rate:.1f}%\n"
+        f"Total P&L      : ₹{total_pnl:,.2f}\n"
+        f"Avg Win        : ₹{avg_win:,.2f}\n"
+        f"Avg Loss       : ₹{avg_loss:,.2f}\n"
+        f"Capital        : ₹{se.current_capital:,.2f}\n"
+        f"Peak Capital   : ₹{se.peak_capital:,.2f}\n"
+        f"Drawdown       : ₹{drawdown:,.2f}\n"
+        f"Open Positions : {len(se.open_positions)}\n"
+        f"Regime at EOD  : {se.re.confirmed_regime}\n"
+        f"Spot at EOD    : {dm.spot or 'N/A'}\n"
+        f"VIX at EOD     : {dm.vix or 'N/A'}\n"
+        f"{'=' * 60}\n"
+    )
+
+    logger.info(report)
+
+    try:
+        with open(config.AUDIT_CSV, "a", encoding="utf-8") as f:
+            f.write(report)
+    except Exception as e:
+        logger.warning(f"EOD report write failed: {e}")
+
+
+def _is_expiry_day() -> bool:
+    """Check if today is Nifty expiry day (Thursday)."""
+    today = date.today()
+    if today.weekday() == 3:  # Thursday
+        return True
+    return False
+
+
+async def main() -> None:
+    """Main orchestration coroutine."""
+    # STEP 1 — Setup logging
+    setup_logging()
+    IST = pytz.timezone(config.TZ)
+
+    logger.info("=" * 60)
+    logger.info("NIFTY OPTIONS ALGO TRADING ENGINE STARTING")
+    logger.info(
+        f"Mode: {'PAPER TRADING' if config.PAPER_TRADING_MODE else '*** LIVE TRADING ***'}"
+    )
+    logger.info(f"Capital: ₹{config.TOTAL_CAPITAL:,}")
+    logger.info(f"Time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info("=" * 60)
+
+    # STEP 2 — Load access token
+    access_token = _load_access_token()
+    if access_token is None:
+        logger.critical("Cannot load access token — exiting")
+        sys.exit(1)
+
+    # STEP 3 — Pre-flight checks
+    preflight_ok = await _run_preflight_checks(access_token)
+    if not preflight_ok:
+        logger.critical("Pre-flight checks failed — exiting")
+        sys.exit(1)
+
+    # STEP 4 — Initialize components
+    dm = DataManager(access_token, config.STATE_DB)
+    await dm.initialize()
+
+    re = RegimeEngine(dm, config.STATE_DB)
+    re.load_buffers_from_sqlite()
+
+    se = StrategyEngine(dm, re, config.STATE_DB)
+    se._load_positions_from_sqlite()
+
+    # Broker reconciliation on startup (live mode)
+    if not config.PAPER_TRADING_MODE:
+        await se._reconcile_with_broker()
+
+    # STEP 5 — Register signal handlers
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler(sig, frame):
+        logger.warning(
+            f"Signal {sig} received — initiating graceful shutdown"
+        )
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # STEP 6 — Wait for market open
+    await _wait_for_market_open(shutdown_event)
+    if shutdown_event.is_set():
+        await _graceful_shutdown(se, dm, shutdown_event)
+        return
+
+    # STEP 7 — Start WebSocket feed
+    ws_task = asyncio.create_task(dm.start_websocket())
+    ws_health_task = asyncio.create_task(dm.monitor_ws_health())
+
+    # Wait for first WebSocket data
+    logger.info("Waiting for WebSocket data...")
+    await asyncio.sleep(3)
+
+    # STEP 8 — Initial data fetch
+    await dm.fetch_spot_and_vix()
+
+    if dm.spot is None or dm.vix is None:
+        logger.critical(
+            "Cannot fetch spot/VIX after WebSocket start — aborting"
+        )
+        ws_task.cancel()
+        ws_health_task.cancel()
+        await _graceful_shutdown(se, dm, shutdown_event)
+        return
+
+    logger.info(
+        f"Initial data: spot={dm.spot:.2f} vix={dm.vix:.2f}"
+    )
+
+    # Fetch option chain for nearest expiries
+    today_str = date.today().strftime("%Y-%m-%d")
+    from_date = (
+        date.today() - timedelta(days=30)
+    ).strftime("%Y-%m-%d")
+
+    # First fetch to get available expiries
+    await dm.fetch_option_chain(
+        (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+    )
+    expiries = dm.get_available_expiries()
+
+    if not expiries:
+        logger.warning(
+            "No expiries found — fetching with default dates"
+        )
+        for days_ahead in [7, 14, 30, 45]:
+            exp_str = (
+                date.today() + timedelta(days=days_ahead)
+            ).strftime("%Y-%m-%d")
+            await dm.fetch_option_chain(exp_str)
+            await asyncio.sleep(0.3)
+        expiries = dm.get_available_expiries()
+
+    for expiry in expiries[:3]:
+        await dm.fetch_option_chain(expiry)
+        await asyncio.sleep(0.3)
+
+    # Fetch historical candles
+    await dm.fetch_historical_candles(
+        config.INSTRUMENT_NIFTY,
+        config.ADX_CANDLE_TIMEFRAME,
+        from_date,
+        today_str
+    )
+
+    # Compute initial indicators
+    await dm.compute_realized_vol()
+    dm.compute_adx()
+    dm.compute_ema_slope()
+
+    logger.info(
+        f"Initial indicators: "
+        f"rv={dm.rv_20d} adx={dm.adx} "
+        f"ema50={dm.ema_50} iv_atm={dm.iv_atm}"
+    )
+    logger.info("Initial data loaded successfully — entering main loop")
+
+    # STEP 9 — Main trading loop
+    last_regime_refresh = datetime.now(IST) - timedelta(
+        seconds=config.REGIME_REFRESH_SECONDS
+    )
+    last_data_refresh = datetime.now(IST) - timedelta(
+        seconds=config.REGIME_REFRESH_SECONDS
+    )
+    last_console_update = datetime.now(IST)
+    last_heartbeat = datetime.now(IST)
+    last_trading_date = date.today()
+
+    while not shutdown_event.is_set():
+        try:
+            now = datetime.now(IST)
+            now_time = now.time()
+
+            # Check WebSocket kill switch
+            if dm.kill_switch_triggered:
+                logger.critical(
+                    "WebSocket kill switch triggered — "
+                    "initiating graceful shutdown"
+                )
+                break
+
+            # Check strategy engine kill switch
+            if se.kill_switch_active:
+                logger.critical(
+                    "Strategy engine kill switch active — "
+                    "initiating graceful shutdown"
+                )
+                break
+
+            # Daily reset check
+            today = date.today()
+            if today != last_trading_date:
+                se.reset_daily_state()
+                last_trading_date = today
+                if today.weekday() == 0:  # Monday
+                    se.reset_weekly_state()
+                logger.info(f"New trading day: {today}")
+
+            # Market hours check — EOD
+            if now_time >= config.TIME_EXIT_NORMAL:
+                logger.info(
+                    f"Market closing time reached "
+                    f"({config.TIME_EXIT_NORMAL}) — "
+                    f"initiating EOD procedures"
+                )
+                await _end_of_day(se, dm)
+                break
+
+            # Expiry day check
+            if _is_expiry_day():
+                if now_time >= config.TIME_EXIT_EXPIRY:
+                    logger.info(
+                        f"Expiry day exit time reached "
+                        f"({config.TIME_EXIT_EXPIRY})"
+                    )
+                    await _expiry_day_close_all(se)
+                    await _end_of_day(se, dm)
+                    break
+
+            # ─────────────────────────────────────────
+            # DATA REFRESH (every 5 minutes)
+            # ─────────────────────────────────────────
+            data_elapsed = (now - last_data_refresh).total_seconds()
+            if data_elapsed >= config.REGIME_REFRESH_SECONDS:
+                logger.info("Starting data refresh cycle")
+
+                try:
+                    await dm.fetch_spot_and_vix()
+                except Exception as e:
+                    logger.error(f"fetch_spot_and_vix error: {e}")
+
+                # Refresh option chain for active expiries
+                current_expiries = dm.get_available_expiries()
+                if not current_expiries:
+                    current_expiries = expiries
+
+                for expiry in current_expiries[:3]:
+                    try:
+                        await dm.fetch_option_chain(expiry)
+                        await asyncio.sleep(0.2)
+                    except Exception as e:
+                        logger.error(
+                            f"fetch_option_chain error for {expiry}: {e}"
+                        )
+
+                # Refresh historical candles
+                try:
+                    await dm.fetch_historical_candles(
+                        config.INSTRUMENT_NIFTY,
+                        config.ADX_CANDLE_TIMEFRAME,
+                        from_date,
+                        today_str
+                    )
+                except Exception as e:
+                    logger.error(f"fetch_historical_candles error: {e}")
+
+                # Recompute indicators
+                try:
+                    await dm.compute_realized_vol()
+                except Exception as e:
+                    logger.error(f"compute_realized_vol error: {e}")
+
+                try:
+                    dm.compute_adx()
+                except Exception as e:
+                    logger.error(f"compute_adx error: {e}")
+
+                try:
+                    dm.compute_ema_slope()
+                except Exception as e:
+                    logger.error(f"compute_ema_slope error: {e}")
+
+                try:
+                    await dm.fetch_oi_snapshot()
+                except Exception as e:
+                    logger.error(f"fetch_oi_snapshot error: {e}")
+
+                try:
+                    dm.compute_net_flow()
+                except Exception as e:
+                    logger.error(f"compute_net_flow error: {e}")
+
+                try:
+                    dm.compute_spread_ratio()
+                except Exception as e:
+                    logger.error(f"compute_spread_ratio error: {e}")
+
+                last_data_refresh = now
+                logger.info("Data refresh cycle complete")
+
+            # ─────────────────────────────────────────
+            # REGIME REFRESH (every 5 minutes)
+            # ─────────────────────────────────────────
+            regime_elapsed = (now - last_regime_refresh).total_seconds()
+            if regime_elapsed >= config.REGIME_REFRESH_SECONDS:
+                logger.info("Starting regime refresh cycle")
+
+                try:
+                    # Freeze regime after REGIME_FREEZE_TIME
+                    if now_time < config.REGIME_FREEZE_TIME:
+                        regime = await re.refresh()
+                        logger.info(
+                            f"Regime refreshed: {regime} "
+                            f"composite={re.raw_composite:.4f}"
+                        )
+                    else:
+                        logger.info(
+                            f"Regime frozen at {config.REGIME_FREEZE_TIME} "
+                            f"— current: {re.confirmed_regime}"
+                        )
+                except Exception as e:
+                    logger.error(f"Regime refresh error: {e}")
+
+                # Run strategy cycle
+                try:
+                    await se.run_cycle()
+                except Exception as e:
+                    logger.error(f"Strategy cycle error: {e}")
+                    logger.error(traceback.format_exc())
+
+                # Save score buffers
+                try:
+                    re.save_buffers_to_sqlite()
+                except Exception as e:
+                    logger.warning(f"save_buffers_to_sqlite error: {e}")
+
+                last_regime_refresh = now
+                logger.info("Regime refresh cycle complete")
+
+            # ─────────────────────────────────────────
+            # HEARTBEAT (every 10 seconds)
+            # ─────────────────────────────────────────
+            hb_elapsed = (now - last_heartbeat).total_seconds()
+            if hb_elapsed >= config.HEARTBEAT_INTERVAL_SEC:
+                try:
+                    dm.save_state_to_sqlite({
+                        "timestamp":       now.isoformat(),
+                        "spot":            dm.spot,
+                        "vix":             dm.vix,
+                        "iv_atm":          dm.iv_atm,
+                        "rv_20d":          dm.rv_20d,
+                        "skew":            dm.skew,
+                        "adx":             dm.adx,
+                        "ema_50":          dm.ema_50,
+                        "composite_score": re.raw_composite,
+                        "regime":          re.confirmed_regime
+                    })
+                except Exception as e:
+                    logger.warning(f"Heartbeat save error: {e}")
+
+                last_heartbeat = now
+
+            # ─────────────────────────────────────────
+            # CONSOLE DISPLAY (every 5 seconds)
+            # ─────────────────────────────────────────
+            console_elapsed = (now - last_console_update).total_seconds()
+            if console_elapsed >= config.CONSOLE_REFRESH_SECONDS:
+                try:
+                    _display_console(dm, re, se)
+                except Exception as e:
+                    logger.warning(f"Console display error: {e}")
+                last_console_update = now
+
+            # Sleep 1 second between loop iterations
+            await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            logger.info("Main loop cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Main loop unhandled error: {e}")
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(5)
+            continue
+
+    # STEP 10 — Graceful shutdown
+    logger.info("Main loop exited — starting shutdown sequence")
+
+    try:
+        ws_task.cancel()
+        await asyncio.gather(ws_task, return_exceptions=True)
+    except Exception:
+        pass
+
+    try:
+        ws_health_task.cancel()
+        await asyncio.gather(ws_health_task, return_exceptions=True)
+    except Exception:
+        pass
+
+    await _graceful_shutdown(se, dm, shutdown_event)
+
 
 if __name__ == "__main__":
-    sys.exit(main())
-
-
-
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt received — shutdown complete")
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
+        print(traceback.format_exc())
+        sys.exit(1)
