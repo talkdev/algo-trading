@@ -1,0 +1,55 @@
+{"ts": "2026-08-30T20:15:15.841767", "event": "ENTRY_STARTED", "trade_id": "04c9c84f-156d-419b-921c-ba73fb8f0a6e", "strategy": "BULL_PUT_BEAR_CALL", "regime": "MILD_SELL_VOL", "legs": 4, "spot": 24204.276525346275, "vix": 12.0}
+{"ts": "2026-08-30T20:15:15.851026", "event": "ENTRY_COMPLETE", "trade_id": "04c9c84f-156d-419b-921c-ba73fb8f0a6e", "strategy": "BULL_PUT_BEAR_CALL", "credit": 214.98, "debit": 207.77}
+{"ts": "2026-08-30T20:15:16.022780", "event": "REGIME_CHANGE", "from_regime": "NEUTRAL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:15:16.268081", "event": "RULE_A", "trade_id": "04c9c84f-156d-419b-921c-ba73fb8f0a6e"}
+{"ts": "2026-08-30T20:15:16.269258", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T20:15:16.275473", "event": "TRADE_CLOSED", "trade_id": "04c9c84f-156d-419b-921c-ba73fb8f0a6e", "reason": "PROFIT_TARGET", "pnl_points": -1.89, "pnl_rupees": -8065.72}
+{"ts": "2026-08-30T20:15:16.608226", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:15:17.064747", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_SELL_VOL", "composite": 1.0}
+{"ts": "2026-08-30T20:15:17.404426", "event": "REGIME_CHANGE", "from_regime": "STRONG_SELL_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:15:17.652272", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T20:15:17.906677", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.3}
+{"ts": "2026-08-30T20:15:18.407613", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_SELL_VOL", "composite": 1.0}
+{"ts": "2026-08-30T20:15:18.667653", "event": "REGIME_CHANGE", "from_regime": "STRONG_SELL_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:15:19.021749", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T20:15:19.270663", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.3}
+{"ts": "2026-08-30T20:15:19.539142", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_SELL_VOL", "composite": 0.55}
+{"ts": "2026-08-30T20:15:20.039092", "event": "REGIME_CHANGE", "from_regime": "STRONG_SELL_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:15:20.235686", "event": "SHUTDOWN", "signal": 2}
+{"ts": "2026-08-30T20:28:18.143713", "event": "ENTRY_STARTED", "trade_id": "1ebd421c-251e-4f1d-9c6a-5ff351239768", "strategy": "BULL_PUT_BEAR_CALL", "regime": "MILD_SELL_VOL", "legs": 4, "spot": 24204.276525346275, "vix": 12.0}
+{"ts": "2026-08-30T20:28:18.156608", "event": "ENTRY_COMPLETE", "trade_id": "1ebd421c-251e-4f1d-9c6a-5ff351239768", "strategy": "BULL_PUT_BEAR_CALL", "credit": 214.98, "debit": 207.77}
+{"ts": "2026-08-30T20:28:18.672626", "event": "RULE_A", "trade_id": "1ebd421c-251e-4f1d-9c6a-5ff351239768"}
+{"ts": "2026-08-30T20:28:18.673777", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T20:28:18.680064", "event": "TRADE_CLOSED", "trade_id": "1ebd421c-251e-4f1d-9c6a-5ff351239768", "reason": "PROFIT_TARGET", "pnl_points": -1.89, "pnl_rupees": -8065.72}
+{"ts": "2026-08-30T20:28:18.990494", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:28:19.523420", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_SELL_VOL", "composite": 1.0}
+{"ts": "2026-08-30T20:28:19.921212", "event": "REGIME_CHANGE", "from_regime": "STRONG_SELL_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:28:20.190435", "event": "SHUTDOWN", "signal": 2}
+{"ts": "2026-08-30T20:28:33.689984", "event": "ENTRY_STARTED", "trade_id": "0467a64e-4030-45f1-8561-41c3267d5643", "strategy": "BULL_PUT_BEAR_CALL", "regime": "MILD_SELL_VOL", "legs": 4, "spot": 24204.276525346275, "vix": 12.0}
+{"ts": "2026-08-30T20:28:33.700052", "event": "ENTRY_COMPLETE", "trade_id": "0467a64e-4030-45f1-8561-41c3267d5643", "strategy": "BULL_PUT_BEAR_CALL", "credit": 214.98, "debit": 207.77}
+{"ts": "2026-08-30T20:28:34.347710", "event": "RULE_A", "trade_id": "0467a64e-4030-45f1-8561-41c3267d5643"}
+{"ts": "2026-08-30T20:28:34.348468", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T20:28:34.353121", "event": "TRADE_CLOSED", "trade_id": "0467a64e-4030-45f1-8561-41c3267d5643", "reason": "PROFIT_TARGET", "pnl_points": -1.89, "pnl_rupees": -8065.72}
+{"ts": "2026-08-30T20:28:34.664880", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:28:35.184201", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_SELL_VOL", "composite": 1.0}
+{"ts": "2026-08-30T20:28:35.584586", "event": "REGIME_CHANGE", "from_regime": "STRONG_SELL_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:28:35.664582", "event": "SHUTDOWN", "signal": 2}
+{"ts": "2026-08-30T20:29:22.656773", "event": "ENTRY_STARTED", "trade_id": "decbe6b3-e126-4605-a555-9276e3f365d8", "strategy": "BULL_PUT_BEAR_CALL", "regime": "MILD_SELL_VOL", "legs": 4, "spot": 24204.276525346275, "vix": 12.0}
+{"ts": "2026-08-30T20:29:22.666708", "event": "ENTRY_COMPLETE", "trade_id": "decbe6b3-e126-4605-a555-9276e3f365d8", "strategy": "BULL_PUT_BEAR_CALL", "credit": 214.98, "debit": 207.77}
+{"ts": "2026-08-30T20:29:22.863055", "event": "REGIME_CHANGE", "from_regime": "NEUTRAL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:29:23.178270", "event": "RULE_A", "trade_id": "decbe6b3-e126-4605-a555-9276e3f365d8"}
+{"ts": "2026-08-30T20:29:23.179028", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T20:29:23.185893", "event": "TRADE_CLOSED", "trade_id": "decbe6b3-e126-4605-a555-9276e3f365d8", "reason": "PROFIT_TARGET", "pnl_points": -1.89, "pnl_rupees": -8065.72}
+{"ts": "2026-08-30T20:29:23.496304", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T20:29:24.018584", "event": "SHUTDOWN", "signal": 2}
+{"ts": "2026-08-30T21:25:14.904334", "event": "ENTRY_STARTED", "trade_id": "68429e32-5112-4da4-b5ce-07d9b991045a", "strategy": "WIDE_IRON_CONDOR", "regime": "STRONG_SELL_VOL", "legs": 4, "spot": 24249.564802640147, "vix": 12.0}
+{"ts": "2026-08-30T21:25:14.927886", "event": "ENTRY_COMPLETE", "trade_id": "68429e32-5112-4da4-b5ce-07d9b991045a", "strategy": "WIDE_IRON_CONDOR", "credit": 74.65, "debit": 843.55}
+{"ts": "2026-08-30T21:25:15.265296", "event": "TRADE_CLOSED", "trade_id": "68429e32-5112-4da4-b5ce-07d9b991045a", "reason": "STOP_LOSS", "pnl_points": 2.01, "pnl_rupees": 8381.99}
+{"ts": "2026-08-30T21:25:15.371359", "event": "REGIME_CHANGE", "from_regime": "STRONG_SELL_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T21:25:15.684253", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T21:25:15.994650", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T21:25:16.598354", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_SELL_VOL", "composite": 1.0}
+{"ts": "2026-08-30T21:25:16.996984", "event": "REGIME_CHANGE", "from_regime": "STRONG_SELL_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.15}
+{"ts": "2026-08-30T21:25:17.285278", "event": "REGIME_CHANGE", "from_regime": "MILD_SELL_VOL", "to_regime": "STRONG_BUY_VOL", "composite": -0.5499999999999999}
+{"ts": "2026-08-30T21:25:17.568126", "event": "REGIME_CHANGE", "from_regime": "STRONG_BUY_VOL", "to_regime": "MILD_SELL_VOL", "composite": 0.3}
+{"ts": "2026-08-30T21:25:18.085460", "event": "SHUTDOWN", "signal": 2}
