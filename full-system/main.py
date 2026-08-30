@@ -3,6 +3,15 @@
 Orchestrator — starts and manages all components.
 Handles pre-flight checks, main trading loop, graceful shutdown,
 and real-time console display.
+
+FIXES IN THIS VERSION:
+  CRITICAL FIX 1: Cancel sweep before EOD procedures
+  CRITICAL FIX 2: Cancel sweep on graceful shutdown
+  CRITICAL FIX 3: Startup stale order cancellation
+  CRITICAL FIX 4: Cancel sweep on expiry day close
+  CRITICAL FIX 5: Cancel sweep on kill switch
+  HIGH FIX 6:     Net PnL (after transaction costs) in EOD report
+  HIGH FIX 7:     Net PnL in console display
 """
 
 import asyncio
@@ -33,7 +42,7 @@ def setup_logging() -> logging.Logger:
 
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     root_logger = logging.getLogger()
@@ -41,16 +50,14 @@ def setup_logging() -> logging.Logger:
         getattr(logging, config.LOG_LEVEL, logging.INFO)
     )
 
-    # Console handler — WARNING and above only
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(fmt)
     root_logger.addHandler(console_handler)
 
-    # File handler — all levels
     audit_file = os.path.join(
         config.LOG_DIR,
-        f"audit_log_{today_str}.log"
+        f"audit_log_{today_str}.log",
     )
     file_handler = logging.FileHandler(
         audit_file, mode="a", encoding="utf-8"
@@ -61,7 +68,6 @@ def setup_logging() -> logging.Logger:
     file_handler.setFormatter(fmt)
     root_logger.addHandler(file_handler)
 
-    # Suppress noisy third-party loggers
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
@@ -80,7 +86,9 @@ def _load_access_token() -> Optional[str]:
                 if line.startswith("UPSTOX_ACCESS_TOKEN="):
                     token = line.split("=", 1)[1].strip()
                     if token:
-                        logger.info("Access token loaded successfully")
+                        logger.info(
+                            "Access token loaded successfully"
+                        )
                         return token
         logger.critical(
             f"Token not found in {config.TOKEN_FILE} — "
@@ -98,8 +106,10 @@ def _load_access_token() -> Optional[str]:
         return None
 
 
-async def _run_preflight_checks(access_token: str) -> bool:
-    """Run all pre-flight validation checks before starting engine."""
+async def _run_preflight_checks(
+    access_token: str,
+) -> bool:
+    """Run all pre-flight validation checks."""
     checks_passed = True
     IST = pytz.timezone(config.TZ)
 
@@ -129,14 +139,18 @@ async def _run_preflight_checks(access_token: str) -> bool:
                 )
                 return False
             else:
-                logger.warning("Running on weekend (test mode)")
+                logger.warning(
+                    "Running on weekend (test mode)"
+                )
 
     # CHECK 2 — NTP clock sync (live mode only)
     if not config.PAPER_TRADING_MODE:
         try:
             import ntplib
             client = ntplib.NTPClient()
-            response = client.request(config.NTP_SERVER, version=3)
+            response = client.request(
+                config.NTP_SERVER, version=3
+            )
             offset = abs(response.offset)
             if offset > config.NTP_MAX_OFFSET_SEC:
                 logger.critical(
@@ -145,27 +159,39 @@ async def _run_preflight_checks(access_token: str) -> bool:
                     f"sync system clock before trading"
                 )
                 return False
-            logger.info(f"NTP sync OK: offset={offset:.3f}s")
+            logger.info(
+                f"NTP sync OK: offset={offset:.3f}s"
+            )
         except ImportError:
-            logger.warning("ntplib not installed — skipping NTP check")
+            logger.warning(
+                "ntplib not installed — skipping NTP check"
+            )
         except Exception as e:
-            logger.warning(f"NTP check failed: {e} — proceeding")
+            logger.warning(
+                f"NTP check failed: {e} — proceeding"
+            )
 
     # CHECK 3 — Token validation
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 config.UPSTOX_BASE_V2 + config.EP_PROFILE,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=aiohttp.ClientTimeout(total=10)
+                headers={
+                    "Authorization": f"Bearer {access_token}"
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     name = (
-                        data.get("data", {}).get("name", "Unknown") or
-                        data.get("name", "Unknown")
+                        data.get("data", {}).get(
+                            "name", "Unknown"
+                        )
+                        or data.get("name", "Unknown")
                     )
-                    logger.info(f"Token valid — User: {name}")
+                    logger.info(
+                        f"Token valid — User: {name}"
+                    )
                 elif resp.status == 401:
                     logger.critical(
                         "Token expired or invalid — "
@@ -174,30 +200,41 @@ async def _run_preflight_checks(access_token: str) -> bool:
                     return False
                 else:
                     logger.warning(
-                        f"Profile check returned {resp.status} — "
-                        f"proceeding with caution"
+                        f"Profile check returned {resp.status}"
+                        f" — proceeding with caution"
                     )
     except Exception as e:
-        logger.warning(f"Token validation error: {e} — proceeding")
+        logger.warning(
+            f"Token validation error: {e} — proceeding"
+        )
 
     # CHECK 4 — Execution window check
     now_time = datetime.now(IST).time()
-    if now_time > config.EXEC_END_TIME and now_time < config.MARKET_CLOSE:
+    if (
+        now_time > config.EXEC_END_TIME
+        and now_time < config.MARKET_CLOSE
+    ):
         logger.warning(
-            f"Entry window {config.EXEC_START_TIME}-{config.EXEC_END_TIME} "
-            f"already closed for today — monitoring only"
+            f"Entry window {config.EXEC_START_TIME}-"
+            f"{config.EXEC_END_TIME} already closed "
+            f"for today — monitoring only"
         )
 
     # CHECK 5 — Log directory
     if not os.path.exists(config.LOG_DIR):
         os.makedirs(config.LOG_DIR, exist_ok=True)
-        logger.info(f"Created log directory: {config.LOG_DIR}")
+        logger.info(
+            f"Created log directory: {config.LOG_DIR}"
+        )
 
     # CHECK 6 — Holiday calendar review date
-    days_since_review = (today - config.HOLIDAY_CALENDAR_REVIEWED_ON).days
+    days_since_review = (
+        today - config.HOLIDAY_CALENDAR_REVIEWED_ON
+    ).days
     if days_since_review > 180:
         logger.warning(
-            f"Holiday calendar last reviewed {days_since_review} days ago — "
+            f"Holiday calendar last reviewed "
+            f"{days_since_review} days ago — "
             f"please update NSE_MARKET_HOLIDAYS in config.py"
         )
 
@@ -217,7 +254,7 @@ async def _run_preflight_checks(access_token: str) -> bool:
 
 
 async def _wait_for_market_open(
-    shutdown_event: asyncio.Event
+    shutdown_event: asyncio.Event,
 ) -> None:
     """Wait until market opens at MARKET_OPEN time."""
     IST = pytz.timezone(config.TZ)
@@ -243,7 +280,10 @@ async def _wait_for_market_open(
                 f"Waiting {wait_sec:.0f}s for market open "
                 f"at {config.MARKET_OPEN}"
             )
-            while wait_sec > 0 and not shutdown_event.is_set():
+            while (
+                wait_sec > 0
+                and not shutdown_event.is_set()
+            ):
                 sleep_chunk = min(30.0, wait_sec)
                 await asyncio.sleep(sleep_chunk)
                 wait_sec -= sleep_chunk
@@ -253,13 +293,30 @@ async def _wait_for_market_open(
 
 async def _end_of_day(
     se: StrategyEngine,
-    dm: DataManager
+    dm: DataManager,
 ) -> None:
-    """Execute end-of-day procedures."""
+    """
+    Execute end-of-day procedures.
+    CRITICAL FIX 1: Cancel all open orders BEFORE closing positions.
+    """
     IST = pytz.timezone(config.TZ)
     logger.info("=" * 60)
     logger.info("END OF DAY PROCEDURES STARTING")
     logger.info("=" * 60)
+
+    # CRITICAL FIX 1: Cancel all open orders first
+    # This ensures no limit orders fill after we start closing
+    logger.info("EOD: Running cancel sweep before position close")
+    cancelled = await se.cancel_all_open_orders(
+        context="EOD_CANCEL_SWEEP"
+    )
+    if cancelled > 0:
+        logger.info(
+            f"EOD: Cancelled {cancelled} open orders "
+            f"before position close"
+        )
+    # Allow broker to process cancellations
+    await asyncio.sleep(1.0)
 
     for position in list(se.open_positions):
         regime = se.re.confirmed_regime
@@ -273,13 +330,18 @@ async def _end_of_day(
 
         should_close = True
 
-        if (regime in [config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL] and
-                dte > 5 and
-                position.strategy_name in [
-                    config.STRAT_SHORT_STRADDLE,
-                    config.STRAT_IRON_CONDOR,
-                    config.STRAT_CREDIT_SPREADS
-                ]):
+        if (
+            regime in [
+                config.REGIME_STRONG_SELL,
+                config.REGIME_MILD_SELL,
+            ]
+            and dte > 5
+            and position.strategy_name in [
+                config.STRAT_SHORT_STRADDLE,
+                config.STRAT_IRON_CONDOR,
+                config.STRAT_CREDIT_SPREADS,
+            ]
+        ):
             should_close = False
             logger.info(
                 f"Keeping overnight: {position.strategy_name} "
@@ -303,16 +365,36 @@ async def _end_of_day(
         "adx":             dm.adx,
         "ema_50":          dm.ema_50,
         "composite_score": se.re.raw_composite,
-        "regime":          se.re.confirmed_regime
+        "regime":          se.re.confirmed_regime,
     })
     se.re.save_buffers_to_sqlite()
 
     logger.info("EOD procedures complete")
 
 
-async def _expiry_day_close_all(se: StrategyEngine) -> None:
-    """Force close all expiring positions on expiry day."""
-    logger.info("EXPIRY DAY: Force closing all expiring positions")
+async def _expiry_day_close_all(
+    se: StrategyEngine,
+) -> None:
+    """
+    Force close all expiring positions on expiry day.
+    CRITICAL FIX 4: Cancel open orders before force close.
+    """
+    logger.info(
+        "EXPIRY DAY: Force closing all expiring positions"
+    )
+
+    # CRITICAL FIX 4: Cancel all open orders first
+    logger.info(
+        "EXPIRY DAY: Running cancel sweep before force close"
+    )
+    cancelled = await se.cancel_all_open_orders(
+        context="EXPIRY_CANCEL_SWEEP"
+    )
+    if cancelled > 0:
+        logger.info(
+            f"EXPIRY DAY: Cancelled {cancelled} open orders"
+        )
+    await asyncio.sleep(1.0)
 
     for position in list(se.open_positions):
         try:
@@ -326,7 +408,7 @@ async def _expiry_day_close_all(se: StrategyEngine) -> None:
             await se._close_position(
                 position,
                 config.EXIT_REASONS["EXPIRY"],
-                use_market=True
+                use_market=True,
             )
             logger.info(
                 f"Expiry closed: {position.strategy_name} "
@@ -339,22 +421,55 @@ async def _expiry_day_close_all(se: StrategyEngine) -> None:
 async def _graceful_shutdown(
     se: StrategyEngine,
     dm: DataManager,
-    shutdown_event: asyncio.Event
+    shutdown_event: asyncio.Event,
 ) -> None:
-    """Execute graceful shutdown with position square-off."""
+    """
+    Execute graceful shutdown with position square-off.
+    CRITICAL FIX 2: Cancel all open orders BEFORE closing positions.
+    """
     IST = pytz.timezone(config.TZ)
     logger.info("=" * 60)
     logger.info("GRACEFUL SHUTDOWN INITIATED")
     logger.info("=" * 60)
 
+    # CRITICAL FIX 2: Cancel ALL open orders first
+    # This is the most important step — nothing should be
+    # left open at the broker after shutdown
+    logger.info(
+        "SHUTDOWN: Running cancel sweep before position close"
+    )
+    try:
+        cancelled = await se.cancel_all_open_orders(
+            context="SHUTDOWN_CANCEL_SWEEP"
+        )
+        if cancelled > 0:
+            logger.warning(
+                f"SHUTDOWN: Cancelled {cancelled} open orders "
+                f"— these would have been orphaned"
+            )
+        else:
+            logger.info(
+                "SHUTDOWN: No open orders to cancel — clean"
+            )
+        # Allow broker to process cancellations
+        await asyncio.sleep(1.0)
+    except Exception as e:
+        logger.error(
+            f"SHUTDOWN: Cancel sweep failed: {e} — "
+            f"proceeding with position close anyway"
+        )
+
+    # Close positions
     if not config.PAPER_TRADING_MODE:
-        logger.info("Live mode: squaring off all open positions")
+        logger.info(
+            "Live mode: squaring off all open positions"
+        )
         for position in list(se.open_positions):
             try:
                 await se._close_position(
                     position,
                     config.EXIT_REASONS["MANUAL"],
-                    use_market=True
+                    use_market=True,
                 )
             except Exception as e:
                 logger.error(
@@ -362,12 +477,15 @@ async def _graceful_shutdown(
                     f"{position.trade_id[:8]}: {e}"
                 )
     else:
-        logger.info("Paper mode: logging open positions at shutdown")
+        logger.info(
+            "Paper mode: logging open positions at shutdown"
+        )
         for position in se.open_positions:
             logger.info(
                 f"Open at shutdown: {position.strategy_name} "
                 f"trade_id={position.trade_id[:8]} "
-                f"pnl=₹{position.realized_pnl:,.2f}"
+                f"gross_pnl=₹{position.realized_pnl:,.2f} "
+                f"net_pnl=₹{position.net_pnl:,.2f}"
             )
 
     # Close WebSocket
@@ -398,7 +516,7 @@ async def _graceful_shutdown(
             "adx":             dm.adx,
             "ema_50":          dm.ema_50,
             "composite_score": se.re.raw_composite,
-            "regime":          se.re.confirmed_regime
+            "regime":          se.re.confirmed_regime,
         })
         se.re.save_buffers_to_sqlite()
     except Exception as e:
@@ -413,9 +531,12 @@ async def _graceful_shutdown(
 def _display_console(
     dm: DataManager,
     re: RegimeEngine,
-    se: StrategyEngine
+    se: StrategyEngine,
 ) -> None:
-    """Render real-time console display."""
+    """
+    Render real-time console display.
+    HIGH FIX 7: Shows net PnL (after transaction costs).
+    """
     IST = pytz.timezone(config.TZ)
     now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -433,12 +554,24 @@ def _display_console(
 
     greeks = se._get_portfolio_greeks()
 
-    spot_str = f"{dm.spot:>10.2f}" if dm.spot else "       N/A"
-    vix_str = f"{dm.vix:>6.2f}" if dm.vix else "   N/A"
-    iv_atm_str = f"{dm.iv_atm:>10.4f}" if dm.iv_atm else "       N/A"
-    rv_str = f"{dm.rv_20d:>6.4f}" if dm.rv_20d else "   N/A"
-    adx_str = f"{dm.adx:>10.2f}" if dm.adx else "       N/A"
-    skew_str = f"{dm.skew:>6.4f}" if dm.skew else "   N/A"
+    spot_str = (
+        f"{dm.spot:>10.2f}" if dm.spot else "       N/A"
+    )
+    vix_str = (
+        f"{dm.vix:>6.2f}" if dm.vix else "   N/A"
+    )
+    iv_atm_str = (
+        f"{dm.iv_atm:>10.4f}" if dm.iv_atm else "       N/A"
+    )
+    rv_str = (
+        f"{dm.rv_20d:>6.4f}" if dm.rv_20d else "   N/A"
+    )
+    adx_str = (
+        f"{dm.adx:>10.2f}" if dm.adx else "       N/A"
+    )
+    skew_str = (
+        f"{dm.skew:>6.4f}" if dm.skew else "   N/A"
+    )
 
     try:
         print("\033[2J\033[H", end="", flush=True)
@@ -462,17 +595,35 @@ def _display_console(
         f"Trend: {re.confirmed_trend:>+6.2f}  "
         f"Flow : {re.confirmed_flow:>+6.2f}"
     )
-    print(f" Composite Score : {re.raw_composite:>+8.4f}")
+    print(
+        f" Composite Score : {re.raw_composite:>+8.4f}"
+    )
     print(
         f" Regime  : {color}{regime}{RESET}  "
         f"(persist={re.persistence_count})"
     )
-    print(f" Action  : {re.get_regime_action_description()}")
+    print(
+        f" Action  : {re.get_regime_action_description()}"
+    )
     print("-" * 65)
+
+    # HIGH FIX 7: Show both gross and net PnL
+    # Calculate estimated transaction costs for open positions
+    estimated_costs = sum(
+        se._estimate_costs(p) for p in se.open_positions
+    )
+    net_daily_pnl = se.daily_pnl - estimated_costs
+
     print(
         f" Positions: {len(se.open_positions)}  "
-        f"Daily P&L: ₹{se.daily_pnl:>10,.2f}  "
-        f"Capital: ₹{se.current_capital:>12,.2f}"
+        f"Daily P&L (gross): ₹{se.daily_pnl:>10,.2f}"
+    )
+    print(
+        f" Est. Tx Costs:    ₹{estimated_costs:>10,.2f}  "
+        f"Net P&L: ₹{net_daily_pnl:>10,.2f}"
+    )
+    print(
+        f" Capital (net): ₹{se.current_capital:>12,.2f}"
     )
     print(
         f" Delta  : {greeks['delta']:>8.3f}  "
@@ -487,32 +638,64 @@ def _display_console(
     if se.open_positions:
         print(" OPEN POSITIONS:")
         for pos in se.open_positions:
+            # HIGH FIX 7: Show net PnL per position
+            pos_tx_costs = se._estimate_costs(pos)
+            pos_net_pnl = pos.realized_pnl - pos_tx_costs
             pnl_color = (
-                "\033[92m" if pos.realized_pnl >= 0 else "\033[91m"
+                "\033[92m" if pos_net_pnl >= 0
+                else "\033[91m"
             )
             print(
                 f"  {pos.strategy_name:<25} "
                 f"Entry: {pos.entry_spot:>8.2f}  "
-                f"P&L: {pnl_color}₹{pos.realized_pnl:>8,.2f}{RESET}"
+                f"Net P&L: {pnl_color}"
+                f"₹{pos_net_pnl:>8,.2f}{RESET}"
             )
     else:
         print(" No open positions")
 
     print("-" * 65)
 
+    # Session order registry status
+    session_order_count = len(se._session_orders)
+    if session_order_count > 0:
+        filled = sum(
+            1 for o in se._session_orders.values()
+            if o.get("filled")
+        )
+        cancelled = sum(
+            1 for o in se._session_orders.values()
+            if o.get("cancelled")
+        )
+        open_orders = (
+            session_order_count - filled - cancelled
+        )
+        print(
+            f" Orders this session: {session_order_count} "
+            f"(filled={filled} cancelled={cancelled} "
+            f"open={open_orders})"
+        )
+
     alerts = []
     if se.daily_trading_halted:
-        alerts.append(" \033[91m⚠ DAILY TRADING HALTED (CB L2)\033[0m")
+        alerts.append(
+            " \033[91m⚠ DAILY TRADING HALTED (CB L2)\033[0m"
+        )
     if se.kill_switch_active:
-        alerts.append(" \033[91m⚠ KILL SWITCH ACTIVE (CB L4)\033[0m")
+        alerts.append(
+            " \033[91m⚠ KILL SWITCH ACTIVE (CB L4)\033[0m"
+        )
     if dm.kill_switch_triggered:
-        alerts.append(" \033[91m⚠ WEBSOCKET KILL SWITCH\033[0m")
+        alerts.append(
+            " \033[91m⚠ WEBSOCKET KILL SWITCH\033[0m"
+        )
     if se.cooling_period_end:
         IST = pytz.timezone(config.TZ)
         if datetime.now(IST) < se.cooling_period_end:
             alerts.append(
                 f" \033[93m⚠ COOLING PERIOD ACTIVE until "
-                f"{se.cooling_period_end.strftime('%H:%M:%S')}\033[0m"
+                f"{se.cooling_period_end.strftime('%H:%M:%S')}"
+                f"\033[0m"
             )
 
     for alert in alerts:
@@ -526,57 +709,98 @@ def _display_console(
 
 def _generate_eod_report(
     se: StrategyEngine,
-    dm: DataManager
+    dm: DataManager,
 ) -> None:
-    """Generate and log end-of-day performance report."""
+    """
+    Generate and log end-of-day performance report.
+    HIGH FIX 6: Reports both gross and net PnL.
+    """
     IST = pytz.timezone(config.TZ)
-    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    now_str = datetime.now(IST).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
     total_trades = len(se.closed_positions)
-    winning = [p for p in se.closed_positions if p.realized_pnl > 0]
-    losing = [p for p in se.closed_positions if p.realized_pnl <= 0]
+    winning = [
+        p for p in se.closed_positions
+        if p.net_pnl > 0
+    ]
+    losing = [
+        p for p in se.closed_positions
+        if p.net_pnl <= 0
+    ]
 
     win_rate = (
         len(winning) / total_trades * 100
         if total_trades > 0 else 0.0
     )
-    total_pnl = sum(p.realized_pnl for p in se.closed_positions)
-    avg_win = (
-        float(np.mean([p.realized_pnl for p in winning]))
+
+    # HIGH FIX 6: Use net_pnl for all calculations
+    total_gross_pnl = sum(
+        p.realized_pnl for p in se.closed_positions
+    )
+    total_tx_costs = sum(
+        p.transaction_costs for p in se.closed_positions
+    )
+    total_net_pnl = sum(
+        p.net_pnl for p in se.closed_positions
+    )
+
+    avg_win_net = (
+        float(np.mean([p.net_pnl for p in winning]))
         if winning else 0.0
     )
-    avg_loss = (
-        float(np.mean([p.realized_pnl for p in losing]))
+    avg_loss_net = (
+        float(np.mean([p.net_pnl for p in losing]))
         if losing else 0.0
     )
+
+    # Profit factor using net PnL
+    gross_wins = sum(p.net_pnl for p in winning)
+    gross_losses = abs(sum(p.net_pnl for p in losing))
+    profit_factor = (
+        gross_wins / gross_losses
+        if gross_losses > 0 else float("inf")
+    )
+
     drawdown = se.peak_capital - se.current_capital
 
     report = (
         f"\n{'=' * 60}\n"
         f"END OF DAY REPORT — {now_str}\n"
         f"{'=' * 60}\n"
-        f"Mode           : {'PAPER' if config.PAPER_TRADING_MODE else 'LIVE'}\n"
-        f"Total Trades   : {total_trades}\n"
-        f"Winning Trades : {len(winning)}\n"
-        f"Losing Trades  : {len(losing)}\n"
-        f"Win Rate       : {win_rate:.1f}%\n"
-        f"Total P&L      : ₹{total_pnl:,.2f}\n"
-        f"Avg Win        : ₹{avg_win:,.2f}\n"
-        f"Avg Loss       : ₹{avg_loss:,.2f}\n"
-        f"Capital        : ₹{se.current_capital:,.2f}\n"
-        f"Peak Capital   : ₹{se.peak_capital:,.2f}\n"
-        f"Drawdown       : ₹{drawdown:,.2f}\n"
-        f"Open Positions : {len(se.open_positions)}\n"
-        f"Regime at EOD  : {se.re.confirmed_regime}\n"
-        f"Spot at EOD    : {dm.spot or 'N/A'}\n"
-        f"VIX at EOD     : {dm.vix or 'N/A'}\n"
+        f"Mode              : "
+        f"{'PAPER' if config.PAPER_TRADING_MODE else 'LIVE'}\n"
+        f"Total Trades      : {total_trades}\n"
+        f"Winning Trades    : {len(winning)}\n"
+        f"Losing Trades     : {len(losing)}\n"
+        f"Win Rate          : {win_rate:.1f}%\n"
+        f"Profit Factor     : "
+        f"{profit_factor:.2f if profit_factor != float('inf') else 'inf'}\n"
+        f"{'─' * 60}\n"
+        f"Gross P&L         : ₹{total_gross_pnl:,.2f}\n"
+        f"Transaction Costs : ₹{total_tx_costs:,.2f}\n"
+        f"Net P&L           : ₹{total_net_pnl:,.2f}\n"
+        f"{'─' * 60}\n"
+        f"Avg Win (net)     : ₹{avg_win_net:,.2f}\n"
+        f"Avg Loss (net)    : ₹{avg_loss_net:,.2f}\n"
+        f"{'─' * 60}\n"
+        f"Capital           : ₹{se.current_capital:,.2f}\n"
+        f"Peak Capital      : ₹{se.peak_capital:,.2f}\n"
+        f"Drawdown          : ₹{drawdown:,.2f}\n"
+        f"Open Positions    : {len(se.open_positions)}\n"
+        f"Regime at EOD     : {se.re.confirmed_regime}\n"
+        f"Spot at EOD       : {dm.spot or 'N/A'}\n"
+        f"VIX at EOD        : {dm.vix or 'N/A'}\n"
         f"{'=' * 60}\n"
     )
 
     logger.info(report)
 
     try:
-        with open(config.AUDIT_CSV, "a", encoding="utf-8") as f:
+        with open(
+            config.AUDIT_CSV, "a", encoding="utf-8"
+        ) as f:
             f.write(report)
     except Exception as e:
         logger.warning(f"EOD report write failed: {e}")
@@ -584,10 +808,7 @@ def _generate_eod_report(
 
 def _is_expiry_day() -> bool:
     """Check if today is Nifty expiry day (Thursday)."""
-    today = date.today()
-    if today.weekday() == 3:  # Thursday
-        return True
-    return False
+    return date.today().weekday() == 3
 
 
 async def main() -> None:
@@ -599,10 +820,27 @@ async def main() -> None:
     logger.info("=" * 60)
     logger.info("NIFTY OPTIONS ALGO TRADING ENGINE STARTING")
     logger.info(
-        f"Mode: {'PAPER TRADING' if config.PAPER_TRADING_MODE else '*** LIVE TRADING ***'}"
+        f"Mode: "
+        f"{'PAPER TRADING' if config.PAPER_TRADING_MODE else '*** LIVE TRADING ***'}"
     )
     logger.info(f"Capital: ₹{config.TOTAL_CAPITAL:,}")
-    logger.info(f"Time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info(
+        f"Time: "
+        f"{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    )
+    logger.info("FIXES ACTIVE:")
+    logger.info(
+        "  CRITICAL: Idempotent orders (tag-based dedup)"
+    )
+    logger.info(
+        "  CRITICAL: Cancel sweep (EOD + shutdown + expiry)"
+    )
+    logger.info(
+        "  CRITICAL: Startup stale order cancellation"
+    )
+    logger.info(
+        "  HIGH: Transaction costs in PnL reporting"
+    )
     logger.info("=" * 60)
 
     # STEP 2 — Load access token
@@ -614,7 +852,9 @@ async def main() -> None:
     # STEP 3 — Pre-flight checks
     preflight_ok = await _run_preflight_checks(access_token)
     if not preflight_ok:
-        logger.critical("Pre-flight checks failed — exiting")
+        logger.critical(
+            "Pre-flight checks failed — exiting"
+        )
         sys.exit(1)
 
     # STEP 4 — Initialize components
@@ -627,6 +867,34 @@ async def main() -> None:
     se = StrategyEngine(dm, re, config.STATE_DB)
     se._load_positions_from_sqlite()
 
+    # CRITICAL FIX 3: Cancel stale orders from previous session
+    # This must happen BEFORE any new orders are placed
+    if not config.PAPER_TRADING_MODE:
+        logger.info(
+            "STARTUP: Checking for stale orders from "
+            "previous session..."
+        )
+        try:
+            stale_cancelled = (
+                await se.startup_cancel_stale_orders()
+            )
+            if stale_cancelled > 0:
+                logger.warning(
+                    f"STARTUP: Cancelled {stale_cancelled} "
+                    f"stale orders from previous session — "
+                    f"these would have been orphaned"
+                )
+            else:
+                logger.info(
+                    "STARTUP: No stale orders found — "
+                    "clean start"
+                )
+        except Exception as e:
+            logger.error(
+                f"STARTUP: Stale order check failed: {e} — "
+                f"proceeding (manual check recommended)"
+            )
+
     # Broker reconciliation on startup (live mode)
     if not config.PAPER_TRADING_MODE:
         await se._reconcile_with_broker()
@@ -636,7 +904,8 @@ async def main() -> None:
 
     def _signal_handler(sig, frame):
         logger.warning(
-            f"Signal {sig} received — initiating graceful shutdown"
+            f"Signal {sig} received — "
+            f"initiating graceful shutdown"
         )
         shutdown_event.set()
 
@@ -651,9 +920,10 @@ async def main() -> None:
 
     # STEP 7 — Start WebSocket feed
     ws_task = asyncio.create_task(dm.start_websocket())
-    ws_health_task = asyncio.create_task(dm.monitor_ws_health())
+    ws_health_task = asyncio.create_task(
+        dm.monitor_ws_health()
+    )
 
-    # Wait for first WebSocket data
     logger.info("Waiting for WebSocket data...")
     await asyncio.sleep(3)
 
@@ -662,7 +932,7 @@ async def main() -> None:
 
     if dm.spot is None or dm.vix is None:
         logger.critical(
-            "Cannot fetch spot/VIX after WebSocket start — aborting"
+            "Cannot fetch spot/VIX — aborting"
         )
         ws_task.cancel()
         ws_health_task.cancel()
@@ -673,15 +943,15 @@ async def main() -> None:
         f"Initial data: spot={dm.spot:.2f} vix={dm.vix:.2f}"
     )
 
-    # Fetch option chain for nearest expiries
     today_str = date.today().strftime("%Y-%m-%d")
     from_date = (
         date.today() - timedelta(days=30)
     ).strftime("%Y-%m-%d")
 
-    # First fetch to get available expiries
     await dm.fetch_option_chain(
-        (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+        (date.today() + timedelta(days=7)).strftime(
+            "%Y-%m-%d"
+        )
     )
     expiries = dm.get_available_expiries()
 
@@ -701,25 +971,25 @@ async def main() -> None:
         await dm.fetch_option_chain(expiry)
         await asyncio.sleep(0.3)
 
-    # Fetch historical candles
     await dm.fetch_historical_candles(
         config.INSTRUMENT_NIFTY,
         config.ADX_CANDLE_TIMEFRAME,
         from_date,
-        today_str
+        today_str,
     )
 
-    # Compute initial indicators
     await dm.compute_realized_vol()
     dm.compute_adx()
     dm.compute_ema_slope()
 
     logger.info(
-        f"Initial indicators: "
-        f"rv={dm.rv_20d} adx={dm.adx} "
-        f"ema50={dm.ema_50} iv_atm={dm.iv_atm}"
+        f"Initial indicators: rv={dm.rv_20d} "
+        f"adx={dm.adx} ema50={dm.ema_50} "
+        f"iv_atm={dm.iv_atm}"
     )
-    logger.info("Initial data loaded successfully — entering main loop")
+    logger.info(
+        "Initial data loaded — entering main loop"
+    )
 
     # STEP 9 — Main trading loop
     last_regime_refresh = datetime.now(IST) - timedelta(
@@ -731,6 +1001,9 @@ async def main() -> None:
     last_console_update = datetime.now(IST)
     last_heartbeat = datetime.now(IST)
     last_trading_date = date.today()
+
+    # Track if cancel sweep has been run today
+    eod_cancel_sweep_done = False
 
     while not shutdown_event.is_set():
         try:
@@ -751,6 +1024,10 @@ async def main() -> None:
                     "Strategy engine kill switch active — "
                     "initiating graceful shutdown"
                 )
+                # CRITICAL FIX 5: Cancel sweep on kill switch
+                await se.cancel_all_open_orders(
+                    context="KILL_SWITCH_SWEEP"
+                )
                 break
 
             # Daily reset check
@@ -758,7 +1035,8 @@ async def main() -> None:
             if today != last_trading_date:
                 se.reset_daily_state()
                 last_trading_date = today
-                if today.weekday() == 0:  # Monday
+                eod_cancel_sweep_done = False
+                if today.weekday() == 0:
                     se.reset_weekly_state()
                 logger.info(f"New trading day: {today}")
 
@@ -783,19 +1061,42 @@ async def main() -> None:
                     await _end_of_day(se, dm)
                     break
 
+            # CRITICAL FIX 1: Pre-EOD cancel sweep
+            # Run 5 minutes before TIME_EXIT_NORMAL
+            # to cancel any stale limit orders before
+            # we start closing positions
+            pre_eod_time = datetime.combine(
+                now.date(), config.TIME_EXIT_NORMAL
+            ).replace(tzinfo=IST) - timedelta(minutes=5)
+            if (
+                not eod_cancel_sweep_done
+                and now >= pre_eod_time
+                and not config.PAPER_TRADING_MODE
+            ):
+                logger.info(
+                    "Pre-EOD cancel sweep (5 min before close)"
+                )
+                await se.cancel_all_open_orders(
+                    context="PRE_EOD_SWEEP"
+                )
+                eod_cancel_sweep_done = True
+
             # ─────────────────────────────────────────
             # DATA REFRESH (every 5 minutes)
             # ─────────────────────────────────────────
-            data_elapsed = (now - last_data_refresh).total_seconds()
+            data_elapsed = (
+                now - last_data_refresh
+            ).total_seconds()
             if data_elapsed >= config.REGIME_REFRESH_SECONDS:
                 logger.info("Starting data refresh cycle")
 
                 try:
                     await dm.fetch_spot_and_vix()
                 except Exception as e:
-                    logger.error(f"fetch_spot_and_vix error: {e}")
+                    logger.error(
+                        f"fetch_spot_and_vix error: {e}"
+                    )
 
-                # Refresh option chain for active expiries
                 current_expiries = dm.get_available_expiries()
                 if not current_expiries:
                     current_expiries = expiries
@@ -806,25 +1107,28 @@ async def main() -> None:
                         await asyncio.sleep(0.2)
                     except Exception as e:
                         logger.error(
-                            f"fetch_option_chain error for {expiry}: {e}"
+                            f"fetch_option_chain error "
+                            f"for {expiry}: {e}"
                         )
 
-                # Refresh historical candles
                 try:
                     await dm.fetch_historical_candles(
                         config.INSTRUMENT_NIFTY,
                         config.ADX_CANDLE_TIMEFRAME,
                         from_date,
-                        today_str
+                        today_str,
                     )
                 except Exception as e:
-                    logger.error(f"fetch_historical_candles error: {e}")
+                    logger.error(
+                        f"fetch_historical_candles error: {e}"
+                    )
 
-                # Recompute indicators
                 try:
                     await dm.compute_realized_vol()
                 except Exception as e:
-                    logger.error(f"compute_realized_vol error: {e}")
+                    logger.error(
+                        f"compute_realized_vol error: {e}"
+                    )
 
                 try:
                     dm.compute_adx()
@@ -834,22 +1138,30 @@ async def main() -> None:
                 try:
                     dm.compute_ema_slope()
                 except Exception as e:
-                    logger.error(f"compute_ema_slope error: {e}")
+                    logger.error(
+                        f"compute_ema_slope error: {e}"
+                    )
 
                 try:
                     await dm.fetch_oi_snapshot()
                 except Exception as e:
-                    logger.error(f"fetch_oi_snapshot error: {e}")
+                    logger.error(
+                        f"fetch_oi_snapshot error: {e}"
+                    )
 
                 try:
                     dm.compute_net_flow()
                 except Exception as e:
-                    logger.error(f"compute_net_flow error: {e}")
+                    logger.error(
+                        f"compute_net_flow error: {e}"
+                    )
 
                 try:
                     dm.compute_spread_ratio()
                 except Exception as e:
-                    logger.error(f"compute_spread_ratio error: {e}")
+                    logger.error(
+                        f"compute_spread_ratio error: {e}"
+                    )
 
                 last_data_refresh = now
                 logger.info("Data refresh cycle complete")
@@ -857,46 +1169,61 @@ async def main() -> None:
             # ─────────────────────────────────────────
             # REGIME REFRESH (every 5 minutes)
             # ─────────────────────────────────────────
-            regime_elapsed = (now - last_regime_refresh).total_seconds()
-            if regime_elapsed >= config.REGIME_REFRESH_SECONDS:
+            regime_elapsed = (
+                now - last_regime_refresh
+            ).total_seconds()
+            if (
+                regime_elapsed
+                >= config.REGIME_REFRESH_SECONDS
+            ):
                 logger.info("Starting regime refresh cycle")
 
                 try:
-                    # Freeze regime after REGIME_FREEZE_TIME
                     if now_time < config.REGIME_FREEZE_TIME:
                         regime = await re.refresh()
                         logger.info(
                             f"Regime refreshed: {regime} "
-                            f"composite={re.raw_composite:.4f}"
+                            f"composite="
+                            f"{re.raw_composite:.4f}"
                         )
                     else:
                         logger.info(
-                            f"Regime frozen at {config.REGIME_FREEZE_TIME} "
-                            f"— current: {re.confirmed_regime}"
+                            f"Regime frozen at "
+                            f"{config.REGIME_FREEZE_TIME} "
+                            f"— current: "
+                            f"{re.confirmed_regime}"
                         )
                 except Exception as e:
-                    logger.error(f"Regime refresh error: {e}")
+                    logger.error(
+                        f"Regime refresh error: {e}"
+                    )
 
-                # Run strategy cycle
                 try:
                     await se.run_cycle()
                 except Exception as e:
-                    logger.error(f"Strategy cycle error: {e}")
+                    logger.error(
+                        f"Strategy cycle error: {e}"
+                    )
                     logger.error(traceback.format_exc())
 
-                # Save score buffers
                 try:
                     re.save_buffers_to_sqlite()
                 except Exception as e:
-                    logger.warning(f"save_buffers_to_sqlite error: {e}")
+                    logger.warning(
+                        f"save_buffers_to_sqlite error: {e}"
+                    )
 
                 last_regime_refresh = now
-                logger.info("Regime refresh cycle complete")
+                logger.info(
+                    "Regime refresh cycle complete"
+                )
 
             # ─────────────────────────────────────────
             # HEARTBEAT (every 10 seconds)
             # ─────────────────────────────────────────
-            hb_elapsed = (now - last_heartbeat).total_seconds()
+            hb_elapsed = (
+                now - last_heartbeat
+            ).total_seconds()
             if hb_elapsed >= config.HEARTBEAT_INTERVAL_SEC:
                 try:
                     dm.save_state_to_sqlite({
@@ -909,22 +1236,31 @@ async def main() -> None:
                         "adx":             dm.adx,
                         "ema_50":          dm.ema_50,
                         "composite_score": re.raw_composite,
-                        "regime":          re.confirmed_regime
+                        "regime":          re.confirmed_regime,
                     })
                 except Exception as e:
-                    logger.warning(f"Heartbeat save error: {e}")
+                    logger.warning(
+                        f"Heartbeat save error: {e}"
+                    )
 
                 last_heartbeat = now
 
             # ─────────────────────────────────────────
             # CONSOLE DISPLAY (every 5 seconds)
             # ─────────────────────────────────────────
-            console_elapsed = (now - last_console_update).total_seconds()
-            if console_elapsed >= config.CONSOLE_REFRESH_SECONDS:
+            console_elapsed = (
+                now - last_console_update
+            ).total_seconds()
+            if (
+                console_elapsed
+                >= config.CONSOLE_REFRESH_SECONDS
+            ):
                 try:
                     _display_console(dm, re, se)
                 except Exception as e:
-                    logger.warning(f"Console display error: {e}")
+                    logger.warning(
+                        f"Console display error: {e}"
+                    )
                 last_console_update = now
 
             # Sleep 1 second between loop iterations
@@ -934,23 +1270,31 @@ async def main() -> None:
             logger.info("Main loop cancelled")
             break
         except Exception as e:
-            logger.error(f"Main loop unhandled error: {e}")
+            logger.error(
+                f"Main loop unhandled error: {e}"
+            )
             logger.error(traceback.format_exc())
             await asyncio.sleep(5)
             continue
 
     # STEP 10 — Graceful shutdown
-    logger.info("Main loop exited — starting shutdown sequence")
+    logger.info(
+        "Main loop exited — starting shutdown sequence"
+    )
 
     try:
         ws_task.cancel()
-        await asyncio.gather(ws_task, return_exceptions=True)
+        await asyncio.gather(
+            ws_task, return_exceptions=True
+        )
     except Exception:
         pass
 
     try:
         ws_health_task.cancel()
-        await asyncio.gather(ws_health_task, return_exceptions=True)
+        await asyncio.gather(
+            ws_health_task, return_exceptions=True
+        )
     except Exception:
         pass
 
@@ -961,7 +1305,10 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nKeyboardInterrupt received — shutdown complete")
+        print(
+            "\nKeyboardInterrupt received — "
+            "shutdown complete"
+        )
     except Exception as e:
         print(f"FATAL ERROR: {e}")
         print(traceback.format_exc())
