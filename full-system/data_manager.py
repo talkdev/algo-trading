@@ -441,6 +441,7 @@ class DataManager:
         self._last_vix_date:    Optional[date] = None
         self._last_spread_date: Optional[date] = None
         self._last_skew_date:   Optional[date] = None
+        self._last_iv_rank_date: Optional[date] = None  # PATCH: D3
 
         # ATR contraction cache
         self._atr_contracting_cache:        Optional[bool] = None
@@ -1180,6 +1181,7 @@ class DataManager:
                     self.iv_atm = put_iv
                 if self.iv_atm and self.iv_atm > 0:
                     self.iv_atm_history.append(self.iv_atm)
+                    self._save_daily_iv_close()  # PATCH: D3
                     logger.info(
                         f"IV_ATM: {self.iv_atm:.4f} "
                         f"({self.iv_atm*100:.2f}%)"
@@ -1963,11 +1965,95 @@ class DataManager:
 
         return sorted(list(expiry_set))
 
+    def _init_iv_rank_table(self) -> None:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS iv_rank_history (
+                    trading_date TEXT PRIMARY KEY,
+                    iv_atm REAL
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"iv_rank_history table init error: {e}")
+
+    def _save_daily_iv_close(self) -> None:
+        """
+        PATCH (D3): persist one IV_ATM close per calendar day so
+        compute_iv_rank() can use a genuine multi-week percentile
+        instead of the previous intraday-only history / hardcoded
+        default.
+        """
+        if not self.iv_atm or self.iv_atm <= 0:
+            return
+        today = date.today()
+        if self._last_iv_rank_date == today:
+            return
+        try:
+            self._init_iv_rank_table()
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO iv_rank_history
+                (trading_date, iv_atm) VALUES (?, ?)
+            """, (today.isoformat(), self.iv_atm))
+            cursor.execute("""
+                DELETE FROM iv_rank_history WHERE trading_date
+                NOT IN (
+                    SELECT trading_date FROM iv_rank_history
+                    ORDER BY trading_date DESC LIMIT 90
+                )
+            """)
+            conn.commit()
+            conn.close()
+            self._last_iv_rank_date = today
+        except sqlite3.Error as e:
+            logger.warning(f"_save_daily_iv_close error: {e}")
+
+    def _load_iv_rank_history(self) -> List[float]:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT iv_atm FROM iv_rank_history
+                ORDER BY trading_date DESC LIMIT 60
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+            return [r[0] for r in rows if r[0] and r[0] > 0]
+        except sqlite3.OperationalError:
+            return []
+        except sqlite3.Error as e:
+            logger.warning(f"_load_iv_rank_history error: {e}")
+            return []
+
     def compute_iv_rank(self) -> float:
-        # PATCH: was 50.0, which combined with
-        # _should_enter_new_position()'s NEUTRAL gate condition
-        # (`iv_rank <= 50` blocks) meant NEUTRAL could NEVER trade
-        # during warmup, regardless of true conditions.
+        # PATCH (D3): prefer a persisted 60-day daily-close
+        # history over the old intraday-only deque / hardcoded
+        # default. Falls back to the previous logic only if the
+        # persisted history is still too short (e.g. brand-new
+        # deployment with no history yet).
+        daily_history = self._load_iv_rank_history()
+        if len(daily_history) >= 10:
+            if self.iv_atm is None:
+                return 55.0
+            try:
+                iv_high = max(daily_history)
+                iv_low  = min(daily_history)
+                if abs(iv_high - iv_low) < 1e-10:
+                    return 50.0
+                rank = (
+                    (self.iv_atm - iv_low)
+                    / (iv_high - iv_low)
+                ) * 100.0
+                return float(max(0.0, min(100.0, rank)))
+            except Exception as e:
+                logger.error(f"compute_iv_rank error: {e}")
+                return 55.0
+
         if len(self.iv_atm_history) < 10:
             return 55.0
         if self.iv_atm is None:
