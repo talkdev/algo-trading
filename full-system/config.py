@@ -49,7 +49,17 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────
 TOTAL_CAPITAL = 1_000_000
 
-LOT_SIZE          = 75     # NSE NIFTY confirmed lot size
+# Parameter: LOT_SIZE
+#   Old value: 75   New value: 65   Unit: shares/contract
+#   Effective: per transition period following NSE circular
+#   NSE/FAOP/70616 dated 03-Oct-2025 (revised NIFTY lot 75->65).
+#   Source: user-supplied verification, NOT independently
+#   confirmed by this codebase. Broker-specific override: the
+#   Upstox instrument master should be treated as the final
+#   contract-level validation source before relying on this
+#   constant in production — cross-check there before going live.
+#   Verification date: 2026-08-31 (as supplied).
+LOT_SIZE          = 65
 NIFTY_STRIKE_STEP = 100    # weekly options 100-pt steps
 
 MAX_RISK_PER_TRADE_PCT   = 0.08
@@ -72,6 +82,68 @@ MAX_DAILY_LOSS     = int(
 MAX_DRAWDOWN       = int(
     MAX_DRAWDOWN_PCT * TOTAL_CAPITAL
 )
+
+# ─────────────────────────────────────────────────────────────────────
+# TRANSACTION COST MODEL (production verification record)
+# Kept as SEPARATE named categories per verification requirements —
+# do not recombine into one generic transaction-cost percentage.
+# All rates below were supplied externally as verified values; NOT
+# independently confirmed by this codebase. Re-check against a live
+# NSE circular / broker contract note before production use.
+# ─────────────────────────────────────────────────────────────────────
+
+# Parameter: COST_STT_OPTION_SELL_PCT
+#   Old value: 0.001 (0.10%)   New value: 0.0015 (0.15%)
+#   Unit: % of option premium   Side: Seller
+#   Effective: 01-Apr-2026   Basis: Finance Act 2026 (as supplied)
+COST_STT_OPTION_SELL_PCT = 0.0015
+
+# Parameter: COST_STT_EXERCISE_PCT
+#   0.15% of intrinsic value, charged on exercise of an ITM option.
+#   NOTE: this engine always closes positions via market order
+#   before/at expiry (_close_position / _expiry_day_close_all)
+#   rather than letting them run into exercise — defined here for
+#   completeness/architecture correctness; not currently applied
+#   anywhere since the exercise code path doesn't exist here.
+COST_STT_EXERCISE_PCT = 0.0015
+
+# Parameter: COST_EXCHANGE_PCT
+#   Old value: 0.0000325 (0.00325%)   New: 0.0003552 (0.03552%)
+#   Unit: % of total turnover, both sides
+#   Effective: 01-Mar-2026   Basis: Rs 3,552/crore/side
+COST_EXCHANGE_PCT = 0.0003552
+
+# Parameter: COST_NSE_IPFT_PCT
+#   New value: 0.000000001 (Rs 0.01/crore/side) — economically
+#   negligible, modeled separately per architecture requirement
+#   (must not be silently folded into exchange charge).
+#   Unit: % of total turnover, both sides   Effective: 01-Mar-2026
+COST_NSE_IPFT_PCT = 0.000000001
+
+# Parameter: COST_SEBI_PCT
+#   Unchanged: 0.000001 (0.0001%)   Unit: % of total turnover
+COST_SEBI_PCT = 0.000001
+
+# Parameter: COST_STAMP_PCT
+#   Old value: 0.00015 (0.015%)   New value: 0.00003 (0.003%)
+#   Unit: % of buy-side value only   Side: Buyer
+COST_STAMP_PCT = 0.00003
+
+# Parameter: COST_GST_PCT
+#   Unchanged: 0.18 (18%). Applies ONLY to brokerage + exchange
+#   transaction charge (taxable service components) — never to
+#   STT, stamp duty, SEBI fee, or IPFT. This was already correct
+#   in the pre-existing cost function; kept unchanged here.
+COST_GST_PCT = 0.18
+
+# Parameter: COST_BROKERAGE_PER_ORDER
+#   Kept at Rs 20/order — pre-existing Upstox flat-fee assumption,
+#   NOT invented for this update. Per the supplied instruction to
+#   never assume brokerage: CONFIRM this against your actual
+#   Upstox account tariff / contract note before production use.
+COST_BROKERAGE_PER_ORDER = 20.0
+
+COST_MODEL_VERIFIED_ON = date(2026, 8, 31)
 
 # ─────────────────────────────────────────────────────────────────────
 # VIX BANDS
