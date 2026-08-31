@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """
-patch_margin.py — Heuristic margin/SPAN approximation for
-paper-mode sizing realism, verified against the current state of
-config.py / strategy_engine.py (post diversification/rolling
-patch).
+patch_main_fix2.py — WS reconnect storm fix, tomorrow_is_expiry
+scoping, NTP-in-paper-mode, midnight log rotation, and shutdown
+timeout guards for main.py.
 
-IMPORTANT — this is NOT a real SPAN calculation. Real exchange
-margin varies daily with volatility scans and is broker-specific.
-This is a documented, conservative approximation so paper-mode
-position sizes are closer to what would actually be achievable
-live, instead of assuming margin is unlimited. Live mode is
-unaffected in terms of authority — it still separately validates
-against the REAL broker margin API via check_margin() in
-_pre_trade_checks() (unchanged); this heuristic just makes the
-upstream lot-sizing decision more realistic before that gate.
+Rebuilt fresh and verified line-for-line against the confirmed
+current state of main.py (as directly pasted in this
+conversation) — the earlier patch_main_fix.py attempt assumed a
+different state and was apparently never actually run/applied.
 
-WHAT THIS ADDS
----------------
-[config.py]
-  - MARGIN_UTILIZATION_PCT = 0.80
-  - SPAN_NAKED_MARGIN_PCT = 0.11
-  - SPAN_SPREAD_MARGIN_MULTIPLIER = 1.15
+Does not touch or overlap with the EOD status-print patch
+(different, non-overlapping sections of the file) — safe to run
+before or after that one, in either order.
 
-[strategy_engine.py]
-  - Position.margin_estimate field
-  - _estimate_margin_requirement(): per-strategy heuristic
-  - _calculate_lot_size(): additional margin-budget cap
-  - _enter_new_position(): stores total margin_estimate in meta
-  - _create_position_record(): persists margin_estimate on Position
+WHAT THIS FIXES
+----------------
+  1. Insert _guarded_ws_reconnect() helper (after
+     _ensure_term_structure_expiry(), before _is_expiry_day()).
+  2. Fix WS reconnect storm: market-hours check, concurrency
+     guard, 15-min backoff after 3 consecutive full failures.
+  3. Fix _end_of_day()'s tomorrow_is_expiry — was checking "is
+     tomorrow ANY known expiry" instead of "is tomorrow THIS
+     position's expiry".
+  4. Run the NTP clock-sync check even in paper mode.
+  5. Rotate the log file at midnight (TimedRotatingFileHandler)
+     instead of one static file per process start.
+  6. Timeout guards on the graceful-shutdown cancel-sweep and
+     each live-mode position close.
 
 Usage:
-    python patch_margin.py --dry-run
-    python patch_margin.py
+    python patch_main_fix2.py --dry-run
+    python patch_main_fix2.py
 """
 
 import ast
 import os
-import re
 import sys
 import shutil
 import datetime
@@ -44,11 +42,7 @@ import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DRY_RUN = "--dry-run" in sys.argv
 TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-FILES = {
-    "config": os.path.join(BASE_DIR, "config.py"),
-    "strategy_engine": os.path.join(BASE_DIR, "strategy_engine.py"),
-}
+TARGET = os.path.join(BASE_DIR, "main.py")
 
 
 class PatchError(Exception):
@@ -99,335 +93,344 @@ def verify_syntax(path, content):
         return False, str(e)
 
 
-def patch_file(key, patches):
-    path = FILES[key]
-    if not os.path.exists(path):
-        raise PatchError(f"{path} not found")
+# ════════════════════════════════════════════════════════════════
+# Fix 1/2: insert _guarded_ws_reconnect() + fix the storm itself
+# ════════════════════════════════════════════════════════════════
 
-    print(f"\nPatching {os.path.basename(path)} "
-          f"{'(dry-run)' if DRY_RUN else ''} ...")
-    content = read(path)
-    changed_any = False
-
-    for label, old, new in patches:
-        content, changed = apply_text_patch(content, old, new, label)
-        changed_any = changed_any or changed
-
-    if not changed_any:
-        print(f"  Nothing to do for {os.path.basename(path)}.")
-        return
-
-    ok, err = verify_syntax(path, content)
-    if not ok:
-        raise PatchError(
-            f"Syntax error after patching "
-            f"{os.path.basename(path)}: {err}"
+_func_insert_old = '''        logger.warning(
+            "Term-structure expiry coverage: no expiry found "
+            f"in {target_dte_low}-{target_dte_high} DTE window"
         )
-    print(f"  Syntax check: OK")
-
-    if DRY_RUN:
-        print(f"  [DRY-RUN] Would write {os.path.basename(path)} "
-              f"(no changes written)")
-        return
-
-    bak = backup(path)
-    write(path, content)
-    print(f"  Backed up original -> {os.path.basename(bak)}")
-    print(f"  Wrote patched file  -> {os.path.basename(path)}")
-
-
-# ════════════════════════════════════════════════════════════════
-# CONFIG.PY
-# ════════════════════════════════════════════════════════════════
-
-_config_margin_old = '''MAX_TRANCHES_PER_STRATEGY = 2
-
-REENTRY_COOLDOWN_SEC       = 300
-REENTRY_MAX_SPOT_MOVE_PCT  = 0.02
-BUILD_FAILURE_COOLDOWN_SEC = 300'''
-
-_config_margin_new = '''MAX_TRANCHES_PER_STRATEGY = 2
-
-REENTRY_COOLDOWN_SEC       = 300
-REENTRY_MAX_SPOT_MOVE_PCT  = 0.02
-BUILD_FAILURE_COOLDOWN_SEC = 300
-
-# ─────────────────────────────────────────────────────────────────────
-# MARGIN/SPAN APPROXIMATION (heuristic, NOT the real exchange calc)
-# PATCH: previously lot sizing never considered margin at all —
-# only theoretical max-loss and capital %. For naked/undefined-risk
-# strategies, real SPAN+exposure margin is typically far higher
-# than max_risk. These are documented, conservative approximations
-# for paper-mode sizing realism; live mode still separately
-# validates against the real broker margin API via check_margin().
-# ─────────────────────────────────────────────────────────────────────
-MARGIN_UTILIZATION_PCT        = 0.80  # cap cumulative estimated margin at 80% of capital
-SPAN_NAKED_MARGIN_PCT         = 0.11  # ~11% of notional for naked short options (approx)
-SPAN_SPREAD_MARGIN_MULTIPLIER = 1.15  # defined-risk spreads: ~1.15x max loss'''
-
-config_patches = [
-    ("Add margin/SPAN approximation constants",
-     _config_margin_old, _config_margin_new),
-]
-
-
-# ════════════════════════════════════════════════════════════════
-# STRATEGY_ENGINE.PY
-# ════════════════════════════════════════════════════════════════
-
-_dataclass_old = '''    banked_pnl:           float = 0.0   # PATCH: partial-close pnl
-    banked_costs:         float = 0.0   # PATCH: partial-close costs'''
-
-_dataclass_new = '''    banked_pnl:           float = 0.0   # PATCH: partial-close pnl
-    banked_costs:         float = 0.0   # PATCH: partial-close costs
-    margin_estimate:      float = 0.0   # PATCH: heuristic SPAN/margin estimate'''
-
-_create_record_old = '''            max_risk=meta.get("max_risk", 0.0),
-            paper_trade=config.PAPER_TRADING_MODE,
-            trend_direction=meta.get(
-                "trend_direction", 0.0
-            ),
-            meta=copy.deepcopy(meta),
-        )'''
-
-_create_record_new = '''            max_risk=meta.get("max_risk", 0.0),
-            paper_trade=config.PAPER_TRADING_MODE,
-            trend_direction=meta.get(
-                "trend_direction", 0.0
-            ),
-            margin_estimate=meta.get("margin_estimate", 0.0),
-            meta=copy.deepcopy(meta),
-        )'''
-
-_enter_margin_old = '''        for leg in legs:
-            leg.qty = leg.qty * lots
-
-        trade_id = str(uuid.uuid4())'''
-
-_enter_margin_new = '''        for leg in legs:
-            leg.qty = leg.qty * lots
-
-        # PATCH: store total estimated margin for this position
-        # (per-lot heuristic estimate x final lot count), so
-        # future sizing calls can track cumulative margin usage
-        # across all open positions.
-        meta["margin_estimate"] = (
-            meta.get("margin_estimate_per_lot", 0.0) * lots
+    except Exception as e:
+        logger.error(
+            f"_ensure_term_structure_expiry error: {e}"
         )
 
-        trade_id = str(uuid.uuid4())'''
 
-_estimate_margin_insert_old = '''    def _calculate_lot_size(
-        self, strategy_name: str, meta: Dict
-    ) -> int:
-        max_loss_per_lot = meta.get("max_risk", 0)
-        if max_loss_per_lot <= 0:
-            return 0
+def _is_expiry_day(
+    dm: Optional[DataManager] = None,
+) -> bool:'''
 
-        risk_per_trade = config.MAX_RISK_PER_TRADE'''
+_func_insert_new = '''        logger.warning(
+            "Term-structure expiry coverage: no expiry found "
+            f"in {target_dte_low}-{target_dte_high} DTE window"
+        )
+    except Exception as e:
+        logger.error(
+            f"_ensure_term_structure_expiry error: {e}"
+        )
 
-_estimate_margin_insert_new = '''    def _estimate_margin_requirement(
-        self, strategy_name: str, max_risk_per_lot: float
-    ) -> float:
-        """
-        PATCH: heuristic SPAN+exposure margin approximation for
-        paper-mode sizing realism. This is NOT the real exchange
-        calculation (real SPAN varies daily with volatility scans
-        and is broker/exchange-specific) — it's a conservative,
-        documented approximation so paper-mode position sizes are
-        closer to what would actually be achievable live, rather
-        than assuming margin is unlimited (the previous behavior).
-        Live mode still separately validates against the REAL
-        broker margin API via check_margin() in
-        _pre_trade_checks().
-        """
-        spot = self.dm.spot or 24000.0
-        notional_per_lot = spot * config.LOT_SIZE
 
-        if strategy_name == config.STRAT_SHORT_STRADDLE:
-            # Naked short options on both sides — margin is
-            # dominated by SPAN+exposure on notional, not by the
-            # (large) theoretical max loss.
-            return notional_per_lot * config.SPAN_NAKED_MARGIN_PCT
-
-        elif strategy_name in (
-            config.STRAT_IRON_CONDOR,
-            config.STRAT_CREDIT_SPREADS,
-        ):
-            # Defined-risk spread in the same expiry — exchanges
-            # typically apply spread margining close to (a modest
-            # multiple of) max loss, not full naked margin.
-            return (
-                max_risk_per_lot
-                * config.SPAN_SPREAD_MARGIN_MULTIPLIER
-            )
-
-        elif strategy_name == config.STRAT_RATIO_SPREAD:
-            # Mostly hedged (2 long vs 1 short per side) but not a
-            # clean defined-risk spread — blend spread-margining
-            # with a partial naked-margin allowance.
-            return max(
-                max_risk_per_lot
-                * config.SPAN_SPREAD_MARGIN_MULTIPLIER,
-                notional_per_lot
-                * config.SPAN_NAKED_MARGIN_PCT * 0.5,
-            )
-
-        elif strategy_name == config.STRAT_BACKSPREAD:
-            # More longs than shorts by construction — treat as
-            # spread-like.
-            return (
-                max_risk_per_lot
-                * config.SPAN_SPREAD_MARGIN_MULTIPLIER
-            )
-
+async def _guarded_ws_reconnect(dm, ist_tz) -> None:
+    """
+    PATCH: prevents overlapping WS reconnect attempts and adds a
+    15-min backoff after 3 consecutive full-failure cycles, so a
+    persistent broker-side rejection (e.g. HTTP 403) doesn't turn
+    into an unbounded retry storm.
+    """
+    try:
+        await dm._reconnect_websocket()
+    finally:
+        dm._ws_reconnect_in_progress = False
+        if dm.ws_connected:
+            dm._ws_reconnect_fail_count = 0
         else:
-            # Long-only debit strategies (long straddle, strangle,
-            # butterfly, defensive hedge): margin required is just
-            # the premium paid, already captured by
-            # max_risk_per_lot.
-            return max_risk_per_lot
-
-    def _calculate_lot_size(
-        self, strategy_name: str, meta: Dict
-    ) -> int:
-        max_loss_per_lot = meta.get("max_risk", 0)
-        if max_loss_per_lot <= 0:
-            return 0
-
-        risk_per_trade = config.MAX_RISK_PER_TRADE'''
-
-_lotsize_tail_old = '''        position_cap = math.floor(
-            (
-                config.POSITION_SIZE_PCT
-                * config.TOTAL_CAPITAL
-            ) / max_loss_per_lot
-        )
-        lots = min(lots, max(position_cap, 0))
-        lots = max(lots, 0)
-
-        logger.info(
-            f"Lot size: {lots} for {strategy_name} "
-            f"risk={risk_per_trade} "
-            f"max_loss={max_loss_per_lot:.0f}"
-        )
-        return lots'''
-
-_lotsize_tail_new = '''        position_cap = math.floor(
-            (
-                config.POSITION_SIZE_PCT
-                * config.TOTAL_CAPITAL
-            ) / max_loss_per_lot
-        )
-        lots = min(lots, max(position_cap, 0))
-        lots = max(lots, 0)
-
-        # PATCH: heuristic margin/SPAN cap. Previously sizing was
-        # based purely on theoretical max-loss and capital %,
-        # never on what margin the position would actually tie up
-        # — which for naked/undefined-risk strategies (short
-        # straddle, ratio spread) is typically far higher than
-        # max_risk. This is a documented approximation, not the
-        # real exchange calculation (live mode still separately
-        # validates against the real broker margin API in
-        # _pre_trade_checks()).
-        margin_per_lot = self._estimate_margin_requirement(
-            strategy_name, max_loss_per_lot
-        )
-        meta["margin_estimate_per_lot"] = margin_per_lot
-        if margin_per_lot > 0:
-            deployed_margin = sum(
-                getattr(p, "margin_estimate", 0.0)
-                for p in self.open_positions
-            )
-            margin_budget = (
-                config.MARGIN_UTILIZATION_PCT
-                * config.TOTAL_CAPITAL
-            )
-            available_margin = margin_budget - deployed_margin
-            if available_margin <= 0:
-                logger.info(
-                    f"Lot size: 0 for {strategy_name} — "
-                    f"margin budget exhausted "
-                    f"(deployed={deployed_margin:.0f}/"
-                    f"{margin_budget:.0f})"
+            fail_count = getattr(
+                dm, "_ws_reconnect_fail_count", 0
+            ) + 1
+            dm._ws_reconnect_fail_count = fail_count
+            if fail_count >= 3:
+                dm._ws_reconnect_backoff_until = (
+                    datetime.now(ist_tz) + timedelta(minutes=15)
                 )
-                return 0
-            lots_by_margin = math.floor(
-                available_margin / margin_per_lot
-            )
-            lots = min(lots, lots_by_margin)
-            lots = max(lots, 0)
+                logger.warning(
+                    f"WS: {fail_count} consecutive full "
+                    f"failures — backing off reconnect "
+                    f"attempts for 15 min"
+                )
 
-        logger.info(
-            f"Lot size: {lots} for {strategy_name} "
-            f"risk={risk_per_trade} "
-            f"max_loss={max_loss_per_lot:.0f} "
-            f"margin_per_lot={margin_per_lot:.0f}"
+
+def _is_expiry_day(
+    dm: Optional[DataManager] = None,
+) -> bool:'''
+
+_ws_storm_old = '''            if dm.kill_switch_triggered:
+                logger.warning(
+                    "WS disconnected — engine continues "
+                    "with REST data, attempting reconnect"
+                )
+                dm.kill_switch_triggered = False
+                asyncio.create_task(
+                    dm._reconnect_websocket()
+                )'''
+
+_ws_storm_new = '''            if dm.kill_switch_triggered:
+                # PATCH: market-hours check + concurrency guard +
+                # backoff, to stop the WS reconnect storm (was
+                # firing unconditionally every main-loop
+                # iteration with no guard against overlapping
+                # attempts).
+                _now_ws = datetime.now(IST)
+                _now_ws_time = _now_ws.time()
+                _today_ws_str = _now_ws.date().strftime(
+                    "%Y-%m-%d"
+                )
+                _is_trading_ws = (
+                    _now_ws.date().weekday() < 5
+                    and _today_ws_str
+                    not in config.NSE_MARKET_HOLIDAYS
+                )
+                _is_mkt_ws = (
+                    config.MARKET_OPEN
+                    <= _now_ws_time
+                    <= config.MARKET_CLOSE
+                )
+                _backoff_until = getattr(
+                    dm, "_ws_reconnect_backoff_until", None
+                )
+                _in_progress = getattr(
+                    dm, "_ws_reconnect_in_progress", False
+                )
+                if not (_is_trading_ws and _is_mkt_ws):
+                    dm.kill_switch_triggered = False
+                elif _in_progress:
+                    dm.kill_switch_triggered = False
+                elif (
+                    _backoff_until
+                    and _now_ws < _backoff_until
+                ):
+                    dm.kill_switch_triggered = False
+                else:
+                    logger.warning(
+                        "WS disconnected — engine continues "
+                        "with REST data, attempting reconnect"
+                    )
+                    dm.kill_switch_triggered = False
+                    dm._ws_reconnect_in_progress = True
+                    asyncio.create_task(
+                        _guarded_ws_reconnect(dm, IST)
+                    )'''
+
+# ════════════════════════════════════════════════════════════════
+# Fix 3: tomorrow_is_expiry scoping
+# ════════════════════════════════════════════════════════════════
+
+_tomorrow_old = '''        tomorrow_str = (
+            date.today() + timedelta(days=1)
+        ).isoformat()
+        tomorrow_is_expiry = (
+            tomorrow_str in dm.get_available_expiries()
+        )'''
+
+_tomorrow_new = '''        tomorrow_str = (
+            date.today() + timedelta(days=1)
+        ).isoformat()
+        # PATCH: was checking "is tomorrow ANY known expiry" —
+        # since NIFTY has a weekly expiry almost every Tuesday,
+        # this was True on nearly every Monday regardless of
+        # which contract this specific position is in. Now
+        # correctly scoped to this position's own expiry.
+        tomorrow_is_expiry = (
+            tomorrow_str == position.expiry_date
+        )'''
+
+# ════════════════════════════════════════════════════════════════
+# Fix 4: NTP check in paper mode
+# ════════════════════════════════════════════════════════════════
+
+_ntp_old = '''    # CHECK 2 — NTP clock sync (live mode only)
+    if not config.PAPER_TRADING_MODE:
+        try:
+            import ntplib'''
+
+_ntp_new = '''    # CHECK 2 — NTP clock sync
+    # PATCH: run this even in paper mode — it validates the
+    # system clock, which every time-gated decision in the
+    # engine depends on, regardless of trading mode.
+    if True:
+        try:
+            import ntplib'''
+
+# ════════════════════════════════════════════════════════════════
+# Fix 5: midnight log rotation
+# ════════════════════════════════════════════════════════════════
+
+_logrotate_old = '''    audit_file = os.path.join(
+        config.LOG_DIR,
+        f"audit_log_{today_str}.log",
+    )
+    file_handler = logging.FileHandler(
+        audit_file, mode="a", encoding="utf-8"
+    )'''
+
+_logrotate_new = '''    audit_file = os.path.join(
+        config.LOG_DIR,
+        f"audit_log_{today_str}.log",
+    )
+    # PATCH: rotate at midnight so continuous multi-day operation
+    # doesn't keep appending every subsequent day's logs into the
+    # first day's file.
+    from logging.handlers import TimedRotatingFileHandler
+    file_handler = TimedRotatingFileHandler(
+        audit_file,
+        when="midnight",
+        backupCount=90,
+        encoding="utf-8",
+    )
+    file_handler.suffix = "%Y-%m-%d"'''
+
+# ════════════════════════════════════════════════════════════════
+# Fix 6: shutdown timeout guards
+# ════════════════════════════════════════════════════════════════
+
+_shutdown_cancel_old = '''    try:
+        cancelled = await se.cancel_all_open_orders(
+            context="SHUTDOWN_CANCEL_SWEEP"
         )
-        return lots'''
+        if cancelled > 0:
+            logger.warning(
+                f"SHUTDOWN: Cancelled {cancelled} "
+                f"open orders"
+            )
+        await asyncio.sleep(1.0)
+    except Exception as e:
+        logger.error(
+            f"SHUTDOWN: Cancel sweep failed: {e}"
+        )'''
 
-strategy_engine_patches = [
-    ("Add margin_estimate field to Position",
-     _dataclass_old, _dataclass_new),
-    ("Persist margin_estimate in _create_position_record",
-     _create_record_old, _create_record_new),
-    ("Store total margin_estimate in _enter_new_position",
-     _enter_margin_old, _enter_margin_new),
-    ("Insert _estimate_margin_requirement()",
-     _estimate_margin_insert_old, _estimate_margin_insert_new),
-    ("Add margin-budget cap to _calculate_lot_size",
-     _lotsize_tail_old, _lotsize_tail_new),
+_shutdown_cancel_new = '''    try:
+        # PATCH: timeout guard so a hung network call during
+        # shutdown can't stall the whole "graceful" sequence
+        # indefinitely.
+        cancelled = await asyncio.wait_for(
+            se.cancel_all_open_orders(
+                context="SHUTDOWN_CANCEL_SWEEP"
+            ),
+            timeout=30.0,
+        )
+        if cancelled > 0:
+            logger.warning(
+                f"SHUTDOWN: Cancelled {cancelled} "
+                f"open orders"
+            )
+        await asyncio.sleep(1.0)
+    except asyncio.TimeoutError:
+        logger.error(
+            "SHUTDOWN: Cancel sweep timed out after 30s "
+            "— continuing shutdown anyway"
+        )
+    except Exception as e:
+        logger.error(
+            f"SHUTDOWN: Cancel sweep failed: {e}"
+        )'''
+
+_shutdown_close_old = '''    if not config.PAPER_TRADING_MODE:
+        logger.info("Live mode: squaring off positions")
+        for position in list(se.open_positions):
+            try:
+                await se._close_position(
+                    position,
+                    config.EXIT_REASONS["MANUAL"],
+                    use_market=True,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Shutdown close error "
+                    f"{position.trade_id[:8]}: {e}"
+                )'''
+
+_shutdown_close_new = '''    if not config.PAPER_TRADING_MODE:
+        logger.info("Live mode: squaring off positions")
+        for position in list(se.open_positions):
+            try:
+                # PATCH: timeout guard per position close during
+                # shutdown, same reasoning as the cancel sweep.
+                await asyncio.wait_for(
+                    se._close_position(
+                        position,
+                        config.EXIT_REASONS["MANUAL"],
+                        use_market=True,
+                    ),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Shutdown close timed out "
+                    f"{position.trade_id[:8]} — continuing"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Shutdown close error "
+                    f"{position.trade_id[:8]}: {e}"
+                )'''
+
+
+PATCHES = [
+    ("Insert _guarded_ws_reconnect() helper",
+     _func_insert_old, _func_insert_new),
+    ("Fix WS reconnect storm",
+     _ws_storm_old, _ws_storm_new),
+    ("Fix tomorrow_is_expiry scoping",
+     _tomorrow_old, _tomorrow_new),
+    ("Run NTP check even in paper mode",
+     _ntp_old, _ntp_new),
+    ("Add midnight log rotation",
+     _logrotate_old, _logrotate_new),
+    ("Timeout guard on shutdown cancel-sweep",
+     _shutdown_cancel_old, _shutdown_cancel_new),
+    ("Timeout guard on shutdown position closes",
+     _shutdown_close_old, _shutdown_close_new),
 ]
 
 
 def main():
     print("=" * 70)
-    print("MARGIN/SPAN APPROXIMATION — FINAL FIX SCRIPT"
-          + (" [DRY RUN]" if DRY_RUN else ""))
+    print("MAIN.PY — WS STORM / TOMORROW-EXPIRY / NTP / LOG-ROTATE / "
+          "SHUTDOWN FIX SCRIPT" + (" [DRY RUN]" if DRY_RUN else ""))
     print("=" * 70)
 
-    errors = []
-
-    try:
-        patch_file("config", config_patches)
-    except PatchError as e:
-        print(f"  [ABORTED] config.py: {e}")
-        errors.append(("config", str(e)))
-
-    try:
-        patch_file("strategy_engine", strategy_engine_patches)
-    except PatchError as e:
-        print(f"  [ABORTED] strategy_engine.py: {e}")
-        errors.append(("strategy_engine", str(e)))
-
-    print("\n" + "=" * 70)
-    if errors:
-        print(f"COMPLETED WITH {len(errors)} FAILURE(S):")
-        for key, err in errors:
-            print(f"  - {key}.py: {err}")
+    if not os.path.exists(TARGET):
+        print(f"ERROR: {TARGET} not found")
         sys.exit(1)
 
-    print("ALL PATCHES " + ("VALIDATED (dry-run)" if DRY_RUN
-                             else "APPLIED SUCCESSFULLY"))
-    print("=" * 70)
-    print(
-        "\nWhat to watch for next:\n"
-        "  - Lot-size log lines now show 'margin_per_lot=...' —\n"
-        "    for STRAT_SHORT_STRADDLE this should look noticeably\n"
-        "    larger relative to max_loss than for\n"
-        "    IRON_CONDOR/CREDIT_SPREADS.\n"
-        "  - If a position ever gets sized to fewer lots than\n"
-        "    before, or blocked with 'margin budget exhausted',\n"
-        "    that's this heuristic actively constraining sizing —\n"
-        "    expected behavior, not a bug.\n"
-        "  - This is a heuristic, not the real SPAN formula — if\n"
-        "    you ever get real margin figures from Upstox (e.g.\n"
-        "    via the live check_margin() call, or their margin\n"
-        "    calculator), it's worth comparing against these\n"
-        "    estimates and adjusting SPAN_NAKED_MARGIN_PCT /\n"
-        "    SPAN_SPREAD_MARGIN_MULTIPLIER accordingly."
-    )
+    content = read(TARGET)
+    changed_any = False
+    errors = []
+
+    for label, old, new in PATCHES:
+        try:
+            content, changed = apply_text_patch(
+                content, old, new, label
+            )
+            changed_any = changed_any or changed
+        except PatchError as e:
+            print(f"  [ABORTED] {label}: {e}")
+            errors.append((label, str(e)))
+
+    if errors:
+        print(f"\n{len(errors)} PATCH(ES) FAILED — nothing written.")
+        sys.exit(1)
+
+    if not changed_any:
+        print("\nNothing to do — already fully patched.")
+        return
+
+    ok, err = verify_syntax(TARGET, content)
+    if not ok:
+        print(f"\nSYNTAX ERROR after patching: {err}")
+        print("Nothing written.")
+        sys.exit(1)
+    print("\nSyntax check: OK")
+
+    if DRY_RUN:
+        print("[DRY-RUN] Would write main.py (no changes written)")
+        return
+
+    bak = backup(TARGET)
+    write(TARGET, content)
+    print(f"Backed up original -> {os.path.basename(bak)}")
+    print(f"Wrote patched file  -> main.py")
+    print("\nALL PATCHES APPLIED SUCCESSFULLY")
 
 
 if __name__ == "__main__":
