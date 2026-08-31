@@ -167,7 +167,14 @@ def leg_delta(
         return d
     iv = leg.get("iv")
     if iv and iv > 0:
-        return bs_delta(spot, strike, T, iv, rate, is_call)
+        # PATCH (R1): leg["iv"] is stored as a DECIMAL (e.g. 0.12
+        # for 12%), but bs_delta() divides its iv_pct parameter by
+        # 100 again internally (expects a percentage like 12.0).
+        # Previously this made sigma ~100x too small, pushing
+        # fallback deltas to ~0/±1 whenever the API delta was
+        # missing/out-of-range. Convert decimal -> percentage here.
+        iv_pct = iv * 100.0 if iv < 1.5 else iv
+        return bs_delta(spot, strike, T, iv_pct, rate, is_call)
     return None
 
 
