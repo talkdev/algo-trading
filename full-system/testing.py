@@ -1,36 +1,43 @@
 #!/usr/bin/env python3
 """
-patch_main_fix2.py — WS reconnect storm fix, tomorrow_is_expiry
-scoping, NTP-in-paper-mode, midnight log rotation, and shutdown
-timeout guards for main.py.
+patch_cost_model.py — Production cost-model update: NIFTY lot
+size 75->65, and full separation of NSE transaction charge / STT /
+IPFT / SEBI fee / stamp duty / GST into distinct, named
+constants per the supplied production verification spec.
 
-Rebuilt fresh and verified line-for-line against the confirmed
-current state of main.py (as directly pasted in this
-conversation) — the earlier patch_main_fix.py attempt assumed a
-different state and was apparently never actually run/applied.
+IMPORTANT: the specific rates/dates below were supplied externally
+by the user as verified values — this codebase has not
+independently confirmed the underlying NSE circulars. Re-check
+against a live circular / your broker's contract note before
+relying on this in production, per the verification checklist
+that was supplied alongside these values.
 
-Does not touch or overlap with the EOD status-print patch
-(different, non-overlapping sections of the file) — safe to run
-before or after that one, in either order.
+Brokerage is deliberately NOT changed — it remains the existing
+Rs 20/order Upstox flat-fee assumption that predates this patch.
+Per the supplied instruction ("do NOT invent or assume
+brokerage"), that number needs to come from your actual account
+tariff/contract note, not from this patch.
 
-WHAT THIS FIXES
-----------------
-  1. Insert _guarded_ws_reconnect() helper (after
-     _ensure_term_structure_expiry(), before _is_expiry_day()).
-  2. Fix WS reconnect storm: market-hours check, concurrency
-     guard, 15-min backoff after 3 consecutive full failures.
-  3. Fix _end_of_day()'s tomorrow_is_expiry — was checking "is
-     tomorrow ANY known expiry" instead of "is tomorrow THIS
-     position's expiry".
-  4. Run the NTP clock-sync check even in paper mode.
-  5. Rotate the log file at midnight (TimedRotatingFileHandler)
-     instead of one static file per process start.
-  6. Timeout guards on the graceful-shutdown cancel-sweep and
-     each live-mode position close.
+WHAT THIS CHANGES
+-------------------
+[config.py]
+  - LOT_SIZE: 75 -> 65
+  - New separated cost constants: COST_STT_OPTION_SELL_PCT,
+    COST_STT_EXERCISE_PCT, COST_EXCHANGE_PCT, COST_NSE_IPFT_PCT,
+    COST_SEBI_PCT, COST_STAMP_PCT, COST_GST_PCT,
+    COST_BROKERAGE_PER_ORDER, COST_MODEL_VERIFIED_ON
+
+[strategy_engine.py]
+  - _calculate_transaction_costs(): rewritten to use the new
+    named constants (adds NSE IPFT as its own line item; GST
+    base unchanged — applies only to brokerage + exchange
+    charge, never to STT/stamp/SEBI, which was already correct).
+  - _close_one_side()'s banked-cost formula: same update, for
+    consistency with the main cost function.
 
 Usage:
-    python patch_main_fix2.py --dry-run
-    python patch_main_fix2.py
+    python patch_cost_model.py --dry-run
+    python patch_cost_model.py
 """
 
 import ast
@@ -42,7 +49,11 @@ import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DRY_RUN = "--dry-run" in sys.argv
 TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-TARGET = os.path.join(BASE_DIR, "main.py")
+
+FILES = {
+    "config": os.path.join(BASE_DIR, "config.py"),
+    "strategy_engine": os.path.join(BASE_DIR, "strategy_engine.py"),
+}
 
 
 class PatchError(Exception):
@@ -93,344 +104,407 @@ def verify_syntax(path, content):
         return False, str(e)
 
 
+def patch_file(key, patches):
+    path = FILES[key]
+    if not os.path.exists(path):
+        raise PatchError(f"{path} not found")
+
+    print(f"\nPatching {os.path.basename(path)} "
+          f"{'(dry-run)' if DRY_RUN else ''} ...")
+    content = read(path)
+    changed_any = False
+
+    for label, old, new in patches:
+        content, changed = apply_text_patch(content, old, new, label)
+        changed_any = changed_any or changed
+
+    if not changed_any:
+        print(f"  Nothing to do for {os.path.basename(path)}.")
+        return
+
+    ok, err = verify_syntax(path, content)
+    if not ok:
+        raise PatchError(
+            f"Syntax error after patching "
+            f"{os.path.basename(path)}: {err}"
+        )
+    print(f"  Syntax check: OK")
+
+    if DRY_RUN:
+        print(f"  [DRY-RUN] Would write {os.path.basename(path)} "
+              f"(no changes written)")
+        return
+
+    bak = backup(path)
+    write(path, content)
+    print(f"  Backed up original -> {os.path.basename(bak)}")
+    print(f"  Wrote patched file  -> {os.path.basename(path)}")
+
+
 # ════════════════════════════════════════════════════════════════
-# Fix 1/2: insert _guarded_ws_reconnect() + fix the storm itself
+# CONFIG.PY
 # ════════════════════════════════════════════════════════════════
 
-_func_insert_old = '''        logger.warning(
-            "Term-structure expiry coverage: no expiry found "
-            f"in {target_dte_low}-{target_dte_high} DTE window"
-        )
-    except Exception as e:
-        logger.error(
-            f"_ensure_term_structure_expiry error: {e}"
-        )
+_lotsize_old = '''LOT_SIZE          = 75     # NSE NIFTY confirmed lot size
+NIFTY_STRIKE_STEP = 100    # weekly options 100-pt steps'''
+
+_lotsize_new = '''# Parameter: LOT_SIZE
+#   Old value: 75   New value: 65   Unit: shares/contract
+#   Effective: per transition period following NSE circular
+#   NSE/FAOP/70616 dated 03-Oct-2025 (revised NIFTY lot 75->65).
+#   Source: user-supplied verification, NOT independently
+#   confirmed by this codebase. Broker-specific override: the
+#   Upstox instrument master should be treated as the final
+#   contract-level validation source before relying on this
+#   constant in production — cross-check there before going live.
+#   Verification date: 2026-08-31 (as supplied).
+LOT_SIZE          = 65
+NIFTY_STRIKE_STEP = 100    # weekly options 100-pt steps'''
+
+_capitalrisk_old = '''MAX_RISK_PER_TRADE = int(
+    MAX_RISK_PER_TRADE_PCT * TOTAL_CAPITAL
+)
+MAX_COMBINED_RISK  = int(
+    MAX_COMBINED_RISK_PCT * TOTAL_CAPITAL
+)
+MAX_DAILY_LOSS     = int(
+    MAX_DAILY_LOSS_PCT * TOTAL_CAPITAL
+)
+MAX_DRAWDOWN       = int(
+    MAX_DRAWDOWN_PCT * TOTAL_CAPITAL
+)
+
+# ─────────────────────────────────────────────────────────────────────
+# VIX BANDS
+# ─────────────────────────────────────────────────────────────────────'''
+
+_capitalrisk_new = '''MAX_RISK_PER_TRADE = int(
+    MAX_RISK_PER_TRADE_PCT * TOTAL_CAPITAL
+)
+MAX_COMBINED_RISK  = int(
+    MAX_COMBINED_RISK_PCT * TOTAL_CAPITAL
+)
+MAX_DAILY_LOSS     = int(
+    MAX_DAILY_LOSS_PCT * TOTAL_CAPITAL
+)
+MAX_DRAWDOWN       = int(
+    MAX_DRAWDOWN_PCT * TOTAL_CAPITAL
+)
+
+# ─────────────────────────────────────────────────────────────────────
+# TRANSACTION COST MODEL (production verification record)
+# Kept as SEPARATE named categories per verification requirements —
+# do not recombine into one generic transaction-cost percentage.
+# All rates below were supplied externally as verified values; NOT
+# independently confirmed by this codebase. Re-check against a live
+# NSE circular / broker contract note before production use.
+# ─────────────────────────────────────────────────────────────────────
+
+# Parameter: COST_STT_OPTION_SELL_PCT
+#   Old value: 0.001 (0.10%)   New value: 0.0015 (0.15%)
+#   Unit: % of option premium   Side: Seller
+#   Effective: 01-Apr-2026   Basis: Finance Act 2026 (as supplied)
+COST_STT_OPTION_SELL_PCT = 0.0015
+
+# Parameter: COST_STT_EXERCISE_PCT
+#   0.15% of intrinsic value, charged on exercise of an ITM option.
+#   NOTE: this engine always closes positions via market order
+#   before/at expiry (_close_position / _expiry_day_close_all)
+#   rather than letting them run into exercise — defined here for
+#   completeness/architecture correctness; not currently applied
+#   anywhere since the exercise code path doesn't exist here.
+COST_STT_EXERCISE_PCT = 0.0015
+
+# Parameter: COST_EXCHANGE_PCT
+#   Old value: 0.0000325 (0.00325%)   New: 0.0003552 (0.03552%)
+#   Unit: % of total turnover, both sides
+#   Effective: 01-Mar-2026   Basis: Rs 3,552/crore/side
+COST_EXCHANGE_PCT = 0.0003552
+
+# Parameter: COST_NSE_IPFT_PCT
+#   New value: 0.000000001 (Rs 0.01/crore/side) — economically
+#   negligible, modeled separately per architecture requirement
+#   (must not be silently folded into exchange charge).
+#   Unit: % of total turnover, both sides   Effective: 01-Mar-2026
+COST_NSE_IPFT_PCT = 0.000000001
+
+# Parameter: COST_SEBI_PCT
+#   Unchanged: 0.000001 (0.0001%)   Unit: % of total turnover
+COST_SEBI_PCT = 0.000001
+
+# Parameter: COST_STAMP_PCT
+#   Old value: 0.00015 (0.015%)   New value: 0.00003 (0.003%)
+#   Unit: % of buy-side value only   Side: Buyer
+COST_STAMP_PCT = 0.00003
+
+# Parameter: COST_GST_PCT
+#   Unchanged: 0.18 (18%). Applies ONLY to brokerage + exchange
+#   transaction charge (taxable service components) — never to
+#   STT, stamp duty, SEBI fee, or IPFT. This was already correct
+#   in the pre-existing cost function; kept unchanged here.
+COST_GST_PCT = 0.18
+
+# Parameter: COST_BROKERAGE_PER_ORDER
+#   Kept at Rs 20/order — pre-existing Upstox flat-fee assumption,
+#   NOT invented for this update. Per the supplied instruction to
+#   never assume brokerage: CONFIRM this against your actual
+#   Upstox account tariff / contract note before production use.
+COST_BROKERAGE_PER_ORDER = 20.0
+
+COST_MODEL_VERIFIED_ON = date(2026, 8, 31)
+
+# ─────────────────────────────────────────────────────────────────────
+# VIX BANDS
+# ─────────────────────────────────────────────────────────────────────'''
+
+config_patches = [
+    ("Update LOT_SIZE 75 -> 65 (with audit record)",
+     _lotsize_old, _lotsize_new),
+    ("Add separated transaction cost model constants",
+     _capitalrisk_old, _capitalrisk_new),
+]
 
 
-def _is_expiry_day(
-    dm: Optional[DataManager] = None,
-) -> bool:'''
+# ════════════════════════════════════════════════════════════════
+# STRATEGY_ENGINE.PY
+# ════════════════════════════════════════════════════════════════
 
-_func_insert_new = '''        logger.warning(
-            "Term-structure expiry coverage: no expiry found "
-            f"in {target_dte_low}-{target_dte_high} DTE window"
-        )
-    except Exception as e:
-        logger.error(
-            f"_ensure_term_structure_expiry error: {e}"
-        )
+_txcost_old = '''    def _calculate_transaction_costs(
+        self, position: Position
+    ) -> float:
+        """
+        Calculate NSE transaction costs.
+        FIX QS7: brokerage = flat ₹20 per order.
+        """
+        if not position.legs:
+            return 0.0
 
+        buy_value  = 0.0
+        sell_value = 0.0
+        num_orders = 0
 
-async def _guarded_ws_reconnect(dm, ist_tz) -> None:
-    """
-    PATCH: prevents overlapping WS reconnect attempts and adds a
-    15-min backoff after 3 consecutive full-failure cycles, so a
-    persistent broker-side rejection (e.g. HTTP 403) doesn't turn
-    into an unbounded retry storm.
-    """
-    try:
-        await dm._reconnect_websocket()
-    finally:
-        dm._ws_reconnect_in_progress = False
-        if dm.ws_connected:
-            dm._ws_reconnect_fail_count = 0
-        else:
-            fail_count = getattr(
-                dm, "_ws_reconnect_fail_count", 0
-            ) + 1
-            dm._ws_reconnect_fail_count = fail_count
-            if fail_count >= 3:
-                dm._ws_reconnect_backoff_until = (
-                    datetime.now(ist_tz) + timedelta(minutes=15)
+        for leg in position.legs:
+            if leg.entry_price > 0 and leg.qty > 0:
+                value      = (
+                    leg.entry_price
+                    * leg.qty
+                    * config.LOT_SIZE
                 )
-                logger.warning(
-                    f"WS: {fail_count} consecutive full "
-                    f"failures — backing off reconnect "
-                    f"attempts for 15 min"
-                )
-
-
-def _is_expiry_day(
-    dm: Optional[DataManager] = None,
-) -> bool:'''
-
-_ws_storm_old = '''            if dm.kill_switch_triggered:
-                logger.warning(
-                    "WS disconnected — engine continues "
-                    "with REST data, attempting reconnect"
-                )
-                dm.kill_switch_triggered = False
-                asyncio.create_task(
-                    dm._reconnect_websocket()
-                )'''
-
-_ws_storm_new = '''            if dm.kill_switch_triggered:
-                # PATCH: market-hours check + concurrency guard +
-                # backoff, to stop the WS reconnect storm (was
-                # firing unconditionally every main-loop
-                # iteration with no guard against overlapping
-                # attempts).
-                _now_ws = datetime.now(IST)
-                _now_ws_time = _now_ws.time()
-                _today_ws_str = _now_ws.date().strftime(
-                    "%Y-%m-%d"
-                )
-                _is_trading_ws = (
-                    _now_ws.date().weekday() < 5
-                    and _today_ws_str
-                    not in config.NSE_MARKET_HOLIDAYS
-                )
-                _is_mkt_ws = (
-                    config.MARKET_OPEN
-                    <= _now_ws_time
-                    <= config.MARKET_CLOSE
-                )
-                _backoff_until = getattr(
-                    dm, "_ws_reconnect_backoff_until", None
-                )
-                _in_progress = getattr(
-                    dm, "_ws_reconnect_in_progress", False
-                )
-                if not (_is_trading_ws and _is_mkt_ws):
-                    dm.kill_switch_triggered = False
-                elif _in_progress:
-                    dm.kill_switch_triggered = False
-                elif (
-                    _backoff_until
-                    and _now_ws < _backoff_until
-                ):
-                    dm.kill_switch_triggered = False
+                num_orders += 1
+                if leg.action == "BUY":
+                    buy_value  += value
                 else:
-                    logger.warning(
-                        "WS disconnected — engine continues "
-                        "with REST data, attempting reconnect"
+                    sell_value += value
+
+            if leg.exit_price > 0 and leg.qty > 0:
+                value      = (
+                    leg.exit_price
+                    * leg.qty
+                    * config.LOT_SIZE
+                )
+                num_orders += 1
+                if leg.action == "SELL":
+                    buy_value  += value
+                else:
+                    sell_value += value
+
+        total_turnover = buy_value + sell_value
+        if total_turnover <= 0:
+            return 0.0
+
+        # FIX QS7: flat ₹20 per order (Upstox flat fee)
+        brokerage    = 20.0 * num_orders
+        stt          = sell_value * 0.001
+        exchange_fee = total_turnover * 0.0000325
+        sebi         = total_turnover * 0.000001
+        stamp        = buy_value    * 0.00015
+        gst          = (brokerage + exchange_fee) * 0.18
+
+        return round(
+            brokerage + stt + exchange_fee
+            + sebi + stamp + gst,
+            2,
+        )'''
+
+_txcost_new = '''    def _calculate_transaction_costs(
+        self, position: Position
+    ) -> float:
+        """
+        Calculate NSE transaction costs.
+        PATCH: rates updated per production verification record
+        (see config.py's COST_* constants). Kept as separate named
+        categories (brokerage, exchange charge, NSE IPFT, SEBI
+        fee, STT, stamp duty, GST) rather than one generic
+        percentage, per the verification requirements. Rates were
+        supplied externally, NOT independently confirmed by this
+        codebase — re-check against a live NSE circular / broker
+        contract note before production use.
+        """
+        if not position.legs:
+            return 0.0
+
+        buy_value  = 0.0
+        sell_value = 0.0
+        num_orders = 0
+
+        for leg in position.legs:
+            if leg.entry_price > 0 and leg.qty > 0:
+                value      = (
+                    leg.entry_price
+                    * leg.qty
+                    * config.LOT_SIZE
+                )
+                num_orders += 1
+                if leg.action == "BUY":
+                    buy_value  += value
+                else:
+                    sell_value += value
+
+            if leg.exit_price > 0 and leg.qty > 0:
+                value      = (
+                    leg.exit_price
+                    * leg.qty
+                    * config.LOT_SIZE
+                )
+                num_orders += 1
+                if leg.action == "SELL":
+                    buy_value  += value
+                else:
+                    sell_value += value
+
+        total_turnover = buy_value + sell_value
+        if total_turnover <= 0:
+            return 0.0
+
+        brokerage    = (
+            config.COST_BROKERAGE_PER_ORDER * num_orders
+        )
+        stt          = sell_value * config.COST_STT_OPTION_SELL_PCT
+        exchange_fee = total_turnover * config.COST_EXCHANGE_PCT
+        ipft         = total_turnover * config.COST_NSE_IPFT_PCT
+        sebi         = total_turnover * config.COST_SEBI_PCT
+        stamp        = buy_value * config.COST_STAMP_PCT
+        # GST applies ONLY to brokerage + exchange charge — not to
+        # STT, stamp duty, SEBI fee, or IPFT (unchanged from the
+        # original, already-correct logic).
+        gst          = (
+            brokerage + exchange_fee
+        ) * config.COST_GST_PCT
+
+        return round(
+            brokerage + stt + exchange_fee + ipft
+            + sebi + stamp + gst,
+            2,
+        )'''
+
+_bankedcost_old = '''                _leg_value = (
+                    exit_price * qty_closed * config.LOT_SIZE
+                )
+                _leg_brokerage = 20.0
+                _leg_exchange = _leg_value * 0.0000325
+                _leg_sebi = _leg_value * 0.000001
+                if leg.action == "SELL":
+                    _leg_stt = 0.0
+                    _leg_stamp = _leg_value * 0.00015
+                else:
+                    _leg_stt = _leg_value * 0.001
+                    _leg_stamp = 0.0
+                _leg_gst = (
+                    _leg_brokerage + _leg_exchange
+                ) * 0.18
+                leg_cost = (
+                    _leg_brokerage + _leg_exchange
+                    + _leg_sebi + _leg_stt + _leg_stamp
+                    + _leg_gst
+                )'''
+
+_bankedcost_new = '''                # PATCH: rates updated per production
+                # verification record (config.py's COST_*
+                # constants), matching _calculate_transaction_costs().
+                _leg_value = (
+                    exit_price * qty_closed * config.LOT_SIZE
+                )
+                _leg_brokerage = config.COST_BROKERAGE_PER_ORDER
+                _leg_exchange = (
+                    _leg_value * config.COST_EXCHANGE_PCT
+                )
+                _leg_ipft = (
+                    _leg_value * config.COST_NSE_IPFT_PCT
+                )
+                _leg_sebi = _leg_value * config.COST_SEBI_PCT
+                if leg.action == "SELL":
+                    _leg_stt = 0.0
+                    _leg_stamp = (
+                        _leg_value * config.COST_STAMP_PCT
                     )
-                    dm.kill_switch_triggered = False
-                    dm._ws_reconnect_in_progress = True
-                    asyncio.create_task(
-                        _guarded_ws_reconnect(dm, IST)
-                    )'''
-
-# ════════════════════════════════════════════════════════════════
-# Fix 3: tomorrow_is_expiry scoping
-# ════════════════════════════════════════════════════════════════
-
-_tomorrow_old = '''        tomorrow_str = (
-            date.today() + timedelta(days=1)
-        ).isoformat()
-        tomorrow_is_expiry = (
-            tomorrow_str in dm.get_available_expiries()
-        )'''
-
-_tomorrow_new = '''        tomorrow_str = (
-            date.today() + timedelta(days=1)
-        ).isoformat()
-        # PATCH: was checking "is tomorrow ANY known expiry" —
-        # since NIFTY has a weekly expiry almost every Tuesday,
-        # this was True on nearly every Monday regardless of
-        # which contract this specific position is in. Now
-        # correctly scoped to this position's own expiry.
-        tomorrow_is_expiry = (
-            tomorrow_str == position.expiry_date
-        )'''
-
-# ════════════════════════════════════════════════════════════════
-# Fix 4: NTP check in paper mode
-# ════════════════════════════════════════════════════════════════
-
-_ntp_old = '''    # CHECK 2 — NTP clock sync (live mode only)
-    if not config.PAPER_TRADING_MODE:
-        try:
-            import ntplib'''
-
-_ntp_new = '''    # CHECK 2 — NTP clock sync
-    # PATCH: run this even in paper mode — it validates the
-    # system clock, which every time-gated decision in the
-    # engine depends on, regardless of trading mode.
-    if True:
-        try:
-            import ntplib'''
-
-# ════════════════════════════════════════════════════════════════
-# Fix 5: midnight log rotation
-# ════════════════════════════════════════════════════════════════
-
-_logrotate_old = '''    audit_file = os.path.join(
-        config.LOG_DIR,
-        f"audit_log_{today_str}.log",
-    )
-    file_handler = logging.FileHandler(
-        audit_file, mode="a", encoding="utf-8"
-    )'''
-
-_logrotate_new = '''    audit_file = os.path.join(
-        config.LOG_DIR,
-        f"audit_log_{today_str}.log",
-    )
-    # PATCH: rotate at midnight so continuous multi-day operation
-    # doesn't keep appending every subsequent day's logs into the
-    # first day's file.
-    from logging.handlers import TimedRotatingFileHandler
-    file_handler = TimedRotatingFileHandler(
-        audit_file,
-        when="midnight",
-        backupCount=90,
-        encoding="utf-8",
-    )
-    file_handler.suffix = "%Y-%m-%d"'''
-
-# ════════════════════════════════════════════════════════════════
-# Fix 6: shutdown timeout guards
-# ════════════════════════════════════════════════════════════════
-
-_shutdown_cancel_old = '''    try:
-        cancelled = await se.cancel_all_open_orders(
-            context="SHUTDOWN_CANCEL_SWEEP"
-        )
-        if cancelled > 0:
-            logger.warning(
-                f"SHUTDOWN: Cancelled {cancelled} "
-                f"open orders"
-            )
-        await asyncio.sleep(1.0)
-    except Exception as e:
-        logger.error(
-            f"SHUTDOWN: Cancel sweep failed: {e}"
-        )'''
-
-_shutdown_cancel_new = '''    try:
-        # PATCH: timeout guard so a hung network call during
-        # shutdown can't stall the whole "graceful" sequence
-        # indefinitely.
-        cancelled = await asyncio.wait_for(
-            se.cancel_all_open_orders(
-                context="SHUTDOWN_CANCEL_SWEEP"
-            ),
-            timeout=30.0,
-        )
-        if cancelled > 0:
-            logger.warning(
-                f"SHUTDOWN: Cancelled {cancelled} "
-                f"open orders"
-            )
-        await asyncio.sleep(1.0)
-    except asyncio.TimeoutError:
-        logger.error(
-            "SHUTDOWN: Cancel sweep timed out after 30s "
-            "— continuing shutdown anyway"
-        )
-    except Exception as e:
-        logger.error(
-            f"SHUTDOWN: Cancel sweep failed: {e}"
-        )'''
-
-_shutdown_close_old = '''    if not config.PAPER_TRADING_MODE:
-        logger.info("Live mode: squaring off positions")
-        for position in list(se.open_positions):
-            try:
-                await se._close_position(
-                    position,
-                    config.EXIT_REASONS["MANUAL"],
-                    use_market=True,
-                )
-            except Exception as e:
-                logger.error(
-                    f"Shutdown close error "
-                    f"{position.trade_id[:8]}: {e}"
+                else:
+                    _leg_stt = (
+                        _leg_value
+                        * config.COST_STT_OPTION_SELL_PCT
+                    )
+                    _leg_stamp = 0.0
+                _leg_gst = (
+                    _leg_brokerage + _leg_exchange
+                ) * config.COST_GST_PCT
+                leg_cost = (
+                    _leg_brokerage + _leg_exchange + _leg_ipft
+                    + _leg_sebi + _leg_stt + _leg_stamp
+                    + _leg_gst
                 )'''
 
-_shutdown_close_new = '''    if not config.PAPER_TRADING_MODE:
-        logger.info("Live mode: squaring off positions")
-        for position in list(se.open_positions):
-            try:
-                # PATCH: timeout guard per position close during
-                # shutdown, same reasoning as the cancel sweep.
-                await asyncio.wait_for(
-                    se._close_position(
-                        position,
-                        config.EXIT_REASONS["MANUAL"],
-                        use_market=True,
-                    ),
-                    timeout=30.0,
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"Shutdown close timed out "
-                    f"{position.trade_id[:8]} — continuing"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Shutdown close error "
-                    f"{position.trade_id[:8]}: {e}"
-                )'''
-
-
-PATCHES = [
-    ("Insert _guarded_ws_reconnect() helper",
-     _func_insert_old, _func_insert_new),
-    ("Fix WS reconnect storm",
-     _ws_storm_old, _ws_storm_new),
-    ("Fix tomorrow_is_expiry scoping",
-     _tomorrow_old, _tomorrow_new),
-    ("Run NTP check even in paper mode",
-     _ntp_old, _ntp_new),
-    ("Add midnight log rotation",
-     _logrotate_old, _logrotate_new),
-    ("Timeout guard on shutdown cancel-sweep",
-     _shutdown_cancel_old, _shutdown_cancel_new),
-    ("Timeout guard on shutdown position closes",
-     _shutdown_close_old, _shutdown_close_new),
+strategy_engine_patches = [
+    ("Update _calculate_transaction_costs with new cost model",
+     _txcost_old, _txcost_new),
+    ("Update _close_one_side banked-cost formula",
+     _bankedcost_old, _bankedcost_new),
 ]
 
 
 def main():
     print("=" * 70)
-    print("MAIN.PY — WS STORM / TOMORROW-EXPIRY / NTP / LOG-ROTATE / "
-          "SHUTDOWN FIX SCRIPT" + (" [DRY RUN]" if DRY_RUN else ""))
+    print("COST MODEL / LOT SIZE UPDATE — PRODUCTION VERIFICATION"
+          + (" [DRY RUN]" if DRY_RUN else ""))
     print("=" * 70)
 
-    if not os.path.exists(TARGET):
-        print(f"ERROR: {TARGET} not found")
-        sys.exit(1)
-
-    content = read(TARGET)
-    changed_any = False
     errors = []
 
-    for label, old, new in PATCHES:
-        try:
-            content, changed = apply_text_patch(
-                content, old, new, label
-            )
-            changed_any = changed_any or changed
-        except PatchError as e:
-            print(f"  [ABORTED] {label}: {e}")
-            errors.append((label, str(e)))
+    try:
+        patch_file("config", config_patches)
+    except PatchError as e:
+        print(f"  [ABORTED] config.py: {e}")
+        errors.append(("config", str(e)))
 
+    try:
+        patch_file("strategy_engine", strategy_engine_patches)
+    except PatchError as e:
+        print(f"  [ABORTED] strategy_engine.py: {e}")
+        errors.append(("strategy_engine", str(e)))
+
+    print("\n" + "=" * 70)
     if errors:
-        print(f"\n{len(errors)} PATCH(ES) FAILED — nothing written.")
+        print(f"COMPLETED WITH {len(errors)} FAILURE(S):")
+        for key, err in errors:
+            print(f"  - {key}.py: {err}")
         sys.exit(1)
 
-    if not changed_any:
-        print("\nNothing to do — already fully patched.")
-        return
-
-    ok, err = verify_syntax(TARGET, content)
-    if not ok:
-        print(f"\nSYNTAX ERROR after patching: {err}")
-        print("Nothing written.")
-        sys.exit(1)
-    print("\nSyntax check: OK")
-
-    if DRY_RUN:
-        print("[DRY-RUN] Would write main.py (no changes written)")
-        return
-
-    bak = backup(TARGET)
-    write(TARGET, content)
-    print(f"Backed up original -> {os.path.basename(bak)}")
-    print(f"Wrote patched file  -> main.py")
-    print("\nALL PATCHES APPLIED SUCCESSFULLY")
+    print("ALL PATCHES " + ("VALIDATED (dry-run)" if DRY_RUN
+                             else "APPLIED SUCCESSFULLY"))
+    print("=" * 70)
+    print(
+        "\nBEFORE marking production-ready, per the supplied "
+        "checklist, still required:\n"
+        "  1. Compare against an actual recent broker contract note\n"
+        "  2. Verify one SELL, one BUY, one Iron Condor, one\n"
+        "     4-leg round trip — reconcile every rupee\n"
+        "  3. Confirm LOT_SIZE=65 against the live Upstox\n"
+        "     instrument master (not just this constant)\n"
+        "  4. Confirm COST_BROKERAGE_PER_ORDER=20 against your\n"
+        "     actual account tariff — this was NOT changed by\n"
+        "     this patch and predates it\n"
+        "  5. Re-run backtests with this cost model and do NOT\n"
+        "     compare directly against pre-patch backtest numbers\n"
+        "     without documenting the cost-model change"
+    )
 
 
 if __name__ == "__main__":

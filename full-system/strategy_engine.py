@@ -1336,7 +1336,14 @@ class StrategyEngine:
     ) -> float:
         """
         Calculate NSE transaction costs.
-        FIX QS7: brokerage = flat ₹20 per order.
+        PATCH: rates updated per production verification record
+        (see config.py's COST_* constants). Kept as separate named
+        categories (brokerage, exchange charge, NSE IPFT, SEBI
+        fee, STT, stamp duty, GST) rather than one generic
+        percentage, per the verification requirements. Rates were
+        supplied externally, NOT independently confirmed by this
+        codebase — re-check against a live NSE circular / broker
+        contract note before production use.
         """
         if not position.legs:
             return 0.0
@@ -1374,16 +1381,23 @@ class StrategyEngine:
         if total_turnover <= 0:
             return 0.0
 
-        # FIX QS7: flat ₹20 per order (Upstox flat fee)
-        brokerage    = 20.0 * num_orders
-        stt          = sell_value * 0.001
-        exchange_fee = total_turnover * 0.0000325
-        sebi         = total_turnover * 0.000001
-        stamp        = buy_value    * 0.00015
-        gst          = (brokerage + exchange_fee) * 0.18
+        brokerage    = (
+            config.COST_BROKERAGE_PER_ORDER * num_orders
+        )
+        stt          = sell_value * config.COST_STT_OPTION_SELL_PCT
+        exchange_fee = total_turnover * config.COST_EXCHANGE_PCT
+        ipft         = total_turnover * config.COST_NSE_IPFT_PCT
+        sebi         = total_turnover * config.COST_SEBI_PCT
+        stamp        = buy_value * config.COST_STAMP_PCT
+        # GST applies ONLY to brokerage + exchange charge — not to
+        # STT, stamp duty, SEBI fee, or IPFT (unchanged from the
+        # original, already-correct logic).
+        gst          = (
+            brokerage + exchange_fee
+        ) * config.COST_GST_PCT
 
         return round(
-            brokerage + stt + exchange_fee
+            brokerage + stt + exchange_fee + ipft
             + sebi + stamp + gst,
             2,
         )
@@ -1562,10 +1576,20 @@ class StrategyEngine:
                 position.realized_pnl
                 - self._estimate_costs(position)
             )
-            if position_net_estimate < -(
-                config.CB_LEVEL_1_PCT
-                * config.TOTAL_CAPITAL
-            ):
+            # PATCH: CB_LEVEL_1's flat 2%-of-capital threshold was
+            # pre-empting almost every strategy's own designed
+            # stop (e.g. a multi-lot straddle's 2x-credit stop can
+            # be far larger), making circuit-breaks the dominant
+            # exit reason instead of the designed stop-loss
+            # ladder. Scale the L1 threshold up to at least 1x the
+            # credit actually received on this position (debit
+            # strategies have total_credit=0 and simply fall back
+            # to the flat percentage, unchanged).
+            cb_l1_threshold = max(
+                config.CB_LEVEL_1_PCT * config.TOTAL_CAPITAL,
+                position.total_credit,
+            )
+            if position_net_estimate < -cb_l1_threshold:
                 logger.critical(
                     f"CB L1: position="
                     f"{position.trade_id[:8]} "
@@ -2506,6 +2530,35 @@ class StrategyEngine:
         meta["margin_estimate"] = (
             meta.get("margin_estimate_per_lot", 0.0) * lots
         )
+
+        # PATCH: max_risk / stop_loss / profit_target / max_profit
+        # are all computed by the builders using PER-1-LOT premium
+        # points or 1-lot rupee figures (before any lot multiplier
+        # exists). They were previously stored on the position
+        # unscaled, while the values compared against them at
+        # monitoring time (_get_position_current_premium() /
+        # _get_position_value(), which read leg.qty — already
+        # lot-scaled by the loop above) ARE correctly scaled. That
+        # mismatch meant: (a) capital-deployment gates read
+        # max_risk at 1/lots of the true figure, letting the
+        # regime-capital cap go effectively unenforced; (b) profit
+        # targets became progressively harder to hit and
+        # stop-losses progressively more trigger-happy as lot
+        # count grew — both by a factor of `lots`. Rescale all of
+        # them here so they're expressed in the same
+        # total-position units as what they'll be compared
+        # against.
+        meta["max_risk"] = meta.get("max_risk", 0.0) * lots
+        if meta.get("stop_loss") is not None:
+            meta["stop_loss"] = meta.get("stop_loss", 0.0) * lots
+        if meta.get("profit_target") is not None:
+            meta["profit_target"] = (
+                meta.get("profit_target", 0.0) * lots
+            )
+        if meta.get("max_profit") is not None:
+            meta["max_profit"] = (
+                meta.get("max_profit", 0.0) * lots
+            )
 
         trade_id = str(uuid.uuid4())
 
@@ -4861,22 +4914,49 @@ class StrategyEngine:
                     if l.action == "BUY"
                 )
             )
-            sell_strikes = [
+            # PATCH: previously paired sell/buy strikes across
+            # BOTH sides (e.g. short put vs long call), producing
+            # a cross-strike distance far larger than either
+            # spread's true width. Pair strikes within the SAME
+            # option_type (put spread width, call spread width)
+            # instead — matching what _build_credit_spreads()
+            # itself already does correctly for meta["max_risk"].
+            put_sell = [
                 l.strike for l in legs
-                if l.action == "SELL"
+                if l.action == "SELL" and l.option_type == "put"
             ]
-            buy_strikes  = [
+            put_buy = [
                 l.strike for l in legs
-                if l.action == "BUY"
+                if l.action == "BUY" and l.option_type == "put"
             ]
-            if sell_strikes and buy_strikes:
-                spread_width = max(
-                    abs(s - b)
-                    for s in sell_strikes
-                    for b in buy_strikes
+            call_sell = [
+                l.strike for l in legs
+                if l.action == "SELL" and l.option_type == "call"
+            ]
+            call_buy = [
+                l.strike for l in legs
+                if l.action == "BUY" and l.option_type == "call"
+            ]
+
+            widths = []
+            if put_sell and put_buy:
+                widths.append(
+                    max(
+                        abs(s - b)
+                        for s in put_sell for b in put_buy
+                    )
                 )
-            else:
-                spread_width = config.CONDOR_WING_WIDTH / 2
+            if call_sell and call_buy:
+                widths.append(
+                    max(
+                        abs(s - b)
+                        for s in call_sell for b in call_buy
+                    )
+                )
+            spread_width = (
+                max(widths) if widths
+                else config.CONDOR_WING_WIDTH / 2
+            )
             return max(
                 0,
                 (spread_width - net_credit) * config.LOT_SIZE,
@@ -5147,7 +5227,14 @@ class StrategyEngine:
         if position.strategy_name == (
             config.STRAT_SHORT_STRADDLE
         ):
-            position.stop_loss = position.entry_spot
+            # PATCH: was position.entry_spot (a spot PRICE,
+            # ~24,000), compared against current_premium (a few
+            # hundred points) in _check_stop_loss — that stop
+            # could never trigger again once this ran. Use
+            # total_credit (unit-matched: points x lots, same as
+            # current_premium) so "breakeven" actually means
+            # giving back all the credit collected.
+            position.stop_loss = position.total_credit
         elif position.strategy_name in [
             config.STRAT_IRON_CONDOR,
             config.STRAT_CREDIT_SPREADS,
@@ -5266,23 +5353,36 @@ class StrategyEngine:
                 # PATCH: now includes STT/SEBI/stamp/GST,
                 # matching _calculate_transaction_costs() (was
                 # only brokerage + exchange fee before).
+                # PATCH: rates updated per production
+                # verification record (config.py's COST_*
+                # constants), matching _calculate_transaction_costs().
                 _leg_value = (
                     exit_price * qty_closed * config.LOT_SIZE
                 )
-                _leg_brokerage = 20.0
-                _leg_exchange = _leg_value * 0.0000325
-                _leg_sebi = _leg_value * 0.000001
+                _leg_brokerage = config.COST_BROKERAGE_PER_ORDER
+                _leg_exchange = (
+                    _leg_value * config.COST_EXCHANGE_PCT
+                )
+                _leg_ipft = (
+                    _leg_value * config.COST_NSE_IPFT_PCT
+                )
+                _leg_sebi = _leg_value * config.COST_SEBI_PCT
                 if leg.action == "SELL":
                     _leg_stt = 0.0
-                    _leg_stamp = _leg_value * 0.00015
+                    _leg_stamp = (
+                        _leg_value * config.COST_STAMP_PCT
+                    )
                 else:
-                    _leg_stt = _leg_value * 0.001
+                    _leg_stt = (
+                        _leg_value
+                        * config.COST_STT_OPTION_SELL_PCT
+                    )
                     _leg_stamp = 0.0
                 _leg_gst = (
                     _leg_brokerage + _leg_exchange
-                ) * 0.18
+                ) * config.COST_GST_PCT
                 leg_cost = (
-                    _leg_brokerage + _leg_exchange
+                    _leg_brokerage + _leg_exchange + _leg_ipft
                     + _leg_sebi + _leg_stt + _leg_stamp
                     + _leg_gst
                 )
@@ -5734,6 +5834,9 @@ class StrategyEngine:
 
                 legs = []
                 for l in legs_data:
+                    _entry_price = float(
+                        l.get("entry_price", 0)
+                    )
                     leg = Leg(
                         instrument_key=l.get(
                             "instrument_key", ""
@@ -5748,13 +5851,25 @@ class StrategyEngine:
                             row_dict.get("expiry_date", ""),
                         ),
                         qty=int(l.get("qty", 1)),
-                        entry_price=float(
-                            l.get("entry_price", 0)
-                        ),
+                        entry_price=_entry_price,
                         exit_price=float(
                             l.get("exit_price", 0)
                         ),
                         order_tag=l.get("order_tag", ""),
+                        # PATCH: previously every restored leg
+                        # defaulted to fill_status="PENDING" (the
+                        # Leg dataclass default), causing
+                        # _monitor_all_positions() to force-close
+                        # every restored position at market on
+                        # the very next cycle after any restart.
+                        # A leg with a real recorded entry_price
+                        # was genuinely filled before the restart;
+                        # only a leg with no entry_price at all is
+                        # still treated as pending.
+                        fill_status=(
+                            "COMPLETE" if _entry_price > 0
+                            else "PENDING"
+                        ),
                     )
                     legs.append(leg)
 
