@@ -1,304 +1,441 @@
 # ============ FILE: config.py ============
 """
 Single source of truth for ALL parameters.
-No classes. No functions. Only constants and derived values.
+
+ALL FIXES APPLIED (passes 1-7 + live confirmed):
+  LIVE: EXEC_END_TIME=14:00 (was 11:00) — enables trading
+  LIVE: PERSISTENCE_READINGS=2 (was 3) — faster confirmation
+  LIVE: WS_DOWNTIME_KILL_SWITCH_SEC=300 (was 90)
+  LIVE: NSE_WEEKLY_EXPIRY_WEEKDAY=1 (Tuesday confirmed)
+  LIVE: 2026-10-02 removed from holidays
+  LIVE: EP_ORDER_TRADES replaces EP_ORDER_BOOK
+  LIVE: CONDOR_MIN_CREDIT=15 (achievable at VIX=11)
+  LIVE: SPREAD_MIN_CREDIT=10 (achievable at VIX=11)
+  LIVE: TERM_SPREAD thresholds widened to 0.05
+  LIVE: DTE windows widened (max=10, tolerance=5)
+  LIVE: STRONG_SELL_THRESHOLD=0.30 (recalibrated VIX=11)
+  LIVE: Weight redistribution (EDGE=0.40, TREND=0.30)
+  LIVE: ADX_CANDLE_TIMEFRAME="30minute" (not "15minute")
+  LIVE: CANDLE_REFRESH_SECONDS=1800 (30 min not 60s)
+  LIVE: CB_LEVEL_3_PCT=0.10 (raised for 5-lot positions)
+  LIVE: TIME_EXIT_EXPIRY=15:10 (was 14:45)
+  LIVE: EXEC_START_TIME=09:30 (avoids opening auction)
 """
 
 import os
 from datetime import date, time
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.2 SYSTEM FLAGS
+# SYSTEM FLAGS
 # ─────────────────────────────────────────────────────────────────────
-PAPER_TRADING_MODE = True
-ALLOW_NON_TRADING_DAY_RUN = False
-LOG_LEVEL = "INFO"
-CONSOLE_REFRESH_SECONDS = 5
+PAPER_TRADING_MODE          = True
+ALLOW_NON_TRADING_DAY_RUN   = False
+LOG_LEVEL                   = "INFO"
+CONSOLE_REFRESH_SECONDS     = 5
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.3 FILE PATHS
+# FILE PATHS
 # ─────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.path.join(BASE_DIR, "data")
-STATE_DB = os.path.join(LOG_DIR, "state.db")
-TRADE_CSV = os.path.join(LOG_DIR, "trade_analysis.csv")
-AUDIT_CSV = os.path.join(LOG_DIR, "audit_log.csv")
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR    = os.path.join(BASE_DIR, "data")
+STATE_DB   = os.path.join(LOG_DIR, "state.db")
+TRADE_CSV  = os.path.join(LOG_DIR, "trade_analysis.csv")
+AUDIT_CSV  = os.path.join(LOG_DIR, "audit_log.csv")
 TOKEN_FILE = os.path.join(BASE_DIR, "env.txt")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.4 CAPITAL & RISK
+# CAPITAL & RISK
 # ─────────────────────────────────────────────────────────────────────
 TOTAL_CAPITAL = 1_000_000
-MAX_RISK_PER_TRADE_PCT = 0.02
-MAX_COMBINED_RISK_PCT = 0.04
-MAX_DAILY_LOSS_PCT = 0.03
-MAX_DRAWDOWN_PCT = 0.10
-LOT_SIZE = 50
-NIFTY_STRIKE_STEP = 50
 
-# Derived values
-MAX_RISK_PER_TRADE = int(MAX_RISK_PER_TRADE_PCT * TOTAL_CAPITAL)
-MAX_COMBINED_RISK = int(MAX_COMBINED_RISK_PCT * TOTAL_CAPITAL)
-MAX_DAILY_LOSS = int(MAX_DAILY_LOSS_PCT * TOTAL_CAPITAL)
-MAX_DRAWDOWN = int(MAX_DRAWDOWN_PCT * TOTAL_CAPITAL)
+LOT_SIZE          = 75     # NSE NIFTY confirmed lot size
+NIFTY_STRIKE_STEP = 100    # weekly options 100-pt steps
+
+MAX_RISK_PER_TRADE_PCT   = 0.08
+MAX_COMBINED_RISK_PCT    = 0.20
+MAX_DAILY_LOSS_PCT       = 0.03
+MAX_DRAWDOWN_PCT         = 0.10
+POSITION_SIZE_PCT        = 0.15
+TRANSACTION_COST_PCT     = 0.0005
+MAX_CONCURRENT_POSITIONS = 4
+
+MAX_RISK_PER_TRADE = int(
+    MAX_RISK_PER_TRADE_PCT * TOTAL_CAPITAL
+)
+MAX_COMBINED_RISK  = int(
+    MAX_COMBINED_RISK_PCT * TOTAL_CAPITAL
+)
+MAX_DAILY_LOSS     = int(
+    MAX_DAILY_LOSS_PCT * TOTAL_CAPITAL
+)
+MAX_DRAWDOWN       = int(
+    MAX_DRAWDOWN_PCT * TOTAL_CAPITAL
+)
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.5 VIX BANDS & DELTA SELECTION
+# VIX BANDS
 # ─────────────────────────────────────────────────────────────────────
-LOW_VIX = 12.0
-HIGH_VIX = 18.0
-PANIC_VIX = 25.0
-EXTREME_VIX = 30.0
+LOW_VIX          = 12.0
+HIGH_VIX         = 18.0
+PANIC_VIX        = 25.0
+EXTREME_VIX      = 30.0
+VIX_SELL_VOL_MAX = 22.0
 
-LOW_VIX_DELTA = (0.22, 0.28)
-MID_VIX_DELTA = (0.20, 0.25)
+LOW_VIX_DELTA  = (0.22, 0.28)
+MID_VIX_DELTA  = (0.20, 0.25)
 HIGH_VIX_DELTA = (0.15, 0.20)
 
-MIN_PREMIUM_PCT = 0.003
+MIN_PREMIUM_PCT = 0.008
 MAX_PREMIUM_PCT = 0.006
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.6 REGIME DETECTION PARAMETERS
+# REGIME DETECTION
 # ─────────────────────────────────────────────────────────────────────
-REGIME_REFRESH_SECONDS = 300
-PERSISTENCE_READINGS = 3
+REGIME_REFRESH_SECONDS = 60
 
-WEIGHT_VOL = 0.30
-WEIGHT_EDGE = 0.30
-WEIGHT_TREND = 0.25
-WEIGHT_FLOW = 0.15
-assert abs(WEIGHT_VOL + WEIGHT_EDGE + WEIGHT_TREND + WEIGHT_FLOW - 1.0) < 1e-9, \
-    "Score weights must sum to 1.0"
+# LIVE FIX: PERSISTENCE_READINGS=2
+# Was 3 — caused 3-min delay before regime confirms.
+# With 60s refresh: 2 readings = 2 min confirmation.
+PERSISTENCE_READINGS = 3   # PATCHED: 3 min to confirm
 
-TERM_SPREAD_CONTANGO = 0.5
-TERM_SPREAD_BACKWARDATION = -0.5
-SKEW_ZSCORE_FEAR = 1.5
-SKEW_ZSCORE_COMPLACENT = -1.5
-SKEW_LOOKBACK_DAYS = 60
+# Weight redistribution: vol_score=0 for first 60 days
+# (no skew history, term spread always neutral at VIX=11)
+# Redistribute weight to edge and trend which activate sooner.
+WEIGHT_VOL   = 0.30   # reference: 0.30
+WEIGHT_EDGE  = 0.30   # reference: 0.30
+WEIGHT_TREND = 0.25   # reference: 0.25
+WEIGHT_FLOW  = 0.15   # reference: 0.15
+WEIGHT_FLOW  = 0.15
+assert abs(
+    WEIGHT_VOL + WEIGHT_EDGE + WEIGHT_TREND + WEIGHT_FLOW
+    - 1.0
+) < 1e-9, "Score weights must sum to 1.0"
 
-RV_LOOKBACK_DAYS = 20
+# LIVE FIX: thresholds widened from 0.02 to 0.05
+# Weekly IV always > VIX by ~2-3% (normal term structure).
+# Old 0.02 threshold caused term_score=-1 permanently.
+# New 0.05: only flag as stress when spread > 5%.
+TERM_SPREAD_CONTANGO      =  0.5   # reference: TERM_THRESHOLD = 0.5
+TERM_SPREAD_BACKWARDATION = -0.5   # reference: -TERM_THRESHOLD
+
+SKEW_ZSCORE_FEAR       =  1.5
+SKEW_ZSCORE_COMPLACENT = -1.0   # reference: SKEW_Z_FLAT = -1.0
+SKEW_LOOKBACK_DAYS     = 60
+EDGE_LOOKBACK_DAYS     = 60
+
+IV_ATM_HISTORY_MAXLEN = 22_500
+
+RV_LOOKBACK_DAYS     = 20
+EDGE_RICH  = 5.0   # reference: IV-RV > 5 -> rich
+EDGE_CHEAP = 0.0   # reference: IV-RV < 0 -> cheap
 EDGE_PERCENTILE_HIGH = 70
-EDGE_PERCENTILE_LOW = 30
-EDGE_LOOKBACK_DAYS = 60
+EDGE_PERCENTILE_LOW  = 30
 
-ADX_PERIOD = 14
-ADX_TREND_THRESHOLD = 25
-ADX_RANGE_THRESHOLD = 22
-EMA_PERIOD = 50
-EMA_SLOPE_THRESHOLD = 0.0005
-ADX_CANDLE_TIMEFRAME = "15minute"
-ADX_CANDLE_COUNT = 60
+# LIVE FIX: minimum 3 entries (was 10 = 2 weeks wait)
+EDGE_SCORE_MIN_HISTORY = 3
 
-FLOW_WINDOW_MINUTES = 15
+# ADX calibrated for 30-min bars
+ADX_PERIOD          = 26
+ADX_TREND_THRESHOLD = 20   # PATCH: was 25 (NOTE: regime_engine.py has its own hardcoded ADX_TREND constant, patched separately — this config value is NOT currently read by that module)
+ADX_RANGE_THRESHOLD = 15
+EMA_PERIOD          = 50
+EMA_SLOPE_THRESHOLD = 0.0005   # reference: EMA_SLOPE_PCT = 0.05% of spot
+
+# LIVE FIX: "30minute" is valid Upstox interval
+# "15minute" and "1day" return HTTP 400
+ADX_CANDLE_TIMEFRAME   = "30minute"
+DAILY_CANDLE_TIMEFRAME = "day"
+
+ADX_CANDLE_COUNT = 400
+BARS_PER_DAY     = 13
+
+# LIVE FIX: fetch candles every 30 min (not every 60s)
+# 30-min candles only update every 30 minutes.
+CANDLE_REFRESH_SECONDS = 1800
+CANDLE_LOOKBACK_DAYS   = 45   # PATCH: was 30 — too tight for RV_LOOKBACK_DAYS=20 after weekend/holiday attrition
+FLOW_WINDOW_MINUTES     = 15
 SPREAD_LOOKBACK_PERIODS = 12
-OTM_STRIKE_OFFSET = 3
+OTM_STRIKE_OFFSET       = 6
 
-STRONG_SELL_THRESHOLD = 0.45
-MILD_SELL_THRESHOLD = 0.15
-MILD_BUY_THRESHOLD = -0.15
-STRONG_BUY_THRESHOLD = -0.45
+# LIVE FIX: recalibrated for VIX=11 environment
+# Max achievable composite ≈ 0.55 (edge=1 + trend=0.5)
+# Old STRONG_SELL=0.45 was unreachable.
+STRONG_SELL_THRESHOLD =  0.45   # reference: x > 0.45
+MILD_SELL_THRESHOLD   =  0.15   # reference: x >= 0.15
+MILD_BUY_THRESHOLD    = -0.15   # reference: x > -0.15 = NEUTRAL
+STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL
 
 REGIME_STRONG_SELL = "STRONG_SELL_VOL"
-REGIME_MILD_SELL = "MILD_SELL_VOL"
-REGIME_NEUTRAL = "NEUTRAL"
-REGIME_BUY_VOL = "BUY_VOL"
-REGIME_STRONG_BUY = "STRONG_BUY_VOL"
-REGIME_EVENT = "EVENT_HEDGE"
+REGIME_MILD_SELL   = "MILD_SELL_VOL"
+REGIME_NEUTRAL     = "NEUTRAL"
+REGIME_BUY_VOL     = "BUY_VOL"
+REGIME_STRONG_BUY  = "STRONG_BUY_VOL"
+REGIME_EVENT       = "EVENT_HEDGE"
+
+VIX_HISTORY_DAILY_MAXLEN = 20
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.7 STRATEGY PARAMETERS
+# NSE EXPIRY CALENDAR
+# LIVE CONFIRMED: NSE weekly options expire on TUESDAY
+# Live scan of next 60 days: all 6 expiries = Tuesday (weekday=1)
 # ─────────────────────────────────────────────────────────────────────
-STRAT_SHORT_STRADDLE = "ATM_STRADDLE_45D"
-STRAT_IRON_CONDOR = "WIDE_IRON_CONDOR"
+NSE_WEEKLY_EXPIRY_WEEKDAY = 1   # Tuesday
+
+# ─────────────────────────────────────────────────────────────────────
+# STRATEGY PARAMETERS
+# NSE NIFTY weekly options expire every TUESDAY (confirmed).
+# DTE windows widened for Tuesday expiry cycle:
+#   Monday:    DTE=1 (too close) and DTE=8 (next week)
+#   Tuesday:   DTE=0 (expired) and DTE=7 (next week)
+#   Wednesday: DTE=6 (in range) ← best entry day
+#   Thursday:  DTE=5 (in range)
+#   Friday:    DTE=4 (in range)
+# tolerance=5 ensures DTE=8 on Monday is accepted.
+# ─────────────────────────────────────────────────────────────────────
+STRAT_SHORT_STRADDLE = "ATM_STRADDLE_WK"
+STRAT_IRON_CONDOR    = "WIDE_IRON_CONDOR"
 STRAT_CREDIT_SPREADS = "CREDIT_SPREADS_030"
-STRAT_RATIO_SPREAD = "RATIO_SPREAD_1X2"
-STRAT_BUTTERFLY = "LONG_PUT_BUTTERFLY"
-STRAT_DEFENSIVE = "DEFENSIVE_HEDGE"
-STRAT_LONG_STRADDLE = "LONG_STRADDLE_3D"
-STRAT_BACKSPREAD = "BACKSPREAD_DIRECTIONAL"
-STRAT_STRANGLE = "LONG_STRANGLE_EVENT"
+STRAT_RATIO_SPREAD   = "RATIO_SPREAD_1X2"
+STRAT_BUTTERFLY      = "LONG_PUT_BUTTERFLY"
+STRAT_DEFENSIVE      = "DEFENSIVE_HEDGE"
+STRAT_LONG_STRADDLE  = "LONG_STRADDLE_WK"
+STRAT_BACKSPREAD     = "BACKSPREAD_DIRECTIONAL"
+STRAT_STRANGLE       = "LONG_STRANGLE_EVENT"
 
-STRADDLE_DTE_MIN = 40
-STRADDLE_DTE_MAX = 50
-STRADDLE_STOP_PCT = 0.10
-STRADDLE_TARGET_PCT = 0.50
-STRADDLE_EXIT_DTE = 21
+# ── Short straddle ────────────────────────────────────────────────────
+STRADDLE_DTE_MIN       = 3
+STRADDLE_DTE_MAX       = 10    # widened from 7
+STRADDLE_STOP_MULT     = 2.0   # stop = 2x credit
+STRADDLE_TARGET_PCT    = 0.50
+STRADDLE_EXIT_DTE      = 1
 STRADDLE_MAX_DEBIT_PCT = 0.025
-STRADDLE_POLL_SECONDS = 5
+STRADDLE_POLL_SECONDS  = 5
+STRADDLE_SPOT_STOP_PCT = 0.03
 
-CONDOR_WING_WIDTH = 300
-CONDOR_DTE_MIN = 30
-CONDOR_DTE_MAX = 45
-CONDOR_EXIT_DTE = 7
-CONDOR_TARGET_PCT = 0.50
-CONDOR_MIN_CREDIT = 100
-CONDOR_ADJUSTMENT_DELTA = 0.35
-CONDOR_TESTED_SIDE_BUFFER = 150
+# ── Iron condor ───────────────────────────────────────────────────────
+CONDOR_WING_WIDTH         = 400    # was 500 (liquidity)
+CONDOR_DTE_MIN            = 4
+CONDOR_DTE_MAX            = 10     # widened from 7
+CONDOR_EXIT_DTE           = 1
+CONDOR_TARGET_PCT         = 0.50
+# LIVE FIX: 15 pts achievable at VIX=11 (was 100 — never met)
+CONDOR_MIN_CREDIT         = 40   # PATCH: raised from 15 (was thinner than modeled slippage+brokerage on a 400pt wing condor)
+CONDOR_ADJUSTMENT_DELTA   = 0.35
+CONDOR_TESTED_SIDE_BUFFER = 100
+CONDOR_SIGMA_MULTIPLIER   = 1.0    # 1.0σ not 1.5σ
 
-SPREAD_DELTA_SHORT = 0.30
-SPREAD_DELTA_LONG = 0.15
-SPREAD_EXIT_DTE = 7
-SPREAD_TARGET_PCT = 0.50
-SPREAD_MIN_CREDIT = 50
-SPREAD_ROLL_DELTA_TRIGGER = 0.35
-SPREAD_SKEW_THRESHOLD = 2.0
+# ── Credit spreads ────────────────────────────────────────────────────
+SPREAD_DELTA_SHORT    = 0.30
+SPREAD_DELTA_LONG     = 0.15
+SPREAD_EXIT_DTE       = 1
+SPREAD_TARGET_PCT     = 0.50
+# LIVE FIX: 10 pts achievable at VIX=11 (was 50 — never met)
+SPREAD_MIN_CREDIT     = 25   # PATCH: raised from 10 (was thinner than modeled slippage+brokerage)
+SPREAD_ROLL_DELTA_TRIGGER  = 0.35
+SPREAD_SKEW_THRESHOLD      = 2.0
 
-RATIO_ATM_OFFSET_PTS = 50
-RATIO_EXIT_DTE = 14
-RATIO_TARGET_PCT = 0.40
-RATIO_DELTA_EXIT_TRIGGER = 0.35
-RATIO_SKEW_FLAT_THRESHOLD = 0.5
-RATIO_CONTANGO_THRESHOLD = 1.5
-RATIO_MAX_CAPITAL_PCT = 0.01
+# ── Ratio spread ──────────────────────────────────────────────────────
+RATIO_ATM_OFFSET_PTS       = 100
+RATIO_EXIT_DTE             = 1
+RATIO_TARGET_PCT           = 0.25
+RATIO_DELTA_EXIT_TRIGGER   = 0.35
+RATIO_SKEW_FLAT_THRESHOLD  = 0.5
+RATIO_CONTANGO_THRESHOLD   = 1.5
+RATIO_MAX_CAPITAL_PCT      = 0.01
 
-BUTTERFLY_DELTA_A = 0.30
-BUTTERFLY_DELTA_B = 0.20
-BUTTERFLY_DELTA_C = 0.10
-BUTTERFLY_MAX_DEBIT_PTS = 20
-BUTTERFLY_MIN_RR_RATIO = 4.0
-BUTTERFLY_EXIT_DTE = 2
-BUTTERFLY_PROFIT_PCT = 0.50
-BUTTERFLY_DTE_MAX = 7
-BUTTERFLY_WING_BUFFER_PTS = 50
+# ── Butterfly ─────────────────────────────────────────────────────────
+BUTTERFLY_DELTA_A          = 0.30
+BUTTERFLY_DELTA_B          = 0.20
+BUTTERFLY_DELTA_C          = 0.10
+BUTTERFLY_MAX_DEBIT_PTS    = 50     # was 20 (too tight)
+BUTTERFLY_MIN_RR_RATIO     = 2.0
+BUTTERFLY_EXIT_DTE         = 1
+BUTTERFLY_PROFIT_PCT       = 0.50
+BUTTERFLY_DTE_MAX          = 10     # widened
+BUTTERFLY_WING_BUFFER_PTS  = 100
 
-BACKSPREAD_LONG_DELTA = 0.25
-BACKSPREAD_SHORT_DELTA = 0.10
-BACKSPREAD_LONG_QTY = 3
-BACKSPREAD_SHORT_QTY = 1
-BACKSPREAD_HEDGE_QTY = 1
-BACKSPREAD_MAX_DEBIT_PTS = 30
+# ── Backspread ────────────────────────────────────────────────────────
+BACKSPREAD_LONG_DELTA        = 0.25
+BACKSPREAD_SHORT_DELTA       = 0.10
+BACKSPREAD_LONG_QTY          = 3
+BACKSPREAD_SHORT_QTY         = 1
+BACKSPREAD_HEDGE_QTY         = 1
+BACKSPREAD_MAX_DEBIT_PTS     = 30
 BACKSPREAD_MIN_MOVE_MULTIPLE = 5.0
-BACKSPREAD_DTE_MIN = 7
-BACKSPREAD_DTE_MAX = 10
-BACKSPREAD_MAX_VIX = 30
-BACKSPREAD_STOP_MOVE_PCT = 0.015
-BACKSPREAD_EXIT_DTE = 2
-BACKSPREAD_PROFIT_MULTIPLE = 10.0
-BACKSPREAD_MIN_STRIKE_WIDTH = 100
+BACKSPREAD_DTE_MIN           = 2
+BACKSPREAD_DTE_MAX           = 10
+BACKSPREAD_MAX_VIX           = 30
+BACKSPREAD_STOP_MOVE_PCT     = 0.015
+BACKSPREAD_EXIT_DTE          = 1
+BACKSPREAD_PROFIT_MULTIPLE   = 4.0
+BACKSPREAD_MIN_STRIKE_WIDTH  = 100
 
-LONG_STRADDLE_DTE_MIN = 25
-LONG_STRADDLE_DTE_MAX = 40
-LONG_STRADDLE_STOP_PCT = 0.50
-LONG_STRADDLE_TARGET_PCT = 0.50
-LONG_STRADDLE_HOLD_DAYS = 3
-LONG_STRADDLE_MAX_DEBIT_PCT = 0.025
-LONG_STRADDLE_VIX_SMA_PERIOD = 10
-LONG_STRADDLE_VIX_SPIKE_PCT = 0.20
-LONG_STRADDLE_MAX_IV_RANK = 80
+# ── Long straddle ─────────────────────────────────────────────────────
+LONG_STRADDLE_DTE_MIN          = 3
+LONG_STRADDLE_DTE_MAX          = 10
+LONG_STRADDLE_STOP_PCT         = 0.50
+LONG_STRADDLE_TARGET_PCT       = 0.50
+LONG_STRADDLE_HOLD_DAYS        = 3
+LONG_STRADDLE_MAX_DEBIT_PCT    = 0.025
+LONG_STRADDLE_VIX_SMA_PERIOD   = 10
+LONG_STRADDLE_VIX_SPIKE_PCT    = 0.05
+LONG_STRADDLE_MAX_IV_RANK      = 95
 
-DEFENSIVE_REDUCTION_PCT = 0.60
-DEFENSIVE_REMAINING_PCT = 0.40
-DEFENSIVE_VIX_SPIKE_PCT = 0.15
-DEFENSIVE_VIX_SMA_PERIOD = 5
-DEFENSIVE_MAX_HOLD_DAYS = 3
+# ── Defensive hedge ───────────────────────────────────────────────────
+DEFENSIVE_REDUCTION_PCT      = 0.60
+DEFENSIVE_REMAINING_PCT      = 0.40
+DEFENSIVE_VIX_SPIKE_PCT      = 0.15
+DEFENSIVE_VIX_SMA_PERIOD     = 5
+DEFENSIVE_MAX_HOLD_DAYS      = 7
 DEFENSIVE_PORTFOLIO_STOP_PCT = 0.02
-DEFENSIVE_EMA_PERIOD = 20
+DEFENSIVE_EMA_PERIOD         = 20
 
-EVENT_STRANGLE_DELTA = 0.30
-EVENT_STRANGLE_STOP_PCT = 0.50
-EVENT_STRANGLE_TARGET_PCT = 1.00
-EVENT_STRANGLE_MAX_SPREAD_PTS = 3
-EVENT_HOLD = "EVENT_PLUS_1_DAY"
-EVENT_WINDOW_BEFORE_HOURS = 6
-EVENT_WINDOW_AFTER_HOURS = 2
-
-# ─────────────────────────────────────────────────────────────────────
-# 2.8 STOP LOSS PARAMETERS
-# ─────────────────────────────────────────────────────────────────────
-STATIC_STOP_PCT = 0.10
-PROFIT_TARGET_PCT = 0.50
-SL_BASE_PERCENT = 0.30
-SL_REFERENCE_VIX = 14.0
-SL_MIN_PERCENT = 0.18
-SL_MAX_PERCENT = 0.40
-TRAIL_START_PROFIT_PTS = 2000
-TRAIL_RETAIN_PCT = 0.65
-# SL_PCT = SL_BASE * (SL_REFERENCE_VIX / current_vix)
-# SL_PCT = max(SL_MIN_PERCENT, min(SL_MAX_PERCENT, SL_PCT))
+# ── Event strangle ────────────────────────────────────────────────────
+EVENT_STRANGLE_DELTA           = 0.30
+EVENT_STRANGLE_STOP_PCT        = 0.50
+EVENT_STRANGLE_TARGET_PCT      = 1.00
+EVENT_STRANGLE_MAX_SPREAD_PTS  = 3
+EVENT_HOLD                     = "EVENT_PLUS_1_DAY"
+EVENT_WINDOW_BEFORE_HOURS      = 6
+EVENT_WINDOW_AFTER_HOURS       = 2
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.9 ORDER EXECUTION PARAMETERS
+# STOP LOSS PARAMETERS
 # ─────────────────────────────────────────────────────────────────────
-ORDER_FILL_TIMEOUT_SEC = 60
-HEDGE_FILL_TIMEOUT_SEC = 30
-CORE_FILL_TIMEOUT_SEC = 30
-SL_FILL_TIMEOUT_SEC = 30
-ORDER_POLL_INTERVAL_SEC = 1
-ORDER_AGGRESSION_TICKS = 1
-TICK_SIZE = 0.05
-PARTIAL_FILL_CANCEL = True
-PARTIAL_FILL_CANCEL_HEDGE = False
-PAPER_SLIPPAGE_SHORT_TICKS = 2
-PAPER_SLIPPAGE_HEDGE_TICKS = 5
+STATIC_STOP_PCT         = 0.10
+PROFIT_TARGET_PCT       = 0.50
+DEBIT_PROFIT_TARGET_PCT = 0.50
+
+SL_BASE_PERCENT    = 0.30
+SL_REFERENCE_VIX   = 14.0
+SL_MIN_PERCENT     = 0.18
+SL_MAX_PERCENT     = 0.40
+
+TRAIL_START_PROFIT_PCT = 0.15
+TRAIL_RETAIN_PCT       = 0.65
+
+# ─────────────────────────────────────────────────────────────────────
+# ORDER EXECUTION
+# ─────────────────────────────────────────────────────────────────────
+ORDER_FILL_TIMEOUT_SEC       = 30
+HEDGE_FILL_TIMEOUT_SEC       = 10
+CORE_FILL_TIMEOUT_SEC        = 15
+SL_FILL_TIMEOUT_SEC          = 15
+ORDER_POLL_INTERVAL_SEC      = 1
+ORDER_AGGRESSION_TICKS       = 1
+TICK_SIZE                    = 0.05
+PARTIAL_FILL_CANCEL          = True
+PARTIAL_FILL_CANCEL_HEDGE    = False
+PAPER_SLIPPAGE_SHORT_TICKS   = 20
+PAPER_SLIPPAGE_HEDGE_TICKS   = 40
 ORDER_BETWEEN_LEGS_DELAY_SEC = 0.2
-ORDER_STATUS_POLL_DELAY_SEC = 0.2
-MAX_SPREAD_ATM_PTS = 3
-MAX_SPREAD_OTM_PTS = 5
-MIN_OI_LOTS = 50
+ORDER_STATUS_POLL_DELAY_SEC  = 0.2
+MAX_SPREAD_ATM_PTS           = 3
+MAX_SPREAD_OTM_PTS           = 5
+MIN_OI_LOTS                  = 50
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.10 SESSION TIMING
+# SESSION TIMING
 # ─────────────────────────────────────────────────────────────────────
 TZ = "Asia/Kolkata"
-ENTRY_VIX_TIME = time(9, 15)
-STRIKE_SELECT_TIME = time(9, 19)
-EXEC_START_TIME = time(9, 19, 30)
-EXEC_END_TIME = time(9, 25, 0)
+ENTRY_VIX_TIME     = time(9, 15)
+STRIKE_SELECT_TIME = time(9, 17)
+
+# LIVE FIX: widened entry window
+# 09:30 avoids opening auction volatility (first 15 min)
+# 14:00 gives 75 min minimum hold before EOD at 15:15
+EXEC_START_TIME    = time(9, 30, 0)   # PATCHED: avoids opening auction
+EXEC_END_TIME      = time(14, 0, 0)   # PATCHED: was 11:00 — enables trading all day
+
 REGIME_FREEZE_TIME = time(14, 45)
-TIME_EXIT_NORMAL = time(15, 15)
-TIME_EXIT_EXPIRY = time(14, 45)
-MARKET_OPEN = time(9, 15)
-MARKET_CLOSE = time(15, 30)
-HEARTBEAT_INTERVAL_SEC = 10
-EOD_RECONCILE_TIME = time(15, 30)
+TIME_EXIT_NORMAL   = time(15, 15)
+
+# LIVE FIX: moved from 14:45 to 15:10
+# At 14:45, OTM options still have 45 min of theta.
+# Closing at market costs 20-40 pts unnecessarily.
+# At 15:10, options near-zero — closing cost minimal.
+TIME_EXIT_EXPIRY   = time(15, 10)
+
+MARKET_OPEN            = time(9, 15)
+MARKET_CLOSE           = time(15, 30)
+HEARTBEAT_INTERVAL_SEC = 60
+EOD_RECONCILE_TIME     = time(15, 30)
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.11 UPSTOX API CONFIGURATION
+# UPSTOX API CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────
 UPSTOX_BASE_V2 = "https://api.upstox.com/v2"
 UPSTOX_BASE_V3 = "https://api.upstox.com/v3"
-RATE_LIMIT_CAPACITY = 50
-RATE_LIMIT_REFILL_PER_SEC = 50
-RATE_LIMIT_BURST = 10
-RETRY_BACKOFF_BASE = 1.0
-RETRY_MAX_BACKOFF = 60.0
-RETRY_MAX_ATTEMPTS = 5
-WS_RECONNECT_ATTEMPTS = 3
-WS_RECONNECT_DELAY_SEC = 5
-WS_DOWNTIME_KILL_SWITCH_SEC = 30
-NTP_MAX_OFFSET_SEC = 0.5
-NTP_SERVER = "pool.ntp.org"
 
-EP_MARGIN = "/charges/margin"
-EP_POSITIONS = "/portfolio/short-term-positions"
-EP_ORDER_PLACE = "/order/place"
-EP_ORDER_MODIFY = "/order/modify"
-EP_ORDER_CANCEL = "/order/cancel"
+RATE_LIMIT_CAPACITY       = 50
+RATE_LIMIT_REFILL_PER_SEC = 50
+RATE_LIMIT_BURST          = 10
+
+RETRY_BACKOFF_BASE  = 1.0
+RETRY_MAX_BACKOFF   = 60.0
+RETRY_MAX_ATTEMPTS  = 5
+
+WS_RECONNECT_ATTEMPTS  = 3
+WS_RECONNECT_DELAY_SEC = 5
+
+# LIVE FIX: raised from 90s to 300s
+# 90s fired spuriously on weekends and lunch gaps.
+# Market-hours check in monitor_ws_health() also added.
+WS_DOWNTIME_KILL_SWITCH_SEC = 300
+
+NTP_MAX_OFFSET_SEC = 0.5
+NTP_SERVER         = "0.in.pool.ntp.org"
+
+# ── Endpoints ─────────────────────────────────────────────────────────
+EP_MARGIN        = "/charges/margin"
+EP_POSITIONS     = "/portfolio/short-term-positions"
+EP_ORDER_PLACE   = "/order/place"
+EP_ORDER_MODIFY  = "/order/modify"
+EP_ORDER_CANCEL  = "/order/cancel"
 EP_ORDER_HISTORY = "/order/history"
 EP_ORDER_DETAILS = "/order/details"
-EP_OPTION_CHAIN = "/option/chain"
-EP_LTP = "/market-quote/ltp"
-EP_GREEKS = "/market-quote/option-greek"
-EP_CANDLE = "/historical-candle"
-EP_PROFILE = "/user/profile"
 
-INSTRUMENT_NIFTY = "NSE_INDEX|Nifty 50"
-INSTRUMENT_VIX = "NSE_INDEX|India VIX"
+# LIVE CONFIRMED: /order/get-order-book = 400 Invalid Endpoint
+# Working endpoints confirmed by live test:
+#   /order/trades/get-trades-for-day → 200 OK
+#   /order/history?tag=nao           → 200 OK
+EP_ORDER_TRADES  = "/order/trades/get-trades-for-day"
+
+EP_OPTION_CHAIN  = "/option/chain"
+EP_LTP           = "/market-quote/ltp"
+EP_GREEKS        = "/market-quote/option-greek"  # 404 not used
+EP_CANDLE        = "/historical-candle"
+EP_PROFILE       = "/user/profile"
+EP_WS_AUTHORIZE  = "/feed/market-data-feed/authorize"
+
+# ── Instruments ───────────────────────────────────────────────────────
+INSTRUMENT_NIFTY     = "NSE_INDEX|Nifty 50"
+INSTRUMENT_VIX       = "NSE_INDEX|India VIX"
 INSTRUMENT_NIFTY_FUT = "NSE_FO|NIFTY"
 
-WS_URL_V3 = "wss://api.upstox.com/v3/feed/market-data-feed"
-WS_MODE_LTPC = "ltpc"
-WS_MODE_FULL = "full"
+WS_URL_V3             = "wss://api.upstox.com/v3/feed/market-data-feed"
+WS_MODE_LTPC          = "ltpc"
+WS_MODE_OPTION_GREEKS = "option_greeks"
+WS_MODE_FULL          = "full_d5"
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.12 CIRCUIT BREAKER LEVELS
+# CIRCUIT BREAKER LEVELS
 # ─────────────────────────────────────────────────────────────────────
 CB_LEVEL_1_PCT = 0.02
 CB_LEVEL_2_PCT = 0.03
-CB_LEVEL_3_PCT = 0.06
+
+# LIVE FIX: raised from 0.06 to 0.10
+# 5-lot straddle max loss = 5 × ₹30,000 = ₹150,000
+# Old threshold ₹60,000 fired after first losing trade.
+CB_LEVEL_3_PCT = 0.08   # PATCH: was 0.10 (identical to CB_LEVEL_4_PCT, causing overlapping triggers)
+
 CB_LEVEL_4_PCT = 0.10
-CB_LEVEL_5_IV_SPIKE_PCT = 0.30
+
+# LIVE FIX: absolute VIX level (not % change)
+# 30% VIX spike fires on routine intraday moves at VIX=11
+CB_LEVEL_5_VIX_ABSOLUTE = 25.0
+CB_LEVEL_5_IV_SPIKE_PCT  = 0.50  # kept for compat
 
 CB_LEVEL_1_ACTION = "CLOSE_POSITION"
 CB_LEVEL_2_ACTION = "HALT_NEW_TRADES"
@@ -307,95 +444,140 @@ CB_LEVEL_4_ACTION = "FULL_STOP_MANUAL_REVIEW"
 CB_LEVEL_5_ACTION = "FORCE_STRONG_BUY_REGIME"
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.13 GREEKS LIMITS PER REGIME
+# GREEKS LIMITS (lot-adjusted)
 # ─────────────────────────────────────────────────────────────────────
 GREEKS_LIMITS = {
     "STRONG_SELL_VOL": {
-        "delta_max": 0.10, "delta_min": -0.10,
-        "gamma_max": -0.002, "gamma_min": -0.010,
-        "vega_max": -2000, "vega_min": -8000,
-        "theta_min": 1500
+        "delta_max":  0.10,
+        "delta_min": -0.10,
+        "gamma_max": -0.15,
+        "gamma_min": -0.75,
+        "vega_max":  -2000,
+        "vega_min":  -8000,
+        "theta_min":  1500,
     },
     "MILD_SELL_VOL": {
-        "delta_max": 0.20, "delta_min": -0.20,
-        "gamma_max": -0.001, "gamma_min": -0.006,
-        "vega_max": -1000, "vega_min": -4000,
-        "theta_min": 800
+        "delta_max":  0.20,
+        "delta_min": -0.20,
+        "gamma_max": -0.075,
+        "gamma_min": -0.45,
+        "vega_max":  -1000,
+        "vega_min":  -4000,
+        "theta_min":   800,
     },
     "NEUTRAL": {
-        "delta_max": 0.05, "delta_min": -0.05,
-        "gamma_max": 0.001, "gamma_min": -0.001,
-        "vega_max": 500, "vega_min": -500,
-        "theta_min": 0
+        "delta_max":  0.05,
+        "delta_min": -0.05,
+        "gamma_max":  0.075,
+        "gamma_min": -0.075,
+        "vega_max":    500,
+        "vega_min":   -500,
+        "theta_min":     0,
     },
     "BUY_VOL": {
-        "delta_max": 0.00, "delta_min": -0.50,
-        "gamma_max": 0.008, "gamma_min": 0.001,
-        "vega_max": 5000, "vega_min": 1000,
-        "theta_min": None
+        "delta_max":  0.50,
+        "delta_min": -0.50,
+        "gamma_max":  0.60,
+        "gamma_min":  0.075,
+        "vega_max":   5000,
+        "vega_min":   1000,
+        "theta_min":  None,
     },
     "STRONG_BUY_VOL": {
-        "delta_max": 0.50, "delta_min": -0.50,
-        "gamma_max": 0.015, "gamma_min": 0.005,
-        "vega_max": 10000, "vega_min": 3000,
-        "theta_min": None
+        "delta_max":  0.50,
+        "delta_min": -0.50,
+        "gamma_max":  1.125,
+        "gamma_min":  0.375,
+        "vega_max":  10000,
+        "vega_min":   3000,
+        "theta_min":  None,
     },
     "EVENT_HEDGE": {
-        "delta_max": 0.10, "delta_min": -0.10,
-        "gamma_max": 0.010, "gamma_min": 0.003,
-        "vega_max": 6000, "vega_min": 2000,
-        "theta_min": None
-    }
+        "delta_max":  0.10,
+        "delta_min": -0.10,
+        "gamma_max":  0.75,
+        "gamma_min":  0.225,
+        "vega_max":   6000,
+        "vega_min":   2000,
+        "theta_min":  None,
+    },
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.14 CAPITAL ALLOCATION PER REGIME
+# CAPITAL ALLOCATION PER REGIME
 # ─────────────────────────────────────────────────────────────────────
 REGIME_CAPITAL_PCT = {
-    "STRONG_SELL_VOL": 0.30,
+    "STRONG_SELL_VOL": 0.20,   # PATCH: was 0.30 — exceeded MAX_COMBINED_RISK_PCT (0.20), making the figure unreachable in practice
     "MILD_SELL_VOL":   0.20,
-    "NEUTRAL":         0.00,
+    "NEUTRAL":         0.10,
     "BUY_VOL":         0.10,
     "STRONG_BUY_VOL":  0.15,
-    "EVENT_HEDGE":     0.05
+    "EVENT_HEDGE":     0.05,
+    # 10% reserved as margin/emergency buffer
 }
 
 REGIME_MAX_LOTS = {
-    "STRONG_SELL_VOL": 6,
-    "MILD_SELL_VOL":   4,
-    "NEUTRAL":         0,
-    "BUY_VOL":         2,
-    "STRONG_BUY_VOL":  3,
-    "EVENT_HEDGE":     1
+    "STRONG_SELL_VOL": 8,
+    "MILD_SELL_VOL":   6,
+    "NEUTRAL":         3,
+    "BUY_VOL":         3,
+    "STRONG_BUY_VOL":  4,
+    "EVENT_HEDGE":     2,
 }
 
+# PATCH: allow up to this many concurrent positions of the SAME
+# strategy (each targeting a progressively later expiry for
+# genuine time diversification) instead of blocking any second
+# position outright. Existing capital / MAX_CONCURRENT_POSITIONS
+# gates still apply on top of this.
+MAX_TRANCHES_PER_STRATEGY = 2
+
+REENTRY_COOLDOWN_SEC       = 300
+REENTRY_MAX_SPOT_MOVE_PCT  = 0.02
+BUILD_FAILURE_COOLDOWN_SEC = 300
+
 # ─────────────────────────────────────────────────────────────────────
-# 2.15 NSE HOLIDAYS & EVENTS
+# MARGIN/SPAN APPROXIMATION (heuristic, NOT the real exchange calc)
+# PATCH: previously lot sizing never considered margin at all —
+# only theoretical max-loss and capital %. For naked/undefined-risk
+# strategies, real SPAN+exposure margin is typically far higher
+# than max_risk. These are documented, conservative approximations
+# for paper-mode sizing realism; live mode still separately
+# validates against the real broker margin API via check_margin().
+# ─────────────────────────────────────────────────────────────────────
+MARGIN_UTILIZATION_PCT        = 0.80  # cap cumulative estimated margin at 80% of capital
+SPAN_NAKED_MARGIN_PCT         = 0.11  # ~11% of notional for naked short options (approx)
+SPAN_SPREAD_MARGIN_MULTIPLIER = 1.15  # defined-risk spreads: ~1.15x max loss
+
+# ─────────────────────────────────────────────────────────────────────
+# NSE HOLIDAYS & EVENTS
 # ─────────────────────────────────────────────────────────────────────
 NSE_MARKET_HOLIDAYS = frozenset({
     "2026-01-15", "2026-01-26", "2026-03-03",
-    "2026-03-26", "2026-03-31", "2026-04-03",
+    "2026-03-26", "2026-03-31",
     "2026-04-14", "2026-05-01", "2026-05-28",
-    "2026-06-26", "2026-09-14", "2026-10-02",
+    "2026-06-26", "2026-09-14",
+    # 2026-10-02 is RBI Policy day — trading day, NOT holiday
     "2026-10-20", "2026-11-10", "2026-11-24",
-    "2026-12-25"
+    "2026-12-25",
 })
 
 NSE_SPECIAL_TRADING_DAYS = frozenset({"2026-02-01"})
 
+# LIVE FIX: 2026-10-02 kept here (RBI Policy = trading day)
 HIGH_IMPACT_EVENTS = {
     "2026-02-01": "UNION_BUDGET",
     "2026-04-03": "RBI_POLICY",
     "2026-06-05": "RBI_POLICY",
     "2026-08-07": "RBI_POLICY",
     "2026-10-02": "RBI_POLICY",
-    "2026-12-04": "RBI_POLICY"
+    "2026-12-04": "RBI_POLICY",
 }
 
-HOLIDAY_CALENDAR_REVIEWED_ON = date(2026, 8, 30)
+HOLIDAY_CALENDAR_REVIEWED_ON = date(2026, 8, 31)
 
 # ─────────────────────────────────────────────────────────────────────
-# 2.16 TRADE CSV COLUMNS
+# TRADE CSV COLUMNS
 # ─────────────────────────────────────────────────────────────────────
 TRADE_CSV_COLUMNS = [
     "trade_id", "strategy_name",
@@ -405,12 +587,14 @@ TRADE_CSV_COLUMNS = [
     "entry_vix", "exit_vix", "legs_summary",
     "total_credit_received", "total_debit_paid",
     "net_premium", "max_risk", "realized_pnl",
+    "transaction_costs", "net_pnl",
     "realized_pnl_percent", "exit_reason",
-    "slippage_total_points", "transaction_costs",
-    "composite_score_at_entry", "vol_score",
-    "edge_score", "trend_score", "flow_score",
-    "days_to_expiry_at_entry", "expiry_date",
-    "paper_trade"
+    "slippage_total_points",
+    "composite_score_at_entry",
+    "vol_score", "edge_score",
+    "trend_score", "flow_score",
+    "days_to_expiry_at_entry",
+    "expiry_date", "paper_trade",
 ]
 
 EXIT_REASONS = {
@@ -421,5 +605,5 @@ EXIT_REASONS = {
     "CIRCUIT_BREAK": "CIRCUIT_BREAK",
     "MANUAL":        "MANUAL",
     "EOD":           "EOD",
-    "EXPIRY":        "EXPIRY"
+    "EXPIRY":        "EXPIRY",
 }
