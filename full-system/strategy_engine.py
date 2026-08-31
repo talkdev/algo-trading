@@ -3,11 +3,28 @@
 Strategy selection, construction, execution, position management,
 risk management, circuit breakers, and trade logging.
 
-FIXES IN THIS VERSION:
-  CRITICAL FIX 1: Idempotent order placement via deterministic tags
-  CRITICAL FIX 2: Cancel sweep for all open orders (EOD + shutdown)
-  CRITICAL FIX 3: Order tag deduplication system
-  HIGH FIX 4:     Transaction cost deduction from performance tracking
+FIXES APPLIED (all passes cumulative + pass 7):
+  CRITICAL VS1 : DTE windows widened (DTE_MAX=10, tolerance=5)
+                 Fixes Monday gap: DTE=1 (too close) and DTE=8
+                 (outside old max=7). Now DTE=8 is accepted.
+  CRITICAL QS1 : All builders use expiry-scoped chain access
+  CRITICAL QS2 : CONDOR_MIN_CREDIT=15 (in config)
+  CRITICAL FS2 : Pre-trade validates non-zero LTP
+  CONFIRMED-10 : cancel_all_open_orders uses registry sweep only
+                 (no EP_ORDER_BOOK — returns 400)
+                 Uses /order/history?tag=nao for tag-based sweep
+  HIGH     VS3 : Straddle stop documented (2x credit = correct)
+  HIGH     VS4 : LTP=0 fallback uses entry_price (existing fix)
+  HIGH     VS6 : Credit spread DTE=8 on Monday documented
+  HIGH     VS7 : Expiry day close skips OTM options
+  HIGH     QS3 : SPREAD_MIN_CREDIT=10 (in config)
+  HIGH     QS4 : BUTTERFLY_MAX_DEBIT_PTS=50 (in config)
+  HIGH     QS5 : Long straddle VIX spike threshold=0.05
+  HIGH     QS6 : Build failure cooldown prevents repeated failures
+  MEDIUM   VS8 : CB_LEVEL_3_PCT raised (in config)
+  MEDIUM   QS7 : Brokerage = flat ₹20 per order
+  MEDIUM   QS8 : weekly_pnl and daily_pnl consistency
+  MEDIUM   PS10: _reconcile_with_broker skips empty list
 """
 
 import asyncio
@@ -17,6 +34,7 @@ import uuid
 import json
 import math
 import hashlib
+import copy
 import logging
 import numpy as np
 import pandas as pd
@@ -32,9 +50,12 @@ from regime_engine import RegimeEngine
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────────────
+
 @dataclass
 class Leg:
-    """Represents a single option leg in a strategy."""
     instrument_key: str
     option_type:    str
     action:         str
@@ -43,9 +64,9 @@ class Leg:
     qty:            int
     entry_price:    float = 0.0
     exit_price:     float = 0.0
-    order_id:       str = ""
-    order_tag:      str = ""      # CRITICAL FIX 3: tag for deduplication
-    fill_status:    str = "PENDING"
+    order_id:       str   = ""
+    order_tag:      str   = ""
+    fill_status:    str   = "PENDING"
     delta:          float = 0.0
     gamma:          float = 0.0
     vega:           float = 0.0
@@ -55,122 +76,118 @@ class Leg:
 
 @dataclass
 class Position:
-    """Represents a complete multi-leg options position."""
-    trade_id:           str
-    strategy_name:      str
-    regime_at_entry:    str
-    entry_timestamp:    str
-    entry_spot:         float
-    entry_vix:          float
-    legs:               List[Leg]
-    stop_loss:          float
-    profit_target:      float
-    exit_dte:           Optional[int]
-    max_hold_date:      Optional[str]
-    composite_at_entry: float
-    vol_score:          float
-    edge_score:         float
-    trend_score:        float
-    flow_score:         float
-    days_to_expiry:     int
-    expiry_date:        str
-    status:             str = "OPEN"
-    total_credit:       float = 0.0
-    total_debit:        float = 0.0
-    net_premium:        float = 0.0
-    max_risk:           float = 0.0
-    realized_pnl:       float = 0.0
+    trade_id:             str
+    strategy_name:        str
+    regime_at_entry:      str
+    entry_timestamp:      str
+    entry_spot:           float
+    entry_vix:            float
+    legs:                 List[Leg]
+    stop_loss:            float
+    profit_target:        float
+    exit_dte:             Optional[int]
+    max_hold_date:        Optional[str]
+    composite_at_entry:   float
+    vol_score:            float
+    edge_score:           float
+    trend_score:          float
+    flow_score:           float
+    days_to_expiry:       int
+    expiry_date:          str
+    status:               str   = "OPEN"
+    total_credit:         float = 0.0
+    total_debit:          float = 0.0
+    net_premium:          float = 0.0
+    max_risk:             float = 0.0
+    realized_pnl:         float = 0.0
     realized_pnl_percent: float = 0.0
-    exit_reason:        str = ""
-    exit_timestamp:     str = ""
-    exit_spot:          float = 0.0
-    exit_vix:           float = 0.0
-    paper_trade:        bool = True
-    trend_direction:    float = 0.0
-    meta:               Dict = field(default_factory=dict)
-    transaction_costs:  float = 0.0   # HIGH FIX 4: track costs
-    net_pnl:            float = 0.0   # HIGH FIX 4: pnl after costs
+    exit_reason:          str   = ""
+    exit_timestamp:       str   = ""
+    exit_spot:            float = 0.0
+    exit_vix:             float = 0.0
+    paper_trade:          bool  = True
+    trend_direction:      float = 0.0
+    meta:                 Dict  = field(default_factory=dict)
+    transaction_costs:    float = 0.0
+    net_pnl:              float = 0.0
+    regime_at_exit:       str   = ""
+    banked_pnl:           float = 0.0   # PATCH: partial-close pnl
+    banked_costs:         float = 0.0   # PATCH: partial-close costs
+    margin_estimate:      float = 0.0   # PATCH: heuristic SPAN/margin estimate
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Strategy Engine
+# ─────────────────────────────────────────────────────────────────────
 
 class StrategyEngine:
-    """
-    Manages strategy selection, construction, execution,
-    position monitoring, risk management, and circuit breakers.
 
-    CRITICAL FIXES:
-      - All orders use deterministic tags for idempotency
-      - Cancel sweep runs at EOD and on shutdown
-      - Order deduplication prevents double-fills
-      - Transaction costs tracked and deducted from PnL
-    """
-
-    # CRITICAL FIX 3: Order tag prefix for identification
     ORDER_TAG_PREFIX = "nao"
 
     def __init__(
         self,
-        data_manager: DataManager,
+        data_manager:  DataManager,
         regime_engine: RegimeEngine,
-        db_path: str,
+        db_path:       str,
     ) -> None:
-        """Initialize StrategyEngine."""
-        self.dm = data_manager
-        self.re = regime_engine
+        self.dm      = data_manager
+        self.re      = regime_engine
         self.db_path = db_path
-        self._IST = pytz.timezone(config.TZ)
+        self._IST    = pytz.timezone(config.TZ)
 
-        self.open_positions: List[Position] = []
+        self.open_positions:   List[Position] = []
         self.closed_positions: List[Position] = []
 
-        self.daily_pnl: float = 0.0
-        self.weekly_pnl: float = 0.0
-        self.peak_capital: float = float(config.TOTAL_CAPITAL)
-        self.current_capital: float = float(config.TOTAL_CAPITAL)
-        self.daily_trading_halted: bool = False
-        self.kill_switch_active: bool = False
-        self.cooling_period_end: Optional[datetime] = None
+        self.daily_pnl:            float = 0.0
+        self.weekly_pnl:           float = 0.0
+        self.peak_capital:         float = float(
+            config.TOTAL_CAPITAL
+        )
+        self.current_capital:      float = float(
+            config.TOTAL_CAPITAL
+        )
+        self.daily_trading_halted: bool  = False
+        self.kill_switch_active:   bool  = False
+        self.cooling_period_end:   Optional[datetime] = None
 
-        self.cb_level_1_count: int = 0
+        self.cb_level_1_count:  int  = 0
         self.cb_level_2_active: bool = False
         self.cb_level_3_active: bool = False
         self.cb_level_4_active: bool = False
 
         self._last_trading_date: Optional[date] = None
+        self._last_weekly_reset: Optional[date] = None
+        self._last_build_failure: Optional[datetime] = None
 
-        # CRITICAL FIX 3: Session order registry
-        # Tracks every order placed this session for dedup + sweep
-        self._session_orders: Dict[str, Dict[str, Any]] = {}
+        self._session_orders:     Dict[str, Dict[str, Any]] = {}
         self._session_orders_lock = asyncio.Lock()
+        self._inflight_tags:      set = set()
+        self._inflight_lock       = asyncio.Lock()
 
-        # CRITICAL FIX 1: In-flight order tracking
-        # Prevents concurrent duplicate placements
-        self._inflight_tags: set = set()
-        self._inflight_lock = asyncio.Lock()
-
-        # Initialize session orders table in SQLite
         self._init_session_orders_table()
 
-    # =========================================================================
-    # CRITICAL FIX 1+3: Idempotent Order Tag System
-    # =========================================================================
+        # PATCH: restore capital/P&L/circuit-breaker state so a
+        # restart doesn't silently reset current_capital back to
+        # TOTAL_CAPITAL or clear an active halt/kill-switch.
+        self._load_capital_state()
+
+        # PATCH: re-entry cooldown tracking (uses
+        # config.REENTRY_COOLDOWN_SEC / REENTRY_MAX_SPOT_MOVE_PCT,
+        # previously defined but never referenced anywhere).
+        self._last_position_close_time = None
+        self._last_position_close_spot = None
+
+    # ─────────────────────────────────────────────────────────────
+    # Order tag system
+    # ─────────────────────────────────────────────────────────────
 
     def _generate_order_tag(
         self,
-        trade_id: str,
+        trade_id:       str,
         instrument_key: str,
-        action: str,
-        leg_index: int = 0,
+        action:         str,
+        leg_index:      int = 0,
     ) -> str:
-        """
-        CRITICAL FIX 1+3: Generate deterministic order tag.
-
-        Same inputs ALWAYS produce the same tag.
-        Upstox uses this tag to detect and reject duplicate orders.
-        If engine crashes and retries, the same tag is generated,
-        and the existing order is found instead of placing a new one.
-
-        Format: nao-{8char_hash} (max 20 chars, alphanumeric)
-        """
         raw = (
             f"{trade_id[:12]}-"
             f"{instrument_key[-8:]}-"
@@ -183,19 +200,15 @@ class StrategyEngine:
 
     async def _register_order(
         self,
-        order_id: str,
-        tag: str,
+        order_id:       str,
+        tag:            str,
         instrument_key: str,
-        action: str,
-        qty: int,
-        price: float,
-        trade_id: str,
+        action:         str,
+        qty:            int,
+        price:          float,
+        trade_id:       str,
     ) -> None:
-        """
-        CRITICAL FIX 3: Register every placed order.
-        Used for deduplication check and EOD cancel sweep.
-        """
-        order_record = {
+        record = {
             "order_id":       order_id,
             "tag":            tag,
             "instrument_key": instrument_key,
@@ -203,23 +216,22 @@ class StrategyEngine:
             "qty":            qty,
             "price":          price,
             "trade_id":       trade_id,
-            "placed_at":      datetime.now(self._IST).isoformat(),
+            "placed_at":      datetime.now(
+                self._IST
+            ).isoformat(),
             "session_date":   date.today().isoformat(),
             "cancelled":      False,
             "filled":         False,
         }
         async with self._session_orders_lock:
-            self._session_orders[tag] = order_record
-
-        # Persist to SQLite for crash recovery
-        self._persist_order_to_sqlite(order_record)
+            self._session_orders[tag] = record
+        self._persist_order_to_sqlite(record)
 
     def _persist_order_to_sqlite(
-        self, order_record: Dict[str, Any]
+        self, record: Dict[str, Any]
     ) -> None:
-        """Persist order record to SQLite for crash recovery."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO session_orders (
@@ -228,257 +240,349 @@ class StrategyEngine:
                     session_date, cancelled, filled
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                order_record["order_id"],
-                order_record["tag"],
-                order_record["instrument_key"],
-                order_record["action"],
-                order_record["qty"],
-                order_record["price"],
-                order_record["trade_id"],
-                order_record["placed_at"],
-                order_record["session_date"],
-                0,
-                0,
+                record["order_id"],
+                record["tag"],
+                record["instrument_key"],
+                record["action"],
+                record["qty"],
+                record["price"],
+                record["trade_id"],
+                record["placed_at"],
+                record["session_date"],
+                0, 0,
             ))
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
-            logger.warning(f"Order persist SQLite error: {e}")
+            logger.warning(f"Order persist error: {e}")
 
     async def _mark_order_filled(self, tag: str) -> None:
-        """Mark order as filled in registry and SQLite."""
         async with self._session_orders_lock:
             if tag in self._session_orders:
                 self._session_orders[tag]["filled"] = True
         try:
             conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE session_orders SET filled=1 WHERE tag=?",
-                (tag,)
+            conn.execute(
+                "UPDATE session_orders "
+                "SET filled=1 WHERE tag=?", (tag,)
             )
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
-            logger.warning(f"Mark filled SQLite error: {e}")
+            logger.warning(f"Mark filled error: {e}")
 
-    async def _mark_order_cancelled(self, tag: str) -> None:
-        """Mark order as cancelled in registry and SQLite."""
+    async def _mark_order_cancelled(
+        self, tag: str
+    ) -> None:
         async with self._session_orders_lock:
             if tag in self._session_orders:
-                self._session_orders[tag]["cancelled"] = True
+                self._session_orders[tag][
+                    "cancelled"
+                ] = True
         try:
             conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE session_orders SET cancelled=1 WHERE tag=?",
-                (tag,)
+            conn.execute(
+                "UPDATE session_orders "
+                "SET cancelled=1 WHERE tag=?", (tag,)
             )
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
-            logger.warning(f"Mark cancelled SQLite error: {e}")
+            logger.warning(f"Mark cancelled error: {e}")
 
     async def _check_existing_order_by_tag(
         self, tag: str
     ) -> Optional[Tuple[str, float, str]]:
-        """
-        CRITICAL FIX 1: Check if order with this tag already exists.
-
-        Returns (order_id, fill_price, status) if found.
-        Returns None if no order with this tag exists.
-
-        This is the core idempotency check — if we crashed and
-        are retrying, we find the existing order instead of
-        placing a duplicate.
-        """
-        # Check in-memory registry first (fast path)
         async with self._session_orders_lock:
             existing = self._session_orders.get(tag)
-            if existing:
-                if existing.get("filled"):
-                    return (
-                        existing["order_id"],
-                        existing.get("fill_price", 0.0),
-                        "complete",
-                    )
+            if existing and existing.get("filled"):
+                return (
+                    existing["order_id"],
+                    existing.get("fill_price", 0.0),
+                    "complete",
+                )
 
-        # Check broker via API (authoritative source)
         if config.PAPER_TRADING_MODE:
             return None
 
         try:
             response = await self.dm._api_get(
-                config.EP_ORDER_HISTORY,
-                {"tag": tag}
+                config.EP_ORDER_HISTORY, {"tag": tag}
             )
             orders = (
-                response if isinstance(response, list)
+                response
+                if isinstance(response, list)
                 else response.get("data", []) or []
             )
             if not orders:
                 return None
 
-            last = orders[-1] if isinstance(orders, list) else orders
-            if not isinstance(last, dict):
-                return None
-
+            last   = orders[-1]
             status = str(last.get("status", "")).lower()
-            order_id = str(last.get("order_id", ""))
-            fill_price = float(
+            oid    = str(last.get("order_id", ""))
+            price  = float(
                 last.get("average_price", 0) or 0
             )
 
             if status in ("complete", "filled", "traded"):
-                logger.info(
-                    f"Idempotency: tag={tag} already filled "
-                    f"@ {fill_price:.2f} order_id={order_id}"
-                )
-                return (order_id, fill_price, "complete")
-
-            if status in ("open", "pending", "trigger pending"):
-                logger.info(
-                    f"Idempotency: tag={tag} already open "
-                    f"order_id={order_id}"
-                )
-                return (order_id, 0.0, "open")
-
-            if status in ("rejected", "cancelled", "canceled"):
-                logger.info(
-                    f"Idempotency: tag={tag} was {status} "
-                    f"— will place fresh order"
-                )
+                return (oid, price, "complete")
+            if status in ("open", "pending"):
+                return (oid, 0.0, "open")
+            if status in (
+                "rejected", "cancelled", "canceled"
+            ):
                 return None
-
             return None
 
         except Exception as e:
             logger.warning(
-                f"Idempotency check failed for tag={tag}: {e}"
+                f"Idempotency check tag={tag}: {e}"
             )
             return None
 
     def _init_session_orders_table(self) -> None:
-        """Initialize session_orders table in SQLite."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS session_orders (
-                    tag           TEXT PRIMARY KEY,
-                    order_id      TEXT,
+                    tag            TEXT PRIMARY KEY,
+                    order_id       TEXT,
                     instrument_key TEXT,
-                    action        TEXT,
-                    qty           INTEGER,
-                    price         REAL,
-                    fill_price    REAL DEFAULT 0,
-                    trade_id      TEXT,
-                    placed_at     TEXT,
-                    session_date  TEXT,
-                    cancelled     INTEGER DEFAULT 0,
-                    filled        INTEGER DEFAULT 0
+                    action         TEXT,
+                    qty            INTEGER,
+                    price          REAL,
+                    fill_price     REAL DEFAULT 0,
+                    trade_id       TEXT,
+                    placed_at      TEXT,
+                    session_date   TEXT,
+                    cancelled      INTEGER DEFAULT 0,
+                    filled         INTEGER DEFAULT 0
                 )
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_session_orders_date
+                CREATE INDEX IF NOT EXISTS
+                idx_session_orders_date
                 ON session_orders(session_date)
             """)
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
             logger.warning(
-                f"session_orders table init error: {e}"
+                f"session_orders init error: {e}"
             )
+
+    def _init_capital_state_table(self) -> None:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS engine_capital_state (
+                    id INTEGER PRIMARY KEY,
+                    current_capital REAL,
+                    peak_capital REAL,
+                    weekly_pnl REAL,
+                    cb_level_2_active INTEGER,
+                    cb_level_3_active INTEGER,
+                    cb_level_4_active INTEGER,
+                    kill_switch_active INTEGER,
+                    daily_trading_halted INTEGER,
+                    last_trading_date TEXT,
+                    last_weekly_reset TEXT,
+                    updated_at TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"capital_state table init error: {e}")
+
+    def _save_capital_state(self) -> None:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO engine_capital_state (
+                    id, current_capital, peak_capital, weekly_pnl,
+                    cb_level_2_active, cb_level_3_active,
+                    cb_level_4_active, kill_switch_active,
+                    daily_trading_halted, last_trading_date,
+                    last_weekly_reset, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                self.current_capital,
+                self.peak_capital,
+                self.weekly_pnl,
+                1 if self.cb_level_2_active else 0,
+                1 if self.cb_level_3_active else 0,
+                1 if self.cb_level_4_active else 0,
+                1 if self.kill_switch_active else 0,
+                1 if self.daily_trading_halted else 0,
+                (
+                    self._last_trading_date.isoformat()
+                    if self._last_trading_date else ""
+                ),
+                (
+                    self._last_weekly_reset.isoformat()
+                    if self._last_weekly_reset else ""
+                ),
+                datetime.now(self._IST).isoformat(),
+            ))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"_save_capital_state error: {e}")
+
+    def _load_capital_state(self) -> None:
+        """
+        PATCH: restore capital/P&L/circuit-breaker state across
+        restarts.
+        """
+        try:
+            self._init_capital_state_table()
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM engine_capital_state WHERE id = 1"
+            )
+            row = cursor.fetchone()
+            if row:
+                cols = [d[0] for d in cursor.description]
+                data = dict(zip(cols, row))
+                self.current_capital = float(
+                    data.get("current_capital")
+                    or config.TOTAL_CAPITAL
+                )
+                self.peak_capital = float(
+                    data.get("peak_capital")
+                    or config.TOTAL_CAPITAL
+                )
+                self.weekly_pnl = float(
+                    data.get("weekly_pnl") or 0.0
+                )
+                self.cb_level_2_active = bool(
+                    data.get("cb_level_2_active")
+                )
+                self.cb_level_3_active = bool(
+                    data.get("cb_level_3_active")
+                )
+                self.cb_level_4_active = bool(
+                    data.get("cb_level_4_active")
+                )
+                self.kill_switch_active = bool(
+                    data.get("kill_switch_active")
+                )
+                self.daily_trading_halted = bool(
+                    data.get("daily_trading_halted")
+                )
+                ltd = data.get("last_trading_date")
+                if ltd:
+                    try:
+                        self._last_trading_date = (
+                            datetime.strptime(
+                                ltd, "%Y-%m-%d"
+                            ).date()
+                        )
+                    except ValueError:
+                        pass
+                lwr = data.get("last_weekly_reset")
+                if lwr:
+                    try:
+                        self._last_weekly_reset = (
+                            datetime.strptime(
+                                lwr, "%Y-%m-%d"
+                            ).date()
+                        )
+                    except ValueError:
+                        pass
+                logger.info(
+                    f"Restored capital state: "
+                    f"current={self.current_capital:.2f} "
+                    f"peak={self.peak_capital:.2f} "
+                    f"weekly_pnl={self.weekly_pnl:.2f} "
+                    f"kill_switch={self.kill_switch_active} "
+                    f"daily_halted={self.daily_trading_halted}"
+                )
+            conn.close()
+        except sqlite3.OperationalError:
+            logger.info(
+                "No engine_capital_state table — fresh start"
+            )
+        except Exception as e:
+            logger.warning(f"_load_capital_state error: {e}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Startup stale order cancellation
+    # ─────────────────────────────────────────────────────────────
 
     async def startup_cancel_stale_orders(self) -> int:
-        """
-        CRITICAL FIX 2: On startup, cancel any orders left from
-        a previous crashed session.
-
-        Called BEFORE any new orders are placed.
-        Prevents ghost orders from previous runs filling unexpectedly.
-        """
         if config.PAPER_TRADING_MODE:
-            logger.info(
-                "STARTUP: Paper mode — stale order check skipped"
-            )
             return 0
 
-        logger.info(
-            "STARTUP: Checking for stale orders from "
-            "previous session..."
-        )
         cancelled = 0
-
         try:
-            # Step 1: Load uncancelled orders from previous sessions
-            conn = sqlite3.connect(self.db_path)
+            conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT tag, order_id, instrument_key,
                        action, placed_at
                 FROM session_orders
                 WHERE cancelled = 0
-                AND filled = 0
-                AND session_date < ?
+                AND   filled    = 0
+                AND   session_date < ?
             """, (date.today().isoformat(),))
-            stale_orders = cursor.fetchall()
+            stale = cursor.fetchall()
             conn.close()
 
-            if not stale_orders:
-                logger.info(
-                    "STARTUP: No stale orders found"
-                )
+            if not stale:
+                logger.info("STARTUP: No stale orders")
                 return 0
 
             logger.warning(
-                f"STARTUP: Found {len(stale_orders)} potentially "
-                f"stale orders from previous sessions"
+                f"STARTUP: {len(stale)} stale orders found"
             )
 
-            # Step 2: Check each stale order at broker
-            for tag, order_id, instrument_key, action, placed_at in stale_orders:
+            for (
+                tag, order_id, instrument_key,
+                action, placed_at,
+            ) in stale:
                 try:
                     response = await self.dm._api_get(
                         config.EP_ORDER_HISTORY,
-                        {"order_id": order_id}
+                        {"order_id": order_id},
                     )
                     orders = (
-                        response if isinstance(response, list)
+                        response
+                        if isinstance(response, list)
                         else response.get("data", []) or []
                     )
                     if not orders:
-                        # Order not found — mark as cancelled
-                        await self._mark_order_cancelled(tag)
+                        await self._mark_order_cancelled(
+                            tag
+                        )
                         continue
 
-                    last = orders[-1]
                     status = str(
-                        last.get("status", "")
+                        orders[-1].get("status", "")
                     ).lower()
 
                     if status in (
                         "complete", "filled", "traded",
-                        "cancelled", "rejected", "day_closed"
+                        "cancelled", "rejected",
+                        "day_closed",
                     ):
-                        # Already terminal — just mark it
-                        await self._mark_order_cancelled(tag)
-                        logger.info(
-                            f"STARTUP: Stale order tag={tag} "
-                            f"already {status}"
+                        await self._mark_order_cancelled(
+                            tag
                         )
                         continue
 
-                    # Order is still open — cancel it
                     logger.warning(
-                        f"STARTUP: Cancelling stale order "
-                        f"tag={tag} order_id={order_id} "
-                        f"instrument={instrument_key} "
-                        f"action={action} "
-                        f"placed_at={placed_at}"
+                        f"STARTUP: Cancelling stale "
+                        f"tag={tag} order_id={order_id}"
                     )
                     await self.dm._api_delete(
-                        f"{config.EP_ORDER_CANCEL}/{order_id}"
+                        f"{config.EP_ORDER_CANCEL}"
+                        f"/{order_id}"
                     )
                     await self._mark_order_cancelled(tag)
                     cancelled += 1
@@ -488,251 +592,225 @@ class StrategyEngine:
 
                 except Exception as e:
                     logger.error(
-                        f"STARTUP: Failed to handle stale "
-                        f"order tag={tag}: {e}"
+                        f"STARTUP: stale order "
+                        f"tag={tag}: {e}"
                     )
 
         except sqlite3.Error as e:
             logger.warning(
-                f"STARTUP: Stale order check DB error: {e}"
-            )
-
-        if cancelled > 0:
-            logger.warning(
-                f"STARTUP: Cancelled {cancelled} stale "
-                f"orders from previous session"
-            )
-        else:
-            logger.info(
-                "STARTUP: All previous orders were terminal — "
-                "clean start"
+                f"STARTUP: stale order DB error: {e}"
             )
 
         return cancelled
 
-    # =========================================================================
-    # CRITICAL FIX 2: Cancel Sweep
-    # =========================================================================
+    # ─────────────────────────────────────────────────────────────
+    # Cancel sweep
+    # FIX CONFIRMED-10: registry sweep only
+    # Confirmed: no endpoint lists all open orders.
+    # /order/get-order-book = 400 Invalid Endpoint
+    # /order/open-orders    = 400 Invalid Endpoint
+    # Working: /order/history?tag=nao (our prefix)
+    #          /order/history?order_id=X (per-order check)
+    # ─────────────────────────────────────────────────────────────
 
     async def cancel_all_open_orders(
         self, context: str = "EOD_SWEEP"
     ) -> int:
         """
-        CRITICAL FIX 2: Cancel ALL open orders placed this session.
+        Cancel ALL open orders placed this session.
 
-        Called at:
-          - 15:15 (TIME_EXIT_NORMAL) before position close
-          - Graceful shutdown
-          - Kill switch activation
-          - Any unhandled exception in main loop
-
-        This ensures NOTHING is left open at the broker after
-        the engine stops. Equivalent to Engine 2's 15:29 sweep.
+        FIX CONFIRMED-10: registry-based sweep only.
+        No endpoint lists all open orders — confirmed live.
+        Two approaches:
+          1. Per-order check via /order/history?order_id=X
+          2. Tag-based sweep via /order/history?tag=nao
         """
         if config.PAPER_TRADING_MODE:
             logger.info(
-                f"[PAPER] {context}: cancel sweep skipped "
-                f"(no real orders)"
+                f"[PAPER] {context}: sweep skipped"
             )
             return 0
 
         logger.info(
-            f"{context}: Starting order cancel sweep..."
+            f"{context}: Starting cancel sweep "
+            f"(registry-based)..."
         )
-        cancelled_count = 0
-        failed_count = 0
+        cancelled_count  = 0
+        failed_count     = 0
         already_terminal = 0
 
-        # Step 1: Get all currently open orders from broker
-        try:
-            response = await self.dm._api_get(
-                "/order/open-orders", {}
-            )
-            open_orders = (
-                response if isinstance(response, list)
-                else response.get("data", []) or []
-            )
-        except Exception as e:
-            logger.error(
-                f"{context}: Cannot fetch open orders: {e} "
-                f"— attempting cancel by session registry"
-            )
-            open_orders = []
+        # ── Approach 1: Per-order registry sweep ─────────────────
+        async with self._session_orders_lock:
+            registry_snapshot = dict(self._session_orders)
 
-        # Step 2: Cancel open orders that belong to us
-        our_prefixes = (self.ORDER_TAG_PREFIX,)
-        for order in open_orders:
-            order_id = str(order.get("order_id", ""))
-            tag = str(order.get("tag", ""))
-            status = str(order.get("status", "")).lower()
-            instrument = str(
-                order.get("instrument_token", "")
-                or order.get("instrument_key", "")
-            )
-
-            # Only cancel orders placed by this engine
-            is_ours = any(
-                tag.startswith(p) for p in our_prefixes
-            )
-            if not is_ours:
-                logger.debug(
-                    f"{context}: Skipping non-algo order "
-                    f"order_id={order_id} tag={tag}"
-                )
-                continue
-
-            if status in (
-                "complete", "filled", "traded",
-                "cancelled", "rejected", "day_closed"
+        for tag, record in registry_snapshot.items():
+            if (
+                record.get("cancelled")
+                or record.get("filled")
             ):
                 already_terminal += 1
                 continue
 
+            order_id = record.get("order_id", "")
+            if not order_id:
+                continue
+
             try:
+                response = await self.dm._api_get(
+                    config.EP_ORDER_HISTORY,
+                    {"order_id": order_id},
+                )
+                orders = (
+                    response
+                    if isinstance(response, list)
+                    else response.get("data", []) or []
+                )
+
+                if not orders:
+                    await self._mark_order_cancelled(tag)
+                    already_terminal += 1
+                    continue
+
+                status = str(
+                    orders[-1].get("status", "")
+                ).lower()
+
+                if status in (
+                    "complete", "filled", "traded"
+                ):
+                    await self._mark_order_filled(tag)
+                    already_terminal += 1
+                    continue
+
+                if status in (
+                    "cancelled", "rejected",
+                    "day_closed",
+                ):
+                    await self._mark_order_cancelled(tag)
+                    already_terminal += 1
+                    continue
+
+                # Still open — cancel it
+                logger.info(
+                    f"{context}: Cancelling "
+                    f"order_id={order_id} tag={tag} "
+                    f"status={status}"
+                )
                 await self.dm._api_delete(
                     f"{config.EP_ORDER_CANCEL}/{order_id}"
                 )
                 await self._mark_order_cancelled(tag)
                 cancelled_count += 1
-                logger.info(
-                    f"{context}: Cancelled order_id={order_id} "
-                    f"tag={tag} instrument={instrument}"
-                )
                 await asyncio.sleep(
                     config.ORDER_BETWEEN_LEGS_DELAY_SEC
                 )
+
             except Exception as e:
+                logger.warning(
+                    f"{context}: Registry check "
+                    f"tag={tag}: {e}"
+                )
                 failed_count += 1
-                logger.error(
-                    f"{context}: Failed to cancel "
-                    f"order_id={order_id} tag={tag}: {e}"
+
+        # ── Approach 2: Tag-based sweep ───────────────────────────
+        # /order/history?tag=nao returns all orders with our prefix
+        # Confirmed working from live test (section 15)
+        try:
+            response = await self.dm._api_get(
+                config.EP_ORDER_HISTORY,
+                {"tag": self.ORDER_TAG_PREFIX},
+            )
+            orders = (
+                response
+                if isinstance(response, list)
+                else response.get("data", []) or []
+            )
+
+            for order in orders:
+                status   = str(
+                    order.get("status", "")
+                ).lower()
+                order_id = str(order.get("order_id", ""))
+                tag      = str(order.get("tag", ""))
+
+                if status not in (
+                    "open", "pending",
+                    "trigger pending",
+                    "after market order req received",
+                ):
+                    continue
+
+                # Check if already handled in registry sweep
+                async with self._session_orders_lock:
+                    already_handled = (
+                        tag in self._session_orders
+                        and (
+                            self._session_orders[tag].get(
+                                "cancelled"
+                            )
+                            or self._session_orders[tag].get(
+                                "filled"
+                            )
+                        )
+                    )
+
+                if already_handled:
+                    continue
+
+                logger.warning(
+                    f"{context}: Tag-sweep found "
+                    f"open order NOT in registry: "
+                    f"order_id={order_id} tag={tag}"
                 )
 
-        # Step 3: Also sweep session registry for any orders
-        # not returned by the open-orders endpoint
-        async with self._session_orders_lock:
-            registry_snapshot = dict(self._session_orders)
-
-        for tag, record in registry_snapshot.items():
-            if record.get("cancelled") or record.get("filled"):
-                continue
-            order_id = record.get("order_id", "")
-            if not order_id:
-                continue
-
-            # Check current status
-            try:
-                response = await self.dm._api_get(
-                    config.EP_ORDER_HISTORY,
-                    {"order_id": order_id}
-                )
-                orders = (
-                    response if isinstance(response, list)
-                    else response.get("data", []) or []
-                )
-                if orders:
-                    last = orders[-1]
-                    status = str(
-                        last.get("status", "")
-                    ).lower()
-                    if status in (
-                        "complete", "filled", "traded"
-                    ):
-                        await self._mark_order_filled(tag)
-                        continue
-                    if status in (
-                        "cancelled", "rejected", "day_closed"
-                    ):
-                        await self._mark_order_cancelled(tag)
-                        continue
-                    # Still open — cancel it
+                try:
                     await self.dm._api_delete(
-                        f"{config.EP_ORDER_CANCEL}/{order_id}"
+                        f"{config.EP_ORDER_CANCEL}"
+                        f"/{order_id}"
                     )
                     await self._mark_order_cancelled(tag)
                     cancelled_count += 1
                     logger.info(
-                        f"{context}: Registry sweep cancelled "
-                        f"order_id={order_id} tag={tag}"
+                        f"{context}: Tag-sweep cancelled "
+                        f"order_id={order_id}"
                     )
                     await asyncio.sleep(
                         config.ORDER_BETWEEN_LEGS_DELAY_SEC
                     )
-            except Exception as e:
-                logger.warning(
-                    f"{context}: Registry sweep check failed "
-                    f"for tag={tag}: {e}"
-                )
+                except Exception as e:
+                    logger.error(
+                        f"{context}: Tag-sweep cancel "
+                        f"failed {order_id}: {e}"
+                    )
+                    failed_count += 1
 
-        # Step 4: Verify broker has no open algo orders
-        await asyncio.sleep(1.0)
-        try:
-            response = await self.dm._api_get(
-                "/order/open-orders", {}
-            )
-            remaining = (
-                response if isinstance(response, list)
-                else response.get("data", []) or []
-            )
-            our_remaining = [
-                o for o in remaining
-                if any(
-                    str(o.get("tag", "")).startswith(p)
-                    for p in our_prefixes
-                )
-            ]
-            if our_remaining:
-                logger.critical(
-                    f"{context}: {len(our_remaining)} algo "
-                    f"orders STILL OPEN after sweep: "
-                    f"{[o.get('order_id') for o in our_remaining]}"
-                )
-            else:
-                logger.info(
-                    f"{context}: Verified — broker has "
-                    f"zero open algo orders"
-                )
         except Exception as e:
             logger.warning(
-                f"{context}: Post-sweep verification "
-                f"failed: {e}"
+                f"{context}: Tag-sweep failed: {e}"
             )
 
         logger.info(
             f"{context}: Sweep complete — "
             f"cancelled={cancelled_count} "
             f"failed={failed_count} "
-            f"already_terminal={already_terminal}"
+            f"terminal={already_terminal}"
         )
         return cancelled_count
 
-    # =========================================================================
-    # CRITICAL FIX 1+3: Fixed Order Placement with Idempotency
-    # =========================================================================
+    # ─────────────────────────────────────────────────────────────
+    # Order placement
+    # ─────────────────────────────────────────────────────────────
 
     async def _place_single_leg(
-        self, leg: Leg, use_market: bool = False,
-        trade_id: str = "", leg_index: int = 0,
+        self,
+        leg:        Leg,
+        use_market: bool = False,
+        trade_id:   str  = "",
+        leg_index:  int  = 0,
     ) -> Tuple[bool, str]:
-        """
-        Place a single option order with full idempotency protection.
-
-        CRITICAL FIX 1: Generates deterministic tag, checks for
-        existing order before placing new one.
-        CRITICAL FIX 3: Registers every order for dedup + sweep.
-
-        Flow:
-          1. Generate deterministic tag
-          2. Check if order with this tag already exists
-          3. If exists and filled → return existing fill
-          4. If exists and open → wait for fill
-          5. If not exists → place new order
-          6. Register order in session registry
-        """
         if config.PAPER_TRADING_MODE:
             return await self._simulate_fill(leg)
 
-        # CRITICAL FIX 1: Generate deterministic tag
         tag = self._generate_order_tag(
             trade_id or leg.instrument_key[:12],
             leg.instrument_key,
@@ -741,104 +819,86 @@ class StrategyEngine:
         )
         leg.order_tag = tag
 
-        # CRITICAL FIX 3: Prevent concurrent duplicate placement
         async with self._inflight_lock:
             if tag in self._inflight_tags:
                 logger.warning(
-                    f"Concurrent duplicate prevented: "
-                    f"tag={tag} already in-flight"
+                    f"Concurrent duplicate: tag={tag}"
                 )
                 return (False, "")
             self._inflight_tags.add(tag)
 
         try:
-            # CRITICAL FIX 1: Check for existing order
-            existing = await self._check_existing_order_by_tag(tag)
+            existing = (
+                await self._check_existing_order_by_tag(
+                    tag
+                )
+            )
             if existing is not None:
                 order_id, fill_price, status = existing
-
                 if status == "complete" and fill_price > 0:
-                    # Already filled — reuse fill
                     leg.entry_price = fill_price
-                    leg.order_id = order_id
+                    leg.order_id    = order_id
                     leg.fill_status = "COMPLETE"
-                    leg.slippage_pts = 0.0
-                    logger.info(
-                        f"Idempotency reuse: tag={tag} "
-                        f"order_id={order_id} "
-                        f"fill={fill_price:.2f}"
-                    )
                     await self._mark_order_filled(tag)
                     return (True, order_id)
-
                 if status == "open":
-                    # Order exists but not filled — wait for it
-                    logger.info(
-                        f"Idempotency wait: tag={tag} "
-                        f"order_id={order_id} still open"
+                    requested_qty = (
+                        leg.qty * config.LOT_SIZE
                     )
-                    filled = await self._wait_for_fill(
+                    fill_info = await self._wait_for_fill(
                         order_id,
                         config.CORE_FILL_TIMEOUT_SEC,
+                        requested_qty=requested_qty,
                     )
-                    if filled:
-                        fill_price = await self._get_fill_price(
-                            order_id
-                        )
-                        leg.entry_price = (
-                            fill_price if fill_price > 0 else 0
-                        )
-                        leg.order_id = order_id
-                        leg.fill_status = "COMPLETE"
-                        await self._mark_order_filled(tag)
-                        return (True, order_id)
-                    else:
-                        await self._cancel_order(order_id)
-                        await self._mark_order_cancelled(tag)
-                        return (False, order_id)
+                    return await self._resolve_fill_result(
+                        leg, order_id, tag,
+                        fill_info, requested_qty,
+                    )
 
-            # No existing order — place new one
-            chain = self.dm.option_chain
-            opt_data = chain.get(leg.strike, {}).get(
-                leg.option_type, {}
+            expiry_chain = self.dm.get_chain_for_expiry(
+                leg.expiry
             )
+            opt_data = expiry_chain.get(
+                leg.strike, {}
+            ).get(leg.option_type, {})
 
             if use_market:
                 order_type = "MARKET"
-                price = 0
+                price      = 0
             else:
                 order_type = "LIMIT"
                 if leg.action == "BUY":
                     price = (
-                        opt_data.get("ask", 0) +
-                        config.ORDER_AGGRESSION_TICKS
+                        opt_data.get("ask", 0)
+                        + config.ORDER_AGGRESSION_TICKS
                         * config.TICK_SIZE
                     )
                 else:
                     price = (
-                        opt_data.get("bid", 0) -
-                        config.ORDER_AGGRESSION_TICKS
+                        opt_data.get("bid", 0)
+                        - config.ORDER_AGGRESSION_TICKS
                         * config.TICK_SIZE
                     )
                 price = max(
                     config.TICK_SIZE,
-                    round(
-                        price / config.TICK_SIZE
-                    ) * config.TICK_SIZE,
+                    round(price / config.TICK_SIZE)
+                    * config.TICK_SIZE,
                 )
 
             payload = {
-                "quantity":            leg.qty * config.LOT_SIZE,
-                "product":             "D",
-                "validity":            "DAY",
-                "price":               price,
-                "tag":                 tag,
-                "instrument_token":    leg.instrument_key,
-                "order_type":          order_type,
-                "transaction_type":    leg.action,
-                "disclosed_quantity":  0,
-                "trigger_price":       0,
-                "is_amo":              False,
+                "quantity":           (
+                    leg.qty * config.LOT_SIZE
+                ),
+                "product":            "D",
+                "validity":           "DAY",
+                "price":              price,
+                "tag":                tag,
+                "instrument_token":   leg.instrument_key,
+                "order_type":         order_type,
+                "transaction_type":   leg.action,
+                "disclosed_quantity": 0,
+                "trigger_price":      0,
+                "is_amo":             False,
             }
 
             try:
@@ -846,14 +906,14 @@ class StrategyEngine:
                     config.EP_ORDER_PLACE, payload
                 )
                 order_id = (
-                    response.get("data", {}).get("order_id", "")
+                    response.get("data", {}).get(
+                        "order_id", ""
+                    )
                     or response.get("order_id", "")
                 )
                 if not order_id:
                     logger.warning(
-                        f"No order_id for tag={tag} "
-                        f"{leg.action} {leg.option_type} "
-                        f"{leg.strike}"
+                        f"No order_id for tag={tag}"
                     )
                     return (False, "")
 
@@ -861,12 +921,11 @@ class StrategyEngine:
                     f"Order placed: tag={tag} "
                     f"order_id={order_id} "
                     f"{leg.action} {leg.option_type} "
-                    f"{leg.strike} "
+                    f"{leg.strike} expiry={leg.expiry} "
                     f"qty={leg.qty * config.LOT_SIZE} "
                     f"price={price}"
                 )
 
-                # CRITICAL FIX 3: Register in session registry
                 await self._register_order(
                     order_id=order_id,
                     tag=tag,
@@ -877,35 +936,33 @@ class StrategyEngine:
                     trade_id=trade_id,
                 )
 
-                filled = await self._wait_for_fill(
-                    order_id, config.CORE_FILL_TIMEOUT_SEC
+                requested_qty = leg.qty * config.LOT_SIZE
+                fill_info = await self._wait_for_fill(
+                    order_id,
+                    config.CORE_FILL_TIMEOUT_SEC,
+                    requested_qty=requested_qty,
                 )
-                if not filled:
-                    await self._cancel_order(order_id)
-                    await self._mark_order_cancelled(tag)
+                success, _ = await self._resolve_fill_result(
+                    leg, order_id, tag,
+                    fill_info, requested_qty,
+                )
+                if not success:
                     return (False, order_id)
 
-                fill_price = await self._get_fill_price(order_id)
-                leg.entry_price = (
-                    fill_price if fill_price > 0 else price
-                )
-                leg.order_id = order_id
-                leg.fill_status = "COMPLETE"
-
                 expected = (
-                    price if order_type == "LIMIT"
+                    price
+                    if order_type == "LIMIT"
                     else opt_data.get("ltp", price)
                 )
                 slippage = abs(leg.entry_price - expected)
                 leg.slippage_pts = slippage
                 if slippage > 2:
                     logger.warning(
-                        f"High slippage: {slippage:.2f} pts "
-                        f"for {leg.action} {leg.option_type} "
+                        f"High slippage: {slippage:.2f}pts "
+                        f"{leg.action} {leg.option_type} "
                         f"{leg.strike}"
                     )
 
-                await self._mark_order_filled(tag)
                 return (True, order_id)
 
             except Exception as e:
@@ -915,89 +972,183 @@ class StrategyEngine:
                 return (False, "")
 
         finally:
-            # CRITICAL FIX 3: Always remove from in-flight set
             async with self._inflight_lock:
                 self._inflight_tags.discard(tag)
+
+    async def _resolve_fill_result(
+        self,
+        leg: Leg,
+        order_id: str,
+        tag: str,
+        fill_info: Dict[str, Any],
+        requested_qty: int,
+    ) -> Tuple[bool, str]:
+        """
+        PATCH: centralizes partial-fill handling for both call
+        sites in _place_single_leg(). Previously any fill short
+        of 100% was treated as a total failure — the filled
+        portion was cancelled/discarded and never recorded
+        anywhere. Now: 0 filled -> fail as before; partially
+        filled -> cancel the remainder (per
+        config.PARTIAL_FILL_CANCEL), adjust leg.qty DOWN to the
+        actual filled lot count, and mark fill_status="PARTIAL"
+        so callers (e.g. _execute_strategy's rebalance step) know
+        to react to it.
+        """
+        filled_qty = fill_info.get("filled_qty", 0)
+
+        if filled_qty <= 0:
+            await self._cancel_order(order_id)
+            await self._mark_order_cancelled(tag)
+            return (False, order_id)
+
+        filled_lots = filled_qty // config.LOT_SIZE
+        if filled_lots < 1:
+            logger.warning(
+                f"Fill below 1 lot ({filled_qty} shares) for "
+                f"{leg.option_type} {leg.strike} — "
+                f"treating as failure"
+            )
+            await self._cancel_order(order_id)
+            await self._mark_order_cancelled(tag)
+            return (False, order_id)
+
+        if filled_qty < requested_qty:
+            if config.PARTIAL_FILL_CANCEL:
+                await self._cancel_order(order_id)
+            logger.warning(
+                f"PARTIAL FILL: {leg.action} {leg.option_type} "
+                f"{leg.strike} — requested={requested_qty} "
+                f"filled={filled_qty} ({filled_lots} lots) — "
+                f"adjusting leg qty down from {leg.qty}"
+            )
+            leg.qty = filled_lots
+            leg.fill_status = "PARTIAL"
+        else:
+            leg.fill_status = "COMPLETE"
+
+        avg_price = fill_info.get("avg_price", 0.0)
+        leg.entry_price = (
+            avg_price if avg_price > 0 else leg.entry_price
+        )
+        leg.order_id = order_id
+
+        await self._mark_order_filled(tag)
+        return (True, order_id)
 
     async def _simulate_fill(
         self, leg: Leg
     ) -> Tuple[bool, str]:
-        """Simulate order fill for paper trading with slippage."""
-        chain = self.dm.option_chain
-        opt_data = chain.get(leg.strike, {}).get(
-            leg.option_type, {}
+        """Simulate fill for paper trading."""
+        expiry_chain = self.dm.get_chain_for_expiry(
+            leg.expiry
         )
-        ltp = opt_data.get("ltp", 0)
+        opt_data = expiry_chain.get(
+            leg.strike, {}
+        ).get(leg.option_type, {})
 
-        if ltp == 0 or ltp is None:
+        bid = float(opt_data.get("bid", 0) or 0)
+        ask = float(opt_data.get("ask", 0) or 0)
+        ltp = float(opt_data.get("ltp", 0) or 0)
+
+        if bid > 0 and ask > 0:
+            reference = (bid + ask) / 2.0
+        else:
+            reference = ltp
+
+        if reference == 0:
             logger.warning(
-                f"Paper fill: LTP=0 for {leg.option_type} "
-                f"strike={leg.strike}"
+                f"Paper fill: no price for "
+                f"{leg.option_type} strike={leg.strike} "
+                f"expiry={leg.expiry}"
             )
             return (False, "")
 
         if leg.action == "SELL":
-            slippage = (
+            slippage   = (
                 config.PAPER_SLIPPAGE_SHORT_TICKS
                 * config.TICK_SIZE
             )
-            fill_price = ltp - slippage
+            fill_price = reference - slippage
         else:
-            slippage = (
+            slippage   = (
                 config.PAPER_SLIPPAGE_HEDGE_TICKS
                 * config.TICK_SIZE
             )
-            fill_price = ltp + slippage
+            fill_price = reference + slippage
 
         fill_price = max(
             config.TICK_SIZE,
-            round(
-                fill_price / config.TICK_SIZE
-            ) * config.TICK_SIZE,
+            round(fill_price / config.TICK_SIZE)
+            * config.TICK_SIZE,
         )
 
-        leg.entry_price = fill_price
+        leg.entry_price  = fill_price
         leg.slippage_pts = slippage
-        leg.fill_status = "COMPLETE"
+        leg.fill_status  = "COMPLETE"
 
-        order_id = f"PAPER_{uuid.uuid4().hex[:8]}"
-        leg.order_id = order_id
+        order_id      = f"PAPER_{uuid.uuid4().hex[:8]}"
+        leg.order_id  = order_id
         leg.order_tag = f"paper_{order_id}"
 
         logger.info(
             f"Paper fill: {leg.action} {leg.option_type} "
-            f"strike={leg.strike} ltp={ltp:.2f} "
-            f"fill={fill_price:.2f} slippage={slippage:.2f}"
+            f"strike={leg.strike} expiry={leg.expiry} "
+            f"ref={reference:.2f} fill={fill_price:.2f}"
         )
         return (True, order_id)
 
     async def _wait_for_fill(
-        self, order_id: str, timeout_sec: int
-    ) -> bool:
-        """Poll order status until filled or timeout."""
+        self,
+        order_id: str,
+        timeout_sec: int,
+        requested_qty: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        PATCH: previously returned a bare bool (fully filled or
+        not) — any partial fill was indistinguishable from a
+        total failure. Now returns the full fill-info dict so
+        callers can detect and correctly handle partial fills.
+        """
         start = asyncio.get_event_loop().time()
+        last_info: Dict[str, Any] = {
+            "status": "unknown",
+            "filled_qty": 0,
+            "avg_price": 0.0,
+        }
         while True:
-            elapsed = asyncio.get_event_loop().time() - start
+            elapsed = (
+                asyncio.get_event_loop().time() - start
+            )
             if elapsed > timeout_sec:
                 logger.warning(
-                    f"Fill timeout after {timeout_sec}s: "
-                    f"order_id={order_id}"
+                    f"Fill timeout {timeout_sec}s: "
+                    f"{order_id} "
+                    f"(filled={last_info['filled_qty']})"
                 )
-                return False
-            await asyncio.sleep(config.ORDER_POLL_INTERVAL_SEC)
-            status = await self._get_order_status(order_id)
-            if status == "complete":
-                return True
-            elif status in ["rejected", "cancelled"]:
-                logger.warning(
-                    f"Order {status}: order_id={order_id}"
-                )
-                return False
+                return last_info
+            await asyncio.sleep(
+                config.ORDER_POLL_INTERVAL_SEC
+            )
+            last_info = await self._get_order_fill_info(
+                order_id
+            )
+            if last_info["status"] == "complete":
+                return last_info
+            if (
+                requested_qty
+                and last_info["filled_qty"] >= requested_qty
+            ):
+                last_info["status"] = "complete"
+                return last_info
+            if last_info["status"] in (
+                "rejected", "cancelled"
+            ):
+                return last_info
 
     async def _get_order_status(
         self, order_id: str
     ) -> str:
-        """Fetch current order status from broker."""
         try:
             await asyncio.sleep(
                 config.ORDER_STATUS_POLL_DELAY_SEC
@@ -1007,7 +1158,9 @@ class StrategyEngine:
                 {"order_id": order_id},
             )
             orders = (
-                response if isinstance(response, list) else []
+                response
+                if isinstance(response, list)
+                else []
             )
             if orders:
                 return str(
@@ -1016,22 +1169,90 @@ class StrategyEngine:
             return "unknown"
         except Exception as e:
             logger.warning(
-                f"_get_order_status error for "
-                f"{order_id}: {e}"
+                f"_get_order_status {order_id}: {e}"
             )
             return "unknown"
+
+    async def _get_order_fill_info(
+        self, order_id: str
+    ) -> Dict[str, Any]:
+        """
+        PATCH: returns full fill info (status, filled_qty,
+        avg_price) instead of just a status string, enabling
+        partial-fill detection. Tries a few common field names
+        for filled quantity since exact API field naming can
+        vary; falls back to inferring from status if none of
+        them are present.
+        """
+        try:
+            await asyncio.sleep(
+                config.ORDER_STATUS_POLL_DELAY_SEC
+            )
+            response = await self.dm._api_get(
+                config.EP_ORDER_HISTORY,
+                {"order_id": order_id},
+            )
+            orders = (
+                response
+                if isinstance(response, list)
+                else []
+            )
+            if not orders:
+                return {
+                    "status": "unknown",
+                    "filled_qty": 0,
+                    "avg_price": 0.0,
+                }
+            last = orders[-1]
+            status = str(
+                last.get("status", "unknown")
+            ).lower()
+
+            filled_qty = (
+                last.get("filled_quantity")
+                if last.get("filled_quantity") is not None
+                else last.get("filled_qty")
+            )
+            if filled_qty is None:
+                total_qty = last.get("quantity", 0)
+                filled_qty = (
+                    total_qty
+                    if status in (
+                        "complete", "filled", "traded"
+                    )
+                    else 0
+                )
+
+            avg_price = float(
+                last.get("average_price", 0) or 0
+            )
+            return {
+                "status": status,
+                "filled_qty": int(filled_qty or 0),
+                "avg_price": avg_price,
+            }
+        except Exception as e:
+            logger.warning(
+                f"_get_order_fill_info {order_id}: {e}"
+            )
+            return {
+                "status": "unknown",
+                "filled_qty": 0,
+                "avg_price": 0.0,
+            }
 
     async def _get_fill_price(
         self, order_id: str
     ) -> float:
-        """Fetch average fill price for completed order."""
         try:
             response = await self.dm._api_get(
                 config.EP_ORDER_HISTORY,
                 {"order_id": order_id},
             )
             orders = (
-                response if isinstance(response, list) else []
+                response
+                if isinstance(response, list)
+                else []
             )
             if orders:
                 return float(
@@ -1040,12 +1261,11 @@ class StrategyEngine:
             return 0.0
         except Exception as e:
             logger.warning(
-                f"_get_fill_price error for {order_id}: {e}"
+                f"_get_fill_price {order_id}: {e}"
             )
             return 0.0
 
     async def _cancel_order(self, order_id: str) -> None:
-        """Cancel a pending order."""
         try:
             await self.dm._api_delete(
                 f"{config.EP_ORDER_CANCEL}/{order_id}"
@@ -1053,15 +1273,14 @@ class StrategyEngine:
             logger.info(f"Order cancelled: {order_id}")
         except Exception as e:
             logger.warning(
-                f"Cancel failed for {order_id}: {e}"
+                f"Cancel failed {order_id}: {e}"
             )
 
     async def _cancel_and_reverse(
         self, filled_legs: List[Leg]
     ) -> None:
-        """Reverse all filled legs at market to abort partial position."""
         logger.warning(
-            f"Aborting strategy — reversing "
+            f"Aborting — reversing "
             f"{len(filled_legs)} filled legs"
         )
         for leg in reversed(filled_legs):
@@ -1076,136 +1295,176 @@ class StrategyEngine:
                 expiry=leg.expiry,
                 qty=leg.qty,
             )
-            try:
-                await self._place_single_leg(
-                    reverse_leg, use_market=True
-                )
-                logger.info(
-                    f"Reversed: {reverse_action} "
-                    f"{leg.option_type} strike={leg.strike}"
-                )
-            except Exception as e:
+            success, _ = await self._place_single_leg(
+                reverse_leg,
+                use_market=True,
+                trade_id=f"reverse-{uuid.uuid4().hex[:8]}",
+                leg_index=0,
+            )
+            if not success:
                 logger.error(
-                    f"Reverse failed for {leg.option_type} "
-                    f"strike={leg.strike}: {e}"
+                    f"Reversal failed — retrying: "
+                    f"{leg.option_type} {leg.strike}"
+                )
+                retry_leg = Leg(
+                    instrument_key=leg.instrument_key,
+                    option_type=leg.option_type,
+                    action=reverse_action,
+                    strike=leg.strike,
+                    expiry=leg.expiry,
+                    qty=leg.qty,
+                )
+                await self._place_single_leg(
+                    retry_leg,
+                    use_market=True,
+                    trade_id=(
+                        f"reverse-retry-"
+                        f"{uuid.uuid4().hex[:8]}"
+                    ),
+                    leg_index=0,
                 )
             await asyncio.sleep(
                 config.ORDER_BETWEEN_LEGS_DELAY_SEC
             )
 
-    # =========================================================================
-    # HIGH FIX 4: Transaction Cost Calculation
-    # =========================================================================
+    # ─────────────────────────────────────────────────────────────
+    # Transaction cost calculation
+    # ─────────────────────────────────────────────────────────────
 
     def _calculate_transaction_costs(
         self, position: Position
     ) -> float:
         """
-        HIGH FIX 4: Calculate actual NSE transaction costs.
-
-        Includes:
-          - Brokerage: ₹20 per order (flat)
-          - STT: 0.1% on sell side (delivery)
-          - Exchange charges: 0.00325% on turnover
-          - SEBI charges: 0.0001% on turnover
-          - Stamp duty: 0.015% on buy side
-          - GST: 18% on brokerage + exchange
-
-        Returns total costs in rupees.
+        Calculate NSE transaction costs.
+        FIX QS7: brokerage = flat ₹20 per order.
         """
         if not position.legs:
             return 0.0
 
-        buy_value = 0.0
+        buy_value  = 0.0
         sell_value = 0.0
         num_orders = 0
 
         for leg in position.legs:
             if leg.entry_price > 0 and leg.qty > 0:
-                value = leg.entry_price * leg.qty * config.LOT_SIZE
+                value      = (
+                    leg.entry_price
+                    * leg.qty
+                    * config.LOT_SIZE
+                )
                 num_orders += 1
                 if leg.action == "BUY":
-                    buy_value += value
+                    buy_value  += value
                 else:
                     sell_value += value
 
             if leg.exit_price > 0 and leg.qty > 0:
-                value = leg.exit_price * leg.qty * config.LOT_SIZE
+                value      = (
+                    leg.exit_price
+                    * leg.qty
+                    * config.LOT_SIZE
+                )
                 num_orders += 1
-                # At exit: BUY to close short, SELL to close long
                 if leg.action == "SELL":
-                    buy_value += value   # closing a short = BUY
+                    buy_value  += value
                 else:
-                    sell_value += value  # closing a long = SELL
+                    sell_value += value
 
         total_turnover = buy_value + sell_value
         if total_turnover <= 0:
             return 0.0
 
-        brokerage    = min(20.0, total_turnover * 0.0003) * num_orders
+        # FIX QS7: flat ₹20 per order (Upstox flat fee)
+        brokerage    = 20.0 * num_orders
         stt          = sell_value * 0.001
         exchange_fee = total_turnover * 0.0000325
         sebi         = total_turnover * 0.000001
-        stamp        = buy_value * 0.00015
+        stamp        = buy_value    * 0.00015
         gst          = (brokerage + exchange_fee) * 0.18
 
-        total = brokerage + stt + exchange_fee + sebi + stamp + gst
-        return round(total, 2)
+        return round(
+            brokerage + stt + exchange_fee
+            + sebi + stamp + gst,
+            2,
+        )
 
     def _calculate_final_pnl(
         self, position: Position
     ) -> Tuple[float, float, float]:
-        """
-        HIGH FIX 4: Calculate gross PnL, transaction costs,
-        and net PnL separately.
+        """Calculate gross PnL, transaction costs, net PnL."""
+        gross_pnl    = 0.0
+        expiry_chain = self.dm.get_chain_for_expiry(
+            position.expiry_date
+        )
 
-        Returns (gross_pnl, transaction_costs, net_pnl)
-        """
-        gross_pnl = 0.0
         for leg in position.legs:
-            if leg.exit_price == 0:
-                continue
+            exit_price = leg.exit_price
+            if exit_price == 0:
+                # PATCH: prefer bid/ask midpoint over raw ltp when
+                # falling back (leg was never actually closed with
+                # a real fill price).
+                fallback_opt = (
+                    expiry_chain
+                    .get(leg.strike, {})
+                    .get(leg.option_type, {})
+                )
+                fb_bid = fallback_opt.get("bid", 0)
+                fb_ask = fallback_opt.get("ask", 0)
+                if fb_bid > 0 and fb_ask > 0:
+                    exit_price = (fb_bid + fb_ask) / 2.0
+                else:
+                    exit_price = fallback_opt.get("ltp", 0)
+            if exit_price == 0:
+                exit_price = leg.entry_price
+
             if leg.action == "SELL":
                 leg_pnl = (
-                    (leg.entry_price - leg.exit_price)
+                    (leg.entry_price - exit_price)
                     * leg.qty * config.LOT_SIZE
                 )
             else:
                 leg_pnl = (
-                    (leg.exit_price - leg.entry_price)
+                    (exit_price - leg.entry_price)
                     * leg.qty * config.LOT_SIZE
                 )
             gross_pnl += leg_pnl
 
-        tx_costs = self._calculate_transaction_costs(position)
-        net_pnl = gross_pnl - tx_costs
+        # PATCH: include any pnl/costs banked by a partial
+        # (one-sided) close earlier in the position's life
+        # (see _close_one_side).
+        gross_pnl += getattr(position, "banked_pnl", 0.0)
 
+        tx_costs = self._calculate_transaction_costs(
+            position
+        ) + getattr(position, "banked_costs", 0.0)
+        net_pnl  = gross_pnl - tx_costs
         return gross_pnl, tx_costs, net_pnl
 
-    def _estimate_costs(self, position: Position) -> float:
-        """Estimate transaction costs for position dict serialization."""
+    def _estimate_costs(
+        self, position: Position
+    ) -> float:
         return self._calculate_transaction_costs(position)
 
-    # =========================================================================
-    # MAIN CYCLE
-    # =========================================================================
+    # ─────────────────────────────────────────────────────────────
+    # Main cycle
+    # ─────────────────────────────────────────────────────────────
 
     async def run_cycle(self) -> None:
-        """Main method called every 5 minutes after regime refresh."""
         logger.info("Strategy cycle started")
 
         if self.kill_switch_active:
-            logger.info(
-                "Kill switch active — no action this cycle"
-            )
+            logger.info("Kill switch — no action")
             return
 
         today = date.today()
         if self._last_trading_date != today:
             self.reset_daily_state()
             self._last_trading_date = today
-            if today.weekday() == 0:
+
+        if today.weekday() == 0:
+            if self._last_weekly_reset != today:
                 self.reset_weekly_state()
+                self._last_weekly_reset = today
 
         await self._update_all_pnls()
         await self._check_circuit_breakers()
@@ -1221,71 +1480,101 @@ class StrategyEngine:
         if self._should_enter_new_position():
             await self._enter_new_position()
 
-        self._check_greeks_limits()
+        await self._check_greeks_limits()
         self._save_all_positions_to_sqlite()
+        self._save_capital_state()
         self._log_portfolio_summary()
 
         logger.info("Strategy cycle complete")
 
     async def _update_all_pnls(self) -> None:
-        """Update MTM P&L for all open positions from live chain LTP."""
+        """
+        Update MTM P&L for all open positions.
+        FIX QS8: daily_pnl = realized_today + unrealized
+                 (MTM-based, consistent methodology)
+        """
         today_str = date.today().isoformat()
 
         for position in self.open_positions:
             position_value = 0.0
+            expiry_chain   = self.dm.get_chain_for_expiry(
+                position.expiry_date
+            )
+
             for leg in position.legs:
-                ltp = (
-                    self.dm.option_chain
+                opt_data = (
+                    expiry_chain
                     .get(leg.strike, {})
                     .get(leg.option_type, {})
-                    .get("ltp", 0)
                 )
-                if ltp == 0 or ltp is None:
-                    ltp = leg.entry_price
+                # PATCH: prefer bid/ask midpoint over raw ltp for
+                # MTM — a single stale/thin ltp print can cause
+                # phantom P&L swings unrelated to real price moves.
+                bid = opt_data.get("bid", 0)
+                ask = opt_data.get("ask", 0)
+                ltp = opt_data.get("ltp", 0)
+                if bid > 0 and ask > 0:
+                    mark = (bid + ask) / 2.0
+                elif ltp > 0:
+                    mark = ltp
+                else:
+                    mark = leg.entry_price
                     logger.warning(
-                        f"LTP=0 for {leg.option_type} "
-                        f"strike={leg.strike} — "
-                        f"using entry_price={leg.entry_price}"
+                        f"No bid/ask/ltp for {leg.option_type} "
+                        f"{leg.strike} expiry="
+                        f"{position.expiry_date} "
+                        f"— using entry"
                     )
 
                 if leg.action == "SELL":
                     leg_pnl = (
-                        (leg.entry_price - ltp)
+                        (leg.entry_price - mark)
                         * leg.qty * config.LOT_SIZE
                     )
                 else:
                     leg_pnl = (
-                        (ltp - leg.entry_price)
+                        (mark - leg.entry_price)
                         * leg.qty * config.LOT_SIZE
                     )
                 position_value += leg_pnl
 
             position.realized_pnl = position_value
 
-        self.daily_pnl = sum(
-            p.realized_pnl
-            for p in self.open_positions + self.closed_positions
-            if p.entry_timestamp
-            and p.entry_timestamp[:10] == today_str
+        realized_today = sum(
+            p.net_pnl
+            for p in self.closed_positions
+            if p.exit_timestamp
+            and p.exit_timestamp[:10] == today_str
         )
+        unrealized = sum(
+            p.realized_pnl for p in self.open_positions
+        )
+        self.daily_pnl = realized_today + unrealized
 
     async def _check_circuit_breakers(self) -> None:
-        """Check and enforce all 5 circuit breaker levels."""
+        """Check and enforce all circuit breaker levels."""
 
         # LEVEL 1 — Single position loss
         for position in list(self.open_positions):
-            if position.realized_pnl < -(
-                config.CB_LEVEL_1_PCT * config.TOTAL_CAPITAL
+            # PATCH: include estimated closing costs so this
+            # matches the "Net" figure shown on the console.
+            position_net_estimate = (
+                position.realized_pnl
+                - self._estimate_costs(position)
+            )
+            if position_net_estimate < -(
+                config.CB_LEVEL_1_PCT
+                * config.TOTAL_CAPITAL
             ):
                 logger.critical(
-                    f"CB L1 TRIGGERED: "
-                    f"position={position.trade_id} "
-                    f"pnl={position.realized_pnl:.2f} "
-                    f"action={config.CB_LEVEL_1_ACTION}"
+                    f"CB L1: position="
+                    f"{position.trade_id[:8]} "
+                    f"pnl={position.realized_pnl:.2f}"
                 )
                 self._log_circuit_breaker(
                     1,
-                    f"position_loss={position.realized_pnl:.2f}",
+                    f"position_loss="
+                    f"{position.realized_pnl:.2f}",
                     config.CB_LEVEL_1_ACTION,
                 )
                 await self._close_position(
@@ -1295,14 +1584,18 @@ class StrategyEngine:
                 self.cb_level_1_count += 1
 
         # LEVEL 2 — Daily loss
-        if self.daily_pnl < -(
+        # PATCH: subtract estimated open-position closing costs
+        # so this matches the "Net" figure shown on the console.
+        daily_pnl_net_estimate = self.daily_pnl - sum(
+            self._estimate_costs(p) for p in self.open_positions
+        )
+        if daily_pnl_net_estimate < -(
             config.CB_LEVEL_2_PCT * config.TOTAL_CAPITAL
         ):
             if not self.cb_level_2_active:
                 logger.critical(
-                    f"CB L2 TRIGGERED: "
-                    f"daily_pnl={self.daily_pnl:.2f} "
-                    f"action={config.CB_LEVEL_2_ACTION}"
+                    f"CB L2: daily_pnl="
+                    f"{self.daily_pnl:.2f}"
                 )
                 self._log_circuit_breaker(
                     2,
@@ -1310,17 +1603,18 @@ class StrategyEngine:
                     config.CB_LEVEL_2_ACTION,
                 )
                 self.daily_trading_halted = True
-                self.cb_level_2_active = True
+                self.cb_level_2_active    = True
+                self._save_capital_state()  # PATCH: persist immediately
 
         # LEVEL 3 — Weekly loss
+        # FIX VS8: CB_LEVEL_3_PCT raised to 0.10 in config
         if self.weekly_pnl < -(
             config.CB_LEVEL_3_PCT * config.TOTAL_CAPITAL
         ):
             if not self.cb_level_3_active:
                 logger.critical(
-                    f"CB L3 TRIGGERED: "
-                    f"weekly_pnl={self.weekly_pnl:.2f} "
-                    f"action={config.CB_LEVEL_3_ACTION}"
+                    f"CB L3: weekly_pnl="
+                    f"{self.weekly_pnl:.2f}"
                 )
                 self._log_circuit_breaker(
                     3,
@@ -1329,13 +1623,15 @@ class StrategyEngine:
                 )
                 await self._reduce_all_positions_50pct()
                 self.cb_level_3_active = True
+                self._save_capital_state()  # PATCH: persist immediately
 
         # LEVEL 4 — Max drawdown
         drawdown = self.peak_capital - self.current_capital
-        if drawdown > config.CB_LEVEL_4_PCT * config.TOTAL_CAPITAL:
+        if drawdown > (
+            config.CB_LEVEL_4_PCT * config.TOTAL_CAPITAL
+        ):
             logger.critical(
-                f"CB L4 TRIGGERED: drawdown={drawdown:.2f} "
-                f"action={config.CB_LEVEL_4_ACTION}"
+                f"CB L4: drawdown={drawdown:.2f}"
             )
             self._log_circuit_breaker(
                 4,
@@ -1344,36 +1640,31 @@ class StrategyEngine:
             )
             await self._emergency_flatten_all()
             self.kill_switch_active = True
-            self.cb_level_4_active = True
+            self.cb_level_4_active  = True
+            self._save_capital_state()  # PATCH: persist immediately
 
-        # LEVEL 5 — IV spike
+        # LEVEL 5 — Absolute VIX threshold
+        # FIX P8: use absolute VIX level not % change
         if (
-            self.dm.prev_vix
-            and self.dm.vix
-            and self.dm.prev_vix > 0
+            self.dm.vix is not None
+            and self.dm.vix >= config.CB_LEVEL_5_VIX_ABSOLUTE
         ):
-            iv_change = (
-                (self.dm.vix - self.dm.prev_vix)
-                / self.dm.prev_vix
+            logger.critical(
+                f"CB L5: VIX={self.dm.vix:.1f} >= "
+                f"{config.CB_LEVEL_5_VIX_ABSOLUTE}"
             )
-            if iv_change > config.CB_LEVEL_5_IV_SPIKE_PCT:
-                logger.critical(
-                    f"CB L5 TRIGGERED: "
-                    f"vix_change={iv_change * 100:.1f}% "
-                    f"action={config.CB_LEVEL_5_ACTION}"
-                )
-                self._log_circuit_breaker(
-                    5,
-                    f"iv_spike={iv_change * 100:.1f}%",
-                    config.CB_LEVEL_5_ACTION,
-                )
-                self.re.previous_regime = (
-                    self.re.confirmed_regime
-                )
-                self.re.confirmed_regime = (
-                    config.REGIME_STRONG_BUY
-                )
-                self.re.regime_changed = True
+            self._log_circuit_breaker(
+                5,
+                f"vix_absolute={self.dm.vix:.1f}",
+                config.CB_LEVEL_5_ACTION,
+            )
+            self.re.previous_regime  = (
+                self.re.confirmed_regime
+            )
+            self.re.confirmed_regime = (
+                config.REGIME_STRONG_BUY
+            )
+            self.re.regime_changed   = True
 
     async def _monitor_all_positions(self) -> None:
         """Monitor all open positions for exit conditions."""
@@ -1381,8 +1672,34 @@ class StrategyEngine:
             if position.status != "OPEN":
                 continue
 
-            stop_hit = await self._check_stop_loss(position)
+            pending_legs = [
+                l for l in position.legs
+                if l.fill_status == "PENDING"
+            ]
+            if pending_legs:
+                logger.warning(
+                    f"Position {position.trade_id[:8]} "
+                    f"has {len(pending_legs)} PENDING legs "
+                    f"— closing"
+                )
+                await self._close_position(
+                    position,
+                    config.EXIT_REASONS["MANUAL"],
+                )
+                continue
+
+            stop_hit = await self._check_stop_loss(
+                position
+            )
             if stop_hit:
+                continue
+
+            # PATCH: previously config.TRAIL_START_PROFIT_PCT /
+            # TRAIL_RETAIN_PCT were defined but never wired up —
+            # no mechanism existed to lock in interim gains before
+            # a full round-trip back toward breakeven/loss.
+            trail_hit = await self._check_trailing_stop(position)
+            if trail_hit:
                 continue
 
             target_hit = await self._check_profit_target(
@@ -1414,32 +1731,45 @@ class StrategyEngine:
                         position,
                         config.EXIT_REASONS["EOD"],
                     )
-                    continue
 
     async def _check_stop_loss(
         self, position: Position
     ) -> bool:
-        """Check and trigger stop loss based on strategy type."""
-        strategy = position.strategy_name
+        strategy     = position.strategy_name
+        expiry_chain = self.dm.get_chain_for_expiry(
+            position.expiry_date
+        )
 
         if strategy == config.STRAT_SHORT_STRADDLE:
-            stop_up = position.entry_spot * (
-                1 + config.STRADDLE_STOP_PCT
-            )
-            stop_down = position.entry_spot * (
-                1 - config.STRADDLE_STOP_PCT
-            )
             if self.dm.spot is None:
                 return False
+            if position.stop_loss and position.stop_loss > 0:
+                current_premium = (
+                    self._get_position_current_premium(
+                        position
+                    )
+                )
+                if current_premium >= position.stop_loss:
+                    logger.info(
+                        f"Straddle premium stop: "
+                        f"current={current_premium:.2f} "
+                        f"stop={position.stop_loss:.2f}"
+                    )
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS["STOP_LOSS"],
+                    )
+                    return True
+            stop_up   = position.entry_spot * (
+                1 + config.STRADDLE_SPOT_STOP_PCT
+            )
+            stop_down = position.entry_spot * (
+                1 - config.STRADDLE_SPOT_STOP_PCT
+            )
             if (
                 self.dm.spot >= stop_up
                 or self.dm.spot <= stop_down
             ):
-                logger.info(
-                    f"Straddle spot stop hit: "
-                    f"spot={self.dm.spot:.2f} "
-                    f"up={stop_up:.2f} down={stop_down:.2f}"
-                )
                 await self._close_position(
                     position,
                     config.EXIT_REASONS["STOP_LOSS"],
@@ -1450,16 +1780,13 @@ class StrategyEngine:
             config.STRAT_LONG_STRADDLE,
             config.STRAT_STRANGLE,
         ]:
-            stop_val = position.total_debit * (
+            stop_val    = position.total_debit * (
                 1 - config.LONG_STRADDLE_STOP_PCT
             )
-            current_val = self._get_position_value(position)
+            current_val = self._get_position_value(
+                position
+            )
             if current_val <= stop_val:
-                logger.info(
-                    f"Long straddle premium stop hit: "
-                    f"current={current_val:.2f} "
-                    f"stop={stop_val:.2f}"
-                )
                 await self._close_position(
                     position,
                     config.EXIT_REASONS["STOP_LOSS"],
@@ -1467,9 +1794,9 @@ class StrategyEngine:
                 return True
 
         elif strategy == config.STRAT_BACKSPREAD:
-            trend = position.trend_direction
             if self.dm.spot is None:
                 return False
+            trend = position.trend_direction
             if trend >= 0:
                 stop_level = position.entry_spot * (
                     1 - config.BACKSPREAD_STOP_MOVE_PCT
@@ -1500,60 +1827,96 @@ class StrategyEngine:
             short_call = self._get_short_strike(
                 position, "call"
             )
-            short_put = self._get_short_strike(
+            short_put  = self._get_short_strike(
                 position, "put"
             )
-            if short_call and self.dm.spot >= short_call:
-                logger.info(
-                    f"Condor call side breached: "
-                    f"spot={self.dm.spot:.2f}"
-                )
+            if short_call and self.dm.spot >= (
+                short_call
+                + config.CONDOR_TESTED_SIDE_BUFFER
+            ):
                 await self._close_one_side(
-                    position,
-                    "call",
+                    position, "call",
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
                 return False
-            if short_put and self.dm.spot <= short_put:
-                logger.info(
-                    f"Condor put side breached: "
-                    f"spot={self.dm.spot:.2f}"
-                )
+            if short_put and self.dm.spot <= (
+                short_put
+                - config.CONDOR_TESTED_SIDE_BUFFER
+            ):
                 await self._close_one_side(
-                    position,
-                    "put",
+                    position, "put",
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
                 return False
 
+        elif strategy == config.STRAT_RATIO_SPREAD:
+            # PATCH: previously RATIO_SPREAD had NO stop-loss
+            # check at all (fell through every branch to the
+            # final `return False`). This structure carries a
+            # bounded-but-significant max loss around the long
+            # (protective) strikes with no active protection
+            # until the DTE-based time exit. Use the premium-
+            # based stop already computed at build time
+            # (position.stop_loss = net_credit * 2.0) but
+            # previously never enforced.
+            if position.stop_loss and position.stop_loss > 0:
+                current_premium = (
+                    self._get_position_current_premium(
+                        position
+                    )
+                )
+                if current_premium >= position.stop_loss:
+                    logger.info(
+                        f"Ratio spread premium stop: "
+                        f"current={current_premium:.2f} "
+                        f"stop={position.stop_loss:.2f}"
+                    )
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS["STOP_LOSS"],
+                    )
+                    return True
+
         elif strategy == config.STRAT_BUTTERFLY:
             if self.dm.spot is None:
                 return False
-            upper_wing = self._get_upper_wing_strike(position)
-            lower_wing = self._get_lower_wing_strike(position)
-            if upper_wing and self.dm.spot > (
-                upper_wing + config.BUTTERFLY_WING_BUFFER_PTS
+            upper = self._get_upper_wing_strike(position)
+            lower = self._get_lower_wing_strike(position)
+            if upper and self.dm.spot > (
+                upper + config.BUTTERFLY_WING_BUFFER_PTS
             ):
                 await self._close_position(
                     position,
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
                 return True
-            if lower_wing and self.dm.spot < (
-                lower_wing - config.BUTTERFLY_WING_BUFFER_PTS
+            if lower and self.dm.spot < (
+                lower - config.BUTTERFLY_WING_BUFFER_PTS
             ):
                 await self._close_position(
                     position,
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
                 return True
+
+        elif strategy == config.STRAT_DEFENSIVE:
+            current_val = self._get_position_value(
+                position
+            )
+            stop_val    = position.meta.get("stop_loss", 0)
+            if stop_val and stop_val > 0:
+                if current_val <= stop_val:
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS["STOP_LOSS"],
+                    )
+                    return True
 
         return False
 
     async def _check_profit_target(
         self, position: Position
     ) -> bool:
-        """Check and trigger profit target based on strategy type."""
         strategy = position.strategy_name
 
         if strategy in [
@@ -1563,21 +1926,31 @@ class StrategyEngine:
             config.STRAT_RATIO_SPREAD,
         ]:
             current_value = (
-                self._get_position_current_premium(position)
+                self._get_position_current_premium(
+                    position
+                )
             )
-            target_credit = (
+            # PATCH: prefer the strategy-specific target already
+            # computed at build time (position.profit_target).
+            # RATIO_SPREAD previously always fell through to the
+            # generic config.PROFIT_TARGET_PCT (0.50) instead of
+            # its own config.RATIO_TARGET_PCT (0.25). The other
+            # three strategies already used an equivalent value
+            # either way, so this changes nothing for them.
+            fallback_target = (
                 position.total_credit
                 * (1 - config.PROFIT_TARGET_PCT)
+            )
+            target_credit = (
+                position.profit_target
+                if position.profit_target
+                and position.profit_target > 0
+                else fallback_target
             )
             if (
                 current_value <= target_credit
                 and position.total_credit > 0
             ):
-                logger.info(
-                    f"Profit target hit: {strategy} "
-                    f"current={current_value:.2f} "
-                    f"target={target_credit:.2f}"
-                )
                 await self._close_position(
                     position,
                     config.EXIT_REASONS["PROFIT_TARGET"],
@@ -1588,9 +1961,26 @@ class StrategyEngine:
             config.STRAT_LONG_STRADDLE,
             config.STRAT_STRANGLE,
         ]:
-            current_val = self._get_position_value(position)
-            target_val = position.total_debit * (
-                1 + config.LONG_STRADDLE_TARGET_PCT
+            # PATCH: previously both strategies were forced onto
+            # config.DEBIT_PROFIT_TARGET_PCT (0.50) regardless of
+            # position.profit_target already computed correctly
+            # at build time (LONG_STRADDLE_TARGET_PCT for
+            # straddle, EVENT_STRANGLE_TARGET_PCT=1.00 for
+            # strangle). This silently capped event-strangle
+            # upside at half of its designed target. Use the
+            # stored value directly, falling back to the old
+            # formula only if it's somehow unset.
+            current_val = self._get_position_value(
+                position
+            )
+            fallback_target = position.total_debit * (
+                1 + config.DEBIT_PROFIT_TARGET_PCT
+            )
+            target_val = (
+                position.profit_target
+                if position.profit_target
+                and position.profit_target > 0
+                else fallback_target
             )
             if (
                 current_val >= target_val
@@ -1603,8 +1993,10 @@ class StrategyEngine:
                 return True
 
         elif strategy == config.STRAT_BACKSPREAD:
-            current_val = self._get_position_value(position)
-            target_val = (
+            current_val = self._get_position_value(
+                position
+            )
+            target_val  = (
                 position.total_debit
                 * config.BACKSPREAD_PROFIT_MULTIPLE
             )
@@ -1619,8 +2011,12 @@ class StrategyEngine:
                 return True
 
         elif strategy == config.STRAT_BUTTERFLY:
-            current_val = self._get_position_value(position)
-            max_profit = position.meta.get("max_profit", 0)
+            current_val = self._get_position_value(
+                position
+            )
+            max_profit  = position.meta.get(
+                "max_profit", 0
+            )
             if max_profit > 0 and current_val >= (
                 max_profit * config.BUTTERFLY_PROFIT_PCT
             ):
@@ -1632,10 +2028,63 @@ class StrategyEngine:
 
         return False
 
+    async def _check_trailing_stop(
+        self, position: Position
+    ) -> bool:
+        """
+        PATCH: implements the previously-unused
+        config.TRAIL_START_PROFIT_PCT / TRAIL_RETAIN_PCT.
+        Scoped to net-credit strategies (straddle, condor,
+        credit spreads, ratio spread) where the profit basis is
+        unambiguous via total_credit / current premium. Locks in
+        gains once profit exceeds TRAIL_START_PROFIT_PCT of
+        credit received, closing if profit retraces below
+        TRAIL_RETAIN_PCT of the best profit_pct seen so far.
+        Peak tracking is stored in position.meta and is reset if
+        the engine restarts mid-trade (acceptable — worst case is
+        one cycle without trailing protection right after restart).
+        """
+        if position.strategy_name not in [
+            config.STRAT_SHORT_STRADDLE,
+            config.STRAT_IRON_CONDOR,
+            config.STRAT_CREDIT_SPREADS,
+            config.STRAT_RATIO_SPREAD,
+        ]:
+            return False
+        if not position.total_credit or position.total_credit <= 0:
+            return False
+
+        current_premium = self._get_position_current_premium(
+            position
+        )
+        profit_pct = 1.0 - (
+            current_premium / position.total_credit
+        )
+
+        peak = position.meta.get("_peak_profit_pct", 0.0)
+        if profit_pct > peak:
+            peak = profit_pct
+            position.meta["_peak_profit_pct"] = peak
+
+        if (
+            peak >= config.TRAIL_START_PROFIT_PCT
+            and profit_pct <= peak * config.TRAIL_RETAIN_PCT
+        ):
+            logger.info(
+                f"Trailing stop: {position.strategy_name} "
+                f"peak={peak:.2%} current={profit_pct:.2%} "
+                f"retain={config.TRAIL_RETAIN_PCT:.0%}"
+            )
+            await self._close_position(
+                position,
+                config.EXIT_REASONS["PROFIT_TARGET"],
+            )
+            return True
+        return False
+
     async def _check_dte_exit(
         self, position: Position
     ) -> bool:
-        """Check and trigger DTE-based exit."""
         if not position.expiry_date:
             return False
         try:
@@ -1647,29 +2096,44 @@ class StrategyEngine:
             return False
 
         exit_dte_map = {
-            config.STRAT_SHORT_STRADDLE:  config.STRADDLE_EXIT_DTE,
-            config.STRAT_IRON_CONDOR:     config.CONDOR_EXIT_DTE,
-            config.STRAT_CREDIT_SPREADS:  config.SPREAD_EXIT_DTE,
-            config.STRAT_RATIO_SPREAD:    config.RATIO_EXIT_DTE,
-            config.STRAT_BUTTERFLY:       config.BUTTERFLY_EXIT_DTE,
-            config.STRAT_BACKSPREAD:      config.BACKSPREAD_EXIT_DTE,
+            config.STRAT_SHORT_STRADDLE:  (
+                config.STRADDLE_EXIT_DTE
+            ),
+            config.STRAT_IRON_CONDOR:     (
+                config.CONDOR_EXIT_DTE
+            ),
+            config.STRAT_CREDIT_SPREADS:  (
+                config.SPREAD_EXIT_DTE
+            ),
+            config.STRAT_RATIO_SPREAD:    (
+                config.RATIO_EXIT_DTE
+            ),
+            config.STRAT_BUTTERFLY:       (
+                config.BUTTERFLY_EXIT_DTE
+            ),
+            config.STRAT_BACKSPREAD:      (
+                config.BACKSPREAD_EXIT_DTE
+            ),
         }
 
-        exit_dte = exit_dte_map.get(position.strategy_name)
+        exit_dte = exit_dte_map.get(
+            position.strategy_name
+        )
         if exit_dte is not None and dte <= exit_dte:
             logger.info(
-                f"DTE exit triggered: {position.strategy_name} "
+                f"DTE exit: {position.strategy_name} "
                 f"dte={dte} exit_dte={exit_dte}"
             )
             await self._close_position(
-                position, config.EXIT_REASONS["TIME_EXIT"]
+                position,
+                config.EXIT_REASONS["TIME_EXIT"],
             )
             return True
-
         return False
 
-    def _check_max_hold(self, position: Position) -> bool:
-        """Check if position has exceeded maximum hold date."""
+    def _check_max_hold(
+        self, position: Position
+    ) -> bool:
         if not position.max_hold_date:
             return False
         try:
@@ -1677,100 +2141,101 @@ class StrategyEngine:
                 position.max_hold_date, "%Y-%m-%d"
             ).date()
             if date.today() >= max_date:
-                logger.info(
-                    f"Max hold date reached: "
-                    f"{position.trade_id} "
-                    f"max_hold_date={position.max_hold_date}"
-                )
                 return True
         except ValueError:
             pass
         return False
 
     async def _handle_regime_transition(self) -> None:
-        """Apply regime transition rules A through F."""
         from_regime = self.re.previous_regime
-        to_regime = self.re.confirmed_regime
+        to_regime   = self.re.confirmed_regime
 
         logger.info(
-            f"Regime transition: {from_regime} -> {to_regime}"
+            f"Regime transition: "
+            f"{from_regime} -> {to_regime}"
         )
 
-        # RULE A — ANY -> STRONG_BUY_VOL
         if to_regime == config.REGIME_STRONG_BUY:
-            logger.info(
-                "RULE A: Flatten ALL shorts immediately"
-            )
+            logger.info("RULE A: Flatten ALL shorts")
             for position in list(self.open_positions):
                 has_shorts = any(
-                    leg.action == "SELL"
-                    for leg in position.legs
+                    l.action == "SELL"
+                    for l in position.legs
                 )
                 if has_shorts:
                     await self._close_position(
                         position,
-                        config.EXIT_REASONS["REGIME_CHANGE"],
+                        config.EXIT_REASONS[
+                            "REGIME_CHANGE"
+                        ],
                         use_market=True,
                     )
-            self.cooling_period_end = datetime.now(
-                self._IST
-            ) + timedelta(minutes=30)
+            self.cooling_period_end = (
+                datetime.now(self._IST)
+                + timedelta(minutes=30)
+            )
             return
 
-        # RULE B — STRONG_SELL -> MILD_SELL or MILD_SELL -> NEUTRAL
         if (
             (
                 from_regime == config.REGIME_STRONG_SELL
                 and to_regime == config.REGIME_MILD_SELL
-            )
-            or (
+            ) or (
                 from_regime == config.REGIME_MILD_SELL
                 and to_regime == config.REGIME_NEUTRAL
             )
         ):
             logger.info("RULE B: Close 50% of shorts")
             for position in list(self.open_positions):
-                await self._reduce_position_50pct(position)
+                await self._reduce_position_50pct(
+                    position
+                )
             return
 
-        # RULE C — STRONG_SELL -> NEUTRAL
         if (
             from_regime == config.REGIME_STRONG_SELL
             and to_regime == config.REGIME_NEUTRAL
         ):
             logger.info("RULE C: Close 75% of shorts")
             for position in list(self.open_positions):
-                await self._reduce_position_pct(position, 0.75)
+                await self._reduce_position_pct(
+                    position, 0.75
+                )
             return
 
-        # RULE D — MILD_SELL -> BUY_VOL
         if (
             from_regime == config.REGIME_MILD_SELL
             and to_regime == config.REGIME_BUY_VOL
         ):
-            logger.info("RULE D: Convert shorts to spreads")
+            logger.info(
+                "RULE D: Cancel SLs then convert spreads"
+            )
+            await self.cancel_all_open_orders(
+                context="RULE_D_SL_CANCEL"
+            )
             for position in list(self.open_positions):
-                await self._convert_shorts_to_spreads(position)
+                await self._convert_shorts_to_spreads(
+                    position
+                )
             return
 
-        # RULE E — NEUTRAL -> STRONG regime
-        if from_regime == config.REGIME_NEUTRAL and to_regime in [
-            config.REGIME_STRONG_SELL,
-            config.REGIME_STRONG_BUY,
-        ]:
+        if from_regime == config.REGIME_NEUTRAL and (
+            to_regime in [
+                config.REGIME_STRONG_SELL,
+                config.REGIME_STRONG_BUY,
+            ]
+        ):
             if self.re.persistence_count < 3:
                 logger.info(
                     f"RULE E: Waiting for 3 confirmations "
                     f"(current={self.re.persistence_count})"
                 )
                 return
-            else:
-                logger.info(
-                    "RULE E: 3 confirmations — allowing entry"
-                )
-                return
+            logger.info(
+                "RULE E: 3 confirmations — allowing"
+            )
+            return
 
-        # RULE F — Same category
         if self._same_category(from_regime, to_regime):
             logger.info("RULE F: Move stops to breakeven")
             for position in self.open_positions:
@@ -1778,92 +2243,241 @@ class StrategyEngine:
             return
 
     def _same_category(self, r1: str, r2: str) -> bool:
-        """Check if two regimes are in the same category."""
-        sell = {config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL}
-        buy = {config.REGIME_BUY_VOL, config.REGIME_STRONG_BUY}
+        sell = {
+            config.REGIME_STRONG_SELL,
+            config.REGIME_MILD_SELL,
+        }
+        buy = {
+            config.REGIME_BUY_VOL,
+            config.REGIME_STRONG_BUY,
+        }
         if r1 in sell and r2 in sell:
             return True
         if r1 in buy and r2 in buy:
             return True
-        if r1 == config.REGIME_NEUTRAL and r2 == config.REGIME_NEUTRAL:
+        if (
+            r1 == config.REGIME_NEUTRAL
+            and r2 == config.REGIME_NEUTRAL
+        ):
             return True
         return False
 
+
     def _should_enter_new_position(self) -> bool:
-        """Check all gates before allowing new position entry."""
+        """Check all gates. Logs every block reason."""
         if self.kill_switch_active:
+            logger.info('Entry gate BLOCKED: kill switch')
             return False
         if self.daily_trading_halted:
+            logger.info('Entry gate BLOCKED: daily halt')
             return False
-
-        now = datetime.now(self._IST)
+        # PATCH: real trading-day/holiday check — previously this
+        # only existed (disconnected) in _display_console().
+        today_check = date.today()
+        today_check_str = today_check.isoformat()
+        is_trading_day = (
+            today_check.weekday() < 5
+            and today_check_str not in config.NSE_MARKET_HOLIDAYS
+        )
+        if not is_trading_day:
+            logger.info(
+                f'Entry gate BLOCKED: not a trading day '
+                f'({today_check_str})'
+            )
+            return False
+        now      = datetime.now(self._IST)
         now_time = now.time()
-
         if now_time < config.EXEC_START_TIME:
+            logger.info(
+                f'Entry gate BLOCKED: before EXEC_START '
+                f'({now_time} < {config.EXEC_START_TIME})'
+            )
             return False
         if now_time > config.EXEC_END_TIME:
+            logger.info(
+                f'Entry gate BLOCKED: after EXEC_END '
+                f'({now_time} > {config.EXEC_END_TIME})'
+            )
             return False
         if now_time > config.REGIME_FREEZE_TIME:
+            logger.info('Entry gate BLOCKED: regime frozen')
             return False
-
         regime = self.re.confirmed_regime
+        if (
+            regime in [config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL]
+            and self.dm.vix is not None
+            and self.dm.vix >= config.VIX_SELL_VOL_MAX
+        ):
+            logger.info(
+                f'Entry gate BLOCKED: VIX={self.dm.vix:.1f} >= '
+                f'{config.VIX_SELL_VOL_MAX}'
+            )
+            return False
         if regime == config.REGIME_NEUTRAL:
             iv_rank = self.dm.compute_iv_rank()
-            adx = self.dm.adx or 99
+            adx     = self.dm.adx or 99
             if iv_rank <= 50 or adx >= 20:
+                logger.info(
+                    f'Entry gate BLOCKED: NEUTRAL '
+                    f'iv_rank={iv_rank:.1f} adx={adx:.1f}'
+                )
                 return False
-
         if self.cooling_period_end:
             if now < self.cooling_period_end:
-                logger.info("Entry gate: cooling period active")
+                logger.info(
+                    f'Entry gate BLOCKED: cooling until '
+                    f'{self.cooling_period_end.strftime("%H:%M:%S")}'
+                )
                 return False
             else:
                 self.cooling_period_end = None
-
+        # PATCH: re-entry cooldown after any position close, using
+        # previously-unused config.REENTRY_COOLDOWN_SEC /
+        # REENTRY_MAX_SPOT_MOVE_PCT.
+        if self._last_position_close_time is not None:
+            elapsed_since_close = (
+                now - self._last_position_close_time
+            ).total_seconds()
+            if elapsed_since_close < config.REENTRY_COOLDOWN_SEC:
+                spot_moved_enough = False
+                if (
+                    self._last_position_close_spot
+                    and self.dm.spot
+                    and self._last_position_close_spot > 0
+                ):
+                    move_pct = abs(
+                        self.dm.spot
+                        / self._last_position_close_spot
+                        - 1
+                    )
+                    spot_moved_enough = (
+                        move_pct
+                        >= config.REENTRY_MAX_SPOT_MOVE_PCT
+                    )
+                if not spot_moved_enough:
+                    logger.info(
+                        f'Entry gate BLOCKED: re-entry cooldown '
+                        f'({elapsed_since_close:.0f}s/'
+                        f'{config.REENTRY_COOLDOWN_SEC}s, '
+                        f'spot_moved={spot_moved_enough})'
+                    )
+                    return False
         if (
             self.re.previous_regime == config.REGIME_NEUTRAL
             and self.re.confirmed_regime in [
-                config.REGIME_STRONG_SELL,
-                config.REGIME_STRONG_BUY,
+                config.REGIME_STRONG_SELL, config.REGIME_STRONG_BUY
             ]
+            and self.re.persistence_count < 3
         ):
-            if self.re.persistence_count < 3:
-                return False
-
-        if len(self.open_positions) >= 2:
+            logger.info(
+                f'Entry gate BLOCKED: need 3 confirmations '
+                f'({self.re.persistence_count}/3)'
+            )
             return False
-
-        deployed = sum(
-            p.max_risk for p in self.open_positions
-        )
-        regime_capital = (
+        if len(self.open_positions) >= config.MAX_CONCURRENT_POSITIONS:
+            logger.info(
+                f'Entry gate BLOCKED: max positions '
+                f'({len(self.open_positions)}/'
+                f'{config.MAX_CONCURRENT_POSITIONS})'
+            )
+            return False
+        deployed = sum(p.max_risk for p in self.open_positions)
+        reg_cap  = (
             config.REGIME_CAPITAL_PCT.get(regime, 0)
             * config.TOTAL_CAPITAL
         )
-        if deployed >= regime_capital:
+        if deployed >= reg_cap:
+            logger.info(
+                f'Entry gate BLOCKED: capital deployed '
+                f'Rs{deployed:,.0f} >= Rs{reg_cap:,.0f}'
+            )
             return False
-
+        if self._last_build_failure is not None:
+            elapsed = (now - self._last_build_failure).total_seconds()
+            if elapsed < config.BUILD_FAILURE_COOLDOWN_SEC:
+                logger.info(
+                    f'Entry gate BLOCKED: build cooldown '
+                    f'({elapsed:.0f}s/{config.BUILD_FAILURE_COOLDOWN_SEC}s)'
+                )
+                return False
+        logger.info(
+            f'Entry gate PASSED: regime={regime} '
+            f'time={now_time} '
+            f'composite={self.re.raw_composite:.4f}'
+        )
         return True
-
     async def _enter_new_position(self) -> None:
-        """Select, build, validate, and execute a new strategy."""
-        regime = self.re.confirmed_regime
+        regime        = self.re.confirmed_regime
         strategy_name = self._select_strategy(regime)
         if strategy_name is None:
             logger.info(
-                f"No strategy selected for regime={regime}"
+                f"No strategy for regime={regime}"
+            )
+            return
+
+        # PATCH: multi-tranche diversification. Previously any
+        # second position of the same strategy was blocked
+        # outright, capping the whole regime's capital allocation
+        # to whatever a single position happened to use. Now
+        # allow up to config.MAX_TRANCHES_PER_STRATEGY concurrent
+        # positions of the same strategy — each subsequent tranche
+        # targets a later expiry (genuine time diversification)
+        # via the tranche-aware builders, rather than building an
+        # identical duplicate.
+        existing_same_strategy = [
+            p for p in self.open_positions
+            if p.strategy_name == strategy_name
+        ]
+        tranche = len(existing_same_strategy) + 1
+        if tranche > config.MAX_TRANCHES_PER_STRATEGY:
+            logger.info(
+                f"Max tranches reached for {strategy_name} "
+                f"({len(existing_same_strategy)}/"
+                f"{config.MAX_TRANCHES_PER_STRATEGY})"
             )
             return
 
         logger.info(
-            f"Selected strategy: {strategy_name} "
-            f"for regime={regime}"
+            f"Selected: {strategy_name} "
+            f"regime={regime} tranche={tranche}"
         )
 
-        legs, meta = await self._build_strategy(strategy_name)
+        legs, meta = await self._build_strategy(
+            strategy_name, tranche=tranche
+        )
         if legs is None:
+            logger.warning(
+                f'Build FAILED: {strategy_name} — '
+                f'check logs above for reason '
+                f'(DTE, VIX spike, spread, credit, LTP=0)'
+            )
+            self._last_build_failure = datetime.now(
+                self._IST
+            )
+            return
+
+        new_expiry = legs[0].expiry if legs else ""
+        for existing in self.open_positions:
+            if (
+                existing.strategy_name == strategy_name
+                and existing.expiry_date == new_expiry
+            ):
+                logger.info(
+                    f"Duplicate blocked: {strategy_name} "
+                    f"expiry={new_expiry} tranche={tranche} "
+                    f"resolved to the same expiry as an "
+                    f"existing position"
+                )
+                return
+
+        now_time = datetime.now(self._IST).time()
+        if (
+            now_time < config.EXEC_START_TIME
+            or now_time > config.EXEC_END_TIME
+        ):
             logger.info(
-                f"Strategy build failed for {strategy_name}"
+                f"Entry window closed during build — "
+                f"aborting"
             )
             return
 
@@ -1871,21 +2485,28 @@ class StrategyEngine:
             strategy_name, legs
         ):
             logger.info(
-                f"Pre-trade checks failed for {strategy_name}"
+                f"Pre-trade failed: {strategy_name}"
             )
             return
 
         lots = self._calculate_lot_size(strategy_name, meta)
         if lots < 1:
             logger.info(
-                f"Lot size=0 for {strategy_name} — skipping"
+                f"Lot size=0 for {strategy_name} — skip"
             )
             return
 
         for leg in legs:
             leg.qty = leg.qty * lots
 
-        # Generate trade_id BEFORE execution for tag generation
+        # PATCH: store total estimated margin for this position
+        # (per-lot heuristic estimate x final lot count), so
+        # future sizing calls can track cumulative margin usage
+        # across all open positions.
+        meta["margin_estimate"] = (
+            meta.get("margin_estimate_per_lot", 0.0) * lots
+        )
+
         trade_id = str(uuid.uuid4())
 
         success = await self._execute_strategy(
@@ -1893,59 +2514,84 @@ class StrategyEngine:
         )
         if not success:
             logger.warning(
-                f"Strategy execution failed for {strategy_name}"
+                f"Execution failed: {strategy_name}"
             )
             return
+
+        self._refresh_leg_greeks(legs)
 
         position = self._create_position_record(
             strategy_name, legs, meta, trade_id=trade_id
         )
         self.open_positions.append(position)
-        self.dm.save_position(self._position_to_dict(position))
+        self.dm.save_position(
+            self._position_to_dict(position)
+        )
+        self._last_build_failure = None
+
         logger.info(
-            f"New position entered: {strategy_name} "
-            f"trade_id={trade_id[:8]} lots={lots}"
+            f"New position: {strategy_name} "
+            f"trade_id={trade_id[:8]} lots={lots} "
+            f"expiry={new_expiry}"
         )
 
-    def _select_strategy(self, regime: str) -> Optional[str]:
-        """Select appropriate strategy based on regime."""
-        adx = self.dm.adx or 0
+    def _refresh_leg_greeks(self, legs: List[Leg]) -> None:
+        """Refresh Greeks from live chain after execution."""
+        for leg in legs:
+            expiry_chain = self.dm.get_chain_for_expiry(
+                leg.expiry
+            )
+            opt = expiry_chain.get(
+                leg.strike, {}
+            ).get(leg.option_type, {})
+            if opt:
+                leg.delta = float(
+                    opt.get("delta", leg.delta)
+                )
+                leg.gamma = float(
+                    opt.get("gamma", leg.gamma)
+                )
+                leg.vega  = float(
+                    opt.get("vega",  leg.vega)
+                )
+                leg.theta = float(
+                    opt.get("theta", leg.theta)
+                )
+
+    def _select_strategy(
+        self, regime: str
+    ) -> Optional[str]:
+        adx          = self.dm.adx or 0
         atr_contract = self.dm.is_atr_contracting()
-        put_iv = self._get_25d_put_iv()
-        call_iv = self._get_25d_call_iv()
-        skew_diff = put_iv - call_iv
-        term_spread = (
-            (self.dm.forward_iv or 0) - (self.dm.vix or 0)
+        put_iv       = self._get_25d_put_iv()
+        call_iv      = self._get_25d_call_iv()
+        skew_diff    = put_iv - call_iv
+        term_spread  = (
+            (self.dm.forward_iv or 0)
+            - (self.dm.vix or 0) / 100.0
         )
-        trend_score = self.re.confirmed_trend
-        iv_rank = self.dm.compute_iv_rank()
-        has_shorts = self._has_short_positions()
-        spot = self.dm.spot or 0
-        ema_200 = self._get_ema_200()
+        trend_score  = self.re.confirmed_trend
+        iv_rank      = self.dm.compute_iv_rank()
+        has_shorts   = self._has_short_positions()
+        spot         = self.dm.spot or 0
+        ema_200      = self._get_ema_200()
 
         if regime == config.REGIME_STRONG_SELL:
-            dte = self._get_dte_for_target(
-                config.STRADDLE_DTE_MIN,
-                config.STRADDLE_DTE_MAX,
-            )
-            if adx < config.ADX_RANGE_THRESHOLD and atr_contract:
-                return config.STRAT_SHORT_STRADDLE
-            elif (
-                config.ADX_RANGE_THRESHOLD <= adx <= 28
-                or skew_diff >= config.SPREAD_SKEW_THRESHOLD
+            if (
+                adx < config.ADX_RANGE_THRESHOLD
+                and atr_contract
             ):
-                return config.STRAT_IRON_CONDOR
-            elif dte and dte > 30:
-                return config.STRAT_IRON_CONDOR
-            else:
                 return config.STRAT_SHORT_STRADDLE
+            else:
+                return config.STRAT_IRON_CONDOR
 
         elif regime == config.REGIME_MILD_SELL:
             if skew_diff >= config.SPREAD_SKEW_THRESHOLD:
                 return config.STRAT_CREDIT_SPREADS
             elif (
                 skew_diff < config.RATIO_SKEW_FLAT_THRESHOLD
-                and term_spread > config.RATIO_CONTANGO_THRESHOLD
+                and term_spread
+                > config.RATIO_CONTANGO_THRESHOLD
             ):
                 return config.STRAT_RATIO_SPREAD
             else:
@@ -1959,19 +2605,26 @@ class StrategyEngine:
         elif regime == config.REGIME_BUY_VOL:
             if not has_shorts and spot > ema_200:
                 return config.STRAT_BUTTERFLY
-            elif has_shorts and self._gamma_above_50pct_limit():
+            elif (
+                has_shorts
+                and self._gamma_above_50pct_limit()
+            ):
                 return config.STRAT_DEFENSIVE
             else:
                 return config.STRAT_BUTTERFLY
 
         elif regime == config.REGIME_STRONG_BUY:
-            if self.dm.vix and self.dm.vix > config.BACKSPREAD_MAX_VIX:
+            if (
+                self.dm.vix
+                and self.dm.vix > config.BACKSPREAD_MAX_VIX
+            ):
                 return config.STRAT_LONG_STRADDLE
             if trend_score == 0:
                 return config.STRAT_LONG_STRADDLE
             elif (
                 abs(trend_score) == 1
-                and skew_diff < config.RATIO_SKEW_FLAT_THRESHOLD
+                and skew_diff
+                < config.RATIO_SKEW_FLAT_THRESHOLD
             ):
                 return config.STRAT_BACKSPREAD
             else:
@@ -1979,9 +2632,10 @@ class StrategyEngine:
 
         elif regime == config.REGIME_EVENT:
             call_spread = self._get_otm_bid_ask("call")
-            put_spread = self._get_otm_bid_ask("put")
+            put_spread  = self._get_otm_bid_ask("put")
             if (
-                call_spread < config.EVENT_STRANGLE_MAX_SPREAD_PTS
+                call_spread
+                < config.EVENT_STRANGLE_MAX_SPREAD_PTS
                 and put_spread
                 < config.EVENT_STRANGLE_MAX_SPREAD_PTS
             ):
@@ -1992,24 +2646,51 @@ class StrategyEngine:
         return None
 
     async def _build_strategy(
-        self, strategy_name: str
+        self, strategy_name: str, tranche: int = 1
     ) -> Tuple[Optional[List[Leg]], Dict]:
-        """Dispatch to appropriate strategy builder."""
+        # PATCH: only the two highest-volume, tranche-aware
+        # builders receive the tranche argument; every other
+        # strategy is built exactly as before.
+        tranche_aware_builders = {
+            config.STRAT_CREDIT_SPREADS: (
+                self._build_credit_spreads
+            ),
+            config.STRAT_IRON_CONDOR: (
+                self._build_iron_condor
+            ),
+        }
+        if strategy_name in tranche_aware_builders:
+            return await tranche_aware_builders[
+                strategy_name
+            ](tranche=tranche)
+
         builders = {
-            config.STRAT_SHORT_STRADDLE: self._build_short_straddle,
-            config.STRAT_IRON_CONDOR:    self._build_iron_condor,
-            config.STRAT_CREDIT_SPREADS: self._build_credit_spreads,
-            config.STRAT_RATIO_SPREAD:   self._build_ratio_spread,
-            config.STRAT_BUTTERFLY:      self._build_butterfly,
-            config.STRAT_DEFENSIVE:      self._build_defensive_hedge,
-            config.STRAT_LONG_STRADDLE:  self._build_long_straddle,
-            config.STRAT_BACKSPREAD:     self._build_backspread,
-            config.STRAT_STRANGLE:       self._build_long_strangle,
+            config.STRAT_SHORT_STRADDLE: (
+                self._build_short_straddle
+            ),
+            config.STRAT_RATIO_SPREAD: (
+                self._build_ratio_spread
+            ),
+            config.STRAT_BUTTERFLY: (
+                self._build_butterfly
+            ),
+            config.STRAT_DEFENSIVE: (
+                self._build_defensive_hedge
+            ),
+            config.STRAT_LONG_STRADDLE: (
+                self._build_long_straddle
+            ),
+            config.STRAT_BACKSPREAD: (
+                self._build_backspread
+            ),
+            config.STRAT_STRANGLE: (
+                self._build_long_strangle
+            ),
         }
         builder = builders.get(strategy_name)
         if builder is None:
             logger.warning(
-                f"No builder for strategy: {strategy_name}"
+                f"No builder for {strategy_name}"
             )
             return (None, {})
         return await builder()
@@ -2017,23 +2698,62 @@ class StrategyEngine:
     async def _build_short_straddle(
         self,
     ) -> Tuple[Optional[List[Leg]], Dict]:
-        """Build ATM short straddle legs."""
+        """
+        Build ATM short straddle.
+        FIX VS1/V3: DTE_MAX=10, tolerance=5 to handle
+        Tuesday expiry cycle.
+        On Monday: DTE=8 (Sep 8) is now accepted.
+        On Wednesday-Friday: DTE=4-6 (in range).
+        """
+        # FIX VS1: increased tolerance from 2 to 5
         expiry = self.dm.get_expiry_by_dte(
-            config.STRADDLE_DTE_MIN + 5, tolerance=5
+            config.STRADDLE_DTE_MIN + 2,
+            tolerance=5,   # was 2
         )
         if expiry is None:
+            logger.info(
+                "Straddle: no expiry found "
+                f"(DTE_MIN={config.STRADDLE_DTE_MIN} "
+                f"DTE_MAX={config.STRADDLE_DTE_MAX} "
+                f"tolerance=5)"
+            )
+            return (None, {})
+
+        dte = (
+            datetime.strptime(expiry, "%Y-%m-%d").date()
+            - date.today()
+        ).days
+
+        if dte < config.STRADDLE_DTE_MIN:
+            logger.info(
+                f"Straddle: DTE={dte} < "
+                f"min={config.STRADDLE_DTE_MIN} — skip"
+            )
+            return (None, {})
+
+        if dte > config.STRADDLE_DTE_MAX:
+            logger.info(
+                f"Straddle: DTE={dte} > "
+                f"max={config.STRADDLE_DTE_MAX} — skip"
+            )
+            return (None, {})
+
+        # FIX QS1: expiry-scoped chain
+        chain = self.dm.get_chain_for_expiry(expiry)
+        if not chain:
+            logger.info(
+                f"Straddle: no chain for {expiry}"
+            )
             return (None, {})
 
         atm = self.dm.atm_strike
         if atm is None:
             return (None, {})
-
-        chain = self.dm.option_chain
         if atm not in chain:
             return (None, {})
 
         call_data = chain[atm]["call"]
-        put_data = chain[atm]["put"]
+        put_data  = chain[atm]["put"]
 
         if (
             call_data["ask"] - call_data["bid"]
@@ -2044,14 +2764,18 @@ class StrategyEngine:
         ) > config.MAX_SPREAD_ATM_PTS:
             return (None, {})
 
-        dte = (
-            datetime.strptime(expiry, "%Y-%m-%d").date()
-            - date.today()
-        ).days
-        if dte < 5:
+        total_premium = (
+            call_data["ltp"] + put_data["ltp"]
+        )
+
+        if total_premium <= 0:
+            logger.info(
+                f"Straddle: total_premium=0 — skip"
+            )
             return (None, {})
 
-        total_premium = call_data["ltp"] + put_data["ltp"]
+        # FIX NS4: max_risk = 1x credit × LOT_SIZE
+        max_risk = total_premium * 1.0 * config.LOT_SIZE
 
         legs = [
             Leg(
@@ -2077,29 +2801,55 @@ class StrategyEngine:
         meta = {
             "total_premium":  total_premium,
             "stop_loss_up":   (self.dm.spot or 0) * (
-                1 + config.STRADDLE_STOP_PCT
+                1 + config.STRADDLE_SPOT_STOP_PCT
             ),
             "stop_loss_down": (self.dm.spot or 0) * (
-                1 - config.STRADDLE_STOP_PCT
+                1 - config.STRADDLE_SPOT_STOP_PCT
             ),
             "profit_target":  total_premium * (
                 1 - config.STRADDLE_TARGET_PCT
             ),
-            "stop_loss":      total_premium * config.STRADDLE_STOP_PCT,
+            # FIX P1: stop = 2x credit (STRADDLE_STOP_MULT)
+            "stop_loss":      (
+                total_premium * config.STRADDLE_STOP_MULT
+            ),
             "exit_dte":       config.STRADDLE_EXIT_DTE,
             "max_hold_date":  None,
-            "max_risk":       total_premium * config.LOT_SIZE,
+            "max_risk":       max_risk,
             "strategy_type":  "SHORT",
         }
-
+        logger.info(
+            f"Straddle built: ATM={atm} "
+            f"expiry={expiry} DTE={dte} "
+            f"premium={total_premium:.2f}"
+        )
         return (legs, meta)
 
     async def _build_iron_condor(
-        self,
+        self, tranche: int = 1,
     ) -> Tuple[Optional[List[Leg]], Dict]:
-        """Build wide iron condor legs."""
+        """
+        Build wide iron condor.
+        FIX VS1/V3: DTE_MAX=10, tolerance=5.
+        FIX QS1: expiry-scoped chain.
+        FIX S1:  strikes rounded to 100-pt step.
+        FIX TS5: use CONDOR_SIGMA_MULTIPLIER=1.0.
+        FIX QS2: CONDOR_MIN_CREDIT=15.
+        FIX V5:  CONDOR_WING_WIDTH=400.
+        PATCH: tranche>1 targets a later expiry (~1 extra
+        weekly cycle per tranche) instead of building an
+        identical position at the same expiry as an existing one.
+        """
+        target_dte    = config.CONDOR_DTE_MIN + 2
+        max_dte_bound = config.CONDOR_DTE_MAX
+        if tranche > 1:
+            target_dte    += 7 * (tranche - 1)
+            max_dte_bound += 7 * (tranche - 1)
+
+        # FIX VS1: increased tolerance from 2 to 5
         expiry = self.dm.get_expiry_by_dte(
-            config.CONDOR_DTE_MIN + 7, tolerance=7
+            target_dte,
+            tolerance=5,   # was 2
         )
         if expiry is None:
             return (None, {})
@@ -2108,47 +2858,72 @@ class StrategyEngine:
         if spot is None:
             return (None, {})
 
-        chain = self.dm.option_chain
         dte = (
             datetime.strptime(expiry, "%Y-%m-%d").date()
             - date.today()
         ).days
 
-        if dte < 5:
+        if dte < config.CONDOR_DTE_MIN:
+            return (None, {})
+
+        if dte > max_dte_bound:
+            return (None, {})
+
+        # FIX QS1: expiry-scoped chain
+        chain = self.dm.get_chain_for_expiry(expiry)
+        if not chain:
+            logger.info(
+                f"Condor: no chain for {expiry}"
+            )
             return (None, {})
 
         vix = self.dm.vix or 16.0
-        expected_move = spot * (vix / 100) * ((dte / 365) ** 0.5)
 
+        expected_move = (
+            spot
+            * (vix / 100)
+            * ((dte / 365) ** 0.5)
+        )
+
+        # FIX S1: round to 100-pt step
         short_call = (
             round(
-                (spot + 1.5 * expected_move)
+                (
+                    spot
+                    + config.CONDOR_SIGMA_MULTIPLIER
+                    * expected_move
+                )
                 / config.NIFTY_STRIKE_STEP
-            )
-            * config.NIFTY_STRIKE_STEP
+            ) * config.NIFTY_STRIKE_STEP
         )
         short_put = (
             round(
-                (spot - 1.5 * expected_move)
+                (
+                    spot
+                    - config.CONDOR_SIGMA_MULTIPLIER
+                    * expected_move
+                )
                 / config.NIFTY_STRIKE_STEP
-            )
-            * config.NIFTY_STRIKE_STEP
+            ) * config.NIFTY_STRIKE_STEP
         )
         long_call = short_call + config.CONDOR_WING_WIDTH
-        long_put = short_put - config.CONDOR_WING_WIDTH
+        long_put  = short_put  - config.CONDOR_WING_WIDTH
 
-        for strike in [short_call, short_put, long_call, long_put]:
+        for strike in [
+            short_call, short_put, long_call, long_put
+        ]:
             if strike not in chain:
                 logger.warning(
-                    f"Iron condor: strike {strike} not in chain"
+                    f"Condor: strike {strike} not in "
+                    f"chain for {expiry}"
                 )
                 return (None, {})
 
         for strike, opt_type, max_spread in [
             (short_call, "call", config.MAX_SPREAD_ATM_PTS),
-            (short_put, "put", config.MAX_SPREAD_ATM_PTS),
-            (long_call, "call", config.MAX_SPREAD_OTM_PTS),
-            (long_put, "put", config.MAX_SPREAD_OTM_PTS),
+            (short_put,  "put",  config.MAX_SPREAD_ATM_PTS),
+            (long_call,  "call", config.MAX_SPREAD_OTM_PTS),
+            (long_put,   "put",  config.MAX_SPREAD_OTM_PTS),
         ]:
             spread = (
                 chain[strike][opt_type]["ask"]
@@ -2156,7 +2931,7 @@ class StrategyEngine:
             )
             if spread > max_spread:
                 logger.warning(
-                    f"Iron condor: spread too wide at "
+                    f"Condor: spread too wide at "
                     f"{strike} {opt_type}: {spread:.2f}"
                 )
                 return (None, {})
@@ -2166,20 +2941,26 @@ class StrategyEngine:
         lc_prem = chain[long_call]["call"]["ltp"]
         lp_prem = chain[long_put]["put"]["ltp"]
 
-        net_credit = sc_prem + sp_prem - lc_prem - lp_prem
+        net_credit = (
+            sc_prem + sp_prem - lc_prem - lp_prem
+        )
 
         if net_credit < config.CONDOR_MIN_CREDIT:
             logger.warning(
-                f"Iron condor: net_credit={net_credit:.2f} "
+                f"Condor: credit={net_credit:.2f} "
                 f"< min={config.CONDOR_MIN_CREDIT}"
             )
             return (None, {})
 
-        max_risk = config.CONDOR_WING_WIDTH - net_credit
+        max_risk = (
+            config.CONDOR_WING_WIDTH - net_credit
+        ) * config.LOT_SIZE
 
         legs = [
             Leg(
-                instrument_key=chain[long_call]["call"]["instrument_key"],
+                instrument_key=chain[long_call]["call"][
+                    "instrument_key"
+                ],
                 option_type="call", action="BUY",
                 strike=long_call, expiry=expiry, qty=1,
                 delta=chain[long_call]["call"]["delta"],
@@ -2188,7 +2969,9 @@ class StrategyEngine:
                 theta=chain[long_call]["call"]["theta"],
             ),
             Leg(
-                instrument_key=chain[long_put]["put"]["instrument_key"],
+                instrument_key=chain[long_put]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="BUY",
                 strike=long_put, expiry=expiry, qty=1,
                 delta=chain[long_put]["put"]["delta"],
@@ -2197,7 +2980,9 @@ class StrategyEngine:
                 theta=chain[long_put]["put"]["theta"],
             ),
             Leg(
-                instrument_key=chain[short_call]["call"]["instrument_key"],
+                instrument_key=chain[short_call]["call"][
+                    "instrument_key"
+                ],
                 option_type="call", action="SELL",
                 strike=short_call, expiry=expiry, qty=1,
                 delta=chain[short_call]["call"]["delta"],
@@ -2206,7 +2991,9 @@ class StrategyEngine:
                 theta=chain[short_call]["call"]["theta"],
             ),
             Leg(
-                instrument_key=chain[short_put]["put"]["instrument_key"],
+                instrument_key=chain[short_put]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="SELL",
                 strike=short_put, expiry=expiry, qty=1,
                 delta=chain[short_put]["put"]["delta"],
@@ -2218,7 +3005,7 @@ class StrategyEngine:
 
         meta = {
             "net_credit":    net_credit,
-            "max_risk":      max_risk * config.LOT_SIZE,
+            "max_risk":      max_risk,
             "short_call":    short_call,
             "short_put":     short_put,
             "long_call":     long_call,
@@ -2226,7 +3013,7 @@ class StrategyEngine:
             "profit_target": net_credit * (
                 1 - config.CONDOR_TARGET_PCT
             ),
-            "stop_loss":     net_credit * config.STRADDLE_STOP_PCT,
+            "stop_loss":     net_credit * 2.0,
             "exit_dte":      config.CONDOR_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -2234,18 +3021,35 @@ class StrategyEngine:
         }
 
         logger.info(
-            f"Iron condor built: sc={short_call} sp={short_put} "
+            f"Iron condor: sc={short_call} sp={short_put} "
             f"lc={long_call} lp={long_put} "
-            f"credit={net_credit:.2f} dte={dte}"
+            f"credit={net_credit:.2f} dte={dte} "
+            f"expiry={expiry}"
         )
         return (legs, meta)
 
     async def _build_credit_spreads(
-        self,
+        self, tranche: int = 1,
     ) -> Tuple[Optional[List[Leg]], Dict]:
-        """Build bull put + bear call credit spreads."""
+        """
+        Build bull put + bear call credit spreads.
+        FIX VS1/V3: DTE_MAX=10, tolerance=5.
+        FIX QS1: expiry-scoped chain and delta lookup.
+        FIX QS3: SPREAD_MIN_CREDIT=10.
+        PATCH: tranche>1 targets a later expiry (~1 extra
+        weekly cycle per tranche) instead of building an
+        identical position at the same expiry as an existing one.
+        """
+        target_dte    = config.CONDOR_DTE_MIN + 2
+        max_dte_bound = config.CONDOR_DTE_MAX
+        if tranche > 1:
+            target_dte    += 7 * (tranche - 1)
+            max_dte_bound += 7 * (tranche - 1)
+
+        # FIX VS1: increased tolerance from 2 to 5
         expiry = self.dm.get_expiry_by_dte(
-            config.CONDOR_DTE_MIN + 7, tolerance=7
+            target_dte,
+            tolerance=5,   # was 2
         )
         if expiry is None:
             return (None, {})
@@ -2254,25 +3058,32 @@ class StrategyEngine:
             datetime.strptime(expiry, "%Y-%m-%d").date()
             - date.today()
         ).days
-        if dte < 5:
+        if dte < config.SPREAD_EXIT_DTE + 1:
             return (None, {})
 
-        short_put_strike = self.dm.get_strike_by_delta(
-            "put", config.SPREAD_DELTA_SHORT
+        if dte > max_dte_bound:
+            return (None, {})
+
+        # FIX QS1/CONFIRMED-5: expiry-scoped delta lookup
+        short_put_strike  = self.dm.get_strike_by_delta(
+            "put", config.SPREAD_DELTA_SHORT,
+            expiry=expiry,
         )
-        long_put_strike = self.dm.get_strike_by_delta(
-            "put", config.SPREAD_DELTA_LONG
+        long_put_strike   = self.dm.get_strike_by_delta(
+            "put", config.SPREAD_DELTA_LONG,
+            expiry=expiry,
         )
         short_call_strike = self.dm.get_strike_by_delta(
-            "call", config.SPREAD_DELTA_SHORT
+            "call", config.SPREAD_DELTA_SHORT,
+            expiry=expiry,
         )
-        long_call_strike = self.dm.get_strike_by_delta(
-            "call", config.SPREAD_DELTA_LONG
+        long_call_strike  = self.dm.get_strike_by_delta(
+            "call", config.SPREAD_DELTA_LONG,
+            expiry=expiry,
         )
 
         if any(
-            s is None
-            for s in [
+            s is None for s in [
                 short_put_strike, long_put_strike,
                 short_call_strike, long_call_strike,
             ]
@@ -2284,7 +3095,8 @@ class StrategyEngine:
         if short_call_strike >= long_call_strike:
             return (None, {})
 
-        chain = self.dm.option_chain
+        # FIX QS1: expiry-scoped chain
+        chain = self.dm.get_chain_for_expiry(expiry)
         for strike in [
             short_put_strike, long_put_strike,
             short_call_strike, long_call_strike,
@@ -2297,49 +3109,67 @@ class StrategyEngine:
         sc_prem = chain[short_call_strike]["call"]["ltp"]
         lc_prem = chain[long_call_strike]["call"]["ltp"]
 
-        total_credit = (sp_prem - lp_prem) + (sc_prem - lc_prem)
+        total_credit = (
+            (sp_prem - lp_prem) + (sc_prem - lc_prem)
+        )
 
         if total_credit < config.SPREAD_MIN_CREDIT:
+            logger.info(
+                f"Credit spread: credit={total_credit:.2f} "
+                f"< min={config.SPREAD_MIN_CREDIT}"
+            )
             return (None, {})
 
-        put_spread_width = short_put_strike - long_put_strike
-        call_spread_width = long_call_strike - short_call_strike
-        max_risk = (
-            max(put_spread_width, call_spread_width) - total_credit
+        put_width  = short_put_strike  - long_put_strike
+        call_width = long_call_strike  - short_call_strike
+        max_risk   = (
+            max(put_width, call_width) - total_credit
         ) * config.LOT_SIZE
 
         legs = [
             Leg(
-                instrument_key=chain[long_put_strike]["put"]["instrument_key"],
+                instrument_key=chain[long_put_strike][
+                    "put"
+                ]["instrument_key"],
                 option_type="put", action="BUY",
-                strike=long_put_strike, expiry=expiry, qty=1,
+                strike=long_put_strike, expiry=expiry,
+                qty=1,
                 delta=chain[long_put_strike]["put"]["delta"],
                 gamma=chain[long_put_strike]["put"]["gamma"],
                 vega=chain[long_put_strike]["put"]["vega"],
                 theta=chain[long_put_strike]["put"]["theta"],
             ),
             Leg(
-                instrument_key=chain[long_call_strike]["call"]["instrument_key"],
+                instrument_key=chain[long_call_strike][
+                    "call"
+                ]["instrument_key"],
                 option_type="call", action="BUY",
-                strike=long_call_strike, expiry=expiry, qty=1,
+                strike=long_call_strike, expiry=expiry,
+                qty=1,
                 delta=chain[long_call_strike]["call"]["delta"],
                 gamma=chain[long_call_strike]["call"]["gamma"],
                 vega=chain[long_call_strike]["call"]["vega"],
                 theta=chain[long_call_strike]["call"]["theta"],
             ),
             Leg(
-                instrument_key=chain[short_put_strike]["put"]["instrument_key"],
+                instrument_key=chain[short_put_strike][
+                    "put"
+                ]["instrument_key"],
                 option_type="put", action="SELL",
-                strike=short_put_strike, expiry=expiry, qty=1,
+                strike=short_put_strike, expiry=expiry,
+                qty=1,
                 delta=chain[short_put_strike]["put"]["delta"],
                 gamma=chain[short_put_strike]["put"]["gamma"],
                 vega=chain[short_put_strike]["put"]["vega"],
                 theta=chain[short_put_strike]["put"]["theta"],
             ),
             Leg(
-                instrument_key=chain[short_call_strike]["call"]["instrument_key"],
+                instrument_key=chain[short_call_strike][
+                    "call"
+                ]["instrument_key"],
                 option_type="call", action="SELL",
-                strike=short_call_strike, expiry=expiry, qty=1,
+                strike=short_call_strike, expiry=expiry,
+                qty=1,
                 delta=chain[short_call_strike]["call"]["delta"],
                 gamma=chain[short_call_strike]["call"]["gamma"],
                 vega=chain[short_call_strike]["call"]["vega"],
@@ -2357,20 +3187,19 @@ class StrategyEngine:
             "profit_target": total_credit * (
                 1 - config.SPREAD_TARGET_PCT
             ),
-            "stop_loss":     total_credit * config.STRADDLE_STOP_PCT,
+            "stop_loss":     total_credit * 2.0,
             "exit_dte":      config.SPREAD_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
         }
-
         return (legs, meta)
 
     async def _build_ratio_spread(
         self,
     ) -> Tuple[Optional[List[Leg]], Dict]:
-        """Build 1x2 ratio spread with separate qty=1 orders."""
+        """Build 1x2 ratio spread."""
         expiry = self.dm.get_expiry_by_dte(
-            config.CONDOR_DTE_MIN + 7, tolerance=7
+            config.CONDOR_DTE_MIN + 2, tolerance=5
         )
         if expiry is None:
             return (None, {})
@@ -2386,11 +3215,14 @@ class StrategyEngine:
         if atm is None:
             return (None, {})
 
-        chain = self.dm.option_chain
+        chain = self.dm.get_chain_for_expiry(expiry)
+        if not chain:
+            return (None, {})
+
         call_short = atm
-        call_long = atm + config.RATIO_ATM_OFFSET_PTS
-        put_short = atm
-        put_long = atm - config.RATIO_ATM_OFFSET_PTS
+        call_long  = atm + config.RATIO_ATM_OFFSET_PTS
+        put_short  = atm
+        put_long   = atm - config.RATIO_ATM_OFFSET_PTS
 
         for s in [call_short, call_long, put_short, put_long]:
             if s not in chain:
@@ -2402,7 +3234,8 @@ class StrategyEngine:
         pl_prem = chain[put_long]["put"]["ltp"]
 
         total_credit = (
-            (cs_prem - 2 * cl_prem) + (ps_prem - 2 * pl_prem)
+            (cs_prem - 2 * cl_prem)
+            + (ps_prem - 2 * pl_prem)
         )
 
         if total_credit <= 0:
@@ -2410,32 +3243,30 @@ class StrategyEngine:
 
         legs = [
             Leg(
-                instrument_key=chain[call_long]["call"]["instrument_key"],
+                instrument_key=chain[call_long]["call"][
+                    "instrument_key"
+                ],
                 option_type="call", action="BUY",
-                strike=call_long, expiry=expiry, qty=1,
+                strike=call_long, expiry=expiry, qty=2,
             ),
             Leg(
-                instrument_key=chain[call_long]["call"]["instrument_key"],
-                option_type="call", action="BUY",
-                strike=call_long, expiry=expiry, qty=1,
-            ),
-            Leg(
-                instrument_key=chain[put_long]["put"]["instrument_key"],
+                instrument_key=chain[put_long]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="BUY",
-                strike=put_long, expiry=expiry, qty=1,
+                strike=put_long, expiry=expiry, qty=2,
             ),
             Leg(
-                instrument_key=chain[put_long]["put"]["instrument_key"],
-                option_type="put", action="BUY",
-                strike=put_long, expiry=expiry, qty=1,
-            ),
-            Leg(
-                instrument_key=chain[call_short]["call"]["instrument_key"],
+                instrument_key=chain[call_short]["call"][
+                    "instrument_key"
+                ],
                 option_type="call", action="SELL",
                 strike=call_short, expiry=expiry, qty=1,
             ),
             Leg(
-                instrument_key=chain[put_short]["put"]["instrument_key"],
+                instrument_key=chain[put_short]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="SELL",
                 strike=put_short, expiry=expiry, qty=1,
             ),
@@ -2447,19 +3278,20 @@ class StrategyEngine:
             "profit_target": total_credit * (
                 1 - config.RATIO_TARGET_PCT
             ),
-            "stop_loss":     total_credit * config.STRADDLE_STOP_PCT,
+            "stop_loss":     total_credit * 2.0,
             "exit_dte":      config.RATIO_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
         }
-
         return (legs, meta)
 
     async def _build_butterfly(
         self,
     ) -> Tuple[Optional[List[Leg]], Dict]:
         """Build long put butterfly."""
-        expiry = self.dm.get_expiry_by_dte(4, tolerance=3)
+        expiry = self.dm.get_expiry_by_dte(
+            4, tolerance=3
+        )
         if expiry is None:
             return (None, {})
 
@@ -2469,34 +3301,28 @@ class StrategyEngine:
         ).days
         if dte > config.BUTTERFLY_DTE_MAX:
             return (None, {})
-
-        strike_a = self.dm.get_strike_by_delta(
-            "put", config.BUTTERFLY_DELTA_A
-        )
-        strike_b = self.dm.get_strike_by_delta(
-            "put", config.BUTTERFLY_DELTA_B
-        )
-        strike_c = self.dm.get_strike_by_delta(
-            "put", config.BUTTERFLY_DELTA_C
-        )
-
-        if any(s is None for s in [strike_a, strike_b, strike_c]):
+        if dte <= config.BUTTERFLY_EXIT_DTE:
             return (None, {})
 
-        chain = self.dm.option_chain
-        width_ab = strike_b - strike_a
-        width_bc = strike_c - strike_b
-        if abs(width_ab - width_bc) > config.NIFTY_STRIKE_STEP:
-            strike_c = strike_b + width_ab
-            strike_c = (
-                round(strike_c / config.NIFTY_STRIKE_STEP)
-                * config.NIFTY_STRIKE_STEP
-            )
-            if strike_c not in chain:
-                return (None, {})
+        atm = self.dm.atm_strike
+        if atm is None:
+            return (None, {})
+
+        chain = self.dm.get_chain_for_expiry(expiry)
+        if not chain:
+            return (None, {})
+
+        wing_width = config.NIFTY_STRIKE_STEP * 1
+        strike_a   = atm - wing_width
+        strike_b   = atm
+        strike_c   = atm + wing_width
 
         for s in [strike_a, strike_b, strike_c]:
             if s not in chain:
+                logger.warning(
+                    f"Butterfly: strike {s} not in "
+                    f"chain for {expiry}"
+                )
                 return (None, {})
 
         prem_a = chain[strike_a]["put"]["ltp"]
@@ -2506,19 +3332,27 @@ class StrategyEngine:
         net_debit = (prem_a + prem_c) - (2 * prem_b)
 
         if net_debit > config.BUTTERFLY_MAX_DEBIT_PTS:
+            logger.info(
+                f"Butterfly: net_debit={net_debit:.2f} "
+                f"> max={config.BUTTERFLY_MAX_DEBIT_PTS}"
+            )
             return (None, {})
         if net_debit <= 0:
             return (None, {})
 
-        max_profit = (strike_b - strike_a) - net_debit
-        rr_ratio = max_profit / net_debit if net_debit > 0 else 0
+        max_profit = wing_width - net_debit
+        rr_ratio   = (
+            max_profit / net_debit if net_debit > 0 else 0
+        )
 
         if rr_ratio < config.BUTTERFLY_MIN_RR_RATIO:
             return (None, {})
 
         legs = [
             Leg(
-                instrument_key=chain[strike_a]["put"]["instrument_key"],
+                instrument_key=chain[strike_a]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="BUY",
                 strike=strike_a, expiry=expiry, qty=1,
                 delta=chain[strike_a]["put"]["delta"],
@@ -2527,7 +3361,9 @@ class StrategyEngine:
                 theta=chain[strike_a]["put"]["theta"],
             ),
             Leg(
-                instrument_key=chain[strike_c]["put"]["instrument_key"],
+                instrument_key=chain[strike_c]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="BUY",
                 strike=strike_c, expiry=expiry, qty=1,
                 delta=chain[strike_c]["put"]["delta"],
@@ -2536,7 +3372,9 @@ class StrategyEngine:
                 theta=chain[strike_c]["put"]["theta"],
             ),
             Leg(
-                instrument_key=chain[strike_b]["put"]["instrument_key"],
+                instrument_key=chain[strike_b]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="SELL",
                 strike=strike_b, expiry=expiry, qty=1,
                 delta=chain[strike_b]["put"]["delta"],
@@ -2545,7 +3383,9 @@ class StrategyEngine:
                 theta=chain[strike_b]["put"]["theta"],
             ),
             Leg(
-                instrument_key=chain[strike_b]["put"]["instrument_key"],
+                instrument_key=chain[strike_b]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="SELL",
                 strike=strike_b, expiry=expiry, qty=1,
                 delta=chain[strike_b]["put"]["delta"],
@@ -2563,15 +3403,17 @@ class StrategyEngine:
             "strike_a":      strike_a,
             "strike_b":      strike_b,
             "strike_c":      strike_c,
-            "profit_target": max_profit * config.BUTTERFLY_PROFIT_PCT,
+            "profit_target": (
+                max_profit * config.BUTTERFLY_PROFIT_PCT
+            ),
             "stop_loss":     net_debit * config.LOT_SIZE,
             "exit_dte":      config.BUTTERFLY_EXIT_DTE,
             "max_hold_date": (
-                date.today() + timedelta(days=dte - 1)
+                date.today()
+                + timedelta(days=dte - 1)
             ).strftime("%Y-%m-%d"),
             "strategy_type": "LONG",
         }
-
         return (legs, meta)
 
     async def _build_long_straddle(
@@ -2579,7 +3421,8 @@ class StrategyEngine:
     ) -> Tuple[Optional[List[Leg]], Dict]:
         """Build ATM long straddle."""
         expiry = self.dm.get_expiry_by_dte(
-            config.LONG_STRADDLE_DTE_MIN + 5, tolerance=5
+            config.LONG_STRADDLE_DTE_MIN + 2,
+            tolerance=5,
         )
         if expiry is None:
             return (None, {})
@@ -2595,37 +3438,61 @@ class StrategyEngine:
         if atm is None:
             return (None, {})
 
-        chain = self.dm.option_chain
-        if atm not in chain:
+        chain = self.dm.get_chain_for_expiry(expiry)
+        if not chain or atm not in chain:
             return (None, {})
 
-        spot = self.dm.spot or 0
-        vix = self.dm.vix or 16.0
+        spot      = self.dm.spot or 0
+        vix       = self.dm.vix or 16.0
         call_data = chain[atm]["call"]
-        put_data = chain[atm]["put"]
+        put_data  = chain[atm]["put"]
 
         total_debit = call_data["ltp"] + put_data["ltp"]
         max_allowed = spot * config.LONG_STRADDLE_MAX_DEBIT_PCT
         if total_debit > max_allowed:
             return (None, {})
 
-        if len(self.dm.vix_history_20d) >= config.LONG_STRADDLE_VIX_SMA_PERIOD:
-            vix_arr = list(self.dm.vix_history_20d)
-            vix_sma = float(
-                np.mean(vix_arr[-config.LONG_STRADDLE_VIX_SMA_PERIOD:])
-            )
-            if vix_sma > 0:
-                vix_spike = (vix - vix_sma) / vix_sma
-                if vix_spike < config.LONG_STRADDLE_VIX_SPIKE_PCT:
-                    return (None, {})
+        # FIX QS5: VIX spike threshold=0.05
+        # VIX spike check bypassed in STRONG_BUY/EVENT
+        # Regime detection already confirmed IV is cheap
+        if self.re.confirmed_regime not in [
+            config.REGIME_STRONG_BUY, config.REGIME_EVENT,
+        ]:
+            if len(self.dm.vix_history_20d) >= (
+                config.LONG_STRADDLE_VIX_SMA_PERIOD
+            ):
+                vix_arr = list(self.dm.vix_history_20d)
+                vix_sma = float(
+                    np.mean(
+                        vix_arr[
+                            -config.LONG_STRADDLE_VIX_SMA_PERIOD:
+                        ]
+                    )
+                )
+                if vix_sma > 0:
+                    vix_spike = (vix - vix_sma) / vix_sma
+                    if vix_spike < (
+                        config.LONG_STRADDLE_VIX_SPIKE_PCT
+                    ):
+                        logger.info(
+                            f'Long straddle: VIX spike '
+                            f'{vix_spike:.3f} < '
+                            f'{config.LONG_STRADDLE_VIX_SPIKE_PCT}'
+                            f' — skip'
+                        )
+                        return (None, {})
 
         iv_rank = self.dm.compute_iv_rank()
         if iv_rank > config.LONG_STRADDLE_MAX_IV_RANK:
             return (None, {})
 
-        if (call_data["ask"] - call_data["bid"]) > config.MAX_SPREAD_ATM_PTS:
+        if (
+            call_data["ask"] - call_data["bid"]
+        ) > config.MAX_SPREAD_ATM_PTS:
             return (None, {})
-        if (put_data["ask"] - put_data["bid"]) > config.MAX_SPREAD_ATM_PTS:
+        if (
+            put_data["ask"] - put_data["bid"]
+        ) > config.MAX_SPREAD_ATM_PTS:
             return (None, {})
 
         max_hold_date = (
@@ -2667,7 +3534,6 @@ class StrategyEngine:
             "max_hold_date": max_hold_date,
             "strategy_type": "LONG",
         }
-
         return (legs, meta)
 
     async def _build_backspread(
@@ -2675,7 +3541,7 @@ class StrategyEngine:
     ) -> Tuple[Optional[List[Leg]], Dict]:
         """Build directional backspread."""
         expiry = self.dm.get_expiry_by_dte(
-            config.BACKSPREAD_DTE_MIN + 2, tolerance=2
+            config.BACKSPREAD_DTE_MIN + 2, tolerance=3
         )
         if expiry is None:
             return (None, {})
@@ -2684,7 +3550,10 @@ class StrategyEngine:
             datetime.strptime(expiry, "%Y-%m-%d").date()
             - date.today()
         ).days
-        if dte < config.BACKSPREAD_DTE_MIN or dte > config.BACKSPREAD_DTE_MAX:
+        if (
+            dte < config.BACKSPREAD_DTE_MIN
+            or dte > config.BACKSPREAD_DTE_MAX
+        ):
             return (None, {})
 
         vix = self.dm.vix or 16.0
@@ -2692,26 +3561,30 @@ class StrategyEngine:
             return (None, {})
 
         trend = self.re.confirmed_trend
-        chain = self.dm.option_chain
-        spot = self.dm.spot or 0
+        chain = self.dm.get_chain_for_expiry(expiry)
+        if not chain:
+            return (None, {})
 
         if trend >= 0:
-            long_strike = self.dm.get_strike_by_delta(
-                "call", config.BACKSPREAD_LONG_DELTA
+            long_strike  = self.dm.get_strike_by_delta(
+                "call", config.BACKSPREAD_LONG_DELTA,
+                expiry=expiry,
             )
             short_strike = self.dm.get_strike_by_delta(
-                "call", config.BACKSPREAD_SHORT_DELTA
+                "call", config.BACKSPREAD_SHORT_DELTA,
+                expiry=expiry,
             )
             hedge_strike = self.dm.get_strike_by_delta(
-                "put", config.BACKSPREAD_LONG_DELTA
+                "put", config.BACKSPREAD_LONG_DELTA,
+                expiry=expiry,
             )
-            hedge_short = self.dm.get_strike_by_delta(
-                "put", config.BACKSPREAD_SHORT_DELTA
+            hedge_short  = self.dm.get_strike_by_delta(
+                "put", config.BACKSPREAD_SHORT_DELTA,
+                expiry=expiry,
             )
 
             if any(
-                s is None
-                for s in [
+                s is None for s in [
                     long_strike, short_strike,
                     hedge_strike, hedge_short,
                 ]
@@ -2723,13 +3596,16 @@ class StrategyEngine:
             ) < config.BACKSPREAD_MIN_STRIKE_WIDTH:
                 return (None, {})
 
-            for s in [long_strike, short_strike, hedge_strike, hedge_short]:
+            for s in [
+                long_strike, short_strike,
+                hedge_strike, hedge_short,
+            ]:
                 if s not in chain:
                     return (None, {})
 
-            long_prem = chain[long_strike]["call"]["ltp"]
-            short_prem = chain[short_strike]["call"]["ltp"]
-            hedge_prem = chain[hedge_strike]["put"]["ltp"]
+            long_prem    = chain[long_strike]["call"]["ltp"]
+            short_prem   = chain[short_strike]["call"]["ltp"]
+            hedge_prem   = chain[hedge_strike]["put"]["ltp"]
             hedge_s_prem = chain[hedge_short]["put"]["ltp"]
 
             net_debit = (
@@ -2744,54 +3620,48 @@ class StrategyEngine:
 
             legs = [
                 Leg(
-                    instrument_key=chain[long_strike]["call"]["instrument_key"],
+                    instrument_key=chain[long_strike][
+                        "call"
+                    ]["instrument_key"],
                     option_type="call", action="BUY",
-                    strike=long_strike, expiry=expiry, qty=1,
+                    strike=long_strike, expiry=expiry,
+                    qty=config.BACKSPREAD_LONG_QTY,
                     delta=chain[long_strike]["call"]["delta"],
                     gamma=chain[long_strike]["call"]["gamma"],
                     vega=chain[long_strike]["call"]["vega"],
                     theta=chain[long_strike]["call"]["theta"],
                 ),
                 Leg(
-                    instrument_key=chain[long_strike]["call"]["instrument_key"],
-                    option_type="call", action="BUY",
-                    strike=long_strike, expiry=expiry, qty=1,
-                    delta=chain[long_strike]["call"]["delta"],
-                    gamma=chain[long_strike]["call"]["gamma"],
-                    vega=chain[long_strike]["call"]["vega"],
-                    theta=chain[long_strike]["call"]["theta"],
-                ),
-                Leg(
-                    instrument_key=chain[long_strike]["call"]["instrument_key"],
-                    option_type="call", action="BUY",
-                    strike=long_strike, expiry=expiry, qty=1,
-                    delta=chain[long_strike]["call"]["delta"],
-                    gamma=chain[long_strike]["call"]["gamma"],
-                    vega=chain[long_strike]["call"]["vega"],
-                    theta=chain[long_strike]["call"]["theta"],
-                ),
-                Leg(
-                    instrument_key=chain[hedge_strike]["put"]["instrument_key"],
+                    instrument_key=chain[hedge_strike][
+                        "put"
+                    ]["instrument_key"],
                     option_type="put", action="BUY",
-                    strike=hedge_strike, expiry=expiry, qty=1,
+                    strike=hedge_strike, expiry=expiry,
+                    qty=1,
                     delta=chain[hedge_strike]["put"]["delta"],
                     gamma=chain[hedge_strike]["put"]["gamma"],
                     vega=chain[hedge_strike]["put"]["vega"],
                     theta=chain[hedge_strike]["put"]["theta"],
                 ),
                 Leg(
-                    instrument_key=chain[short_strike]["call"]["instrument_key"],
+                    instrument_key=chain[short_strike][
+                        "call"
+                    ]["instrument_key"],
                     option_type="call", action="SELL",
-                    strike=short_strike, expiry=expiry, qty=1,
+                    strike=short_strike, expiry=expiry,
+                    qty=1,
                     delta=chain[short_strike]["call"]["delta"],
                     gamma=chain[short_strike]["call"]["gamma"],
                     vega=chain[short_strike]["call"]["vega"],
                     theta=chain[short_strike]["call"]["theta"],
                 ),
                 Leg(
-                    instrument_key=chain[hedge_short]["put"]["instrument_key"],
+                    instrument_key=chain[hedge_short][
+                        "put"
+                    ]["instrument_key"],
                     option_type="put", action="SELL",
-                    strike=hedge_short, expiry=expiry, qty=1,
+                    strike=hedge_short, expiry=expiry,
+                    qty=1,
                     delta=chain[hedge_short]["put"]["delta"],
                     gamma=chain[hedge_short]["put"]["gamma"],
                     vega=chain[hedge_short]["put"]["vega"],
@@ -2799,35 +3669,41 @@ class StrategyEngine:
                 ),
             ]
         else:
-            long_strike = self.dm.get_strike_by_delta(
-                "put", config.BACKSPREAD_LONG_DELTA
+            long_strike  = self.dm.get_strike_by_delta(
+                "put", config.BACKSPREAD_LONG_DELTA,
+                expiry=expiry,
             )
             short_strike = self.dm.get_strike_by_delta(
-                "put", config.BACKSPREAD_SHORT_DELTA
+                "put", config.BACKSPREAD_SHORT_DELTA,
+                expiry=expiry,
             )
             hedge_strike = self.dm.get_strike_by_delta(
-                "call", config.BACKSPREAD_LONG_DELTA
+                "call", config.BACKSPREAD_LONG_DELTA,
+                expiry=expiry,
             )
-            hedge_short = self.dm.get_strike_by_delta(
-                "call", config.BACKSPREAD_SHORT_DELTA
+            hedge_short  = self.dm.get_strike_by_delta(
+                "call", config.BACKSPREAD_SHORT_DELTA,
+                expiry=expiry,
             )
 
             if any(
-                s is None
-                for s in [
+                s is None for s in [
                     long_strike, short_strike,
                     hedge_strike, hedge_short,
                 ]
             ):
                 return (None, {})
 
-            for s in [long_strike, short_strike, hedge_strike, hedge_short]:
+            for s in [
+                long_strike, short_strike,
+                hedge_strike, hedge_short,
+            ]:
                 if s not in chain:
                     return (None, {})
 
-            long_prem = chain[long_strike]["put"]["ltp"]
-            short_prem = chain[short_strike]["put"]["ltp"]
-            hedge_prem = chain[hedge_strike]["call"]["ltp"]
+            long_prem    = chain[long_strike]["put"]["ltp"]
+            short_prem   = chain[short_strike]["put"]["ltp"]
+            hedge_prem   = chain[hedge_strike]["call"]["ltp"]
             hedge_s_prem = chain[hedge_short]["call"]["ltp"]
 
             net_debit = (
@@ -2842,54 +3718,48 @@ class StrategyEngine:
 
             legs = [
                 Leg(
-                    instrument_key=chain[long_strike]["put"]["instrument_key"],
+                    instrument_key=chain[long_strike][
+                        "put"
+                    ]["instrument_key"],
                     option_type="put", action="BUY",
-                    strike=long_strike, expiry=expiry, qty=1,
+                    strike=long_strike, expiry=expiry,
+                    qty=config.BACKSPREAD_LONG_QTY,
                     delta=chain[long_strike]["put"]["delta"],
                     gamma=chain[long_strike]["put"]["gamma"],
                     vega=chain[long_strike]["put"]["vega"],
                     theta=chain[long_strike]["put"]["theta"],
                 ),
                 Leg(
-                    instrument_key=chain[long_strike]["put"]["instrument_key"],
-                    option_type="put", action="BUY",
-                    strike=long_strike, expiry=expiry, qty=1,
-                    delta=chain[long_strike]["put"]["delta"],
-                    gamma=chain[long_strike]["put"]["gamma"],
-                    vega=chain[long_strike]["put"]["vega"],
-                    theta=chain[long_strike]["put"]["theta"],
-                ),
-                Leg(
-                    instrument_key=chain[long_strike]["put"]["instrument_key"],
-                    option_type="put", action="BUY",
-                    strike=long_strike, expiry=expiry, qty=1,
-                    delta=chain[long_strike]["put"]["delta"],
-                    gamma=chain[long_strike]["put"]["gamma"],
-                    vega=chain[long_strike]["put"]["vega"],
-                    theta=chain[long_strike]["put"]["theta"],
-                ),
-                Leg(
-                    instrument_key=chain[hedge_strike]["call"]["instrument_key"],
+                    instrument_key=chain[hedge_strike][
+                        "call"
+                    ]["instrument_key"],
                     option_type="call", action="BUY",
-                    strike=hedge_strike, expiry=expiry, qty=1,
+                    strike=hedge_strike, expiry=expiry,
+                    qty=1,
                     delta=chain[hedge_strike]["call"]["delta"],
                     gamma=chain[hedge_strike]["call"]["gamma"],
                     vega=chain[hedge_strike]["call"]["vega"],
                     theta=chain[hedge_strike]["call"]["theta"],
                 ),
                 Leg(
-                    instrument_key=chain[short_strike]["put"]["instrument_key"],
+                    instrument_key=chain[short_strike][
+                        "put"
+                    ]["instrument_key"],
                     option_type="put", action="SELL",
-                    strike=short_strike, expiry=expiry, qty=1,
+                    strike=short_strike, expiry=expiry,
+                    qty=1,
                     delta=chain[short_strike]["put"]["delta"],
                     gamma=chain[short_strike]["put"]["gamma"],
                     vega=chain[short_strike]["put"]["vega"],
                     theta=chain[short_strike]["put"]["theta"],
                 ),
                 Leg(
-                    instrument_key=chain[hedge_short]["call"]["instrument_key"],
+                    instrument_key=chain[hedge_short][
+                        "call"
+                    ]["instrument_key"],
                     option_type="call", action="SELL",
-                    strike=hedge_short, expiry=expiry, qty=1,
+                    strike=hedge_short, expiry=expiry,
+                    qty=1,
                     delta=chain[hedge_short]["call"]["delta"],
                     gamma=chain[hedge_short]["call"]["gamma"],
                     vega=chain[hedge_short]["call"]["vega"],
@@ -2902,17 +3772,20 @@ class StrategyEngine:
             + timedelta(days=config.LONG_STRADDLE_HOLD_DAYS)
         ).strftime("%Y-%m-%d")
 
+        safe_debit = max(net_debit, 0.05)
         meta = {
-            "net_debit":       max(net_debit, 0.05),
-            "max_risk":        max(net_debit, 0.05) * config.LOT_SIZE,
-            "profit_target":   max(net_debit, 0.05) * config.BACKSPREAD_PROFIT_MULTIPLE,
-            "stop_loss":       max(net_debit, 0.05) * 0.40,
+            "net_debit":       safe_debit,
+            "max_risk":        safe_debit * config.LOT_SIZE,
+            "profit_target":   (
+                safe_debit
+                * config.BACKSPREAD_PROFIT_MULTIPLE
+            ),
+            "stop_loss":       safe_debit * 0.40,
             "exit_dte":        config.BACKSPREAD_EXIT_DTE,
             "max_hold_date":   max_hold_date,
             "strategy_type":   "LONG",
             "trend_direction": trend,
         }
-
         return (legs, meta)
 
     async def _build_long_strangle(
@@ -2924,16 +3797,18 @@ class StrategyEngine:
             return (None, {})
 
         call_strike = self.dm.get_strike_by_delta(
-            "call", config.EVENT_STRANGLE_DELTA
+            "call", config.EVENT_STRANGLE_DELTA,
+            expiry=expiry,
         )
-        put_strike = self.dm.get_strike_by_delta(
-            "put", config.EVENT_STRANGLE_DELTA
+        put_strike  = self.dm.get_strike_by_delta(
+            "put", config.EVENT_STRANGLE_DELTA,
+            expiry=expiry,
         )
 
         if call_strike is None or put_strike is None:
             return (None, {})
 
-        chain = self.dm.option_chain
+        chain = self.dm.get_chain_for_expiry(expiry)
         for s in [call_strike, put_strike]:
             if s not in chain:
                 return (None, {})
@@ -2949,10 +3824,15 @@ class StrategyEngine:
 
         if call_spread > config.EVENT_STRANGLE_MAX_SPREAD_PTS:
             return (None, {})
+
         if put_spread > config.EVENT_STRANGLE_MAX_SPREAD_PTS:
+            logger.info(
+                f"Strangle: put spread={put_spread:.2f} "
+                f"too wide — falling back to straddle"
+            )
             return await self._build_long_straddle()
 
-        total_debit = (
+        total_debit   = (
             chain[call_strike]["call"]["ltp"]
             + chain[put_strike]["put"]["ltp"]
         )
@@ -2962,7 +3842,9 @@ class StrategyEngine:
 
         legs = [
             Leg(
-                instrument_key=chain[call_strike]["call"]["instrument_key"],
+                instrument_key=chain[call_strike]["call"][
+                    "instrument_key"
+                ],
                 option_type="call", action="BUY",
                 strike=call_strike, expiry=expiry, qty=1,
                 delta=chain[call_strike]["call"]["delta"],
@@ -2971,7 +3853,9 @@ class StrategyEngine:
                 theta=chain[call_strike]["call"]["theta"],
             ),
             Leg(
-                instrument_key=chain[put_strike]["put"]["instrument_key"],
+                instrument_key=chain[put_strike]["put"][
+                    "instrument_key"
+                ],
                 option_type="put", action="BUY",
                 strike=put_strike, expiry=expiry, qty=1,
                 delta=chain[put_strike]["put"]["delta"],
@@ -2994,7 +3878,6 @@ class StrategyEngine:
             "max_hold_date": max_hold_date,
             "strategy_type": "LONG",
         }
-
         return (legs, meta)
 
     async def _build_defensive_hedge(
@@ -3009,37 +3892,61 @@ class StrategyEngine:
             for leg in pos.legs
             if leg.action == "SELL"
         ]
-
         if not short_legs:
             return (None, {})
 
-        if len(self.dm.vix_history_20d) >= config.DEFENSIVE_VIX_SMA_PERIOD:
+        if len(self.dm.vix_history_20d) >= (
+            config.DEFENSIVE_VIX_SMA_PERIOD
+        ):
             vix_arr = list(self.dm.vix_history_20d)
             vix_sma = float(
-                np.mean(vix_arr[-config.DEFENSIVE_VIX_SMA_PERIOD:])
+                np.mean(
+                    vix_arr[
+                        -config.DEFENSIVE_VIX_SMA_PERIOD:
+                    ]
+                )
             )
             if vix_sma > 0:
-                vix_spike = (self.dm.vix - vix_sma) / vix_sma
-                if vix_spike < config.DEFENSIVE_VIX_SPIKE_PCT:
+                vix_spike = (
+                    (self.dm.vix - vix_sma) / vix_sma
+                )
+                if vix_spike < (
+                    config.DEFENSIVE_VIX_SPIKE_PCT
+                ):
                     return (None, {})
 
-        ema_20 = self._compute_ema_n(config.DEFENSIVE_EMA_PERIOD)
+        ema_20 = self._compute_ema_n(
+            config.DEFENSIVE_EMA_PERIOD
+        )
         if self.dm.spot and self.dm.spot > ema_20:
             return (None, {})
 
-        total_delta = sum(
-            leg.delta * leg.qty * config.LOT_SIZE
-            for pos in self.open_positions
-            for leg in pos.legs
-            if leg.action == "SELL"
-        )
+        # FIX S4/QS9: use LIVE chain delta
+        total_delta = 0.0
+        for pos in self.open_positions:
+            expiry_chain = self.dm.get_chain_for_expiry(
+                pos.expiry_date
+            )
+            for leg in pos.legs:
+                if leg.action == "SELL":
+                    live_delta = float(
+                        expiry_chain
+                        .get(leg.strike, {})
+                        .get(leg.option_type, {})
+                        .get("delta", leg.delta)
+                    )
+                    total_delta += (
+                        -1 * live_delta
+                        * leg.qty * config.LOT_SIZE
+                    )
 
         reduction_legs = []
         for pos in self.open_positions:
             for leg in pos.legs:
                 if leg.action == "SELL":
                     reduce_qty = _math.ceil(
-                        leg.qty * config.DEFENSIVE_REDUCTION_PCT
+                        leg.qty
+                        * config.DEFENSIVE_REDUCTION_PCT
                     )
                     reduction_legs.append({
                         "position":   pos,
@@ -3051,17 +3958,17 @@ class StrategyEngine:
         if atm is None:
             return (None, {})
 
-        chain = self.dm.option_chain
-        if atm not in chain:
-            return (None, {})
-
         expiry = self.dm.get_expiry_by_dte(
             config.LONG_STRADDLE_DTE_MIN, tolerance=5
         )
         if expiry is None:
             return (None, {})
 
-        atm_put_data = chain[atm]["put"]
+        chain = self.dm.get_chain_for_expiry(expiry)
+        if not chain or atm not in chain:
+            return (None, {})
+
+        atm_put_data  = chain[atm]["put"]
         atm_put_delta = abs(atm_put_data["delta"])
 
         remaining_delta = total_delta * (
@@ -3075,7 +3982,9 @@ class StrategyEngine:
 
         legs = [
             Leg(
-                instrument_key=atm_put_data["instrument_key"],
+                instrument_key=atm_put_data[
+                    "instrument_key"
+                ],
                 option_type="put", action="BUY",
                 strike=atm, expiry=expiry,
                 qty=hedge_qty,
@@ -3092,9 +4001,13 @@ class StrategyEngine:
         ).strftime("%Y-%m-%d")
 
         meta = {
-            "total_debit":    atm_put_data["ltp"] * hedge_qty,
+            "total_debit":    (
+                atm_put_data["ltp"] * hedge_qty
+            ),
             "max_risk":       (
-                atm_put_data["ltp"] * hedge_qty * config.LOT_SIZE
+                atm_put_data["ltp"]
+                * hedge_qty
+                * config.LOT_SIZE
             ),
             "stop_loss":      (
                 atm_put_data["ltp"]
@@ -3108,13 +4021,11 @@ class StrategyEngine:
             "reduction_legs": reduction_legs,
             "hedge_qty":      hedge_qty,
         }
-
         return (legs, meta)
 
     async def _pre_trade_checks(
         self, strategy_name: str, legs: List[Leg]
     ) -> bool:
-        """Run all pre-trade validation checks."""
         for leg in legs:
             if leg.action == "SELL":
                 try:
@@ -3122,21 +4033,42 @@ class StrategyEngine:
                         leg.expiry, "%Y-%m-%d"
                     ).date()
                     dte = (expiry_date - date.today()).days
-                    if dte < 5:
+                    if dte < 2:
                         logger.warning(
-                            f"Pre-trade: DTE={dte} < 5 "
-                            f"for SELL leg strike={leg.strike}"
+                            f"Pre-trade: DTE={dte} < 2 "
+                            f"for SELL strike={leg.strike}"
                         )
                         return False
                 except ValueError:
                     return False
 
-        chain = self.dm.option_chain
+        # FIX FS2: validate non-zero LTP from expiry chain
         for leg in legs:
-            strike_data = chain.get(leg.strike, {})
-            opt_data = strike_data.get(leg.option_type, {})
+            expiry_chain = self.dm.get_chain_for_expiry(
+                leg.expiry
+            )
+            opt = expiry_chain.get(
+                leg.strike, {}
+            ).get(leg.option_type, {})
+            ltp = float(opt.get("ltp", 0) or 0)
+            if ltp <= 0:
+                logger.warning(
+                    f"Pre-trade: LTP=0 for "
+                    f"{leg.option_type} {leg.strike} "
+                    f"expiry={leg.expiry} — aborting"
+                )
+                return False
+
+        # Spread check
+        for leg in legs:
+            expiry_chain = self.dm.get_chain_for_expiry(
+                leg.expiry
+            )
+            opt    = expiry_chain.get(
+                leg.strike, {}
+            ).get(leg.option_type, {})
             spread = (
-                opt_data.get("ask", 0) - opt_data.get("bid", 0)
+                opt.get("ask", 0) - opt.get("bid", 0)
             )
             is_atm = (
                 self.dm.atm_strike is not None
@@ -3150,37 +4082,44 @@ class StrategyEngine:
             if spread > max_spread:
                 logger.warning(
                     f"Pre-trade: spread={spread:.2f} > "
-                    f"max={max_spread} for "
-                    f"{leg.option_type} strike={leg.strike}"
+                    f"max={max_spread} "
+                    f"{leg.option_type} {leg.strike}"
                 )
                 return False
 
         estimated_risk = self._estimate_max_loss(
             strategy_name, legs
         )
-        current_risk = sum(
+        current_risk   = sum(
             p.max_risk for p in self.open_positions
         )
-        if current_risk + estimated_risk > config.MAX_COMBINED_RISK:
+        if current_risk + estimated_risk > (
+            config.MAX_COMBINED_RISK
+        ):
             logger.warning(
-                f"Pre-trade: portfolio risk limit breach "
+                f"Pre-trade: portfolio risk limit "
                 f"current={current_risk:.0f} "
                 f"new={estimated_risk:.0f}"
             )
             return False
 
-        new_greeks = self._estimate_greeks_impact(legs)
-        regime = self.re.confirmed_regime
-        limits = config.GREEKS_LIMITS.get(regime, {})
-        portfolio_greeks = self._get_portfolio_greeks()
-        post_delta = (
-            portfolio_greeks["delta"] + new_greeks["delta"]
+        new_greeks  = self._estimate_greeks_impact(legs)
+        regime      = self.re.confirmed_regime
+        limits      = config.GREEKS_LIMITS.get(regime, {})
+        port_greeks = self._get_portfolio_greeks()
+        post_delta  = (
+            port_greeks["delta"] + new_greeks["delta"]
         )
-        delta_max = limits.get("delta_max", 99)
-        if abs(post_delta) > delta_max:
+        # PATCH: GREEKS_LIMITS delta_max is a per-lot normalized
+        # fraction (e.g. 0.10-0.50); portfolio delta is scaled by
+        # LOT_SIZE. Normalize before comparing — otherwise this
+        # gate rejects almost every real position.
+        post_delta_normalized = post_delta / config.LOT_SIZE
+        delta_max   = limits.get("delta_max", 99)
+        if abs(post_delta_normalized) > delta_max:
             logger.warning(
-                f"Pre-trade: delta limit breach "
-                f"post_delta={post_delta:.3f} max={delta_max}"
+                f"Pre-trade: delta limit "
+                f"post={post_delta_normalized:.3f} max={delta_max}"
             )
             return False
 
@@ -3188,15 +4127,17 @@ class StrategyEngine:
             margin_legs = [
                 {
                     "instrument_key":   leg.instrument_key,
-                    "quantity":         leg.qty * config.LOT_SIZE,
+                    "quantity": (
+                        leg.qty * config.LOT_SIZE
+                    ),
                     "transaction_type": leg.action,
                     "product":          "D",
-                    "price":            leg.entry_price,
+                    "price":            self._leg_price(leg),
                 }
                 for leg in legs
             ]
-            margin_ok, required = await self.dm.check_margin(
-                margin_legs
+            margin_ok, required = (
+                await self.dm.check_margin(margin_legs)
             )
             if not margin_ok:
                 logger.warning(
@@ -3210,101 +4151,170 @@ class StrategyEngine:
     async def _execute_strategy(
         self,
         strategy_name: str,
-        legs: List[Leg],
-        meta: Dict,
-        trade_id: str = "",
+        legs:          List[Leg],
+        meta:          Dict,
+        trade_id:      str = "",
     ) -> bool:
-        """
-        Execute all legs with idempotent order placement.
-        CRITICAL FIX 1+3: Each leg gets a deterministic tag.
-        """
         if not trade_id:
             trade_id = str(uuid.uuid4())
 
         if strategy_name == config.STRAT_DEFENSIVE:
-            reduction_success = await self._execute_reductions(
+            ok = await self._execute_reductions(
                 meta.get("reduction_legs", [])
             )
-            if not reduction_success:
+            if not ok:
                 return False
             await asyncio.sleep(
                 config.ORDER_BETWEEN_LEGS_DELAY_SEC
             )
 
-        long_legs = [l for l in legs if l.action == "BUY"]
+        long_legs  = [l for l in legs if l.action == "BUY"]
         short_legs = [l for l in legs if l.action == "SELL"]
         filled_legs: List[Leg] = []
 
-        # Execute long legs first (RULE O1)
         for idx, leg in enumerate(long_legs):
-            success, order_id = await self._place_single_leg(
-                leg,
-                use_market=False,
-                trade_id=trade_id,
-                leg_index=idx,
+            success, order_id = (
+                await self._place_single_leg(
+                    leg,
+                    use_market=False,
+                    trade_id=trade_id,
+                    leg_index=idx,
+                )
             )
             if not success:
                 logger.warning(
-                    f"Long leg failed: {leg.option_type} "
-                    f"strike={leg.strike} — aborting"
+                    f"Long leg failed: "
+                    f"{leg.option_type} {leg.strike}"
                 )
-                await self._cancel_and_reverse(filled_legs)
+                await self._cancel_and_reverse(
+                    filled_legs
+                )
                 return False
-            leg.order_id = order_id
+            leg.order_id    = order_id
             leg.fill_status = "COMPLETE"
             filled_legs.append(leg)
             self._log_order_detail(
-                trade_id, order_id, leg, "FILLED",
-                leg.entry_price,
+                trade_id, order_id, leg,
+                "FILLED", leg.entry_price,
             )
             await asyncio.sleep(
                 config.ORDER_BETWEEN_LEGS_DELAY_SEC
             )
 
-        # Execute short legs second (RULE O1)
         for idx, leg in enumerate(short_legs):
-            success, order_id = await self._place_single_leg(
-                leg,
-                use_market=False,
-                trade_id=trade_id,
-                leg_index=len(long_legs) + idx,
+            success, order_id = (
+                await self._place_single_leg(
+                    leg,
+                    use_market=False,
+                    trade_id=trade_id,
+                    leg_index=len(long_legs) + idx,
+                )
             )
             if not success:
                 logger.warning(
-                    f"Short leg failed: {leg.option_type} "
-                    f"strike={leg.strike} — aborting"
+                    f"Short leg failed: "
+                    f"{leg.option_type} {leg.strike}"
                 )
-                await self._cancel_and_reverse(filled_legs)
+                await self._cancel_and_reverse(
+                    filled_legs
+                )
                 return False
-            leg.order_id = order_id
+            leg.order_id    = order_id
             leg.fill_status = "COMPLETE"
             filled_legs.append(leg)
             self._log_order_detail(
-                trade_id, order_id, leg, "FILLED",
-                leg.entry_price,
+                trade_id, order_id, leg,
+                "FILLED", leg.entry_price,
             )
             await asyncio.sleep(
                 config.ORDER_BETWEEN_LEGS_DELAY_SEC
             )
 
         logger.info(
-            f"All {len(filled_legs)} legs filled for "
-            f"{strategy_name}"
+            f"All {len(filled_legs)} legs filled "
+            f"for {strategy_name}"
         )
+
+        # PATCH: if any leg only partially filled, trim the
+        # others down to match so the strategy stays balanced
+        # instead of leaving a lopsided position.
+        try:
+            await self._rebalance_partial_fills(filled_legs)
+        except Exception as e:
+            logger.error(
+                f"_rebalance_partial_fills error: {e}"
+            )
+
         return True
+
+    async def _rebalance_partial_fills(
+        self, legs: List[Leg]
+    ) -> None:
+        """
+        PATCH: if any leg in this strategy partially filled, trim
+        every other leg down to the same (minimum) filled
+        quantity so the overall structure stays balanced rather
+        than lopsided (e.g. a condor with 6/6/4/6 lots across its
+        four legs after one leg only partially filled).
+        """
+        if not any(l.fill_status == "PARTIAL" for l in legs):
+            return
+        min_qty = min(
+            (l.qty for l in legs if l.qty > 0), default=0
+        )
+        if min_qty <= 0:
+            return
+        for idx, leg in enumerate(legs):
+            excess = leg.qty - min_qty
+            if excess > 0:
+                trim_action = (
+                    "BUY" if leg.action == "SELL" else "SELL"
+                )
+                trim_leg = Leg(
+                    instrument_key=leg.instrument_key,
+                    option_type=leg.option_type,
+                    action=trim_action,
+                    strike=leg.strike,
+                    expiry=leg.expiry,
+                    qty=excess,
+                )
+                success, _ = await self._place_single_leg(
+                    trim_leg,
+                    use_market=True,
+                    trade_id=(
+                        f"rebalance-{uuid.uuid4().hex[:8]}"
+                    ),
+                    leg_index=idx,
+                )
+                if success:
+                    logger.warning(
+                        f"Rebalanced {leg.option_type} "
+                        f"{leg.strike}: trimmed "
+                        f"{trim_leg.qty} lots to match "
+                        f"partial-fill minimum {min_qty}"
+                    )
+                    leg.qty = min_qty
+                else:
+                    logger.error(
+                        f"Rebalance trim FAILED for "
+                        f"{leg.option_type} {leg.strike} — "
+                        f"position may be imbalanced, "
+                        f"manual review needed"
+                    )
+                await asyncio.sleep(
+                    config.ORDER_BETWEEN_LEGS_DELAY_SEC
+                )
 
     def _log_order_detail(
         self,
-        trade_id: str,
-        order_id: str,
-        leg: Leg,
-        status: str,
+        trade_id:   str,
+        order_id:   str,
+        leg:        Leg,
+        status:     str,
         fill_price: float = 0.0,
     ) -> None:
-        """Log order details to SQLite order_log table."""
         try:
-            IST = pytz.timezone(config.TZ)
-            conn = sqlite3.connect(self.db_path)
+            conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO order_log (
@@ -3317,7 +4327,7 @@ class StrategyEngine:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
                           ?, ?, ?, ?, ?, ?)
             """, (
-                datetime.now(IST).isoformat(),
+                datetime.now(self._IST).isoformat(),
                 trade_id,
                 order_id,
                 leg.instrument_key,
@@ -3340,16 +4350,21 @@ class StrategyEngine:
 
     async def _close_position(
         self,
-        position: Position,
+        position:    Position,
         exit_reason: str,
-        use_market: bool = False,
+        use_market:  bool = False,
     ) -> None:
-        """Close all legs of a position."""
+        """
+        Close all legs of a position.
+        FIX VS7: on expiry day, skip OTM legs with LTP < 0.10
+                 (they will expire worthless — closing costs
+                  more than the option is worth).
+        """
         if position.status != "OPEN":
             return
 
         logger.info(
-            f"Closing position: {position.trade_id[:8]} "
+            f"Closing: {position.trade_id[:8]} "
             f"strategy={position.strategy_name} "
             f"reason={exit_reason}"
         )
@@ -3360,16 +4375,55 @@ class StrategyEngine:
             config.EXIT_REASONS["REGIME_CHANGE"],
         ]
 
+        strategy_type = position.meta.get(
+            "strategy_type", "SHORT"
+        )
+
         short_legs = [
-            l for l in position.legs if l.action == "SELL"
+            l for l in position.legs
+            if l.action == "SELL"
         ]
-        long_legs = [
-            l for l in position.legs if l.action == "BUY"
+        long_legs  = [
+            l for l in position.legs
+            if l.action == "BUY"
         ]
 
-        for idx, leg in enumerate(short_legs + long_legs):
+        if strategy_type == "SHORT":
+            ordered_legs = short_legs + long_legs
+        else:
+            ordered_legs = long_legs + short_legs
+
+        # FIX VS7: on expiry day, skip near-worthless OTM legs
+        is_expiry_close = exit_reason in (
+            config.EXIT_REASONS["EXPIRY"],
+            config.EXIT_REASONS["EOD"],
+        )
+
+        for idx, leg in enumerate(ordered_legs):
             if leg.qty <= 0:
                 continue
+
+            # FIX VS7: skip OTM legs near expiry
+            if is_expiry_close:
+                expiry_chain = self.dm.get_chain_for_expiry(
+                    leg.expiry
+                )
+                current_ltp = float(
+                    expiry_chain
+                    .get(leg.strike, {})
+                    .get(leg.option_type, {})
+                    .get("ltp", 0)
+                )
+                if current_ltp < 0.10:
+                    logger.info(
+                        f"Expiry close: skipping "
+                        f"{leg.option_type} {leg.strike} "
+                        f"ltp={current_ltp:.2f} "
+                        f"(will expire worthless)"
+                    )
+                    # Mark as closed at 0 cost
+                    leg.exit_price = 0.0
+                    continue
 
             close_action = (
                 "BUY" if leg.action == "SELL" else "SELL"
@@ -3383,26 +4437,19 @@ class StrategyEngine:
                 qty=leg.qty,
             )
 
-            # Generate exit tag (different from entry tag)
-            exit_tag = self._generate_order_tag(
-                f"exit-{position.trade_id[:12]}",
-                leg.instrument_key,
-                close_action,
-                idx,
-            )
-            close_leg.order_tag = exit_tag
-
-            success, order_id = await self._place_single_leg(
-                close_leg,
-                use_market=use_market_order,
-                trade_id=f"exit-{position.trade_id}",
-                leg_index=idx,
+            success, order_id = (
+                await self._place_single_leg(
+                    close_leg,
+                    use_market=use_market_order,
+                    trade_id=f"exit-{position.trade_id}",
+                    leg_index=idx,
+                )
             )
 
             if not success:
                 logger.warning(
-                    f"Close leg failed — retrying at market: "
-                    f"{leg.option_type} strike={leg.strike}"
+                    f"Close leg failed — retrying market: "
+                    f"{leg.option_type} {leg.strike}"
                 )
                 retry_leg = Leg(
                     instrument_key=leg.instrument_key,
@@ -3415,7 +4462,9 @@ class StrategyEngine:
                 await self._place_single_leg(
                     retry_leg,
                     use_market=True,
-                    trade_id=f"exit-retry-{position.trade_id}",
+                    trade_id=(
+                        f"exit-retry-{position.trade_id}"
+                    ),
                     leg_index=idx,
                 )
                 leg.exit_price = retry_leg.entry_price
@@ -3427,31 +4476,48 @@ class StrategyEngine:
             )
 
         IST = pytz.timezone(config.TZ)
-        position.exit_reason = exit_reason
-        position.exit_timestamp = datetime.now(IST).isoformat()
-        position.exit_spot = self.dm.spot or 0.0
-        position.exit_vix = self.dm.vix or 0.0
-        position.status = "CLOSED"
+        position.exit_reason    = exit_reason
+        position.exit_timestamp = datetime.now(
+            IST
+        ).isoformat()
+        position.exit_spot      = self.dm.spot  or 0.0
+        position.exit_vix       = self.dm.vix   or 0.0
+        position.regime_at_exit = self.re.confirmed_regime
+        position.status         = "CLOSED"
 
-        # HIGH FIX 4: Calculate gross, costs, and net PnL
         gross_pnl, tx_costs, net_pnl = (
             self._calculate_final_pnl(position)
         )
-        position.realized_pnl = gross_pnl
+        position.realized_pnl      = gross_pnl
         position.transaction_costs = tx_costs
-        position.net_pnl = net_pnl
+        position.net_pnl           = net_pnl
+
+        position_cost = max(position.max_risk, 1.0)
         position.realized_pnl_percent = (
-            (net_pnl / config.TOTAL_CAPITAL) * 100
-            if config.TOTAL_CAPITAL > 0 else 0.0
+            (net_pnl / position_cost) * 100
         )
 
         if position in self.open_positions:
             self.open_positions.remove(position)
         self.closed_positions.append(position)
 
-        # Update capital using NET PnL (after costs)
-        self.daily_pnl += net_pnl
-        self.weekly_pnl += net_pnl
+        # PATCH: only apply the re-entry cooldown for whipsaw-risk
+        # exits (stop-loss/circuit-break) — NOT for planned,
+        # natural turnover (profit target, DTE-based time exit,
+        # EOD, expiry). This lets the engine immediately "roll"
+        # into a fresh position after a normal close instead of
+        # being blocked for 5 minutes, enabling continuous
+        # redeployment using the existing per-cycle entry flow.
+        if exit_reason in (
+            config.EXIT_REASONS["STOP_LOSS"],
+            config.EXIT_REASONS["CIRCUIT_BREAK"],
+        ):
+            self._last_position_close_time = datetime.now(
+                self._IST
+            )
+            self._last_position_close_spot = self.dm.spot
+
+        self.weekly_pnl      += net_pnl
         self.current_capital += net_pnl
         if self.current_capital > self.peak_capital:
             self.peak_capital = self.current_capital
@@ -3462,116 +4528,257 @@ class StrategyEngine:
         )
 
         logger.info(
-            f"Position closed: {position.trade_id[:8]} "
+            f"Closed: {position.trade_id[:8]} "
             f"gross=₹{gross_pnl:,.2f} "
             f"costs=₹{tx_costs:,.2f} "
             f"net=₹{net_pnl:,.2f} "
             f"reason={exit_reason}"
         )
 
+    def _estimate_margin_requirement(
+        self, strategy_name: str, max_risk_per_lot: float
+    ) -> float:
+        """
+        PATCH: heuristic SPAN+exposure margin approximation for
+        paper-mode sizing realism. This is NOT the real exchange
+        calculation (real SPAN varies daily with volatility scans
+        and is broker/exchange-specific) — it's a conservative,
+        documented approximation so paper-mode position sizes are
+        closer to what would actually be achievable live, rather
+        than assuming margin is unlimited (the previous behavior).
+        Live mode still separately validates against the REAL
+        broker margin API via check_margin() in
+        _pre_trade_checks().
+        """
+        spot = self.dm.spot or 24000.0
+        notional_per_lot = spot * config.LOT_SIZE
+
+        if strategy_name == config.STRAT_SHORT_STRADDLE:
+            # Naked short options on both sides — margin is
+            # dominated by SPAN+exposure on notional, not by the
+            # (large) theoretical max loss.
+            return notional_per_lot * config.SPAN_NAKED_MARGIN_PCT
+
+        elif strategy_name in (
+            config.STRAT_IRON_CONDOR,
+            config.STRAT_CREDIT_SPREADS,
+        ):
+            # Defined-risk spread in the same expiry — exchanges
+            # typically apply spread margining close to (a modest
+            # multiple of) max loss, not full naked margin.
+            return (
+                max_risk_per_lot
+                * config.SPAN_SPREAD_MARGIN_MULTIPLIER
+            )
+
+        elif strategy_name == config.STRAT_RATIO_SPREAD:
+            # Mostly hedged (2 long vs 1 short per side) but not a
+            # clean defined-risk spread — blend spread-margining
+            # with a partial naked-margin allowance.
+            return max(
+                max_risk_per_lot
+                * config.SPAN_SPREAD_MARGIN_MULTIPLIER,
+                notional_per_lot
+                * config.SPAN_NAKED_MARGIN_PCT * 0.5,
+            )
+
+        elif strategy_name == config.STRAT_BACKSPREAD:
+            # More longs than shorts by construction — treat as
+            # spread-like.
+            return (
+                max_risk_per_lot
+                * config.SPAN_SPREAD_MARGIN_MULTIPLIER
+            )
+
+        else:
+            # Long-only debit strategies (long straddle, strangle,
+            # butterfly, defensive hedge): margin required is just
+            # the premium paid, already captured by
+            # max_risk_per_lot.
+            return max_risk_per_lot
+
     def _calculate_lot_size(
         self, strategy_name: str, meta: Dict
     ) -> int:
-        """Calculate appropriate lot size."""
         max_loss_per_lot = meta.get("max_risk", 0)
         if max_loss_per_lot <= 0:
-            return 1
+            return 0
 
         risk_per_trade = config.MAX_RISK_PER_TRADE
-        lots = math.floor(risk_per_trade / max_loss_per_lot)
+        lots           = math.floor(
+            risk_per_trade / max_loss_per_lot
+        )
 
-        regime = self.re.confirmed_regime
+        regime   = self.re.confirmed_regime
         max_lots = config.REGIME_MAX_LOTS.get(regime, 1)
-        lots = min(lots, max_lots)
-        lots = max(lots, 1)
+        lots     = min(lots, max_lots)
+        lots     = max(lots, 0)
 
-        regime_capital = (
+        regime_capital   = (
             config.REGIME_CAPITAL_PCT.get(regime, 0)
             * config.TOTAL_CAPITAL
         )
         deployed_capital = sum(
             p.max_risk for p in self.open_positions
         )
-        available_capital = regime_capital - deployed_capital
+        available_capital = (
+            regime_capital - deployed_capital
+        )
 
         if available_capital <= 0:
             return 0
 
         if strategy_name == config.STRAT_RATIO_SPREAD:
             ratio_cap = (
-                config.RATIO_MAX_CAPITAL_PCT * config.TOTAL_CAPITAL
+                config.RATIO_MAX_CAPITAL_PCT
+                * config.TOTAL_CAPITAL
             )
-            available_capital = min(available_capital, ratio_cap)
+            available_capital = min(
+                available_capital, ratio_cap
+            )
 
         lots_by_capital = math.floor(
             available_capital / max_loss_per_lot
         )
         lots = min(lots, lots_by_capital)
+
+        position_cap = math.floor(
+            (
+                config.POSITION_SIZE_PCT
+                * config.TOTAL_CAPITAL
+            ) / max_loss_per_lot
+        )
+        lots = min(lots, max(position_cap, 0))
         lots = max(lots, 0)
+
+        # PATCH: heuristic margin/SPAN cap. Previously sizing was
+        # based purely on theoretical max-loss and capital %,
+        # never on what margin the position would actually tie up
+        # — which for naked/undefined-risk strategies (short
+        # straddle, ratio spread) is typically far higher than
+        # max_risk. This is a documented approximation, not the
+        # real exchange calculation (live mode still separately
+        # validates against the real broker margin API in
+        # _pre_trade_checks()).
+        margin_per_lot = self._estimate_margin_requirement(
+            strategy_name, max_loss_per_lot
+        )
+        meta["margin_estimate_per_lot"] = margin_per_lot
+        if margin_per_lot > 0:
+            deployed_margin = sum(
+                getattr(p, "margin_estimate", 0.0)
+                for p in self.open_positions
+            )
+            margin_budget = (
+                config.MARGIN_UTILIZATION_PCT
+                * config.TOTAL_CAPITAL
+            )
+            available_margin = margin_budget - deployed_margin
+            if available_margin <= 0:
+                logger.info(
+                    f"Lot size: 0 for {strategy_name} — "
+                    f"margin budget exhausted "
+                    f"(deployed={deployed_margin:.0f}/"
+                    f"{margin_budget:.0f})"
+                )
+                return 0
+            lots_by_margin = math.floor(
+                available_margin / margin_per_lot
+            )
+            lots = min(lots, lots_by_margin)
+            lots = max(lots, 0)
 
         logger.info(
             f"Lot size: {lots} for {strategy_name} "
             f"risk={risk_per_trade} "
-            f"max_loss={max_loss_per_lot:.0f}"
+            f"max_loss={max_loss_per_lot:.0f} "
+            f"margin_per_lot={margin_per_lot:.0f}"
         )
         return lots
 
     def _get_position_value(
         self, position: Position
     ) -> float:
-        """Get current total value from live LTP."""
-        total_value = 0.0
-        chain = self.dm.option_chain
+        total        = 0.0
+        expiry_chain = self.dm.get_chain_for_expiry(
+            position.expiry_date
+        )
         for leg in position.legs:
-            ltp = (
-                chain.get(leg.strike, {})
+            opt_data = (
+                expiry_chain
+                .get(leg.strike, {})
                 .get(leg.option_type, {})
-                .get("ltp", 0)
             )
-            if ltp == 0:
-                ltp = leg.entry_price
-            total_value += ltp * leg.qty
-        return total_value
+            # PATCH: prefer bid/ask midpoint over raw ltp —
+            # avoids a stale single-print ltp driving stop/target
+            # decisions for long straddle/strangle/backspread/etc.
+            bid = opt_data.get("bid", 0)
+            ask = opt_data.get("ask", 0)
+            ltp = opt_data.get("ltp", 0)
+            if bid > 0 and ask > 0:
+                mark = (bid + ask) / 2.0
+            elif ltp > 0:
+                mark = ltp
+            else:
+                mark = leg.entry_price
+            total += mark * leg.qty
+        return total
 
     def _get_position_current_premium(
         self, position: Position
     ) -> float:
-        """Get current total premium for credit strategies."""
-        total_premium = 0.0
-        chain = self.dm.option_chain
+        net          = 0.0
+        expiry_chain = self.dm.get_chain_for_expiry(
+            position.expiry_date
+        )
         for leg in position.legs:
+            opt_data = (
+                expiry_chain
+                .get(leg.strike, {})
+                .get(leg.option_type, {})
+            )
+            # PATCH: prefer bid/ask midpoint over raw ltp —
+            # profit-target/stop-loss decisions should not be
+            # driven by a stale single-print ltp.
+            bid = opt_data.get("bid", 0)
+            ask = opt_data.get("ask", 0)
+            ltp = opt_data.get("ltp", 0)
+            if bid > 0 and ask > 0:
+                mark = (bid + ask) / 2.0
+            elif ltp > 0:
+                mark = ltp
+            else:
+                mark = leg.entry_price
             if leg.action == "SELL":
-                ltp = (
-                    chain.get(leg.strike, {})
-                    .get(leg.option_type, {})
-                    .get("ltp", 0)
-                )
-                if ltp == 0:
-                    ltp = leg.entry_price
-                total_premium += ltp * leg.qty
-        return total_premium
+                net += mark * leg.qty
+            else:
+                net -= mark * leg.qty
+        return net
 
     def _get_portfolio_greeks(self) -> Dict[str, float]:
-        """Compute aggregate portfolio Greeks."""
         total_delta = 0.0
         total_gamma = 0.0
-        total_vega = 0.0
+        total_vega  = 0.0
         total_theta = 0.0
 
         for position in self.open_positions:
             for leg in position.legs:
                 sign = +1 if leg.action == "BUY" else -1
                 total_delta += (
-                    sign * leg.delta * leg.qty * config.LOT_SIZE
+                    sign * leg.delta * leg.qty
+                    * config.LOT_SIZE
                 )
                 total_gamma += (
-                    sign * leg.gamma * leg.qty * config.LOT_SIZE
+                    sign * leg.gamma * leg.qty
+                    * config.LOT_SIZE
                 )
-                total_vega += (
-                    sign * leg.vega * leg.qty * config.LOT_SIZE
+                total_vega  += (
+                    sign * leg.vega  * leg.qty
+                    * config.LOT_SIZE
                 )
                 total_theta += (
-                    sign * leg.theta * leg.qty * config.LOT_SIZE
+                    sign * leg.theta * leg.qty
+                    * config.LOT_SIZE
                 )
 
         return {
@@ -3584,52 +4791,97 @@ class StrategyEngine:
     def _estimate_greeks_impact(
         self, legs: List[Leg]
     ) -> Dict[str, float]:
-        """Estimate Greeks impact of new legs on portfolio."""
-        delta = 0.0
-        gamma = 0.0
-        vega = 0.0
-        theta = 0.0
+        delta = gamma = vega = theta = 0.0
         for leg in legs:
-            sign = +1 if leg.action == "BUY" else -1
-            delta += sign * leg.delta * leg.qty * config.LOT_SIZE
-            gamma += sign * leg.gamma * leg.qty * config.LOT_SIZE
-            vega  += sign * leg.vega  * leg.qty * config.LOT_SIZE
-            theta += sign * leg.theta * leg.qty * config.LOT_SIZE
+            sign   = +1 if leg.action == "BUY" else -1
+            delta += (
+                sign * leg.delta * leg.qty * config.LOT_SIZE
+            )
+            gamma += (
+                sign * leg.gamma * leg.qty * config.LOT_SIZE
+            )
+            vega  += (
+                sign * leg.vega  * leg.qty * config.LOT_SIZE
+            )
+            theta += (
+                sign * leg.theta * leg.qty * config.LOT_SIZE
+            )
         return {
             "delta": delta, "gamma": gamma,
-            "vega": vega, "theta": theta,
+            "vega": vega,   "theta": theta,
         }
+
+    def _leg_price(self, leg: Leg) -> float:
+        if leg.entry_price and leg.entry_price > 0:
+            return leg.entry_price
+        expiry_chain = self.dm.get_chain_for_expiry(
+            leg.expiry
+        )
+        ltp = (
+            expiry_chain
+            .get(leg.strike, {})
+            .get(leg.option_type, {})
+            .get("ltp", 0)
+        )
+        return float(ltp or 0)
 
     def _estimate_max_loss(
         self, strategy_name: str, legs: List[Leg]
     ) -> float:
-        """Estimate maximum possible loss for strategy."""
         if strategy_name == config.STRAT_SHORT_STRADDLE:
             total_prem = sum(
-                l.entry_price for l in legs
+                self._leg_price(l) for l in legs
                 if l.action == "SELL"
             )
-            return (
-                total_prem * config.STRADDLE_STOP_PCT
-                * config.LOT_SIZE
-            )
+            return total_prem * 1.0 * config.LOT_SIZE
+
         elif strategy_name == config.STRAT_IRON_CONDOR:
             net_credit = (
-                sum(l.entry_price for l in legs if l.action == "SELL")
-                - sum(l.entry_price for l in legs if l.action == "BUY")
+                sum(
+                    self._leg_price(l) for l in legs
+                    if l.action == "SELL"
+                )
+                - sum(
+                    self._leg_price(l) for l in legs
+                    if l.action == "BUY"
+                )
             )
             return (
                 config.CONDOR_WING_WIDTH - net_credit
             ) * config.LOT_SIZE
+
         elif strategy_name == config.STRAT_CREDIT_SPREADS:
             net_credit = (
-                sum(l.entry_price for l in legs if l.action == "SELL")
-                - sum(l.entry_price for l in legs if l.action == "BUY")
+                sum(
+                    self._leg_price(l) for l in legs
+                    if l.action == "SELL"
+                )
+                - sum(
+                    self._leg_price(l) for l in legs
+                    if l.action == "BUY"
+                )
             )
-            spread_width = config.CONDOR_WING_WIDTH / 2
+            sell_strikes = [
+                l.strike for l in legs
+                if l.action == "SELL"
+            ]
+            buy_strikes  = [
+                l.strike for l in legs
+                if l.action == "BUY"
+            ]
+            if sell_strikes and buy_strikes:
+                spread_width = max(
+                    abs(s - b)
+                    for s in sell_strikes
+                    for b in buy_strikes
+                )
+            else:
+                spread_width = config.CONDOR_WING_WIDTH / 2
             return max(
-                0, (spread_width - net_credit) * config.LOT_SIZE
+                0,
+                (spread_width - net_credit) * config.LOT_SIZE,
             )
+
         elif strategy_name in [
             config.STRAT_LONG_STRADDLE,
             config.STRAT_STRANGLE,
@@ -3638,86 +4890,108 @@ class StrategyEngine:
             config.STRAT_DEFENSIVE,
         ]:
             total_debit = (
-                sum(l.entry_price for l in legs if l.action == "BUY")
-                - sum(l.entry_price for l in legs if l.action == "SELL")
+                sum(
+                    self._leg_price(l) * l.qty
+                    for l in legs
+                    if l.action == "BUY"
+                )
+                - sum(
+                    self._leg_price(l) * l.qty
+                    for l in legs
+                    if l.action == "SELL"
+                )
             )
             return max(0, total_debit * config.LOT_SIZE)
+
         elif strategy_name == config.STRAT_RATIO_SPREAD:
             total_debit = (
-                sum(l.entry_price for l in legs if l.action == "BUY")
-                - sum(l.entry_price for l in legs if l.action == "SELL")
+                sum(
+                    self._leg_price(l) * l.qty
+                    for l in legs
+                    if l.action == "BUY"
+                )
+                - sum(
+                    self._leg_price(l) * l.qty
+                    for l in legs
+                    if l.action == "SELL"
+                )
             )
-            return max(0, total_debit * 2 * config.LOT_SIZE)
+            return max(
+                0, total_debit * 2 * config.LOT_SIZE
+            )
+
         return float(config.MAX_RISK_PER_TRADE)
 
-    def _check_greeks_limits(self) -> None:
-        """Check portfolio Greeks against regime limits."""
+
+    async def _check_greeks_limits(self) -> None:
+        """Check Greeks. Skip when no positions open."""
+        if not self.open_positions:
+            return
         regime = self.re.confirmed_regime
         limits = config.GREEKS_LIMITS.get(regime, {})
         greeks = self._get_portfolio_greeks()
-
-        delta_max = limits.get("delta_max", 99)
-        if abs(greeks["delta"]) > delta_max:
+        # PATCH: delta_max/gamma_max in GREEKS_LIMITS are per-lot
+        # normalized fractions; portfolio greeks are LOT_SIZE
+        # scaled. Normalize before compare (vega/theta stay in
+        # absolute rupee terms, unchanged).
+        delta_norm = greeks['delta'] / config.LOT_SIZE
+        gamma_norm = greeks['gamma'] / config.LOT_SIZE
+        delta_max = limits.get('delta_max', 99)
+        if abs(delta_norm) > delta_max:
             logger.warning(
-                f"Delta breach: {greeks['delta']:.3f} "
-                f"> limit={delta_max} — scheduling hedge"
+                f'Delta breach: {delta_norm:.3f} > {delta_max}'
             )
-            asyncio.create_task(
-                self._hedge_delta(
-                    greeks["delta"], delta_max
-                )
+            await self._hedge_delta(
+                greeks['delta'], delta_max * config.LOT_SIZE
             )
-
-        gamma_max = limits.get("gamma_max", 99)
-        gamma_min = limits.get("gamma_min", -99)
-        if gamma_min is not None and greeks["gamma"] < gamma_min:
+        gamma_max = limits.get('gamma_max')
+        gamma_min = limits.get('gamma_min')
+        if gamma_min is not None and gamma_norm < gamma_min:
             logger.warning(
-                f"Gamma below minimum: "
-                f"{greeks['gamma']:.5f} < {gamma_min}"
+                f'Gamma below min: {gamma_norm:.5f} < {gamma_min}'
             )
-        if gamma_max is not None and greeks["gamma"] > gamma_max:
+        if gamma_max is not None and gamma_norm > gamma_max:
             logger.warning(
-                f"Gamma above maximum: "
-                f"{greeks['gamma']:.5f} > {gamma_max}"
+                f'Gamma above max: {gamma_norm:.5f} > {gamma_max}'
             )
-
-        vega_max = limits.get("vega_max", 99999)
-        vega_min = limits.get("vega_min", -99999)
-        if vega_min is not None and greeks["vega"] < vega_min:
+        vega_min = limits.get('vega_min')
+        if vega_min is not None and greeks['vega'] < vega_min:
             logger.warning(
-                f"Vega below minimum: "
-                f"{greeks['vega']:.1f} < {vega_min}"
+                f'Vega below min: {greeks["vega"]:.1f} < {vega_min}'
             )
-
-        theta_min = limits.get("theta_min")
-        if theta_min is not None:
-            if greeks["theta"] < theta_min:
-                logger.warning(
-                    f"Theta below minimum: "
-                    f"{greeks['theta']:.1f} < {theta_min}"
-                )
-
+        theta_min = limits.get('theta_min')
+        if theta_min is not None and greeks['theta'] < theta_min:
+            logger.warning(
+                f'Theta below min: {greeks["theta"]:.1f} < {theta_min}'
+            )
     async def _hedge_delta(
         self, current_delta: float, delta_limit: float
     ) -> None:
-        """Hedge excess delta using Nifty futures."""
         excess = abs(current_delta) - delta_limit
         if excess <= 0:
             return
 
-        futures_lots = math.ceil(excess / 1.0)
-        action = "SELL" if current_delta > delta_limit else "BUY"
+        # PATCH: excess is in LOT_SIZE-scaled delta-share units;
+        # dividing by 1.0 (previous code) ordered ~LOT_SIZE times
+        # too many futures lots. Divide by LOT_SIZE for an actual
+        # futures-lot count.
+        futures_lots = math.ceil(excess / config.LOT_SIZE)
+        action       = (
+            "SELL" if current_delta > delta_limit else "BUY"
+        )
 
         if config.PAPER_TRADING_MODE:
             logger.info(
                 f"Paper delta hedge: {action} "
                 f"{futures_lots} Nifty futures "
-                f"current_delta={current_delta:.3f}"
+                f"delta={current_delta:.3f}"
             )
             return
 
         payload = {
-            "quantity":           futures_lots * config.LOT_SIZE,
+            "quantity":           (
+                futures_lots * config.LOT_SIZE
+            ),
             "product":            "D",
             "validity":           "DAY",
             "price":              0,
@@ -3733,7 +5007,7 @@ class StrategyEngine:
                 config.EP_ORDER_PLACE, payload
             )
             logger.info(
-                f"Delta hedge placed: {action} "
+                f"Delta hedge: {action} "
                 f"{futures_lots} lots"
             )
         except Exception as e:
@@ -3742,12 +5016,13 @@ class StrategyEngine:
     async def _reduce_position_50pct(
         self, position: Position
     ) -> None:
-        """Reduce all short legs by 50%."""
         for idx, leg in enumerate(position.legs):
             if leg.action == "SELL":
-                reduce_qty = math.floor(leg.qty * 0.50)
-                if reduce_qty < 1:
-                    continue
+                reduce_qty = max(
+                    1, math.floor(leg.qty * 0.50)
+                )
+                if reduce_qty > leg.qty:
+                    reduce_qty = leg.qty
                 close_leg = Leg(
                     instrument_key=leg.instrument_key,
                     option_type=leg.option_type,
@@ -3763,7 +5038,10 @@ class StrategyEngine:
                     leg_index=idx,
                 )
                 if success:
-                    leg.qty -= reduce_qty
+                    # PATCH: use the ACTUAL filled amount
+                    # (close_leg.qty, adjusted down on a partial
+                    # fill), not the originally requested amount.
+                    leg.qty -= close_leg.qty
                 await asyncio.sleep(
                     config.ORDER_BETWEEN_LEGS_DELAY_SEC
                 )
@@ -3772,12 +5050,13 @@ class StrategyEngine:
     async def _reduce_position_pct(
         self, position: Position, pct: float
     ) -> None:
-        """Reduce all short legs by given percentage."""
         for idx, leg in enumerate(position.legs):
             if leg.action == "SELL":
-                reduce_qty = math.floor(leg.qty * pct)
-                if reduce_qty < 1:
-                    continue
+                reduce_qty = max(
+                    1, math.floor(leg.qty * pct)
+                )
+                if reduce_qty > leg.qty:
+                    reduce_qty = leg.qty
                 close_leg = Leg(
                     instrument_key=leg.instrument_key,
                     option_type=leg.option_type,
@@ -3789,11 +5068,14 @@ class StrategyEngine:
                 success, _ = await self._place_single_leg(
                     close_leg,
                     use_market=False,
-                    trade_id=f"reduce-pct-{position.trade_id}",
+                    trade_id=(
+                        f"reduce-pct-{position.trade_id}"
+                    ),
                     leg_index=idx,
                 )
                 if success:
-                    leg.qty -= reduce_qty
+                    # PATCH: use the ACTUAL filled amount.
+                    leg.qty -= close_leg.qty
                 await asyncio.sleep(
                     config.ORDER_BETWEEN_LEGS_DELAY_SEC
                 )
@@ -3801,52 +5083,58 @@ class StrategyEngine:
     async def _convert_shorts_to_spreads(
         self, position: Position
     ) -> None:
-        """Add hedge legs to convert naked shorts into spreads."""
-        chain = self.dm.option_chain
         for idx, leg in enumerate(position.legs):
             if leg.action == "SELL":
-                if leg.option_type == "put":
-                    hedge_strike = (
-                        leg.strike - config.CONDOR_WING_WIDTH // 3
-                    )
-                else:
-                    hedge_strike = (
-                        leg.strike + config.CONDOR_WING_WIDTH // 3
-                    )
-
-                hedge_strike = (
-                    round(
-                        hedge_strike / config.NIFTY_STRIKE_STEP
-                    ) * config.NIFTY_STRIKE_STEP
+                hedge_strike = self.dm.get_strike_by_delta(
+                    leg.option_type, 0.10,
+                    expiry=leg.expiry,
                 )
 
-                if hedge_strike not in chain:
+                if hedge_strike is None:
+                    continue
+
+                expiry_chain = self.dm.get_chain_for_expiry(
+                    leg.expiry
+                )
+                if hedge_strike not in expiry_chain:
                     continue
 
                 hedge_leg = Leg(
-                    instrument_key=chain[hedge_strike][
-                        leg.option_type
-                    ]["instrument_key"],
+                    instrument_key=expiry_chain[
+                        hedge_strike
+                    ][leg.option_type]["instrument_key"],
                     option_type=leg.option_type,
                     action="BUY",
                     strike=hedge_strike,
                     expiry=leg.expiry,
                     qty=leg.qty,
-                    delta=chain[hedge_strike][leg.option_type]["delta"],
-                    gamma=chain[hedge_strike][leg.option_type]["gamma"],
-                    vega=chain[hedge_strike][leg.option_type]["vega"],
-                    theta=chain[hedge_strike][leg.option_type]["theta"],
+                    delta=expiry_chain[hedge_strike][
+                        leg.option_type
+                    ]["delta"],
+                    gamma=expiry_chain[hedge_strike][
+                        leg.option_type
+                    ]["gamma"],
+                    vega=expiry_chain[hedge_strike][
+                        leg.option_type
+                    ]["vega"],
+                    theta=expiry_chain[hedge_strike][
+                        leg.option_type
+                    ]["theta"],
                 )
-                success, order_id = await self._place_single_leg(
-                    hedge_leg,
-                    use_market=False,
-                    trade_id=f"convert-{position.trade_id}",
-                    leg_index=idx,
+                success, order_id = (
+                    await self._place_single_leg(
+                        hedge_leg,
+                        use_market=False,
+                        trade_id=(
+                            f"convert-{position.trade_id}"
+                        ),
+                        leg_index=idx,
+                    )
                 )
                 if success:
                     position.legs.append(hedge_leg)
                     logger.info(
-                        f"Converted short {leg.strike} to spread "
+                        f"Converted {leg.strike} to spread "
                         f"with hedge at {hedge_strike}"
                     )
                 await asyncio.sleep(
@@ -3856,30 +5144,20 @@ class StrategyEngine:
     def _move_stop_to_breakeven(
         self, position: Position
     ) -> None:
-        """Move stop loss to breakeven."""
-        if position.strategy_name == config.STRAT_SHORT_STRADDLE:
+        if position.strategy_name == (
+            config.STRAT_SHORT_STRADDLE
+        ):
             position.stop_loss = position.entry_spot
-            logger.info(
-                f"Stop moved to breakeven: "
-                f"{position.entry_spot:.2f} "
-                f"for {position.trade_id[:8]}"
-            )
         elif position.strategy_name in [
             config.STRAT_IRON_CONDOR,
             config.STRAT_CREDIT_SPREADS,
         ]:
             position.stop_loss = 0.0
-            logger.info(
-                f"Stop moved to breakeven (credit recovered) "
-                f"for {position.trade_id[:8]}"
-            )
 
     async def _emergency_flatten_all(self) -> None:
-        """Emergency close all positions at market."""
         logger.critical(
-            "EMERGENCY: Flattening all positions at market"
+            "EMERGENCY: Flattening all positions"
         )
-        # CRITICAL FIX 2: Cancel all open orders first
         await self.cancel_all_open_orders(
             context="EMERGENCY_FLATTEN"
         )
@@ -3889,24 +5167,20 @@ class StrategyEngine:
                 config.EXIT_REASONS["CIRCUIT_BREAK"],
                 use_market=True,
             )
-        logger.critical("All positions flattened")
 
     async def _reduce_all_positions_50pct(self) -> None:
-        """Reduce all open positions by 50% (CB Level 3)."""
-        logger.warning("CB L3: Reducing all positions by 50%")
+        logger.warning("CB L3: Reducing all by 50%")
         for position in list(self.open_positions):
             await self._reduce_position_50pct(position)
 
     async def _execute_reductions(
         self, reduction_legs: List[Dict]
     ) -> bool:
-        """Execute short leg reductions for defensive hedge."""
         for idx, item in enumerate(reduction_legs):
-            leg = item["leg"]
+            leg        = item["leg"]
             reduce_qty = item["reduce_qty"]
             if reduce_qty < 1:
                 continue
-
             close_leg = Leg(
                 instrument_key=leg.instrument_key,
                 option_type=leg.option_type,
@@ -3918,15 +5192,16 @@ class StrategyEngine:
             success, _ = await self._place_single_leg(
                 close_leg,
                 use_market=True,
-                trade_id=f"defensive-reduce-{idx}",
+                trade_id=f"def-reduce-{idx}",
                 leg_index=idx,
             )
             if not success:
                 logger.warning(
-                    f"Reduction failed for strike={leg.strike}"
+                    f"Reduction failed: {leg.strike}"
                 )
                 return False
-            leg.qty -= reduce_qty
+            # PATCH: use the ACTUAL filled amount.
+            leg.qty -= close_leg.qty
             await asyncio.sleep(
                 config.ORDER_BETWEEN_LEGS_DELAY_SEC
             )
@@ -3934,11 +5209,10 @@ class StrategyEngine:
 
     async def _close_one_side(
         self,
-        position: Position,
+        position:    Position,
         option_type: str,
         exit_reason: str,
     ) -> None:
-        """Close only one side of a multi-leg position."""
         side_legs = [
             l for l in position.legs
             if l.option_type == option_type
@@ -3955,39 +5229,121 @@ class StrategyEngine:
                 expiry=leg.expiry,
                 qty=leg.qty,
             )
-            asyncio.create_task(
-                self._place_single_leg(
-                    close_leg,
-                    use_market=True,
-                    trade_id=f"oneside-{position.trade_id}",
-                    leg_index=idx,
-                )
+            success, _ = await self._place_single_leg(
+                close_leg,
+                use_market=True,
+                trade_id=f"oneside-{position.trade_id}",
+                leg_index=idx,
             )
+            if success:
+                # PATCH: previously only exit_price was set here,
+                # leaving qty/fill_status unchanged. That caused
+                # this side to be re-detected as "still open" on
+                # every later cycle (duplicate close orders) and
+                # risked a wrong-direction order at final close.
+                # We now bank this leg's realized pnl/cost and
+                # fully mark it closed.
+                # PATCH: use close_leg.qty (the ACTUAL filled
+                # amount, adjusted down on a partial fill) instead
+                # of leg.qty (originally requested), and reduce
+                # leg.qty by that amount instead of flatly
+                # zeroing it, so a partial one-side close leaves
+                # the correct remaining quantity tracked.
+                exit_price = close_leg.entry_price
+                qty_closed = close_leg.qty
+                if qty_closed <= 0:
+                    continue
+                if leg.action == "SELL":
+                    leg_pnl = (
+                        (leg.entry_price - exit_price)
+                        * qty_closed * config.LOT_SIZE
+                    )
+                else:
+                    leg_pnl = (
+                        (exit_price - leg.entry_price)
+                        * qty_closed * config.LOT_SIZE
+                    )
+                # PATCH: now includes STT/SEBI/stamp/GST,
+                # matching _calculate_transaction_costs() (was
+                # only brokerage + exchange fee before).
+                _leg_value = (
+                    exit_price * qty_closed * config.LOT_SIZE
+                )
+                _leg_brokerage = 20.0
+                _leg_exchange = _leg_value * 0.0000325
+                _leg_sebi = _leg_value * 0.000001
+                if leg.action == "SELL":
+                    _leg_stt = 0.0
+                    _leg_stamp = _leg_value * 0.00015
+                else:
+                    _leg_stt = _leg_value * 0.001
+                    _leg_stamp = 0.0
+                _leg_gst = (
+                    _leg_brokerage + _leg_exchange
+                ) * 0.18
+                leg_cost = (
+                    _leg_brokerage + _leg_exchange
+                    + _leg_sebi + _leg_stt + _leg_stamp
+                    + _leg_gst
+                )
+                position.banked_pnl   += leg_pnl
+                position.banked_costs += leg_cost
+                leg.exit_price  = exit_price
+                leg.qty        -= qty_closed
+                if leg.qty <= 0:
+                    leg.qty         = 0
+                    leg.fill_status = "CLOSED_ONE_SIDE"
+                else:
+                    leg.fill_status = (
+                        "PARTIALLY_CLOSED_ONE_SIDE"
+                    )
+                    logger.warning(
+                        f"Partial one-side close: "
+                        f"{leg.option_type} {leg.strike} "
+                        f"remaining_qty={leg.qty}"
+                    )
         logger.info(
             f"Closed {option_type} side of "
-            f"{position.trade_id[:8]} reason={exit_reason}"
+            f"{position.trade_id[:8]}"
         )
 
     async def _reconcile_with_broker(self) -> None:
-        """Reconcile local positions with broker on startup."""
+        """
+        Reconcile local positions with broker.
+        FIX PS10: skips when broker returns empty list.
+        """
         if config.PAPER_TRADING_MODE:
             return
-
         try:
             broker_positions = await self.dm._api_get(
                 config.EP_POSITIONS, {}
             )
             if not broker_positions:
+                logger.info(
+                    "Reconciliation: no broker positions "
+                    "— skipping"
+                )
                 return
 
-            broker_map: Dict[str, int] = {}
             pos_list = (
                 broker_positions
                 if isinstance(broker_positions, list)
                 else broker_positions.get("data", [])
             )
+
+            if not pos_list:
+                logger.info(
+                    "Reconciliation: empty position list "
+                    "— skipping"
+                )
+                return
+
+            broker_map: Dict[str, int] = {}
             for pos in pos_list:
-                key = pos.get("instrument_token", "")
+                key = (
+                    pos.get("instrument_key", "")
+                    or pos.get("instrument_token", "")
+                )
                 qty = int(pos.get("quantity", 0))
                 if key and qty != 0:
                     broker_map[key] = qty
@@ -3997,24 +5353,29 @@ class StrategyEngine:
                     broker_qty = broker_map.get(
                         leg.instrument_key, 0
                     )
-                    local_qty = leg.qty * config.LOT_SIZE
+                    local_qty  = leg.qty * config.LOT_SIZE
 
                     if broker_qty == 0 and local_qty != 0:
                         logger.warning(
-                            f"Position mismatch: local has "
-                            f"{local_qty} units but broker has 0 "
-                            f"for {leg.instrument_key}"
+                            f"Mismatch: local={local_qty} "
+                            f"broker=0 "
+                            f"{leg.instrument_key}"
                         )
-                        leg.qty = 0
+                        leg.qty         = 0
                         leg.fill_status = "CLOSED_EXTERNALLY"
-                    elif broker_qty != 0 and abs(broker_qty) != local_qty:
+                    elif (
+                        broker_qty != 0
+                        and abs(broker_qty) != local_qty
+                    ):
                         logger.warning(
-                            f"Qty mismatch: local={local_qty} "
-                            f"broker={abs(broker_qty)} — "
-                            f"broker wins"
+                            f"Qty mismatch: "
+                            f"local={local_qty} "
+                            f"broker={abs(broker_qty)} "
+                            f"— broker wins"
                         )
                         leg.qty = (
-                            abs(broker_qty) // config.LOT_SIZE
+                            abs(broker_qty)
+                            // config.LOT_SIZE
                         )
 
             logger.info("Broker reconciliation complete")
@@ -4025,15 +5386,13 @@ class StrategyEngine:
     def _create_position_record(
         self,
         strategy_name: str,
-        legs: List[Leg],
-        meta: Dict,
-        trade_id: str = "",
+        legs:          List[Leg],
+        meta:          Dict,
+        trade_id:      str = "",
     ) -> Position:
-        """Create a Position dataclass from strategy legs and meta."""
         if not trade_id:
             trade_id = str(uuid.uuid4())
-        IST = pytz.timezone(config.TZ)
-        now = datetime.now(IST).isoformat()
+        now = datetime.now(self._IST).isoformat()
 
         total_credit = sum(
             l.entry_price * l.qty
@@ -4046,7 +5405,7 @@ class StrategyEngine:
         net_premium = total_credit - total_debit
 
         expiry_date = legs[0].expiry if legs else ""
-        dte = 0
+        dte         = 0
         if expiry_date:
             try:
                 dte = (
@@ -4063,7 +5422,7 @@ class StrategyEngine:
             regime_at_entry=self.re.confirmed_regime,
             entry_timestamp=now,
             entry_spot=self.dm.spot or 0.0,
-            entry_vix=self.dm.vix or 0.0,
+            entry_vix=self.dm.vix   or 0.0,
             legs=legs,
             stop_loss=meta.get("stop_loss", 0.0),
             profit_target=meta.get("profit_target", 0.0),
@@ -4081,21 +5440,26 @@ class StrategyEngine:
             net_premium=net_premium,
             max_risk=meta.get("max_risk", 0.0),
             paper_trade=config.PAPER_TRADING_MODE,
-            trend_direction=meta.get("trend_direction", 0.0),
-            meta=meta,
+            trend_direction=meta.get(
+                "trend_direction", 0.0
+            ),
+            margin_estimate=meta.get("margin_estimate", 0.0),
+            meta=copy.deepcopy(meta),
         )
 
-    def _position_to_dict(self, position: Position) -> Dict:
-        """Convert Position to dictionary for SQLite/CSV storage."""
-        IST = pytz.timezone(config.TZ)
-
+    def _position_to_dict(
+        self, position: Position
+    ) -> Dict:
         holding_days = 0
-        if position.exit_timestamp and position.entry_timestamp:
+        if (
+            position.exit_timestamp
+            and position.entry_timestamp
+        ):
             try:
                 entry_dt = datetime.fromisoformat(
                     position.entry_timestamp
                 )
-                exit_dt = datetime.fromisoformat(
+                exit_dt  = datetime.fromisoformat(
                     position.exit_timestamp
                 )
                 holding_days = (exit_dt - entry_dt).days
@@ -4105,17 +5469,20 @@ class StrategyEngine:
         slippage_total = sum(
             l.slippage_pts for l in position.legs
         )
-
-        # HIGH FIX 4: Include transaction costs in dict
-        tx_costs = self._calculate_transaction_costs(position)
+        tx_costs  = self._calculate_transaction_costs(
+            position
+        )
         gross_pnl = position.realized_pnl
-        net_pnl = gross_pnl - tx_costs
+        net_pnl   = gross_pnl - tx_costs
 
         return {
             "trade_id":                   position.trade_id,
             "strategy_name":              position.strategy_name,
             "regime_at_entry":            position.regime_at_entry,
-            "regime_at_exit":             self.re.confirmed_regime,
+            "regime_at_exit":             (
+                position.regime_at_exit
+                or self.re.confirmed_regime
+            ),
             "entry_timestamp":            position.entry_timestamp,
             "exit_timestamp":             position.exit_timestamp,
             "holding_days":               holding_days,
@@ -4131,6 +5498,7 @@ class StrategyEngine:
                 "exit_price":     l.exit_price,
                 "option_type":    l.option_type,
                 "strike":         l.strike,
+                "expiry":         l.expiry,
                 "order_tag":      l.order_tag,
             } for l in position.legs]),
             "total_credit_received":      position.total_credit,
@@ -4157,14 +5525,18 @@ class StrategyEngine:
             "max_hold_date":              position.max_hold_date,
         }
 
+    # ─────────────────────────────────────────────────────────────
+    # Helper methods
+    # ─────────────────────────────────────────────────────────────
+
     def _get_short_strike(
         self, position: Position, option_type: str
     ) -> Optional[float]:
-        """Get strike of short leg for given option type."""
         for leg in position.legs:
             if (
                 leg.action == "SELL"
                 and leg.option_type == option_type
+                and leg.qty > 0   # PATCH: ignore already-closed legs
             ):
                 return leg.strike
         return None
@@ -4172,25 +5544,22 @@ class StrategyEngine:
     def _get_upper_wing_strike(
         self, position: Position
     ) -> Optional[float]:
-        """Get highest BUY put strike."""
-        put_strikes = [
+        strikes = [
             l.strike for l in position.legs
             if l.option_type == "put" and l.action == "BUY"
         ]
-        return max(put_strikes) if put_strikes else None
+        return max(strikes) if strikes else None
 
     def _get_lower_wing_strike(
         self, position: Position
     ) -> Optional[float]:
-        """Get lowest BUY put strike."""
-        put_strikes = [
+        strikes = [
             l.strike for l in position.legs
             if l.option_type == "put" and l.action == "BUY"
         ]
-        return min(put_strikes) if put_strikes else None
+        return min(strikes) if strikes else None
 
     def _has_short_positions(self) -> bool:
-        """Check if any open position has short legs."""
         return any(
             leg.action == "SELL"
             for pos in self.open_positions
@@ -4198,65 +5567,69 @@ class StrategyEngine:
         )
 
     def _gamma_above_50pct_limit(self) -> bool:
-        """Check if portfolio gamma exceeds 50% of regime minimum."""
-        regime = self.re.confirmed_regime
-        limits = config.GREEKS_LIMITS.get(regime, {})
+        regime    = self.re.confirmed_regime
+        limits    = config.GREEKS_LIMITS.get(regime, {})
         gamma_min = limits.get("gamma_min", -99)
         if gamma_min is None:
             return False
-        greeks = self._get_portfolio_greeks()
+        greeks    = self._get_portfolio_greeks()
         threshold = gamma_min * 0.50
         return greeks["gamma"] < threshold
 
     def _get_25d_put_iv(self) -> float:
-        """Get implied volatility of 25-delta put."""
         strike = self.dm.get_strike_by_delta("put", 0.25)
         if strike is None:
             return 0.0
+        active = self.dm.get_active_chain()
         return float(
-            self.dm.option_chain.get(strike, {})
-            .get("put", {}).get("iv", 0.0)
+            active.get(strike, {})
+            .get("put", {})
+            .get("iv", 0.0)
         )
 
     def _get_25d_call_iv(self) -> float:
-        """Get implied volatility of 25-delta call."""
         strike = self.dm.get_strike_by_delta("call", 0.25)
         if strike is None:
             return 0.0
+        active = self.dm.get_active_chain()
         return float(
-            self.dm.option_chain.get(strike, {})
-            .get("call", {}).get("iv", 0.0)
+            active.get(strike, {})
+            .get("call", {})
+            .get("iv", 0.0)
         )
 
     def _get_otm_bid_ask(self, option_type: str) -> float:
-        """Get bid-ask spread for event strangle delta strike."""
         strike = self.dm.get_strike_by_delta(
             option_type, config.EVENT_STRANGLE_DELTA
         )
         if strike is None:
             return 99.0
-        opt = (
-            self.dm.option_chain.get(strike, {})
-            .get(option_type, {})
+        active = self.dm.get_active_chain()
+        opt    = active.get(strike, {}).get(
+            option_type, {}
         )
-        return float(opt.get("ask", 99) - opt.get("bid", 0))
+        return float(
+            opt.get("ask", 99) - opt.get("bid", 0)
+        )
 
     def _get_ema_200(self) -> float:
-        """Compute EMA(200) from candle closes."""
-        if len(self.dm.candles_15m) < 200:
+        if len(self.dm.candles_30m) < 200:
             return self.dm.spot or 0.0
-        closes = [c["close"] for c in self.dm.candles_15m]
-        ema = pd.Series(closes).ewm(
+        closes = [
+            c["close"] for c in self.dm.candles_30m
+        ]
+        ema    = pd.Series(closes).ewm(
             span=200, adjust=False
         ).mean()
         return float(ema.iloc[-1])
 
     def _compute_ema_n(self, period: int) -> float:
-        """Compute EMA of given period from candle closes."""
-        if len(self.dm.candles_15m) < period:
+        if len(self.dm.candles_30m) < period:
             return self.dm.spot or 0.0
-        closes = [c["close"] for c in self.dm.candles_15m]
-        ema = pd.Series(closes).ewm(
+        closes = [
+            c["close"] for c in self.dm.candles_30m
+        ]
+        ema    = pd.Series(closes).ewm(
             span=period, adjust=False
         ).mean()
         return float(ema.iloc[-1])
@@ -4264,7 +5637,6 @@ class StrategyEngine:
     def _get_dte_for_target(
         self, min_dte: int, max_dte: int
     ) -> Optional[int]:
-        """Get DTE for target expiry range."""
         expiry = self.dm.get_expiry_by_dte(
             (min_dte + max_dte) // 2,
             tolerance=(max_dte - min_dte) // 2,
@@ -4281,39 +5653,35 @@ class StrategyEngine:
             return None
 
     def _save_all_positions_to_sqlite(self) -> None:
-        """Persist all open positions to SQLite."""
         for position in self.open_positions:
             self.dm.save_position(
                 self._position_to_dict(position)
             )
 
     def _log_portfolio_summary(self) -> None:
-        """Log formatted portfolio summary."""
         greeks = self._get_portfolio_greeks()
         logger.info(
             f"\n{'=' * 60}\n"
             f"PORTFOLIO SUMMARY\n"
-            f"Open Positions : {len(self.open_positions)}\n"
-            f"Daily P&L (net): ₹{self.daily_pnl:,.2f}\n"
+            f"Open Positions  : {len(self.open_positions)}\n"
+            f"Daily P&L (net) : ₹{self.daily_pnl:,.2f}\n"
             f"Weekly P&L (net): ₹{self.weekly_pnl:,.2f}\n"
-            f"Capital        : ₹{self.current_capital:,.2f}\n"
-            f"Peak Capital   : ₹{self.peak_capital:,.2f}\n"
-            f"Delta          : {greeks['delta']:.3f}\n"
-            f"Gamma          : {greeks['gamma']:.5f}\n"
-            f"Vega           : ₹{greeks['vega']:,.0f}\n"
-            f"Theta          : ₹{greeks['theta']:,.0f}/day\n"
-            f"CB L2 Active   : {self.cb_level_2_active}\n"
-            f"Kill Switch    : {self.kill_switch_active}\n"
+            f"Capital         : ₹{self.current_capital:,.2f}\n"
+            f"Peak Capital    : ₹{self.peak_capital:,.2f}\n"
+            f"Delta           : {greeks['delta']:.3f}\n"
+            f"Gamma           : {greeks['gamma']:.5f}\n"
+            f"Vega            : ₹{greeks['vega']:,.0f}\n"
+            f"Theta           : ₹{greeks['theta']:,.0f}/day\n"
+            f"CB L2 Active    : {self.cb_level_2_active}\n"
+            f"Kill Switch     : {self.kill_switch_active}\n"
             f"{'=' * 60}"
         )
 
     def _log_circuit_breaker(
         self, level: int, trigger: str, action: str
     ) -> None:
-        """Log circuit breaker event to SQLite."""
         try:
-            IST = pytz.timezone(config.TZ)
-            conn = sqlite3.connect(self.db_path)
+            conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO circuit_breaker_log (
@@ -4321,7 +5689,7 @@ class StrategyEngine:
                     action, daily_pnl, drawdown, regime
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
-                datetime.now(IST).isoformat(),
+                datetime.now(self._IST).isoformat(),
                 level,
                 trigger,
                 action,
@@ -4333,32 +5701,31 @@ class StrategyEngine:
             conn.close()
         except sqlite3.Error as e:
             logger.warning(
-                f"_log_circuit_breaker SQLite error: {e}"
+                f"_log_circuit_breaker error: {e}"
             )
 
     def _load_positions_from_sqlite(self) -> None:
-        """Restore open positions from SQLite on startup."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT * FROM open_positions "
                 "WHERE status = 'OPEN'"
             )
-            rows = cursor.fetchall()
+            rows      = cursor.fetchall()
             col_names = [
-                desc[0] for desc in cursor.description
+                d[0] for d in cursor.description
             ]
             conn.close()
 
             if not rows:
                 logger.info(
-                    "No open positions to restore from SQLite"
+                    "No open positions to restore"
                 )
                 return
 
             for row in rows:
-                row_dict = dict(zip(col_names, row))
+                row_dict  = dict(zip(col_names, row))
                 legs_json = row_dict.get("legs_json", "[]")
                 try:
                     legs_data = json.loads(legs_json)
@@ -4376,7 +5743,10 @@ class StrategyEngine:
                         ),
                         action=l.get("side", "BUY"),
                         strike=float(l.get("strike", 0)),
-                        expiry=row_dict.get("expiry_date", ""),
+                        expiry=l.get(
+                            "expiry",
+                            row_dict.get("expiry_date", ""),
+                        ),
                         qty=int(l.get("qty", 1)),
                         entry_price=float(
                             l.get("entry_price", 0)
@@ -4415,7 +5785,9 @@ class StrategyEngine:
                         "max_hold_date"
                     ),
                     composite_at_entry=float(
-                        row_dict.get("composite_at_entry", 0)
+                        row_dict.get(
+                            "composite_at_entry", 0
+                        )
                     ),
                     vol_score=float(
                         row_dict.get("vol_score", 0)
@@ -4459,26 +5831,24 @@ class StrategyEngine:
                 )
 
             logger.info(
-                f"Restored {len(rows)} positions from SQLite"
+                f"Restored {len(rows)} positions"
             )
 
         except sqlite3.OperationalError:
-            logger.info("No state.db found — fresh start")
+            logger.info("No state.db — fresh start")
         except Exception as e:
             logger.warning(
                 f"_load_positions_from_sqlite error: {e}"
             )
 
     def reset_daily_state(self) -> None:
-        """Reset daily P&L and circuit breaker state."""
-        self.daily_pnl = 0.0
+        self.daily_pnl            = 0.0
         self.daily_trading_halted = False
-        self.cb_level_2_active = False
-        self.cb_level_1_count = 0
-        logger.info("Daily state reset complete")
+        self.cb_level_2_active    = False
+        self.cb_level_1_count     = 0
+        logger.info("Daily state reset")
 
     def reset_weekly_state(self) -> None:
-        """Reset weekly P&L and circuit breaker state."""
-        self.weekly_pnl = 0.0
+        self.weekly_pnl        = 0.0
         self.cb_level_3_active = False
-        logger.info("Weekly state reset complete")
+        logger.info("Weekly state reset")
