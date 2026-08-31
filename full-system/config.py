@@ -114,9 +114,16 @@ COST_STT_EXERCISE_PCT = 0.0015
 COST_EXCHANGE_PCT = 0.0003552
 
 # Parameter: COST_NSE_IPFT_PCT
-#   New value: 0.000000001 (Rs 0.01/crore/side) — economically
-#   negligible, modeled separately per architecture requirement
-#   (must not be silently folded into exchange charge).
+#   RESOLVED: reverted to Rs 0.01/crore/side (1e-9). Verified by
+#   direct arithmetic: 0.01 / 10,000,000 = 1e-9. The intermediate
+#   1e-6 value (from a round-2 audit claiming Rs 10/crore) was
+#   incorrect and has been reverted.
+#   NOTE: a later message also proposed changing
+#   COST_EXCHANGE_PCT (below) from 0.0003552 to 3.552e-5 for
+#   Rs 3,552/crore — that proposed change is itself off by a
+#   factor of 10 (10,000,000 x 0.0003552 = 3,552, which checks
+#   out exactly) and was NOT applied. COST_EXCHANGE_PCT remains
+#   0.0003552.
 #   Unit: % of total turnover, both sides   Effective: 01-Mar-2026
 COST_NSE_IPFT_PCT = 0.000000001
 

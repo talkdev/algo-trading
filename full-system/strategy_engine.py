@@ -1389,11 +1389,12 @@ class StrategyEngine:
         ipft         = total_turnover * config.COST_NSE_IPFT_PCT
         sebi         = total_turnover * config.COST_SEBI_PCT
         stamp        = buy_value * config.COST_STAMP_PCT
-        # GST applies ONLY to brokerage + exchange charge — not to
-        # STT, stamp duty, SEBI fee, or IPFT (unchanged from the
-        # original, already-correct logic).
+        # PATCH (NEW-5): GST base now includes SEBI turnover fee —
+        # standard broker contract notes apply GST to brokerage +
+        # exchange transaction charges + SEBI fee (never to STT or
+        # stamp duty, which are statutory levies, not services).
         gst          = (
-            brokerage + exchange_fee
+            brokerage + exchange_fee + sebi
         ) * config.COST_GST_PCT
 
         return round(
@@ -1413,7 +1414,16 @@ class StrategyEngine:
 
         for leg in position.legs:
             exit_price = leg.exit_price
-            if exit_price == 0:
+            # PATCH (S6): a leg explicitly marked
+            # EXPIRED_WORTHLESS was genuinely worth 0 at close —
+            # bypass both fallback layers below so its real P&L
+            # (full credit for a short, full debit loss for a
+            # long) isn't silently zeroed out by the entry_price
+            # fallback.
+            is_expired_worthless = (
+                leg.fill_status == "EXPIRED_WORTHLESS"
+            )
+            if exit_price == 0 and not is_expired_worthless:
                 # PATCH: prefer bid/ask midpoint over raw ltp when
                 # falling back (leg was never actually closed with
                 # a real fill price).
@@ -1428,7 +1438,7 @@ class StrategyEngine:
                     exit_price = (fb_bid + fb_ask) / 2.0
                 else:
                     exit_price = fallback_opt.get("ltp", 0)
-            if exit_price == 0:
+            if exit_price == 0 and not is_expired_worthless:
                 exit_price = leg.entry_price
 
             if leg.action == "SELL":
@@ -1585,9 +1595,15 @@ class StrategyEngine:
             # credit actually received on this position (debit
             # strategies have total_credit=0 and simply fall back
             # to the flat percentage, unchanged).
+            # PATCH (round-2, fixing my own earlier bug):
+            # position.total_credit is in "points x lots" units
+            # (no LOT_SIZE multiplication), not rupees — comparing
+            # it directly against a rupee threshold made the floor
+            # an effective no-op. Multiply by LOT_SIZE to convert
+            # to rupees before comparing.
             cb_l1_threshold = max(
                 config.CB_LEVEL_1_PCT * config.TOTAL_CAPITAL,
-                position.total_credit,
+                position.total_credit * config.LOT_SIZE,
             )
             if position_net_estimate < -cb_l1_threshold:
                 logger.critical(
@@ -2560,6 +2576,28 @@ class StrategyEngine:
                 meta.get("max_profit", 0.0) * lots
             )
 
+        # PATCH (NEW-2): authoritative post-sizing combined-risk
+        # check. _pre_trade_checks() runs BEFORE lot sizing, so it
+        # compares existing positions' TRUE (lot-scaled) max_risk
+        # against the new position's 1-lot-only estimate,
+        # understating the new position's contribution by a
+        # factor of `lots`. This uses the final, correctly-scaled
+        # max_risk to catch what the earlier check could miss.
+        current_risk = sum(
+            p.max_risk for p in self.open_positions
+        )
+        if (
+            current_risk + meta["max_risk"]
+            > config.MAX_COMBINED_RISK
+        ):
+            logger.info(
+                f"Entry aborted: combined risk limit would be "
+                f"breached — current={current_risk:.0f} "
+                f"new={meta['max_risk']:.0f} "
+                f"limit={config.MAX_COMBINED_RISK:.0f}"
+            )
+            return
+
         trade_id = str(uuid.uuid4())
 
         success = await self._execute_strategy(
@@ -2618,10 +2656,21 @@ class StrategyEngine:
         atr_contract = self.dm.is_atr_contracting()
         put_iv       = self._get_25d_put_iv()
         call_iv      = self._get_25d_call_iv()
-        skew_diff    = put_iv - call_iv
+        # PATCH (S3): put_iv/call_iv/forward_iv/vix are all stored
+        # as DECIMALS (e.g. 0.15 for 15%), but SPREAD_SKEW_THRESHOLD
+        # (2.0), RATIO_CONTANGO_THRESHOLD (1.5), and
+        # RATIO_SKEW_FLAT_THRESHOLD (0.5) are all clearly scaled in
+        # PERCENTAGE POINTS. Without this conversion, skew_diff/
+        # term_spread were ~0.005-0.02, making these thresholds
+        # unreachable — the ratio-spread branch was dead code and
+        # MILD_SELL always fell through to credit spreads. Convert
+        # to percentage points here.
+        skew_diff    = (put_iv - call_iv) * 100.0
         term_spread  = (
-            (self.dm.forward_iv or 0)
-            - (self.dm.vix or 0) / 100.0
+            (
+                (self.dm.forward_iv or 0)
+                - (self.dm.vix or 0) / 100.0
+            ) * 100.0
         )
         trend_score  = self.re.confirmed_trend
         iv_rank      = self.dm.compute_iv_rank()
@@ -4476,6 +4525,14 @@ class StrategyEngine:
                     )
                     # Mark as closed at 0 cost
                     leg.exit_price = 0.0
+                    # PATCH (S6): distinguish "genuinely expired
+                    # worthless" from "never closed, price
+                    # unknown" so _calculate_final_pnl doesn't
+                    # fall back to entry_price and silently zero
+                    # out this leg's real P&L (full credit
+                    # realized for a short leg, full debit lost
+                    # for a long leg).
+                    leg.fill_status = "EXPIRED_WORTHLESS"
                     continue
 
             close_action = (
@@ -5378,8 +5435,10 @@ class StrategyEngine:
                         * config.COST_STT_OPTION_SELL_PCT
                     )
                     _leg_stamp = 0.0
+                # PATCH (NEW-5): GST base now includes SEBI
+                # fee, matching _calculate_transaction_costs().
                 _leg_gst = (
-                    _leg_brokerage + _leg_exchange
+                    _leg_brokerage + _leg_exchange + _leg_sebi
                 ) * config.COST_GST_PCT
                 leg_cost = (
                     _leg_brokerage + _leg_exchange + _leg_ipft
