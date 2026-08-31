@@ -68,9 +68,17 @@ def setup_logging() -> logging.Logger:
         config.LOG_DIR,
         f"audit_log_{today_str}.log",
     )
-    file_handler = logging.FileHandler(
-        audit_file, mode="a", encoding="utf-8"
+    # PATCH: rotate at midnight so continuous multi-day operation
+    # doesn't keep appending every subsequent day's logs into the
+    # first day's file.
+    from logging.handlers import TimedRotatingFileHandler
+    file_handler = TimedRotatingFileHandler(
+        audit_file,
+        when="midnight",
+        backupCount=90,
+        encoding="utf-8",
     )
+    file_handler.suffix = "%Y-%m-%d"
     file_handler.setLevel(
         getattr(logging, config.LOG_LEVEL, logging.INFO)
     )
@@ -145,8 +153,11 @@ async def _run_preflight_checks(
                     "Running on weekend (test mode)"
                 )
 
-    # CHECK 2 — NTP clock sync (live mode only)
-    if not config.PAPER_TRADING_MODE:
+    # CHECK 2 — NTP clock sync
+    # PATCH: run this even in paper mode — it validates the
+    # system clock, which every time-gated decision in the
+    # engine depends on, regardless of trading mode.
+    if True:
         try:
             import ntplib
             client   = ntplib.NTPClient()
@@ -453,6 +464,35 @@ async def _ensure_term_structure_expiry(
         )
 
 
+async def _guarded_ws_reconnect(dm, ist_tz) -> None:
+    """
+    PATCH: prevents overlapping WS reconnect attempts and adds a
+    15-min backoff after 3 consecutive full-failure cycles, so a
+    persistent broker-side rejection (e.g. HTTP 403) doesn't turn
+    into an unbounded retry storm.
+    """
+    try:
+        await dm._reconnect_websocket()
+    finally:
+        dm._ws_reconnect_in_progress = False
+        if dm.ws_connected:
+            dm._ws_reconnect_fail_count = 0
+        else:
+            fail_count = getattr(
+                dm, "_ws_reconnect_fail_count", 0
+            ) + 1
+            dm._ws_reconnect_fail_count = fail_count
+            if fail_count >= 3:
+                dm._ws_reconnect_backoff_until = (
+                    datetime.now(ist_tz) + timedelta(minutes=15)
+                )
+                logger.warning(
+                    f"WS: {fail_count} consecutive full "
+                    f"failures — backing off reconnect "
+                    f"attempts for 15 min"
+                )
+
+
 def _is_expiry_day(
     dm: Optional[DataManager] = None,
 ) -> bool:
@@ -516,8 +556,13 @@ async def _end_of_day(
         tomorrow_str = (
             date.today() + timedelta(days=1)
         ).isoformat()
+        # PATCH: was checking "is tomorrow ANY known expiry" —
+        # since NIFTY has a weekly expiry almost every Tuesday,
+        # this was True on nearly every Monday regardless of
+        # which contract this specific position is in. Now
+        # correctly scoped to this position's own expiry.
         tomorrow_is_expiry = (
-            tomorrow_str in dm.get_available_expiries()
+            tomorrow_str == position.expiry_date
         )
         vix_ok = (
             dm.vix is not None
@@ -630,8 +675,14 @@ async def _graceful_shutdown(
     logger.info("=" * 60)
 
     try:
-        cancelled = await se.cancel_all_open_orders(
-            context="SHUTDOWN_CANCEL_SWEEP"
+        # PATCH: timeout guard so a hung network call during
+        # shutdown can't stall the whole "graceful" sequence
+        # indefinitely.
+        cancelled = await asyncio.wait_for(
+            se.cancel_all_open_orders(
+                context="SHUTDOWN_CANCEL_SWEEP"
+            ),
+            timeout=30.0,
         )
         if cancelled > 0:
             logger.warning(
@@ -639,6 +690,11 @@ async def _graceful_shutdown(
                 f"open orders"
             )
         await asyncio.sleep(1.0)
+    except asyncio.TimeoutError:
+        logger.error(
+            "SHUTDOWN: Cancel sweep timed out after 30s "
+            "— continuing shutdown anyway"
+        )
     except Exception as e:
         logger.error(
             f"SHUTDOWN: Cancel sweep failed: {e}"
@@ -648,10 +704,20 @@ async def _graceful_shutdown(
         logger.info("Live mode: squaring off positions")
         for position in list(se.open_positions):
             try:
-                await se._close_position(
-                    position,
-                    config.EXIT_REASONS["MANUAL"],
-                    use_market=True,
+                # PATCH: timeout guard per position close during
+                # shutdown, same reasoning as the cancel sweep.
+                await asyncio.wait_for(
+                    se._close_position(
+                        position,
+                        config.EXIT_REASONS["MANUAL"],
+                        use_market=True,
+                    ),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Shutdown close timed out "
+                    f"{position.trade_id[:8]} — continuing"
                 )
             except Exception as e:
                 logger.error(
@@ -1312,14 +1378,51 @@ async def main() -> None:
 
             # Kill switch checks
             if dm.kill_switch_triggered:
-                logger.warning(
-                    "WS disconnected — engine continues "
-                    "with REST data, attempting reconnect"
+                # PATCH: market-hours check + concurrency guard +
+                # backoff, to stop the WS reconnect storm (was
+                # firing unconditionally every main-loop
+                # iteration with no guard against overlapping
+                # attempts).
+                _now_ws = datetime.now(IST)
+                _now_ws_time = _now_ws.time()
+                _today_ws_str = _now_ws.date().strftime(
+                    "%Y-%m-%d"
                 )
-                dm.kill_switch_triggered = False
-                asyncio.create_task(
-                    dm._reconnect_websocket()
+                _is_trading_ws = (
+                    _now_ws.date().weekday() < 5
+                    and _today_ws_str
+                    not in config.NSE_MARKET_HOLIDAYS
                 )
+                _is_mkt_ws = (
+                    config.MARKET_OPEN
+                    <= _now_ws_time
+                    <= config.MARKET_CLOSE
+                )
+                _backoff_until = getattr(
+                    dm, "_ws_reconnect_backoff_until", None
+                )
+                _in_progress = getattr(
+                    dm, "_ws_reconnect_in_progress", False
+                )
+                if not (_is_trading_ws and _is_mkt_ws):
+                    dm.kill_switch_triggered = False
+                elif _in_progress:
+                    dm.kill_switch_triggered = False
+                elif (
+                    _backoff_until
+                    and _now_ws < _backoff_until
+                ):
+                    dm.kill_switch_triggered = False
+                else:
+                    logger.warning(
+                        "WS disconnected — engine continues "
+                        "with REST data, attempting reconnect"
+                    )
+                    dm.kill_switch_triggered = False
+                    dm._ws_reconnect_in_progress = True
+                    asyncio.create_task(
+                        _guarded_ws_reconnect(dm, IST)
+                    )
 
             if se.kill_switch_active:
                 logger.critical(
@@ -1359,6 +1462,21 @@ async def main() -> None:
                         "EOD complete — engine monitoring, "
                         "waiting for next trading day"
                     )
+                # PATCH: this branch previously went completely
+                # silent on the console for the rest of the day
+                # (the `continue` below skips the normal
+                # console-display code entirely). Print an
+                # abbreviated status line every ~60s so it's
+                # obvious the engine is alive and simply waiting
+                # for the next trading day, not hung.
+                print(
+                    f"[{datetime.now(IST).strftime('%H:%M:%S')}] "
+                    f"EOD monitoring — "
+                    f"spot={dm.spot if dm.spot else 'N/A'} "
+                    f"vix={dm.vix if dm.vix else 'N/A'} "
+                    f"positions={len(se.open_positions)} "
+                    f"— waiting for next trading day"
+                )
                 await asyncio.sleep(60)
                 continue
 
