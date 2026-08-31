@@ -1982,16 +1982,20 @@ class DataManager:
 
     def _save_daily_iv_close(self) -> None:
         """
-        PATCH (D3): persist one IV_ATM close per calendar day so
-        compute_iv_rank() can use a genuine multi-week percentile
-        instead of the previous intraday-only history / hardcoded
-        default.
+        PATCH (D3a): previously saved only the FIRST iv_atm
+        reading of the day (an opening snapshot, not a genuine
+        close) because of the "already saved today" early-return.
+        Now only writes/overwrites today's row within the last
+        ~45 min of the trading session, so repeated calls in that
+        window converge toward the actual closing IV instead of
+        locking in an early-morning value.
         """
         if not self.iv_atm or self.iv_atm <= 0:
             return
-        today = date.today()
-        if self._last_iv_rank_date == today:
+        now_ist = datetime.now(self._IST)
+        if (now_ist.hour, now_ist.minute) < (14, 45):
             return
+        today = date.today()
         try:
             self._init_iv_rank_table()
             conn = sqlite3.connect(self.db_path)
@@ -2014,6 +2018,20 @@ class DataManager:
             logger.warning(f"_save_daily_iv_close error: {e}")
 
     def _load_iv_rank_history(self) -> List[float]:
+        # PATCH (D3c): cache for up to 60s — compute_iv_rank() can
+        # run 2-3x per cycle from different callers
+        # (_should_enter_new_position, _select_strategy,
+        # _build_long_straddle), each previously opening a fresh
+        # SQLite connection.
+        now = datetime.now(self._IST)
+        cached = getattr(self, "_iv_rank_cache", None)
+        cached_at = getattr(self, "_iv_rank_cache_time", None)
+        if (
+            cached is not None
+            and cached_at is not None
+            and (now - cached_at).total_seconds() < 60
+        ):
+            return cached
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -2023,7 +2041,10 @@ class DataManager:
             """)
             rows = cursor.fetchall()
             conn.close()
-            return [r[0] for r in rows if r[0] and r[0] > 0]
+            result = [r[0] for r in rows if r[0] and r[0] > 0]
+            self._iv_rank_cache = result
+            self._iv_rank_cache_time = now
+            return result
         except sqlite3.OperationalError:
             return []
         except sqlite3.Error as e:

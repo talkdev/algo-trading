@@ -4293,7 +4293,13 @@ class StrategyEngine:
                 )
                 return False
             leg.order_id    = order_id
-            leg.fill_status = "COMPLETE"
+            # PATCH (S9): don't clobber the fill_status
+            # _resolve_fill_result() already set correctly
+            # (COMPLETE or PARTIAL) — this unconditional overwrite
+            # was silently destroying the PARTIAL marker that
+            # _rebalance_partial_fills() depends on.
+            if leg.fill_status != "PARTIAL":
+                leg.fill_status = "COMPLETE"
             filled_legs.append(leg)
             self._log_order_detail(
                 trade_id, order_id, leg,
@@ -4322,7 +4328,9 @@ class StrategyEngine:
                 )
                 return False
             leg.order_id    = order_id
-            leg.fill_status = "COMPLETE"
+            # PATCH (S9): same fix as the long-legs loop above.
+            if leg.fill_status != "PARTIAL":
+                leg.fill_status = "COMPLETE"
             filled_legs.append(leg)
             self._log_order_detail(
                 trade_id, order_id, leg,
@@ -5628,11 +5636,23 @@ class StrategyEngine:
         slippage_total = sum(
             l.slippage_pts for l in position.legs
         )
-        tx_costs  = self._calculate_transaction_costs(
-            position
-        )
-        gross_pnl = position.realized_pnl
-        net_pnl   = gross_pnl - tx_costs
+        # PATCH (S8): for a CLOSED position, use the authoritative
+        # values _close_position() already computed and stored
+        # (correctly including banked_pnl/banked_costs from any
+        # partial one-sided closes) instead of recomputing
+        # tx_costs fresh here, which silently drops banked_costs.
+        # Open positions still compute live for real-time
+        # unrealized tracking.
+        if position.status == "CLOSED":
+            gross_pnl = position.realized_pnl
+            tx_costs  = position.transaction_costs
+            net_pnl   = position.net_pnl
+        else:
+            tx_costs  = self._calculate_transaction_costs(
+                position
+            )
+            gross_pnl = position.realized_pnl
+            net_pnl   = gross_pnl - tx_costs
 
         return {
             "trade_id":                   position.trade_id,
