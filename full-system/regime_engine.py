@@ -1,440 +1,1100 @@
 # ============ FILE: regime_engine.py ============
 """
-Computes regime scores and maps to trading regime.
-Handles vol/edge/trend/flow scores, persistence filtering,
-macro override, composite aggregation, and regime mapping.
+Regime engine implementing the 8-step vol-regime algorithm
+from the reference nifty_regime_monitor.py.
+
+Steps:
+  1  Vol surface   : Term spread (V_fwd - V_spot) + 25d skew z-score
+  2  Edge          : RV(20d) vs ATM IV
+  3  Trend         : ADX(14) on 30-min bars + EMA-50 slope
+  4  Flow          : Net delta-weighted OI change + spread ratio
+  5  Persistence   : 3 consecutive identical readings to confirm
+  6  Macro override: high-impact event -> EVENT_HEDGE
+  7  Aggregation   : 0.30*Vol + 0.30*Edge + 0.25*Trend + 0.15*Flow
+  8  Regime mapping: STRONG_SELL_VOL ... STRONG_BUY_VOL
 """
 
 import logging
 import sqlite3
 import json
+import asyncio
+import math
+import statistics
 import numpy as np
 from collections import deque
-from datetime import datetime
-from typing import Optional
-from typing import Optional, Dict, List
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Tuple
 import pytz
 import config
 from data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────
+# Reference algorithm constants (from nifty_regime_monitor.py)
+# ─────────────────────────────────────────────────────────────────────
+TERM_THRESHOLD   = 0.5    # V_fwd - V_spot contango/backwardation
+SKEW_Z_STEEP     = 1.5    # z > 1.5  -> fear    (Skew_Score = -1)
+SKEW_Z_FLAT      = -1.0   # z < -1.0 -> complacent (Skew_Score = +1)
+EDGE_RICH        = 5.0    # IV - RV > 5  -> rich (Edge_Score = +1)
+EDGE_CHEAP       = 0.0    # IV - RV < 0  -> cheap (Edge_Score = -1)
+ADX_TREND        = 20.0   # PATCH: was 25.0 — recalibrated for 30-min bars (live logs showed ADX rarely exceeding ~16-24 even in directional phases; 25 was likely tuned for daily bars)
+EMA_SLOPE_PCT    = 0.05   # |slope| > 0.05% of spot
+RV_WINDOW        = 20     # trading days
+RV_ANNUALISE     = 252
+SKEW_HISTORY_DAYS = 30
+SKEW_MIN_DAYS    = 3      # minimum history before z is trusted
+SPREAD_AVG_MIN   = 60     # minutes for spread-ratio average
+EVENT_PRE_HOURS  = 6
+EVENT_POST_HOURS = 2
+MODULES          = ["vol", "edge", "trend", "flow"]
+WEIGHTS          = {"vol": 0.30, "edge": 0.30, "trend": 0.25, "flow": 0.15}
+
+
+def map_regime(x: float) -> str:
+    """Reference algorithm regime mapping."""
+    if x > 0.45:
+        return "STRONG_SELL_VOL"
+    if x >= 0.15:
+        return "MILD_SELL_VOL"
+    if x > -0.15:
+        return "NEUTRAL"
+    if x >= -0.45:
+        return "BUY_VOL"
+    return "STRONG_BUY_VOL"
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_delta(spot, strike, T, iv_pct, r, is_call) -> Optional[float]:
+    """Black-Scholes delta fallback."""
+    if T <= 0 or iv_pct <= 0 or spot <= 0 or strike <= 0:
+        if is_call:
+            return 1.0 if spot > strike else 0.0
+        return -1.0 if spot < strike else 0.0
+    sq = math.sqrt(T)
+    d1 = (
+        math.log(spot / strike)
+        + (r + 0.5 * (iv_pct / 100.0) ** 2) * T
+    ) / (iv_pct / 100.0 * sq)
+    return norm_cdf(d1) if is_call else norm_cdf(d1) - 1.0
+
+
+def _wilder(vals: List[float], n: int) -> List[float]:
+    if len(vals) < n:
+        return []
+    out = [sum(vals[:n]) / n]
+    for v in vals[n:]:
+        out.append((out[-1] * (n - 1) + v) / n)
+    return out
+
+
+def adx14(bars: List[Dict], n: int = 14) -> Optional[Tuple]:
+    """Wilder ADX. bars: ascending [{"h","l","c"}]. -> (adx, +di, -di)."""
+    if len(bars) < 2 * n + 2:
+        return None
+    trs, pdms, ndms = [], [], []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i]["h"], bars[i]["l"], bars[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        up = bars[i]["h"] - bars[i - 1]["h"]
+        dn = bars[i - 1]["l"] - bars[i]["l"]
+        pdms.append(up if (up > dn and up > 0) else 0.0)
+        ndms.append(dn if (dn > up and dn > 0) else 0.0)
+    atr   = _wilder(trs,  n)
+    pdm_s = _wilder(pdms, n)
+    ndm_s = _wilder(ndms, n)
+    if not atr or len(atr) != len(pdm_s):
+        return None
+    pdi = [100.0 * p / a if a > 0 else 0.0 for p, a in zip(pdm_s, atr)]
+    ndi = [100.0 * d / a if a > 0 else 0.0 for d, a in zip(ndm_s, atr)]
+    dx  = [
+        abs(a - b) / (a + b) * 100 if (a + b) > 0 else 0.0
+        for a, b in zip(pdi, ndi)
+    ]
+    adx_line = _wilder(dx, n)
+    if not adx_line:
+        return None
+    return adx_line[-1], pdi[-1], ndi[-1]
+
+
+def ema_series(vals: List[float], span: int) -> List[float]:
+    if len(vals) < span:
+        return []
+    k = 2.0 / (span + 1.0)
+    e = [sum(vals[:span]) / span]
+    for v in vals[span:]:
+        e.append(e[-1] + k * (v - e[-1]))
+    return e
+
+
+def realised_vol_pct(
+    closes: List[float], window: int = RV_WINDOW
+) -> Tuple[Optional[float], int]:
+    closes = closes[-(window + 1):]
+    if len(closes) < window + 1:
+        return None, len(closes) - 1
+    rets = [
+        math.log(closes[i + 1] / closes[i])
+        for i in range(len(closes) - 1)
+        if closes[i] > 0 and closes[i + 1] > 0
+    ]
+    if len(rets) < window:
+        return None, len(rets)
+    return (
+        statistics.stdev(rets) * math.sqrt(RV_ANNUALISE) * 100.0,
+        len(rets),
+    )
+
+
+def quality(leg: Dict, min_oi: float = 50.0) -> bool:
+    return (
+        leg.get("oi") is not None and leg["oi"] >= min_oi
+        and leg.get("bid") is not None and leg["bid"] > 0
+        and leg.get("ask") is not None and leg["ask"] > 0
+    )
+
+
+def leg_delta(
+    leg: Dict, spot: float, strike: float,
+    T: float, rate: float, is_call: bool
+) -> Optional[float]:
+    """Prefer API greeks; fall back to Black-Scholes."""
+    d = leg.get("delta")
+    if d is not None and 0.01 < abs(d) < 0.99:
+        return d
+    iv = leg.get("iv")
+    if iv and iv > 0:
+        return bs_delta(spot, strike, T, iv, rate, is_call)
+    return None
+
+
+def atm_strike_from_chain(
+    chain: Dict[float, Dict], spot: float
+) -> Optional[float]:
+    if not chain:
+        return None
+    return min(chain.keys(), key=lambda k: abs(k - spot))
+
+
+def years_to_expiry(expiry_iso: str, now: datetime) -> float:
+    try:
+        IST = pytz.timezone("Asia/Kolkata")
+        exp_dt = datetime.strptime(
+            expiry_iso, "%Y-%m-%d"
+        ).replace(hour=15, minute=30, tzinfo=IST)
+        return max(
+            (exp_dt - now).total_seconds(), 1.0
+        ) / (365.0 * 24 * 3600)
+    except Exception:
+        return 1.0 / 365.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# RegimeEngine
+# ─────────────────────────────────────────────────────────────────────
 
 class RegimeEngine:
     """
-    Detects and confirms market regime using four composite scores.
-    Applies persistence filter to avoid regime whipsawing.
+    Implements the 8-step vol-regime algorithm from the reference
+    nifty_regime_monitor.py, adapted for async operation.
     """
 
-    def __init__(self, data_manager: DataManager, db_path: str) -> None:
-        """Initialize RegimeEngine with data manager and database path."""
-        self.dm = data_manager
+    def __init__(
+        self,
+        data_manager: DataManager,
+        db_path: str,
+    ) -> None:
+        self.dm      = data_manager
         self.db_path = db_path
-        self._IST = pytz.timezone(config.TZ)
+        self._IST    = pytz.timezone(config.TZ)
 
-        # Score buffers (circular, size=PERSISTENCE_READINGS)
-        self.vol_buffer: deque = deque(maxlen=config.PERSISTENCE_READINGS)
-        self.edge_buffer: deque = deque(maxlen=config.PERSISTENCE_READINGS)
-        self.trend_buffer: deque = deque(maxlen=config.PERSISTENCE_READINGS)
-        self.flow_buffer: deque = deque(maxlen=config.PERSISTENCE_READINGS)
+        # Persistence buffers (3 consecutive readings to confirm)
+        self._buf: Dict[str, List[int]] = {
+            m: [] for m in MODULES
+        }
+        self._conf: Dict[str, int] = {
+            m: 0 for m in MODULES
+        }
 
-        # Confirmed scores
-        self.confirmed_vol: float = 0.0
-        self.confirmed_edge: float = 0.0
-        self.confirmed_trend: float = 0.0
-        self.confirmed_flow: float = 0.0
+        # Skew history (one value per calendar day)
+        self._skew_history: List[Dict] = []
 
-        # Regime state
-        self.raw_composite: float = 0.0
-        self.confirmed_regime: str = config.REGIME_NEUTRAL
-        self.previous_regime: str = config.REGIME_NEUTRAL
-        self.regime_changed: bool = False
-        self.persistence_count: int = 0
+        # Flow snapshots (last 75 min)
+        self._flow_snapshots: List[Dict] = []
+
+        # Score history for debugging
+        self.score_history: deque = deque(maxlen=288 * 10)
+
+        # Public state
+        self.raw_composite:     float = 0.0
+        self.confirmed_regime:  str   = config.REGIME_NEUTRAL
+        self.previous_regime:   str   = config.REGIME_NEUTRAL
+        self.regime_changed:    bool  = False
+        self.persistence_count: int   = 0
         self.last_refresh_time: Optional[datetime] = None
 
-        # Score history for logging (288 = one full trading day of 5-min bars)
-        self.score_history: deque = deque(maxlen=288)
+        # Expose confirmed scores for display
+        self.confirmed_vol:   float = 0.0
+        self.confirmed_edge:  float = 0.0
+        self.confirmed_trend: float = 0.0
+        self.confirmed_flow:  float = 0.0
+
+        # Raw scores for display
+        self._raw: Dict[str, Optional[float]] = {
+            m: None for m in MODULES
+        }
+        self._detail: Dict[str, str] = {
+            m: "not computed" for m in MODULES
+        }
+
+        self._refresh_lock  = asyncio.Lock()
+        self._refresh_count = 0
+        self._warmup_required = 1
+
+        self._load_state()
+
+    # ─────────────────────────────────────────────────────────────────
+    # Public entry point
+    # ─────────────────────────────────────────────────────────────────
+
+    # ── Backward-compatible buffer properties ─────────────────────────
+    # strategy_engine and display code reference these names
+
+    @property
+    def vol_buffer(self):
+        return self._buf.get("vol", [])
+
+    @property
+    def edge_buffer(self):
+        return self._buf.get("edge", [])
+
+    @property
+    def trend_buffer(self):
+        return self._buf.get("trend", [])
+
+    @property
+    def flow_buffer(self):
+        return self._buf.get("flow", [])
+
 
     async def refresh(self) -> str:
-        """
-        Main method called every 5 minutes.
-        Orchestrates all score computations and regime detection.
-        Returns confirmed regime string.
-        """
+        async with self._refresh_lock:
+            return await self._refresh_locked()
+
+    async def _refresh_locked(self) -> str:
         logger.info("Regime refresh started")
 
-        # Step 0: Pre-processing validation
-        if self.dm.spot is None:
-            logger.warning("Regime refresh skipped: spot is None")
-            return self.confirmed_regime
-        if self.dm.vix is None:
-            logger.warning("Regime refresh skipped: vix is None")
+        if self.dm.spot is None or self.dm.vix is None:
+            logger.warning("Regime refresh skipped: spot/vix None")
             return self.confirmed_regime
         if not self.dm.option_chain:
-            logger.warning("Regime refresh skipped: option chain empty")
+            logger.warning("Regime refresh skipped: chain empty")
             return self.confirmed_regime
 
-        # Step 1: Compute raw scores
-        raw_vol = self._compute_vol_score()
-        raw_edge = self._compute_edge_score()
-        raw_trend = self._compute_trend_score()
-        raw_flow = self._compute_flow_score()
+        self._refresh_count += 1
+        now = datetime.now(self._IST)
 
-        # Step 2: Apply persistence filter
-        conf_vol = self._apply_persistence(
-            raw_vol, self.vol_buffer, self.confirmed_vol
-        )
-        conf_edge = self._apply_persistence(
-            raw_edge, self.edge_buffer, self.confirmed_edge
-        )
-        conf_trend = self._apply_persistence(
-            raw_trend, self.trend_buffer, self.confirmed_trend
-        )
-        conf_flow = self._apply_persistence(
-            raw_flow, self.flow_buffer, self.confirmed_flow
-        )
+        # Step 1: Vol surface
+        raw_vol, vol_detail = self._module_vol(now)
 
-        self.confirmed_vol = conf_vol
-        self.confirmed_edge = conf_edge
-        self.confirmed_trend = conf_trend
-        self.confirmed_flow = conf_flow
+        # Step 2: Edge (RV vs IV)
+        raw_edge, edge_detail = self._module_edge()
 
-        # Step 3: Check macro override
-        macro_active = self._check_macro_override()
+        # Step 3: Trend (ADX + EMA slope)
+        raw_trend, trend_detail = self._module_trend()
 
-        if macro_active:
-            new_regime = config.REGIME_EVENT
+        # Step 4: Order flow
+        raw_flow, flow_detail = self._module_flow(now)
+
+        self._raw["vol"]   = raw_vol
+        self._raw["edge"]  = raw_edge
+        self._raw["trend"] = raw_trend
+        self._raw["flow"]  = raw_flow
+        self._detail["vol"]   = vol_detail
+        self._detail["edge"]  = edge_detail
+        self._detail["trend"] = trend_detail
+        self._detail["flow"]  = flow_detail
+
+        # Step 5: Persistence filter
+        conf_vol   = self._persist("vol",   raw_vol)
+        conf_edge  = self._persist("edge",  raw_edge)
+        conf_trend = self._persist("trend", raw_trend)
+        conf_flow  = self._persist("flow",  raw_flow)
+
+        self.confirmed_vol   = float(conf_vol)
+        self.confirmed_edge  = float(conf_edge)
+        self.confirmed_trend = float(conf_trend)
+        self.confirmed_flow  = float(conf_flow)
+
+        # Step 6: Macro override
+        macro_active, macro_name = self._check_macro_override(now)
+
+        # Warmup gate
+        if self._refresh_count <= self._warmup_required:
+            new_regime = config.REGIME_NEUTRAL
             logger.info(
-                f"Macro override active — forcing {config.REGIME_EVENT}"
+                f"Warmup ({self._refresh_count}/"
+                f"{self._warmup_required}) — NEUTRAL"
             )
+        elif macro_active:
+            new_regime = config.REGIME_EVENT
+            logger.info(f"Macro override: {macro_name}")
         else:
-            # Step 4: Compute composite score
-            composite = (
-                config.WEIGHT_VOL * conf_vol +
-                config.WEIGHT_EDGE * conf_edge +
-                config.WEIGHT_TREND * conf_trend +
-                config.WEIGHT_FLOW * conf_flow
+            # Step 7: Weighted aggregation
+            composite = sum(
+                WEIGHTS[m] * self._conf[m]
+                for m in MODULES
             )
-            # Clamp to [-1.0, +1.0]
-            self.raw_composite = float(max(-1.0, min(1.0, composite)))
+            self.raw_composite = float(
+                max(-1.0, min(1.0, composite))
+            )
+            # Step 8: Regime mapping
+            new_regime = self._map_regime(self.raw_composite)
 
-            # Step 5: Map to regime
-            new_regime = self._map_to_regime(self.raw_composite)
-
-        # Step 6: Detect regime change
-        self.regime_changed = (new_regime != self.confirmed_regime)
-
+        # Detect change
+        self.regime_changed = (
+            new_regime != self.confirmed_regime
+        )
         if self.regime_changed:
-            self.previous_regime = self.confirmed_regime
-            self.confirmed_regime = new_regime
+            self.previous_regime   = self.confirmed_regime
+            self.confirmed_regime  = new_regime
             self.persistence_count = 1
             logger.info(
-                f"REGIME CHANGE: {self.previous_regime} -> {self.confirmed_regime} | "
-                f"composite={self.raw_composite:.4f} | "
-                f"vol={conf_vol:.2f} edge={conf_edge:.2f} "
-                f"trend={conf_trend:.2f} flow={conf_flow:.2f}"
+                f"REGIME CHANGE: "
+                f"{self.previous_regime} -> "
+                f"{self.confirmed_regime} | "
+                f"composite={self.raw_composite:.4f}"
             )
         else:
             self.persistence_count += 1
 
-        # Step 7: Save to SQLite
-        self._save_regime_to_sqlite({
-            "timestamp": datetime.now(self._IST).isoformat(),
-            "vol_score": conf_vol,
-            "edge_score": conf_edge,
-            "trend_score": conf_trend,
-            "flow_score": conf_flow,
-            "composite_score": self.raw_composite,
-            "raw_regime": new_regime,
-            "confirmed_regime": self.confirmed_regime,
+        # Save state
+        await self._save_regime_to_sqlite({
+            "timestamp":         now.isoformat(),
+            "vol_score":         conf_vol,
+            "edge_score":        conf_edge,
+            "trend_score":       conf_trend,
+            "flow_score":        conf_flow,
+            "composite_score":   self.raw_composite,
+            "raw_regime":        new_regime,
+            "confirmed_regime":  self.confirmed_regime,
             "persistence_count": self.persistence_count,
-            "macro_override": 1 if macro_active else 0
+            "macro_override":    1 if macro_active else 0,
         })
 
-        # Step 8: Log console output
-        self._log_console_output()
+        self._log_console_output(now)
+        self.last_refresh_time = now
 
-        self.last_refresh_time = datetime.now(self._IST)
-
-        # Record in score history
         self.score_history.append({
-            "timestamp": self.last_refresh_time.isoformat(),
-            "vol": conf_vol,
-            "edge": conf_edge,
-            "trend": conf_trend,
-            "flow": conf_flow,
-            "composite": self.raw_composite,
-            "regime": self.confirmed_regime
+            "timestamp":  now.isoformat(),
+            "raw_vol":    raw_vol,
+            "raw_edge":   raw_edge,
+            "raw_trend":  raw_trend,
+            "raw_flow":   raw_flow,
+            "conf_vol":   conf_vol,
+            "conf_edge":  conf_edge,
+            "conf_trend": conf_trend,
+            "conf_flow":  conf_flow,
+            "composite":  self.raw_composite,
+            "regime":     self.confirmed_regime,
         })
+
+        self._save_state()
 
         logger.info(
-            f"Regime refresh complete: {self.confirmed_regime} "
-            f"(composite={self.raw_composite:.4f}, "
-            f"persist={self.persistence_count})"
+            f"Regime: {self.confirmed_regime} "
+            f"composite={self.raw_composite:.4f} "
+            f"persist={self.persistence_count}"
         )
         return self.confirmed_regime
 
-    def _compute_vol_score(self) -> float:
-        """Compute volatility score from term spread and skew z-score."""
-        z = 0.0
+    # ─────────────────────────────────────────────────────────────────
+    # Step 1: Vol surface
+    # ─────────────────────────────────────────────────────────────────
 
-        # TERM SPREAD COMPONENT
-        if self.dm.forward_iv is None or self.dm.vix is None:
-            term_score = 0
-        else:
-            term_spread = self.dm.forward_iv - self.dm.vix
-            if term_spread > config.TERM_SPREAD_CONTANGO:
-                term_score = +1
-            elif term_spread < config.TERM_SPREAD_BACKWARDATION:
-                term_score = -1
+    def _module_vol(
+        self, now: datetime
+    ) -> Tuple[Optional[int], str]:
+        """
+        Reference algorithm Step 1:
+        Term spread (V_fwd - V_spot) + 25d-Put/Call skew z-score.
+        """
+        notes = []
+        active = self.dm.get_active_chain()
+        if not active:
+            return None, "no option chain"
+
+        spot = self.dm.spot
+        if not spot:
+            return None, "no spot"
+
+        vix = self.dm.vix or 0.0
+
+        # ── Term spread ───────────────────────────────────────────────
+        # V_fwd = ATM IV from far expiry (30-45 DTE)
+        # V_spot = VIX (30-day implied vol proxy)
+        v_fwd = self.dm.forward_iv
+        if v_fwd is not None:
+            # forward_iv is stored as decimal (e.g. 0.138)
+            # vix is in percentage (e.g. 11.35)
+            # Convert to same units: both as percentage
+            v_fwd_pct  = v_fwd * 100.0
+            v_spot_pct = vix
+            t_spread   = v_fwd_pct - v_spot_pct
+            if t_spread > TERM_THRESHOLD:
+                term_score = 1    # contango = sell vol
+            elif t_spread < -TERM_THRESHOLD:
+                term_score = -1   # backwardation = buy vol
             else:
                 term_score = 0
-
-        # SKEW Z-SCORE COMPONENT
-        if len(self.dm.skew_history) < 10:
-            skew_score = 0
+            term_txt = (
+                f"T_spread {t_spread:+.2f}% "
+                f"({'CONTANGO' if term_score==1 else 'BACKWARDATION' if term_score==-1 else 'FLAT'})"
+            )
         else:
-            skew_arr = np.array(list(self.dm.skew_history))
-            skew_mean = float(np.mean(skew_arr))
-            skew_std = float(np.std(skew_arr))
+            term_score = 0
+            term_txt   = "T_spread n/a (no far expiry)"
+            notes.append("forward IV unavailable")
 
-            if skew_std < 1e-10:
+        # ── 25-delta skew z-score ─────────────────────────────────────
+        near_expiry = self.dm._active_expiry
+        if near_expiry:
+            T = years_to_expiry(near_expiry, now)
+        else:
+            T = 7.0 / 365.0
+
+        best_c = best_p = None
+        for strike, data in active.items():
+            c_leg = data.get("call", {})
+            p_leg = data.get("put",  {})
+            if (
+                quality(c_leg, config.MIN_OI_LOTS)
+                and c_leg.get("iv")
+            ):
+                d = leg_delta(
+                    c_leg, spot, strike, T,
+                    0.065, True,
+                )
+                if d is not None and (
+                    best_c is None
+                    or abs(d - 0.25) < abs(best_c[0] - 0.25)
+                ):
+                    best_c = (d, strike, c_leg)
+            if (
+                quality(p_leg, config.MIN_OI_LOTS)
+                and p_leg.get("iv")
+            ):
+                d = leg_delta(
+                    p_leg, spot, strike, T,
+                    0.065, False,
+                )
+                if d is not None and (
+                    best_p is None
+                    or abs(d + 0.25) < abs(best_p[0] + 0.25)
+                ):
+                    best_p = (d, strike, p_leg)
+
+        if (
+            best_c and best_p
+            and abs(best_c[0] - 0.25) < 0.15
+            and abs(best_p[0] + 0.25) < 0.15
+        ):
+            # iv stored as decimal → convert to % for skew
+            iv_c = best_c[2]["iv"] * 100.0
+            iv_p = best_p[2]["iv"] * 100.0
+            skew = iv_p - iv_c
+
+            # Record daily skew
+            today_iso = now.date().isoformat()
+            self._record_skew(skew, today_iso)
+            z, ndays = self._skew_zscore(today_iso)
+
+            if z is None:
+                notes.append(
+                    f"skew z warming up ({ndays}/{SKEW_MIN_DAYS} days)"
+                )
                 skew_score = 0
+                skew_txt   = (
+                    f"skew25 {skew:+.2f}% "
+                    f"(z warming {ndays}/{SKEW_MIN_DAYS}d)"
+                )
             else:
-                z = (self.dm.skew - skew_mean) / skew_std if self.dm.skew is not None else 0.0
-                if z > config.SKEW_ZSCORE_FEAR:
-                    skew_score = -1
-                elif z < config.SKEW_ZSCORE_COMPLACENT:
-                    skew_score = +1
+                if z > SKEW_Z_STEEP:
+                    skew_score = -1   # fear = buy vol
+                elif z < SKEW_Z_FLAT:
+                    skew_score = +1   # complacency = sell vol
                 else:
                     skew_score = 0
-
-        vol_score = (0.5 * term_score) + (0.5 * skew_score)
-        vol_score = float(max(-1.0, min(1.0, vol_score)))
-
-        logger.info(
-            f"Vol_Score={vol_score:.2f} term={term_score} "
-            f"skew_z={z:.2f} skew_score={skew_score}"
-        )
-        return vol_score
-
-    def _compute_edge_score(self) -> float:
-        """Compute edge score from IV vs RV percentile comparison."""
-        if self.dm.rv_20d is None:
-            logger.info("Edge_Score=0.0 (rv_20d is None)")
-            return 0.0
-        if self.dm.iv_atm is None:
-            logger.info("Edge_Score=0.0 (iv_atm is None)")
-            return 0.0
-        if len(self.dm.iv_rv_spread_history) < 10:
-            logger.info(
-                f"Edge_Score=0.0 (insufficient history: "
-                f"{len(self.dm.iv_rv_spread_history)}/10)"
-            )
-            return 0.0
-
-        current_spread = self.dm.iv_atm - self.dm.rv_20d
-        spread_array = np.array(list(self.dm.iv_rv_spread_history))
-        pct_70 = float(np.percentile(spread_array, config.EDGE_PERCENTILE_HIGH))
-        pct_30 = float(np.percentile(spread_array, config.EDGE_PERCENTILE_LOW))
-
-        if current_spread > pct_70:
-            edge_score = +1.0
-        elif current_spread < pct_30:
-            edge_score = -1.0
-        else:
-            edge_score = 0.0
-
-        logger.info(
-            f"Edge_Score={edge_score:.2f} IV={self.dm.iv_atm:.4f} "
-            f"RV={self.dm.rv_20d:.4f} spread={current_spread:.4f} "
-            f"p70={pct_70:.4f} p30={pct_30:.4f}"
-        )
-        return float(edge_score)
-
-    def _compute_trend_score(self) -> float:
-        """Compute trend score from ADX and EMA slope."""
-        if self.dm.adx is None:
-            logger.info("Trend_Score=0.0 (adx is None)")
-            return 0.0
-        if self.dm.ema_50 is None:
-            logger.info("Trend_Score=0.0 (ema_50 is None)")
-            return 0.0
-        if self.dm.ema_slope is None:
-            logger.info("Trend_Score=0.0 (ema_slope is None)")
-            return 0.0
-        if self.dm.spot is None:
-            logger.info("Trend_Score=0.0 (spot is None)")
-            return 0.0
-
-        adx = self.dm.adx
-        slope = self.dm.ema_slope
-        spot = self.dm.spot
-        ema = self.dm.ema_50
-
-        if (adx > config.ADX_TREND_THRESHOLD and
-                abs(slope) > config.EMA_SLOPE_THRESHOLD):
-            if spot > ema:
-                trend_score = +1.0
-            else:
-                trend_score = -1.0
-        elif adx < config.ADX_RANGE_THRESHOLD:
-            trend_score = 0.0
-        else:
-            # Transition zone — use last confirmed
-            trend_score = self.confirmed_trend
-
-        logger.info(
-            f"Trend_Score={trend_score:.2f} ADX={adx:.2f} "
-            f"slope={slope:.6f} spot={spot:.2f} ema={ema:.2f}"
-        )
-        return float(trend_score)
-
-    def _compute_flow_score(self) -> float:
-        """Compute flow score from net OI flow and spread ratio."""
-        if self.dm.net_flow is None:
-            logger.info("Flow_Score=0.0 (net_flow is None)")
-            return 0.0
-        if self.dm.spread_ratio is None:
-            logger.info("Flow_Score=0.0 (spread_ratio is None)")
-            return 0.0
-
-        net_flow = self.dm.net_flow
-        spread_ratio = self.dm.spread_ratio
-
-        if net_flow > 0 and spread_ratio < 1.0:
-            flow_score = +1.0
-        elif net_flow < 0 and spread_ratio > 1.0:
-            flow_score = -1.0
-        else:
-            flow_score = 0.0
-
-        logger.info(
-            f"Flow_Score={flow_score:.2f} net_flow={net_flow:.4f} "
-            f"spread_ratio={spread_ratio:.3f}"
-        )
-        return float(flow_score)
-
-    def _apply_persistence(
-        self,
-        new_score: float,
-        buffer: deque,
-        last_confirmed: float
-    ) -> float:
-        """
-        Apply persistence filter: confirm only if all 3 readings identical.
-        Mixed buffer reverts to last confirmed value.
-        """
-        buffer.append(new_score)
-
-        if len(buffer) < config.PERSISTENCE_READINGS:
-            logger.info(
-                f"Persistence buffer not full: {len(buffer)}/{config.PERSISTENCE_READINGS} "
-                f"— using last_confirmed={last_confirmed:.2f}"
-            )
-            return last_confirmed
-
-        # Check if all readings are identical
-        unique_values = set(buffer)
-        if len(unique_values) == 1:
-            confirmed = buffer[-1]
-            logger.info(
-                f"Persistence confirmed: all {config.PERSISTENCE_READINGS} "
-                f"readings = {confirmed:.2f}"
-            )
-            return confirmed
-        else:
-            logger.info(
-                f"Persistence mixed: buffer={list(buffer)} "
-                f"— reverting to last_confirmed={last_confirmed:.2f}"
-            )
-            return last_confirmed
-
-    def _check_macro_override(self) -> bool:
-        """Check if current time is within event window of high-impact event."""
-        now = datetime.now(self._IST)
-
-        for event_date_str, event_name in config.HIGH_IMPACT_EVENTS.items():
-            try:
-                event_dt = datetime.strptime(
-                    event_date_str, "%Y-%m-%d"
-                ).replace(
-                    hour=9, minute=15, second=0, microsecond=0,
-                    tzinfo=self._IST
+                skew_txt = (
+                    f"skew25 {skew:+.2f}% "
+                    f"(z={z:+.2f}, {ndays}d)"
                 )
-
-                hours_diff = (now - event_dt).total_seconds() / 3600.0
-
-                if now < event_dt:
-                    # Before event
-                    hours_until = abs(hours_diff)
-                    if hours_until <= config.EVENT_WINDOW_BEFORE_HOURS:
-                        logger.info(
-                            f"Macro override: {event_name} in "
-                            f"{hours_until:.1f} hours"
-                        )
-                        return True
-                else:
-                    # After event
-                    hours_after = hours_diff
-                    if hours_after <= config.EVENT_WINDOW_AFTER_HOURS:
-                        logger.info(
-                            f"Macro override: {event_name} "
-                            f"{hours_after:.1f} hours ago"
-                        )
-                        return True
-
-            except (ValueError, Exception) as e:
-                logger.warning(f"Macro override check error for {event_date_str}: {e}")
-                continue
-
-        return False
-
-    def _map_to_regime(self, composite: float) -> str:
-        """Map composite score to regime label."""
-        if composite > config.STRONG_SELL_THRESHOLD:
-            return config.REGIME_STRONG_SELL
-        elif composite >= config.MILD_SELL_THRESHOLD:
-            return config.REGIME_MILD_SELL
-        elif composite > config.MILD_BUY_THRESHOLD:
-            return config.REGIME_NEUTRAL
-        elif composite >= config.STRONG_BUY_THRESHOLD:
-            return config.REGIME_BUY_VOL
         else:
-            return config.REGIME_STRONG_BUY
+            skew_score = 0
+            skew_txt   = "skew25 n/a (illiquid chain)"
+            notes.append("25-delta legs not found")
 
-    def _save_regime_to_sqlite(self, data: Dict) -> None:
-        """Save regime history record to SQLite. Never raises."""
+        vol_score = 0.5 * term_score + 0.5 * skew_score
+        detail = f"{term_txt} | {skew_txt}"
+        if notes:
+            detail += " | " + "; ".join(notes)
+
+        logger.info(
+            f"Vol: score={vol_score:.2f} "
+            f"term={term_score} skew={skew_score} | "
+            f"{detail}"
+        )
+        return vol_score, detail
+
+    # ─────────────────────────────────────────────────────────────────
+    # Step 2: Edge (RV vs IV)
+    # ─────────────────────────────────────────────────────────────────
+
+    def _module_edge(self) -> Tuple[Optional[int], str]:
+        """
+        Reference algorithm Step 2:
+        IV_atm - RV(20d). Rich = sell vol, Cheap = buy vol.
+        """
+        # Get RV — use estimated if actual not available
+        rv = self.dm.get_estimated_rv()
+        if rv is None:
+            return None, "RV unavailable (no daily candles or VIX)"
+
+        # rv is in decimal (e.g. 0.08 = 8%)
+        # Convert to percentage
+        rv_pct = rv * 100.0
+
+        active = self.dm.get_active_chain()
+        if not active:
+            return None, "no chain"
+
+        spot = self.dm.spot
+        if not spot:
+            return None, "no spot"
+
+        atm = atm_strike_from_chain(active, spot)
+        if atm is None:
+            return None, "ATM not found"
+
+        atm_data = active[atm]
+        # iv stored as decimal → convert to %
+        ivs = [
+            v * 100.0
+            for v in (
+                atm_data.get("call", {}).get("iv"),
+                atm_data.get("put",  {}).get("iv"),
+            )
+            if v and v > 0
+        ]
+        if not ivs:
+            return None, "ATM IV unavailable"
+
+        iv_atm = statistics.mean(ivs)
+        edge   = iv_atm - rv_pct
+
+        if edge > EDGE_RICH:
+            raw = 1
+            tag = "RICH (seller edge)"
+        elif edge < EDGE_CHEAP:
+            raw = -1
+            tag = "CHEAP (buyer edge)"
+        else:
+            raw = 0
+            tag = "FAIR"
+
+        rv_src = "actual" if self.dm.rv_20d else "est(VIX×0.70)"
+        detail = (
+            f"IV_atm {iv_atm:.2f}% - "
+            f"RV{RV_WINDOW} {rv_pct:.2f}%({rv_src}) = "
+            f"{edge:+.2f} -> {tag}"
+        )
+        logger.info(f"Edge: score={raw} | {detail}")
+        return raw, detail
+
+    # ─────────────────────────────────────────────────────────────────
+    # Step 3: Trend (ADX + EMA slope)
+    # ─────────────────────────────────────────────────────────────────
+
+    def _module_trend(self) -> Tuple[Optional[int], str]:
+        """
+        Reference algorithm Step 3:
+        ADX(14) on 30-min bars + EMA-50 slope.
+        """
+        bars = list(self.dm.candles_30m)
+        if len(bars) < 75:
+            return None, f"only {len(bars)} bars (need 75)"
+
+        spot = self.dm.spot
+        if not spot:
+            return None, "no spot"
+
+        closes = [b.get("close", b.get("c", 0)) for b in bars]
+        ax = adx14([
+            {"h": b["high"], "l": b["low"], "c": b["close"]}
+            for b in bars
+        ])
+        ema = ema_series(closes, 50)
+
+        if ax is None or len(ema) < 21:
+            return None, "indicator warmup"
+
+        adx_v, pdi, ndi = ax
+        slope     = ema[-1] - ema[-21]
+        slope_pct = slope / spot * 100.0 if spot else 0.0
+        above     = spot > ema[-1]
+
+        if adx_v > ADX_TREND and abs(slope_pct) > EMA_SLOPE_PCT:
+            raw  = 1 if above else -1
+            dirn = "bullish" if above else "bearish"
+        else:
+            raw  = 0
+            dirn = "range-bound"
+
+        detail = (
+            f"ADX {adx_v:.1f} "
+            f"(+DI {pdi:.0f}/-DI {ndi:.0f}) | "
+            f"EMA50 slope {slope_pct:+.3f}% | "
+            f"spot {'>' if above else '<'} EMA50 -> {dirn}"
+        )
+        logger.info(f"Trend: score={raw} | {detail}")
+        return raw, detail
+
+    # ─────────────────────────────────────────────────────────────────
+    # Step 4: Order flow
+    # ─────────────────────────────────────────────────────────────────
+
+    def _module_flow(
+        self, now: datetime
+    ) -> Tuple[Optional[int], str]:
+        """
+        Reference algorithm Step 4:
+        Net delta-weighted OI change (15 min) +
+        3rd-OTM-put spread ratio vs 1h average.
+        """
+        active = self.dm.get_active_chain()
+        if not active:
+            return None, "no chain"
+
+        spot = self.dm.spot
+        if not spot:
+            return None, "no spot"
+
+        near_expiry = self.dm._active_expiry or ""
+        T = years_to_expiry(near_expiry, now)
+
+        # Record this cycle's snapshot
+        strikes_snap = {}
+        for strike, data in active.items():
+            c_leg = data.get("call", {})
+            p_leg = data.get("put",  {})
+            coi   = c_leg.get("oi")
+            poi   = p_leg.get("oi")
+            if coi is not None and coi < config.MIN_OI_LOTS:
+                coi = None
+            if poi is not None and poi < config.MIN_OI_LOTS:
+                poi = None
+            if coi is None and poi is None:
+                continue
+            cd = (
+                leg_delta(c_leg, spot, strike, T, 0.065, True)
+                if coi is not None else None
+            )
+            pd = (
+                leg_delta(p_leg, spot, strike, T, 0.065, False)
+                if poi is not None else None
+            )
+            strikes_snap[f"{strike:.0f}"] = [coi, poi, cd, pd]
+
+        # 3rd OTM put spread ratio
+        otm_puts = [
+            (strike, data["put"])
+            for strike, data in active.items()
+            if strike < spot and quality(data.get("put", {}), config.MIN_OI_LOTS)
+        ]
+        spr = None
+        spr_strike = None
+        if len(otm_puts) >= 3:
+            third = sorted(otm_puts, key=lambda x: x[0], reverse=True)[2]
+            bid, ask = third[1].get("bid"), third[1].get("ask")
+            if bid and ask:
+                mid = (bid + ask) / 2.0
+                if mid > 0:
+                    spr        = (ask - bid) / mid
+                    spr_strike = third[0]
+
+        self._add_flow_snapshot({
+            "ts":      now.isoformat(),
+            "strikes": strikes_snap,
+            "spr":     spr,
+            "spot":    spot,
+        })
+
+        # Net delta-weighted OI change vs ~15 min ago
+        ref = self._snapshot_near(
+            now,
+            min_age_s=600,
+            target_age_s=900,
+            max_age_s=1800,
+        )
+        net_flow = None
+        if ref:
+            dcall = dput = 0.0
+            for k, (coi, poi, cd, pd) in strikes_snap.items():
+                old = ref["strikes"].get(k)
+                if not old:
+                    continue
+                if coi is not None and old[0] is not None and cd is not None:
+                    dcall += (coi - old[0]) * cd
+                if poi is not None and old[1] is not None and pd is not None:
+                    dput  += (poi - old[1]) * pd
+            net_flow = dcall + dput
+
+        # Spread ratio vs 1h average
+        spr_avg = None
+        hist    = []
+        for s in self._flow_snapshots:
+            if s.get("spr") is None:
+                continue
+            try:
+                age = (
+                    now - datetime.fromisoformat(s["ts"])
+                ).total_seconds()
+            except ValueError:
+                continue
+            if age <= 3600:
+                hist.append((s["ts"], s["spr"]))
+        if len(hist) >= 3:
+            span_min = (
+                now - datetime.fromisoformat(hist[0][0])
+            ).total_seconds() / 60.0
+            if span_min >= 20:
+                spr_avg = statistics.mean(v for _, v in hist)
+
+        if net_flow is None or spr_avg is None:
+            why = []
+            if net_flow is None:
+                why.append("net-flow warming (needs 10-30 min old snapshot)")
+            if spr_avg is None:
+                why.append("spread baseline warming (needs ~20 min history)")
+            detail = (
+                f"Net_dOI(15m): {'n/a' if net_flow is None else f'{net_flow:+,.0f}'} | "
+                f"SPR({spr_strike or '-'}): "
+                f"{f'{spr:.4f}' if spr is not None else 'n/a'} vs "
+                f"1h avg {f'{spr_avg:.4f}' if spr_avg is not None else 'n/a'} | "
+                + "; ".join(why)
+            )
+            return None, detail
+
+        if spr < spr_avg * 0.985:
+            spr_state = "CONTRACTING"
+        elif spr > spr_avg * 1.015:
+            spr_state = "WIDENING"
+        else:
+            spr_state = "FLAT"
+
+        if net_flow > 0 and spr_state == "CONTRACTING":
+            raw = 1
+            tag = "aggressive bullish flow"
+        elif net_flow < 0 and spr_state == "WIDENING":
+            raw = -1
+            tag = "defensive/panic flow"
+        else:
+            raw = 0
+            tag = "mixed"
+
+        detail = (
+            f"Net_dOI(15m) {net_flow:+,.0f} | "
+            f"SPR {spr:.4f} vs avg {spr_avg:.4f} "
+            f"-> {spr_state} | {tag}"
+        )
+        logger.info(f"Flow: score={raw} | {detail}")
+        return raw, detail
+
+    # ─────────────────────────────────────────────────────────────────
+    # Step 5: Persistence filter
+    # ─────────────────────────────────────────────────────────────────
+
+    def _persist(
+        self, name: str, raw: Optional[float]
+    ) -> int:
+        """
+        Reference algorithm Step 5:
+        3 consecutive identical readings to confirm.
+        raw=None -> hold previous confirmed value.
+        """
+        if raw is None:
+            return self._conf[name]
+
+        raw_int = int(round(raw))
+        buf     = self._buf[name]
+        buf.append(raw_int)
+        if len(buf) > 3:
+            buf.pop(0)
+
+        if len(buf) == 3 and buf[0] == buf[1] == buf[2]:
+            self._conf[name] = raw_int
+            logger.info(
+                f"Persistence confirmed: {name}={raw_int}"
+            )
+        else:
+            logger.info(
+                f"Persistence unconfirmed: {name} "
+                f"buf={buf} "
+                f"holding={self._conf[name]}"
+            )
+        return self._conf[name]
+
+    # ─────────────────────────────────────────────────────────────────
+    # Step 6: Macro override
+    # ─────────────────────────────────────────────────────────────────
+
+    def _check_macro_override(
+        self, now: datetime
+    ) -> Tuple[bool, str]:
+        for event_date_str, event_name in (
+            config.HIGH_IMPACT_EVENTS.items()
+        ):
+            try:
+                event_dt = self._IST.localize(
+                    datetime.strptime(
+                        event_date_str, "%Y-%m-%d"
+                    ).replace(
+                        hour=9, minute=15,
+                        second=0, microsecond=0,
+                    )
+                )
+                diff_h = (
+                    (now - event_dt).total_seconds() / 3600.0
+                )
+                # Skip events > 7 days past
+                if diff_h > 7 * 24:
+                    continue
+                if diff_h < 0:
+                    if abs(diff_h) <= EVENT_PRE_HOURS:
+                        return True, event_name
+                else:
+                    if diff_h <= EVENT_POST_HOURS:
+                        return True, event_name
+            except Exception:
+                continue
+        return False, ""
+
+    # ─────────────────────────────────────────────────────────────────
+    # Step 8: Regime mapping
+    # ─────────────────────────────────────────────────────────────────
+
+    def _map_regime(self, composite: float) -> str:
+        """Reference algorithm regime mapping."""
+        if composite > 0.45:
+            return config.REGIME_STRONG_SELL
+        if composite >= 0.15:
+            return config.REGIME_MILD_SELL
+        if composite > -0.15:
+            return config.REGIME_NEUTRAL
+        if composite >= -0.45:
+            return config.REGIME_BUY_VOL
+        return config.REGIME_STRONG_BUY
+
+    # ─────────────────────────────────────────────────────────────────
+    # Skew history helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    def _record_skew(self, skew: float, today_iso: str) -> None:
+        h = [
+            e for e in self._skew_history
+            if e.get("date") != today_iso
+        ]
+        h.append({"date": today_iso, "skew": round(skew, 4)})
+        h.sort(key=lambda e: e["date"])
+        self._skew_history = h[-60:]
+
+    def _skew_zscore(
+        self, today_iso: str
+    ) -> Tuple[Optional[float], int]:
+        hist = [
+            e["skew"] for e in self._skew_history
+            if e.get("date") != today_iso
+        ][-SKEW_HISTORY_DAYS:]
+        if len(hist) < SKEW_MIN_DAYS:
+            return None, len(hist)
+        sd = statistics.stdev(hist) if len(hist) > 1 else 0.0
+        if sd < 1e-9:
+            return None, len(hist)
+        cur = next(
+            (
+                e["skew"] for e in reversed(self._skew_history)
+                if e["date"] == today_iso
+            ),
+            None,
+        )
+        if cur is None:
+            return None, len(hist)
+        return (cur - statistics.mean(hist)) / sd, len(hist)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Flow snapshot helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    def _add_flow_snapshot(self, snap: Dict) -> None:
+        self._flow_snapshots.append(snap)
+        cutoff = (
+            datetime.now(self._IST) - timedelta(minutes=75)
+        ).isoformat()
+        self._flow_snapshots = [
+            s for s in self._flow_snapshots
+            if s.get("ts", "") >= cutoff
+        ]
+
+    def _snapshot_near(
+        self,
+        now: datetime,
+        min_age_s: float,
+        target_age_s: float,
+        max_age_s: float,
+    ) -> Optional[Dict]:
+        best, best_d = None, None
+        for s in reversed(self._flow_snapshots):
+            try:
+                age = (
+                    now - datetime.fromisoformat(s["ts"])
+                ).total_seconds()
+            except (KeyError, ValueError):
+                continue
+            if min_age_s <= age <= max_age_s:
+                d = abs(age - target_age_s)
+                if best_d is None or d < best_d:
+                    best, best_d = s, d
+        return best
+
+    # ─────────────────────────────────────────────────────────────────
+    # State persistence
+    # ─────────────────────────────────────────────────────────────────
+
+    def _save_state(self) -> None:
+        """Save skew history and flow snapshots to SQLite."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO regime_history (
-                    timestamp, vol_score, edge_score,
-                    trend_score, flow_score,
-                    composite_score, raw_regime,
-                    confirmed_regime, persistence_count,
-                    macro_override
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                data.get("timestamp"),
-                data.get("vol_score"),
-                data.get("edge_score"),
-                data.get("trend_score"),
-                data.get("flow_score"),
-                data.get("composite_score"),
-                data.get("raw_regime"),
-                data.get("confirmed_regime"),
-                data.get("persistence_count"),
-                data.get("macro_override", 0)
-            ))
+                CREATE TABLE IF NOT EXISTS regime_algo_state (
+                    id           INTEGER PRIMARY KEY,
+                    key          TEXT UNIQUE,
+                    value_json   TEXT,
+                    updated_at   TEXT
+                )
+            """)
+            now_str = datetime.now(self._IST).isoformat()
+            for key, value in [
+                ("skew_history",    self._skew_history),
+                ("flow_snapshots",  self._flow_snapshots[-20:]),
+                ("buffers",         self._buf),
+                ("confirmed",       self._conf),
+            ]:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO regime_algo_state
+                    (id, key, value_json, updated_at)
+                    VALUES (
+                        (SELECT id FROM regime_algo_state WHERE key=?),
+                        ?, ?, ?
+                    )
+                """, (key, key, json.dumps(value), now_str))
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
-            logger.warning(f"_save_regime_to_sqlite error: {e}")
+            logger.warning(f"_save_state error: {e}")
 
-    def _log_console_output(self) -> None:
-        """Log formatted regime summary to console."""
+    def _load_state(self) -> None:
+        """Restore skew history and buffers from SQLite."""
+        try:
+            conn   = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT key, value_json FROM regime_algo_state
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+            for key, val in rows:
+                try:
+                    data = json.loads(val)
+                    if key == "skew_history":
+                        self._skew_history = data
+                    elif key == "flow_snapshots":
+                        self._flow_snapshots = data
+                    elif key == "buffers":
+                        self._buf = {
+                            m: data.get(m, [])
+                            for m in MODULES
+                        }
+                    elif key == "confirmed":
+                        self._conf = {
+                            m: int(data.get(m, 0))
+                            for m in MODULES
+                        }
+                except Exception:
+                    pass
+            logger.info("Regime algo state loaded from SQLite")
+        except sqlite3.OperationalError:
+            logger.info("No regime_algo_state table — fresh start")
+        except Exception as e:
+            logger.warning(f"_load_state error: {e}")
+
+    async def _save_regime_to_sqlite(self, data: Dict) -> None:
+        def _write():
+            try:
+                conn   = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO regime_history (
+                        timestamp, vol_score, edge_score,
+                        trend_score, flow_score,
+                        composite_score, raw_regime,
+                        confirmed_regime, persistence_count,
+                        macro_override
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    data.get("timestamp"),
+                    data.get("vol_score"),
+                    data.get("edge_score"),
+                    data.get("trend_score"),
+                    data.get("flow_score"),
+                    data.get("composite_score"),
+                    data.get("raw_regime"),
+                    data.get("confirmed_regime"),
+                    data.get("persistence_count"),
+                    data.get("macro_override", 0),
+                ))
+                cursor.execute("""
+                    DELETE FROM regime_history
+                    WHERE id NOT IN (
+                        SELECT id FROM regime_history
+                        ORDER BY id DESC LIMIT 5000
+                    )
+                """)
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.warning(f"_save_regime error: {e}")
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as e:
+            logger.warning(f"_save_regime thread error: {e}")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Backward-compatible methods (used by strategy_engine + main)
+    # ─────────────────────────────────────────────────────────────────
+
+    def load_buffers_from_sqlite(self) -> None:
+        """Called at startup — loads saved state."""
+        self._load_state()
+
+    def save_buffers_to_sqlite(self) -> None:
+        """Called periodically — saves state."""
+        self._save_state()
+
+    def _log_console_output(self, now: datetime) -> None:
         COLORS = {
             config.REGIME_STRONG_SELL: "\033[92m",
             config.REGIME_MILD_SELL:   "\033[32m",
@@ -445,107 +1105,58 @@ class RegimeEngine:
         }
         RESET = "\033[0m"
         color = COLORS.get(self.confirmed_regime, "")
-        now_str = datetime.now(self._IST).strftime("%Y-%m-%d %H:%M:%S")
+        spot_str = f"{self.dm.spot:.2f}" if self.dm.spot else "N/A"
+        vix_str  = f"{self.dm.vix:.2f}"  if self.dm.vix  else "N/A"
 
-        logger.info(
-            f"\n┌─────────────────────────────────────────┐\n"
-            f"│ {now_str} │\n"
-            f"│ Spot={self.dm.spot or 'N/A':<10} VIX={self.dm.vix or 'N/A':<6} "
-            f"Composite={self.raw_composite:+.4f} │\n"
-            f"│ Vol={self.confirmed_vol:+.2f} Edge={self.confirmed_edge:+.2f} "
-            f"Trend={self.confirmed_trend:+.2f} Flow={self.confirmed_flow:+.2f} │\n"
-            f"│ Regime: {color}{self.confirmed_regime}{RESET} "
-            f"(persist={self.persistence_count}) │\n"
-            f"│ Action: {self.get_regime_action_description()} │\n"
-            f"└─────────────────────────────────────────┘"
+        # Show raw vs confirmed for each module
+        def fmt(raw, conf):
+            r = f"{raw:+.2f}" if raw is not None else " n/a"
+            c = f"{conf:+.2f}"
+            return f"raw={r} conf={c}"
+
+        print(
+            f"\n[{now.strftime('%H:%M:%S')}] "
+            f"Spot={spot_str} VIX={vix_str} "
+            f"Composite={self.raw_composite:+.4f} "
+            f"Regime={color}{self.confirmed_regime}{RESET} "
+            f"(persist={self.persistence_count})"
+        )
+        print(
+            f"  Vol:   {fmt(self._raw['vol'],   self._conf['vol'])}   "
+            f"{self._detail['vol'][:60]}"
+        )
+        print(
+            f"  Edge:  {fmt(self._raw['edge'],  self._conf['edge'])}   "
+            f"{self._detail['edge'][:60]}"
+        )
+        print(
+            f"  Trend: {fmt(self._raw['trend'], self._conf['trend'])}   "
+            f"{self._detail['trend'][:60]}"
+        )
+        print(
+            f"  Flow:  {fmt(self._raw['flow'],  self._conf['flow'])}   "
+            f"{self._detail['flow'][:60]}"
         )
 
     def get_regime_action_description(self) -> str:
-        """Return human-readable action description for current regime."""
-        descriptions = {
-            config.REGIME_STRONG_SELL: "SELL PREMIUM: Straddle/Condor",
-            config.REGIME_MILD_SELL:   "SELL DEFINED: Credit Spreads",
-            config.REGIME_NEUTRAL:     "HOLD: Manage existing only",
-            config.REGIME_BUY_VOL:     "DEFENSIVE: Hedge/Reduce",
-            config.REGIME_STRONG_BUY:  "BUY VOL: Long Straddle/Backspread",
-            config.REGIME_EVENT:       "EVENT: Long Strangle"
+        actions = {
+            config.REGIME_STRONG_SELL: (
+                "SELL PREMIUM: Straddle/Condor"
+            ),
+            config.REGIME_MILD_SELL: (
+                "SELL DEFINED: Credit Spreads"
+            ),
+            config.REGIME_NEUTRAL: (
+                "HOLD: Manage existing only"
+            ),
+            config.REGIME_BUY_VOL: (
+                "BUY VOL: Butterfly/Defensive Hedge"
+            ),
+            config.REGIME_STRONG_BUY: (
+                "BUY VOL: Long Straddle/Backspread"
+            ),
+            config.REGIME_EVENT: (
+                "EVENT HEDGE: Flatten shorts, long gamma"
+            ),
         }
-        return descriptions.get(self.confirmed_regime, "UNKNOWN")
-
-    def load_buffers_from_sqlite(self) -> None:
-        """Restore score buffers and confirmed scores from SQLite."""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM score_buffers")
-            rows = cursor.fetchall()
-            conn.close()
-
-            if not rows:
-                logger.info("No score buffers in SQLite — starting fresh")
-                return
-
-            cols = ["id", "score_name", "buffer_json", "confirmed_score", "updated_at"]
-            for row in rows:
-                row_dict = dict(zip(cols, row))
-                score_name = row_dict.get("score_name", "")
-                buffer_json = row_dict.get("buffer_json", "[]")
-                confirmed = float(row_dict.get("confirmed_score", 0.0))
-
-                try:
-                    buffer_list = json.loads(buffer_json)
-                except Exception:
-                    buffer_list = []
-
-                if score_name == "vol":
-                    self.vol_buffer = deque(buffer_list, maxlen=config.PERSISTENCE_READINGS)
-                    self.confirmed_vol = confirmed
-                elif score_name == "edge":
-                    self.edge_buffer = deque(buffer_list, maxlen=config.PERSISTENCE_READINGS)
-                    self.confirmed_edge = confirmed
-                elif score_name == "trend":
-                    self.trend_buffer = deque(buffer_list, maxlen=config.PERSISTENCE_READINGS)
-                    self.confirmed_trend = confirmed
-                elif score_name == "flow":
-                    self.flow_buffer = deque(buffer_list, maxlen=config.PERSISTENCE_READINGS)
-                    self.confirmed_flow = confirmed
-
-            logger.info("Score buffers restored from SQLite")
-
-        except sqlite3.OperationalError:
-            logger.info("No score_buffers table — fresh start")
-        except Exception as e:
-            logger.warning(f"load_buffers_from_sqlite error: {e}")
-
-    def save_buffers_to_sqlite(self) -> None:
-        """Persist score buffers and confirmed scores to SQLite."""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            now_str = datetime.now(self._IST).isoformat()
-
-            buffers = {
-                "vol":   (self.vol_buffer,   self.confirmed_vol),
-                "edge":  (self.edge_buffer,  self.confirmed_edge),
-                "trend": (self.trend_buffer, self.confirmed_trend),
-                "flow":  (self.flow_buffer,  self.confirmed_flow),
-            }
-
-            for score_name, (buf, confirmed) in buffers.items():
-                cursor.execute("""
-                    INSERT OR REPLACE INTO score_buffers
-                    (score_name, buffer_json, confirmed_score, updated_at)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    score_name,
-                    json.dumps(list(buf)),
-                    confirmed,
-                    now_str
-                ))
-
-            conn.commit()
-            conn.close()
-            logger.info("Score buffers saved to SQLite")
-
-        except sqlite3.Error as e:
-            logger.warning(f"save_buffers_to_sqlite error: {e}")
+        return actions.get(self.confirmed_regime, "UNKNOWN")
