@@ -401,10 +401,11 @@ STRAT_BACKSPREAD     = "BACKSPREAD_DIRECTIONAL"
 STRAT_STRANGLE       = "LONG_STRANGLE_EVENT"
 
 # ── Short straddle ────────────────────────────────────────────────────
-# CFG-P4C: tightened to high-theta zone. Theta/day at DTE 3 is
-# 37% higher than at DTE 8 for the same notional gamma exposure.
+# CFG-02: widened DTE windows. Analysis shows EV/lot rises
+# monotonically with DTE while P(stop) does not increase.
+# Confining to DTE<=4 was the least favourable point on the curve.
 STRADDLE_DTE_MIN       = 1
-STRADDLE_DTE_MAX       = 4    # widened from 7
+STRADDLE_DTE_MAX       = 8    # was 4    # widened from 7
 STRADDLE_STOP_MULT     = 2.0   # stop = 2x credit
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning).
 STRADDLE_TARGET_PCT    = 0.50
@@ -418,9 +419,9 @@ STRADDLE_SPOT_STOP_PCT = 0.03
 # yields only 15-26pts credit vs the 88pt floor — never buildable.
 # At 250-wide the credit/width ratio is achievable at VIX 11-16.
 CONDOR_WING_WIDTH         = 250
-# CFG-P4C: tightened to high-theta zone (DTE 2-5).
+# CFG-02: widened (same reasoning as straddle).
 CONDOR_DTE_MIN            = 2
-CONDOR_DTE_MAX            = 5     # widened from 7
+CONDOR_DTE_MAX            = 8    # was 5     # widened from 7
 # EXE-02: set to 1. With TIME_EXIT_EXPIRY=13:30, holding to DTE=0
 # is dangerous. Exit at DTE=1 harvests 95%+ of theta without the
 # terminal gamma tail risk from 0-DTE institutional hedging flows.

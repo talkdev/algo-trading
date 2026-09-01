@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 TERM_THRESHOLD   = 1.5    # V_fwd - V_spot contango/backwardation
 SKEW_Z_STEEP = config.SKEW_ZSCORE_FEAR        # AUDIT #2.2: reads from config
 SKEW_Z_FLAT = config.SKEW_ZSCORE_COMPLACENT  # AUDIT #2.2: reads from config
+# CFG-01: reads from config (now symmetric ±2.0)
 EDGE_RICH = config.EDGE_RICH        # AUDIT #2.2: reads from config
 EDGE_CHEAP = config.EDGE_CHEAP       # AUDIT #2.2: reads from config
 # AUDIT #2.2/#2.3: ADX_TREND now reads from config.
@@ -496,6 +497,23 @@ class RegimeEngine:
             f"composite={self.raw_composite:.4f} "
             f"persist={self.persistence_count}"
         )
+
+        # LOG-RE-02: log this cycle for walk-forward analysis
+        # _live_weights was computed earlier in this method;
+        # rebuild it here so the log captures what was actually used.
+        try:
+            _log_weights = _build_weights(
+                getattr(self, "_last_flow_none_frac", 0.0)
+            )
+        except Exception:
+            _log_weights = {
+                "vol": config.WEIGHT_VOL,
+                "edge": config.WEIGHT_EDGE,
+                "trend": config.WEIGHT_TREND,
+                "flow": config.WEIGHT_FLOW,
+            }
+        self._log_regime_cycle(now, _log_weights)
+
         return self.confirmed_regime
 
     # ─────────────────────────────────────────────────────────────────
@@ -531,10 +549,19 @@ class RegimeEngine:
         # different tenors). Fall back to VIX only if iv_atm unavailable.
         v_fwd = self.dm.forward_iv
         _near_iv = self.dm.iv_atm  # near-expiry ATM IV (decimal)
-        if v_fwd is not None:
+        # RE-01: detect whether forward_iv is a genuine far-expiry
+        # ATM IV or the VIX/100 fallback. When it is the fallback,
+        # the 'term spread' compares a 30-day variance-swap integral
+        # against a 3-6 day ATM number — not a term spread at all.
+        # Return None (honest zero) so _persist decays gracefully
+        # rather than injecting a structurally biased constant.
+        _fwd_is_vix_proxy = (
+            v_fwd is not None
+            and self.dm.vix is not None
+            and abs(v_fwd - self.dm.vix / 100.0) < 0.001
+        )
+        if v_fwd is not None and not _fwd_is_vix_proxy:
             v_fwd_pct  = v_fwd * 100.0
-            # Use near ATM IV if available (apples-to-apples comparison)
-            # Fall back to VIX only when iv_atm is missing
             if _near_iv is not None and _near_iv > 0:
                 v_spot_pct = _near_iv * 100.0
             else:
@@ -550,6 +577,11 @@ class RegimeEngine:
                 f"T_spread {t_spread:+.2f}% "
                 f"({'CONTANGO' if term_score==1 else 'BACKWARDATION' if term_score==-1 else 'FLAT'})"
             )
+        elif _fwd_is_vix_proxy:
+            # RE-01: VIX proxy — not a real term spread, return None
+            term_score = None
+            term_txt   = "T_spread n/a (forward_iv is VIX proxy)"
+            notes.append("forward IV is VIX/100 proxy — not a term spread")
         else:
             term_score = 0
             term_txt   = "T_spread n/a (no far expiry)"
@@ -638,7 +670,11 @@ class RegimeEngine:
             skew_txt   = "skew25 n/a (illiquid chain)"
             notes.append("25-delta legs not found")
 
-        vol_score = 0.5 * term_score + 0.5 * skew_score
+        # RE-01: if term_score is None (VIX proxy), use only skew
+        if term_score is None:
+            vol_score = skew_score  # full weight on skew
+        else:
+            vol_score = 0.5 * term_score + 0.5 * skew_score
         detail = f"{term_txt} | {skew_txt}"
         if notes:
             detail += " | " + "; ".join(notes)
@@ -1428,6 +1464,43 @@ class RegimeEngine:
                     updated_at   TEXT
                 )
             """)
+            # LOG-RE-03: decision logging table for walk-forward analysis
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS regime_cycle_log (
+                    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp                TEXT NOT NULL,
+                    spot                     REAL,
+                    vix                      REAL,
+                    iv_atm                   REAL,
+                    rv_20d                   REAL,
+                    adx                      REAL,
+                    ema_slope_pct            REAL,
+                    raw_vol                  REAL,
+                    raw_edge                 REAL,
+                    raw_trend                REAL,
+                    raw_flow                 REAL,
+                    conf_vol                 REAL,
+                    conf_edge                REAL,
+                    conf_trend               REAL,
+                    conf_flow                REAL,
+                    weight_vol               REAL,
+                    weight_edge              REAL,
+                    weight_trend             REAL,
+                    weight_flow              REAL,
+                    composite_score          REAL,
+                    confirmed_regime         TEXT,
+                    regime_changed           INTEGER,
+                    persistence_count        INTEGER,
+                    entry_gate_passed        INTEGER,
+                    entry_gate_blocked_reason TEXT,
+                    active_expiry            TEXT,
+                    active_expiry_dte        INTEGER
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_regime_cycle_ts
+                ON regime_cycle_log(timestamp)
+            """)
             now_str = datetime.now(self._IST).isoformat()
             _today_save = datetime.now(self._IST).date().isoformat()
             for key, value in [
@@ -1465,6 +1538,88 @@ class RegimeEngine:
             conn.close()
         except sqlite3.Error as e:
             logger.warning(f"_save_state error: {e}")
+
+    def _log_regime_cycle(
+        self,
+        now: datetime,
+        weights: dict,
+        entry_gate_passed: bool = False,
+        blocked_reason: str = "",
+    ) -> None:
+        """LOG-RE-01: log every regime refresh cycle for walk-forward analysis.
+
+        Called at the end of _refresh_locked() so every cycle
+        (including warmup and macro-override cycles) is recorded.
+        The resulting regime_cycle_log table is consumed by
+        decision_journal.py to build the daily LLM prompt.
+        """
+        try:
+            # Compute active expiry DTE
+            _dte = None
+            _active = self.dm._active_expiry
+            if _active:
+                try:
+                    from datetime import date as _date
+                    _exp = datetime.strptime(
+                        _active, "%Y-%m-%d"
+                    ).date()
+                    _dte = (_exp - _date.today()).days
+                except Exception:
+                    pass
+
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                INSERT INTO regime_cycle_log (
+                    timestamp, spot, vix, iv_atm, rv_20d,
+                    adx, ema_slope_pct,
+                    raw_vol, raw_edge, raw_trend, raw_flow,
+                    conf_vol, conf_edge, conf_trend, conf_flow,
+                    weight_vol, weight_edge, weight_trend, weight_flow,
+                    composite_score, confirmed_regime,
+                    regime_changed, persistence_count,
+                    entry_gate_passed, entry_gate_blocked_reason,
+                    active_expiry, active_expiry_dte
+                ) VALUES (
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                )
+            """, (
+                now.isoformat(),
+                self.dm.spot,
+                self.dm.vix,
+                self.dm.iv_atm,
+                self.dm.rv_20d,
+                self.dm.adx,
+                self.dm.ema_slope,
+                self._raw.get("vol"),
+                self._raw.get("edge"),
+                self._raw.get("trend"),
+                self._raw.get("flow"),
+                float(self._conf.get("vol", 0)),
+                float(self._conf.get("edge", 0)),
+                float(self._conf.get("trend", 0)),
+                float(self._conf.get("flow", 0)),
+                weights.get("vol"),
+                weights.get("edge"),
+                weights.get("trend"),
+                weights.get("flow"),
+                self.raw_composite,
+                self.confirmed_regime,
+                1 if self.regime_changed else 0,
+                self.persistence_count,
+                1 if entry_gate_passed else 0,
+                blocked_reason or "",
+                _active,
+                _dte,
+            ))
+            # Keep last 30 days only to avoid unbounded growth
+            conn.execute("""
+                DELETE FROM regime_cycle_log
+                WHERE timestamp < datetime('now', '-30 days')
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug(f"_log_regime_cycle: {e}")
 
     def _load_state(self) -> None:
         """Restore skew history and buffers from SQLite."""

@@ -1,0 +1,76 @@
+{
+  "journal_version": "1.0",
+  "trading_date": "2026-09-01",
+  "generated_at": "2026-09-01T16:09:47.399619+05:30",
+  "engine_version": "arena-algo-trading",
+  "parameters": {
+    "WEIGHT_VOL": 0.3,
+    "WEIGHT_EDGE": 0.3,
+    "WEIGHT_TREND": 0.25,
+    "WEIGHT_FLOW": 0.15,
+    "STRONG_SELL_ENTER": 0.45,
+    "STRONG_SELL_EXIT": 0.4,
+    "MILD_SELL_ENTER": 0.15,
+    "MILD_SELL_EXIT": 0.1,
+    "CONDOR_SIGMA_MULTIPLIER": 1.2,
+    "CONDOR_MIN_CREDIT_PCT_OF_WIDTH": 0.18,
+    "CONDOR_WING_WIDTH": 250,
+    "CONDOR_TARGET_PCT": 0.5,
+    "STRADDLE_TARGET_PCT": 0.5,
+    "SPREAD_TARGET_PCT": 0.5,
+    "STRADDLE_STOP_MULT": 2.0,
+    "STOP_BREACH_TICKS_REQUIRED": 3,
+    "STOP_SPOT_FRACTION_OF_DISTANCE": 0.8,
+    "MAX_RISK_PER_TRADE_PCT": 0.02,
+    "VIX_ADAPTIVE_SIZING": true,
+    "VIX_ADAPTIVE_REFERENCE": 16.0,
+    "EXEC_START_TIME": "09:30:00",
+    "EXEC_END_TIME": "14:30:00",
+    "TIME_EXIT_EXPIRY": "13:30:00",
+    "CONDOR_EXIT_DTE": 1,
+    "SPREAD_EXIT_DTE": 1,
+    "ADAPTIVE_PERSISTENCE_ENABLED": true,
+    "ADAPTIVE_PERSISTENCE_FAST_THRESHOLD": 0.6,
+    "PARTIAL_PROFIT_ENABLED": true,
+    "PARTIAL_PROFIT_TRIGGER_PCT": 0.25,
+    "PARTIAL_PROFIT_CLOSE_PCT": 0.5,
+    "FLOW_WEIGHT_NONE_THRESHOLD": 0.5
+  },
+  "market_state_eod": {
+    "spot": 24055.8,
+    "vix": 11.49,
+    "iv_atm": 0.0996,
+    "rv_20d": 0.053948444156647214,
+    "skew": 0.035299999999999984,
+    "adx": 15.930358031385392,
+    "ema_50": 24121.638611261642,
+    "composite_score": 0.0,
+    "regime": "NEUTRAL"
+  },
+  "regime_cycles": [],
+  "regime_history": [],
+  "entry_attempts": [],
+  "trades_today": [],
+  "open_positions": [],
+  "circuit_breakers": [],
+  "capital_state": {},
+  "trailing_pnl": {
+    "trailing_7d": {
+      "trades": 0,
+      "total_pnl": 0,
+      "avg_pnl": 0,
+      "win_rate": 0
+    },
+    "trailing_30d": {
+      "trades": 0,
+      "total_pnl": 0,
+      "avg_pnl": 0,
+      "win_rate": 0
+    }
+  },
+  "daily_statistics": {
+    "trades_opened": 0,
+    "trades_closed": 0,
+    "total_net_pnl": 0
+  }
+}
