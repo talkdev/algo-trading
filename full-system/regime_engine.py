@@ -702,11 +702,19 @@ class RegimeEngine:
             _slope_up = slope > 0
             _di_bull  = pdi > ndi
             if above and _slope_up and _di_bull:
-                raw  = 1
-                dirn = "bullish (3-way confirmed)"
-            elif not above and not _slope_up and not _di_bull:
+                # RE-02: a confirmed bullish trend means the market
+                # is moving directionally — exactly when a short-gamma
+                # book gets run over. Score -1 (reduce short-vol
+                # conviction) rather than +1 (increase it).
+                # The directional information is preserved in `dirn`
+                # for logging and future strike-skew logic.
                 raw  = -1
-                dirn = "bearish (3-way confirmed)"
+                dirn = "bullish trend (reduces short-vol score)"
+            elif not above and not _slope_up and not _di_bull:
+                # Bearish trend also reduces short-vol conviction
+                # (gap-down risk for short puts).
+                raw  = -1
+                dirn = "bearish trend (reduces short-vol score)"
             else:
                 raw  = 0
                 dirn = "mixed signals (no 3-way agreement)"
@@ -974,7 +982,14 @@ class RegimeEngine:
             config.HIGH_IMPACT_EVENTS.items()
         ):
             try:
-                event_dt = self._IST.localize(
+                # RE-03: anchor to market OPEN (09:15) on the event
+                # date. The old code anchored to 09:15 and used
+                # EVENT_PRE_HOURS=6, making the pre-window 03:15-09:15
+                # IST — the market is closed for all of it. The engine
+                # never de-risked BEFORE a Budget/RBI print.
+                # New: pre-window = EVENT_PRE_HOURS before market open
+                # on the event date, so it covers the trading session.
+                event_market_open = self._IST.localize(
                     datetime.strptime(
                         event_date_str, "%Y-%m-%d"
                     ).replace(
@@ -982,18 +997,27 @@ class RegimeEngine:
                         second=0, microsecond=0,
                     )
                 )
+                # Pre-window starts EVENT_PRE_HOURS before market open
+                pre_window_start = (
+                    event_market_open
+                    - __import__("datetime").timedelta(
+                        hours=EVENT_PRE_HOURS
+                    )
+                )
+                post_window_end = (
+                    event_market_open
+                    + __import__("datetime").timedelta(
+                        hours=EVENT_POST_HOURS
+                    )
+                )
                 diff_h = (
-                    (now - event_dt).total_seconds() / 3600.0
+                    (now - event_market_open).total_seconds() / 3600.0
                 )
                 # Skip events > 7 days past
                 if diff_h > 7 * 24:
                     continue
-                if diff_h < 0:
-                    if abs(diff_h) <= EVENT_PRE_HOURS:
-                        return True, event_name
-                else:
-                    if diff_h <= EVENT_POST_HOURS:
-                        return True, event_name
+                if pre_window_start <= now <= post_window_end:
+                    return True, event_name
             except Exception:
                 continue
         return False, ""
