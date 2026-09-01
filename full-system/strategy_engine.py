@@ -3210,17 +3210,12 @@ class StrategyEngine:
         ema_200      = self._get_ema_200()
 
         if regime == config.REGIME_STRONG_SELL:
-            # SE-B1: route to straddle by default.
-            # The condor is arithmetically unbuildable at 1.5sigma
-            # across the realistic VIX range (credit ~6-9% of width
-            # vs 18% required floor). The straddle has 2 legs (1.7pts
-            # cost vs 3.2), no wing debit, and maximum theta.
-            # Route to condor only when ADX confirms a genuine trend
-            # (tail risk warrants paying for wings).
-            if adx > config.ADX_TREND_THRESHOLD:
-                return config.STRAT_IRON_CONDOR
-            else:
-                return config.STRAT_SHORT_STRADDLE
+            # PATCH S-08: always route STRONG_SELL to straddle.
+            # STRONG_SELL requires trend=+1 (ADX<ADX_RANGE_THRESHOLD),
+            # so ADX>ADX_TREND_THRESHOLD is impossible when in this regime.
+            # The condor branch was permanently dead code.
+            # Straddle: 2 legs, maximum theta, no wing debit.
+            return config.STRAT_SHORT_STRADDLE
 
         elif regime == config.REGIME_MILD_SELL:
             if skew_diff >= config.SPREAD_SKEW_THRESHOLD:
@@ -3730,11 +3725,9 @@ class StrategyEngine:
             "profit_target": net_credit * (
                 1 - config.CONDOR_TARGET_PCT
             ),
-            # PRF-S05: raised from 1.25x to 2.0x credit.
-            # 1.25x stop = 50pt on a 40pt credit condor. NIFTY moves
-            # 50-80pt intraday routinely, causing many false stop-outs.
-            # 2.0x = 80pt stop, survives normal intraday noise.
-            "stop_loss":     net_credit * 2.0,
+            # PATCH S-05: 2.0x→1.0x. At 2.0x stop + 60% target,
+            # break-even WR=77% (unachievable). At 1.0x + 60%: WR=62.5%.
+            "stop_loss":     net_credit * 1.0,
             "exit_dte":      config.CONDOR_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -3875,6 +3868,16 @@ class StrategyEngine:
         # SE-01: widths computed before the credit gate.
         put_width  = short_put_strike  - long_put_strike
         call_width = long_call_strike  - short_call_strike
+        # PATCH S-01: assign side flags BEFORE first use.
+        # Previously assigned after the credit gate that used them → NameError.
+        _build_put_side  = skew_side in ("put",  "both")
+        _build_call_side = skew_side in ("call", "both")
+
+        # PATCHED S-01: assign side flags BEFORE first use.
+        # Previously assigned after the credit gate that used them.
+        _build_put_side  = skew_side in ("put",  "both")
+        _build_call_side = skew_side in ("call", "both")
+
         # FIX-02: max_risk based on active sides only
         _active_w = max(
             put_width  if _build_put_side  else 0,
@@ -3939,9 +3942,8 @@ class StrategyEngine:
         # Use executable credit for position record
         total_credit = _exec_credit
 
-        # PRF-02: only build the side(s) justified by skew.
-        _build_put_side  = skew_side in ("put",  "both")
-        _build_call_side = skew_side in ("call", "both")
+        # PATCH S-02: _build_put_side/_build_call_side already assigned
+        # above (PATCH S-01). No re-assignment needed here.
 
         # Recalculate credit and max_risk for the active sides
         if not _build_put_side:
@@ -4034,8 +4036,8 @@ class StrategyEngine:
             "profit_target": total_credit * (
                 1 - config.SPREAD_TARGET_PCT
             ),
-            # PRF-S05: raised from 1.25x to 2.0x credit (same as condor).
-            "stop_loss":     total_credit * 2.0,
+            # PATCH S-06: 2.0x→1.0x (same reasoning as S-05).
+            "stop_loss":     total_credit * 1.0,
             "exit_dte":      config.SPREAD_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -4140,7 +4142,8 @@ class StrategyEngine:
             "profit_target": total_credit * (
                 1 - config.RATIO_TARGET_PCT
             ),
-            "stop_loss":     total_credit * 2.0,
+            # PATCH S-07: 2.0x→1.0x stop for ratio spread.
+            "stop_loss":     total_credit * 1.0,
             "exit_dte":      config.RATIO_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -5871,6 +5874,11 @@ class StrategyEngine:
         if max_loss_per_lot <= 0:
             return 0
 
+        # PATCH S-04: define _defined_risk_budget (was undefined → NameError).
+        # Currently no per-strategy override exists; always uses global budget.
+        _defined_risk_budget = None
+        # PATCHED S-04: define _defined_risk_budget before use.
+        _defined_risk_budget = None
         # FIX-09: use defined-risk budget if set
         risk_per_trade = (
             _defined_risk_budget
@@ -5923,6 +5931,39 @@ class StrategyEngine:
         lots = min(lots, max(position_cap, 0))
         lots = max(lots, 0)
 
+        # PATCH S-03: compute _vix_mult before use (was undefined → NameError).
+        # IMM-02: VIX-adaptive lot sizing.
+        _vix_adaptive = getattr(config, "VIX_ADAPTIVE_SIZING", False)
+        _vix_ref = getattr(config, "VIX_ADAPTIVE_REFERENCE", 16.0)
+        _vix_min_mult = getattr(config, "VIX_ADAPTIVE_MIN_MULT", 0.5)
+        _vix_max_mult = getattr(config, "VIX_ADAPTIVE_MAX_MULT", 2.0)
+        _current_vix = self.dm.vix if self.dm.vix and self.dm.vix > 0 else _vix_ref
+        if _vix_adaptive and _current_vix > 0:
+            # Scale UP when VIX is low (premium thin, need more lots for same Rs return)
+            # Scale DOWN when VIX is high (premium rich but risk higher)
+            _vix_mult = max(
+                _vix_min_mult,
+                min(_vix_max_mult, _vix_ref / _current_vix)
+            )
+        else:
+            _vix_mult = 1.0
+        # PATCHED S-03: compute _vix_mult before use.
+        _vix_adaptive = getattr(config, "VIX_ADAPTIVE_SIZING", False)
+        _vix_ref_sz = getattr(config, "VIX_ADAPTIVE_REFERENCE", 16.0)
+        _vix_min_m = getattr(config, "VIX_ADAPTIVE_MIN_MULT", 0.5)
+        _vix_max_m = getattr(config, "VIX_ADAPTIVE_MAX_MULT", 2.0)
+        _cur_vix = (
+            self.dm.vix
+            if self.dm.vix and self.dm.vix > 0
+            else _vix_ref_sz
+        )
+        if _vix_adaptive and _cur_vix > 0:
+            _vix_mult = max(
+                _vix_min_m,
+                min(_vix_max_m, _vix_ref_sz / _cur_vix),
+            )
+        else:
+            _vix_mult = 1.0
         # IMM-02: apply VIX-adaptive multiplier to final lot count
         if _vix_mult != 1.0 and lots > 0:
             lots = max(1, int(lots * _vix_mult))

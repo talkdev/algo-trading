@@ -3253,9 +3253,28 @@ class DataManager:
                     max_risk           REAL,
                     paper_trade        INTEGER DEFAULT 1,
                     status             TEXT    DEFAULT 'OPEN',
+                    meta_json          TEXT    DEFAULT '{}',
                     created_at         TEXT    DEFAULT CURRENT_TIMESTAMP
-                )
+                )  -- PATCH D-01: added meta_json column
             """)
+
+            # PATCH D-04: safe migration — add meta_json if not present
+            try:
+                cursor.execute(
+                    "ALTER TABLE open_positions "
+                    "ADD COLUMN meta_json TEXT DEFAULT '{}'"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+            # PATCHED D-04: safe migration for existing databases
+            try:
+                cursor.execute(
+                    "ALTER TABLE open_positions "
+                    "ADD COLUMN meta_json TEXT DEFAULT '{}'"
+                )
+            except sqlite3.OperationalError:
+                pass
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS closed_trades (
@@ -3480,13 +3499,13 @@ class DataManager:
                     days_to_expiry,
                     total_credit, total_debit,
                     net_premium, max_risk,
-                    paper_trade, status
+                    paper_trade, status, meta_json
                 ) VALUES (
                     ?,?,?,?,?,?,?,?,?,?,
                     ?,?,?,?,?,?,?,?,?,?,
-                    ?,?,?,?
+                    ?,?,?,?,?
                 )
-            """, (
+            """, (  # PATCH D-02: added meta_json
                 position_dict.get("trade_id"),
                 position_dict.get("strategy_name"),
                 position_dict.get("regime_at_entry"),
@@ -3516,6 +3535,7 @@ class DataManager:
                 1 if position_dict.get("paper_trade")
                 else 0,
                 "OPEN",
+                position_dict.get("meta_json", "{}"),  # PATCH D-03
             ))
             conn.commit()
             conn.close()
