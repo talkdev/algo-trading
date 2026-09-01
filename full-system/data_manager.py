@@ -88,25 +88,33 @@ def _sf(value, default: float = 0.0) -> float:
         return default
 
 
-def _clean_delta(raw, is_call: bool) -> float:
+def _clean_delta(raw, is_call: bool):
     """
-    PATCH: sanity-bound API-supplied delta before it's trusted
-    anywhere. Mirrors the guard regime_engine.py's leg_delta()
-    already applies internally, extended to the shared chain
-    data store that actual trading legs are built from.
+    DM7-P1-01: returns None for out-of-range deltas instead of 0.0.
+    Returning 0.0 was indistinguishable from a genuine zero-delta
+    strike, causing get_strike_by_delta() to select deep-ITM/OTM
+    strikes and making _get_portfolio_greeks() blind to ITM legs
+    (the most dangerous legs in a short-vol book).
     """
     try:
         raw = float(raw)
     except (TypeError, ValueError):
-        return 0.0
+        return None
     if is_call:
         if 0.01 < raw < 0.99:
             return raw
-        return 0.0
+        # Deep ITM call: clamp to 1.0 rather than returning None
+        # so portfolio delta still sees it.
+        if raw >= 0.99:
+            return 1.0
+        return None
     else:
         if -0.99 < raw < -0.01:
             return raw
-        return 0.0
+        # Deep ITM put: clamp to -1.0
+        if raw <= -0.99:
+            return -1.0
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -609,6 +617,10 @@ class DataManager:
                         await asyncio.sleep(backoff)
                         continue
                     elif resp.status == 401:
+                        # DM7-P1-04: 401 means token revoked mid-session.
+                        # Set a flag so main.py can halt new entries
+                        # and attempt re-authentication.
+                        self._auth_failed = True
                         raise AuthenticationError(
                             f"Token expired — {url}"
                         )
@@ -1240,7 +1252,13 @@ class DataManager:
                 elif put_iv > 0:
                     self.iv_atm = put_iv
                 if self.iv_atm and self.iv_atm > 0:
-                    self.iv_atm_history.append(self.iv_atm)
+                    # DM7-P3-02: only append when we just fetched
+                    # the active expiry. Without this guard, each
+                    # 60s cycle appends 3-4 times (once per expiry
+                    # fetched), shortening the effective lookback
+                    # from ~60 days to ~15 days.
+                    if expiry_date == self._active_expiry:
+                        self.iv_atm_history.append(self.iv_atm)
                     self._save_daily_iv_close()  # PATCH: D3
                     logger.info(
                         f"IV_ATM: {self.iv_atm:.4f} "

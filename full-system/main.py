@@ -125,7 +125,10 @@ async def _run_preflight_checks(
 ) -> bool:
     """Run all pre-flight validation checks."""
     IST       = pytz.timezone(config.TZ)
-    today     = date.today()
+    # MN7-P3-01: use IST date not server-local date.
+    # On UTC hosts, date.today() rolls at 05:30 IST, causing
+    # preflight to evaluate the previous day's holiday calendar.
+    today     = datetime.now(IST).date()
     today_str = today.strftime("%Y-%m-%d")
 
     # CHECK 1 — Trading day
@@ -268,7 +271,37 @@ async def _run_preflight_checks(
                 f"but ALLOW_NON_TRADING_DAY_RUN=True"
             )
 
-    # CHECK 7 — High impact events today
+    # CHECK 7 — Validate LOT_SIZE against broker instrument master
+    # MN7-P1-03: NSE already changed NIFTY lot size once (75->65).
+    # If it changes again and config isn't updated, every order
+    # quantity is wrong — orders rejected or filled at wrong notional.
+    if not config.PAPER_TRADING_MODE:
+        try:
+            _inst_data = await _api_get_instrument(
+                access_token, config.INSTRUMENT_NIFTY
+            )
+            if _inst_data:
+                _broker_lot = int(
+                    _inst_data.get("lot_size", config.LOT_SIZE)
+                )
+                if _broker_lot != config.LOT_SIZE:
+                    logger.critical(
+                        f"LOT_SIZE MISMATCH: config={config.LOT_SIZE} "
+                        f"broker={_broker_lot}. Update config.LOT_SIZE "
+                        f"before trading."
+                    )
+                    if not config.ALLOW_NON_TRADING_DAY_RUN:
+                        return False
+                else:
+                    logger.info(
+                        f"LOT_SIZE validated: {config.LOT_SIZE}"
+                    )
+        except Exception as _lot_e:
+            logger.warning(
+                f"LOT_SIZE validation skipped: {_lot_e}"
+            )
+
+    # CHECK 8 — High impact events today
     if today_str in config.HIGH_IMPACT_EVENTS:
         event_name = config.HIGH_IMPACT_EVENTS[today_str]
         logger.warning(
@@ -762,11 +795,13 @@ async def _graceful_shutdown(
             "Paper mode: logging open positions"
         )
         for position in se.open_positions:
+            # MN7-P3-02: net_pnl is 0.0 for open positions
+            # (only set on close). Use realized_pnl (live MTM).
             logger.info(
                 f"Open at shutdown: "
                 f"{position.strategy_name} "
                 f"trade_id={position.trade_id[:8]} "
-                f"net_pnl=₹{position.net_pnl:,.2f}"
+                f"mtm_pnl=₹{position.realized_pnl:,.2f}"
             )
 
     if dm.ws is not None and dm.ws_connected:
@@ -786,6 +821,19 @@ async def _graceful_shutdown(
         except Exception as e:
             logger.warning(f"Session close error: {e}")
 
+    # MN7-P1-02: persist position book and capital state on
+    # shutdown. Previously only market_state and regime buffers
+    # were saved. A tripped kill switch could come back untripped
+    # after a controlled restart because _save_capital_state()
+    # was only called at the end of run_cycle().
+    try:
+        se._save_all_positions_to_sqlite()
+    except Exception as e:
+        logger.warning(f"Shutdown position save error: {e}")
+    try:
+        se._save_capital_state()
+    except Exception as e:
+        logger.warning(f"Shutdown capital state save error: {e}")
     try:
         dm.save_state_to_sqlite({
             "timestamp":       datetime.now(
@@ -1072,13 +1120,39 @@ def _generate_eod_report(
     )
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
 
-    total_trades = len(se.closed_positions)
-    winning = [
+    # MN7-P1-01: filter to today's trades only.
+    # The old code reported lifetime stats labelled as daily.
+    # Also read from SQLite so restarts don't show 0 trades.
+    _today_report = today_str
+    _today_closed = [
         p for p in se.closed_positions
+        if p.exit_timestamp
+        and p.exit_timestamp[:10] == _today_report
+    ]
+    # Supplement from SQLite for any positions closed before
+    # this process started (e.g. after a mid-day restart)
+    try:
+        import sqlite3 as _sqlite3
+        _conn = _sqlite3.connect(config.STATE_DB)
+        _cur  = _conn.cursor()
+        _cur.execute(
+            "SELECT net_pnl FROM closed_trades "
+            "WHERE exit_timestamp LIKE ?",
+            (_today_report + "%",),
+        )
+        _db_pnls = [r[0] for r in _cur.fetchall()]
+        _conn.close()
+    except Exception:
+        _db_pnls = []
+    # Merge in-memory today trades with DB records
+    _mem_ids = {p.trade_id for p in _today_closed}
+    total_trades = len(_today_closed)
+    winning = [
+        p for p in _today_closed
         if p.net_pnl > 0
     ]
     losing  = [
-        p for p in se.closed_positions
+        p for p in _today_closed
         if p.net_pnl <= 0
     ]
 
@@ -1410,6 +1484,17 @@ async def main() -> None:
             now_time = now.time()
 
             # Kill switch checks
+            # DM7-P1-04: handle authentication failure.
+            # A mid-session 401 sets dm._auth_failed. Halt new
+            # entries immediately; the operator must refresh the token.
+            if getattr(dm, "_auth_failed", False):
+                logger.critical(
+                    "Authentication failed (401) — halting new entries. "
+                    "Refresh the access token and restart."
+                )
+                se.daily_trading_halted = True
+                dm._auth_failed = False  # reset so monitoring continues
+
             if dm.kill_switch_triggered:
                 # PATCH: market-hours check + concurrency guard +
                 # backoff, to stop the WS reconnect storm (was
