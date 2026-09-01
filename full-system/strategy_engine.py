@@ -360,6 +360,61 @@ class StrategyEngine:
         try:
             conn   = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            # LOG-SE-04: decision logging tables for walk-forward analysis
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS entry_attempt_log (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp            TEXT NOT NULL,
+                    strategy_name        TEXT,
+                    regime_at_attempt    TEXT,
+                    composite_score      REAL,
+                    build_result         TEXT,
+                    build_failure_reason TEXT,
+                    expiry_date          TEXT,
+                    dte                  INTEGER,
+                    net_credit           REAL,
+                    min_credit_required  REAL,
+                    wing_width           INTEGER,
+                    expected_move        REAL,
+                    pretrade_passed      INTEGER,
+                    pretrade_fail_reason TEXT,
+                    execution_result     TEXT,
+                    lots_requested       INTEGER,
+                    lots_filled          INTEGER,
+                    actual_credit        REAL,
+                    vix_at_entry         REAL,
+                    vix_adaptive_mult    REAL,
+                    max_risk_used        REAL,
+                    trade_id             TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_entry_attempt_ts
+                ON entry_attempt_log(timestamp)
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS position_monitor_log (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp             TEXT NOT NULL,
+                    trade_id              TEXT NOT NULL,
+                    strategy_name         TEXT,
+                    current_premium       REAL,
+                    stop_loss             REAL,
+                    profit_target         REAL,
+                    unrealized_pnl        REAL,
+                    stop_breach_ticks     INTEGER,
+                    distance_to_call_pct  REAL,
+                    distance_to_put_pct   REAL,
+                    partial_taken         INTEGER,
+                    action_taken          TEXT,
+                    spot                  REAL,
+                    vix                   REAL
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pos_monitor_ts
+                ON position_monitor_log(timestamp)
+            """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS session_orders (
                     tag            TEXT PRIMARY KEY,
@@ -1089,16 +1144,55 @@ class StrategyEngine:
             )
             return (False, "")
 
+        # PRF-S01: dynamic slippage based on VIX and DTE.
+        # Base slippage is the configured tick count.
+        # Multiply by VIX multiplier when VIX is elevated
+        # (OTM puts have wider spreads in high-vol regimes).
+        # Multiply by DTE multiplier when near expiry
+        # (liquidity thins for OTM strikes near expiry).
+        _vix_now = self.dm.vix or 14.0
+        _vix_thresh = getattr(
+            config, "SLIPPAGE_VIX_HIGH_THRESHOLD", 15.0
+        )
+        _vix_mult = (
+            getattr(config, "SLIPPAGE_VIX_HIGH_MULT", 2.5)
+            if _vix_now > _vix_thresh
+            else 1.0
+        )
+        # DTE-based multiplier
+        _dte_mult = 1.0
+        _dte_thresh = getattr(
+            config, "SLIPPAGE_LOW_DTE_THRESHOLD", 2
+        )
+        try:
+            from datetime import date as _d
+            _exp_date = datetime.strptime(
+                leg.expiry, "%Y-%m-%d"
+            ).date()
+            _dte_now = (_exp_date - _d.today()).days
+            if _dte_now <= _dte_thresh:
+                _dte_mult = getattr(
+                    config, "SLIPPAGE_LOW_DTE_MULT", 1.5
+                )
+        except Exception:
+            pass
+        # Only apply extra multiplier to OTM options (delta < 0.35)
+        # ATM options have tighter spreads and don't need the boost
+        _is_otm = abs(leg.delta) < 0.35 if leg.delta else True
+        _slip_mult = (_vix_mult * _dte_mult) if _is_otm else 1.0
+
         if leg.action == "SELL":
             slippage   = (
                 config.PAPER_SLIPPAGE_SHORT_TICKS
                 * config.TICK_SIZE
+                * _slip_mult
             )
             fill_price = reference - slippage
         else:
             slippage   = (
                 config.PAPER_SLIPPAGE_HEDGE_TICKS
                 * config.TICK_SIZE
+                * _slip_mult
             )
             fill_price = reference + slippage
 
@@ -2758,6 +2852,12 @@ class StrategyEngine:
                 f'check logs above for reason '
                 f'(DTE, VIX spike, spread, credit, LTP=0)'
             )
+            # LOG-SE-03a: log the build failure
+            self._log_entry_attempt(
+                strategy_name,
+                "FAILED_OTHER",
+                "build returned None",
+            )
             self._last_build_failure = datetime.now(
                 self._IST
             )
@@ -2794,12 +2894,50 @@ class StrategyEngine:
             logger.info(
                 f"Pre-trade failed: {strategy_name}"
             )
+            # LOG-SE-03b: log pre-trade failure
+            _exp = legs[0].expiry if legs else None
+            _dte_val = None
+            if _exp:
+                try:
+                    from datetime import date as _d
+                    _dte_val = (
+                        datetime.strptime(_exp, "%Y-%m-%d").date()
+                        - _d.today()
+                    ).days
+                except Exception:
+                    pass
+            self._log_entry_attempt(
+                strategy_name,
+                "FAILED_PRETRADE",
+                "pre-trade checks failed",
+                expiry_date=_exp,
+                dte=_dte_val,
+                net_credit=meta.get(
+                    "net_credit",
+                    meta.get("total_credit", 0),
+                ),
+                pretrade_passed=False,
+            )
             return
 
         lots = self._calculate_lot_size(strategy_name, meta)
         if lots < 1:
             logger.info(
                 f"Lot size=0 for {strategy_name} — skip"
+            )
+            # LOG-SE-03c: log lot-size failure
+            self._log_entry_attempt(
+                strategy_name,
+                "FAILED_LOTS",
+                "lot sizing returned 0",
+                net_credit=meta.get(
+                    "net_credit",
+                    meta.get("total_credit", 0),
+                ),
+                max_risk_used=meta.get("max_risk", 0),
+                vix_adaptive_mult=getattr(
+                    self, "_last_vix_mult", 1.0
+                ),
             )
             return
 
@@ -2921,6 +3059,16 @@ class StrategyEngine:
             logger.warning(
                 f"Execution failed: {strategy_name}"
             )
+            # LOG-SE-03d: log execution failure
+            self._log_entry_attempt(
+                strategy_name,
+                "FAILED_EXECUTION",
+                "_execute_strategy returned False",
+                lots_requested=lots,
+                lots_filled=0,
+                execution_result="FAILED",
+                trade_id=trade_id,
+            )
             return
 
         # AUDIT SE-N03: if any leg partially filled, the lot count
@@ -2957,6 +3105,46 @@ class StrategyEngine:
         # PRF-04: record composite at entry for re-entry gate
         self._last_entry_composite[strategy_name] = (
             self.re.raw_composite
+        )
+        # LOG-SE-03e: log successful entry
+        _success_dte = None
+        if new_expiry:
+            try:
+                from datetime import date as _d2
+                _success_dte = (
+                    datetime.strptime(new_expiry, "%Y-%m-%d").date()
+                    - _d2.today()
+                ).days
+            except Exception:
+                pass
+        self._log_entry_attempt(
+            strategy_name,
+            "SUCCESS",
+            "",
+            expiry_date=new_expiry,
+            dte=_success_dte,
+            net_credit=meta.get(
+                "net_credit",
+                meta.get("total_credit", 0),
+            ),
+            wing_width=meta.get("wing_width",
+                                meta.get("long_call", 0)
+                                - meta.get("short_call", 0)
+                                if meta.get("long_call") else None),
+            expected_move=meta.get("expected_move"),
+            pretrade_passed=True,
+            execution_result="FILLED",
+            lots_requested=lots,
+            lots_filled=lots,
+            actual_credit=meta.get(
+                "net_credit",
+                meta.get("total_credit", 0),
+            ),
+            vix_adaptive_mult=getattr(
+                self, "_last_vix_mult", 1.0
+            ),
+            max_risk_used=meta.get("max_risk", 0),
+            trade_id=trade_id,
         )
         logger.info(
             f"New position: {strategy_name} "
@@ -3036,8 +3224,13 @@ class StrategyEngine:
 
         elif regime == config.REGIME_MILD_SELL:
             if skew_diff >= config.SPREAD_SKEW_THRESHOLD:
-                # PRF-02: put skew is rich — build put side only
+                # PRF-02/S04: put skew is rich — build put side only
                 self._pending_skew_side = "put"
+                return config.STRAT_CREDIT_SPREADS
+            elif skew_diff <= -config.SPREAD_SKEW_THRESHOLD:
+                # PRF-S04: call skew is rich (unusual for NIFTY but
+                # possible after a sharp rally) — build call side only
+                self._pending_skew_side = "call"
                 return config.STRAT_CREDIT_SPREADS
             elif (
                 skew_diff < config.RATIO_SKEW_FLAT_THRESHOLD
@@ -3679,31 +3872,72 @@ class StrategyEngine:
             (sp_prem - lp_prem) + (sc_prem - lc_prem)
         )
 
-        # SE-01: put_width and call_width MUST be computed before
-        # _spread_min_required which references them. The original
-        # order caused an UnboundLocalError on every call, making
-        # MILD_SELL_VOL permanently unable to enter.
+        # SE-01: widths computed before the credit gate.
         put_width  = short_put_strike  - long_put_strike
         call_width = long_call_strike  - short_call_strike
+        # FIX-02: max_risk based on active sides only
+        _active_w = max(
+            put_width  if _build_put_side  else 0,
+            call_width if _build_call_side else 0,
+        )
         max_risk   = (
-            max(put_width, call_width) - total_credit
+            max(_active_w, 1) - total_credit
         ) * config.LOT_SIZE
 
-        # AUDIT CFG-01: check credit as % of max spread width.
-        _spread_min_pct = getattr(
-            config, "SPREAD_MIN_CREDIT_PCT_OF_WIDTH", 0.25
+        # FIX-03/11: side-aware credit gate using credit/max-loss.
+        # Old gate used two-sided width for a one-sided build, and
+        # credit/width (0.20) is unreachable at 0.20/0.08 delta pair.
+        _active_put_width  = put_width  if _build_put_side  else 0
+        _active_call_width = call_width if _build_call_side else 0
+        _active_max_width  = max(_active_put_width, _active_call_width)
+        _spread_min_per_maxloss = getattr(
+            config, "SPREAD_MIN_CREDIT_PER_MAXLOSS", 0.10
+        )
+        _spread_min_maxloss_gate = (
+            _active_max_width
+            * _spread_min_per_maxloss
+            / (1.0 + _spread_min_per_maxloss)
+            if _active_max_width > 0 else 0
         )
         _spread_min_required = max(
             config.SPREAD_MIN_CREDIT,
-            _spread_min_pct * max(put_width, call_width),
+            _spread_min_maxloss_gate,
         )
-        if total_credit < _spread_min_required:
+        # FIX-04: use executable prices (bid/ask) not LTP
+        def _exec_spread(opt, action):
+            b = float(opt.get("bid") or 0)
+            a = float(opt.get("ask") or 0)
+            if b <= 0 or a <= 0:
+                return float(opt.get("ltp") or 0)
+            return b if action == "SELL" else a
+        _exec_credit = 0.0
+        if _build_put_side:
+            _exec_credit += (
+                _exec_spread(chain[short_put_strike]["put"], "SELL")
+                - _exec_spread(chain[long_put_strike]["put"], "BUY")
+            )
+        if _build_call_side:
+            _exec_credit += (
+                _exec_spread(chain[short_call_strike]["call"], "SELL")
+                - _exec_spread(chain[long_call_strike]["call"], "BUY")
+            )
+        _slip = getattr(config, "ENTRY_SLIPPAGE_PTS_PER_LEG", 0.75)
+        _n_active_legs = (
+            (2 if _build_put_side else 0)
+            + (2 if _build_call_side else 0)
+        )
+        _exec_credit_gated = _exec_credit - _slip * _n_active_legs
+        if _exec_credit_gated < _spread_min_required:
             logger.info(
-                f"Credit spread: credit={total_credit:.2f} "
+                f"Credit spread ({skew_side}): "
+                f"exec_credit={_exec_credit:.2f} "
+                f"after_slippage={_exec_credit_gated:.2f} "
                 f"< min={_spread_min_required:.1f} "
-                f"({_spread_min_pct*100:.0f}% of width)"
+                f"(credit/maxloss gate)"
             )
             return (None, {})
+        # Use executable credit for position record
+        total_credit = _exec_credit
 
         # PRF-02: only build the side(s) justified by skew.
         _build_put_side  = skew_side in ("put",  "both")
@@ -4458,6 +4692,32 @@ class StrategyEngine:
         self,
     ) -> Tuple[Optional[List[Leg]], Dict]:
         """Build long strangle for event volatility."""
+        # FIX-05: IV-rank gate, matching _build_long_straddle.
+        # Without this, the strangle buys options at any IV level,
+        # including when vol is expensive. Monte Carlo shows
+        # EV = -Rs900 to -Rs3700/lot with no cheapness check.
+        _ivr = self.dm.compute_iv_rank()
+        _iv_rank = _ivr if _ivr is not None else 50.0
+        _max_iv_rank = getattr(
+            config, "LONG_STRADDLE_MAX_IV_RANK", 40
+        )
+        if _iv_rank > _max_iv_rank:
+            logger.info(
+                f"Long strangle: IV rank {_iv_rank:.1f} > "
+                f"{_max_iv_rank} — vol too expensive to buy"
+            )
+            return (None, {})
+        # Also require IV is not rich vs RV
+        if (
+            self.dm.iv_atm is not None
+            and self.dm.rv_20d is not None
+            and self.dm.iv_atm > self.dm.rv_20d + 0.02
+        ):
+            logger.info(
+                f"Long strangle: IV ({self.dm.iv_atm:.4f}) > "
+                f"RV ({self.dm.rv_20d:.4f}) + 2%% — vol not cheap"
+            )
+            return (None, {})
         expiry = self.dm.get_expiry_by_dte(
             config.EVENT_STRANGLE_DTE_TARGET,
             tolerance=config.EVENT_STRANGLE_DTE_TARGET - 2,
@@ -4872,12 +5132,6 @@ class StrategyEngine:
             return False
 
         # SE-VEGA FIX: extend pre-trade gate to vega.
-        # Previously gamma/vega/theta limits were log-only warnings
-        # with no enforcement. The portfolio can run arbitrarily
-        # outside the carefully calibrated GREEKS_LIMITS vega bands
-        # with no automated consequence. This gates on vega_min/max
-        # (the most important for a short-vol book) when the
-        # GREEKS_VEGA_GATE config flag is True.
         if getattr(config, "GREEKS_VEGA_GATE", False):
             post_vega = (
                 port_greeks["vega"] + new_greeks["vega"]
@@ -4895,6 +5149,30 @@ class StrategyEngine:
                 logger.warning(
                     f"Pre-trade: vega above max: "
                     f"post={post_vega:.0f} > max={vega_max} "
+                    f"— blocking entry"
+                )
+                return False
+
+        # PRF-S05: portfolio-level absolute vega cap.
+        # Prevents over-exposure to volatility shocks across all
+        # positions combined. The per-regime vega bands above are
+        # relative; this is an absolute rupee-vega cap.
+        _vega_cap_pct = getattr(
+            config, "PORTFOLIO_VEGA_CAP_PCT", 0.015
+        )
+        if _vega_cap_pct > 0:
+            _vega_cap_rupees = (
+                _vega_cap_pct * config.TOTAL_CAPITAL
+            )
+            _post_vega_abs = abs(
+                port_greeks["vega"] + new_greeks["vega"]
+            )
+            if _post_vega_abs > _vega_cap_rupees:
+                logger.warning(
+                    f"PRF-S05: portfolio vega cap: "
+                    f"|post_vega|={_post_vega_abs:.0f} > "
+                    f"cap={_vega_cap_rupees:.0f} "
+                    f"({_vega_cap_pct*100:.1f}% of capital) "
                     f"— blocking entry"
                 )
                 return False
@@ -5423,6 +5701,144 @@ class StrategyEngine:
             # max_risk_per_lot.
             return max_risk_per_lot
 
+    def _log_entry_attempt(
+        self,
+        strategy_name: str,
+        build_result: str,
+        build_failure_reason: str = "",
+        **kwargs,
+    ) -> None:
+        """LOG-SE-01: log every entry attempt for walk-forward analysis.
+
+        build_result values:
+          SUCCESS           — trade was opened
+          FAILED_CREDIT     — credit below minimum
+          FAILED_DTE        — no expiry in DTE window
+          FAILED_SPREAD     — bid-ask spread too wide
+          FAILED_CHAIN      — option chain unavailable
+          FAILED_PRETRADE   — pre-trade checks failed
+          FAILED_EXECUTION  — order placement failed
+          FAILED_LOTS       — lot sizing returned 0
+          FAILED_REVALIDATE — credit decayed before execution
+          FAILED_OTHER      — other build failure
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                INSERT INTO entry_attempt_log (
+                    timestamp, strategy_name, regime_at_attempt,
+                    composite_score, build_result, build_failure_reason,
+                    expiry_date, dte, net_credit, min_credit_required,
+                    wing_width, expected_move,
+                    pretrade_passed, pretrade_fail_reason,
+                    execution_result, lots_requested, lots_filled,
+                    actual_credit, vix_at_entry, vix_adaptive_mult,
+                    max_risk_used, trade_id
+                ) VALUES (
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                )
+            """, (
+                datetime.now(self._IST).isoformat(),
+                strategy_name,
+                self.re.confirmed_regime,
+                self.re.raw_composite,
+                build_result,
+                build_failure_reason or "",
+                kwargs.get("expiry_date"),
+                kwargs.get("dte"),
+                kwargs.get("net_credit"),
+                kwargs.get("min_credit_required"),
+                kwargs.get("wing_width"),
+                kwargs.get("expected_move"),
+                1 if kwargs.get("pretrade_passed") else 0,
+                kwargs.get("pretrade_fail_reason", ""),
+                kwargs.get("execution_result", ""),
+                kwargs.get("lots_requested"),
+                kwargs.get("lots_filled"),
+                kwargs.get("actual_credit"),
+                self.dm.vix,
+                kwargs.get("vix_adaptive_mult", 1.0),
+                kwargs.get("max_risk_used"),
+                kwargs.get("trade_id"),
+            ))
+            # Keep last 90 days
+            conn.execute("""
+                DELETE FROM entry_attempt_log
+                WHERE timestamp < datetime('now', '-90 days')
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug(f"_log_entry_attempt: {e}")
+
+    def _log_position_monitor(
+        self,
+        position,
+        action_taken: str,
+        current_premium: float = 0.0,
+        unrealized_pnl: float = 0.0,
+        distance_to_call_pct: float = None,
+        distance_to_put_pct: float = None,
+    ) -> None:
+        """LOG-SE-02: log monitoring decisions for walk-forward analysis.
+
+        action_taken values:
+          HOLD                — no action, position held
+          STOP_BREACH_TICK    — breach tick incremented
+          STOP_FIRED          — stop-loss executed
+          PARTIAL_PROFIT      — partial profit taken
+          PROFIT_TARGET       — full profit target hit
+          TRAIL_STOP          — trailing stop fired
+          DTE_EXIT            — DTE-based time exit
+          DISTANCE_STOP       — distance-based stop fired
+        """
+        # Only log non-HOLD actions and periodic HOLD samples
+        # to avoid filling the table with every 1s monitor tick
+        _should_log = (
+            action_taken != "HOLD"
+            or getattr(self, "_monitor_log_counter", 0) % 60 == 0
+        )
+        self._monitor_log_counter = (
+            getattr(self, "_monitor_log_counter", 0) + 1
+        )
+        if not _should_log:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                INSERT INTO position_monitor_log (
+                    timestamp, trade_id, strategy_name,
+                    current_premium, stop_loss, profit_target,
+                    unrealized_pnl, stop_breach_ticks,
+                    distance_to_call_pct, distance_to_put_pct,
+                    partial_taken, action_taken, spot, vix
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                datetime.now(self._IST).isoformat(),
+                position.trade_id,
+                position.strategy_name,
+                current_premium,
+                position.stop_loss,
+                position.profit_target,
+                unrealized_pnl,
+                position.meta.get("_stop_breach_ticks", 0),
+                distance_to_call_pct,
+                distance_to_put_pct,
+                1 if position.meta.get("_partial_taken") else 0,
+                action_taken,
+                self.dm.spot,
+                self.dm.vix,
+            ))
+            # Keep last 30 days
+            conn.execute("""
+                DELETE FROM position_monitor_log
+                WHERE timestamp < datetime('now', '-30 days')
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug(f"_log_position_monitor: {e}")
+
     def _calculate_lot_size(
         self, strategy_name: str, meta: Dict
     ) -> int:
@@ -5455,7 +5871,12 @@ class StrategyEngine:
         if max_loss_per_lot <= 0:
             return 0
 
-        risk_per_trade = config.MAX_RISK_PER_TRADE
+        # FIX-09: use defined-risk budget if set
+        risk_per_trade = (
+            _defined_risk_budget
+            if _defined_risk_budget is not None
+            else config.MAX_RISK_PER_TRADE
+        )
         lots           = math.floor(
             risk_per_trade / max_loss_per_lot
         )
@@ -5505,6 +5926,8 @@ class StrategyEngine:
         # IMM-02: apply VIX-adaptive multiplier to final lot count
         if _vix_mult != 1.0 and lots > 0:
             lots = max(1, int(lots * _vix_mult))
+        # Store for entry attempt logging
+        self._last_vix_mult = _vix_mult
 
         # PATCH: heuristic margin/SPAN cap. Previously sizing was
         # based purely on theoretical max-loss and capital %,
