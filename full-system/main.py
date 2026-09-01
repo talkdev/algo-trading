@@ -621,6 +621,24 @@ async def _end_of_day(
             dm.vix is not None
             and dm.vix < config.VIX_SELL_VOL_MAX
         )
+        # MN-EVENT FIX: force closure when tomorrow is a high-impact
+        # event day. The existing vix_ok check only sees today's VIX —
+        # markets are often calm the evening BEFORE a scheduled shock.
+        # config.HIGH_IMPACT_EVENTS already has RBI/Budget dates.
+        _tomorrow_str = (
+            date.today() + timedelta(days=1)
+        ).isoformat()
+        _tomorrow_is_event = (
+            _tomorrow_str in config.HIGH_IMPACT_EVENTS
+        )
+        if _tomorrow_is_event:
+            _event_name = config.HIGH_IMPACT_EVENTS[_tomorrow_str]
+            logger.info(
+                f"MN-EVENT: tomorrow is {_event_name} "
+                f"({_tomorrow_str}) — forcing EOD close "
+                f"regardless of VIX/regime"
+            )
+            vix_ok = False  # override: treat as if VIX too high
 
         # AUDIT MN-02: was dte>5, which forced closure on day 2
         # for 6-DTE entries (capturing ~1/6 of theta while paying

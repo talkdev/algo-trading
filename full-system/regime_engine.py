@@ -53,7 +53,10 @@ EMA_SLOPE_PCT    = 0.15   # |slope| > 0.15% of spot
 RV_WINDOW        = 20     # trading days
 RV_ANNUALISE     = 252
 SKEW_HISTORY_DAYS = 30
-SKEW_MIN_DAYS    = 3      # minimum history before z is trusted
+# RE-C1: raised from 3 to 20. Same argument as EDGE_SCORE_MIN_HISTORY:
+# 3-sample std has ~40% error. Skew carries 0.15 composite weight
+# and should not be live on 3 samples when edge is gated at 20.
+SKEW_MIN_DAYS    = 20     # minimum history before z is trusted
 SPREAD_AVG_MIN   = 60     # minutes for spread-ratio average
 EVENT_PRE_HOURS  = 6
 EVENT_POST_HOURS = 2
@@ -410,8 +413,33 @@ class RegimeEngine:
             self.raw_composite = float(
                 max(-1.0, min(1.0, composite))
             )
+            # RE-B2: gate STRONG_SELL on minimum confirming modules.
+            # Count modules with a non-zero confirmed score AND a
+            # non-None raw reading this cycle (genuinely live).
+            _min_modules = getattr(
+                config,
+                "STRONG_SELL_MIN_CONFIRMING_MODULES",
+                3,
+            )
+            _live_nonzero = sum(
+                1 for m in MODULES
+                if self._conf.get(m, 0.0) != 0.0
+                and self._raw.get(m) is not None
+            )
+
             # Step 8: Regime mapping
             new_regime = self._map_regime(self.raw_composite)
+            # Cap at MILD_SELL when insufficient confirming modules
+            if (
+                new_regime == config.REGIME_STRONG_SELL
+                and _live_nonzero < _min_modules
+            ):
+                logger.info(
+                    f"RE-B2: STRONG_SELL capped at MILD_SELL — "
+                    f"only {_live_nonzero}/{_min_modules} "
+                    f"confirming modules live"
+                )
+                new_regime = config.REGIME_MILD_SELL
 
         # Detect change
         self.regime_changed = (
@@ -632,17 +660,51 @@ class RegimeEngine:
         IV_atm - RV(20d). Rich = sell vol, Cheap = buy vol.
         """
         # Get RV — use estimated if actual not available
+        # C4-09: horizon-matched RV window.
+        # Comparing 20-day RV against a 6-day option is a structural
+        # directional bias: 20-day RV lags and understates near-term
+        # risk, making IV look 'rich' more often than justified.
+        # Use the active expiry's DTE to match the RV window to the
+        # option's tenor. Falls back to get_estimated_rv() as before.
+        _dte_for_rv = 20
+        if self.dm._active_expiry:
+            try:
+                from datetime import date as _date
+                _exp = datetime.strptime(
+                    self.dm._active_expiry, "%Y-%m-%d"
+                ).date()
+                _dte_for_rv = max(5, min(20, (_exp - _date.today()).days))
+            except Exception:
+                _dte_for_rv = 20
+
         rv = self.dm.get_estimated_rv()
         if rv is None:
             return None, "RV unavailable (no daily candles or VIX)"
         # AUDIT RE-N01: track whether we are using actual or
-        # estimated (VIX-derived) RV. Estimated RV is circular
-        # (IV vs VIX*0.70 is not independent evidence). We still
-        # compute the score but cap it at 0 when using estimated RV
-        # so it does not push the composite toward sell-vol.
+        # estimated (VIX-derived) RV.
         _rv_is_estimated = (
             self.dm.rv_20d is None or self.dm.rv_20d <= 0
         )
+        # If actual RV is available, recompute over the matched window
+        if not _rv_is_estimated and len(self.dm.candles_daily) >= _dte_for_rv + 1:
+            import math as _math
+            import numpy as _np
+            try:
+                _closes = [
+                    c["close"] for c in list(self.dm.candles_daily)
+                    if c.get("close", 0) > 0
+                ]
+                if len(_closes) >= _dte_for_rv + 1:
+                    _rets = [
+                        _math.log(_closes[i] / _closes[i - 1])
+                        for i in range(
+                            len(_closes) - _dte_for_rv,
+                            len(_closes),
+                        )
+                    ]
+                    rv = float(_np.std(_rets) * _math.sqrt(252))
+            except Exception:
+                pass  # keep original rv estimate
 
         # CAL-01: defensive unit normalisation guard.
         # get_estimated_rv() returns decimal (e.g. 0.08 for 8%).
@@ -793,18 +855,30 @@ class RegimeEngine:
             _slope_up = slope > 0
             _di_bull  = pdi > ndi
             if above and _slope_up and _di_bull:
-                raw  = -1
-                dirn = "bullish trend (reduces short-vol score)"
+                # C4-08: asymmetric penalty. Bullish trend is less
+                # dangerous to short-vol than bearish (IV compresses
+                # on up moves, expands on down moves). Partial penalty.
+                raw  = -0.4
+                dirn = "bullish trend (partial -0.4 short-vol penalty)"
             elif not above and not _slope_up and not _di_bull:
-                raw  = -1
-                dirn = "bearish trend (reduces short-vol score)"
+                # Full penalty: bearish trend expands IV, kills short-gamma
+                raw  = -1.0
+                dirn = "bearish trend (full -1.0 short-vol penalty)"
             else:
                 raw  = 0
                 dirn = "mixed signals (no 3-way agreement)"
-        else:
-            # Range-bound: favorable for premium selling
+        elif adx_v < ADX_RANGE_THRESHOLD and abs(slope_pct) < EMA_SLOPE_PCT * 0.5:
+            # RE-B1: range-bound requires positive evidence, not just
+            # absence of trend. ADX_RANGE_THRESHOLD=15 already exists
+            # in config but was never wired here. Require BOTH low ADX
+            # AND flat slope to score +1 (genuinely range-bound).
             raw  = 1
-            dirn = "range-bound (favorable for short-vol)"
+            dirn = "range-bound (confirmed: low ADX + flat slope)"
+        else:
+            # Indeterminate: ADX between range and trend thresholds,
+            # or slope inconsistent with ADX. Honest answer is 0.
+            raw  = 0
+            dirn = "indeterminate (between range and trend thresholds)"
 
         detail = (
             f"ADX {adx_v:.1f} "
@@ -984,12 +1058,22 @@ class RegimeEngine:
         else:
             spr_state = "FLAT"
 
-        if net_flow > 0 and spr_state == "CONTRACTING":
+        # PRF-R01: smooth net_flow with EMA to reduce snapshot noise.
+        # Single OI snapshots are noisy; EMA gives more stable signal.
+        if not hasattr(self, "_flow_ema") or self._flow_ema is None:
+            self._flow_ema = float(net_flow)
+        else:
+            self._flow_ema = (
+                0.67 * self._flow_ema + 0.33 * float(net_flow)
+            )
+        _net_flow_smoothed = self._flow_ema
+
+        if _net_flow_smoothed > 0 and spr_state == "CONTRACTING":
             raw = 1
-            tag = "aggressive bullish flow"
-        elif net_flow < 0 and spr_state == "WIDENING":
+            tag = "aggressive bullish flow (smoothed)"
+        elif _net_flow_smoothed < 0 and spr_state == "WIDENING":
             raw = -1
-            tag = "defensive/panic flow"
+            tag = "defensive/panic flow (smoothed)"
         else:
             raw = 0
             tag = "mixed"
