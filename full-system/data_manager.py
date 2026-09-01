@@ -1357,11 +1357,14 @@ class DataManager:
         ltp_age  = _age("_ltp_ts")
 
         # DM-T03: reject crossed markets (bid > ask).
-        # DM9-P0-01: reject quotes where spread is fabricated.
-        # Deep-OTM wings quote 0.05/8.00 — mid=4.03 which is
-        # a price at which nothing trades. This noise is larger
-        # than the trailing stop's entire trigger distance.
-        # Reject if spread > 5pts OR spread/mid > 50%.
+        # DM9-P0-01 + DM10-P1-01 FIX: purely relative spread guard.
+        # The old absolute 5pt cap rejected ATM quotes in fast markets:
+        # a NIFTY ATM option (~120pts) with a 6-10pt spread is normal
+        # during volatility spikes. The 5pt cap made mark fall to
+        # entry_price, disabling stops/targets exactly when needed.
+        # Fix: use only the relative guard (spread_pct <= 0.25).
+        # 25% of mid: a ₹4 option needs spread > ₹1 to be rejected;
+        # a ₹120 ATM option needs spread > ₹30 — never rejected.
         _spread = ask - bid if (bid > 0 and ask > 0) else float("inf")
         _mid_for_check = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 1.0
         _spread_pct = _spread / _mid_for_check if _mid_for_check > 0 else 1.0
@@ -1369,8 +1372,7 @@ class DataManager:
             bid > 0
             and ask > 0
             and ask >= bid
-            and _spread <= 5.0
-            and _spread_pct <= 0.50
+            and _spread_pct <= 0.25
         )
 
         # 1. Fresh REST midpoint

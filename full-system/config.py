@@ -331,7 +331,8 @@ STRAT_STRANGLE       = "LONG_STRANGLE_EVENT"
 STRADDLE_DTE_MIN       = 3
 STRADDLE_DTE_MAX       = 10    # widened from 7
 STRADDLE_STOP_MULT     = 2.0   # stop = 2x credit
-STRADDLE_TARGET_PCT    = 0.50
+# SE10-P1-02: raised from 0.50 to 0.65.
+STRADDLE_TARGET_PCT    = 0.65
 STRADDLE_EXIT_DTE      = 1
 STRADDLE_MAX_DEBIT_PCT = 0.025
 STRADDLE_POLL_SECONDS  = 5
@@ -345,7 +346,11 @@ CONDOR_WING_WIDTH         = 250
 CONDOR_DTE_MIN            = 4
 CONDOR_DTE_MAX            = 10     # widened from 7
 CONDOR_EXIT_DTE           = 1
-CONDOR_TARGET_PCT         = 0.50
+# SE10-P1-02 + CFG10-P1-01: raised from 0.50 to 0.65.
+# Old 0.50 target with 2.0x stop = 1:4 R:R, 80% BEP.
+# New 0.65 target with 1.25x stop = 1:1.9 R:R, 56% BEP.
+# Also opens a 0.55-0.65 band for the trailing stop to operate.
+CONDOR_TARGET_PCT         = 0.65
 # AUDIT CFG-01: minimum credit expressed as % of wing width.
 # At CONDOR_WING_WIDTH=400, 22% = 88 pts minimum.
 # Absolute fallback kept for reference only.
@@ -364,7 +369,8 @@ CONDOR_SIGMA_MULTIPLIER   = 1.5
 SPREAD_DELTA_SHORT    = 0.20
 SPREAD_DELTA_LONG     = 0.15
 SPREAD_EXIT_DTE       = 1
-SPREAD_TARGET_PCT     = 0.50
+# SE10-P1-02: raised from 0.50 to 0.65 (same R:R fix as condor).
+SPREAD_TARGET_PCT     = 0.65
 # AUDIT CFG-01: spread min credit as % of wing width.
 SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.25
 SPREAD_MIN_CREDIT     = 25   # legacy absolute floor; builder uses PCT_OF_WIDTH above
