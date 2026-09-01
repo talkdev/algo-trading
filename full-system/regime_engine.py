@@ -610,9 +610,15 @@ class RegimeEngine:
             else:
                 v_spot_pct = vix
             t_spread   = v_fwd_pct - v_spot_pct
-            if t_spread > TERM_THRESHOLD:
+            # RC3: tenor-specific TERM_THRESHOLD for Path A
+            # Genuine 30-45 DTE monthly spread is structurally
+            # 1.5-3.0pp.  Using 0.8pp fires almost always, creating
+            # a 6-hourly artificial composite step-change when the
+            # monthly expiry loads.  Use 2.0pp for monthly tenor.
+            _term_threshold_monthly = 2.0
+            if t_spread > _term_threshold_monthly:
                 term_score = 1    # contango = sell vol
-            elif t_spread < -TERM_THRESHOLD:
+            elif t_spread < -_term_threshold_monthly:
                 term_score = -1   # backwardation = buy vol
             else:
                 term_score = 0
@@ -958,9 +964,34 @@ class RegimeEngine:
             return None, "indicator warmup"
 
         adx_v, pdi, ndi = ax
-        # Use available lookback (capped at 21) for intraday EMA
-        _lookback = min(21, len(ema))
-        slope     = ema[-1] - ema[-_lookback]
+        # CAT4-B: _slope_bars wired into slope calculation
+        # Previously _slope_bars was assigned but never used.
+        # Use intraday-only bars for slope to avoid overnight
+        # gap contamination. Fall back to full EMA if insufficient
+        # intraday bars (< EMA_PERIOD + 5).
+        _min_intraday = config.EMA_PERIOD + 5
+        if len(_slope_bars) >= _min_intraday:
+            _slope_closes = [
+                b.get("close", b.get("c", 0))
+                for b in _slope_bars
+            ]
+            _ema_intraday = ema_series(
+                _slope_closes, config.EMA_PERIOD
+            )
+            if len(_ema_intraday) >= 2:
+                _lookback_intra = min(
+                    21, len(_ema_intraday)
+                )
+                slope = (
+                    _ema_intraday[-1]
+                    - _ema_intraday[-_lookback_intra]
+                )
+            else:
+                _lookback = min(21, len(ema))
+                slope = ema[-1] - ema[-_lookback]
+        else:
+            _lookback = min(21, len(ema))
+            slope = ema[-1] - ema[-_lookback]
         slope_pct = slope / spot * 100.0 if spot else 0.0
         above     = spot > ema[-1]
 
@@ -1179,9 +1210,12 @@ class RegimeEngine:
         # move, causing false WIDENING/CONTRACTING on every tick
         # change in best bid/ask. ±10% requires a meaningful spread
         # change (e.g., bid halves from ₹1 to ₹0.50) to signal.
-        if spr < spr_avg * 0.90:
+        # S5-1: spread ratio band widened to +-25%%
+        # Old +-10%% fired on single-tick noise (one tick = 6-7%% of mid).
+        # +-25%% requires a meaningful spread change before signalling.
+        if spr < spr_avg * 0.75:
             spr_state = "CONTRACTING"
-        elif spr > spr_avg * 1.10:
+        elif spr > spr_avg * 1.25:
             spr_state = "WIDENING"
         else:
             spr_state = "FLAT"
@@ -1196,12 +1230,21 @@ class RegimeEngine:
             )
         _net_flow_smoothed = self._flow_ema
 
-        if _net_flow_smoothed > 0 and spr_state == "CONTRACTING":
+        # RH1: flow signal direction corrected for premium selling
+        # Original logic was designed for a directional engine:
+        #   bullish flow + tight spreads = +1 (buy signal)
+        #   panic flow + wide spreads = -1 (sell signal)
+        # For a premium-selling engine the correct interpretation is:
+        #   wide spreads + institutional put-buying = fear premium
+        #   = elevated IV = BEST time to sell vol → +1
+        #   tight spreads + bullish flow = complacency
+        #   = compressed IV = WORST time to sell vol → -1
+        if _net_flow_smoothed < 0 and spr_state == "WIDENING":
             raw = 1
-            tag = "aggressive bullish flow (smoothed)"
-        elif _net_flow_smoothed < 0 and spr_state == "WIDENING":
+            tag = "fear premium: wide spreads + put-buying (sell vol)"
+        elif _net_flow_smoothed > 0 and spr_state == "CONTRACTING":
             raw = -1
-            tag = "defensive/panic flow (smoothed)"
+            tag = "complacency: tight spreads + bullish flow (avoid selling)"
         else:
             raw = 0
             tag = "mixed"
@@ -1211,6 +1254,20 @@ class RegimeEngine:
             f"SPR {spr:.4f} vs avg {spr_avg:.4f} "
             f"-> {spr_state} | {tag}"
         )
+        # S5-2: flow warmup discontinuity suppressed
+        # When flow transitions from None (warmup) to a live value,
+        # return None for one additional cycle so the persistence
+        # filter absorbs the transition rather than immediately
+        # confirming the new score and causing a composite step-change.
+        _prev_none = getattr(self, '_flow_prev_raw_was_none', True)
+        self._flow_prev_raw_was_none = False  # current cycle has live data
+        if _prev_none:
+            logger.info(
+                "S5-2: flow transitioning from None — "
+                "suppressing for 1 cycle to avoid composite step-change"
+            )
+            detail += " | warmup-transition suppressed"
+            return None, detail
         logger.info(f"Flow: score={raw} | {detail}")
         return raw, detail
 
@@ -1241,8 +1298,15 @@ class RegimeEngine:
                         datetime.now(self._IST)
                         - _last_valid
                     ).total_seconds()
-                    # Decay after 10 minutes of no data
-                    if _elapsed > 600 and self._conf[name] != 0:
+                    # S6-2: symmetric decay — shorter grace for negative scores
+                    # Positive confirmed scores (sell-vol bias) get 10-min grace
+                    # to avoid whipsaws on brief data gaps.
+                    # Negative confirmed scores (buy-vol bias) get 2-min grace
+                    # so bearish bias does not persist when data resumes.
+                    _grace_period = (
+                        120 if self._conf[name] < 0 else 600
+                    )
+                    if _elapsed > _grace_period and self._conf[name] != 0:
                         _old = self._conf[name]
                         # Decay by 10% of current value per
                         # additional 5-minute interval
@@ -1302,25 +1366,42 @@ class RegimeEngine:
         else:
             _required = _slow_n
 
-        # PATCH R-05: confirm on sign-of-average, not sign-stability.
-        # Sign-stability breaks for float scores (e.g. vol=0.5 then 0.0
-        # then 0.5 never confirms because set([+1,0,+1])={0,1}).
-        # Using the average sign handles mixed sub-signals correctly.
+        # S6-1: sign-consistency check before confirmation
+        # Original average-sign logic confirmed [+1,-1,+1] as +0.33
+        # (oscillating signal treated as weak positive).
+        # New logic: ALL readings in the buffer must have the same sign
+        # before confirming.  Mixed-sign buffers hold the previous
+        # confirmed value, preventing oscillating signals from
+        # contaminating the composite.
+        # Exception: all-zero buffer confirms 0 (genuinely neutral).
         if len(buf) >= _required:
             _lastN = buf[-_required:]
             _avg = sum(_lastN) / len(_lastN)
-            if abs(_avg) >= 0.10:  # meaningful average signal
+            _all_positive = all(v > 0 for v in _lastN)
+            _all_negative = all(v < 0 for v in _lastN)
+            _all_zero     = all(abs(v) < 0.05 for v in _lastN)
+            _signs_consistent = (
+                _all_positive or _all_negative or _all_zero
+            )
+            if _signs_consistent and abs(_avg) >= 0.10:
                 self._conf[name] = _avg
                 logger.info(
-                    f"Persistence confirmed: "
+                    f"Persistence confirmed (consistent sign): "
                     f"{name}={_avg:.3f} "
-                    f"(avg-sign over {_required} readings, "
+                    f"(all {'positive' if _all_positive else 'negative'} "
+                    f"over {_required} readings, "
                     f"composite={_composite_mag:.3f})"
+                )
+            elif _all_zero:
+                self._conf[name] = 0.0
+                logger.info(
+                    f"Persistence confirmed (neutral): "
+                    f"{name}=0.0 (all-zero buffer)"
                 )
             else:
                 logger.info(
                     f"Persistence unconfirmed: {name} "
-                    f"avg={_avg:.3f} < 0.10 threshold "
+                    f"avg={_avg:.3f} signs_consistent={_signs_consistent} "
                     f"holding={self._conf[name]:.3f}"
                 )
         return self._conf[name]
@@ -1355,14 +1436,30 @@ class RegimeEngine:
                 # Old: event_open - 6h = 03:15 IST (market closed, never fires).
                 # New: previous trading day 15:30 IST so engine de-risks
                 # during the last session BEFORE the event.
-                _prev_close = self._IST.localize(
-                    __import__("datetime").datetime.strptime(
-                        event_date_str, "%Y-%m-%d"
-                    ).replace(
-                        hour=15, minute=30,
-                        second=0, microsecond=0,
+                # S12-2: macro pre-window skips non-trading days
+                # Walk backwards from event_date - 1 until a trading
+                # day is found.  Monday events previously had their
+                # pre-window on Sunday (market closed).
+                _event_dt_naive = __import__("datetime").datetime.strptime(
+                    event_date_str, "%Y-%m-%d"
+                )
+                _prev_td = _event_dt_naive.date() - __import__("datetime").timedelta(days=1)
+                _max_lookback = 7
+                for _lb in range(_max_lookback):
+                    _td_str = _prev_td.strftime("%Y-%m-%d")
+                    _is_trading = (
+                        _prev_td.weekday() < 5
+                        and _td_str not in config.NSE_MARKET_HOLIDAYS
                     )
-                ) - __import__("datetime").timedelta(days=1)
+                    if _is_trading:
+                        break
+                    _prev_td -= __import__("datetime").timedelta(days=1)
+                _prev_close = self._IST.localize(
+                    __import__("datetime").datetime(
+                        _prev_td.year, _prev_td.month, _prev_td.day,
+                        15, 30, 0
+                    )
+                )
                 pre_window_start = _prev_close
                 post_window_end = (
                     event_market_open

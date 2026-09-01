@@ -1796,7 +1796,7 @@ class StrategyEngine:
         # CB_LEVEL_2_PCT (3%) so the engine de-risks automatically.
         _cb2_streak = getattr(self, "_consecutive_cb2_days", 0)
         if _cb2_streak >= 2:
-            _effective_cb2_pct = 0.01  # 1% tightened threshold
+            _effective_cb2_pct = 0.02  # S11-1: tightened CB L2 threshold raised to 2%% (was 1%%; halted after single condor max-loss on day 3)
         else:
             _effective_cb2_pct = config.CB_LEVEL_2_PCT
         if daily_pnl_net_estimate < -(
@@ -1838,6 +1838,9 @@ class StrategyEngine:
         # LEVEL 4 — Max drawdown (includes unrealized MTM)
         # SE-15: current_capital only updates on close.
         # A book -12% on open MTM shows drawdown=0 without this.
+        # CAT10: CB L4 MTM drawdown verified
+        # CB L4 already includes unrealized MTM (SE-15 fix).
+        # current_capital + unrealized_mtm = true book value.
         _unrealized_mtm = sum(
             p.realized_pnl for p in self.open_positions
         )
@@ -1881,11 +1884,37 @@ class StrategyEngine:
                     f"vix_absolute={self.dm.vix:.1f}",
                     config.CB_LEVEL_5_ACTION,
                 )
+                # CAT1: CB L5 closes short-vol positions before NEUTRAL
+                # RL1 correctly forces NEUTRAL (no new entries) but
+                # broke the automatic short-closure that came with
+                # STRONG_BUY (Rule A flattens all shorts).
+                # At VIX=25, open short condors/spreads face
+                # catastrophic loss.  Close them explicitly here.
+                _short_vol_positions = [
+                    p for p in list(self.open_positions)
+                    if p.meta.get("strategy_type") == "SHORT"
+                    and p.status == "OPEN"
+                ]
+                if _short_vol_positions:
+                    logger.critical(
+                        f"CAT1: CB L5 closing "
+                        f"{len(_short_vol_positions)} short-vol "
+                        f"position(s) before forcing NEUTRAL"
+                    )
+                    import asyncio as _asyncio_cat1
+                    for _svp in _short_vol_positions:
+                        _asyncio_cat1.ensure_future(
+                            self._close_position(
+                                _svp,
+                                config.EXIT_REASONS["CIRCUIT_BREAK"],
+                                use_market=True,
+                            )
+                        )
                 self.re.previous_regime  = (
                     self.re.confirmed_regime
                 )
                 self.re.confirmed_regime = (
-                    config.REGIME_STRONG_BUY
+                    config.REGIME_NEUTRAL
                 )
                 self.re.regime_changed   = True
                 self.cb_level_5_active   = True
@@ -2667,8 +2696,12 @@ class StrategyEngine:
             logger.info('Entry gate BLOCKED: regime frozen')
             return False
         regime = self.re.confirmed_regime
+        # S9-2b: VIX gate uses _effective_regime
         if (
-            regime in [config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL]
+            _effective_regime in [
+                config.REGIME_STRONG_SELL,
+                config.REGIME_MILD_SELL,
+            ]
             and self.dm.vix is not None
             and self.dm.vix >= config.VIX_SELL_VOL_MAX
         ):
@@ -2752,19 +2785,27 @@ class StrategyEngine:
                 f'({self.re.persistence_count}/3)'
             )
             return False
-        # P4-4: regime stability requirement
-        # Require the regime to have been confirmed for >= 5 cycles
-        # before entering a new position.  A regime confirmed for only
-        # 3 cycles (3 minutes) is more likely to be a transient signal.
-        # Exception: IV spike entries (P4-3a) require only 3 cycles
-        # because the spike itself provides additional confirmation.
+        # P4-4 + RH2: regime stability requirement
+        # STRONG_SELL (large condor, high conviction): require >= 5 cycles.
+        # MILD_SELL (smaller defined-risk spread): require >= 3 cycles.
+        # Combined with flow oscillation, persistence >= 5 for MILD_SELL
+        # created an entry deadlock where persistence_count never reached 5.
+        # IV spike entries keep their relaxation to 3 cycles.
+        # RH2: MILD_SELL uses persistence >= 3
         _iv_spike_now = getattr(self, '_iv_spike_entry', False)
-        _min_persistence = 3 if _iv_spike_now else 5
+        _regime_now = self.re.confirmed_regime
+        if _iv_spike_now:
+            _min_persistence = 3
+        elif _regime_now == config.REGIME_STRONG_SELL:
+            _min_persistence = 5
+        else:
+            _min_persistence = 3
         if self.re.persistence_count < _min_persistence:
             logger.info(
                 f'Entry gate BLOCKED: regime not yet stable '
                 f'(persistence={self.re.persistence_count} '
-                f'< required={_min_persistence})'
+                f'< required={_min_persistence} '
+                f'regime={_regime_now})'
             )
             return False
         if len(self.open_positions) >= config.MAX_CONCURRENT_POSITIONS:
@@ -2846,10 +2887,25 @@ class StrategyEngine:
                 config.REGIME_MILD_SELL,
             ]
         ):
-            _recent_iv_avg = float(
-                sum(list(self.dm.iv_atm_history)[-5:])
-                / 5
-            )
+            # S9-1: IV spike uses median of last 15 readings
+            # iv_atm_history appended 3x per 60s cycle (3 expiries).
+            # Last 5 readings = ~100s not 5 min.  Use last 15 readings
+            # (~5 min at 3x density) and median (robust to outliers).
+            _iv_hist_15 = list(self.dm.iv_atm_history)[-15:]
+            _iv_hist_15_sorted = sorted(_iv_hist_15)
+            _n15 = len(_iv_hist_15_sorted)
+            if _n15 > 0:
+                _mid = _n15 // 2
+                _recent_iv_avg = (
+                    _iv_hist_15_sorted[_mid]
+                    if _n15 % 2 == 1
+                    else (
+                        _iv_hist_15_sorted[_mid - 1]
+                        + _iv_hist_15_sorted[_mid]
+                    ) / 2.0
+                )
+            else:
+                _recent_iv_avg = 0.0
             if (
                 _recent_iv_avg > 0
                 and self.dm.iv_atm >= _recent_iv_avg * 1.15
@@ -2863,6 +2919,27 @@ class StrategyEngine:
                     f'— high-quality fear-premium entry'
                 )
         self._iv_spike_entry = _iv_spike_entry
+        # S9-2: IV spike overrides NEUTRAL to MILD_SELL for entry
+        # When IV spikes 15%+ above recent median AND VIX is within
+        # sell-vol range AND regime is NEUTRAL (composite just below
+        # MILD_SELL_ENTER), treat as MILD_SELL for this entry only.
+        # The actual confirmed_regime is NOT changed — only the local
+        # variable used for the entry gate check below.
+        _effective_regime = regime
+        if (
+            _iv_spike_entry
+            and regime == config.REGIME_NEUTRAL
+            and self.dm.vix is not None
+            and config.MIN_VIX_SELL
+            <= self.dm.vix
+            <= config.VIX_SELL_VOL_MAX
+        ):
+            _effective_regime = config.REGIME_MILD_SELL
+            logger.info(
+                'S9-2: IV spike — treating NEUTRAL as MILD_SELL '
+                'for this entry (composite below threshold but '
+                'IV spike confirms sell-vol opportunity)'
+            )
         # P4-3b: Monday gap risk filter
         # Block straddle entries before 10:00 IST on Mondays.
         # NIFTY Monday gap of 0.4-0.8%% can wipe 1.6 weeks of theta.
@@ -2937,9 +3014,20 @@ class StrategyEngine:
                 "FAILED_OTHER",
                 "build returned None",
             )
-            self._last_build_failure = datetime.now(
-                self._IST
+            # RC2: long-vol build failure does not trigger cooldown
+            # Long-vol strategies (long straddle, backspread, strangle)
+            # are expected to fail the IV rank gate in a sell-vol
+            # environment.  Setting _last_build_failure would block
+            # sell-vol entries for 5 minutes — an unintended side-effect.
+            _long_vol_strategies = (
+                config.STRAT_LONG_STRADDLE,
+                config.STRAT_BACKSPREAD,
+                config.STRAT_STRANGLE,
             )
+            if strategy_name not in _long_vol_strategies:
+                self._last_build_failure = datetime.now(
+                    self._IST
+                )
             return
 
         new_expiry = legs[0].expiry if legs else ""
@@ -3259,8 +3347,36 @@ class StrategyEngine:
     ) -> Optional[str]:
         adx          = self.dm.adx or 0
         atr_contract = self.dm.is_atr_contracting()
-        put_iv       = self._get_25d_put_iv()
-        call_iv      = self._get_25d_call_iv()
+        # S8-1: skew_diff computed from builder expiry
+        # _get_25d_put_iv() uses active chain (nearest expiry, DTE=0-8)
+        # but the builder uses DTE=4-9.  On expiry day these differ.
+        # Use the builder's target expiry for consistent skew routing.
+        _builder_expiry = self.dm.get_expiry_by_dte(4, tolerance=5)
+        if _builder_expiry:
+            _b_chain = self.dm.get_chain_for_expiry(_builder_expiry)
+            _put_strike_25d = self.dm.get_strike_by_delta(
+                "put", 0.25, expiry=_builder_expiry
+            )
+            _call_strike_25d = self.dm.get_strike_by_delta(
+                "call", 0.25, expiry=_builder_expiry
+            )
+            if _put_strike_25d and _call_strike_25d and _b_chain:
+                put_iv = float(
+                    _b_chain.get(_put_strike_25d, {})
+                    .get("put", {})
+                    .get("iv", 0.0)
+                )
+                call_iv = float(
+                    _b_chain.get(_call_strike_25d, {})
+                    .get("call", {})
+                    .get("iv", 0.0)
+                )
+            else:
+                put_iv  = self._get_25d_put_iv()
+                call_iv = self._get_25d_call_iv()
+        else:
+            put_iv  = self._get_25d_put_iv()
+            call_iv = self._get_25d_call_iv()
         # SE-P0-01: compute_iv_rank() returns None on cold start
         # (DM-13 fix). Guard all comparisons against None to prevent
         # TypeError crashing run_cycle() for the first ~10 sessions.
@@ -3325,11 +3441,37 @@ class StrategyEngine:
             # P0-4: iv_rank None guard — compute_iv_rank() returns None during warmup
             _iv_rank_neutral = self.dm.compute_iv_rank()
             _iv_rank_neutral = (_iv_rank_neutral if _iv_rank_neutral is not None else 50.0)
+            # S8-2: NEUTRAL iv_rank gate lowered to 40
+            # After RH1 (flow direction fix), fear days now have flow=+1
+            # raising the composite.  IV rank during fear days is 40-60.
+            # iv_rank > 50 was too restrictive, missing fear-day entries.
+            # iv_rank > 40 still ensures IV is elevated (not cheap).
             if _iv_rank_neutral > 50 and adx < 20:
+                # Range-bound + elevated IV: condor is optimal
                 return config.STRAT_IRON_CONDOR
+            if _iv_rank_neutral > 40 and adx >= 20:
+                # Trending + elevated IV: credit spread is safer than condor
+                return config.STRAT_CREDIT_SPREADS
             return None
 
         elif regime == config.REGIME_BUY_VOL:
+            # RH3: BUY_VOL returns None when IV is expensive
+            # Long-vol strategies require cheap IV (low IV rank).
+            # When IV rank > LONG_STRADDLE_MAX_IV_RANK, the builder
+            # will fail its own IV rank gate.  Return None here to
+            # avoid the build attempt and the 5-minute cooldown that
+            # would otherwise block all sell-vol entries.
+            _ivr_buyol = self.dm.compute_iv_rank()
+            _ivr_buyol = (
+                _ivr_buyol if _ivr_buyol is not None else 50.0
+            )
+            if _ivr_buyol > config.LONG_STRADDLE_MAX_IV_RANK:
+                logger.info(
+                    f'RH3: BUY_VOL skipped — IV rank {_ivr_buyol:.1f} '
+                    f'> {config.LONG_STRADDLE_MAX_IV_RANK} '
+                    f'(IV too expensive for long-vol entry)'
+                )
+                return None
             # SE7-P1-02: butterfly is short vega/short gamma at
             # the body — it profits from vol contraction, the
             # opposite of BUY_VOL intent. Use long strangle instead
@@ -3815,7 +3957,7 @@ class StrategyEngine:
             ),
             # PATCH S-05: 2.0x→1.0x. At 2.0x stop + 60% target,
             # break-even WR=77% (unachievable). At 1.0x + 60%: WR=62.5%.
-            "stop_loss":     net_credit * 2.0,  # P1-4a: condor stop_loss 2.0x (was 1.0x, fired immediately at entry)
+            "stop_loss":     0.0,  # RC1a: condor premium stop disabled (spot-distance stop via CONDOR_TESTED_SIDE_BUFFER is sufficient)  # P1-4a: condor stop_loss 2.0x (was 1.0x, fired immediately at entry)
             "exit_dte":      config.CONDOR_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -4130,7 +4272,7 @@ class StrategyEngine:
                 1 - config.SPREAD_TARGET_PCT
             ),
             # PATCH S-06: 2.0x→1.0x (same reasoning as S-05).
-            "stop_loss":     total_credit * 2.0,  # P1-4b: spread stop_loss 2.0x (was 1.0x, fired immediately at entry)
+            "stop_loss":     0.0,  # RC1b: spread premium stop disabled (spot-distance stop via CONDOR_TESTED_SIDE_BUFFER is sufficient)  # P1-4b: spread stop_loss 2.0x (was 1.0x, fired immediately at entry)
             "exit_dte":      config.SPREAD_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -6123,7 +6265,21 @@ class StrategyEngine:
         # Applied AFTER all other caps so it never exceeds margin
         # or regime max lots limits.
         if lots > 0:
-            _comp_now = abs(getattr(self.re, 'raw_composite', 0.0))
+            # S12-1: composite multiplier uses 3-cycle average
+            # raw_composite includes noisy flow signal; lot size
+            # oscillated cycle-to-cycle.  Use 3-cycle average from
+            # score_history to smooth single-cycle flow noise.
+            _score_hist = list(self.re.score_history)[-3:]
+            if _score_hist:
+                _comp_avg = sum(
+                    abs(e.get('composite', 0.0))
+                    for e in _score_hist
+                ) / len(_score_hist)
+            else:
+                _comp_avg = abs(
+                    getattr(self.re, 'raw_composite', 0.0)
+                )
+            _comp_now = _comp_avg
             _comp_base = getattr(
                 config, 'MILD_SELL_ENTER', 0.20
             )
@@ -6146,6 +6302,31 @@ class StrategyEngine:
                         f"(composite={_comp_now:.3f} "
                         f"mult={_comp_mult:.2f}x)"
                     )
+        # S13-1: minimum lot size for credit spreads
+        # At VIX=11, credit spread net_credit ~12pts.
+        # Transaction costs (Rs334-450/round trip) exceed EV at 1-3 lots.
+        # Break-even minimum is 4 lots.  If we cannot size to 4 lots
+        # within risk limits, skip the trade (return 0) rather than
+        # entering an unprofitable 1-3 lot position.
+        if (
+            strategy_name == config.STRAT_CREDIT_SPREADS
+            and lots > 0
+        ):
+            _net_credit_pts = meta.get(
+                "total_credit",
+                meta.get("net_credit", 99)
+            )
+            _min_lots_spread = getattr(
+                config, "CREDIT_SPREAD_MIN_LOTS", 4
+            )
+            if _net_credit_pts < 20 and lots < _min_lots_spread:
+                logger.info(
+                    f"S13-1: credit spread skipped — "
+                    f"lots={lots} < min={_min_lots_spread} "
+                    f"at net_credit={_net_credit_pts:.1f}pts "
+                    f"(transaction costs exceed EV at low lot count)"
+                )
+                return 0
         logger.info(
             f"Lot size: {lots} for {strategy_name} "
             f"risk={risk_per_trade} "
