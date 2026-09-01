@@ -2408,16 +2408,20 @@ class StrategyEngine:
             from_regime == config.REGIME_MILD_SELL
             and to_regime == config.REGIME_BUY_VOL
         ):
+            # SE-F1: replace 0.10-delta hedge with 50% reduction.
+            # The hedge fires AFTER the vol expansion it protects
+            # against. At that point the 0.10-delta option costs
+            # ~114% of the original credit. Partial close is cheaper
+            # and simultaneously reduces vega, gamma and margin.
             logger.info(
-                "RULE D: Cancel SLs then convert spreads"
+                "RULE D: Reducing all positions 50%% "
+                "(replaced 0.10-delta hedge — cheaper post-vol-spike)"
             )
             await self.cancel_all_open_orders(
-                context="RULE_D_SL_CANCEL"
+                context="RULE_D_CANCEL"
             )
             for position in list(self.open_positions):
-                await self._convert_shorts_to_spreads(
-                    position
-                )
+                await self._reduce_position_50pct(position)
             return
 
         if from_regime == config.REGIME_NEUTRAL and (
@@ -2487,6 +2491,17 @@ class StrategyEngine:
         if self.daily_trading_halted:
             logger.info('Entry gate BLOCKED: daily halt')
             return False
+        # SE-STALE: block entries when spot data is stale.
+        # DM-SPIKE sets dm._spot_data_stale=True when a >5% spot
+        # move is rejected as implausible. Trading on stale spot
+        # means ATM selection, expected-move, and stop-loss checks
+        # all run on wrong data — worse than not trading at all.
+        if getattr(self.dm, "_spot_data_stale", False):
+            logger.info(
+                'Entry gate BLOCKED: spot data stale '
+                '(>5%% spike rejected — awaiting valid tick)'
+            )
+            return False
         # PATCH: real trading-day/holiday check — previously this
         # only existed (disconnected) in _display_console().
         today_check = date.today()
@@ -2527,6 +2542,19 @@ class StrategyEngine:
             logger.info(
                 f'Entry gate BLOCKED: VIX={self.dm.vix:.1f} >= '
                 f'{config.VIX_SELL_VOL_MAX}'
+            )
+            return False
+        # PRF-S03: block short-vol when VIX is too low.
+        # Below MIN_VIX_SELL, premium is too thin to cover costs.
+        _min_vix = getattr(config, "MIN_VIX_SELL", 11.0)
+        if (
+            regime in [config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL]
+            and self.dm.vix is not None
+            and self.dm.vix < _min_vix
+        ):
+            logger.info(
+                f'Entry gate BLOCKED: VIX={self.dm.vix:.1f} < '
+                f'MIN_VIX_SELL={_min_vix} (premium too thin)'
             )
             return False
         if regime == config.REGIME_NEUTRAL:
@@ -2607,6 +2635,19 @@ class StrategyEngine:
             logger.info(
                 f'Entry gate BLOCKED: capital deployed '
                 f'Rs{deployed:,.0f} >= Rs{reg_cap:,.0f}'
+            )
+            return False
+        # PRF-S04: block entries when nearest expiry has DTE < MIN_DTE_ENTRY.
+        # Below 4 DTE, theta/gamma ratio deteriorates sharply and
+        # there is insufficient time for the trade to work.
+        _min_dte = getattr(config, "MIN_DTE_ENTRY", 4)
+        _nearest_expiry = self.dm.get_expiry_by_dte(
+            _min_dte, tolerance=_min_dte
+        )
+        if _nearest_expiry is None:
+            logger.info(
+                f'Entry gate BLOCKED: no expiry with DTE >= '
+                f'{_min_dte}'
             )
             return False
         if self._last_build_failure is not None:
@@ -2810,6 +2851,45 @@ class StrategyEngine:
 
         trade_id = str(uuid.uuid4())
 
+        # SE-D1: re-validate credit immediately before execution.
+        # The builder ran in the 60s regime block; in a moving tape
+        # credit can decay materially between gate and order send.
+        _revalidation_pct = getattr(
+            config, "ENTRY_CREDIT_REVALIDATION_PCT", 0.10
+        )
+        _orig_credit = meta.get("net_credit",
+                                meta.get("total_credit", 0))
+        if _orig_credit > 0 and _revalidation_pct > 0:
+            _strategy_type = meta.get("strategy_type", "SHORT")
+            if _strategy_type == "SHORT":
+                # Re-read current credit from live chain
+                _current_credit = 0.0
+                try:
+                    for _leg in legs:
+                        _lc = self.dm.get_chain_for_expiry(
+                            _leg.expiry
+                        ).get(_leg.strike, {}).get(
+                            _leg.option_type, {}
+                        )
+                        _b = float(_lc.get("bid") or 0)
+                        _a = float(_lc.get("ask") or 0)
+                        if _b > 0 and _a > 0:
+                            if _leg.action == "SELL":
+                                _current_credit += _b
+                            else:
+                                _current_credit -= _a
+                except Exception:
+                    _current_credit = _orig_credit
+                _decay = (_orig_credit - _current_credit) / _orig_credit
+                if _decay > _revalidation_pct:
+                    logger.info(
+                        f"SE-D1: credit decayed {_decay*100:.1f}%% "
+                        f"since build ({_orig_credit:.1f} -> "
+                        f"{_current_credit:.1f}) — aborting"
+                    )
+                    self._last_build_failure = datetime.now(self._IST)
+                    return
+
         success = await self._execute_strategy(
             strategy_name, legs, meta, trade_id=trade_id
         )
@@ -2918,13 +2998,17 @@ class StrategyEngine:
         ema_200      = self._get_ema_200()
 
         if regime == config.REGIME_STRONG_SELL:
-            if (
-                adx < config.ADX_RANGE_THRESHOLD
-                and atr_contract
-            ):
-                return config.STRAT_SHORT_STRADDLE
-            else:
+            # SE-B1: route to straddle by default.
+            # The condor is arithmetically unbuildable at 1.5sigma
+            # across the realistic VIX range (credit ~6-9% of width
+            # vs 18% required floor). The straddle has 2 legs (1.7pts
+            # cost vs 3.2), no wing debit, and maximum theta.
+            # Route to condor only when ADX confirms a genuine trend
+            # (tail risk warrants paying for wings).
+            if adx > config.ADX_TREND_THRESHOLD:
                 return config.STRAT_IRON_CONDOR
+            else:
+                return config.STRAT_SHORT_STRADDLE
 
         elif regime == config.REGIME_MILD_SELL:
             if skew_diff >= config.SPREAD_SKEW_THRESHOLD:
@@ -3157,6 +3241,26 @@ class StrategyEngine:
             ),
         ]
 
+        # C4-13: VIX-scaled stop using SL_BASE_PERCENT/SL_REFERENCE_VIX.
+        # Flat STRADDLE_STOP_MULT ignores that 1.25x at VIX=11 is
+        # ~2 hours of noise while at VIX=22 it is a genuine stop.
+        # stop_pct = clamp(SL_BASE * vix / SL_REF, SL_MIN, SL_MAX)
+        _vix_sl    = self.dm.vix or config.SL_REFERENCE_VIX
+        _sl_base   = getattr(config, "SL_BASE_PERCENT",   0.30)
+        _sl_ref    = getattr(config, "SL_REFERENCE_VIX",  14.0)
+        _sl_min    = getattr(config, "SL_MIN_PERCENT",     0.18)
+        _sl_max    = getattr(config, "SL_MAX_PERCENT",     0.40)
+        _sl_pct    = max(_sl_min, min(_sl_max, _sl_base * _vix_sl / _sl_ref))
+        _stop_loss = total_premium * _sl_pct / _sl_base * config.STRADDLE_STOP_MULT
+        # Simplified: scale the stop multiple by VIX ratio
+        _vix_stop_mult = config.STRADDLE_STOP_MULT * (_vix_sl / _sl_ref)
+        _vix_stop_mult = max(1.0, min(3.0, _vix_stop_mult))
+        logger.info(
+            f"Straddle: VIX={_vix_sl:.1f} -> "
+            f"stop_mult={_vix_stop_mult:.2f}x "
+            f"(base={config.STRADDLE_STOP_MULT}x)"
+        )
+
         meta = {
             "total_premium":  total_premium,
             "stop_loss_up":   (self.dm.spot or 0) * (
@@ -3168,9 +3272,9 @@ class StrategyEngine:
             "profit_target":  total_premium * (
                 1 - config.STRADDLE_TARGET_PCT
             ),
-            # FIX P1: stop = 2x credit (STRADDLE_STOP_MULT)
+            # C4-13: VIX-scaled stop (wider at high VIX, tighter at low VIX)
             "stop_loss":      (
-                total_premium * config.STRADDLE_STOP_MULT
+                total_premium * _vix_stop_mult
             ),
             "exit_dte":       config.STRADDLE_EXIT_DTE,
             "max_hold_date":  None,
@@ -3270,8 +3374,9 @@ class StrategyEngine:
                 / config.NIFTY_STRIKE_STEP
             ) * config.NIFTY_STRIKE_STEP
         )
-        long_call = short_call + config.CONDOR_WING_WIDTH
-        long_put  = short_put  - config.CONDOR_WING_WIDTH
+        # PRF-S02: use dynamic wing width instead of fixed constant
+        long_call = short_call + _dynamic_wing
+        long_put  = short_put  - _dynamic_wing
 
         for strike in [
             short_call, short_put, long_call, long_put
@@ -3300,14 +3405,29 @@ class StrategyEngine:
                 )
                 return (None, {})
 
-        sc_prem = chain[short_call]["call"]["ltp"]
-        sp_prem = chain[short_put]["put"]["ltp"]
-        lc_prem = chain[long_call]["call"]["ltp"]
-        lp_prem = chain[long_put]["put"]["ltp"]
+        # SE-P1: use executable prices, not LTP.
+        # LTP can be anywhere in the bid-ask band. On a 4-leg condor
+        # the gap between LTP credit and achievable credit is up to
+        # 8pts on a 55pt floor (15% measurement error).
+        def _exec(opt, action):
+            b = float(opt.get("bid") or 0)
+            a = float(opt.get("ask") or 0)
+            if b <= 0 or a <= 0:
+                return float(opt.get("ltp") or 0)
+            return b if action == "SELL" else a
+        sc_prem = _exec(chain[short_call]["call"], "SELL")
+        sp_prem = _exec(chain[short_put]["put"],   "SELL")
+        lc_prem = _exec(chain[long_call]["call"],  "BUY")
+        lp_prem = _exec(chain[long_put]["put"],    "BUY")
 
         net_credit = (
             sc_prem + sp_prem - lc_prem - lp_prem
         )
+        # SE-P1B: subtract pre-approval slippage haircut.
+        # Slippage currently only appears in _simulate_fill (after
+        # approval). The gate sees a credit that does not exist.
+        _slip = getattr(config, "ENTRY_SLIPPAGE_PTS_PER_LEG", 0.75)
+        net_credit_gated = net_credit - _slip * 4  # 4 legs
 
         # CFG-P1-01: read from config, not a hardcoded literal.
         # The old code had _min_credit_ratio = 0.15 hardcoded here
@@ -3318,20 +3438,22 @@ class StrategyEngine:
             "CONDOR_MIN_CREDIT_PCT_OF_WIDTH",
             0.15,
         )
+        # PRF-S02: min credit check uses dynamic wing width
         _min_credit_required = max(
             config.CONDOR_MIN_CREDIT,
-            _min_credit_ratio * config.CONDOR_WING_WIDTH,
+            _min_credit_ratio * _dynamic_wing,
         )
-        if net_credit < _min_credit_required:
+        if net_credit_gated < _min_credit_required:
             logger.warning(
-                f"Condor: credit={net_credit:.2f} "
-                f"< min={_min_credit_required:.1f} "
-                f"(15% of {config.CONDOR_WING_WIDTH}pt wing)"
+                f"Condor: executable credit={net_credit:.2f} "
+                f"after slippage={net_credit_gated:.2f} "
+                f"< min={_min_credit_required:.1f}"
             )
             return (None, {})
 
+        # PRF-S02: max_risk uses dynamic wing width
         max_risk = (
-            config.CONDOR_WING_WIDTH - net_credit
+            _dynamic_wing - net_credit
         ) * config.LOT_SIZE
 
         legs = [
@@ -3391,12 +3513,17 @@ class StrategyEngine:
             "profit_target": net_credit * (
                 1 - config.CONDOR_TARGET_PCT
             ),
-            # SE10-P1-02: lowered from 2.0x to 1.25x credit.
-            "stop_loss":     net_credit * 1.25,
+            # PRF-S05: raised from 1.25x to 2.0x credit.
+            # 1.25x stop = 50pt on a 40pt credit condor. NIFTY moves
+            # 50-80pt intraday routinely, causing many false stop-outs.
+            # 2.0x = 80pt stop, survives normal intraday noise.
+            "stop_loss":     net_credit * 2.0,
             "exit_dte":      config.CONDOR_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
             "total_credit":  net_credit,
+            # SE-F3: store expected_move for sigma-scaled buffer
+            "expected_move":  expected_move,
         }
 
         logger.info(
@@ -3448,21 +3575,52 @@ class StrategyEngine:
         if dte > max_dte_bound:
             return (None, {})
 
+        # C4-12: wire LOW/MID/HIGH_VIX_DELTA into delta selection.
+        # Flat SPREAD_DELTA_SHORT=0.16 ignores that selling 0.16 delta
+        # at VIX=11 and VIX=25 are very different trades.
+        _vix_now = self.dm.vix or 14.0
+        _low_vix  = getattr(config, "LOW_VIX",  14.0)
+        _high_vix = getattr(config, "HIGH_VIX", 18.0)
+        if _vix_now < _low_vix:
+            # Low VIX: use wider delta (more OTM, less credit but safer)
+            _delta_band = getattr(
+                config, "LOW_VIX_DELTA", (0.22, 0.28)
+            )
+        elif _vix_now > _high_vix:
+            # High VIX: use tighter delta (closer strikes, more credit)
+            _delta_band = getattr(
+                config, "HIGH_VIX_DELTA", (0.15, 0.20)
+            )
+        else:
+            # Mid VIX: standard range
+            _delta_band = getattr(
+                config, "MID_VIX_DELTA", (0.20, 0.25)
+            )
+        # Use midpoint of the band as the short delta target
+        _short_delta = (_delta_band[0] + _delta_band[1]) / 2.0
+        # Long delta stays at config value (wing protection)
+        _long_delta  = config.SPREAD_DELTA_LONG
+        logger.info(
+            f"Credit spread: VIX={_vix_now:.1f} -> "
+            f"short_delta={_short_delta:.3f} "
+            f"(band={_delta_band})"
+        )
+
         # FIX QS1/CONFIRMED-5: expiry-scoped delta lookup
         short_put_strike  = self.dm.get_strike_by_delta(
-            "put", config.SPREAD_DELTA_SHORT,
+            "put", _short_delta,
             expiry=expiry,
         )
         long_put_strike   = self.dm.get_strike_by_delta(
-            "put", config.SPREAD_DELTA_LONG,
+            "put", _long_delta,
             expiry=expiry,
         )
         short_call_strike = self.dm.get_strike_by_delta(
-            "call", config.SPREAD_DELTA_SHORT,
+            "call", _short_delta,
             expiry=expiry,
         )
         long_call_strike  = self.dm.get_strike_by_delta(
-            "call", config.SPREAD_DELTA_LONG,
+            "call", _long_delta,
             expiry=expiry,
         )
 
@@ -3618,8 +3776,8 @@ class StrategyEngine:
             "profit_target": total_credit * (
                 1 - config.SPREAD_TARGET_PCT
             ),
-            # SE10-P1-02: lowered from 2.0x to 1.25x credit.
-            "stop_loss":     total_credit * 1.25,
+            # PRF-S05: raised from 1.25x to 2.0x credit (same as condor).
+            "stop_loss":     total_credit * 2.0,
             "exit_dte":      config.SPREAD_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -4633,6 +4791,34 @@ class StrategyEngine:
             )
             return False
 
+        # SE-VEGA FIX: extend pre-trade gate to vega.
+        # Previously gamma/vega/theta limits were log-only warnings
+        # with no enforcement. The portfolio can run arbitrarily
+        # outside the carefully calibrated GREEKS_LIMITS vega bands
+        # with no automated consequence. This gates on vega_min/max
+        # (the most important for a short-vol book) when the
+        # GREEKS_VEGA_GATE config flag is True.
+        if getattr(config, "GREEKS_VEGA_GATE", False):
+            post_vega = (
+                port_greeks["vega"] + new_greeks["vega"]
+            )
+            vega_min = limits.get("vega_min")
+            vega_max = limits.get("vega_max")
+            if vega_min is not None and post_vega < vega_min:
+                logger.warning(
+                    f"Pre-trade: vega below min: "
+                    f"post={post_vega:.0f} < min={vega_min} "
+                    f"— blocking entry"
+                )
+                return False
+            if vega_max is not None and post_vega > vega_max:
+                logger.warning(
+                    f"Pre-trade: vega above max: "
+                    f"post={post_vega:.0f} > max={vega_max} "
+                    f"— blocking entry"
+                )
+                return False
+
         if not config.PAPER_TRADING_MODE:
             margin_legs = [
                 {
@@ -5163,17 +5349,27 @@ class StrategyEngine:
         # AUDIT #N1: defensive hedge pre-computes its own quantity.
         if strategy_name == config.STRAT_DEFENSIVE:
             return 1
-        # SE-03: size off the DESIGNED STOP LOSS, not the theoretical
-        # max loss. For a condor, max_risk = (wing-credit)*LOT_SIZE
-        # (~Rs24k) which exceeds MAX_RISK_PER_TRADE (Rs40k after fix),
-        # returning 1 lot. For a straddle, stop = 2*credit*LOT_SIZE
-        # (~Rs38k at VIX 11), also returning 1 lot.
-        # Use stop_loss * LOT_SIZE as the sizing denominator for
-        # credit strategies; fall back to max_risk for debit ones.
+        # PRF-S01: use theoretical max_risk for defined-risk structures.
+        # For condors/spreads, max_risk = (wing_width - credit) * LOT_SIZE.
+        # Using stop_loss*LOT_SIZE as the basis was dangerous: a 250pt
+        # condor with 40pt credit has stop=50pt=Rs3250/lot, sizing to
+        # 6 lots at Rs20k risk. A gap blows through stop and loses
+        # 210pt * 6 = Rs82k — 4x the intended risk.
+        # For undefined-risk structures (straddle), keep stop-based sizing.
         _strategy_type = meta.get("strategy_type", "SHORT")
-        _stop_pts = meta.get("stop_loss", 0)
-        if _strategy_type == "SHORT" and _stop_pts and _stop_pts > 0:
-            max_loss_per_lot = _stop_pts * config.LOT_SIZE
+        _is_defined_risk = strategy_name in (
+            config.STRAT_IRON_CONDOR,
+            config.STRAT_CREDIT_SPREADS,
+        )
+        if _is_defined_risk:
+            # Use theoretical max loss (wing_width - credit) * LOT_SIZE
+            max_loss_per_lot = meta.get("max_risk", 0)
+        elif _strategy_type == "SHORT":
+            _stop_pts = meta.get("stop_loss", 0)
+            if _stop_pts and _stop_pts > 0:
+                max_loss_per_lot = _stop_pts * config.LOT_SIZE
+            else:
+                max_loss_per_lot = meta.get("max_risk", 0)
         else:
             max_loss_per_lot = meta.get("max_risk", 0)
         if max_loss_per_lot <= 0:
@@ -5594,6 +5790,34 @@ class StrategyEngine:
             logger.warning(
                 f'Vega below min: {greeks["vega"]:.1f} < {vega_min}'
             )
+            # SE-VEGA FIX: act on vega breach, don't just log.
+            # Portfolio is too short vega (below vega_min).
+            # Reduce the largest short-vol position by 50% to
+            # bring vega back toward the allowed band.
+            # Only act if GREEKS_VEGA_GATE is enabled.
+            if getattr(config, "GREEKS_VEGA_GATE", False):
+                _short_vol_positions = [
+                    p for p in self.open_positions
+                    if p.meta.get("strategy_type") == "SHORT"
+                    and p.status == "OPEN"
+                ]
+                if _short_vol_positions:
+                    # Reduce the position with the most short vega
+                    # (largest credit, as a proxy for most vega)
+                    _largest = max(
+                        _short_vol_positions,
+                        key=lambda p: p.total_credit,
+                    )
+                    logger.warning(
+                        f"SE-VEGA: reducing "
+                        f"{_largest.strategy_name} "
+                        f"{_largest.trade_id[:8]} "
+                        f"by 50%% to address vega breach"
+                    )
+                    import asyncio as _asyncio
+                    _asyncio.ensure_future(
+                        self._reduce_position_50pct(_largest)
+                    )
         theta_min = limits.get('theta_min')
         if theta_min is not None and greeks['theta'] < theta_min:
             logger.warning(

@@ -486,6 +486,10 @@ class DataManager:
         self.prev_spot: Optional[float] = None
         self.vix:       Optional[float] = None
         self.prev_vix:  Optional[float] = None
+        # DM-SPIKE: True when the last spot tick was rejected as
+        # a spike (>5% move). Cleared on next valid tick.
+        # Consumed by strategy_engine._should_enter_new_position.
+        self._spot_data_stale: bool = False
 
         # Nested option chain: [expiry][strike][opt_type]
         self.option_chain: Dict[
@@ -902,12 +906,41 @@ class DataManager:
                 if self.spot and self.spot > 0:
                     change = abs(new_spot / self.spot - 1)
                     if change > 0.05:
-                        logger.critical(
-                            f"Spot spike: "
-                            f"{self.spot:.2f} -> "
-                            f"{new_spot:.2f} — rejected"
+                        # DM-G4: accept second consecutive confirmation.
+                        # A genuine gap is permanently frozen at the
+                        # pre-gap value because every subsequent tick
+                        # is also >5% from the frozen reference.
+                        # Two consecutive out-of-band readings
+                        # distinguish a bad tick from a real gap.
+                        _prev_rejected = getattr(
+                            self, "_spot_prev_rejected", None
                         )
-                        new_spot = self.spot
+                        if (
+                            _prev_rejected is not None
+                            and abs(new_spot / _prev_rejected - 1) < 0.02
+                        ):
+                            # Two consecutive readings agree: accept
+                            logger.warning(
+                                f"DM-G4: Spot gap confirmed by two "
+                                f"consecutive readings: "
+                                f"{self.spot:.2f} -> {new_spot:.2f}"
+                            )
+                            self._spot_prev_rejected = None
+                            self._spot_data_stale = False
+                            # Accept new_spot (fall through)
+                        else:
+                            logger.critical(
+                                f"DM-G4: Spot move {change*100:.1f}%% "
+                                f"{self.spot:.2f} -> {new_spot:.2f} "
+                                f"— awaiting second confirmation."
+                            )
+                            self._spot_prev_rejected = new_spot
+                            self._spot_data_stale = True
+                            new_spot = self.spot
+                    else:
+                        # Valid tick: clear any prior stale flag
+                        self._spot_prev_rejected = None
+                        self._spot_data_stale = False
                 self.prev_spot = self.spot
                 self.spot      = float(new_spot)
                 self._append_daily_return()
@@ -1042,8 +1075,30 @@ class DataManager:
                     abs(strike - atm_candidate)
                     <= config.NIFTY_STRIKE_STEP
                 )
+                # DM-G2: DTE-scaled OI floor.
+                # Far wings early in the week have low OI and
+                # were silently dropped, causing condor build
+                # failures indistinguishable from 'credit too low'.
+                # Scale the floor: full MIN_OI_LOTS at DTE=0,
+                # down to 20% at DTE>=8 (far wing, early week).
+                try:
+                    _exp_date = datetime.strptime(
+                        expiry_date, "%Y-%m-%d"
+                    ).date()
+                    _dte = (
+                        _exp_date - datetime.now(self._IST).date()
+                    ).days
+                    _dte_scale = max(
+                        0.20, min(1.0, 1.0 - _dte / 10.0)
+                    )
+                except Exception:
+                    _dte_scale = 1.0
                 min_oi = (
-                    10 if is_atm else config.MIN_OI_LOTS
+                    10 if is_atm
+                    else max(
+                        10,
+                        int(config.MIN_OI_LOTS * _dte_scale),
+                    )
                 )
 
                 if call_oi < min_oi and put_oi < min_oi:
@@ -2199,34 +2254,60 @@ class DataManager:
             return []
 
     def compute_iv_rank(self) -> float:
-        # PATCH (D3): prefer a persisted 60-day daily-close
-        # history over the old intraday-only deque / hardcoded
-        # default. Falls back to the previous logic only if the
-        # persisted history is still too short (e.g. brand-new
-        # deployment with no history yet).
+        # DM-A1/A3: two fixes applied together.
+        #
+        # A1: rank off a stable-tenor expiry (DTE >= IV_RANK_MIN_DTE=7)
+        # rather than _active_expiry (DTE 0-6 on a weekly cycle).
+        # ATM IV rises sharply into expiry, creating a day-of-week
+        # artefact: IV rank reads ~100 on Tuesday, ~0 on Wednesday,
+        # with no change in the actual volatility regime.
+        #
+        # A3: percentile rank (counting) instead of min/max range.
+        # One outlier expiry-day print sets max for 60 sessions,
+        # compressing all subsequent normal readings to the bottom.
+        # Percentile is robust to exactly this.
         daily_history = self._load_iv_rank_history()
         if len(daily_history) >= 10:
-            if self.iv_atm is None:
-                # DM-13: return None so callers block on no evidence
+            # Determine the IV to rank: prefer stable-tenor expiry
+            _iv_to_rank = None
+            _min_dte = getattr(config, "IV_RANK_MIN_DTE", 7)
+            _today = datetime.now(self._IST).date()
+            for _exp_str in sorted(self._known_expiries):
+                try:
+                    _exp_date = datetime.strptime(
+                        _exp_str, "%Y-%m-%d"
+                    ).date()
+                    _dte = (_exp_date - _today).days
+                    if _dte >= _min_dte:
+                        _chain = self.option_chain.get(_exp_str, {})
+                        if _chain and self.atm_strike in _chain:
+                            _atm = _chain[self.atm_strike]
+                            _c_iv = _atm.get("call", {}).get("iv", 0)
+                            _p_iv = _atm.get("put",  {}).get("iv", 0)
+                            if _c_iv > 0 and _p_iv > 0:
+                                _iv_to_rank = (_c_iv + _p_iv) / 2.0
+                                break
+                except Exception:
+                    continue
+            # Fall back to iv_atm if no stable-tenor expiry found
+            if _iv_to_rank is None:
+                _iv_to_rank = self.iv_atm
+            if _iv_to_rank is None:
                 return None
             try:
-                iv_high = max(daily_history)
-                iv_low  = min(daily_history)
-                if abs(iv_high - iv_low) < 1e-10:
-                    return 50.0
+                # A3: percentile rank — count how many historical
+                # values are below today's reading
                 rank = (
-                    (self.iv_atm - iv_low)
-                    / (iv_high - iv_low)
-                ) * 100.0
+                    100.0
+                    * sum(1 for v in daily_history if v < _iv_to_rank)
+                    / len(daily_history)
+                )
                 return float(max(0.0, min(100.0, rank)))
             except Exception as e:
                 logger.error(f"compute_iv_rank error: {e}")
                 return 55.0
 
         if len(self.iv_atm_history) < 10:
-            # DM-13: return None (not 55.0) so the NEUTRAL-regime
-            # gate blocks entry on no evidence. 55>50 was passing
-            # the iv_rank gate and opening condors on a magic number.
             return None
         if self.iv_atm is None:
             return None
@@ -2244,6 +2325,29 @@ class DataManager:
         except Exception as e:
             logger.error(f"compute_iv_rank error: {e}")
             return 50.0
+
+    def iv_rank_edge_signal(self) -> Optional[int]:
+        """C4-11: return edge signal from IV rank using config thresholds.
+
+        EDGE_PERCENTILE_HIGH and EDGE_PERCENTILE_LOW were defined in
+        config.py but never referenced anywhere. This wires them.
+
+        Returns:
+            +1  if IV rank >= EDGE_PERCENTILE_HIGH (vol is rich, sell)
+            -1  if IV rank <= EDGE_PERCENTILE_LOW  (vol is cheap, buy)
+             0  if in between (neutral)
+            None if IV rank unavailable
+        """
+        rank = self.compute_iv_rank()
+        if rank is None:
+            return None
+        high = getattr(config, "EDGE_PERCENTILE_HIGH", 70)
+        low  = getattr(config, "EDGE_PERCENTILE_LOW",  30)
+        if rank >= high:
+            return 1    # vol rich — sell signal
+        if rank <= low:
+            return -1   # vol cheap — buy signal
+        return 0
 
     def compute_atr(
         self, period: int = 14
