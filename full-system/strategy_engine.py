@@ -190,24 +190,22 @@ class StrategyEngine:
         action:         str,
         leg_index:      int = 0,
     ) -> str:
-        # SE-T04: use IST date.
-        # SE7-P0-02: add a monotonic counter so repeated same-day
-        # operations (two RULE-B reductions, two _close_one_side
-        # calls) produce distinct tags. Without this, the second
-        # call finds the first order via EP_ORDER_HISTORY?tag= and
-        # returns success without placing a new order.
+        # SE8-P0-04 FIX: revert monotonic counter.
+        # The counter made every tag unique, destroying idempotency:
+        # _check_existing_order_by_tag could never match a prior order
+        # so both duplicate-order protections became no-ops, and any
+        # retry would place a second real order.
+        # Tag is deterministic: same inputs = same tag = idempotent.
+        # SE-T04: use IST date not server-local date.
         _ist_date = datetime.now(
             self._IST
         ).date().isoformat()
-        _counter = getattr(self, "_tag_counter", 0) + 1
-        self._tag_counter = _counter
         raw = (
             f"{trade_id[:12]}-"
             f"{instrument_key[-8:]}-"
             f"{action}-"
             f"{leg_index}-"
-            f"{_ist_date}-"
-            f"{_counter}"
+            f"{_ist_date}"
         )
         tag_hash = hashlib.md5(raw.encode()).hexdigest()[:8]
         return f"{self.ORDER_TAG_PREFIX}-{tag_hash}"
@@ -2230,11 +2228,29 @@ class StrategyEngine:
         current_premium = self._get_position_current_premium(
             position
         )
+        # SE9-P0-01 FIX: use net_premium as denominator.
+        # total_credit is GROSS (sell legs only); current_premium
+        # is NET (shorts minus longs). On a 250-wide condor with
+        # 55pt credit and 30pt debit, total_credit=55 but
+        # net_premium=25. Using total_credit made profit_pct=0.30
+        # at entry (trail armed immediately, closed after 4.5pts).
+        # With net_premium, profit_pct=0.0 at entry — correct.
+        _trail_basis = position.net_premium
+        if not _trail_basis or _trail_basis <= 0:
+            return False
         profit_pct = 1.0 - (
-            current_premium / position.total_credit
+            current_premium / _trail_basis
         )
 
+        # SE9-P0-01: initialise peak at 0.0 not from meta.
+        # With the corrected net_premium basis, profit_pct starts
+        # at 0.0 at entry, so peak must also start at 0.0.
+        # Inheriting a stale meta value from a prior position
+        # could arm the trail prematurely on a fresh entry.
         peak = position.meta.get("_peak_profit_pct", 0.0)
+        if peak > 0.95:  # stale value guard
+            peak = 0.0
+            position.meta["_peak_profit_pct"] = 0.0
         if profit_pct > peak:
             peak = profit_pct
             position.meta["_peak_profit_pct"] = peak
@@ -2420,12 +2436,7 @@ class StrategyEngine:
         # DOWNGRADES (STRONG->MILD within a side), never upgrades.
         # On an upgrade (MILD_SELL->STRONG_SELL) it was halving
         # loss tolerance exactly when the model says sell more vol.
-        _sell_regimes = {
-            config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL
-        }
-        _buy_regimes = {
-            config.REGIME_BUY_VOL, config.REGIME_STRONG_BUY
-        }
+        # SE8-P3-02 FIX: removed unused _sell_regimes/_buy_regimes.
         _is_sell_downgrade = (
             from_regime == config.REGIME_STRONG_SELL
             and to_regime == config.REGIME_MILD_SELL
@@ -3925,22 +3936,23 @@ class StrategyEngine:
         if vix > config.BACKSPREAD_MAX_VIX:
             return (None, {})
 
-        # SE-P1-07: after RE-02, confirmed_trend is always -1
-        # (trending) or 0 (range-bound) — never +1. The backspread
-        # needs the actual directional signal (+DI vs -DI).
-        # Read the raw trend direction from the regime engine's
-        # last computed +DI/-DI comparison stored in _detail.
+        # SE8-P1-04 FIX: read direction from regime engine's
+        # raw trend detail, not by parsing a log string.
+        # The old approach defaulted to bullish when range-bound
+        # (majority of sessions), opening call backspreads with
+        # no directional signal. Now returns None when no clear
+        # trend to avoid directional bets on neutral markets.
         trend = self.re.confirmed_trend
         _trend_detail = self.re._detail.get("trend", "")
         _is_bullish = "bullish" in _trend_detail.lower()
         _is_bearish = "bearish" in _trend_detail.lower()
-        # Use directional signal: bullish -> call backspread,
-        # bearish -> put backspread, neutral -> call (default)
-        _trend_direction = (
-            1 if _is_bullish
-            else -1 if _is_bearish
-            else 1
-        )
+        if not _is_bullish and not _is_bearish:
+            # No confirmed directional trend — skip backspread
+            logger.info(
+                "Backspread: no confirmed direction — skip"
+            )
+            return (None, {})
+        _trend_direction = 1 if _is_bullish else -1
         chain = self.dm.get_chain_for_expiry(expiry)
         if not chain:
             return (None, {})
@@ -5171,18 +5183,16 @@ class StrategyEngine:
         self, position: Position
     ) -> float:
         # SE-T01: staleness-aware mark price.
-        # SE-05: apply BUY/SELL sign. Without this, a butterfly
-        # (BUY wing_a, BUY wing_c, SELL body x2) returns
-        # P_a + P_c + 2*P_b instead of P_a + P_c - 2*P_b.
-        # The unsigned sum immediately exceeds max_profit*0.5,
-        # so every butterfly opens and instantly closes.
-        total        = 0.0
-        expiry_chain = self.dm.get_chain_for_expiry(
-            position.expiry_date
-        )
+        # SE-05: apply BUY/SELL sign.
+        # SE9-P2-01: mark each leg against its OWN expiry.
+        # Using position.expiry_date for all legs means off-expiry
+        # legs (defensive hedge, calendar spreads) get opt_data={}
+        # and are marked at entry_price forever — zero P&L.
+        total = 0.0
         for leg in position.legs:
+            _leg_chain = self.dm.get_chain_for_expiry(leg.expiry)
             opt_data = (
-                expiry_chain
+                _leg_chain
                 .get(leg.strike, {})
                 .get(leg.option_type, {})
             )
@@ -5227,15 +5237,25 @@ class StrategyEngine:
         for position in self.open_positions:
             for leg in position.legs:
                 sign = +1 if leg.action == "BUY" else -1
-                # Greeks over-multiplication fix: API-supplied Greeks
-                # are per-contract (per-lot), not per-share. Multiplying
-                # by LOT_SIZE again overstated portfolio Greeks by 65x,
-                # making every Greek limit 65x too strict and making
-                # delta hedge quantities wrong.
-                total_delta += sign * leg.delta * leg.qty
-                total_gamma += sign * leg.gamma * leg.qty
-                total_vega  += sign * leg.vega  * leg.qty
-                total_theta += sign * leg.theta * leg.qty
+                # SE8-P0-02 FIX: restore * LOT_SIZE.
+                # API Greeks are per-contract (per-lot). Multiplying
+                # by LOT_SIZE scales to per-position rupee terms.
+                # All consumers (_check_greeks_limits, _hedge_delta,
+                # _gamma_above_50pct_limit) were written expecting
+                # this scaling. Removing it made every limit 65x too
+                # loose and hedge quantities wrong by 65x.
+                total_delta += (
+                    sign * leg.delta * leg.qty * config.LOT_SIZE
+                )
+                total_gamma += (
+                    sign * leg.gamma * leg.qty * config.LOT_SIZE
+                )
+                total_vega  += (
+                    sign * leg.vega  * leg.qty * config.LOT_SIZE
+                )
+                total_theta += (
+                    sign * leg.theta * leg.qty * config.LOT_SIZE
+                )
 
         return {
             "delta": total_delta,
