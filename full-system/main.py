@@ -1460,8 +1460,20 @@ async def main() -> None:
                 await se.cancel_all_open_orders(
                     context="KILL_SWITCH_SWEEP"
                 )
-                # Do NOT break — engine keeps running
-                await asyncio.sleep(60)
+                # MN-T01: do NOT skip position monitoring.
+                # Failed SE-N01 exits leave positions OPEN;
+                # they need stop-loss checks and retry attempts
+                # even while the kill switch is active.
+                # Run the fast monitor then sleep briefly.
+                if se.open_positions and dm.spot is not None:
+                    try:
+                        await se._update_all_pnls()
+                        await se._monitor_all_positions()
+                    except Exception as _ks_e:
+                        logger.error(
+                            f"Kill-switch monitor error: {_ks_e}"
+                        )
+                await asyncio.sleep(5)
                 continue
 
             # Daily reset
@@ -1489,11 +1501,23 @@ async def main() -> None:
                         "Market closing time reached — EOD"
                     )
                     await _end_of_day(se, dm)
-                    eod_done_today = True
-                    logger.info(
-                        "EOD complete — engine monitoring, "
-                        "waiting for next trading day"
-                    )
+                    # MN-T02: only mark EOD complete when all
+                    # positions are confirmed closed. Failed
+                    # SE-N01 exits keep positions OPEN; marking
+                    # eod_done_today=True would reduce them to
+                    # once-per-minute monitoring.
+                    if not se.open_positions:
+                        eod_done_today = True
+                        logger.info(
+                            "EOD complete — all positions closed, "
+                            "waiting for next trading day"
+                        )
+                    else:
+                        logger.warning(
+                            f"EOD: {len(se.open_positions)} "
+                            f"position(s) still open after "
+                            f"_end_of_day — will retry"
+                        )
                 # PATCH: this branch previously went completely
                 # silent on the console for the rest of the day
                 # (the `continue` below skips the normal
@@ -1524,13 +1548,24 @@ async def main() -> None:
                     )
                     await _expiry_day_close_all(se)
                     await _end_of_day(se, dm)
-                    eod_done_today = True   # PATCH
-                    logger.info(
-                        "Expiry day EOD complete — "
-                        "engine monitoring"
-                    )
-                    await asyncio.sleep(300)
-                    continue
+                    # MN-T03: same guard as normal EOD.
+                    # Do not enter the 300s sleep while
+                    # positions remain open.
+                    if not se.open_positions:
+                        eod_done_today = True
+                        logger.info(
+                            "Expiry day EOD complete — "
+                            "engine monitoring"
+                        )
+                        await asyncio.sleep(300)
+                        continue
+                    else:
+                        logger.warning(
+                            f"Expiry EOD: "
+                            f"{len(se.open_positions)} "
+                            f"position(s) still open — "
+                            f"will retry close"
+                        )
 
             # Pre-EOD cancel sweep
             pre_eod_naive = datetime.combine(
@@ -1741,18 +1776,35 @@ async def main() -> None:
                         dm.spot is not None and dm.spot > 0
                     )
                     _chain_exists = _chain_len_now > 0
-                    if _spot_exists and _chain_exists:
+                    # MN-T05: require that spot was actually
+                    # updated this cycle OR that this is the
+                    # first cycle after startup (no prev value).
+                    # Pre-existing restored state satisfies
+                    # _spot_exists but not _spot_changed.
+                    _is_first_cycle = _cycle_start_spot is None
+                    _refresh_valid = (
+                        _spot_exists
+                        and _chain_exists
+                        and (_spot_changed or _is_first_cycle)
+                    )
+                    if _refresh_valid:
                         last_data_refresh     = now
                         data_refresh_complete = True
-                        if not _spot_changed:
-                            logger.debug(
-                                "Data refresh: spot unchanged "
-                                "(possible API stale response)"
-                            )
-                        else:
-                            logger.info(
-                                "Data refresh cycle complete"
-                            )
+                        logger.info(
+                            "Data refresh cycle complete"
+                        )
+                    elif _spot_exists and _chain_exists:
+                        # Data exists but spot didn't change —
+                        # could be a genuine flat market or a
+                        # stale API response. Update timestamp
+                        # to avoid spin-retry but mark incomplete
+                        # so regime uses previous confirmed data.
+                        last_data_refresh     = now
+                        data_refresh_complete = False
+                        logger.debug(
+                            "Data refresh: spot unchanged "
+                            "— marking incomplete"
+                        )
                     else:
                         last_data_refresh     = now
                         data_refresh_complete = False

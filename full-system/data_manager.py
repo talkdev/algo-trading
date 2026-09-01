@@ -1047,6 +1047,11 @@ class DataManager:
                             "instrument_key", ""
                         ),
                         "ltp":    _sf(call_md.get("ltp", 0)),
+                        # DM-T02: REST LTP gets _ltp_ts so
+                        # get_mark_price() treats it as fresh.
+                        "_ltp_ts": datetime.now(
+                            self._IST
+                        ).isoformat(),
                         "bid":    _sf(
                             call_md.get("bid_price", 0)
                         ),
@@ -1082,6 +1087,10 @@ class DataManager:
                             "instrument_key", ""
                         ),
                         "ltp":    _sf(put_md.get("ltp", 0)),
+                        # DM-T02: REST LTP gets _ltp_ts
+                        "_ltp_ts": datetime.now(
+                            self._IST
+                        ).isoformat(),
                         "bid":    _sf(
                             put_md.get("bid_price", 0)
                         ),
@@ -1312,14 +1321,17 @@ class DataManager:
         rest_age = _age("_rest_ts")
         ltp_age  = _age("_ltp_ts")
 
+        # DM-T03: reject crossed markets (bid > ask).
+        _bid_ask_valid = bid > 0 and ask > 0 and ask >= bid
+
         # 1. Fresh REST midpoint
-        if rest_age <= max_quote_age_sec and bid > 0 and ask > 0:
+        if rest_age <= max_quote_age_sec and _bid_ask_valid:
             return (bid + ask) / 2.0
         # 2. Fresh WS LTP
         if ltp_age <= max_ltp_age_sec and ltp > 0:
             return ltp
-        # 3. Stale REST midpoint (bounded age)
-        if rest_age <= max_rest_fallback_age_sec and bid > 0 and ask > 0:
+        # 3. Stale REST midpoint (bounded age, still valid)
+        if rest_age <= max_rest_fallback_age_sec and _bid_ask_valid:
             return (bid + ask) / 2.0
         # 4. fallback
         return fallback
