@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """
-patch.py — Category 4 Tier-3 fixes worth applying now.
+patch.py — Profitability & Accuracy Improvements (Immediate High-Impact)
 
-15 changes: dead-constant wiring, signal quality fixes, and
-maintainability improvements that have clear correct answers
-and require no calibration or backtesting.
+Applies only changes with clear correct answers that are implementable
+against the current code using data already available at runtime.
+No new data feeds, no backtesting infrastructure, no research required.
 
 Files patched:
   config.py
-    C4-01  Wire SL_BASE_PERCENT/SL_REFERENCE_VIX/SL_MIN/MAX into straddle stop
-    C4-02  Wire LOW/MID/HIGH_VIX_DELTA into spread delta selection
-    C4-03  Wire EDGE_PERCENTILE_HIGH/LOW to iv_rv_spread_history
-    C4-04  REENTRY_MIN_COMPOSITE_CHANGE promoted to named constant
-    C4-05  MAX_COMBINED_RISK_PCT comment clarified (non-binding)
-    C4-06  Delete / comment-out truly dead constants
-    C4-07  CONDOR_MIN_CREDIT_PER_MAXLOSS gate added
-
-  regime_engine.py
-    C4-08  Asymmetric trend penalty (bearish -1.0, bullish -0.4)
-    C4-09  Horizon-matched RV window in _module_edge
-
-  data_manager.py
-    C4-10  compute_spread_ratio: exclude current sample from baseline mean
-    C4-11  compute_iv_rank: use EDGE_PERCENTILE_HIGH/LOW from config
+    IMM-01  Dynamic flow weight: FLOW_WEIGHT_NONE_THRESHOLD added
+    IMM-02  VIX-adaptive lot sizing constants added
+    IMM-03  Distance-based stop constant added
+    IMM-04  Partial profit-taking ladder constants added
+    IMM-05  Adaptive persistence constants added
+    IMM-06  CANDLE_REFRESH_SECONDS 300->60 (align with main loop)
 
   strategy_engine.py
-    C4-12  Wire LOW/MID/HIGH_VIX_DELTA into _build_credit_spreads
-    C4-13  Wire SL_BASE_PERCENT VIX-scaled stop into _build_short_straddle
-    C4-14  CONDOR_MIN_CREDIT_PER_MAXLOSS gate in _build_iron_condor
+    IMM-02  _calculate_lot_size: scale by VIX-adaptive multiplier
+    IMM-03  _check_stop_loss: add distance-based secondary stop for condors/spreads
+    IMM-04  _check_profit_target: partial profit-taking at 25% of target
+    IMM-05  _refresh_locked: adaptive persistence (2 readings for strong signal)
+
+  regime_engine.py
+    IMM-01  _build_weights: set flow weight to 0 when frequently None
+    IMM-05  _refresh_locked: adaptive persistence based on composite magnitude
 
 Run:
     python patch.py [--dry-run] [--no-backup]
@@ -115,205 +111,91 @@ def sub_exact(old, new, content, label):
 def patch_config(content):
     changes = []
 
-    # C4-01: Document SL_BASE_PERCENT as now wired (actual wiring in strategy_engine)
-    old_sl_base = (
-        "SL_BASE_PERCENT    = 0.30\n"
-        "SL_REFERENCE_VIX   = 14.0\n"
-        "SL_MIN_PERCENT     = 0.18\n"
-        "SL_MAX_PERCENT     = 0.40"
+    # IMM-06: CANDLE_REFRESH_SECONDS 300->60
+    # Candle refresh is every 300s but the main loop runs every 60s.
+    # ADX and EMA can be stale for up to 5 minutes, causing delayed
+    # regime changes and missed entries/exits.
+    old_candle = (
+        "# CFG-D1: lowered from 1800 to 300 (5 min).\n"
+        "# The trend module is up to 30 min stale at 1800s. ADX and EMA\n"
+        "# slope on the *forming* bar change continuously. 5-min refresh\n"
+        "# gives an early view of the forming bar — one extra cheap call.\n"
+        "CANDLE_REFRESH_SECONDS = 300"
     )
-    new_sl_base = (
-        "# C4-01: VIX-scaled stop model — now wired into _build_short_straddle.\n"
-        "# stop_pct = clamp(SL_BASE * vix / SL_REF, SL_MIN, SL_MAX)\n"
-        "# At VIX=11: 0.236 (tighter). At VIX=22: 0.40 (wider, capped).\n"
-        "# Replaces the flat STRADDLE_STOP_MULT=1.25 for the straddle builder.\n"
-        "SL_BASE_PERCENT    = 0.30\n"
-        "SL_REFERENCE_VIX   = 14.0\n"
-        "SL_MIN_PERCENT     = 0.18\n"
-        "SL_MAX_PERCENT     = 0.40"
+    new_candle = (
+        "# IMM-06: lowered from 300 to 60 to align with main loop cadence.\n"
+        "# ADX and EMA can be stale for up to 5 minutes at 300s, causing\n"
+        "# delayed regime changes. At 60s the trend module is always fresh.\n"
+        "CANDLE_REFRESH_SECONDS = 60"
     )
-    content, ok = sub_exact(old_sl_base, new_sl_base, content,
-                            "C4-01 SL_BASE comment")
+    content, ok = sub_exact(old_candle, new_candle, content,
+                            "IMM-06 CANDLE_REFRESH_SECONDS")
     if ok:
-        changes.append("C4-01: SL_BASE_PERCENT/SL_REFERENCE_VIX documented as wired")
+        changes.append("IMM-06: CANDLE_REFRESH_SECONDS 300->60")
 
-    # C4-02: Document VIX delta bands as now wired
-    old_vix_delta = (
-        "LOW_VIX_DELTA  = (0.22, 0.28)\n"
-        "MID_VIX_DELTA  = (0.20, 0.25)\n"
-        "HIGH_VIX_DELTA = (0.15, 0.20)"
+    # IMM-01/02/03/04/05: Add new constants block after FLOW_WINDOW_MINUTES
+    old_flow_win = (
+        "FLOW_WINDOW_MINUTES     = 30\n"
+        "# CFG-P1: per-leg slippage haircut applied in credit gate BEFORE\n"
+        "# trade approval. Currently slippage only appears in _simulate_fill\n"
+        "# (after approval). Gate sees a credit that does not exist.\n"
+        "ENTRY_SLIPPAGE_PTS_PER_LEG = 0.75"
     )
-    new_vix_delta = (
-        "# C4-02: VIX-adaptive delta bands — now wired into _build_credit_spreads.\n"
-        "# Selling 0.20 delta at VIX=11 and VIX=25 are very different trades.\n"
-        "# LOW_VIX (< 14): use wider delta range (more OTM, less credit but safer)\n"
-        "# MID_VIX (14-18): standard range\n"
-        "# HIGH_VIX (> 18): tighter delta range (closer strikes, more credit)\n"
-        "LOW_VIX_DELTA  = (0.22, 0.28)\n"
-        "MID_VIX_DELTA  = (0.20, 0.25)\n"
-        "HIGH_VIX_DELTA = (0.15, 0.20)"
-    )
-    content, ok = sub_exact(old_vix_delta, new_vix_delta, content,
-                            "C4-02 VIX delta bands comment")
-    if ok:
-        changes.append("C4-02: LOW/MID/HIGH_VIX_DELTA documented as wired")
-
-    # C4-03: Document EDGE_PERCENTILE constants as now wired
-    old_edge_pct = (
-        "EDGE_PERCENTILE_HIGH = 70\n"
-        "EDGE_PERCENTILE_LOW  = 30"
-    )
-    new_edge_pct = (
-        "# C4-03: Edge percentile thresholds — now wired into compute_iv_rank.\n"
-        "# IV rank >= EDGE_PERCENTILE_HIGH -> vol is rich (sell signal)\n"
-        "# IV rank <= EDGE_PERCENTILE_LOW  -> vol is cheap (buy signal)\n"
-        "# Previously defined but never referenced anywhere in the codebase.\n"
-        "EDGE_PERCENTILE_HIGH = 70\n"
-        "EDGE_PERCENTILE_LOW  = 30"
-    )
-    content, ok = sub_exact(old_edge_pct, new_edge_pct, content,
-                            "C4-03 EDGE_PERCENTILE comment")
-    if ok:
-        changes.append("C4-03: EDGE_PERCENTILE_HIGH/LOW documented as wired")
-
-    # C4-04: Promote REENTRY_MIN_COMPOSITE_CHANGE to named constant
-    # Currently works via getattr with a default — invisible to tuners.
-    old_reentry = (
-        "REENTRY_COOLDOWN_SEC       = 300\n"
-        "REENTRY_MAX_SPOT_MOVE_PCT  = 0.02"
-    )
-    new_reentry = (
-        "REENTRY_COOLDOWN_SEC       = 300\n"
-        "REENTRY_MAX_SPOT_MOVE_PCT  = 0.02\n"
-        "# C4-04: promoted from getattr default to named constant.\n"
-        "# Minimum composite change required before re-entering the same strategy.\n"
-        "# Prevents repeated correlated entries on the same signal.\n"
-        "REENTRY_MIN_COMPOSITE_CHANGE = 0.10"
-    )
-    content, ok = sub_exact(old_reentry, new_reentry, content,
-                            "C4-04 REENTRY_MIN_COMPOSITE_CHANGE")
-    if ok:
-        changes.append("C4-04: REENTRY_MIN_COMPOSITE_CHANGE promoted to named constant")
-
-    # C4-05: Clarify MAX_COMBINED_RISK_PCT is non-binding
-    old_combined = (
-        "# CFG-R02: with MAX_RISK_PER_TRADE_PCT=0.02 and\n"
-        "# MAX_CONCURRENT_POSITIONS=4, max theoretical exposure=8%.\n"
-        "# This 20% limit is non-binding; real constraint is the sum\n"
-        "# of position max_risk values checked in _pre_trade_checks.\n"
-        "MAX_COMBINED_RISK_PCT    = 0.20"
-    )
-    new_combined = (
-        "# C4-05: MAX_COMBINED_RISK_PCT is non-binding.\n"
-        "# With MAX_RISK_PER_TRADE_PCT=0.03 and MAX_CONCURRENT_POSITIONS=4,\n"
-        "# max theoretical exposure = 4 * 3% = 12%, well below this 20% cap.\n"
-        "# The real binding constraint is the sum of position max_risk values\n"
-        "# checked in _pre_trade_checks() and _enter_new_position().\n"
-        "# This constant provides a hard ceiling for extreme scenarios only.\n"
-        "# Do NOT raise MAX_RISK_PER_TRADE_PCT to 'use' this budget —\n"
-        "# the two limits are intentionally not coupled.\n"
-        "MAX_COMBINED_RISK_PCT    = 0.20"
-    )
-    content, ok = sub_exact(old_combined, new_combined, content,
-                            "C4-05 MAX_COMBINED_RISK_PCT clarification")
-    if ok:
-        changes.append("C4-05: MAX_COMBINED_RISK_PCT documented as non-binding ceiling")
-
-    # C4-06: Mark truly dead constants with explicit warnings
-    # These look tunable but do nothing. Mark them clearly.
-    old_static_stop = "STATIC_STOP_PCT         = 0.10"
-    new_static_stop = (
-        "# C4-06: DEAD CONSTANT — never referenced in any decision path.\n"
-        "STATIC_STOP_PCT         = 0.10"
-    )
-    content, ok = sub_exact(old_static_stop, new_static_stop, content,
-                            "C4-06 STATIC_STOP_PCT dead")
-    if ok:
-        changes.append("C4-06: STATIC_STOP_PCT marked as dead constant")
-
-    old_transaction_pct = "TRANSACTION_COST_PCT     = 0.0005"
-    new_transaction_pct = (
-        "# C4-06: DEAD CONSTANT — only referenced in testing.py stub.\n"
-        "# Real costs use the itemised COST_* constants in _calculate_transaction_costs.\n"
-        "TRANSACTION_COST_PCT     = 0.0005"
-    )
-    content, ok = sub_exact(old_transaction_pct, new_transaction_pct, content,
-                            "C4-06 TRANSACTION_COST_PCT dead")
-    if ok:
-        changes.append("C4-06: TRANSACTION_COST_PCT marked as dead constant")
-
-    old_bars_per_day = "BARS_PER_DAY     = 13"
-    new_bars_per_day = (
-        "# C4-06: DEAD CONSTANT — never referenced. NSE 09:15-15:30 on\n"
-        "# 30-min bars = 12.5 bars/day (not 13). Any future use will be wrong.\n"
-        "BARS_PER_DAY     = 13"
-    )
-    content, ok = sub_exact(old_bars_per_day, new_bars_per_day, content,
-                            "C4-06 BARS_PER_DAY dead")
-    if ok:
-        changes.append("C4-06: BARS_PER_DAY marked as dead constant (also wrong value)")
-
-    old_spread_roll = "SPREAD_ROLL_DELTA_TRIGGER  = 0.35"
-    new_spread_roll = (
-        "# C4-06: DEAD CONSTANT — no roll logic exists in strategy_engine.\n"
-        "SPREAD_ROLL_DELTA_TRIGGER  = 0.35"
-    )
-    content, ok = sub_exact(old_spread_roll, new_spread_roll, content,
-                            "C4-06 SPREAD_ROLL_DELTA_TRIGGER dead")
-    if ok:
-        changes.append("C4-06: SPREAD_ROLL_DELTA_TRIGGER marked as dead constant")
-
-    old_condor_adj = "CONDOR_ADJUSTMENT_DELTA   = 0.35"
-    new_condor_adj = (
-        "# C4-06: DEAD CONSTANT — no condor adjustment logic exists.\n"
-        "CONDOR_ADJUSTMENT_DELTA   = 0.35"
-    )
-    content, ok = sub_exact(old_condor_adj, new_condor_adj, content,
-                            "C4-06 CONDOR_ADJUSTMENT_DELTA dead")
-    if ok:
-        changes.append("C4-06: CONDOR_ADJUSTMENT_DELTA marked as dead constant")
-
-    old_ratio_delta = "RATIO_DELTA_EXIT_TRIGGER   = 0.35"
-    new_ratio_delta = (
-        "# C4-06: DEAD CONSTANT — ratio spread has no delta-based exit.\n"
-        "RATIO_DELTA_EXIT_TRIGGER   = 0.35"
-    )
-    content, ok = sub_exact(old_ratio_delta, new_ratio_delta, content,
-                            "C4-06 RATIO_DELTA_EXIT_TRIGGER dead")
-    if ok:
-        changes.append("C4-06: RATIO_DELTA_EXIT_TRIGGER marked as dead constant")
-
-    # C4-07: Add CONDOR_MIN_CREDIT_PER_MAXLOSS constant
-    # Credit as % of max loss is more economically meaningful than credit/width.
-    # High credit/width can mean riskier (closer) strikes.
-    old_condor_min_pct = (
-        "# CFG-RE03: tanh calibration factors for continuous signal squashing.\n"
-        "# Replace {-1,0,+1} quantization with tanh(raw/factor) to preserve\n"
-        "# magnitude information. A 2% edge and a 12% edge both mapped to +1\n"
-        "# before — now they produce 0.38 and 0.96 respectively.\n"
-        "# Calibration: factor = value at which tanh output = 0.76 (~1σ)\n"
-        "EDGE_TANH_FACTOR            = 5.0"
-    )
-    new_condor_min_pct = (
-        "# C4-07: minimum credit as fraction of max possible loss per lot.\n"
-        "# max_loss = (wing_width - credit) * LOT_SIZE\n"
-        "# Require: credit >= CONDOR_MIN_CREDIT_PER_MAXLOSS * max_loss\n"
-        "# This is more economically meaningful than credit/width:\n"
-        "# high credit/width can mean riskier (closer) strikes.\n"
-        "# At 0.10: a 250-wide condor needs credit >= 22.7pts (10% of 227 max loss).\n"
-        "CONDOR_MIN_CREDIT_PER_MAXLOSS = 0.10\n"
+    new_flow_win = (
+        "FLOW_WINDOW_MINUTES     = 30\n"
+        "# CFG-P1: per-leg slippage haircut applied in credit gate BEFORE\n"
+        "# trade approval.\n"
+        "ENTRY_SLIPPAGE_PTS_PER_LEG = 0.75\n"
         "\n"
-        "# CFG-RE03: tanh calibration factors for continuous signal squashing.\n"
-        "# Replace {-1,0,+1} quantization with tanh(raw/factor) to preserve\n"
-        "# magnitude information. A 2% edge and a 12% edge both mapped to +1\n"
-        "# before — now they produce 0.38 and 0.96 respectively.\n"
-        "# Calibration: factor = value at which tanh output = 0.76 (~1σ)\n"
-        "EDGE_TANH_FACTOR            = 5.0"
+        "# ─── IMM-01: Dynamic flow weight ───────────────────────────────\n"
+        "# If flow score is None for more than this fraction of recent cycles,\n"
+        "# set flow weight to 0 and redistribute to other modules.\n"
+        "# The flow module frequently returns None (DTE<3, warming up, etc.)\n"
+        "# and a fixed 15% weight on a missing signal distorts the composite.\n"
+        "FLOW_WEIGHT_NONE_THRESHOLD = 0.50   # >50% None -> weight = 0\n"
+        "FLOW_WEIGHT_NONE_LOOKBACK  = 10     # last N cycles to check\n"
+        "\n"
+        "# ─── IMM-02: VIX-adaptive lot sizing ────────────────────────────\n"
+        "# Scale MAX_RISK_PER_TRADE by (VIX_REFERENCE / current_VIX).\n"
+        "# In high VIX, premium is larger but so is risk — reduce size.\n"
+        "# In low VIX, premium is thin — increase size to maintain returns.\n"
+        "VIX_ADAPTIVE_SIZING        = True\n"
+        "VIX_ADAPTIVE_REFERENCE     = 16.0   # neutral VIX level\n"
+        "VIX_ADAPTIVE_MIN_MULT      = 0.5    # minimum size multiplier\n"
+        "VIX_ADAPTIVE_MAX_MULT      = 2.0    # maximum size multiplier\n"
+        "\n"
+        "# ─── IMM-03: Distance-based secondary stop ───────────────────────\n"
+        "# For condors/spreads: close when spot reaches this fraction of the\n"
+        "# distance from entry spot to the short strike. Prevents holding\n"
+        "# through a strike breach when the premium stop hasn't fired yet.\n"
+        "STOP_SPOT_FRACTION_OF_DISTANCE = 0.80\n"
+        "\n"
+        "# ─── IMM-04: Partial profit-taking ladder ────────────────────────\n"
+        "# Close PARTIAL_PROFIT_CLOSE_PCT of the position when profit reaches\n"
+        "# PARTIAL_PROFIT_TRIGGER_PCT of the full profit target.\n"
+        "# Locks in gains early while letting the remainder run to full target.\n"
+        "PARTIAL_PROFIT_ENABLED         = True\n"
+        "PARTIAL_PROFIT_TRIGGER_PCT     = 0.25   # close partial at 25% of target\n"
+        "PARTIAL_PROFIT_CLOSE_PCT       = 0.50   # close 50% of position\n"
+        "\n"
+        "# ─── IMM-05: Adaptive persistence ────────────────────────────────\n"
+        "# Use fewer confirmation readings when the composite signal is strong.\n"
+        "# Strong signals (high conviction) should not be delayed by 3 readings.\n"
+        "ADAPTIVE_PERSISTENCE_ENABLED   = True\n"
+        "ADAPTIVE_PERSISTENCE_FAST_THRESHOLD = 0.60  # composite > this -> 2 readings\n"
+        "ADAPTIVE_PERSISTENCE_FAST_READINGS  = 2     # readings for strong signal\n"
+        "ADAPTIVE_PERSISTENCE_SLOW_READINGS  = 3     # readings for weak signal"
     )
-    content, ok = sub_exact(old_condor_min_pct, new_condor_min_pct, content,
-                            "C4-07 CONDOR_MIN_CREDIT_PER_MAXLOSS")
+    content, ok = sub_exact(old_flow_win, new_flow_win, content,
+                            "IMM-01/02/03/04/05 new constants")
     if ok:
-        changes.append("C4-07: CONDOR_MIN_CREDIT_PER_MAXLOSS=0.10 added")
+        changes.append(
+            "IMM-01: FLOW_WEIGHT_NONE_THRESHOLD/LOOKBACK added; "
+            "IMM-02: VIX_ADAPTIVE_SIZING constants added; "
+            "IMM-03: STOP_SPOT_FRACTION_OF_DISTANCE added; "
+            "IMM-04: PARTIAL_PROFIT_* constants added; "
+            "IMM-05: ADAPTIVE_PERSISTENCE_* constants added"
+        )
 
     return content, changes
 
@@ -325,209 +207,193 @@ def patch_config(content):
 def patch_regime_engine(content):
     changes = []
 
-    # C4-08: Asymmetric trend penalty
-    # NIFTY's vol-of-vol is strongly asymmetric: a confirmed downtrend is
-    # far more dangerous to a short-vol book than an uptrend of equal ADX,
-    # because IV expands on down moves and compresses on up moves.
-    # pdi/ndi and 'above' are already computed — one conditional change.
-    old_trend_bearish = (
-        "            if above and _slope_up and _di_bull:\n"
-        "                raw  = -1\n"
-        "                dirn = \"bullish trend (reduces short-vol score)\"\n"
-        "            elif not above and not _slope_up and not _di_bull:\n"
-        "                raw  = -1\n"
-        "                dirn = \"bearish trend (reduces short-vol score)\""
+    # IMM-01: Dynamic flow weight — set to 0 when frequently None
+    # Track None count for flow module and redistribute weight when
+    # flow is unavailable more than FLOW_WEIGHT_NONE_THRESHOLD of cycles.
+    old_build_weights = (
+        "# AUDIT #2.2: weights read from config so tuning\n"
+        "# config.WEIGHT_* actually takes effect at runtime.\n"
+        "def _build_weights():\n"
+        "    return {\n"
+        '        "vol":   config.WEIGHT_VOL,\n'
+        '        "edge":  config.WEIGHT_EDGE,\n'
+        '        "trend": config.WEIGHT_TREND,\n'
+        '        "flow":  config.WEIGHT_FLOW,\n'
+        "    }\n"
+        "WEIGHTS = _build_weights()"
     )
-    new_trend_bearish = (
-        "            if above and _slope_up and _di_bull:\n"
-        "                # C4-08: asymmetric penalty. Bullish trend is less\n"
-        "                # dangerous to short-vol than bearish (IV compresses\n"
-        "                # on up moves, expands on down moves). Partial penalty.\n"
-        "                raw  = -0.4\n"
-        "                dirn = \"bullish trend (partial -0.4 short-vol penalty)\"\n"
-        "            elif not above and not _slope_up and not _di_bull:\n"
-        "                # Full penalty: bearish trend expands IV, kills short-gamma\n"
-        "                raw  = -1.0\n"
-        "                dirn = \"bearish trend (full -1.0 short-vol penalty)\""
-    )
-    content, ok = sub_exact(old_trend_bearish, new_trend_bearish, content,
-                            "C4-08 asymmetric trend penalty")
-    if ok:
-        changes.append(
-            "C4-08: trend penalty asymmetric — bullish=-0.4, bearish=-1.0"
-        )
-
-    # C4-09: Horizon-matched RV window in _module_edge
-    # Comparing 20-day RV against a 6-day option is a structural directional
-    # bias: 20-day RV is a lagging, downward-biased estimate of the next 6 days,
-    # making IV look "rich" more often than justified.
-    # Fix: use min(20, max(5, dte)) as the RV window.
-    old_rv_call = (
-        "        rv = self.dm.get_estimated_rv()\n"
-        "        if rv is None:\n"
-        "            return None, \"RV unavailable (no daily candles or VIX)\"\n"
-        "        # AUDIT RE-N01: track whether we are using actual or\n"
-        "        # estimated (VIX-derived) RV. Estimated RV is circular\n"
-        "        # (IV vs VIX*0.70 is not independent evidence). We still\n"
-        "        # compute the score but cap it at 0 when using estimated RV\n"
-        "        # so it does not push the composite toward sell-vol.\n"
-        "        _rv_is_estimated = (\n"
-        "            self.dm.rv_20d is None or self.dm.rv_20d <= 0\n"
-        "        )"
-    )
-    new_rv_call = (
-        "        # C4-09: horizon-matched RV window.\n"
-        "        # Comparing 20-day RV against a 6-day option is a structural\n"
-        "        # directional bias: 20-day RV lags and understates near-term\n"
-        "        # risk, making IV look 'rich' more often than justified.\n"
-        "        # Use the active expiry's DTE to match the RV window to the\n"
-        "        # option's tenor. Falls back to get_estimated_rv() as before.\n"
-        "        _dte_for_rv = 20\n"
-        "        if self.dm._active_expiry:\n"
-        "            try:\n"
-        "                from datetime import date as _date\n"
-        "                _exp = datetime.strptime(\n"
-        "                    self.dm._active_expiry, \"%Y-%m-%d\"\n"
-        "                ).date()\n"
-        "                _dte_for_rv = max(5, min(20, (_exp - _date.today()).days))\n"
-        "            except Exception:\n"
-        "                _dte_for_rv = 20\n"
+    new_build_weights = (
+        "# AUDIT #2.2: weights read from config so tuning\n"
+        "# config.WEIGHT_* actually takes effect at runtime.\n"
+        "def _build_weights(flow_none_fraction: float = 0.0):\n"
+        "    \"\"\"IMM-01: dynamic flow weight.\n"
         "\n"
-        "        rv = self.dm.get_estimated_rv()\n"
-        "        if rv is None:\n"
-        "            return None, \"RV unavailable (no daily candles or VIX)\"\n"
-        "        # AUDIT RE-N01: track whether we are using actual or\n"
-        "        # estimated (VIX-derived) RV.\n"
-        "        _rv_is_estimated = (\n"
-        "            self.dm.rv_20d is None or self.dm.rv_20d <= 0\n"
+        "    If flow has been None for more than FLOW_WEIGHT_NONE_THRESHOLD\n"
+        "    of recent cycles, set its weight to 0 and redistribute\n"
+        "    proportionally to the other modules. A fixed 15% weight on a\n"
+        "    missing signal distorts the composite score.\n"
+        "    \"\"\"\n"
+        "    _threshold = getattr(\n"
+        "        config, \"FLOW_WEIGHT_NONE_THRESHOLD\", 0.50\n"
+        "    )\n"
+        "    if flow_none_fraction > _threshold:\n"
+        "        # Flow is unreliable — redistribute its weight\n"
+        "        _flow_w = 0.0\n"
+        "        _other_sum = (\n"
+        "            config.WEIGHT_VOL\n"
+        "            + config.WEIGHT_EDGE\n"
+        "            + config.WEIGHT_TREND\n"
         "        )\n"
-        "        # If actual RV is available, recompute over the matched window\n"
-        "        if not _rv_is_estimated and len(self.dm.candles_daily) >= _dte_for_rv + 1:\n"
-        "            import math as _math\n"
-        "            import numpy as _np\n"
-        "            try:\n"
-        "                _closes = [\n"
-        "                    c[\"close\"] for c in list(self.dm.candles_daily)\n"
-        "                    if c.get(\"close\", 0) > 0\n"
-        "                ]\n"
-        "                if len(_closes) >= _dte_for_rv + 1:\n"
-        "                    _rets = [\n"
-        "                        _math.log(_closes[i] / _closes[i - 1])\n"
-        "                        for i in range(\n"
-        "                            len(_closes) - _dte_for_rv,\n"
-        "                            len(_closes),\n"
-        "                        )\n"
-        "                    ]\n"
-        "                    rv = float(_np.std(_rets) * _math.sqrt(252))\n"
-        "            except Exception:\n"
-        "                pass  # keep original rv estimate"
+        "        _scale = 1.0 / _other_sum if _other_sum > 0 else 1.0\n"
+        "        return {\n"
+        '            "vol":   config.WEIGHT_VOL   * _scale,\n'
+        '            "edge":  config.WEIGHT_EDGE  * _scale,\n'
+        '            "trend": config.WEIGHT_TREND * _scale,\n'
+        '            "flow":  0.0,\n'
+        "        }\n"
+        "    return {\n"
+        '        "vol":   config.WEIGHT_VOL,\n'
+        '        "edge":  config.WEIGHT_EDGE,\n'
+        '        "trend": config.WEIGHT_TREND,\n'
+        '        "flow":  config.WEIGHT_FLOW,\n'
+        "    }\n"
+        "WEIGHTS = _build_weights()"
     )
-    content, ok = sub_exact(old_rv_call, new_rv_call, content,
-                            "C4-09 horizon-matched RV")
+    content, ok = sub_exact(old_build_weights, new_build_weights, content,
+                            "IMM-01 dynamic flow weight")
+    if ok:
+        changes.append("IMM-01: _build_weights() dynamically zeroes flow weight when frequently None")
+
+    # IMM-01: Track flow None count and pass to _build_weights in refresh
+    old_flow_none_track = (
+        "            # AUDIT RE-N01: cap at 0 when RV is estimated (circular signal)\n"
+        "            if _rv_is_estimated and raw != 0:"
+    )
+    # This target is in _module_edge, not the right place.
+    # Instead patch the composite aggregation in _refresh_locked to use
+    # the dynamic weights based on recent flow None count.
+    old_composite_agg = (
+        "            # AUDIT #2.2: rebuild weights from config each\n"
+        "            # cycle so config.WEIGHT_* tuning is live.\n"
+        "            _live_weights = _build_weights()\n"
+        "            composite = sum(\n"
+        "                _live_weights[m] * self._conf[m]\n"
+        "                for m in MODULES\n"
+        "            )"
+    )
+    new_composite_agg = (
+        "            # IMM-01: compute flow None fraction over recent cycles\n"
+        "            # and use it to dynamically zero the flow weight.\n"
+        "            _lookback = getattr(\n"
+        "                config, \"FLOW_WEIGHT_NONE_LOOKBACK\", 10\n"
+        "            )\n"
+        "            _flow_buf = self._buf.get(\"flow\", [])\n"
+        "            # Count None raw readings in recent history\n"
+        "            # (we track None as a sentinel in the buffer)\n"
+        "            _flow_none_count = sum(\n"
+        "                1 for v in list(self._buf.get(\"flow\", []))[-_lookback:]\n"
+        "                if v == 0 and self._raw.get(\"flow\") is None\n"
+        "            )\n"
+        "            _flow_none_frac = (\n"
+        "                _flow_none_count / _lookback\n"
+        "                if _lookback > 0 else 0.0\n"
+        "            )\n"
+        "            # Also check if current raw_flow is None\n"
+        "            if self._raw.get(\"flow\") is None:\n"
+        "                _flow_none_frac = max(_flow_none_frac, 0.6)\n"
+        "\n"
+        "            # AUDIT #2.2: rebuild weights from config each cycle.\n"
+        "            # IMM-01: pass flow None fraction for dynamic weighting.\n"
+        "            _live_weights = _build_weights(_flow_none_frac)\n"
+        "            composite = sum(\n"
+        "                _live_weights[m] * self._conf[m]\n"
+        "                for m in MODULES\n"
+        "            )"
+    )
+    content, ok = sub_exact(old_composite_agg, new_composite_agg, content,
+                            "IMM-01 flow none fraction in composite")
+    if ok:
+        changes.append("IMM-01: composite aggregation uses dynamic flow weight based on None fraction")
+
+    # IMM-05: Adaptive persistence — use 2 readings for strong signals
+    # Strong composite signals (>0.60) should not be delayed by 3 readings.
+    old_persist_confirm = (
+        "        # RE-T02: confirm when the last 3 readings have the\n"
+        "        # same sign (or are all zero). Use the mean of the\n"
+        "        # buffer as the confirmed value to preserve granularity.\n"
+        "        import math as _math_p\n"
+        "        if len(buf) >= 3:\n"
+        "            _last3 = buf[-3:]\n"
+        "            _signs = [_math_p.copysign(1, v) if v != 0 else 0\n"
+        "                      for v in _last3]\n"
+        "            if len(set(_signs)) == 1:  # all same sign\n"
+        "                _confirmed = sum(_last3) / len(_last3)\n"
+        "                self._conf[name] = _confirmed\n"
+        "                logger.info(\n"
+        "                    f\"Persistence confirmed: \"\n"
+        "                    f\"{name}={_confirmed:.3f} \"\n"
+        "                    f\"(sign-stable over 3 readings)\"\n"
+        "                )\n"
+        "            else:\n"
+        "                logger.info(\n"
+        "                    f\"Persistence unconfirmed: {name} \"\n"
+        "                    f\"buf={[round(v,3) for v in buf[-3:]]} \"\n"
+        "                    f\"holding={self._conf[name]:.3f}\"\n"
+        "                )\n"
+        "        return self._conf[name]"
+    )
+    new_persist_confirm = (
+        "        # IMM-05: adaptive persistence.\n"
+        "        # Use fewer readings when the composite signal is strong.\n"
+        "        # Strong signals (high conviction) should not be delayed.\n"
+        "        import math as _math_p\n"
+        "        _adaptive = getattr(\n"
+        "            config, \"ADAPTIVE_PERSISTENCE_ENABLED\", False\n"
+        "        )\n"
+        "        _fast_thresh = getattr(\n"
+        "            config, \"ADAPTIVE_PERSISTENCE_FAST_THRESHOLD\", 0.60\n"
+        "        )\n"
+        "        _fast_n = getattr(\n"
+        "            config, \"ADAPTIVE_PERSISTENCE_FAST_READINGS\", 2\n"
+        "        )\n"
+        "        _slow_n = getattr(\n"
+        "            config, \"ADAPTIVE_PERSISTENCE_SLOW_READINGS\", 3\n"
+        "        )\n"
+        "        # Determine required readings based on composite magnitude\n"
+        "        _composite_mag = abs(self.raw_composite)\n"
+        "        if _adaptive and _composite_mag >= _fast_thresh:\n"
+        "            _required = _fast_n\n"
+        "        else:\n"
+        "            _required = _slow_n\n"
+        "\n"
+        "        # RE-T02: confirm when the last N readings have the same sign.\n"
+        "        if len(buf) >= _required:\n"
+        "            _lastN = buf[-_required:]\n"
+        "            _signs = [_math_p.copysign(1, v) if v != 0 else 0\n"
+        "                      for v in _lastN]\n"
+        "            if len(set(_signs)) == 1:  # all same sign\n"
+        "                _confirmed = sum(_lastN) / len(_lastN)\n"
+        "                self._conf[name] = _confirmed\n"
+        "                logger.info(\n"
+        "                    f\"Persistence confirmed: \"\n"
+        "                    f\"{name}={_confirmed:.3f} \"\n"
+        "                    f\"(sign-stable over {_required} readings, \"\n"
+        "                    f\"composite={_composite_mag:.3f})\"\n"
+        "                )\n"
+        "            else:\n"
+        "                logger.info(\n"
+        "                    f\"Persistence unconfirmed: {name} \"\n"
+        "                    f\"buf={[round(v,3) for v in buf[-_required:]]} \"\n"
+        "                    f\"holding={self._conf[name]:.3f}\"\n"
+        "                )\n"
+        "        return self._conf[name]"
+    )
+    content, ok = sub_exact(old_persist_confirm, new_persist_confirm, content,
+                            "IMM-05 adaptive persistence")
     if ok:
         changes.append(
-            "C4-09: _module_edge uses horizon-matched RV window (DTE-based, 5-20 days)"
-        )
-
-    return content, changes
-
-
-# ─────────────────────────────────────────────────────────────────────
-# data_manager.py
-# ─────────────────────────────────────────────────────────────────────
-
-def patch_data_manager(content):
-    changes = []
-
-    # C4-10: compute_spread_ratio — exclude current sample from baseline
-    # Currently appends current spread then divides by mean including itself.
-    # Self-referential baseline damps the ratio by ~8%, biasing toward FLAT.
-    old_spr_mean = (
-        "            if span_min >= 20:\n"
-        "                spr_avg = statistics.median(v for _, v in hist)"
-    )
-    new_spr_mean = (
-        "            if span_min >= 20:\n"
-        "                # C4-10: exclude current sample from baseline.\n"
-        "                # Including it damps the ratio by ~8% (1/N self-weight),\n"
-        "                # biasing the spread state toward FLAT.\n"
-        "                _hist_excl = [\n"
-        "                    v for _, v in hist[:-1]\n"
-        "                ] if len(hist) > 1 else [\n"
-        "                    v for _, v in hist\n"
-        "                ]\n"
-        "                spr_avg = statistics.median(_hist_excl) if _hist_excl else None"
-    )
-    content, ok = sub_exact(old_spr_mean, new_spr_mean, content,
-                            "C4-10 spread ratio baseline")
-    if ok:
-        changes.append(
-            "C4-10: compute_spread_ratio excludes current sample from baseline median"
-        )
-
-    # C4-11: compute_iv_rank uses EDGE_PERCENTILE_HIGH/LOW from config
-    # These constants are defined and never referenced. Wire them so that
-    # callers can use the rank for edge scoring with consistent thresholds.
-    # Add a helper method that returns the edge signal from IV rank.
-    old_iv_rank_end = (
-        "        if len(self.iv_atm_history) < 10:\n"
-        "            # DM-13: return None (not 55.0) so the NEUTRAL-regime\n"
-        "            # gate blocks entry on no evidence. 55>50 was passing\n"
-        "            # the iv_rank gate and opening condors on a magic number.\n"
-        "            return None\n"
-        "        if self.iv_atm is None:\n"
-        "            return None"
-    )
-    new_iv_rank_end = (
-        "        if len(self.iv_atm_history) < 10:\n"
-        "            return None\n"
-        "        if self.iv_atm is None:\n"
-        "            return None"
-    )
-    content, ok = sub_exact(old_iv_rank_end, new_iv_rank_end, content,
-                            "C4-11 iv_rank cleanup")
-    if ok:
-        changes.append("C4-11: compute_iv_rank comment cleaned up")
-
-    # Add iv_rank_edge_signal helper after compute_iv_rank
-    old_compute_atr = (
-        "    def compute_atr(\n"
-        "        self, period: int = 14\n"
-        "    ) -> Optional[float]:"
-    )
-    new_compute_atr = (
-        "    def iv_rank_edge_signal(self) -> Optional[int]:\n"
-        "        \"\"\"C4-11: return edge signal from IV rank using config thresholds.\n"
-        "\n"
-        "        EDGE_PERCENTILE_HIGH and EDGE_PERCENTILE_LOW were defined in\n"
-        "        config.py but never referenced anywhere. This wires them.\n"
-        "\n"
-        "        Returns:\n"
-        "            +1  if IV rank >= EDGE_PERCENTILE_HIGH (vol is rich, sell)\n"
-        "            -1  if IV rank <= EDGE_PERCENTILE_LOW  (vol is cheap, buy)\n"
-        "             0  if in between (neutral)\n"
-        "            None if IV rank unavailable\n"
-        "        \"\"\"\n"
-        "        rank = self.compute_iv_rank()\n"
-        "        if rank is None:\n"
-        "            return None\n"
-        "        high = getattr(config, \"EDGE_PERCENTILE_HIGH\", 70)\n"
-        "        low  = getattr(config, \"EDGE_PERCENTILE_LOW\",  30)\n"
-        "        if rank >= high:\n"
-        "            return 1    # vol rich — sell signal\n"
-        "        if rank <= low:\n"
-        "            return -1   # vol cheap — buy signal\n"
-        "        return 0\n"
-        "\n"
-        "    def compute_atr(\n"
-        "        self, period: int = 14\n"
-        "    ) -> Optional[float]:"
-    )
-    content, ok = sub_exact(old_compute_atr, new_compute_atr, content,
-                            "C4-11 iv_rank_edge_signal helper")
-    if ok:
-        changes.append(
-            "C4-11: iv_rank_edge_signal() helper added — wires EDGE_PERCENTILE_HIGH/LOW"
+            "IMM-05: _persist() uses adaptive readings "
+            "(2 for strong composite >=0.60, 3 otherwise)"
         )
 
     return content, changes
@@ -540,213 +406,266 @@ def patch_data_manager(content):
 def patch_strategy_engine(content):
     changes = []
 
-    # C4-12: Wire LOW/MID/HIGH_VIX_DELTA into _build_credit_spreads
-    # SPREAD_DELTA_SHORT = 0.16 is used flat across all VIX.
-    # Selling 0.16 delta at VIX=11 and VIX=25 are very different trades.
-    # The VIX delta bands were designed for exactly this purpose.
-    old_spread_delta = (
-        "        # FIX QS1/CONFIRMED-5: expiry-scoped delta lookup\n"
-        "        short_put_strike  = self.dm.get_strike_by_delta(\n"
-        "            \"put\", config.SPREAD_DELTA_SHORT,\n"
-        "            expiry=expiry,\n"
-        "        )\n"
-        "        long_put_strike   = self.dm.get_strike_by_delta(\n"
-        "            \"put\", config.SPREAD_DELTA_LONG,\n"
-        "            expiry=expiry,\n"
-        "        )\n"
-        "        short_call_strike = self.dm.get_strike_by_delta(\n"
-        "            \"call\", config.SPREAD_DELTA_SHORT,\n"
-        "            expiry=expiry,\n"
-        "        )\n"
-        "        long_call_strike  = self.dm.get_strike_by_delta(\n"
-        "            \"call\", config.SPREAD_DELTA_LONG,\n"
-        "            expiry=expiry,\n"
-        "        )"
+    # IMM-02: VIX-adaptive lot sizing
+    # Scale MAX_RISK_PER_TRADE by (VIX_REFERENCE / current_VIX).
+    # In high VIX, premium is larger but risk is also higher — reduce size.
+    # In low VIX, premium is thin — increase size to maintain returns.
+    old_lot_size_start = (
+        "        # AUDIT #N1: defensive hedge pre-computes its own quantity.\n"
+        "        if strategy_name == config.STRAT_DEFENSIVE:\n"
+        "            return 1\n"
+        "        # SE-03: size off the DESIGNED STOP LOSS, not the theoretical\n"
+        "        # max loss."
     )
-    new_spread_delta = (
-        "        # C4-12: wire LOW/MID/HIGH_VIX_DELTA into delta selection.\n"
-        "        # Flat SPREAD_DELTA_SHORT=0.16 ignores that selling 0.16 delta\n"
-        "        # at VIX=11 and VIX=25 are very different trades.\n"
-        "        _vix_now = self.dm.vix or 14.0\n"
-        "        _low_vix  = getattr(config, \"LOW_VIX\",  14.0)\n"
-        "        _high_vix = getattr(config, \"HIGH_VIX\", 18.0)\n"
-        "        if _vix_now < _low_vix:\n"
-        "            # Low VIX: use wider delta (more OTM, less credit but safer)\n"
-        "            _delta_band = getattr(\n"
-        "                config, \"LOW_VIX_DELTA\", (0.22, 0.28)\n"
-        "            )\n"
-        "        elif _vix_now > _high_vix:\n"
-        "            # High VIX: use tighter delta (closer strikes, more credit)\n"
-        "            _delta_band = getattr(\n"
-        "                config, \"HIGH_VIX_DELTA\", (0.15, 0.20)\n"
-        "            )\n"
-        "        else:\n"
-        "            # Mid VIX: standard range\n"
-        "            _delta_band = getattr(\n"
-        "                config, \"MID_VIX_DELTA\", (0.20, 0.25)\n"
-        "            )\n"
-        "        # Use midpoint of the band as the short delta target\n"
-        "        _short_delta = (_delta_band[0] + _delta_band[1]) / 2.0\n"
-        "        # Long delta stays at config value (wing protection)\n"
-        "        _long_delta  = config.SPREAD_DELTA_LONG\n"
-        "        logger.info(\n"
-        "            f\"Credit spread: VIX={_vix_now:.1f} -> \"\n"
-        "            f\"short_delta={_short_delta:.3f} \"\n"
-        "            f\"(band={_delta_band})\"\n"
-        "        )\n"
+    new_lot_size_start = (
+        "        # AUDIT #N1: defensive hedge pre-computes its own quantity.\n"
+        "        if strategy_name == config.STRAT_DEFENSIVE:\n"
+        "            return 1\n"
         "\n"
-        "        # FIX QS1/CONFIRMED-5: expiry-scoped delta lookup\n"
-        "        short_put_strike  = self.dm.get_strike_by_delta(\n"
-        "            \"put\", _short_delta,\n"
-        "            expiry=expiry,\n"
+        "        # IMM-02: VIX-adaptive lot sizing.\n"
+        "        # Scale risk per trade by (VIX_REFERENCE / current_VIX).\n"
+        "        # High VIX -> smaller size (risk is higher per lot).\n"
+        "        # Low VIX -> larger size (premium is thin, need more lots).\n"
+        "        _vix_adaptive = getattr(\n"
+        "            config, \"VIX_ADAPTIVE_SIZING\", False\n"
         "        )\n"
-        "        long_put_strike   = self.dm.get_strike_by_delta(\n"
-        "            \"put\", _long_delta,\n"
-        "            expiry=expiry,\n"
-        "        )\n"
-        "        short_call_strike = self.dm.get_strike_by_delta(\n"
-        "            \"call\", _short_delta,\n"
-        "            expiry=expiry,\n"
-        "        )\n"
-        "        long_call_strike  = self.dm.get_strike_by_delta(\n"
-        "            \"call\", _long_delta,\n"
-        "            expiry=expiry,\n"
-        "        )"
+        "        _vix_mult = 1.0\n"
+        "        if _vix_adaptive and self.dm.vix and self.dm.vix > 0:\n"
+        "            _vix_ref = getattr(\n"
+        "                config, \"VIX_ADAPTIVE_REFERENCE\", 16.0\n"
+        "            )\n"
+        "            _vix_min = getattr(\n"
+        "                config, \"VIX_ADAPTIVE_MIN_MULT\", 0.5\n"
+        "            )\n"
+        "            _vix_max = getattr(\n"
+        "                config, \"VIX_ADAPTIVE_MAX_MULT\", 2.0\n"
+        "            )\n"
+        "            _vix_mult = max(\n"
+        "                _vix_min,\n"
+        "                min(_vix_max, _vix_ref / self.dm.vix),\n"
+        "            )\n"
+        "            logger.debug(\n"
+        "                f\"VIX-adaptive sizing: VIX={self.dm.vix:.1f} \"\n"
+        "                f\"mult={_vix_mult:.2f}\"\n"
+        "            )\n"
+        "\n"
+        "        # SE-03: size off the DESIGNED STOP LOSS, not the theoretical\n"
+        "        # max loss."
     )
-    content, ok = sub_exact(old_spread_delta, new_spread_delta, content,
-                            "C4-12 VIX delta bands wired")
+    content, ok = sub_exact(old_lot_size_start, new_lot_size_start, content,
+                            "IMM-02 VIX adaptive sizing start")
+    if ok:
+        changes.append("IMM-02: VIX-adaptive multiplier computed in _calculate_lot_size")
+
+    # Apply the VIX multiplier to the final lots calculation
+    old_lots_clamp = (
+        "        lots = max(lots, 0)\n"
+        "\n"
+        "        # PATCH: heuristic margin/SPAN cap."
+    )
+    new_lots_clamp = (
+        "        lots = max(lots, 0)\n"
+        "\n"
+        "        # IMM-02: apply VIX-adaptive multiplier to final lot count\n"
+        "        if _vix_mult != 1.0 and lots > 0:\n"
+        "            lots = max(1, int(lots * _vix_mult))\n"
+        "\n"
+        "        # PATCH: heuristic margin/SPAN cap."
+    )
+    content, ok = sub_exact(old_lots_clamp, new_lots_clamp, content,
+                            "IMM-02 VIX adaptive apply")
+    if ok:
+        changes.append("IMM-02: VIX-adaptive multiplier applied to final lot count")
+
+    # IMM-03: Distance-based secondary stop for condors/spreads
+    # Close when spot reaches STOP_SPOT_FRACTION_OF_DISTANCE of the way
+    # to the short strike. Prevents holding through a strike breach.
+    old_condor_stop_end = (
+        "            if short_put and self.dm.spot <= short_put - _buf:\n"
+        "                await self._close_one_side(\n"
+        "                    position, \"put\",\n"
+        "                    config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                )\n"
+        "                position.meta[\"_one_side_closed_cycle\"] = True\n"
+        "                return True"
+    )
+    new_condor_stop_end = (
+        "            if short_put and self.dm.spot <= short_put - _buf:\n"
+        "                await self._close_one_side(\n"
+        "                    position, \"put\",\n"
+        "                    config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                )\n"
+        "                position.meta[\"_one_side_closed_cycle\"] = True\n"
+        "                return True\n"
+        "\n"
+        "            # IMM-03: distance-based secondary stop.\n"
+        "            # Close the whole position when spot reaches\n"
+        "            # STOP_SPOT_FRACTION_OF_DISTANCE of the way from\n"
+        "            # entry spot to the short strike. This prevents\n"
+        "            # holding through a strike breach when the premium\n"
+        "            # stop hasn't fired yet (e.g. low IV environment).\n"
+        "            _dist_frac = getattr(\n"
+        "                config, \"STOP_SPOT_FRACTION_OF_DISTANCE\", 0.80\n"
+        "            )\n"
+        "            if self.dm.spot and position.entry_spot > 0:\n"
+        "                if short_call:\n"
+        "                    _dist_to_call = short_call - position.entry_spot\n"
+        "                    if (\n"
+        "                        _dist_to_call > 0\n"
+        "                        and self.dm.spot\n"
+        "                        >= position.entry_spot\n"
+        "                        + _dist_to_call * _dist_frac\n"
+        "                    ):\n"
+        "                        logger.info(\n"
+        "                            f\"Distance stop (call): spot reached \"\n"
+        "                            f\"{_dist_frac*100:.0f}%% of distance \"\n"
+        "                            f\"to short call {short_call}\"\n"
+        "                        )\n"
+        "                        await self._close_position(\n"
+        "                            position,\n"
+        "                            config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                        )\n"
+        "                        return True\n"
+        "                if short_put:\n"
+        "                    _dist_to_put = position.entry_spot - short_put\n"
+        "                    if (\n"
+        "                        _dist_to_put > 0\n"
+        "                        and self.dm.spot\n"
+        "                        <= position.entry_spot\n"
+        "                        - _dist_to_put * _dist_frac\n"
+        "                    ):\n"
+        "                        logger.info(\n"
+        "                            f\"Distance stop (put): spot reached \"\n"
+        "                            f\"{_dist_frac*100:.0f}%% of distance \"\n"
+        "                            f\"to short put {short_put}\"\n"
+        "                        )\n"
+        "                        await self._close_position(\n"
+        "                            position,\n"
+        "                            config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                        )\n"
+        "                        return True"
+    )
+    content, ok = sub_exact(old_condor_stop_end, new_condor_stop_end, content,
+                            "IMM-03 distance-based stop")
     if ok:
         changes.append(
-            "C4-12: _build_credit_spreads uses LOW/MID/HIGH_VIX_DELTA bands"
+            "IMM-03: distance-based secondary stop added for condors/spreads "
+            "(fires at STOP_SPOT_FRACTION_OF_DISTANCE of way to short strike)"
         )
 
-    # C4-13: Wire SL_BASE_PERCENT VIX-scaled stop into _build_short_straddle
-    # The flat STRADDLE_STOP_MULT=1.25 ignores that a 1.25x stop at VIX=11
-    # is ~2 hours of noise while at VIX=22 it is a genuine stop.
-    old_straddle_stop = (
-        "        meta = {\n"
-        "            \"total_premium\":  total_premium,\n"
-        "            \"stop_loss_up\":   (self.dm.spot or 0) * (\n"
-        "                1 + config.STRADDLE_SPOT_STOP_PCT\n"
-        "            ),\n"
-        "            \"stop_loss_down\": (self.dm.spot or 0) * (\n"
-        "                1 - config.STRADDLE_SPOT_STOP_PCT\n"
-        "            ),\n"
-        "            \"profit_target\":  total_premium * (\n"
-        "                1 - config.STRADDLE_TARGET_PCT\n"
-        "            ),\n"
-        "            # FIX P1: stop = 2x credit (STRADDLE_STOP_MULT)\n"
-        "            \"stop_loss\":      (\n"
-        "                total_premium * config.STRADDLE_STOP_MULT\n"
-        "            ),"
+    # IMM-04: Partial profit-taking ladder
+    # Close PARTIAL_PROFIT_CLOSE_PCT of position when profit reaches
+    # PARTIAL_PROFIT_TRIGGER_PCT of the full profit target.
+    # This locks in gains early while letting the remainder run.
+    # We add this check in _check_profit_target for credit strategies.
+    old_profit_target_credit = (
+        "        if strategy in [\n"
+        "            config.STRAT_SHORT_STRADDLE,\n"
+        "            config.STRAT_IRON_CONDOR,\n"
+        "            config.STRAT_CREDIT_SPREADS,\n"
+        "            config.STRAT_RATIO_SPREAD,\n"
+        "        ]:\n"
+        "            current_value = (\n"
+        "                self._get_position_current_premium(\n"
+        "                    position\n"
+        "                )\n"
+        "            )\n"
+        "            # PATCH: prefer the strategy-specific target already\n"
+        "            # computed at build time (position.profit_target).\n"
+        "            fallback_target = (\n"
+        "                position.total_credit\n"
+        "                * (1 - config.PROFIT_TARGET_PCT)\n"
+        "            )\n"
+        "            target_credit = (\n"
+        "                position.profit_target\n"
+        "                if position.profit_target\n"
+        "                and position.profit_target > 0\n"
+        "                else fallback_target\n"
+        "            )\n"
+        "            if (\n"
+        "                current_value <= target_credit\n"
+        "                and position.total_credit > 0\n"
+        "            ):\n"
+        "                await self._close_position(\n"
+        "                    position,\n"
+        "                    config.EXIT_REASONS[\"PROFIT_TARGET\"],\n"
+        "                )\n"
+        "                return True"
     )
-    new_straddle_stop = (
-        "        # C4-13: VIX-scaled stop using SL_BASE_PERCENT/SL_REFERENCE_VIX.\n"
-        "        # Flat STRADDLE_STOP_MULT ignores that 1.25x at VIX=11 is\n"
-        "        # ~2 hours of noise while at VIX=22 it is a genuine stop.\n"
-        "        # stop_pct = clamp(SL_BASE * vix / SL_REF, SL_MIN, SL_MAX)\n"
-        "        _vix_sl    = self.dm.vix or config.SL_REFERENCE_VIX\n"
-        "        _sl_base   = getattr(config, \"SL_BASE_PERCENT\",   0.30)\n"
-        "        _sl_ref    = getattr(config, \"SL_REFERENCE_VIX\",  14.0)\n"
-        "        _sl_min    = getattr(config, \"SL_MIN_PERCENT\",     0.18)\n"
-        "        _sl_max    = getattr(config, \"SL_MAX_PERCENT\",     0.40)\n"
-        "        _sl_pct    = max(_sl_min, min(_sl_max, _sl_base * _vix_sl / _sl_ref))\n"
-        "        _stop_loss = total_premium * _sl_pct / _sl_base * config.STRADDLE_STOP_MULT\n"
-        "        # Simplified: scale the stop multiple by VIX ratio\n"
-        "        _vix_stop_mult = config.STRADDLE_STOP_MULT * (_vix_sl / _sl_ref)\n"
-        "        _vix_stop_mult = max(1.0, min(3.0, _vix_stop_mult))\n"
-        "        logger.info(\n"
-        "            f\"Straddle: VIX={_vix_sl:.1f} -> \"\n"
-        "            f\"stop_mult={_vix_stop_mult:.2f}x \"\n"
-        "            f\"(base={config.STRADDLE_STOP_MULT}x)\"\n"
-        "        )\n"
+    new_profit_target_credit = (
+        "        if strategy in [\n"
+        "            config.STRAT_SHORT_STRADDLE,\n"
+        "            config.STRAT_IRON_CONDOR,\n"
+        "            config.STRAT_CREDIT_SPREADS,\n"
+        "            config.STRAT_RATIO_SPREAD,\n"
+        "        ]:\n"
+        "            current_value = (\n"
+        "                self._get_position_current_premium(\n"
+        "                    position\n"
+        "                )\n"
+        "            )\n"
+        "            fallback_target = (\n"
+        "                position.total_credit\n"
+        "                * (1 - config.PROFIT_TARGET_PCT)\n"
+        "            )\n"
+        "            target_credit = (\n"
+        "                position.profit_target\n"
+        "                if position.profit_target\n"
+        "                and position.profit_target > 0\n"
+        "                else fallback_target\n"
+        "            )\n"
         "\n"
-        "        meta = {\n"
-        "            \"total_premium\":  total_premium,\n"
-        "            \"stop_loss_up\":   (self.dm.spot or 0) * (\n"
-        "                1 + config.STRADDLE_SPOT_STOP_PCT\n"
-        "            ),\n"
-        "            \"stop_loss_down\": (self.dm.spot or 0) * (\n"
-        "                1 - config.STRADDLE_SPOT_STOP_PCT\n"
-        "            ),\n"
-        "            \"profit_target\":  total_premium * (\n"
-        "                1 - config.STRADDLE_TARGET_PCT\n"
-        "            ),\n"
-        "            # C4-13: VIX-scaled stop (wider at high VIX, tighter at low VIX)\n"
-        "            \"stop_loss\":      (\n"
-        "                total_premium * _vix_stop_mult\n"
-        "            ),"
+        "            # IMM-04: partial profit-taking ladder.\n"
+        "            # Close PARTIAL_PROFIT_CLOSE_PCT of position when profit\n"
+        "            # reaches PARTIAL_PROFIT_TRIGGER_PCT of full target.\n"
+        "            # Locks in gains early; remainder runs to full target.\n"
+        "            _partial_enabled = getattr(\n"
+        "                config, \"PARTIAL_PROFIT_ENABLED\", False\n"
+        "            )\n"
+        "            if (\n"
+        "                _partial_enabled\n"
+        "                and position.total_credit > 0\n"
+        "                and not position.meta.get(\"_partial_taken\", False)\n"
+        "            ):\n"
+        "                _trigger_pct = getattr(\n"
+        "                    config, \"PARTIAL_PROFIT_TRIGGER_PCT\", 0.25\n"
+        "                )\n"
+        "                _close_pct = getattr(\n"
+        "                    config, \"PARTIAL_PROFIT_CLOSE_PCT\", 0.50\n"
+        "                )\n"
+        "                # Partial trigger: current_value <= credit * (1 - trigger_pct)\n"
+        "                _partial_trigger = (\n"
+        "                    position.total_credit * (1 - _trigger_pct)\n"
+        "                )\n"
+        "                if current_value <= _partial_trigger:\n"
+        "                    logger.info(\n"
+        "                        f\"Partial profit-taking: closing \"\n"
+        "                        f\"{_close_pct*100:.0f}%% at \"\n"
+        "                        f\"{_trigger_pct*100:.0f}%% of target\"\n"
+        "                    )\n"
+        "                    # Reduce position by _close_pct\n"
+        "                    await self._reduce_position_pct(\n"
+        "                        position, _close_pct\n"
+        "                    )\n"
+        "                    position.meta[\"_partial_taken\"] = True\n"
+        "                    # Don't return True — let the remainder run\n"
+        "\n"
+        "            if (\n"
+        "                current_value <= target_credit\n"
+        "                and position.total_credit > 0\n"
+        "            ):\n"
+        "                await self._close_position(\n"
+        "                    position,\n"
+        "                    config.EXIT_REASONS[\"PROFIT_TARGET\"],\n"
+        "                )\n"
+        "                return True"
     )
-    content, ok = sub_exact(old_straddle_stop, new_straddle_stop, content,
-                            "C4-13 VIX-scaled straddle stop")
+    content, ok = sub_exact(old_profit_target_credit, new_profit_target_credit,
+                            content, "IMM-04 partial profit taking")
     if ok:
         changes.append(
-            "C4-13: _build_short_straddle uses VIX-scaled stop "
-            "(SL_BASE_PERCENT/SL_REFERENCE_VIX)"
-        )
-
-    # C4-14: Add CONDOR_MIN_CREDIT_PER_MAXLOSS gate in _build_iron_condor
-    # Credit as % of max loss is more economically meaningful than credit/width.
-    old_condor_credit_gate = (
-        "        # CFG-P1-01: read from config, not a hardcoded literal.\n"
-        "        # The old code had _min_credit_ratio = 0.15 hardcoded here\n"
-        "        # while config.CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.22 was\n"
-        "        # ignored — tuning the config had no effect.\n"
-        "        _min_credit_ratio = getattr(\n"
-        "            config,\n"
-        "            \"CONDOR_MIN_CREDIT_PCT_OF_WIDTH\",\n"
-        "            0.15,\n"
-        "        )\n"
-        "        # SE-02: the old check (0.22 * 400 = 88pts) was never\n"
-        "        # achievable at 1.5\u03c3 strikes (typical credit 15-26pts).\n"
-        "        # Replace with a viable ratio: credit/width >= 0.15.\n"
-        "        # At 400-wide: min = 60pts. At 1.5\u03c3 this is still hard;\n"
-        "        # the condor builder should be called with a tighter wing\n"
-        "        # (200-250pts) for this to work in practice \u2014 but at least\n"
-        "        # the gate no longer permanently blocks every build.\n"
-        "        _min_credit_required = max(\n"
-        "            config.CONDOR_MIN_CREDIT,\n"
-        "            _min_credit_ratio * config.CONDOR_WING_WIDTH,\n"
-        "        )"
-    )
-    new_condor_credit_gate = (
-        "        # CFG-P1-01: read from config, not a hardcoded literal.\n"
-        "        _min_credit_ratio = getattr(\n"
-        "            config,\n"
-        "            \"CONDOR_MIN_CREDIT_PCT_OF_WIDTH\",\n"
-        "            0.15,\n"
-        "        )\n"
-        "        _min_credit_required = max(\n"
-        "            config.CONDOR_MIN_CREDIT,\n"
-        "            _min_credit_ratio * _dynamic_wing,\n"
-        "        )\n"
-        "        # C4-14: also gate on credit as % of max possible loss.\n"
-        "        # Credit/width is misleading: high credit/width can mean\n"
-        "        # riskier (closer) strikes. Credit/max_loss is more economically\n"
-        "        # meaningful — it measures the return on the capital actually at risk.\n"
-        "        _min_credit_per_maxloss = getattr(\n"
-        "            config, \"CONDOR_MIN_CREDIT_PER_MAXLOSS\", 0.10\n"
-        "        )\n"
-        "        # max_loss = (wing - credit) * LOT_SIZE; rearranged:\n"
-        "        # credit >= _min_credit_per_maxloss * (wing - credit)\n"
-        "        # => credit * (1 + _min_credit_per_maxloss) >= _min_credit_per_maxloss * wing\n"
-        "        # => credit >= wing * _min_credit_per_maxloss / (1 + _min_credit_per_maxloss)\n"
-        "        _min_credit_maxloss_gate = (\n"
-        "            _dynamic_wing\n"
-        "            * _min_credit_per_maxloss\n"
-        "            / (1.0 + _min_credit_per_maxloss)\n"
-        "        )\n"
-        "        _min_credit_required = max(\n"
-        "            _min_credit_required,\n"
-        "            _min_credit_maxloss_gate,\n"
-        "        )"
-    )
-    content, ok = sub_exact(old_condor_credit_gate, new_condor_credit_gate, content,
-                            "C4-14 CONDOR_MIN_CREDIT_PER_MAXLOSS gate")
-    if ok:
-        changes.append(
-            "C4-14: condor builder adds CONDOR_MIN_CREDIT_PER_MAXLOSS gate "
-            "(credit as % of max loss)"
+            "IMM-04: partial profit-taking ladder added to _check_profit_target "
+            "(close 50% at 25% of target, remainder runs to full target)"
         )
 
     return content, changes
@@ -758,7 +677,7 @@ def patch_strategy_engine(content):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Category 4 Tier-3 fixes — 15 worth applying now."
+        description="Immediate high-impact profitability improvements."
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Show changes without writing files")
@@ -772,7 +691,6 @@ def main():
     files = {
         "config.py":          os.path.join(base, "config.py"),
         "regime_engine.py":   os.path.join(base, "regime_engine.py"),
-        "data_manager.py":    os.path.join(base, "data_manager.py"),
         "strategy_engine.py": os.path.join(base, "strategy_engine.py"),
     }
 
@@ -788,7 +706,6 @@ def main():
     patches = [
         ("config.py",          patch_config),
         ("regime_engine.py",   patch_regime_engine),
-        ("data_manager.py",    patch_data_manager),
         ("strategy_engine.py", patch_strategy_engine),
     ]
 
@@ -825,8 +742,8 @@ def main():
         print("\nDry-run complete — no files modified.")
     else:
         print("\nAll patches applied.")
-        print("Verify: python -m py_compile config.py regime_engine.py "
-              "data_manager.py strategy_engine.py")
+        print("Verify: python -m py_compile config.py "
+              "regime_engine.py strategy_engine.py")
         print("Then: python testing.py -v")
 
 
