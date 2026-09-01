@@ -4,7 +4,7 @@ Single source of truth for ALL parameters.
 
 ALL FIXES APPLIED (passes 1-7 + live confirmed):
   LIVE: EXEC_END_TIME=14:00 (was 11:00) — enables trading
-  LIVE: PERSISTENCE_READINGS=2 (was 3) — faster confirmation
+  LIVE: PERSISTENCE_READINGS=3 (confirmed value in file)
   LIVE: WS_DOWNTIME_KILL_SWITCH_SEC=300 (was 90)
   LIVE: NSE_WEEKLY_EXPIRY_WEEKDAY=1 (Tuesday confirmed)
   LIVE: 2026-10-02 removed from holidays
@@ -13,8 +13,8 @@ ALL FIXES APPLIED (passes 1-7 + live confirmed):
   LIVE: SPREAD_MIN_CREDIT=10 (achievable at VIX=11)
   LIVE: TERM_SPREAD thresholds widened to 0.05
   LIVE: DTE windows widened (max=10, tolerance=5)
-  LIVE: STRONG_SELL_THRESHOLD=0.30 (recalibrated VIX=11)
-  LIVE: Weight redistribution (EDGE=0.40, TREND=0.30)
+  LIVE: STRONG_SELL_THRESHOLD=0.45 (confirmed value in file)
+  LIVE: Weights unchanged from reference (VOL=0.30 EDGE=0.30 TREND=0.25 FLOW=0.15)
   LIVE: ADX_CANDLE_TIMEFRAME="30minute" (not "15minute")
   LIVE: CANDLE_REFRESH_SECONDS=1800 (30 min not 60s)
   LIVE: CB_LEVEL_3_PCT=0.10 (raised for 5-lot positions)
@@ -215,8 +215,11 @@ EDGE_PERCENTILE_LOW  = 30
 EDGE_SCORE_MIN_HISTORY = 3
 
 # ADX calibrated for 30-min bars
-ADX_PERIOD          = 26
-ADX_TREND_THRESHOLD = 20   # PATCH: was 25 (NOTE: regime_engine.py has its own hardcoded ADX_TREND constant, patched separately — this config value is NOT currently read by that module)
+# AUDIT #2.3: ADX_PERIOD=14 matches the reference algorithm
+# (regime_engine.adx14 default n=14). The old value of 26
+# was never passed anywhere and has been corrected here.
+ADX_PERIOD          = 14
+ADX_TREND_THRESHOLD = 20   # AUDIT #2.2: now read by regime_engine.py via ADX_TREND
 ADX_RANGE_THRESHOLD = 15
 EMA_PERIOD          = 50
 EMA_SLOPE_THRESHOLD = 0.0005   # reference: EMA_SLOPE_PCT = 0.05% of spot
@@ -507,7 +510,11 @@ CB_LEVEL_2_PCT = 0.03
 # LIVE FIX: raised from 0.06 to 0.10
 # 5-lot straddle max loss = 5 × ₹30,000 = ₹150,000
 # Old threshold ₹60,000 fired after first losing trade.
-CB_LEVEL_3_PCT = 0.08   # PATCH: was 0.10 (identical to CB_LEVEL_4_PCT, causing overlapping triggers)
+# AUDIT #2.4: CB_LEVEL_3_PCT=0.08 is the CURRENT correct
+# value. It was previously 0.10 (same as CB_LEVEL_4_PCT,
+# which caused overlapping triggers). Now 0.08 < 0.10,
+# so L3 (50% reduction) fires before L4 (full stop).
+CB_LEVEL_3_PCT = 0.08
 
 CB_LEVEL_4_PCT = 0.10
 

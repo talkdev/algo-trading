@@ -35,10 +35,12 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────
 TERM_THRESHOLD   = 0.5    # V_fwd - V_spot contango/backwardation
 SKEW_Z_STEEP     = 1.5    # z > 1.5  -> fear    (Skew_Score = -1)
-SKEW_Z_FLAT      = -1.0   # z < -1.0 -> complacent (Skew_Score = +1)
-EDGE_RICH        = 5.0    # IV - RV > 5  -> rich (Edge_Score = +1)
-EDGE_CHEAP       = 0.0    # IV - RV < 0  -> cheap (Edge_Score = -1)
-ADX_TREND        = 20.0   # PATCH: was 25.0 — recalibrated for 30-min bars (live logs showed ADX rarely exceeding ~16-24 even in directional phases; 25 was likely tuned for daily bars)
+SKEW_Z_FLAT = config.SKEW_ZSCORE_COMPLACENT  # AUDIT #2.2: reads from config
+EDGE_RICH = config.EDGE_RICH        # AUDIT #2.2: reads from config
+EDGE_CHEAP = config.EDGE_CHEAP       # AUDIT #2.2: reads from config
+# AUDIT #2.2/#2.3: ADX_TREND now reads from config.
+# config.ADX_TREND_THRESHOLD = 20 (calibrated for 30-min bars).
+ADX_TREND = config.ADX_TREND_THRESHOLD
 EMA_SLOPE_PCT    = 0.05   # |slope| > 0.05% of spot
 RV_WINDOW        = 20     # trading days
 RV_ANNUALISE     = 252
@@ -48,18 +50,30 @@ SPREAD_AVG_MIN   = 60     # minutes for spread-ratio average
 EVENT_PRE_HOURS  = 6
 EVENT_POST_HOURS = 2
 MODULES          = ["vol", "edge", "trend", "flow"]
-WEIGHTS          = {"vol": 0.30, "edge": 0.30, "trend": 0.25, "flow": 0.15}
+# AUDIT #2.2: weights now read from config so tuning
+# config.WEIGHT_* actually takes effect at runtime.
+def _build_weights():
+    return {
+        "vol":   config.WEIGHT_VOL,
+        "edge":  config.WEIGHT_EDGE,
+        "trend": config.WEIGHT_TREND,
+        "flow":  config.WEIGHT_FLOW,
+    }
+WEIGHTS = _build_weights()
 
 
 def map_regime(x: float) -> str:
-    """Reference algorithm regime mapping."""
-    if x > 0.45:
+    """Reference algorithm regime mapping.
+    AUDIT #2.2: thresholds now read from config so
+    config.STRONG_SELL_THRESHOLD etc. actually take effect.
+    """
+    if x > config.STRONG_SELL_THRESHOLD:
         return "STRONG_SELL_VOL"
-    if x >= 0.15:
+    if x >= config.MILD_SELL_THRESHOLD:
         return "MILD_SELL_VOL"
-    if x > -0.15:
+    if x > config.MILD_BUY_THRESHOLD:
         return "NEUTRAL"
-    if x >= -0.45:
+    if x >= config.STRONG_BUY_THRESHOLD:
         return "BUY_VOL"
     return "STRONG_BUY_VOL"
 
@@ -351,8 +365,11 @@ class RegimeEngine:
             logger.info(f"Macro override: {macro_name}")
         else:
             # Step 7: Weighted aggregation
+            # AUDIT #2.2: rebuild weights from config
+            # each cycle so config.WEIGHT_* tuning is live.
+            _live_weights = _build_weights()
             composite = sum(
-                WEIGHTS[m] * self._conf[m]
+                _live_weights[m] * self._conf[m]
                 for m in MODULES
             )
             self.raw_composite = float(
@@ -894,14 +911,16 @@ class RegimeEngine:
     # ─────────────────────────────────────────────────────────────────
 
     def _map_regime(self, composite: float) -> str:
-        """Reference algorithm regime mapping."""
-        if composite > 0.45:
+        """Reference algorithm regime mapping.
+        AUDIT #2.2: reads thresholds from config.
+        """
+        if composite > config.STRONG_SELL_THRESHOLD:
             return config.REGIME_STRONG_SELL
-        if composite >= 0.15:
+        if composite >= config.MILD_SELL_THRESHOLD:
             return config.REGIME_MILD_SELL
-        if composite > -0.15:
+        if composite > config.MILD_BUY_THRESHOLD:
             return config.REGIME_NEUTRAL
-        if composite >= -0.45:
+        if composite >= config.STRONG_BUY_THRESHOLD:
             return config.REGIME_BUY_VOL
         return config.REGIME_STRONG_BUY
 
