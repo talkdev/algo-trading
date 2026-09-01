@@ -233,8 +233,8 @@ TERM_SPREAD_BACKWARDATION = -1.5   # reference: -TERM_THRESHOLD
 
 # PRF-C11: thresholds tightened. In low-VIX (11-14), z-scores
 # rarely exceed ±1.0. 1.2/-0.8 makes skew contribute more often.
-SKEW_ZSCORE_FEAR       =  2.0   # P3-3: SKEW_ZSCORE_FEAR raised (was 1.2; fired on pre-event nervousness, suppressing good entries)
-SKEW_ZSCORE_COMPLACENT = -1.2   # P3-4: SKEW_ZSCORE_COMPLACENT lowered (was -0.8; fired on normal calm days, not genuine complacency)   # reference: SKEW_Z_FLAT = -1.0
+SKEW_ZSCORE_FEAR       =  1.5   # CAT4-A: SKEW_ZSCORE_FEAR recalibrated (P3-3 raised to 2.0 which fires only 2.3%% of sessions; 1.5 fires ~6.7%% — better balance)
+SKEW_ZSCORE_COMPLACENT = -1.0   # CAT4-A: SKEW_ZSCORE_COMPLACENT recalibrated (P3-4 lowered to -1.2 which fires 11.4%% of sessions; -1.0 fires ~15.9%% — better balance with fear threshold)   # reference: SKEW_Z_FLAT = -1.0
 SKEW_LOOKBACK_DAYS     = 60
 EDGE_LOOKBACK_DAYS     = 60
 
@@ -362,9 +362,9 @@ STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL
 # creating hidden thresholds that contradict the base values.
 # Band = 0.05 composite units (tune here, not inline).
 STRONG_SELL_ENTER =  0.50   # P3-5a: STRONG_SELL_ENTER raised (was 0.30 = composite baseline; now requires 2+ modules)   # PATCHED: 0.45→0.30 for VIX=11-14 environment
-STRONG_SELL_EXIT  =  0.38   # P3-5b: STRONG_SELL_EXIT raised (was 0.22; band maintained at 0.12)   # PATCHED: 0.40→0.22 (band now 0.08)
+STRONG_SELL_EXIT  =  0.28   # S7-1a: STRONG_SELL_EXIT widened (band 0.12→0.22, > min module contribution 0.15)   # P3-5b: STRONG_SELL_EXIT raised (was 0.22; band maintained at 0.12)   # PATCHED: 0.40→0.22 (band now 0.08)
 MILD_SELL_ENTER   =  0.20   # P3-5c: MILD_SELL_ENTER raised (was 0.10; always exceeded by 0.30 baseline)   # PATCHED: 0.15→0.10
-MILD_SELL_EXIT    =  0.08   # P3-5d: MILD_SELL_EXIT raised (was 0.02; band maintained at 0.12)   # PATCHED: 0.10→0.02 (band now 0.08)
+MILD_SELL_EXIT    =  0.05   # CAT6: MILD_SELL_EXIT tightened (was -0.02 which kept engine in MILD_SELL with no positive signal; 0.05 requires small positive composite to maintain regime)   # P3-5d: MILD_SELL_EXIT raised (was 0.02; band maintained at 0.12)   # PATCHED: 0.10→0.02 (band now 0.08)
 MILD_BUY_ENTER    = -0.15   # enter NEUTRAL above this (from BUY_VOL)
 MILD_BUY_EXIT     = -0.20   # exit  NEUTRAL below this
 STRONG_BUY_ENTER  = -0.45   # enter BUY_VOL above this (from STRONG_BUY)
@@ -577,7 +577,7 @@ SL_MAX_PERCENT     = 0.40
 # barely a band. 0.70 creates a genuine 0.50-0.70 range where the
 # position can run, then trail protects gains above 70% of credit.
 # 0.90 retain means trail closes only when profit retraces 10% from peak.
-TRAIL_START_PROFIT_PCT = 0.70
+TRAIL_START_PROFIT_PCT = 0.40   # S10-1: TRAIL_START_PROFIT_PCT lowered (was 0.70; required 6.5 days on 6-DTE condor — fired after expiry; 0.40 activates on day 2-3)
 TRAIL_RETAIN_PCT       = 0.90
 
 # ─────────────────────────────────────────────────────────────────────
