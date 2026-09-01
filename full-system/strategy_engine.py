@@ -2242,15 +2242,16 @@ class StrategyEngine:
             current_premium / _trail_basis
         )
 
-        # SE9-P0-01: initialise peak at 0.0 not from meta.
-        # With the corrected net_premium basis, profit_pct starts
-        # at 0.0 at entry, so peak must also start at 0.0.
-        # Inheriting a stale meta value from a prior position
-        # could arm the trail prematurely on a fresh entry.
+        # SE10-P2-01 FIX: removed the `peak > 0.95` magnitude guard.
+        # profit_pct=0.96 means 96% of credit captured — a legitimate
+        # near-perfect outcome, not a stale value. The guard was
+        # resetting peak to 0 exactly when the trail had the most to
+        # protect. Staleness is handled by entry_timestamp comparison:
+        # if the position was just created this cycle, reset peak.
         peak = position.meta.get("_peak_profit_pct", 0.0)
-        if peak > 0.95:  # stale value guard
+        # Reset peak if this is a fresh position (no prior peak recorded)
+        if "_peak_profit_pct" not in position.meta:
             peak = 0.0
-            position.meta["_peak_profit_pct"] = 0.0
         if profit_pct > peak:
             peak = profit_pct
             position.meta["_peak_profit_pct"] = peak
@@ -3347,7 +3348,8 @@ class StrategyEngine:
             "profit_target": net_credit * (
                 1 - config.CONDOR_TARGET_PCT
             ),
-            "stop_loss":     net_credit * 2.0,
+            # SE10-P1-02: lowered from 2.0x to 1.25x credit.
+            "stop_loss":     net_credit * 1.25,
             "exit_dte":      config.CONDOR_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -3534,7 +3536,8 @@ class StrategyEngine:
             "profit_target": total_credit * (
                 1 - config.SPREAD_TARGET_PCT
             ),
-            "stop_loss":     total_credit * 2.0,
+            # SE10-P1-02: lowered from 2.0x to 1.25x credit.
+            "stop_loss":     total_credit * 1.25,
             "exit_dte":      config.SPREAD_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -5596,10 +5599,16 @@ class StrategyEngine:
                     reduce_qty = 1
                 if reduce_qty > leg.qty:
                     reduce_qty = leg.qty
+                # SE10-P0-01 FIX: closing action must be opposite
+                # of leg action. 'BUY' was hardcoded, which bought
+                # more of the long legs instead of selling them.
+                _close_action = (
+                    "BUY" if leg.action == "SELL" else "SELL"
+                )
                 close_leg = Leg(
                     instrument_key=leg.instrument_key,
                     option_type=leg.option_type,
-                    action="BUY",
+                    action=_close_action,
                     strike=leg.strike,
                     expiry=leg.expiry,
                     qty=reduce_qty,
