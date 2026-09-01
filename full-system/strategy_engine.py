@@ -1881,16 +1881,40 @@ class StrategyEngine:
                     )
                 )
                 if current_premium >= position.stop_loss:
-                    logger.info(
-                        f"Straddle premium stop: "
-                        f"current={current_premium:.2f} "
-                        f"stop={position.stop_loss:.2f}"
+                    # EXE-05: sustained-breach filter.
+                    # Require N consecutive ticks above stop before
+                    # firing to prevent phantom stop-outs from
+                    # temporary spread expansion in fast markets.
+                    _ticks_req = getattr(
+                        config, "STOP_BREACH_TICKS_REQUIRED", 3
                     )
-                    await self._close_position(
-                        position,
-                        config.EXIT_REASONS["STOP_LOSS"],
-                    )
-                    return True
+                    _breach_key = "_stop_breach_ticks"
+                    _ticks = position.meta.get(_breach_key, 0) + 1
+                    position.meta[_breach_key] = _ticks
+                    if _ticks >= _ticks_req:
+                        logger.info(
+                            f"Straddle premium stop (sustained "
+                            f"{_ticks} ticks): "
+                            f"current={current_premium:.2f} "
+                            f"stop={position.stop_loss:.2f}"
+                        )
+                        position.meta[_breach_key] = 0
+                        await self._close_position(
+                            position,
+                            config.EXIT_REASONS["STOP_LOSS"],
+                        )
+                        return True
+                    else:
+                        logger.debug(
+                            f"Straddle stop breach tick "
+                            f"{_ticks}/{_ticks_req}: "
+                            f"current={current_premium:.2f} "
+                            f"stop={position.stop_loss:.2f} "
+                            f"— awaiting confirmation"
+                        )
+                else:
+                    # Mark cleared — reset breach counter
+                    position.meta["_stop_breach_ticks"] = 0
             stop_up   = position.entry_spot * (
                 1 + config.STRADDLE_SPOT_STOP_PCT
             )
@@ -4644,20 +4668,86 @@ class StrategyEngine:
         )
         hedge_qty = max(1, hedge_qty)
 
-        legs = [
-            Leg(
-                instrument_key=atm_put_data[
-                    "instrument_key"
-                ],
-                option_type="put", action="BUY",
-                strike=atm, expiry=expiry,
-                qty=hedge_qty,
-                delta=atm_put_data["delta"],
-                gamma=atm_put_data["gamma"],
-                vega=atm_put_data["vega"],
-                theta=atm_put_data["theta"],
+        # EXE-06: buy OTM put debit spread instead of naked ATM put.
+        # Buying ATM puts AFTER a VIX spike means paying peak IV.
+        # The vega crush that follows destroys the hedge's value.
+        # An OTM put debit spread (buy OTM put, sell further OTM put)
+        # costs less vega, provides directional protection, and profits
+        # from further spot decline without being destroyed by IV crush.
+        # Use ~0.30 delta for the long put, ~0.15 delta for the short.
+        _otm_long_strike = self.dm.get_strike_by_delta(
+            "put", 0.30, expiry=expiry
+        )
+        _otm_short_strike = self.dm.get_strike_by_delta(
+            "put", 0.15, expiry=expiry
+        )
+        # Fall back to naked ATM put if OTM spread not available
+        if (
+            _otm_long_strike is None
+            or _otm_short_strike is None
+            or _otm_long_strike not in chain
+            or _otm_short_strike not in chain
+            or _otm_long_strike <= _otm_short_strike
+        ):
+            logger.info(
+                "Defensive hedge: OTM spread not available, "
+                "falling back to ATM put"
             )
-        ]
+            _use_spread = False
+        else:
+            _use_spread = True
+            _long_put_data  = chain[_otm_long_strike]["put"]
+            _short_put_data = chain[_otm_short_strike]["put"]
+
+        if _use_spread:
+            _net_debit = (
+                _long_put_data["ltp"] - _short_put_data["ltp"]
+            ) * hedge_qty
+            _max_risk = _net_debit * config.LOT_SIZE
+            legs = [
+                Leg(
+                    instrument_key=_long_put_data["instrument_key"],
+                    option_type="put", action="BUY",
+                    strike=_otm_long_strike, expiry=expiry,
+                    qty=hedge_qty,
+                    delta=_long_put_data["delta"],
+                    gamma=_long_put_data["gamma"],
+                    vega=_long_put_data["vega"],
+                    theta=_long_put_data["theta"],
+                ),
+                Leg(
+                    instrument_key=_short_put_data["instrument_key"],
+                    option_type="put", action="SELL",
+                    strike=_otm_short_strike, expiry=expiry,
+                    qty=hedge_qty,
+                    delta=_short_put_data["delta"],
+                    gamma=_short_put_data["gamma"],
+                    vega=_short_put_data["vega"],
+                    theta=_short_put_data["theta"],
+                ),
+            ]
+            logger.info(
+                f"Defensive hedge: OTM put spread "
+                f"{_otm_long_strike}/{_otm_short_strike} "
+                f"net_debit={_net_debit:.2f}"
+            )
+        else:
+            _net_debit = atm_put_data["ltp"] * hedge_qty
+            _max_risk  = _net_debit * config.LOT_SIZE
+            legs = [
+                Leg(
+                    instrument_key=atm_put_data[
+                        "instrument_key"
+                    ],
+                    option_type="put", action="BUY",
+                    strike=atm, expiry=expiry,
+                    qty=hedge_qty,
+                    delta=atm_put_data["delta"],
+                    gamma=atm_put_data["gamma"],
+                    vega=atm_put_data["vega"],
+                    theta=atm_put_data["theta"],
+                )
+            ]
 
         max_hold_date = (
             date.today()
@@ -4665,17 +4755,10 @@ class StrategyEngine:
         ).strftime("%Y-%m-%d")
 
         meta = {
-            "total_debit":    (
-                atm_put_data["ltp"] * hedge_qty
-            ),
-            "max_risk":       (
-                atm_put_data["ltp"]
-                * hedge_qty
-                * config.LOT_SIZE
-            ),
+            "total_debit":    _net_debit,
+            "max_risk":       _max_risk,
             "stop_loss":      (
-                atm_put_data["ltp"]
-                * hedge_qty
+                _net_debit
                 * (1 - config.EVENT_STRANGLE_STOP_PCT)
             ),
             "profit_target":  None,
@@ -4684,9 +4767,6 @@ class StrategyEngine:
             "strategy_type":  "LONG",
             "reduction_legs": reduction_legs,
             "hedge_qty":      hedge_qty,
-            # AUDIT #N1: hedge_qty is already the correct
-            # absolute quantity — skip the generic lot-scaling
-            # multiplication in _enter_new_position().
             "already_sized":  True,
         }
         return (legs, meta)
@@ -5421,6 +5501,10 @@ class StrategyEngine:
         )
         lots = min(lots, max(position_cap, 0))
         lots = max(lots, 0)
+
+        # IMM-02: apply VIX-adaptive multiplier to final lot count
+        if _vix_mult != 1.0 and lots > 0:
+            lots = max(1, int(lots * _vix_mult))
 
         # PATCH: heuristic margin/SPAN cap. Previously sizing was
         # based purely on theoretical max-loss and capital %,

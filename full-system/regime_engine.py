@@ -1151,26 +1151,47 @@ class RegimeEngine:
         if len(buf) > 3:
             buf.pop(0)
 
-        # RE-T02: confirm when the last 3 readings have the
-        # same sign (or are all zero). Use the mean of the
-        # buffer as the confirmed value to preserve granularity.
+        # IMM-05: adaptive persistence.
+        # Use fewer readings when the composite signal is strong.
+        # Strong signals (high conviction) should not be delayed.
         import math as _math_p
-        if len(buf) >= 3:
-            _last3 = buf[-3:]
+        _adaptive = getattr(
+            config, "ADAPTIVE_PERSISTENCE_ENABLED", False
+        )
+        _fast_thresh = getattr(
+            config, "ADAPTIVE_PERSISTENCE_FAST_THRESHOLD", 0.60
+        )
+        _fast_n = getattr(
+            config, "ADAPTIVE_PERSISTENCE_FAST_READINGS", 2
+        )
+        _slow_n = getattr(
+            config, "ADAPTIVE_PERSISTENCE_SLOW_READINGS", 3
+        )
+        # Determine required readings based on composite magnitude
+        _composite_mag = abs(self.raw_composite)
+        if _adaptive and _composite_mag >= _fast_thresh:
+            _required = _fast_n
+        else:
+            _required = _slow_n
+
+        # RE-T02: confirm when the last N readings have the same sign.
+        if len(buf) >= _required:
+            _lastN = buf[-_required:]
             _signs = [_math_p.copysign(1, v) if v != 0 else 0
-                      for v in _last3]
+                      for v in _lastN]
             if len(set(_signs)) == 1:  # all same sign
-                _confirmed = sum(_last3) / len(_last3)
+                _confirmed = sum(_lastN) / len(_lastN)
                 self._conf[name] = _confirmed
                 logger.info(
                     f"Persistence confirmed: "
                     f"{name}={_confirmed:.3f} "
-                    f"(sign-stable over 3 readings)"
+                    f"(sign-stable over {_required} readings, "
+                    f"composite={_composite_mag:.3f})"
                 )
             else:
                 logger.info(
                     f"Persistence unconfirmed: {name} "
-                    f"buf={[round(v,3) for v in buf[-3:]]} "
+                    f"buf={[round(v,3) for v in buf[-_required:]]} "
                     f"holding={self._conf[name]:.3f}"
                 )
         return self._conf[name]
