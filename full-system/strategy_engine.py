@@ -154,6 +154,8 @@ class StrategyEngine:
         self.cb_level_2_active: bool = False
         self.cb_level_3_active: bool = False
         self.cb_level_4_active: bool = False
+        # MN-T04: CB L5 idempotency flag
+        self.cb_level_5_active: bool = False
 
         self._last_trading_date: Optional[date] = None
         self._last_weekly_reset: Optional[date] = None
@@ -188,12 +190,18 @@ class StrategyEngine:
         action:         str,
         leg_index:      int = 0,
     ) -> str:
+        # SE-T04: use IST date, not server-local date.
+        # On UTC servers, date.today() rolls at 05:30 IST,
+        # causing tag mismatches and wrong session cleanup.
+        _ist_date = datetime.now(
+            self._IST
+        ).date().isoformat()
         raw = (
             f"{trade_id[:12]}-"
             f"{instrument_key[-8:]}-"
             f"{action}-"
             f"{leg_index}-"
-            f"{date.today().isoformat()}"
+            f"{_ist_date}"
         )
         tag_hash = hashlib.md5(raw.encode()).hexdigest()[:8]
         return f"{self.ORDER_TAG_PREFIX}-{tag_hash}"
@@ -530,7 +538,7 @@ class StrategyEngine:
                 WHERE cancelled = 0
                 AND   filled    = 0
                 AND   session_date < ?
-            """, (date.today().isoformat(),))
+            """, (datetime.now(self._IST).date().isoformat(),))
             stale = cursor.fetchall()
             conn.close()
 
@@ -1424,21 +1432,24 @@ class StrategyEngine:
                 leg.fill_status == "EXPIRED_WORTHLESS"
             )
             if exit_price == 0 and not is_expired_worthless:
-                # PATCH: prefer bid/ask midpoint over raw ltp when
-                # falling back (leg was never actually closed with
-                # a real fill price).
+                # Use staleness-aware mark price as fallback.
+                # The old fallback (entry_price) recorded zero P&L
+                # for a failed exit on a deep-ITM leg, preventing
+                # CB L2/L3 from firing when they were needed most.
                 fallback_opt = (
                     expiry_chain
                     .get(leg.strike, {})
                     .get(leg.option_type, {})
                 )
-                fb_bid = fallback_opt.get("bid", 0)
-                fb_ask = fallback_opt.get("ask", 0)
-                if fb_bid > 0 and fb_ask > 0:
-                    exit_price = (fb_bid + fb_ask) / 2.0
-                else:
-                    exit_price = fallback_opt.get("ltp", 0)
+                _mark = self.dm.get_mark_price(
+                    fallback_opt,
+                    fallback=0.0,
+                )
+                if _mark > 0:
+                    exit_price = _mark
             if exit_price == 0 and not is_expired_worthless:
+                # Last resort: use entry_price only if mark is
+                # also unavailable (e.g. position not in chain).
                 exit_price = leg.entry_price
 
             if leg.action == "SELL":
@@ -1690,27 +1701,43 @@ class StrategyEngine:
             self._save_capital_state()  # PATCH: persist immediately
 
         # LEVEL 5 — Absolute VIX threshold
-        # FIX P8: use absolute VIX level not % change
+        # MN-T04: guard with cb_level_5_active so the fast
+        # monitor (running every second) does not emit a new
+        # regime-change event on every iteration while VIX
+        # stays elevated. Without this guard, _handle_regime_
+        # transition fires every second, closing positions
+        # repeatedly and generating excessive API activity.
         if (
             self.dm.vix is not None
             and self.dm.vix >= config.CB_LEVEL_5_VIX_ABSOLUTE
         ):
-            logger.critical(
-                f"CB L5: VIX={self.dm.vix:.1f} >= "
-                f"{config.CB_LEVEL_5_VIX_ABSOLUTE}"
-            )
-            self._log_circuit_breaker(
-                5,
-                f"vix_absolute={self.dm.vix:.1f}",
-                config.CB_LEVEL_5_ACTION,
-            )
-            self.re.previous_regime  = (
-                self.re.confirmed_regime
-            )
-            self.re.confirmed_regime = (
-                config.REGIME_STRONG_BUY
-            )
-            self.re.regime_changed   = True
+            if not getattr(self, "cb_level_5_active", False):
+                logger.critical(
+                    f"CB L5: VIX={self.dm.vix:.1f} >= "
+                    f"{config.CB_LEVEL_5_VIX_ABSOLUTE}"
+                )
+                self._log_circuit_breaker(
+                    5,
+                    f"vix_absolute={self.dm.vix:.1f}",
+                    config.CB_LEVEL_5_ACTION,
+                )
+                self.re.previous_regime  = (
+                    self.re.confirmed_regime
+                )
+                self.re.confirmed_regime = (
+                    config.REGIME_STRONG_BUY
+                )
+                self.re.regime_changed   = True
+                self.cb_level_5_active   = True
+                self._save_capital_state()
+        else:
+            # Reset when VIX drops back below threshold
+            if getattr(self, "cb_level_5_active", False):
+                logger.info(
+                    f"CB L5: VIX={self.dm.vix:.1f} below "
+                    f"threshold — resetting"
+                )
+                self.cb_level_5_active = False
 
     async def _monitor_all_positions(self) -> None:
         """Monitor all open positions for exit conditions."""
@@ -1848,6 +1875,23 @@ class StrategyEngine:
         elif strategy == config.STRAT_BACKSPREAD:
             if self.dm.spot is None:
                 return False
+            # Backspread premium stop: check debit threshold
+            # FIRST. During an IV crush, spot may barely move
+            # while the position bleeds premium. The spot-based
+            # stop alone misses this scenario entirely.
+            if position.stop_loss and position.stop_loss > 0:
+                current_val = self._get_position_value(position)
+                if current_val <= position.stop_loss:
+                    logger.info(
+                        f"Backspread premium stop: "
+                        f"val={current_val:.2f} "
+                        f"stop={position.stop_loss:.2f}"
+                    )
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS["STOP_LOSS"],
+                    )
+                    return True
             trend = position.trend_direction
             if trend >= 0:
                 stop_level = position.entry_spot * (
@@ -3471,9 +3515,19 @@ class StrategyEngine:
             ),
         ]
 
+        # Ratio spread max_risk fix: the maximum loss of a
+        # 1x2 ratio spread occurs when the underlying pins the
+        # long strike at expiry. Max loss = wing_width - credit.
+        # The old formula (credit * 2) understated this by ~2x
+        # for typical credit levels, causing over-leveraging.
+        _ratio_max_risk = max(
+            (config.RATIO_ATM_OFFSET_PTS - total_credit)
+            * config.LOT_SIZE,
+            total_credit * config.LOT_SIZE,  # floor: at least credit
+        )
         meta = {
             "total_credit":  total_credit,
-            "max_risk":      total_credit * 2 * config.LOT_SIZE,
+            "max_risk":      _ratio_max_risk,
             "profit_target": total_credit * (
                 1 - config.RATIO_TARGET_PCT
             ),
@@ -4969,6 +5023,9 @@ class StrategyEngine:
     def _get_position_value(
         self, position: Position
     ) -> float:
+        # SE-T01: use staleness-aware get_mark_price() so
+        # profit-target and stop-loss decisions use the same
+        # freshness logic as the fast P&L monitor.
         total        = 0.0
         expiry_chain = self.dm.get_chain_for_expiry(
             position.expiry_date
@@ -4979,24 +5036,18 @@ class StrategyEngine:
                 .get(leg.strike, {})
                 .get(leg.option_type, {})
             )
-            # PATCH: prefer bid/ask midpoint over raw ltp —
-            # avoids a stale single-print ltp driving stop/target
-            # decisions for long straddle/strangle/backspread/etc.
-            bid = opt_data.get("bid", 0)
-            ask = opt_data.get("ask", 0)
-            ltp = opt_data.get("ltp", 0)
-            if bid > 0 and ask > 0:
-                mark = (bid + ask) / 2.0
-            elif ltp > 0:
-                mark = ltp
-            else:
-                mark = leg.entry_price
+            mark = self.dm.get_mark_price(
+                opt_data, fallback=leg.entry_price
+            )
             total += mark * leg.qty
         return total
 
     def _get_position_current_premium(
         self, position: Position
     ) -> float:
+        # SE-T01: use staleness-aware get_mark_price() so
+        # credit-strategy stop/target decisions use the same
+        # freshness logic as the fast P&L monitor.
         net          = 0.0
         expiry_chain = self.dm.get_chain_for_expiry(
             position.expiry_date
@@ -5007,18 +5058,9 @@ class StrategyEngine:
                 .get(leg.strike, {})
                 .get(leg.option_type, {})
             )
-            # PATCH: prefer bid/ask midpoint over raw ltp —
-            # profit-target/stop-loss decisions should not be
-            # driven by a stale single-print ltp.
-            bid = opt_data.get("bid", 0)
-            ask = opt_data.get("ask", 0)
-            ltp = opt_data.get("ltp", 0)
-            if bid > 0 and ask > 0:
-                mark = (bid + ask) / 2.0
-            elif ltp > 0:
-                mark = ltp
-            else:
-                mark = leg.entry_price
+            mark = self.dm.get_mark_price(
+                opt_data, fallback=leg.entry_price
+            )
             if leg.action == "SELL":
                 net += mark * leg.qty
             else:
@@ -5224,6 +5266,43 @@ class StrategyEngine:
         """Check Greeks. Skip when no positions open."""
         if not self.open_positions:
             return
+        # SE-T06: warn when leg Greeks are stale.
+        # Greeks are set at entry and updated by WS. Near expiry,
+        # gamma changes rapidly; a 30-min-old reading can be off
+        # by 2-3x. We cannot recompute without a live model, but
+        # we can warn so the operator knows the limits check may
+        # be operating on stale data.
+        _now_ist = datetime.now(self._IST)
+        for _pos in self.open_positions:
+            for _leg in _pos.legs:
+                _ws_ts = None
+                _exp_chain = self.dm.get_chain_for_expiry(
+                    _pos.expiry_date
+                )
+                _opt = (
+                    _exp_chain
+                    .get(_leg.strike, {})
+                    .get(_leg.option_type, {})
+                )
+                _ws_ts_str = _opt.get("_ws_ts")
+                if _ws_ts_str:
+                    try:
+                        _ws_ts = datetime.fromisoformat(_ws_ts_str)
+                        if _ws_ts.tzinfo is None:
+                            _ws_ts = self._IST.localize(_ws_ts)
+                        _age = (
+                            _now_ist - _ws_ts
+                        ).total_seconds()
+                        if _age > 1800:  # 30 minutes
+                            logger.warning(
+                                f"SE-T06: Greeks stale "
+                                f"{_leg.option_type} "
+                                f"{_leg.strike} "
+                                f"age={_age:.0f}s — "
+                                f"limits check may be inaccurate"
+                            )
+                    except Exception:
+                        pass
         regime = self.re.confirmed_regime
         limits = config.GREEKS_LIMITS.get(regime, {})
         greeks = self._get_portfolio_greeks()

@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
 """
-patch.py — Round-3 audit fixes for the NIFTY options trading engine.
+patch.py — Round-4 audit fixes for the NIFTY options trading engine.
 
-Fixes applied (confirmed-valid only, no speculative changes):
-
-  regime_engine.py
-    RE-R01  Asymmetric rounding bias in _persist() — symmetric fix
-    RE-R02  Trend direction must agree with EMA slope and DI
-    RE-R03  Intraday module-score decay when data unavailable
-    RE-R04  Final-regime hysteresis (entry/exit bands)
+Fixes applied (confirmed-valid only):
 
   strategy_engine.py
-    SE-R01  Re-closing already-closed legs on next cycle
-    SE-R02  Retry fill quantity ignored in _close_position
-    SE-R03  Rebalance destroys ratio/butterfly structures
-    SE-R04  Partial-fill metadata scaling wrong for ratio legs
-    SE-R05  No per-position CLOSING lock
-    SE-R06  Partial reductions don't rebase risk metrics
-    Partial-close exit_price overwrite (_close_one_side)
-    Pre-trade EV check after costs
-    Trailing stop for debit strategies
+    Ratio spread max_risk undercalculation (critical)
+    Backspread premium stop ignored
+    P&L fallback uses entry_price on exit failure
+    SE-T01  _get_position_value / _get_position_current_premium use stale mid
+    SE-T04  Order tags use date.today() not IST date
+    Partial close exit_price overwrite (carried forward, incomplete fix)
+    SE-T06  Greeks not age-validated before limits check
+    ATR contraction too restrictive
+    MN-T04  CB Level 5 fires every second (idempotency guard)
 
   data_manager.py
-    DM-R01/R02  LTP has no timestamp; stale fallback no age limit
-    DM-R03  Outlier rejection uses stale bid/ask
+    DM-T01  Rejected LTP given fresh _ltp_ts
+    DM-T02  REST chain LTP has no _ltp_ts
+    DM-T03  get_mark_price does not reject crossed markets
+
+  regime_engine.py
+    RE-T01  Hysteresis creates hidden thresholds (explicit enter/exit constants)
+    RE-T02  Integer rounding destroys score granularity (keep floats)
+    RE-T03/T04  Stale-score decay uses wall-clock time + persisted last_valid_at
 
   main.py
-    MN-R01  Old data relabeled as fresh after failed refresh
-    MN-R02  Fast monitor skips circuit breakers
-    MN-R04  date.today() timezone inconsistency
+    MN-T01  Kill switch suspends position monitoring
+    MN-T02/T03  EOD marked complete without confirming positions closed
+    MN-T05  Data refresh variables don't prove a refresh happened
 
   config.py
-    CFG-R01  Daily-limit comment arithmetic corrected
-    CFG-R02  MAX_COMBINED_RISK_PCT comment clarified
+    RE-T01  Add STRONG_SELL_ENTER/EXIT and MILD_SELL_ENTER/EXIT constants
 
 Run:
     python patch.py [--dry-run] [--no-backup]
@@ -118,14 +117,6 @@ def sub_exact(old, new, content, label):
     return content, False
 
 
-def sub_regex(pattern, repl, content, label, flags=0):
-    new_content, n = re.subn(pattern, repl, content, flags=flags)
-    if n > 0:
-        return new_content, True
-    print("  [WARN] " + label + ": regex target not found")
-    return content, False
-
-
 # ─────────────────────────────────────────────────────────────────────
 # config.py
 # ─────────────────────────────────────────────────────────────────────
@@ -133,37 +124,40 @@ def sub_regex(pattern, repl, content, label, flags=0):
 def patch_config(content):
     changes = []
 
-    # CFG-R01: Fix incorrect comment about daily loss arithmetic
-    old_comment = (
-        "# AUDIT CFG-02: was 0.08 (8%). One max-risk loss = 2.7x daily CB.\n"
-        "# CB L1 (2%) fired before the designed stop on almost every trade.\n"
-        "# 0.02 = two full losers fit within MAX_DAILY_LOSS_PCT=0.03.\n"
-        "MAX_RISK_PER_TRADE_PCT   = 0.02"
+    # RE-T01: Add explicit hysteresis enter/exit threshold constants
+    # so operators can tune them directly without hidden inline math.
+    old_thresholds = (
+        "STRONG_SELL_THRESHOLD =  0.45   # reference: x > 0.45\n"
+        "MILD_SELL_THRESHOLD   =  0.15   # reference: x >= 0.15\n"
+        "MILD_BUY_THRESHOLD    = -0.15   # reference: x > -0.15 = NEUTRAL\n"
+        "STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL"
     )
-    new_comment = (
-        "# AUDIT CFG-02: was 0.08 (8%). One max-risk loss = 2.7x daily CB.\n"
-        "# CB L1 (2%) fired before the designed stop on almost every trade.\n"
-        "# CFG-R01: 2x2%=4% > 3% daily limit, so two simultaneous max-risk\n"
-        "# losses exceed the daily CB. The CB is reactive (fires after loss).\n"
-        "# Reserve daily risk before entry; do not rely on the CB as a gate.\n"
-        "MAX_RISK_PER_TRADE_PCT   = 0.02"
+    new_thresholds = (
+        "STRONG_SELL_THRESHOLD =  0.45   # reference: x > 0.45\n"
+        "MILD_SELL_THRESHOLD   =  0.15   # reference: x >= 0.15\n"
+        "MILD_BUY_THRESHOLD    = -0.15   # reference: x > -0.15 = NEUTRAL\n"
+        "STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL\n"
+        "\n"
+        "# RE-T01: explicit hysteresis enter/exit thresholds.\n"
+        "# Enter a regime when composite crosses the ENTER threshold;\n"
+        "# exit only when it crosses the EXIT threshold in the opposite\n"
+        "# direction. This prevents churn near boundaries without\n"
+        "# creating hidden thresholds that contradict the base values.\n"
+        "# Band = 0.05 composite units (tune here, not inline).\n"
+        "STRONG_SELL_ENTER =  0.45   # enter STRONG_SELL above this\n"
+        "STRONG_SELL_EXIT  =  0.40   # exit  STRONG_SELL below this\n"
+        "MILD_SELL_ENTER   =  0.15   # enter MILD_SELL above this\n"
+        "MILD_SELL_EXIT    =  0.10   # exit  MILD_SELL below this\n"
+        "MILD_BUY_ENTER    = -0.15   # enter NEUTRAL above this (from BUY_VOL)\n"
+        "MILD_BUY_EXIT     = -0.20   # exit  NEUTRAL below this\n"
+        "STRONG_BUY_ENTER  = -0.45   # enter BUY_VOL above this (from STRONG_BUY)\n"
+        "STRONG_BUY_EXIT   = -0.50   # exit  STRONG_BUY above this"
     )
-    content, ok = sub_exact(old_comment, new_comment, content, "CFG-R01 comment")
+    content, ok = sub_exact(
+        old_thresholds, new_thresholds, content, "RE-T01 hysteresis constants"
+    )
     if ok:
-        changes.append("CFG-R01: daily-limit comment corrected")
-
-    # CFG-R02: Clarify MAX_COMBINED_RISK_PCT is non-binding
-    old_combined = "MAX_COMBINED_RISK_PCT    = 0.20"
-    new_combined = (
-        "# CFG-R02: with MAX_RISK_PER_TRADE_PCT=0.02 and\n"
-        "# MAX_CONCURRENT_POSITIONS=4, max theoretical exposure=8%.\n"
-        "# This 20% limit is non-binding; real constraint is the sum\n"
-        "# of position max_risk values checked in _pre_trade_checks.\n"
-        "MAX_COMBINED_RISK_PCT    = 0.20"
-    )
-    content, ok = sub_exact(old_combined, new_combined, content, "CFG-R02 comment")
-    if ok:
-        changes.append("CFG-R02: MAX_COMBINED_RISK_PCT comment clarified")
+        changes.append("RE-T01: explicit ENTER/EXIT hysteresis constants added")
 
     return content, changes
 
@@ -175,190 +169,11 @@ def patch_config(content):
 def patch_data_manager(content):
     changes = []
 
-    # DM-R01/R02: Store _ltp_ts on every LTP update so get_mark_price
-    # can validate LTP freshness, not just REST bid/ask freshness.
-    # Also add a hard age limit to the final REST fallback.
-    old_get_mark = (
-        "    def get_mark_price(\n"
-        "        self,\n"
-        "        opt_data: Dict,\n"
-        "        fallback: float = 0.0,\n"
-        "        max_quote_age_sec: float = 15.0,\n"
-        "    ) -> float:\n"
-        "        \"\"\"\n"
-        "        AUDIT DM-01: bid/ask are only updated by the 60s REST\n"
-        "        poll, never by the WebSocket. LTP is updated by WS on\n"
-        "        every tick. Use bid/ask midpoint only when the REST\n"
-        "        quote is fresh (< max_quote_age_sec); otherwise prefer\n"
-        "        the live-ticking LTP.\n"
-        "        \"\"\"\n"
-        "        bid = float(opt_data.get(\"bid\", 0) or 0)\n"
-        "        ask = float(opt_data.get(\"ask\", 0) or 0)\n"
-        "        ltp = float(opt_data.get(\"ltp\", 0) or 0)\n"
-        "        rest_ts = opt_data.get(\"_rest_ts\")\n"
-        "        quote_fresh = False\n"
-        "        if rest_ts:\n"
-        "            try:\n"
-        "                ts_dt = datetime.fromisoformat(rest_ts)\n"
-        "                if ts_dt.tzinfo is None:\n"
-        "                    ts_dt = self._IST.localize(ts_dt)\n"
-        "                age = (\n"
-        "                    datetime.now(self._IST) - ts_dt\n"
-        "                ).total_seconds()\n"
-        "                quote_fresh = age <= max_quote_age_sec\n"
-        "            except Exception:\n"
-        "                pass\n"
-        "        if quote_fresh and bid > 0 and ask > 0:\n"
-        "            return (bid + ask) / 2.0\n"
-        "        if ltp > 0:\n"
-        "            return ltp\n"
-        "        if bid > 0 and ask > 0:\n"
-        "            return (bid + ask) / 2.0\n"
-        "        return fallback"
-    )
-    new_get_mark = (
-        "    def get_mark_price(\n"
-        "        self,\n"
-        "        opt_data: Dict,\n"
-        "        fallback: float = 0.0,\n"
-        "        max_quote_age_sec: float = 15.0,\n"
-        "        max_ltp_age_sec: float = 30.0,\n"
-        "        max_rest_fallback_age_sec: float = 90.0,\n"
-        "    ) -> float:\n"
-        "        \"\"\"\n"
-        "        DM-R01/R02: Returns the best available mark price.\n"
-        "        Priority:\n"
-        "          1. Fresh REST bid/ask midpoint (< max_quote_age_sec)\n"
-        "          2. Fresh WS LTP (< max_ltp_age_sec, uses _ltp_ts)\n"
-        "          3. Stale REST bid/ask midpoint (< max_rest_fallback_age_sec)\n"
-        "          4. fallback (entry price or 0)\n"
-        "        Returns fallback when all sources exceed their age limits\n"
-        "        so callers can detect a genuinely stale mark.\n"
-        "        \"\"\"\n"
-        "        now_ist = datetime.now(self._IST)\n"
-        "        bid = float(opt_data.get(\"bid\", 0) or 0)\n"
-        "        ask = float(opt_data.get(\"ask\", 0) or 0)\n"
-        "        ltp = float(opt_data.get(\"ltp\", 0) or 0)\n"
-        "\n"
-        "        def _age(ts_key):\n"
-        "            ts = opt_data.get(ts_key)\n"
-        "            if not ts:\n"
-        "                return float(\"inf\")\n"
-        "            try:\n"
-        "                ts_dt = datetime.fromisoformat(ts)\n"
-        "                if ts_dt.tzinfo is None:\n"
-        "                    ts_dt = self._IST.localize(ts_dt)\n"
-        "                return (now_ist - ts_dt).total_seconds()\n"
-        "            except Exception:\n"
-        "                return float(\"inf\")\n"
-        "\n"
-        "        rest_age = _age(\"_rest_ts\")\n"
-        "        ltp_age  = _age(\"_ltp_ts\")\n"
-        "\n"
-        "        # 1. Fresh REST midpoint\n"
-        "        if rest_age <= max_quote_age_sec and bid > 0 and ask > 0:\n"
-        "            return (bid + ask) / 2.0\n"
-        "        # 2. Fresh WS LTP\n"
-        "        if ltp_age <= max_ltp_age_sec and ltp > 0:\n"
-        "            return ltp\n"
-        "        # 3. Stale REST midpoint (bounded age)\n"
-        "        if rest_age <= max_rest_fallback_age_sec and bid > 0 and ask > 0:\n"
-        "            return (bid + ask) / 2.0\n"
-        "        # 4. fallback\n"
-        "        return fallback"
-    )
-    content, ok = sub_exact(old_get_mark, new_get_mark, content, "DM-R01/R02 get_mark_price")
-    if ok:
-        changes.append("DM-R01/R02: get_mark_price() validates LTP age via _ltp_ts")
-
-    # Store _ltp_ts on every LTP update in _update_instrument_ltp
-    # Find the option-chain update block and add timestamp storage
-    old_ltp_update = (
-        "                    else:\n"
-        "                        opt_ref[\"ltp\"] = ltp"
-    )
-    new_ltp_update = (
-        "                    else:\n"
-        "                        opt_ref[\"ltp\"] = ltp\n"
-        "                        opt_ref[\"_ltp_ts\"] = datetime.now(\n"
-        "                            pytz.timezone(config.TZ)\n"
-        "                        ).isoformat()"
-    )
-    # This pattern appears in the LTP spike-guard block; use it carefully
-    # We need to match the specific location inside the option chain update
-    old_ltp_store = (
-        "                        opt_ref[\"ltp\"] = ltp\n"
-        "                    else:\n"
-        "                        opt_ref[\"ltp\"] = ltp"
-    )
-    new_ltp_store = (
-        "                        opt_ref[\"ltp\"] = ltp\n"
-        "                        opt_ref[\"_ltp_ts\"] = datetime.now(\n"
-        "                            pytz.timezone(config.TZ)\n"
-        "                        ).isoformat()\n"
-        "                    else:\n"
-        "                        opt_ref[\"ltp\"] = ltp\n"
-        "                        opt_ref[\"_ltp_ts\"] = datetime.now(\n"
-        "                            pytz.timezone(config.TZ)\n"
-        "                        ).isoformat()"
-    )
-    content, ok = sub_exact(old_ltp_store, new_ltp_store, content, "DM-R01 _ltp_ts storage")
-    if ok:
-        changes.append("DM-R01: _ltp_ts stored on every WS LTP update")
-
-    # DM-R03: Fix outlier rejection to use LTP age, not stale REST mid
-    old_outlier = (
-        "                    opt_ref = self.option_chain[expiry][strike][\n"
-        "                        option_type\n"
-        "                    ]\n"
-        "                    bid_ref = opt_ref.get(\"bid\", 0)\n"
-        "                    ask_ref = opt_ref.get(\"ask\", 0)\n"
-        "                    if bid_ref > 0 and ask_ref > 0:\n"
-        "                        mid_ref    = (bid_ref + ask_ref) / 2.0\n"
-        "                        spread_ref = max(ask_ref - bid_ref, 0.05)\n"
-        "                        if abs(ltp - mid_ref) > max(\n"
-        "                            10.0, spread_ref * 3\n"
-        "                        ):\n"
-        "                            logger.warning(\n"
-        "                                f\"Option LTP outlier rejected: \"\n"
-        "                                f\"{option_type} {strike} {expiry} \"\n"
-        "                                f\"ltp={ltp:.2f} mid={mid_ref:.2f} \"\n"
-        "                                f\"bid={bid_ref:.2f} ask={ask_ref:.2f}\"\n"
-        "                            )\n"
-        "                        else:\n"
-        "                            opt_ref[\"ltp\"] = ltp\n"
-        "                    else:\n"
-        "                        opt_ref[\"ltp\"] = ltp"
-    )
-    new_outlier = (
-        "                    opt_ref = self.option_chain[expiry][strike][\n"
-        "                        option_type\n"
-        "                    ]\n"
-        "                    bid_ref = opt_ref.get(\"bid\", 0)\n"
-        "                    ask_ref = opt_ref.get(\"ask\", 0)\n"
-        "                    rest_ts_ref = opt_ref.get(\"_rest_ts\")\n"
-        "                    # DM-R03: only reject as outlier when the\n"
-        "                    # REST quote is fresh (<= 15s). During fast\n"
-        "                    # moves the REST mid is stale and the LTP\n"
-        "                    # is correct; rejecting it causes missed\n"
-        "                    # price updates and late stop-loss triggers.\n"
-        "                    _rest_fresh = False\n"
-        "                    if rest_ts_ref:\n"
-        "                        try:\n"
-        "                            _rts = datetime.fromisoformat(\n"
-        "                                rest_ts_ref\n"
-        "                            )\n"
-        "                            if _rts.tzinfo is None:\n"
-        "                                _rts = pytz.timezone(\n"
-        "                                    config.TZ\n"
-        "                                ).localize(_rts)\n"
-        "                            _rest_fresh = (\n"
-        "                                datetime.now(\n"
-        "                                    pytz.timezone(config.TZ)\n"
-        "                                ) - _rts\n"
-        "                            ).total_seconds() <= 15.0\n"
-        "                        except Exception:\n"
-        "                            pass\n"
+    # DM-T01: Only update _ltp_ts when the LTP is actually accepted.
+    # The previous patch updated _ltp_ts outside the acceptance branch,
+    # so a rejected outlier tick was still given a fresh timestamp,
+    # making get_mark_price() trust the old (unchanged) LTP.
+    old_outlier_block = (
         "                    if _rest_fresh and bid_ref > 0 and ask_ref > 0:\n"
         "                        mid_ref    = (bid_ref + ask_ref) / 2.0\n"
         "                        # Use 5% of mid as threshold (not fixed 10pts)\n"
@@ -381,9 +196,112 @@ def patch_data_manager(content):
         "                            pytz.timezone(config.TZ)\n"
         "                        ).isoformat()"
     )
-    content, ok = sub_exact(old_outlier, new_outlier, content, "DM-R03 outlier rejection")
+    new_outlier_block = (
+        "                    if _rest_fresh and bid_ref > 0 and ask_ref > 0:\n"
+        "                        mid_ref    = (bid_ref + ask_ref) / 2.0\n"
+        "                        pct_thresh = max(10.0, mid_ref * 0.05)\n"
+        "                        if abs(ltp - mid_ref) > pct_thresh:\n"
+        "                            # DM-T01: do NOT update _ltp_ts on\n"
+        "                            # rejection. Updating it here made\n"
+        "                            # get_mark_price() trust the old\n"
+        "                            # (unchanged) LTP as if it were fresh.\n"
+        "                            logger.warning(\n"
+        "                                f\"Option LTP outlier rejected: \"\n"
+        "                                f\"{option_type} {strike} {expiry} \"\n"
+        "                                f\"ltp={ltp:.2f} mid={mid_ref:.2f} \"\n"
+        "                                f\"({abs(ltp-mid_ref)/mid_ref*100:.1f}%)\"\n"
+        "                            )\n"
+        "                        else:\n"
+        "                            # Accept: update both value and timestamp\n"
+        "                            opt_ref[\"ltp\"] = ltp\n"
+        "                            opt_ref[\"_ltp_ts\"] = datetime.now(\n"
+        "                                pytz.timezone(config.TZ)\n"
+        "                            ).isoformat()\n"
+        "                    else:\n"
+        "                        # REST quote stale or no bid/ask: accept LTP\n"
+        "                        # without outlier check (can't validate)\n"
+        "                        opt_ref[\"ltp\"] = ltp\n"
+        "                        opt_ref[\"_ltp_ts\"] = datetime.now(\n"
+        "                            pytz.timezone(config.TZ)\n"
+        "                        ).isoformat()"
+    )
+    content, ok = sub_exact(
+        old_outlier_block, new_outlier_block, content, "DM-T01 _ltp_ts on accept only"
+    )
     if ok:
-        changes.append("DM-R03: LTP outlier rejection only when REST quote is fresh")
+        changes.append("DM-T01: _ltp_ts only updated when LTP is accepted, not rejected")
+
+    # DM-T02: Set _ltp_ts when REST chain populates ltp so that
+    # get_mark_price() can use a fresh REST LTP for illiquid strikes.
+    # We patch the ltp assignment inside fetch_option_chain's parsed dict.
+    old_rest_ltp = (
+        "                        \"ltp\":    _sf(call_md.get(\"ltp\", 0)),"
+    )
+    new_rest_ltp = (
+        "                        \"ltp\":    _sf(call_md.get(\"ltp\", 0)),\n"
+        "                        # DM-T02: REST LTP gets _ltp_ts so\n"
+        "                        # get_mark_price() treats it as fresh.\n"
+        "                        \"_ltp_ts\": datetime.now(\n"
+        "                            self._IST\n"
+        "                        ).isoformat(),"
+    )
+    content, ok = sub_exact(
+        old_rest_ltp, new_rest_ltp, content, "DM-T02 REST call ltp_ts"
+    )
+    if ok:
+        changes.append("DM-T02: REST chain call ltp gets _ltp_ts")
+
+    old_rest_put_ltp = (
+        "                        \"ltp\":    _sf(put_md.get(\"ltp\", 0)),"
+    )
+    new_rest_put_ltp = (
+        "                        \"ltp\":    _sf(put_md.get(\"ltp\", 0)),\n"
+        "                        # DM-T02: REST LTP gets _ltp_ts\n"
+        "                        \"_ltp_ts\": datetime.now(\n"
+        "                            self._IST\n"
+        "                        ).isoformat(),"
+    )
+    content, ok = sub_exact(
+        old_rest_put_ltp, new_rest_put_ltp, content, "DM-T02 REST put ltp_ts"
+    )
+    if ok:
+        changes.append("DM-T02: REST chain put ltp gets _ltp_ts")
+
+    # DM-T03: Reject crossed markets in get_mark_price()
+    old_mark_mid = (
+        "        # 1. Fresh REST midpoint\n"
+        "        if rest_age <= max_quote_age_sec and bid > 0 and ask > 0:\n"
+        "            return (bid + ask) / 2.0\n"
+        "        # 2. Fresh WS LTP\n"
+        "        if ltp_age <= max_ltp_age_sec and ltp > 0:\n"
+        "            return ltp\n"
+        "        # 3. Stale REST midpoint (bounded age)\n"
+        "        if rest_age <= max_rest_fallback_age_sec and bid > 0 and ask > 0:\n"
+        "            return (bid + ask) / 2.0\n"
+        "        # 4. fallback\n"
+        "        return fallback"
+    )
+    new_mark_mid = (
+        "        # DM-T03: reject crossed markets (bid > ask).\n"
+        "        _bid_ask_valid = bid > 0 and ask > 0 and ask >= bid\n"
+        "\n"
+        "        # 1. Fresh REST midpoint\n"
+        "        if rest_age <= max_quote_age_sec and _bid_ask_valid:\n"
+        "            return (bid + ask) / 2.0\n"
+        "        # 2. Fresh WS LTP\n"
+        "        if ltp_age <= max_ltp_age_sec and ltp > 0:\n"
+        "            return ltp\n"
+        "        # 3. Stale REST midpoint (bounded age, still valid)\n"
+        "        if rest_age <= max_rest_fallback_age_sec and _bid_ask_valid:\n"
+        "            return (bid + ask) / 2.0\n"
+        "        # 4. fallback\n"
+        "        return fallback"
+    )
+    content, ok = sub_exact(
+        old_mark_mid, new_mark_mid, content, "DM-T03 crossed market rejection"
+    )
+    if ok:
+        changes.append("DM-T03: get_mark_price() rejects crossed markets (bid > ask)")
 
     return content, changes
 
@@ -395,144 +313,8 @@ def patch_data_manager(content):
 def patch_regime_engine(content):
     changes = []
 
-    # RE-R01: Fix asymmetric rounding — use copysign for symmetric rounding
-    old_round = (
-        "        # AUDIT RE-01: int(round(0.5)) == 0 in Python (banker's\n"
-        "        # rounding). A vol_score of +0.5 (normal contango + neutral\n"
-        "        # skew) was silently becoming 0, making STRONG_SELL_VOL\n"
-        "        # unreachable. Use standard half-up rounding instead.\n"
-        "        import math as _math\n"
-        "        raw_int = int(_math.floor(float(raw) + 0.5))\n"
-        "        buf     = self._buf[name]"
-    )
-    new_round = (
-        "        # RE-R01: floor(x+0.5) is asymmetric: +0.5->1 but -0.5->0.\n"
-        "        # This introduced a sell-vol bias (buy-vol signals zeroed).\n"
-        "        # Use copysign for symmetric rounding away from zero:\n"
-        "        #   +0.5 -> +1,  -0.5 -> -1,  +0.0 -> 0\n"
-        "        import math as _math\n"
-        "        _raw_f  = float(raw)\n"
-        "        raw_int = int(\n"
-        "            _math.copysign(\n"
-        "                _math.floor(abs(_raw_f) + 0.5), _raw_f\n"
-        "            )\n"
-        "        )\n"
-        "        buf     = self._buf[name]"
-    )
-    content, ok = sub_exact(old_round, new_round, content, "RE-R01 symmetric rounding")
-    if ok:
-        changes.append("RE-R01: _persist() uses symmetric copysign rounding")
-
-    # RE-R02: Trend direction must agree with EMA slope and DI
-    old_trend_direction = (
-        "        if adx_v > ADX_TREND and abs(slope_pct) > EMA_SLOPE_PCT:\n"
-        "            raw  = 1 if above else -1\n"
-        "            dirn = \"bullish\" if above else \"bearish\"\n"
-        "        else:\n"
-        "            raw  = 0\n"
-        "            dirn = \"range-bound\""
-    )
-    new_trend_direction = (
-        "        # RE-R02: require three-way directional agreement to\n"
-        "        # avoid false signals at EMA crossings:\n"
-        "        #   bullish: spot > EMA AND slope > 0 AND +DI > -DI\n"
-        "        #   bearish: spot < EMA AND slope < 0 AND -DI > +DI\n"
-        "        # Without this, a falling EMA with spot marginally above\n"
-        "        # it scores +1 (bullish) despite a bearish trend.\n"
-        "        if adx_v > ADX_TREND and abs(slope_pct) > EMA_SLOPE_PCT:\n"
-        "            _slope_up = slope > 0\n"
-        "            _di_bull  = pdi > ndi\n"
-        "            if above and _slope_up and _di_bull:\n"
-        "                raw  = 1\n"
-        "                dirn = \"bullish (3-way confirmed)\"\n"
-        "            elif not above and not _slope_up and not _di_bull:\n"
-        "                raw  = -1\n"
-        "                dirn = \"bearish (3-way confirmed)\"\n"
-        "            else:\n"
-        "                raw  = 0\n"
-        "                dirn = \"mixed signals (no 3-way agreement)\"\n"
-        "        else:\n"
-        "            raw  = 0\n"
-        "            dirn = \"range-bound\""
-    )
-    content, ok = sub_exact(
-        old_trend_direction, new_trend_direction, content, "RE-R02 trend 3-way"
-    )
-    if ok:
-        changes.append("RE-R02: trend direction requires EMA slope + DI agreement")
-
-    # RE-R03: Intraday decay for stale module scores
-    # When raw is None, hold the confirmed value but decay it toward 0
-    # after INTRADAY_SCORE_DECAY_CYCLES consecutive None readings.
-    old_persist_none = (
-        "        if raw is None:\n"
-        "            return self._conf[name]"
-    )
-    new_persist_none = (
-        "        if raw is None:\n"
-        "            # RE-R03: decay stale scores toward 0 intraday.\n"
-        "            # Track consecutive None readings per module.\n"
-        "            _none_key = \"_none_count_\" + name\n"
-        "            _none_count = getattr(self, _none_key, 0) + 1\n"
-        "            setattr(self, _none_key, _none_count)\n"
-        "            # After 10 consecutive None readings (~10 min at\n"
-        "            # 60s refresh), decay the confirmed score toward 0\n"
-        "            # by 1 step so stale flow/vol doesn't drive entries.\n"
-        "            _decay_after = 10\n"
-        "            if _none_count > _decay_after and self._conf[name] != 0:\n"
-        "                _old = self._conf[name]\n"
-        "                self._conf[name] = (\n"
-        "                    _old - 1 if _old > 0 else _old + 1\n"
-        "                )\n"
-        "                logger.info(\n"
-        "                    f\"RE-R03: {name} score decayed \"\n"
-        "                    f\"{_old} -> {self._conf[name]} \"\n"
-        "                    f\"(none_count={_none_count})\"\n"
-        "                )\n"
-        "            return self._conf[name]"
-    )
-    content, ok = sub_exact(
-        old_persist_none, new_persist_none, content, "RE-R03 intraday decay"
-    )
-    if ok:
-        changes.append("RE-R03: stale module scores decay after 10 consecutive None readings")
-
-    # Reset none-count when a real value arrives
-    old_persist_buf = (
-        "        buf     = self._buf[name]\n"
-        "        buf.append(raw_int)"
-    )
-    new_persist_buf = (
-        "        buf     = self._buf[name]\n"
-        "        # Reset decay counter when a real value arrives\n"
-        "        setattr(self, \"_none_count_\" + name, 0)\n"
-        "        buf.append(raw_int)"
-    )
-    content, ok = sub_exact(
-        old_persist_buf, new_persist_buf, content, "RE-R03 reset none count"
-    )
-    if ok:
-        changes.append("RE-R03: none-count reset when real module value arrives")
-
-    # RE-R04: Final-regime hysteresis — use entry/exit bands
-    # Add hysteresis constants and modify _map_regime to use them.
-    # Entry thresholds are tighter; exit thresholds are looser.
-    old_map_regime_method = (
-        "    def _map_regime(self, composite: float) -> str:\n"
-        "        \"\"\"Reference algorithm regime mapping.\n"
-        "        AUDIT #2.2: reads thresholds from config.\n"
-        "        \"\"\"\n"
-        "        if composite > config.STRONG_SELL_THRESHOLD:\n"
-        "            return config.REGIME_STRONG_SELL\n"
-        "        if composite >= config.MILD_SELL_THRESHOLD:\n"
-        "            return config.REGIME_MILD_SELL\n"
-        "        if composite > config.MILD_BUY_THRESHOLD:\n"
-        "            return config.REGIME_NEUTRAL\n"
-        "        if composite >= config.STRONG_BUY_THRESHOLD:\n"
-        "            return config.REGIME_BUY_VOL\n"
-        "        return config.REGIME_STRONG_BUY"
-    )
-    new_map_regime_method = (
+    # RE-T01: Replace inline hysteresis math with config constants
+    old_hysteresis = (
         "    def _map_regime(self, composite: float) -> str:\n"
         "        \"\"\"Reference algorithm regime mapping with hysteresis.\n"
         "        RE-R04: use entry/exit bands to prevent churn near\n"
@@ -577,11 +359,339 @@ def patch_regime_engine(content):
         "            return config.REGIME_BUY_VOL\n"
         "        return config.REGIME_STRONG_BUY"
     )
+    new_hysteresis = (
+        "    def _map_regime(self, composite: float) -> str:\n"
+        "        \"\"\"Regime mapping with explicit config-driven hysteresis.\n"
+        "        RE-T01: thresholds are read from config.STRONG_SELL_ENTER\n"
+        "        etc. so operators can tune them directly. The previous\n"
+        "        inline `threshold ± 0.05` created hidden effective\n"
+        "        thresholds that contradicted the documented base values.\n"
+        "        \"\"\"\n"
+        "        current = self.confirmed_regime\n"
+        "\n"
+        "        # Persistence: stay in current regime until the EXIT\n"
+        "        # threshold is crossed in the opposite direction.\n"
+        "        if current == config.REGIME_STRONG_SELL:\n"
+        "            if composite > getattr(\n"
+        "                config, \"STRONG_SELL_EXIT\",\n"
+        "                config.STRONG_SELL_THRESHOLD - 0.05\n"
+        "            ):\n"
+        "                return config.REGIME_STRONG_SELL\n"
+        "        elif current == config.REGIME_MILD_SELL:\n"
+        "            _ms_exit = getattr(\n"
+        "                config, \"MILD_SELL_EXIT\",\n"
+        "                config.MILD_SELL_THRESHOLD - 0.05\n"
+        "            )\n"
+        "            _ss_exit = getattr(\n"
+        "                config, \"STRONG_SELL_EXIT\",\n"
+        "                config.STRONG_SELL_THRESHOLD - 0.05\n"
+        "            )\n"
+        "            if _ms_exit <= composite <= (\n"
+        "                getattr(\n"
+        "                    config, \"STRONG_SELL_ENTER\",\n"
+        "                    config.STRONG_SELL_THRESHOLD\n"
+        "                )\n"
+        "            ):\n"
+        "                return config.REGIME_MILD_SELL\n"
+        "        elif current == config.REGIME_NEUTRAL:\n"
+        "            _nb_exit = getattr(\n"
+        "                config, \"MILD_BUY_EXIT\",\n"
+        "                config.MILD_BUY_THRESHOLD - 0.05\n"
+        "            )\n"
+        "            _ns_enter = getattr(\n"
+        "                config, \"MILD_SELL_ENTER\",\n"
+        "                config.MILD_SELL_THRESHOLD\n"
+        "            )\n"
+        "            if _nb_exit < composite < _ns_enter:\n"
+        "                return config.REGIME_NEUTRAL\n"
+        "        elif current == config.REGIME_BUY_VOL:\n"
+        "            _bv_exit = getattr(\n"
+        "                config, \"STRONG_BUY_EXIT\",\n"
+        "                config.STRONG_BUY_THRESHOLD - 0.05\n"
+        "            )\n"
+        "            _bv_top = getattr(\n"
+        "                config, \"MILD_BUY_ENTER\",\n"
+        "                config.MILD_BUY_THRESHOLD\n"
+        "            )\n"
+        "            if _bv_exit <= composite <= _bv_top:\n"
+        "                return config.REGIME_BUY_VOL\n"
+        "        elif current == config.REGIME_STRONG_BUY:\n"
+        "            if composite < getattr(\n"
+        "                config, \"STRONG_BUY_EXIT\",\n"
+        "                config.STRONG_BUY_THRESHOLD - 0.05\n"
+        "            ):\n"
+        "                return config.REGIME_STRONG_BUY\n"
+        "\n"
+        "        # Entry: use ENTER thresholds (fall back to base if not set)\n"
+        "        _ss_enter = getattr(\n"
+        "            config, \"STRONG_SELL_ENTER\",\n"
+        "            config.STRONG_SELL_THRESHOLD\n"
+        "        )\n"
+        "        _ms_enter = getattr(\n"
+        "            config, \"MILD_SELL_ENTER\",\n"
+        "            config.MILD_SELL_THRESHOLD\n"
+        "        )\n"
+        "        _mb_enter = getattr(\n"
+        "            config, \"MILD_BUY_ENTER\",\n"
+        "            config.MILD_BUY_THRESHOLD\n"
+        "        )\n"
+        "        _sb_enter = getattr(\n"
+        "            config, \"STRONG_BUY_ENTER\",\n"
+        "            config.STRONG_BUY_THRESHOLD\n"
+        "        )\n"
+        "        if composite > _ss_enter:\n"
+        "            return config.REGIME_STRONG_SELL\n"
+        "        if composite >= _ms_enter:\n"
+        "            return config.REGIME_MILD_SELL\n"
+        "        if composite > _mb_enter:\n"
+        "            return config.REGIME_NEUTRAL\n"
+        "        if composite >= _sb_enter:\n"
+        "            return config.REGIME_BUY_VOL\n"
+        "        return config.REGIME_STRONG_BUY"
+    )
     content, ok = sub_exact(
-        old_map_regime_method, new_map_regime_method, content, "RE-R04 hysteresis"
+        old_hysteresis, new_hysteresis, content, "RE-T01 config-driven hysteresis"
     )
     if ok:
-        changes.append("RE-R04: _map_regime() uses entry/exit hysteresis bands (±0.05)")
+        changes.append("RE-T01: _map_regime() uses config ENTER/EXIT constants")
+
+    # RE-T02: Keep module scores as floats in persistence buffers.
+    # The current code rounds to int, which maps ±0.5 to ±1 (max conviction)
+    # even when only one of two sub-signals fired. Keep float values and
+    # confirm on sign-stability (same sign for 3 consecutive readings).
+    old_persist_round = (
+        "        # RE-R01: floor(x+0.5) is asymmetric: +0.5->1 but -0.5->0.\n"
+        "        # This introduced a sell-vol bias (buy-vol signals zeroed).\n"
+        "        # Use copysign for symmetric rounding away from zero:\n"
+        "        #   +0.5 -> +1,  -0.5 -> -1,  +0.0 -> 0\n"
+        "        import math as _math\n"
+        "        _raw_f  = float(raw)\n"
+        "        raw_int = int(\n"
+        "            _math.copysign(\n"
+        "                _math.floor(abs(_raw_f) + 0.5), _raw_f\n"
+        "            )\n"
+        "        )\n"
+        "        buf     = self._buf[name]\n"
+        "        # Reset decay counter when a real value arrives\n"
+        "        setattr(self, \"_none_count_\" + name, 0)\n"
+        "        buf.append(raw_int)"
+    )
+    new_persist_round = (
+        "        # RE-T02: keep scores as floats. Rounding ±0.5 to ±1\n"
+        "        # (even symmetrically) overstates conviction when only\n"
+        "        # one of two sub-signals fired. Confirm on sign-stability\n"
+        "        # across 3 consecutive readings instead of exact-integer\n"
+        "        # equality, which is meaningless for floats anyway.\n"
+        "        _raw_f = float(raw)\n"
+        "        buf    = self._buf[name]\n"
+        "        # Reset decay counter when a real value arrives\n"
+        "        setattr(self, \"_none_count_\" + name, 0)\n"
+        "        buf.append(_raw_f)"
+    )
+    content, ok = sub_exact(
+        old_persist_round, new_persist_round, content, "RE-T02 float persistence"
+    )
+    if ok:
+        changes.append("RE-T02: module scores kept as floats in persistence buffer")
+
+    # RE-T02: Update the confirmation logic to use sign-stability on floats
+    old_confirm_logic = (
+        "        if len(buf) == 3 and buf[0] == buf[1] == buf[2]:\n"
+        "            self._conf[name] = raw_int\n"
+        "            logger.info(\n"
+        "                f\"Persistence confirmed: {name}={raw_int}\"\n"
+        "            )\n"
+        "        else:\n"
+        "            logger.info(\n"
+        "                f\"Persistence unconfirmed: {name} \"\n"
+        "                f\"buf={buf} \"\n"
+        "                f\"holding={self._conf[name]}\"\n"
+        "            )\n"
+        "        return self._conf[name]"
+    )
+    new_confirm_logic = (
+        "        # RE-T02: confirm when the last 3 readings have the\n"
+        "        # same sign (or are all zero). Use the mean of the\n"
+        "        # buffer as the confirmed value to preserve granularity.\n"
+        "        import math as _math_p\n"
+        "        if len(buf) >= 3:\n"
+        "            _last3 = buf[-3:]\n"
+        "            _signs = [_math_p.copysign(1, v) if v != 0 else 0\n"
+        "                      for v in _last3]\n"
+        "            if len(set(_signs)) == 1:  # all same sign\n"
+        "                _confirmed = sum(_last3) / len(_last3)\n"
+        "                self._conf[name] = _confirmed\n"
+        "                logger.info(\n"
+        "                    f\"Persistence confirmed: \"\n"
+        "                    f\"{name}={_confirmed:.3f} \"\n"
+        "                    f\"(sign-stable over 3 readings)\"\n"
+        "                )\n"
+        "            else:\n"
+        "                logger.info(\n"
+        "                    f\"Persistence unconfirmed: {name} \"\n"
+        "                    f\"buf={[round(v,3) for v in buf[-3:]]} \"\n"
+        "                    f\"holding={self._conf[name]:.3f}\"\n"
+        "                )\n"
+        "        return self._conf[name]"
+    )
+    content, ok = sub_exact(
+        old_confirm_logic, new_confirm_logic, content, "RE-T02 sign-stability confirm"
+    )
+    if ok:
+        changes.append("RE-T02: persistence confirms on sign-stability, not integer equality")
+
+    # RE-T03/T04: Replace cycle-count decay with wall-clock decay
+    # and persist last_valid_at per module in SQLite.
+    old_decay_none = (
+        "        if raw is None:\n"
+        "            # RE-R03: decay stale scores toward 0 intraday.\n"
+        "            # Track consecutive None readings per module.\n"
+        "            _none_key = \"_none_count_\" + name\n"
+        "            _none_count = getattr(self, _none_key, 0) + 1\n"
+        "            setattr(self, _none_key, _none_count)\n"
+        "            # After 10 consecutive None readings (~10 min at\n"
+        "            # 60s refresh), decay the confirmed score toward 0\n"
+        "            # by 1 step so stale flow/vol doesn't drive entries.\n"
+        "            _decay_after = 10\n"
+        "            if _none_count > _decay_after and self._conf[name] != 0:\n"
+        "                _old = self._conf[name]\n"
+        "                self._conf[name] = (\n"
+        "                    _old - 1 if _old > 0 else _old + 1\n"
+        "                )\n"
+        "                logger.info(\n"
+        "                    f\"RE-R03: {name} score decayed \"\n"
+        "                    f\"{_old} -> {self._conf[name]} \"\n"
+        "                    f\"(none_count={_none_count})\"\n"
+        "                )\n"
+        "            return self._conf[name]"
+    )
+    new_decay_none = (
+        "        if raw is None:\n"
+        "            # RE-T03/T04: wall-clock decay using last_valid_at.\n"
+        "            # Cycle-count decay was imprecise (API delays could\n"
+        "            # make 10 cycles take 20+ min). Use actual elapsed\n"
+        "            # exchange time. last_valid_at is persisted in SQLite\n"
+        "            # (see _save_state/_load_state) so restarts don't\n"
+        "            # reset the grace period.\n"
+        "            _lva_key = \"_last_valid_at_\" + name\n"
+        "            _last_valid = getattr(self, _lva_key, None)\n"
+        "            if _last_valid is not None:\n"
+        "                try:\n"
+        "                    _elapsed = (\n"
+        "                        datetime.now(self._IST)\n"
+        "                        - _last_valid\n"
+        "                    ).total_seconds()\n"
+        "                    # Decay after 10 minutes of no data\n"
+        "                    if _elapsed > 600 and self._conf[name] != 0:\n"
+        "                        _old = self._conf[name]\n"
+        "                        # Decay by 10% of current value per\n"
+        "                        # additional 5-minute interval\n"
+        "                        _intervals = int(\n"
+        "                            (_elapsed - 600) / 300\n"
+        "                        ) + 1\n"
+        "                        _decay = _old * (0.90 ** _intervals)\n"
+        "                        if abs(_decay) < 0.05:\n"
+        "                            _decay = 0.0\n"
+        "                        self._conf[name] = _decay\n"
+        "                        logger.info(\n"
+        "                            f\"RE-T03: {name} score decayed \"\n"
+        "                            f\"{_old:.3f} -> {_decay:.3f} \"\n"
+        "                            f\"(elapsed={_elapsed:.0f}s)\"\n"
+        "                        )\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "            return self._conf[name]"
+    )
+    content, ok = sub_exact(
+        old_decay_none, new_decay_none, content, "RE-T03/T04 wall-clock decay"
+    )
+    if ok:
+        changes.append("RE-T03/T04: stale-score decay uses wall-clock time")
+
+    # RE-T03/T04: Set last_valid_at when a real value arrives
+    old_reset_none_count = (
+        "        # Reset decay counter when a real value arrives\n"
+        "        setattr(self, \"_none_count_\" + name, 0)"
+    )
+    new_reset_none_count = (
+        "        # RE-T03/T04: record when this module last had real data\n"
+        "        setattr(\n"
+        "            self,\n"
+        "            \"_last_valid_at_\" + name,\n"
+        "            datetime.now(self._IST),\n"
+        "        )"
+    )
+    content, ok = sub_exact(
+        old_reset_none_count, new_reset_none_count, content, "RE-T04 last_valid_at"
+    )
+    if ok:
+        changes.append("RE-T04: last_valid_at set when real module value arrives")
+
+    # RE-T04: Persist last_valid_at in _save_state
+    old_save_items = (
+        "                (\"last_save_date\",  _today_save),\n"
+        "            ]:"
+    )
+    new_save_items = (
+        "                (\"last_save_date\",  _today_save),\n"
+        "                (\"last_valid_at\", {\n"
+        "                    m: getattr(\n"
+        "                        self,\n"
+        "                        \"_last_valid_at_\" + m,\n"
+        "                        None,\n"
+        "                    ).isoformat()\n"
+        "                    if getattr(\n"
+        "                        self,\n"
+        "                        \"_last_valid_at_\" + m,\n"
+        "                        None,\n"
+        "                    ) is not None else None\n"
+        "                    for m in MODULES\n"
+        "                }),\n"
+        "            ]:"
+    )
+    content, ok = sub_exact(
+        old_save_items, new_save_items, content, "RE-T04 persist last_valid_at"
+    )
+    if ok:
+        changes.append("RE-T04: last_valid_at persisted in SQLite via _save_state")
+
+    # RE-T04: Restore last_valid_at in _load_state
+    old_load_confirmed = (
+        "                    elif key == \"confirmed\":\n"
+        "                        self._conf = {\n"
+        "                            m: int(data.get(m, 0))\n"
+        "                            for m in MODULES\n"
+        "                        }"
+    )
+    new_load_confirmed = (
+        "                    elif key == \"confirmed\":\n"
+        "                        self._conf = {\n"
+        "                            m: float(data.get(m, 0))\n"
+        "                            for m in MODULES\n"
+        "                        }\n"
+        "                    elif key == \"last_valid_at\":\n"
+        "                        for m in MODULES:\n"
+        "                            ts_str = data.get(m)\n"
+        "                            if ts_str:\n"
+        "                                try:\n"
+        "                                    _ts = datetime.fromisoformat(\n"
+        "                                        ts_str\n"
+        "                                    )\n"
+        "                                    if _ts.tzinfo is None:\n"
+        "                                        _ts = self._IST.localize(_ts)\n"
+        "                                    setattr(\n"
+        "                                        self,\n"
+        "                                        \"_last_valid_at_\" + m,\n"
+        "                                        _ts,\n"
+        "                                    )\n"
+        "                                except Exception:\n"
+        "                                    pass"
+    )
+    content, ok = sub_exact(
+        old_load_confirmed, new_load_confirmed, content, "RE-T04 restore last_valid_at"
+    )
+    if ok:
+        changes.append("RE-T04: last_valid_at restored from SQLite on startup")
 
     return content, changes
 
@@ -593,762 +703,524 @@ def patch_regime_engine(content):
 def patch_strategy_engine(content):
     changes = []
 
-    # SE-R05: Add per-position CLOSING lock using a set of trade_ids
-    # Add _closing_positions set to __init__
-    old_inflight = (
-        "        self._inflight_tags:      set = set()\n"
-        "        self._inflight_lock       = asyncio.Lock()"
+    # Ratio spread max_risk undercalculation
+    old_ratio_risk = (
+        "        meta = {\n"
+        "            \"total_credit\":  total_credit,\n"
+        "            \"max_risk\":      total_credit * 2 * config.LOT_SIZE,\n"
+        "            \"profit_target\": total_credit * (\n"
+        "                1 - config.RATIO_TARGET_PCT\n"
+        "            ),\n"
+        "            \"stop_loss\":     total_credit * 2.0,\n"
+        "            \"exit_dte\":      config.RATIO_EXIT_DTE,\n"
+        "            \"max_hold_date\": None,\n"
+        "            \"strategy_type\": \"SHORT\",\n"
+        "        }"
     )
-    new_inflight = (
-        "        self._inflight_tags:      set = set()\n"
-        "        self._inflight_lock       = asyncio.Lock()\n"
-        "        # SE-R05: track positions currently being closed\n"
-        "        # to prevent concurrent close attempts from the\n"
-        "        # fast monitor, circuit breakers, and EOD handler.\n"
-        "        self._closing_positions:  set = set()"
-    )
-    content, ok = sub_exact(old_inflight, new_inflight, content, "SE-R05 closing set init")
-    if ok:
-        changes.append("SE-R05: _closing_positions set added to __init__")
-
-    # SE-R05: Guard _close_position with the closing set
-    old_close_start = (
-        "        if position.status != \"OPEN\":\n"
-        "            return\n"
-        "\n"
-        "        logger.info(\n"
-        "            f\"Closing: {position.trade_id[:8]} \"\n"
-        "            f\"strategy={position.strategy_name} \"\n"
-        "            f\"reason={exit_reason}\"\n"
-        "        )"
-    )
-    new_close_start = (
-        "        if position.status != \"OPEN\":\n"
-        "            return\n"
-        "\n"
-        "        # SE-R05: prevent concurrent close attempts.\n"
-        "        # The fast monitor runs every second; without this\n"
-        "        # guard a slow fill (>1s) causes duplicate orders.\n"
-        "        if position.trade_id in self._closing_positions:\n"
-        "            logger.debug(\n"
-        "                f\"Close already in progress: \"\n"
-        "                f\"{position.trade_id[:8]} — skipping\"\n"
-        "            )\n"
-        "            return\n"
-        "        self._closing_positions.add(position.trade_id)\n"
-        "\n"
-        "        logger.info(\n"
-        "            f\"Closing: {position.trade_id[:8]} \"\n"
-        "            f\"strategy={position.strategy_name} \"\n"
-        "            f\"reason={exit_reason}\"\n"
-        "        )"
-    )
-    content, ok = sub_exact(old_close_start, new_close_start, content, "SE-R05 close guard")
-    if ok:
-        changes.append("SE-R05: _close_position guarded against concurrent calls")
-
-    # SE-R05: Release the closing lock when done (both success and failure paths)
-    # The SE-N01 guard returns early on failure; we need to release there too.
-    old_close_guard_return = (
-        "        if _unconfirmed:\n"
-        "            logger.error(\n"
-        "                f\"SE-N01: {len(_unconfirmed)} leg(s) have no \"\n"
-        "                f\"confirmed exit price for \"\n"
-        "                f\"{position.trade_id[:8]} \u2014 \"\n"
-        "                f\"position remains OPEN. Manual review required.\"\n"
-        "            )\n"
-        "            # Mark legs that did exit so we don't re-close them,\n"
-        "            # but keep the position OPEN for the next cycle.\n"
-        "            return"
-    )
-    new_close_guard_return = (
-        "        if _unconfirmed:\n"
-        "            logger.error(\n"
-        "                f\"SE-N01: {len(_unconfirmed)} leg(s) have no \"\n"
-        "                f\"confirmed exit price for \"\n"
-        "                f\"{position.trade_id[:8]} \u2014 \"\n"
-        "                f\"position remains OPEN. Manual review required.\"\n"
-        "            )\n"
-        "            # Release the closing lock so the next cycle can retry\n"
-        "            self._closing_positions.discard(position.trade_id)\n"
-        "            return"
-    )
-    content, ok = sub_exact(
-        old_close_guard_return, new_close_guard_return, content, "SE-R05 release on failure"
-    )
-    if ok:
-        changes.append("SE-R05: closing lock released on partial-exit failure")
-
-    # SE-R05: Release on successful close
-    old_close_success = (
-        "        if position in self.open_positions:\n"
-        "            self.open_positions.remove(position)\n"
-        "        self.closed_positions.append(position)"
-    )
-    new_close_success = (
-        "        # SE-R05: release the closing lock\n"
-        "        self._closing_positions.discard(position.trade_id)\n"
-        "        if position in self.open_positions:\n"
-        "            self.open_positions.remove(position)\n"
-        "        self.closed_positions.append(position)"
-    )
-    content, ok = sub_exact(
-        old_close_success, new_close_success, content, "SE-R05 release on success"
-    )
-    if ok:
-        changes.append("SE-R05: closing lock released on successful close")
-
-    # SE-R01: Mark successfully closed legs so they are not re-closed
-    # Fix: after a successful leg exit, set fill_status="CLOSED_EXIT"
-    # and reduce qty to 0. The SE-N01 guard checks qty > 0.
-    old_leg_exit_success = (
-        "            if not success:\n"
-        "                logger.warning(\n"
-        "                    f\"Close leg failed \u2014 retrying market: \"\n"
-        "                    f\"{leg.option_type} {leg.strike}\"\n"
-        "                )\n"
-        "                retry_leg = Leg(\n"
-        "                    instrument_key=leg.instrument_key,\n"
-        "                    option_type=leg.option_type,\n"
-        "                    action=close_action,\n"
-        "                    strike=leg.strike,\n"
-        "                    expiry=leg.expiry,\n"
-        "                    qty=leg.qty,\n"
-        "                )\n"
-        "                await self._place_single_leg(\n"
-        "                    retry_leg,\n"
-        "                    use_market=True,\n"
-        "                    trade_id=(\n"
-        "                        f\"exit-retry-{position.trade_id}\"\n"
-        "                    ),\n"
-        "                    leg_index=idx,\n"
-        "                )\n"
-        "                leg.exit_price = retry_leg.entry_price\n"
-        "            else:\n"
-        "                leg.exit_price = close_leg.entry_price"
-    )
-    new_leg_exit_success = (
-        "            if not success:\n"
-        "                logger.warning(\n"
-        "                    f\"Close leg failed \u2014 retrying market: \"\n"
-        "                    f\"{leg.option_type} {leg.strike}\"\n"
-        "                )\n"
-        "                retry_leg = Leg(\n"
-        "                    instrument_key=leg.instrument_key,\n"
-        "                    option_type=leg.option_type,\n"
-        "                    action=close_action,\n"
-        "                    strike=leg.strike,\n"
-        "                    expiry=leg.expiry,\n"
-        "                    qty=leg.qty,\n"
-        "                )\n"
-        "                retry_ok, _ = await self._place_single_leg(\n"
-        "                    retry_leg,\n"
-        "                    use_market=True,\n"
-        "                    trade_id=(\n"
-        "                        f\"exit-retry-{position.trade_id}\"\n"
-        "                    ),\n"
-        "                    leg_index=idx,\n"
-        "                )\n"
-        "                # SE-R02: only record exit if retry actually filled\n"
-        "                if retry_ok and retry_leg.entry_price > 0:\n"
-        "                    # Use actual filled qty from retry_leg\n"
-        "                    leg.exit_price  = retry_leg.entry_price\n"
-        "                    leg.qty         = retry_leg.qty\n"
-        "                    leg.fill_status = \"CLOSED_EXIT\"\n"
-        "                # If retry also failed, leave exit_price=0 so\n"
-        "                # SE-N01 guard keeps the position OPEN\n"
-        "            else:\n"
-        "                # SE-R01: mark leg as fully exited so the next\n"
-        "                # monitoring cycle does not re-close it.\n"
-        "                leg.exit_price  = close_leg.entry_price\n"
-        "                leg.qty         = 0\n"
-        "                leg.fill_status = \"CLOSED_EXIT\""
-    )
-    content, ok = sub_exact(
-        old_leg_exit_success, new_leg_exit_success, content, "SE-R01/R02 leg exit marking"
-    )
-    if ok:
-        changes.append("SE-R01/R02: closed legs marked qty=0/CLOSED_EXIT; retry fill validated")
-
-    # Partial-close exit_price overwrite fix:
-    # In _close_one_side, do NOT set leg.exit_price until qty reaches 0.
-    # Only bank P&L and reduce qty. exit_price is set by _close_position.
-    old_one_side_exit = (
-        "                leg.exit_price  = exit_price\n"
-        "                leg.qty        -= qty_closed\n"
-        "                if leg.qty <= 0:\n"
-        "                    leg.qty         = 0\n"
-        "                    leg.fill_status = \"CLOSED_ONE_SIDE\"\n"
-        "                else:\n"
-        "                    leg.fill_status = (\n"
-        "                        \"PARTIALLY_CLOSED_ONE_SIDE\"\n"
-        "                    )\n"
-        "                    logger.warning(\n"
-        "                        f\"Partial one-side close: \"\n"
-        "                        f\"{leg.option_type} {leg.strike} \"\n"
-        "                        f\"remaining_qty={leg.qty}\"\n"
-        "                    )"
-    )
-    new_one_side_exit = (
-        "                # Partial-close exit_price fix: do NOT set\n"
-        "                # leg.exit_price here. The SE-N01 guard in\n"
-        "                # _close_position checks exit_price <= 0 to\n"
-        "                # detect unconfirmed legs. Setting it here on\n"
-        "                # a partial close causes the guard to pass even\n"
-        "                # when qty > 0 remains, marking the position\n"
-        "                # CLOSED with residual broker exposure.\n"
-        "                # exit_price is set only when qty reaches 0.\n"
-        "                leg.qty -= qty_closed\n"
-        "                if leg.qty <= 0:\n"
-        "                    leg.qty         = 0\n"
-        "                    leg.exit_price  = exit_price\n"
-        "                    leg.fill_status = \"CLOSED_ONE_SIDE\"\n"
-        "                else:\n"
-        "                    leg.fill_status = (\n"
-        "                        \"PARTIALLY_CLOSED_ONE_SIDE\"\n"
-        "                    )\n"
-        "                    logger.warning(\n"
-        "                        f\"Partial one-side close: \"\n"
-        "                        f\"{leg.option_type} {leg.strike} \"\n"
-        "                        f\"remaining_qty={leg.qty}\"\n"
-        "                    )"
-    )
-    content, ok = sub_exact(
-        old_one_side_exit, new_one_side_exit, content, "partial-close exit_price fix"
-    )
-    if ok:
-        changes.append("Partial-close: exit_price only set when leg qty reaches 0")
-
-    # SE-R03: Ratio-aware rebalance
-    # Replace the min-absolute-qty rebalance with a ratio-aware version.
-    old_rebalance_body = (
-        "        if not any(l.fill_status == \"PARTIAL\" for l in legs):\n"
-        "            return True\n"
-        "        min_qty = min(\n"
-        "            (l.qty for l in legs if l.qty > 0), default=0\n"
+    new_ratio_risk = (
+        "        # Ratio spread max_risk fix: the maximum loss of a\n"
+        "        # 1x2 ratio spread occurs when the underlying pins the\n"
+        "        # long strike at expiry. Max loss = wing_width - credit.\n"
+        "        # The old formula (credit * 2) understated this by ~2x\n"
+        "        # for typical credit levels, causing over-leveraging.\n"
+        "        _ratio_max_risk = max(\n"
+        "            (config.RATIO_ATM_OFFSET_PTS - total_credit)\n"
+        "            * config.LOT_SIZE,\n"
+        "            total_credit * config.LOT_SIZE,  # floor: at least credit\n"
         "        )\n"
-        "        if min_qty <= 0:\n"
-        "            return True\n"
-        "        for idx, leg in enumerate(legs):\n"
-        "            excess = leg.qty - min_qty\n"
-        "            if excess > 0:\n"
-        "                trim_action = (\n"
-        "                    \"BUY\" if leg.action == \"SELL\" else \"SELL\"\n"
-        "                )\n"
-        "                trim_leg = Leg(\n"
-        "                    instrument_key=leg.instrument_key,\n"
-        "                    option_type=leg.option_type,\n"
-        "                    action=trim_action,\n"
-        "                    strike=leg.strike,\n"
-        "                    expiry=leg.expiry,\n"
-        "                    qty=excess,\n"
-        "                )\n"
-        "                success, _ = await self._place_single_leg(\n"
-        "                    trim_leg,\n"
-        "                    use_market=True,\n"
-        "                    trade_id=(\n"
-        "                        f\"rebalance-{uuid.uuid4().hex[:8]}\"\n"
-        "                    ),\n"
-        "                    leg_index=idx,\n"
-        "                )\n"
-        "                if success:\n"
-        "                    logger.warning(\n"
-        "                        f\"Rebalanced {leg.option_type} \"\n"
-        "                        f\"{leg.strike}: trimmed \"\n"
-        "                        f\"{trim_leg.qty} lots to match \"\n"
-        "                        f\"partial-fill minimum {min_qty}\"\n"
-        "                    )\n"
-        "                    leg.qty = min_qty\n"
-        "                else:\n"
-        "                    logger.error(\n"
-        "                        f\"Rebalance trim FAILED for \"\n"
-        "                        f\"{leg.option_type} {leg.strike} \u2014 \"\n"
-        "                        f\"returning False for caller to reverse\"\n"
-        "                    )\n"
-        "                    return False\n"
-        "                await asyncio.sleep(\n"
-        "                    config.ORDER_BETWEEN_LEGS_DELAY_SEC\n"
-        "                )\n"
-        "        return True"
+        "        meta = {\n"
+        "            \"total_credit\":  total_credit,\n"
+        "            \"max_risk\":      _ratio_max_risk,\n"
+        "            \"profit_target\": total_credit * (\n"
+        "                1 - config.RATIO_TARGET_PCT\n"
+        "            ),\n"
+        "            \"stop_loss\":     total_credit * 2.0,\n"
+        "            \"exit_dte\":      config.RATIO_EXIT_DTE,\n"
+        "            \"max_hold_date\": None,\n"
+        "            \"strategy_type\": \"SHORT\",\n"
+        "        }"
     )
-    new_rebalance_body = (
-        "        if not any(l.fill_status == \"PARTIAL\" for l in legs):\n"
-        "            return True\n"
-        "\n"
-        "        # SE-R03: ratio-aware rebalance.\n"
-        "        # Trimming all legs to min(qty) destroys ratio structures\n"
-        "        # (butterfly 1:2:1, backspread 3:1). Instead, find the\n"
-        "        # largest common unit (gcd of filled/intended ratios)\n"
-        "        # and trim each leg to intended_ratio * common_units.\n"
-        "        #\n"
-        "        # intended_qty is the qty BEFORE lot-scaling (always 1,\n"
-        "        # 2, or 3 for the strategies we build). We recover it\n"
-        "        # from the minimum non-zero qty among legs that fully\n"
-        "        # filled (fill_status != PARTIAL) as the ratio base.\n"
-        "        import math as _math_rb\n"
-        "\n"
-        "        # Determine the ratio base: smallest fully-filled leg qty\n"
-        "        full_qtys = [\n"
-        "            l.qty for l in legs\n"
-        "            if l.qty > 0 and l.fill_status != \"PARTIAL\"\n"
-        "        ]\n"
-        "        if not full_qtys:\n"
-        "            # All legs partial — use min qty as base\n"
-        "            full_qtys = [l.qty for l in legs if l.qty > 0]\n"
-        "        if not full_qtys:\n"
-        "            return True\n"
-        "\n"
-        "        base_qty = min(full_qtys)\n"
-        "        if base_qty <= 0:\n"
-        "            return True\n"
-        "\n"
-        "        # Compute ratio of each leg relative to base\n"
-        "        # and find the common units achievable given partial fills\n"
-        "        common_units = None\n"
-        "        for leg in legs:\n"
-        "            if leg.qty <= 0:\n"
-        "                continue\n"
-        "            ratio = round(leg.qty / base_qty)\n"
-        "            if ratio < 1:\n"
-        "                ratio = 1\n"
-        "            achievable = leg.qty // ratio\n"
-        "            if common_units is None or achievable < common_units:\n"
-        "                common_units = achievable\n"
-        "\n"
-        "        if common_units is None or common_units <= 0:\n"
-        "            return True\n"
-        "\n"
-        "        for idx, leg in enumerate(legs):\n"
-        "            if leg.qty <= 0:\n"
-        "                continue\n"
-        "            ratio      = max(1, round(leg.qty / base_qty))\n"
-        "            target_qty = common_units * ratio\n"
-        "            excess     = leg.qty - target_qty\n"
-        "            if excess <= 0:\n"
-        "                continue\n"
-        "            trim_action = (\n"
-        "                \"BUY\" if leg.action == \"SELL\" else \"SELL\"\n"
-        "            )\n"
-        "            trim_leg = Leg(\n"
-        "                instrument_key=leg.instrument_key,\n"
-        "                option_type=leg.option_type,\n"
-        "                action=trim_action,\n"
-        "                strike=leg.strike,\n"
-        "                expiry=leg.expiry,\n"
-        "                qty=excess,\n"
-        "            )\n"
-        "            success, _ = await self._place_single_leg(\n"
-        "                trim_leg,\n"
-        "                use_market=True,\n"
-        "                trade_id=(\n"
-        "                    f\"rebalance-{uuid.uuid4().hex[:8]}\"\n"
-        "                ),\n"
-        "                leg_index=idx,\n"
-        "            )\n"
-        "            if success:\n"
-        "                logger.warning(\n"
-        "                    f\"Rebalanced {leg.option_type} \"\n"
-        "                    f\"{leg.strike}: trimmed \"\n"
-        "                    f\"{excess} lots (ratio={ratio}, \"\n"
-        "                    f\"target={target_qty})\"\n"
-        "                )\n"
-        "                leg.qty = target_qty\n"
-        "            else:\n"
-        "                logger.error(\n"
-        "                    f\"Rebalance trim FAILED for \"\n"
-        "                    f\"{leg.option_type} {leg.strike} \u2014 \"\n"
-        "                    f\"returning False for caller to reverse\"\n"
-        "                )\n"
+    content, ok = sub_exact(
+        old_ratio_risk, new_ratio_risk, content, "ratio spread max_risk fix"
+    )
+    if ok:
+        changes.append("Ratio spread: max_risk = (wing_width - credit) * LOT_SIZE")
+
+    # Backspread: add premium stop-loss check
+    old_backspread_stop = (
+        "        elif strategy == config.STRAT_BACKSPREAD:\n"
+        "            if self.dm.spot is None:\n"
         "                return False\n"
-        "            await asyncio.sleep(\n"
-        "                config.ORDER_BETWEEN_LEGS_DELAY_SEC\n"
-        "            )\n"
-        "        return True"
-    )
-    content, ok = sub_exact(
-        old_rebalance_body, new_rebalance_body, content, "SE-R03 ratio-aware rebalance"
-    )
-    if ok:
-        changes.append("SE-R03: _rebalance_partial_fills uses ratio-aware trimming")
-
-    # SE-R04: Remove the broken uniform metadata scaling after partial fills
-    # The scaling used min(qty)/lots which is wrong for ratio legs.
-    # Replace with a note that metadata is rebuilt from actual legs.
-    old_partial_scale = (
-        "        # AUDIT SE-N03: if any leg partially filled, the lot count\n"
-        "        # was reduced. Rescale stop, target, max_risk to actual fills.\n"
-        "        _filled_lots = min(\n"
-        "            (l.qty for l in legs if l.qty > 0), default=lots\n"
-        "        )\n"
-        "        if _filled_lots < lots and lots > 0:\n"
-        "            _scale = _filled_lots / lots\n"
-        "            meta[\"max_risk\"] = meta.get(\"max_risk\", 0) * _scale\n"
-        "            if meta.get(\"stop_loss\"):\n"
-        "                meta[\"stop_loss\"] = meta[\"stop_loss\"] * _scale\n"
-        "            if meta.get(\"profit_target\"):\n"
-        "                meta[\"profit_target\"] = (\n"
-        "                    meta[\"profit_target\"] * _scale\n"
+        "            trend = position.trend_direction\n"
+        "            if trend >= 0:\n"
+        "                stop_level = position.entry_spot * (\n"
+        "                    1 - config.BACKSPREAD_STOP_MOVE_PCT\n"
         "                )\n"
-        "            logger.info(\n"
-        "                f\"SE-N03: partial fill rescale \"\n"
-        "                f\"{lots}->{_filled_lots} lots, \"\n"
-        "                f\"scale={_scale:.3f}\"\n"
-        "            )"
-    )
-    new_partial_scale = (
-        "        # SE-R04: recompute risk metadata from actual filled legs.\n"
-        "        # The previous uniform scale (min_qty/lots) was wrong for\n"
-        "        # ratio structures (backspread 3:1, butterfly 1:2:1) because\n"
-        "        # it applied one scalar to all legs regardless of their ratio.\n"
-        "        # Instead, recompute max_risk from actual leg quantities and\n"
-        "        # entry prices so the position record is always self-consistent.\n"
-        "        _actual_credit = sum(\n"
-        "            l.entry_price * l.qty\n"
-        "            for l in legs if l.action == \"SELL\" and l.entry_price > 0\n"
-        "        )\n"
-        "        _actual_debit = sum(\n"
-        "            l.entry_price * l.qty\n"
-        "            for l in legs if l.action == \"BUY\" and l.entry_price > 0\n"
-        "        )\n"
-        "        _any_partial = any(\n"
-        "            l.fill_status == \"PARTIAL\" for l in legs\n"
-        "        )\n"
-        "        if _any_partial:\n"
-        "            # For credit strategies: max_risk = wing_width - credit\n"
-        "            # For debit strategies: max_risk = net debit paid\n"
-        "            _strategy_type = meta.get(\"strategy_type\", \"SHORT\")\n"
-        "            if _strategy_type == \"SHORT\" and _actual_credit > 0:\n"
-        "                _wing = meta.get(\"max_risk\", 0) / config.LOT_SIZE\n"
-        "                _wing += meta.get(\"net_credit\",\n"
-        "                                  meta.get(\"total_credit\", 0))\n"
-        "                meta[\"max_risk\"] = max(\n"
-        "                    0,\n"
-        "                    (_wing - _actual_credit) * config.LOT_SIZE,\n"
-        "                )\n"
-        "                if meta.get(\"stop_loss\"):\n"
-        "                    meta[\"stop_loss\"] = _actual_credit * 2.0\n"
-        "                if meta.get(\"profit_target\"):\n"
-        "                    meta[\"profit_target\"] = _actual_credit * (\n"
-        "                        1 - config.PROFIT_TARGET_PCT\n"
+        "                if self.dm.spot < stop_level:\n"
+        "                    await self._close_position(\n"
+        "                        position,\n"
+        "                        config.EXIT_REASONS[\"STOP_LOSS\"],\n"
         "                    )\n"
+        "                    return True\n"
         "            else:\n"
-        "                _net = _actual_debit - _actual_credit\n"
-        "                meta[\"max_risk\"] = max(\n"
-        "                    0, _net * config.LOT_SIZE\n"
+        "                stop_level = position.entry_spot * (\n"
+        "                    1 + config.BACKSPREAD_STOP_MOVE_PCT\n"
         "                )\n"
-        "            logger.info(\n"
-        "                f\"SE-R04: metadata rebuilt from actual fills: \"\n"
-        "                f\"credit={_actual_credit:.2f} \"\n"
-        "                f\"debit={_actual_debit:.2f} \"\n"
-        "                f\"max_risk={meta['max_risk']:.0f}\"\n"
-        "            )"
+        "                if self.dm.spot > stop_level:\n"
+        "                    await self._close_position(\n"
+        "                        position,\n"
+        "                        config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                    )\n"
+        "                    return True"
     )
-    content, ok = sub_exact(
-        old_partial_scale, new_partial_scale, content, "SE-R04 ratio-aware metadata"
-    )
-    if ok:
-        changes.append("SE-R04: partial-fill metadata rebuilt from actual legs (ratio-aware)")
-
-    # SE-R06: Add _revalue_position helper and call it after partial reductions
-    # Add helper method after _estimate_costs
-    old_estimate_costs = (
-        "    def _estimate_costs(\n"
-        "        self, position: Position\n"
-        "    ) -> float:\n"
-        "        return self._calculate_transaction_costs(position)"
-    )
-    new_estimate_costs = (
-        "    def _estimate_costs(\n"
-        "        self, position: Position\n"
-        "    ) -> float:\n"
-        "        return self._calculate_transaction_costs(position)\n"
-        "\n"
-        "    def _revalue_position_structure(\n"
-        "        self, position: Position\n"
-        "    ) -> None:\n"
-        "        \"\"\"\n"
-        "        SE-R06: Recompute all position-level risk metrics from\n"
-        "        the current leg quantities and entry prices. Call this\n"
-        "        after any structural change (partial close, reduction,\n"
-        "        one-side close, defensive conversion).\n"
-        "        \"\"\"\n"
-        "        active_legs = [l for l in position.legs if l.qty > 0]\n"
-        "        if not active_legs:\n"
-        "            return\n"
-        "\n"
-        "        new_credit = sum(\n"
-        "            l.entry_price * l.qty\n"
-        "            for l in active_legs if l.action == \"SELL\"\n"
-        "        )\n"
-        "        new_debit = sum(\n"
-        "            l.entry_price * l.qty\n"
-        "            for l in active_legs if l.action == \"BUY\"\n"
-        "        )\n"
-        "\n"
-        "        position.total_credit = new_credit\n"
-        "        position.total_debit  = new_debit\n"
-        "        position.net_premium  = new_credit - new_debit\n"
-        "\n"
-        "        strategy_type = position.meta.get(\"strategy_type\", \"SHORT\")\n"
-        "        if strategy_type == \"SHORT\" and new_credit > 0:\n"
-        "            # max_risk for credit strategies: wing_width - credit\n"
-        "            # Approximate wing_width from original max_risk + credit\n"
-        "            _orig_credit = position.meta.get(\n"
-        "                \"total_credit\",\n"
-        "                position.meta.get(\"net_credit\", new_credit),\n"
-        "            )\n"
-        "            _orig_max_risk = position.max_risk\n"
-        "            if _orig_credit > 0:\n"
-        "                _wing = (\n"
-        "                    _orig_max_risk / config.LOT_SIZE + _orig_credit\n"
-        "                )\n"
-        "                position.max_risk = max(\n"
-        "                    0,\n"
-        "                    (_wing - new_credit) * config.LOT_SIZE,\n"
-        "                )\n"
-        "            position.stop_loss = new_credit * 2.0\n"
-        "            position.profit_target = new_credit * (\n"
-        "                1 - config.PROFIT_TARGET_PCT\n"
-        "            )\n"
-        "        elif strategy_type == \"LONG\" and new_debit > 0:\n"
-        "            position.max_risk = new_debit * config.LOT_SIZE\n"
-        "            position.stop_loss = new_debit * (\n"
-        "                1 - config.LONG_STRADDLE_STOP_PCT\n"
-        "            )\n"
-        "            position.profit_target = new_debit * (\n"
-        "                1 + config.LONG_STRADDLE_TARGET_PCT\n"
-        "            )\n"
-        "\n"
-        "        logger.info(\n"
-        "            f\"Revalued {position.trade_id[:8]}: \"\n"
-        "            f\"credit={new_credit:.2f} \"\n"
-        "            f\"max_risk={position.max_risk:.0f} \"\n"
-        "            f\"stop={position.stop_loss:.2f} \"\n"
-        "            f\"target={position.profit_target:.2f}\"\n"
-        "        )"
-    )
-    content, ok = sub_exact(
-        old_estimate_costs, new_estimate_costs, content, "SE-R06 revalue helper"
-    )
-    if ok:
-        changes.append("SE-R06: _revalue_position_structure() helper added")
-
-    # Call _revalue_position_structure after _reduce_position_50pct
-    old_reduce_50_end = (
-        "        self._move_stop_to_breakeven(position)"
-    )
-    new_reduce_50_end = (
-        "        # SE-R06: rebase all risk metrics after structural change\n"
-        "        self._revalue_position_structure(position)\n"
-        "        self._move_stop_to_breakeven(position)"
-    )
-    content, ok = sub_exact(
-        old_reduce_50_end, new_reduce_50_end, content, "SE-R06 revalue after reduce 50"
-    )
-    if ok:
-        changes.append("SE-R06: _revalue called after _reduce_position_50pct")
-
-    # Call _revalue after _close_one_side
-    old_close_one_side_end = (
-        "        logger.info(\n"
-        "            f\"Closed {option_type} side of \"\n"
-        "            f\"{position.trade_id[:8]}\"\n"
-        "        )"
-    )
-    new_close_one_side_end = (
-        "        # SE-R06: rebase risk metrics after one-side close\n"
-        "        self._revalue_position_structure(position)\n"
-        "        logger.info(\n"
-        "            f\"Closed {option_type} side of \"\n"
-        "            f\"{position.trade_id[:8]}\"\n"
-        "        )"
-    )
-    content, ok = sub_exact(
-        old_close_one_side_end, new_close_one_side_end, content,
-        "SE-R06 revalue after one-side close"
-    )
-    if ok:
-        changes.append("SE-R06: _revalue called after _close_one_side")
-
-    # Pre-trade EV check after costs
-    # Add cost check at end of _pre_trade_checks before returning True
-    old_pretrade_return = (
-        "        if not config.PAPER_TRADING_MODE:\n"
-        "            margin_legs = [\n"
-        "                {\n"
-        "                    \"instrument_key\":   leg.instrument_key,\n"
-        "                    \"quantity\": (\n"
-        "                        leg.qty * config.LOT_SIZE\n"
-        "                    ),\n"
-        "                    \"transaction_type\": leg.action,\n"
-        "                    \"product\":          \"D\",\n"
-        "                    \"price\":            self._leg_price(leg),\n"
-        "                }\n"
-        "                for leg in legs\n"
-        "            ]\n"
-        "            margin_ok, required = (\n"
-        "                await self.dm.check_margin(margin_legs)\n"
-        "            )\n"
-        "            if not margin_ok:\n"
-        "                logger.warning(\n"
-        "                    f\"Pre-trade: insufficient margin \"\n"
-        "                    f\"required={required:.0f}\"\n"
-        "                )\n"
+    new_backspread_stop = (
+        "        elif strategy == config.STRAT_BACKSPREAD:\n"
+        "            if self.dm.spot is None:\n"
         "                return False\n"
-        "\n"
-        "        return True"
-    )
-    new_pretrade_return = (
-        "        if not config.PAPER_TRADING_MODE:\n"
-        "            margin_legs = [\n"
-        "                {\n"
-        "                    \"instrument_key\":   leg.instrument_key,\n"
-        "                    \"quantity\": (\n"
-        "                        leg.qty * config.LOT_SIZE\n"
-        "                    ),\n"
-        "                    \"transaction_type\": leg.action,\n"
-        "                    \"product\":          \"D\",\n"
-        "                    \"price\":            self._leg_price(leg),\n"
-        "                }\n"
-        "                for leg in legs\n"
-        "            ]\n"
-        "            margin_ok, required = (\n"
-        "                await self.dm.check_margin(margin_legs)\n"
-        "            )\n"
-        "            if not margin_ok:\n"
-        "                logger.warning(\n"
-        "                    f\"Pre-trade: insufficient margin \"\n"
-        "                    f\"required={required:.0f}\"\n"
-        "                )\n"
-        "                return False\n"
-        "\n"
-        "        # Pre-trade EV check: net credit must exceed estimated\n"
-        "        # round-trip transaction costs by at least 1.5x.\n"
-        "        # This filters marginal trades that are profitable in\n"
-        "        # points but net losers after STT/brokerage/exchange fees.\n"
-        "        _est_credit = sum(\n"
-        "            self._leg_price(l) * l.qty\n"
-        "            for l in legs if l.action == \"SELL\"\n"
-        "        )\n"
-        "        _est_debit = sum(\n"
-        "            self._leg_price(l) * l.qty\n"
-        "            for l in legs if l.action == \"BUY\"\n"
-        "        )\n"
-        "        _net_premium_pts = _est_credit - _est_debit\n"
-        "        if _net_premium_pts > 0:\n"
-        "            # Credit strategy: check net credit > 1.5x costs\n"
-        "            _mock_pos = type(\n"
-        "                \"_MockPos\", (),\n"
-        "                {\n"
-        "                    \"legs\": [\n"
-        "                        type(\"_L\", (), {\n"
-        "                            \"entry_price\": self._leg_price(l),\n"
-        "                            \"exit_price\":  self._leg_price(l),\n"
-        "                            \"qty\":         l.qty,\n"
-        "                            \"action\":      l.action,\n"
-        "                        })()\n"
-        "                        for l in legs\n"
-        "                    ]\n"
-        "                }\n"
-        "            )()\n"
-        "            try:\n"
-        "                _est_costs = self._calculate_transaction_costs(\n"
-        "                    _mock_pos\n"
-        "                )\n"
-        "                _net_credit_rupees = (\n"
-        "                    _net_premium_pts * config.LOT_SIZE\n"
-        "                )\n"
-        "                _min_required = _est_costs * 1.5\n"
-        "                if _net_credit_rupees < _min_required:\n"
+        "            # Backspread premium stop: check debit threshold\n"
+        "            # FIRST. During an IV crush, spot may barely move\n"
+        "            # while the position bleeds premium. The spot-based\n"
+        "            # stop alone misses this scenario entirely.\n"
+        "            if position.stop_loss and position.stop_loss > 0:\n"
+        "                current_val = self._get_position_value(position)\n"
+        "                if current_val <= position.stop_loss:\n"
         "                    logger.info(\n"
-        "                        f\"Pre-trade EV: net credit \"\n"
-        "                        f\"Rs{_net_credit_rupees:.0f} < \"\n"
-        "                        f\"1.5x costs Rs{_min_required:.0f} \"\n"
-        "                        f\"— skipping\"\n"
+        "                        f\"Backspread premium stop: \"\n"
+        "                        f\"val={current_val:.2f} \"\n"
+        "                        f\"stop={position.stop_loss:.2f}\"\n"
         "                    )\n"
-        "                    return False\n"
-        "            except Exception as _ev_e:\n"
-        "                logger.debug(\n"
-        "                    f\"Pre-trade EV check error: {_ev_e}\"\n"
+        "                    await self._close_position(\n"
+        "                        position,\n"
+        "                        config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                    )\n"
+        "                    return True\n"
+        "            trend = position.trend_direction\n"
+        "            if trend >= 0:\n"
+        "                stop_level = position.entry_spot * (\n"
+        "                    1 - config.BACKSPREAD_STOP_MOVE_PCT\n"
         "                )\n"
-        "\n"
-        "        return True"
+        "                if self.dm.spot < stop_level:\n"
+        "                    await self._close_position(\n"
+        "                        position,\n"
+        "                        config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                    )\n"
+        "                    return True\n"
+        "            else:\n"
+        "                stop_level = position.entry_spot * (\n"
+        "                    1 + config.BACKSPREAD_STOP_MOVE_PCT\n"
+        "                )\n"
+        "                if self.dm.spot > stop_level:\n"
+        "                    await self._close_position(\n"
+        "                        position,\n"
+        "                        config.EXIT_REASONS[\"STOP_LOSS\"],\n"
+        "                    )\n"
+        "                    return True"
     )
     content, ok = sub_exact(
-        old_pretrade_return, new_pretrade_return, content, "pre-trade EV check"
+        old_backspread_stop, new_backspread_stop, content, "backspread premium stop"
     )
     if ok:
-        changes.append("Pre-trade EV: net credit must exceed 1.5x transaction costs")
+        changes.append("Backspread: premium stop-loss added (IV crush protection)")
 
-    # Trailing stop for debit strategies
-    # Extend _check_trailing_stop to cover debit strategies
-    old_trailing_guard = (
-        "        if position.strategy_name not in [\n"
-        "            config.STRAT_SHORT_STRADDLE,\n"
-        "            config.STRAT_IRON_CONDOR,\n"
-        "            config.STRAT_CREDIT_SPREADS,\n"
-        "            config.STRAT_RATIO_SPREAD,\n"
-        "        ]:\n"
-        "            return False\n"
-        "        if not position.total_credit or position.total_credit <= 0:\n"
-        "            return False"
+    # P&L fallback: use get_mark_price() instead of entry_price
+    old_pnl_fallback = (
+        "            if exit_price == 0 and not is_expired_worthless:\n"
+        "                # PATCH: prefer bid/ask midpoint over raw ltp when\n"
+        "                # falling back (leg was never actually closed with\n"
+        "                # a real fill price).\n"
+        "                fallback_opt = (\n"
+        "                    expiry_chain\n"
+        "                    .get(leg.strike, {})\n"
+        "                    .get(leg.option_type, {})\n"
+        "                )\n"
+        "                fb_bid = fallback_opt.get(\"bid\", 0)\n"
+        "                fb_ask = fallback_opt.get(\"ask\", 0)\n"
+        "                if fb_bid > 0 and fb_ask > 0:\n"
+        "                    exit_price = (fb_bid + fb_ask) / 2.0\n"
+        "                else:\n"
+        "                    exit_price = fallback_opt.get(\"ltp\", 0)\n"
+        "            if exit_price == 0 and not is_expired_worthless:\n"
+        "                exit_price = leg.entry_price"
     )
-    new_trailing_guard = (
-        "        # Trailing stop for debit strategies\n"
-        "        _debit_strategies = [\n"
-        "            config.STRAT_LONG_STRADDLE,\n"
-        "            config.STRAT_STRANGLE,\n"
-        "            config.STRAT_BUTTERFLY,\n"
-        "            config.STRAT_BACKSPREAD,\n"
-        "        ]\n"
-        "        if position.strategy_name in _debit_strategies:\n"
-        "            if not position.total_debit or position.total_debit <= 0:\n"
-        "                return False\n"
-        "            current_val = self._get_position_value(position)\n"
-        "            # Value as multiple of debit paid\n"
-        "            value_pct = current_val / (\n"
-        "                position.total_debit * config.LOT_SIZE\n"
-        "            ) if position.total_debit > 0 else 0.0\n"
-        "            peak = position.meta.get(\n"
-        "                \"_peak_value_pct\", 0.0\n"
-        "            )\n"
-        "            if value_pct > peak:\n"
-        "                peak = value_pct\n"
-        "                position.meta[\"_peak_value_pct\"] = peak\n"
-        "            # Close when value retraces 30% from peak\n"
-        "            # Only activate once we have a meaningful gain (>20%)\n"
-        "            if (\n"
-        "                peak >= 1.20\n"
-        "                and value_pct <= peak * 0.70\n"
-        "            ):\n"
-        "                logger.info(\n"
-        "                    f\"Debit trailing stop: \"\n"
-        "                    f\"{position.strategy_name} \"\n"
-        "                    f\"peak={peak:.2%} \"\n"
-        "                    f\"current={value_pct:.2%}\"\n"
+    new_pnl_fallback = (
+        "            if exit_price == 0 and not is_expired_worthless:\n"
+        "                # Use staleness-aware mark price as fallback.\n"
+        "                # The old fallback (entry_price) recorded zero P&L\n"
+        "                # for a failed exit on a deep-ITM leg, preventing\n"
+        "                # CB L2/L3 from firing when they were needed most.\n"
+        "                fallback_opt = (\n"
+        "                    expiry_chain\n"
+        "                    .get(leg.strike, {})\n"
+        "                    .get(leg.option_type, {})\n"
         "                )\n"
-        "                await self._close_position(\n"
-        "                    position,\n"
-        "                    config.EXIT_REASONS[\"PROFIT_TARGET\"],\n"
+        "                _mark = self.dm.get_mark_price(\n"
+        "                    fallback_opt,\n"
+        "                    fallback=0.0,\n"
         "                )\n"
-        "                return True\n"
-        "            return False\n"
-        "\n"
-        "        if position.strategy_name not in [\n"
-        "            config.STRAT_SHORT_STRADDLE,\n"
-        "            config.STRAT_IRON_CONDOR,\n"
-        "            config.STRAT_CREDIT_SPREADS,\n"
-        "            config.STRAT_RATIO_SPREAD,\n"
-        "        ]:\n"
-        "            return False\n"
-        "        if not position.total_credit or position.total_credit <= 0:\n"
-        "            return False"
+        "                if _mark > 0:\n"
+        "                    exit_price = _mark\n"
+        "            if exit_price == 0 and not is_expired_worthless:\n"
+        "                # Last resort: use entry_price only if mark is\n"
+        "                # also unavailable (e.g. position not in chain).\n"
+        "                exit_price = leg.entry_price"
     )
     content, ok = sub_exact(
-        old_trailing_guard, new_trailing_guard, content, "trailing stop debit"
+        old_pnl_fallback, new_pnl_fallback, content, "P&L fallback get_mark_price"
     )
     if ok:
-        changes.append("Trailing stop: added for debit strategies (30% retrace from peak)")
+        changes.append("P&L fallback: uses get_mark_price() instead of entry_price")
+
+    # SE-T01: Route _get_position_value through get_mark_price()
+    old_get_value = (
+        "    def _get_position_value(\n"
+        "        self, position: Position\n"
+        "    ) -> float:\n"
+        "        total        = 0.0\n"
+        "        expiry_chain = self.dm.get_chain_for_expiry(\n"
+        "            position.expiry_date\n"
+        "        )\n"
+        "        for leg in position.legs:\n"
+        "            opt_data = (\n"
+        "                expiry_chain\n"
+        "                .get(leg.strike, {})\n"
+        "                .get(leg.option_type, {})\n"
+        "            )\n"
+        "            # PATCH: prefer bid/ask midpoint over raw ltp —\n"
+        "            # avoids a stale single-print ltp driving stop/target\n"
+        "            # decisions for long straddle/strangle/backspread/etc.\n"
+        "            bid = opt_data.get(\"bid\", 0)\n"
+        "            ask = opt_data.get(\"ask\", 0)\n"
+        "            ltp = opt_data.get(\"ltp\", 0)\n"
+        "            if bid > 0 and ask > 0:\n"
+        "                mark = (bid + ask) / 2.0\n"
+        "            elif ltp > 0:\n"
+        "                mark = ltp\n"
+        "            else:\n"
+        "                mark = leg.entry_price\n"
+        "            total += mark * leg.qty\n"
+        "        return total"
+    )
+    new_get_value = (
+        "    def _get_position_value(\n"
+        "        self, position: Position\n"
+        "    ) -> float:\n"
+        "        # SE-T01: use staleness-aware get_mark_price() so\n"
+        "        # profit-target and stop-loss decisions use the same\n"
+        "        # freshness logic as the fast P&L monitor.\n"
+        "        total        = 0.0\n"
+        "        expiry_chain = self.dm.get_chain_for_expiry(\n"
+        "            position.expiry_date\n"
+        "        )\n"
+        "        for leg in position.legs:\n"
+        "            opt_data = (\n"
+        "                expiry_chain\n"
+        "                .get(leg.strike, {})\n"
+        "                .get(leg.option_type, {})\n"
+        "            )\n"
+        "            mark = self.dm.get_mark_price(\n"
+        "                opt_data, fallback=leg.entry_price\n"
+        "            )\n"
+        "            total += mark * leg.qty\n"
+        "        return total"
+    )
+    content, ok = sub_exact(
+        old_get_value, new_get_value, content, "SE-T01 _get_position_value"
+    )
+    if ok:
+        changes.append("SE-T01: _get_position_value uses get_mark_price()")
+
+    # SE-T01: Route _get_position_current_premium through get_mark_price()
+    old_get_premium = (
+        "    def _get_position_current_premium(\n"
+        "        self, position: Position\n"
+        "    ) -> float:\n"
+        "        net          = 0.0\n"
+        "        expiry_chain = self.dm.get_chain_for_expiry(\n"
+        "            position.expiry_date\n"
+        "        )\n"
+        "        for leg in position.legs:\n"
+        "            opt_data = (\n"
+        "                expiry_chain\n"
+        "                .get(leg.strike, {})\n"
+        "                .get(leg.option_type, {})\n"
+        "            )\n"
+        "            # PATCH: prefer bid/ask midpoint over raw ltp —\n"
+        "            # profit-target/stop-loss decisions should not be\n"
+        "            # driven by a stale single-print ltp.\n"
+        "            bid = opt_data.get(\"bid\", 0)\n"
+        "            ask = opt_data.get(\"ask\", 0)\n"
+        "            ltp = opt_data.get(\"ltp\", 0)\n"
+        "            if bid > 0 and ask > 0:\n"
+        "                mark = (bid + ask) / 2.0\n"
+        "            elif ltp > 0:\n"
+        "                mark = ltp\n"
+        "            else:\n"
+        "                mark = leg.entry_price\n"
+        "            if leg.action == \"SELL\":\n"
+        "                net += mark * leg.qty\n"
+        "            else:\n"
+        "                net -= mark * leg.qty\n"
+        "        return net"
+    )
+    new_get_premium = (
+        "    def _get_position_current_premium(\n"
+        "        self, position: Position\n"
+        "    ) -> float:\n"
+        "        # SE-T01: use staleness-aware get_mark_price() so\n"
+        "        # credit-strategy stop/target decisions use the same\n"
+        "        # freshness logic as the fast P&L monitor.\n"
+        "        net          = 0.0\n"
+        "        expiry_chain = self.dm.get_chain_for_expiry(\n"
+        "            position.expiry_date\n"
+        "        )\n"
+        "        for leg in position.legs:\n"
+        "            opt_data = (\n"
+        "                expiry_chain\n"
+        "                .get(leg.strike, {})\n"
+        "                .get(leg.option_type, {})\n"
+        "            )\n"
+        "            mark = self.dm.get_mark_price(\n"
+        "                opt_data, fallback=leg.entry_price\n"
+        "            )\n"
+        "            if leg.action == \"SELL\":\n"
+        "                net += mark * leg.qty\n"
+        "            else:\n"
+        "                net -= mark * leg.qty\n"
+        "        return net"
+    )
+    content, ok = sub_exact(
+        old_get_premium, new_get_premium, content, "SE-T01 _get_position_current_premium"
+    )
+    if ok:
+        changes.append("SE-T01: _get_position_current_premium uses get_mark_price()")
+
+    # SE-T04: Use IST date in _generate_order_tag
+    old_order_tag = (
+        "        raw = (\n"
+        "            f\"{trade_id[:12]}-\"\n"
+        "            f\"{instrument_key[-8:]}-\"\n"
+        "            f\"{action}-\"\n"
+        "            f\"{leg_index}-\"\n"
+        "            f\"{date.today().isoformat()}\"\n"
+        "        )"
+    )
+    new_order_tag = (
+        "        # SE-T04: use IST date, not server-local date.\n"
+        "        # On UTC servers, date.today() rolls at 05:30 IST,\n"
+        "        # causing tag mismatches and wrong session cleanup.\n"
+        "        _ist_date = datetime.now(\n"
+        "            self._IST\n"
+        "        ).date().isoformat()\n"
+        "        raw = (\n"
+        "            f\"{trade_id[:12]}-\"\n"
+        "            f\"{instrument_key[-8:]}-\"\n"
+        "            f\"{action}-\"\n"
+        "            f\"{leg_index}-\"\n"
+        "            f\"{_ist_date}\"\n"
+        "        )"
+    )
+    content, ok = sub_exact(
+        old_order_tag, new_order_tag, content, "SE-T04 IST date in order tag"
+    )
+    if ok:
+        changes.append("SE-T04: order tags use IST date not server-local date")
+
+    # SE-T04: Use IST date in startup_cancel_stale_orders session_date query
+    old_stale_query = (
+        "                AND   session_date < ?\n"
+        "            \"\"\", (date.today().isoformat(),))"
+    )
+    new_stale_query = (
+        "                AND   session_date < ?\n"
+        "            \"\"\", (datetime.now(self._IST).date().isoformat(),))"
+    )
+    content, ok = sub_exact(
+        old_stale_query, new_stale_query, content, "SE-T04 IST date stale query"
+    )
+    if ok:
+        changes.append("SE-T04: startup stale-order query uses IST date")
+
+    # SE-T06: Add Greeks staleness warning in _check_greeks_limits
+    old_greeks_limits = (
+        "    async def _check_greeks_limits(self) -> None:\n"
+        "        \"\"\"Check Greeks. Skip when no positions open.\"\"\"\n"
+        "        if not self.open_positions:\n"
+        "            return\n"
+        "        regime = self.re.confirmed_regime\n"
+        "        limits = config.GREEKS_LIMITS.get(regime, {})\n"
+        "        greeks = self._get_portfolio_greeks()"
+    )
+    new_greeks_limits = (
+        "    async def _check_greeks_limits(self) -> None:\n"
+        "        \"\"\"Check Greeks. Skip when no positions open.\"\"\"\n"
+        "        if not self.open_positions:\n"
+        "            return\n"
+        "        # SE-T06: warn when leg Greeks are stale.\n"
+        "        # Greeks are set at entry and updated by WS. Near expiry,\n"
+        "        # gamma changes rapidly; a 30-min-old reading can be off\n"
+        "        # by 2-3x. We cannot recompute without a live model, but\n"
+        "        # we can warn so the operator knows the limits check may\n"
+        "        # be operating on stale data.\n"
+        "        _now_ist = datetime.now(self._IST)\n"
+        "        for _pos in self.open_positions:\n"
+        "            for _leg in _pos.legs:\n"
+        "                _ws_ts = None\n"
+        "                _exp_chain = self.dm.get_chain_for_expiry(\n"
+        "                    _pos.expiry_date\n"
+        "                )\n"
+        "                _opt = (\n"
+        "                    _exp_chain\n"
+        "                    .get(_leg.strike, {})\n"
+        "                    .get(_leg.option_type, {})\n"
+        "                )\n"
+        "                _ws_ts_str = _opt.get(\"_ws_ts\")\n"
+        "                if _ws_ts_str:\n"
+        "                    try:\n"
+        "                        _ws_ts = datetime.fromisoformat(_ws_ts_str)\n"
+        "                        if _ws_ts.tzinfo is None:\n"
+        "                            _ws_ts = self._IST.localize(_ws_ts)\n"
+        "                        _age = (\n"
+        "                            _now_ist - _ws_ts\n"
+        "                        ).total_seconds()\n"
+        "                        if _age > 1800:  # 30 minutes\n"
+        "                            logger.warning(\n"
+        "                                f\"SE-T06: Greeks stale \"\n"
+        "                                f\"{_leg.option_type} \"\n"
+        "                                f\"{_leg.strike} \"\n"
+        "                                f\"age={_age:.0f}s — \"\n"
+        "                                f\"limits check may be inaccurate\"\n"
+        "                            )\n"
+        "                    except Exception:\n"
+        "                        pass\n"
+        "        regime = self.re.confirmed_regime\n"
+        "        limits = config.GREEKS_LIMITS.get(regime, {})\n"
+        "        greeks = self._get_portfolio_greeks()"
+    )
+    content, ok = sub_exact(
+        old_greeks_limits, new_greeks_limits, content, "SE-T06 Greeks staleness warning"
+    )
+    if ok:
+        changes.append("SE-T06: Greeks staleness warning added to _check_greeks_limits")
+
+    # ATR contraction: replace strict monotonic with trend comparison
+    old_atr_logic = (
+        "            if len(atrs) < lookback:\n"
+        "                result = False\n"
+        "            else:\n"
+        "                result = all(\n"
+        "                    atrs[i] < atrs[i - 1]\n"
+        "                    for i in range(1, len(atrs))\n"
+        "                )"
+    )
+    new_atr_logic = (
+        "            if len(atrs) < lookback:\n"
+        "                result = False\n"
+        "            else:\n"
+        "                # ATR contraction fix: strict monotonic decrease\n"
+        "                # (all(atrs[i] < atrs[i-1])) is statistically rare\n"
+        "                # even in genuine contraction — micro-fluctuations\n"
+        "                # break the chain. Compare current ATR against the\n"
+        "                # oldest in the window: if the trend is down, ATR\n"
+        "                # is contracting regardless of intrabar noise.\n"
+        "                result = atrs[-1] < atrs[0]"
+    )
+    content, ok = sub_exact(
+        old_atr_logic, new_atr_logic, content, "ATR contraction fix"
+    )
+    if ok:
+        changes.append("ATR contraction: uses atrs[-1] < atrs[0] instead of strict monotonic")
+
+    # MN-T04: Add idempotency guard to CB Level 5
+    old_cb5 = (
+        "        # LEVEL 5 — Absolute VIX threshold\n"
+        "        # FIX P8: use absolute VIX level not % change\n"
+        "        if (\n"
+        "            self.dm.vix is not None\n"
+        "            and self.dm.vix >= config.CB_LEVEL_5_VIX_ABSOLUTE\n"
+        "        ):\n"
+        "            logger.critical(\n"
+        "                f\"CB L5: VIX={self.dm.vix:.1f} >= \"\n"
+        "                f\"{config.CB_LEVEL_5_VIX_ABSOLUTE}\"\n"
+        "            )\n"
+        "            self._log_circuit_breaker(\n"
+        "                5,\n"
+        "                f\"vix_absolute={self.dm.vix:.1f}\",\n"
+        "                config.CB_LEVEL_5_ACTION,\n"
+        "            )\n"
+        "            self.re.previous_regime  = (\n"
+        "                self.re.confirmed_regime\n"
+        "            )\n"
+        "            self.re.confirmed_regime = (\n"
+        "                config.REGIME_STRONG_BUY\n"
+        "            )\n"
+        "            self.re.regime_changed   = True"
+    )
+    new_cb5 = (
+        "        # LEVEL 5 — Absolute VIX threshold\n"
+        "        # MN-T04: guard with cb_level_5_active so the fast\n"
+        "        # monitor (running every second) does not emit a new\n"
+        "        # regime-change event on every iteration while VIX\n"
+        "        # stays elevated. Without this guard, _handle_regime_\n"
+        "        # transition fires every second, closing positions\n"
+        "        # repeatedly and generating excessive API activity.\n"
+        "        if (\n"
+        "            self.dm.vix is not None\n"
+        "            and self.dm.vix >= config.CB_LEVEL_5_VIX_ABSOLUTE\n"
+        "        ):\n"
+        "            if not getattr(self, \"cb_level_5_active\", False):\n"
+        "                logger.critical(\n"
+        "                    f\"CB L5: VIX={self.dm.vix:.1f} >= \"\n"
+        "                    f\"{config.CB_LEVEL_5_VIX_ABSOLUTE}\"\n"
+        "                )\n"
+        "                self._log_circuit_breaker(\n"
+        "                    5,\n"
+        "                    f\"vix_absolute={self.dm.vix:.1f}\",\n"
+        "                    config.CB_LEVEL_5_ACTION,\n"
+        "                )\n"
+        "                self.re.previous_regime  = (\n"
+        "                    self.re.confirmed_regime\n"
+        "                )\n"
+        "                self.re.confirmed_regime = (\n"
+        "                    config.REGIME_STRONG_BUY\n"
+        "                )\n"
+        "                self.re.regime_changed   = True\n"
+        "                self.cb_level_5_active   = True\n"
+        "                self._save_capital_state()\n"
+        "        else:\n"
+        "            # Reset when VIX drops back below threshold\n"
+        "            if getattr(self, \"cb_level_5_active\", False):\n"
+        "                logger.info(\n"
+        "                    f\"CB L5: VIX={self.dm.vix:.1f} below \"\n"
+        "                    f\"threshold — resetting\"\n"
+        "                )\n"
+        "                self.cb_level_5_active = False"
+    )
+    content, ok = sub_exact(
+        old_cb5, new_cb5, content, "MN-T04 CB L5 idempotency"
+    )
+    if ok:
+        changes.append("MN-T04: CB Level 5 is now idempotent (fires once, resets on recovery)")
+
+    # Add cb_level_5_active to __init__
+    old_cb_init = (
+        "        self.cb_level_1_count:  int  = 0\n"
+        "        self.cb_level_2_active: bool = False\n"
+        "        self.cb_level_3_active: bool = False\n"
+        "        self.cb_level_4_active: bool = False"
+    )
+    new_cb_init = (
+        "        self.cb_level_1_count:  int  = 0\n"
+        "        self.cb_level_2_active: bool = False\n"
+        "        self.cb_level_3_active: bool = False\n"
+        "        self.cb_level_4_active: bool = False\n"
+        "        # MN-T04: CB L5 idempotency flag\n"
+        "        self.cb_level_5_active: bool = False"
+    )
+    content, ok = sub_exact(
+        old_cb_init, new_cb_init, content, "MN-T04 cb_level_5_active init"
+    )
+    if ok:
+        changes.append("MN-T04: cb_level_5_active added to __init__")
 
     return content, changes
 
@@ -1360,85 +1232,130 @@ def patch_strategy_engine(content):
 def patch_main(content):
     changes = []
 
-    # MN-R01: Track actual refresh success per cycle, not just data existence
-    # Add cycle_start_spot and cycle_start_chain_len before the refresh block
-    old_refresh_start = (
-        "            if data_elapsed >= config.REGIME_REFRESH_SECONDS:\n"
-        "                logger.info(\"Starting data refresh cycle\")\n"
-        "                data_refresh_complete = False"
+    # MN-T01: Kill switch must not skip position monitoring.
+    # The current code sleeps 60s and continues, leaving any
+    # residual open positions (from failed SE-N01 exits) unmonitored.
+    old_kill_switch = (
+        "            if se.kill_switch_active:\n"
+        "                logger.critical(\n"
+        "                    \"Strategy kill switch ACTIVE — \"\n"
+        "                    \"no new trades, monitoring continues\"\n"
+        "                )\n"
+        "                await se.cancel_all_open_orders(\n"
+        "                    context=\"KILL_SWITCH_SWEEP\"\n"
+        "                )\n"
+        "                # Do NOT break — engine keeps running\n"
+        "                await asyncio.sleep(60)\n"
+        "                continue"
     )
-    new_refresh_start = (
-        "            if data_elapsed >= config.REGIME_REFRESH_SECONDS:\n"
-        "                logger.info(\"Starting data refresh cycle\")\n"
-        "                data_refresh_complete = False\n"
-        "                # MN-R01: capture pre-cycle values to detect\n"
-        "                # whether mandatory data was actually updated.\n"
-        "                _cycle_start_spot = dm.spot\n"
-        "                _cycle_start_chain_len = sum(\n"
-        "                    len(v) for v in dm.option_chain.values()\n"
-        "                )"
+    new_kill_switch = (
+        "            if se.kill_switch_active:\n"
+        "                logger.critical(\n"
+        "                    \"Strategy kill switch ACTIVE — \"\n"
+        "                    \"no new trades, monitoring continues\"\n"
+        "                )\n"
+        "                await se.cancel_all_open_orders(\n"
+        "                    context=\"KILL_SWITCH_SWEEP\"\n"
+        "                )\n"
+        "                # MN-T01: do NOT skip position monitoring.\n"
+        "                # Failed SE-N01 exits leave positions OPEN;\n"
+        "                # they need stop-loss checks and retry attempts\n"
+        "                # even while the kill switch is active.\n"
+        "                # Run the fast monitor then sleep briefly.\n"
+        "                if se.open_positions and dm.spot is not None:\n"
+        "                    try:\n"
+        "                        await se._update_all_pnls()\n"
+        "                        await se._monitor_all_positions()\n"
+        "                    except Exception as _ks_e:\n"
+        "                        logger.error(\n"
+        "                            f\"Kill-switch monitor error: {_ks_e}\"\n"
+        "                        )\n"
+        "                await asyncio.sleep(5)\n"
+        "                continue"
     )
     content, ok = sub_exact(
-        old_refresh_start, new_refresh_start, content, "MN-R01 cycle start capture"
+        old_kill_switch, new_kill_switch, content, "MN-T01 kill switch monitoring"
     )
     if ok:
-        changes.append("MN-R01: pre-cycle spot/chain captured for freshness validation")
+        changes.append("MN-T01: kill switch no longer skips position monitoring")
 
-    # MN-R01: Fix the finally block to check actual updates, not just existence
-    old_finally = (
-        "                finally:\n"
-        "                    # AUDIT MN-N01: only mark complete when\n"
-        "                    # mandatory data succeeded. Spot and chain\n"
-        "                    # are mandatory; candles/OI are optional.\n"
-        "                    _spot_ok  = dm.spot is not None and dm.spot > 0\n"
-        "                    _chain_ok = len(dm.option_chain) > 0\n"
-        "                    if _spot_ok and _chain_ok:\n"
-        "                        last_data_refresh     = now\n"
-        "                        data_refresh_complete = True\n"
+    # MN-T02: EOD marked complete only when open_positions is empty
+    old_eod_done = (
+        "                    await _end_of_day(se, dm)\n"
+        "                    eod_done_today = True\n"
+        "                    logger.info(\n"
+        "                        \"EOD complete — engine monitoring, \"\n"
+        "                        \"waiting for next trading day\"\n"
+        "                    )"
+    )
+    new_eod_done = (
+        "                    await _end_of_day(se, dm)\n"
+        "                    # MN-T02: only mark EOD complete when all\n"
+        "                    # positions are confirmed closed. Failed\n"
+        "                    # SE-N01 exits keep positions OPEN; marking\n"
+        "                    # eod_done_today=True would reduce them to\n"
+        "                    # once-per-minute monitoring.\n"
+        "                    if not se.open_positions:\n"
+        "                        eod_done_today = True\n"
         "                        logger.info(\n"
-        "                            \"Data refresh cycle complete\"\n"
+        "                            \"EOD complete — all positions closed, \"\n"
+        "                            \"waiting for next trading day\"\n"
         "                        )\n"
         "                    else:\n"
-        "                        # Still update timestamp so we don't\n"
-        "                        # spin-retry every second, but mark\n"
-        "                        # incomplete so regime skips this cycle.\n"
-        "                        last_data_refresh     = now\n"
-        "                        data_refresh_complete = False\n"
         "                        logger.warning(\n"
-        "                            \"Data refresh incomplete: \"\n"
-        "                            f\"spot_ok={_spot_ok} \"\n"
-        "                            f\"chain_ok={_chain_ok} \"\n"
-        "                            \"— regime refresh skipped\"\n"
+        "                            f\"EOD: {len(se.open_positions)} \"\n"
+        "                            f\"position(s) still open after \"\n"
+        "                            f\"_end_of_day — will retry\"\n"
         "                        )"
     )
-    new_finally = (
-        "                finally:\n"
-        "                    # MN-R01: check that mandatory data was\n"
-        "                    # ACTUALLY UPDATED this cycle, not just\n"
-        "                    # that it exists (pre-existing restored\n"
-        "                    # state satisfies the old existence check).\n"
-        "                    _spot_changed = (\n"
-        "                        dm.spot is not None\n"
-        "                        and dm.spot > 0\n"
-        "                        and dm.spot != _cycle_start_spot\n"
+    content, ok = sub_exact(
+        old_eod_done, new_eod_done, content, "MN-T02 EOD completion guard"
+    )
+    if ok:
+        changes.append("MN-T02: EOD only marked complete when open_positions is empty")
+
+    # MN-T03: Expiry-day EOD same fix
+    old_expiry_eod = (
+        "                    await _expiry_day_close_all(se)\n"
+        "                    await _end_of_day(se, dm)\n"
+        "                    eod_done_today = True   # PATCH\n"
+        "                    logger.info(\n"
+        "                        \"Expiry day EOD complete — \"\n"
+        "                        \"engine monitoring\"\n"
         "                    )\n"
-        "                    _chain_len_now = sum(\n"
-        "                        len(v) for v in dm.option_chain.values()\n"
-        "                    )\n"
-        "                    _chain_updated = (\n"
-        "                        _chain_len_now > 0\n"
-        "                        and _chain_len_now\n"
-        "                        >= _cycle_start_chain_len\n"
-        "                    )\n"
-        "                    # Accept if spot changed OR chain was\n"
-        "                    # refreshed (chain length stable = same\n"
-        "                    # expiries re-fetched, which is normal).\n"
-        "                    # Reject only when BOTH are zero/unchanged\n"
-        "                    # AND spot is None (cold start failure).\n"
-        "                    _spot_exists = (\n"
-        "                        dm.spot is not None and dm.spot > 0\n"
-        "                    )\n"
-        "                    _chain_exists = _chain_len_now > 0\n"
+        "                    await asyncio.sleep(300)\n"
+        "                    continue"
+    )
+    new_expiry_eod = (
+        "                    await _expiry_day_close_all(se)\n"
+        "                    await _end_of_day(se, dm)\n"
+        "                    # MN-T03: same guard as normal EOD.\n"
+        "                    # Do not enter the 300s sleep while\n"
+        "                    # positions remain open.\n"
+        "                    if not se.open_positions:\n"
+        "                        eod_done_today = True\n"
+        "                        logger.info(\n"
+        "                            \"Expiry day EOD complete — \"\n"
+        "                            \"engine monitoring\"\n"
+        "                        )\n"
+        "                        await asyncio.sleep(300)\n"
+        "                        continue\n"
+        "                    else:\n"
+        "                        logger.warning(\n"
+        "                            f\"Expiry EOD: \"\n"
+        "                            f\"{len(se.open_positions)} \"\n"
+        "                            f\"position(s) still open — \"\n"
+        "                            f\"will retry close\"\n"
+        "                        )"
+    )
+    content, ok = sub_exact(
+        old_expiry_eod, new_expiry_eod, content, "MN-T03 expiry EOD guard"
+    )
+    if ok:
+        changes.append("MN-T03: expiry-day EOD only marked complete when positions closed")
+
+    # MN-T05: Use _spot_changed in the completion decision
+    old_refresh_complete = (
         "                    if _spot_exists and _chain_exists:\n"
         "                        last_data_refresh     = now\n"
         "                        data_refresh_complete = True\n"
@@ -1461,64 +1378,51 @@ def patch_main(content):
         "                            \"— regime refresh skipped\"\n"
         "                        )"
     )
-    content, ok = sub_exact(old_finally, new_finally, content, "MN-R01 finally fix")
-    if ok:
-        changes.append("MN-R01: refresh marked complete only when data actually updated")
-
-    # MN-R02: Add circuit breaker check to fast monitor
-    old_fast_monitor = (
-        "            if se.open_positions and dm.spot is not None:\n"
-        "                try:\n"
-        "                    await se._update_all_pnls()\n"
-        "                    await se._monitor_all_positions()\n"
-        "                except Exception as _mon_e:\n"
-        "                    logger.error(\n"
-        "                        f\"Fast monitor error: {_mon_e}\"\n"
-        "                    )"
-    )
-    new_fast_monitor = (
-        "            if se.open_positions and dm.spot is not None:\n"
-        "                try:\n"
-        "                    await se._update_all_pnls()\n"
-        "                    await se._monitor_all_positions()\n"
-        "                    # MN-R02: circuit breakers must also run\n"
-        "                    # at the fast cadence. A correlated move\n"
-        "                    # across positions can breach portfolio\n"
-        "                    # daily-loss/drawdown limits between 60s\n"
-        "                    # regime cycles. Individual stops fire\n"
-        "                    # every second but the portfolio CB was\n"
-        "                    # only checked once per minute.\n"
-        "                    if not se.kill_switch_active:\n"
-        "                        await se._check_circuit_breakers()\n"
-        "                except Exception as _mon_e:\n"
-        "                    logger.error(\n"
-        "                        f\"Fast monitor error: {_mon_e}\"\n"
-        "                    )"
-    )
-    content, ok = sub_exact(
-        old_fast_monitor, new_fast_monitor, content, "MN-R02 CB in fast monitor"
-    )
-    if ok:
-        changes.append("MN-R02: circuit breakers added to fast monitor loop")
-
-    # MN-R04: Replace date.today() with IST-aware date in main loop
-    # The daily reset block uses date.today() — fix to use IST date
-    old_today_reset = (
-        "            today = date.today()\n"
-        "            if today != last_trading_date:"
-    )
-    new_today_reset = (
-        "            # MN-R04: always use IST date for market decisions.\n"
-        "            # date.today() uses the server's local timezone which\n"
-        "            # may differ from IST on cloud instances.\n"
-        "            today = datetime.now(IST).date()\n"
-        "            if today != last_trading_date:"
+    new_refresh_complete = (
+        "                    # MN-T05: require that spot was actually\n"
+        "                    # updated this cycle OR that this is the\n"
+        "                    # first cycle after startup (no prev value).\n"
+        "                    # Pre-existing restored state satisfies\n"
+        "                    # _spot_exists but not _spot_changed.\n"
+        "                    _is_first_cycle = _cycle_start_spot is None\n"
+        "                    _refresh_valid = (\n"
+        "                        _spot_exists\n"
+        "                        and _chain_exists\n"
+        "                        and (_spot_changed or _is_first_cycle)\n"
+        "                    )\n"
+        "                    if _refresh_valid:\n"
+        "                        last_data_refresh     = now\n"
+        "                        data_refresh_complete = True\n"
+        "                        logger.info(\n"
+        "                            \"Data refresh cycle complete\"\n"
+        "                        )\n"
+        "                    elif _spot_exists and _chain_exists:\n"
+        "                        # Data exists but spot didn't change —\n"
+        "                        # could be a genuine flat market or a\n"
+        "                        # stale API response. Update timestamp\n"
+        "                        # to avoid spin-retry but mark incomplete\n"
+        "                        # so regime uses previous confirmed data.\n"
+        "                        last_data_refresh     = now\n"
+        "                        data_refresh_complete = False\n"
+        "                        logger.debug(\n"
+        "                            \"Data refresh: spot unchanged \"\n"
+        "                            \"— marking incomplete\"\n"
+        "                        )\n"
+        "                    else:\n"
+        "                        last_data_refresh     = now\n"
+        "                        data_refresh_complete = False\n"
+        "                        logger.warning(\n"
+        "                            \"Data refresh incomplete: \"\n"
+        "                            f\"spot_exists={_spot_exists} \"\n"
+        "                            f\"chain_exists={_chain_exists} \"\n"
+        "                            \"— regime refresh skipped\"\n"
+        "                        )"
     )
     content, ok = sub_exact(
-        old_today_reset, new_today_reset, content, "MN-R04 IST date"
+        old_refresh_complete, new_refresh_complete, content, "MN-T05 refresh validation"
     )
     if ok:
-        changes.append("MN-R04: main loop uses IST date instead of date.today()")
+        changes.append("MN-T05: data refresh only marked complete when spot actually updated")
 
     return content, changes
 
@@ -1529,7 +1433,7 @@ def patch_main(content):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Round-3 audit fixes for the NIFTY trading engine."
+        description="Round-4 audit fixes for the NIFTY trading engine."
     )
     parser.add_argument(
         "--dry-run", action="store_true",

@@ -887,56 +887,80 @@ class RegimeEngine:
         raw=None -> hold previous confirmed value.
         """
         if raw is None:
-            # RE-R03: decay stale scores toward 0 intraday.
-            # Track consecutive None readings per module.
-            _none_key = "_none_count_" + name
-            _none_count = getattr(self, _none_key, 0) + 1
-            setattr(self, _none_key, _none_count)
-            # After 10 consecutive None readings (~10 min at
-            # 60s refresh), decay the confirmed score toward 0
-            # by 1 step so stale flow/vol doesn't drive entries.
-            _decay_after = 10
-            if _none_count > _decay_after and self._conf[name] != 0:
-                _old = self._conf[name]
-                self._conf[name] = (
-                    _old - 1 if _old > 0 else _old + 1
-                )
-                logger.info(
-                    f"RE-R03: {name} score decayed "
-                    f"{_old} -> {self._conf[name]} "
-                    f"(none_count={_none_count})"
-                )
+            # RE-T03/T04: wall-clock decay using last_valid_at.
+            # Cycle-count decay was imprecise (API delays could
+            # make 10 cycles take 20+ min). Use actual elapsed
+            # exchange time. last_valid_at is persisted in SQLite
+            # (see _save_state/_load_state) so restarts don't
+            # reset the grace period.
+            _lva_key = "_last_valid_at_" + name
+            _last_valid = getattr(self, _lva_key, None)
+            if _last_valid is not None:
+                try:
+                    _elapsed = (
+                        datetime.now(self._IST)
+                        - _last_valid
+                    ).total_seconds()
+                    # Decay after 10 minutes of no data
+                    if _elapsed > 600 and self._conf[name] != 0:
+                        _old = self._conf[name]
+                        # Decay by 10% of current value per
+                        # additional 5-minute interval
+                        _intervals = int(
+                            (_elapsed - 600) / 300
+                        ) + 1
+                        _decay = _old * (0.90 ** _intervals)
+                        if abs(_decay) < 0.05:
+                            _decay = 0.0
+                        self._conf[name] = _decay
+                        logger.info(
+                            f"RE-T03: {name} score decayed "
+                            f"{_old:.3f} -> {_decay:.3f} "
+                            f"(elapsed={_elapsed:.0f}s)"
+                        )
+                except Exception:
+                    pass
             return self._conf[name]
 
-        # RE-R01: floor(x+0.5) is asymmetric: +0.5->1 but -0.5->0.
-        # This introduced a sell-vol bias (buy-vol signals zeroed).
-        # Use copysign for symmetric rounding away from zero:
-        #   +0.5 -> +1,  -0.5 -> -1,  +0.0 -> 0
-        import math as _math
-        _raw_f  = float(raw)
-        raw_int = int(
-            _math.copysign(
-                _math.floor(abs(_raw_f) + 0.5), _raw_f
-            )
+        # RE-T02: keep scores as floats. Rounding ±0.5 to ±1
+        # (even symmetrically) overstates conviction when only
+        # one of two sub-signals fired. Confirm on sign-stability
+        # across 3 consecutive readings instead of exact-integer
+        # equality, which is meaningless for floats anyway.
+        _raw_f = float(raw)
+        buf    = self._buf[name]
+        # RE-T03/T04: record when this module last had real data
+        setattr(
+            self,
+            "_last_valid_at_" + name,
+            datetime.now(self._IST),
         )
-        buf     = self._buf[name]
-        # Reset decay counter when a real value arrives
-        setattr(self, "_none_count_" + name, 0)
-        buf.append(raw_int)
+        buf.append(_raw_f)
         if len(buf) > 3:
             buf.pop(0)
 
-        if len(buf) == 3 and buf[0] == buf[1] == buf[2]:
-            self._conf[name] = raw_int
-            logger.info(
-                f"Persistence confirmed: {name}={raw_int}"
-            )
-        else:
-            logger.info(
-                f"Persistence unconfirmed: {name} "
-                f"buf={buf} "
-                f"holding={self._conf[name]}"
-            )
+        # RE-T02: confirm when the last 3 readings have the
+        # same sign (or are all zero). Use the mean of the
+        # buffer as the confirmed value to preserve granularity.
+        import math as _math_p
+        if len(buf) >= 3:
+            _last3 = buf[-3:]
+            _signs = [_math_p.copysign(1, v) if v != 0 else 0
+                      for v in _last3]
+            if len(set(_signs)) == 1:  # all same sign
+                _confirmed = sum(_last3) / len(_last3)
+                self._conf[name] = _confirmed
+                logger.info(
+                    f"Persistence confirmed: "
+                    f"{name}={_confirmed:.3f} "
+                    f"(sign-stable over 3 readings)"
+                )
+            else:
+                logger.info(
+                    f"Persistence unconfirmed: {name} "
+                    f"buf={[round(v,3) for v in buf[-3:]]} "
+                    f"holding={self._conf[name]:.3f}"
+                )
         return self._conf[name]
 
     # ─────────────────────────────────────────────────────────────────
@@ -979,46 +1003,91 @@ class RegimeEngine:
     # ─────────────────────────────────────────────────────────────────
 
     def _map_regime(self, composite: float) -> str:
-        """Reference algorithm regime mapping with hysteresis.
-        RE-R04: use entry/exit bands to prevent churn near
-        boundaries. Entry requires crossing a tighter threshold;
-        exit requires crossing a looser threshold in the opposite
-        direction. Hysteresis band = 0.05 composite units.
+        """Regime mapping with explicit config-driven hysteresis.
+        RE-T01: thresholds are read from config.STRONG_SELL_ENTER
+        etc. so operators can tune them directly. The previous
+        inline `threshold ± 0.05` created hidden effective
+        thresholds that contradicted the documented base values.
         """
-        _hyst = 0.05
         current = self.confirmed_regime
 
-        # Staying in current regime unless exit threshold crossed
+        # Persistence: stay in current regime until the EXIT
+        # threshold is crossed in the opposite direction.
         if current == config.REGIME_STRONG_SELL:
-            if composite > (config.STRONG_SELL_THRESHOLD - _hyst):
+            if composite > getattr(
+                config, "STRONG_SELL_EXIT",
+                config.STRONG_SELL_THRESHOLD - 0.05
+            ):
                 return config.REGIME_STRONG_SELL
         elif current == config.REGIME_MILD_SELL:
-            if (config.MILD_SELL_THRESHOLD - _hyst
-                    <= composite
-                    <= config.STRONG_SELL_THRESHOLD + _hyst):
+            _ms_exit = getattr(
+                config, "MILD_SELL_EXIT",
+                config.MILD_SELL_THRESHOLD - 0.05
+            )
+            _ss_exit = getattr(
+                config, "STRONG_SELL_EXIT",
+                config.STRONG_SELL_THRESHOLD - 0.05
+            )
+            if _ms_exit <= composite <= (
+                getattr(
+                    config, "STRONG_SELL_ENTER",
+                    config.STRONG_SELL_THRESHOLD
+                )
+            ):
                 return config.REGIME_MILD_SELL
         elif current == config.REGIME_NEUTRAL:
-            if (config.MILD_BUY_THRESHOLD - _hyst
-                    < composite
-                    < config.MILD_SELL_THRESHOLD + _hyst):
+            _nb_exit = getattr(
+                config, "MILD_BUY_EXIT",
+                config.MILD_BUY_THRESHOLD - 0.05
+            )
+            _ns_enter = getattr(
+                config, "MILD_SELL_ENTER",
+                config.MILD_SELL_THRESHOLD
+            )
+            if _nb_exit < composite < _ns_enter:
                 return config.REGIME_NEUTRAL
         elif current == config.REGIME_BUY_VOL:
-            if (config.STRONG_BUY_THRESHOLD - _hyst
-                    <= composite
-                    <= config.MILD_BUY_THRESHOLD + _hyst):
+            _bv_exit = getattr(
+                config, "STRONG_BUY_EXIT",
+                config.STRONG_BUY_THRESHOLD - 0.05
+            )
+            _bv_top = getattr(
+                config, "MILD_BUY_ENTER",
+                config.MILD_BUY_THRESHOLD
+            )
+            if _bv_exit <= composite <= _bv_top:
                 return config.REGIME_BUY_VOL
         elif current == config.REGIME_STRONG_BUY:
-            if composite < (config.STRONG_BUY_THRESHOLD + _hyst):
+            if composite < getattr(
+                config, "STRONG_BUY_EXIT",
+                config.STRONG_BUY_THRESHOLD - 0.05
+            ):
                 return config.REGIME_STRONG_BUY
 
-        # Entry into new regime (tighter thresholds)
-        if composite > config.STRONG_SELL_THRESHOLD:
+        # Entry: use ENTER thresholds (fall back to base if not set)
+        _ss_enter = getattr(
+            config, "STRONG_SELL_ENTER",
+            config.STRONG_SELL_THRESHOLD
+        )
+        _ms_enter = getattr(
+            config, "MILD_SELL_ENTER",
+            config.MILD_SELL_THRESHOLD
+        )
+        _mb_enter = getattr(
+            config, "MILD_BUY_ENTER",
+            config.MILD_BUY_THRESHOLD
+        )
+        _sb_enter = getattr(
+            config, "STRONG_BUY_ENTER",
+            config.STRONG_BUY_THRESHOLD
+        )
+        if composite > _ss_enter:
             return config.REGIME_STRONG_SELL
-        if composite >= config.MILD_SELL_THRESHOLD:
+        if composite >= _ms_enter:
             return config.REGIME_MILD_SELL
-        if composite > config.MILD_BUY_THRESHOLD:
+        if composite > _mb_enter:
             return config.REGIME_NEUTRAL
-        if composite >= config.STRONG_BUY_THRESHOLD:
+        if composite >= _sb_enter:
             return config.REGIME_BUY_VOL
         return config.REGIME_STRONG_BUY
 
@@ -1118,6 +1187,19 @@ class RegimeEngine:
                 ("buffers",         self._buf),
                 ("confirmed",       self._conf),
                 ("last_save_date",  _today_save),
+                ("last_valid_at", {
+                    m: getattr(
+                        self,
+                        "_last_valid_at_" + m,
+                        None,
+                    ).isoformat()
+                    if getattr(
+                        self,
+                        "_last_valid_at_" + m,
+                        None,
+                    ) is not None else None
+                    for m in MODULES
+                }),
             ]:
                 cursor.execute("""
                     INSERT OR REPLACE INTO regime_algo_state
@@ -1156,9 +1238,26 @@ class RegimeEngine:
                         }
                     elif key == "confirmed":
                         self._conf = {
-                            m: int(data.get(m, 0))
+                            m: float(data.get(m, 0))
                             for m in MODULES
                         }
+                    elif key == "last_valid_at":
+                        for m in MODULES:
+                            ts_str = data.get(m)
+                            if ts_str:
+                                try:
+                                    _ts = datetime.fromisoformat(
+                                        ts_str
+                                    )
+                                    if _ts.tzinfo is None:
+                                        _ts = self._IST.localize(_ts)
+                                    setattr(
+                                        self,
+                                        "_last_valid_at_" + m,
+                                        _ts,
+                                    )
+                                except Exception:
+                                    pass
                 except Exception:
                     pass
             # AUDIT RE-05: clear confirmed scores on a new trading day
