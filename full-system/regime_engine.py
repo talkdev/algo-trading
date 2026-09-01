@@ -57,19 +57,38 @@ SKEW_HISTORY_DAYS = 30
 # RE-C1: raised from 3 to 20. Same argument as EDGE_SCORE_MIN_HISTORY:
 # 3-sample std has ~40% error. Skew carries 0.15 composite weight
 # and should not be live on 3 samples when edge is gated at 20.
-SKEW_MIN_DAYS    = 20     # minimum history before z is trusted
+SKEW_MIN_DAYS    = 10     # PATCHED: 20→10 (2-week warmup sufficient)
 SPREAD_AVG_MIN   = 60     # minutes for spread-ratio average
 EVENT_PRE_HOURS  = 6
 EVENT_POST_HOURS = 2
 MODULES          = ["vol", "edge", "trend", "flow"]
 # AUDIT #2.2: weights now read from config so tuning
 # config.WEIGHT_* actually takes effect at runtime.
-def _build_weights():
+def _build_weights(flow_none_frac=0.0):
+    """PATCH R-07: redistribute flow weight when flow is frequently None.
+    flow_none_frac: fraction of recent cycles where flow returned None.
+    When > FLOW_WEIGHT_NONE_THRESHOLD, flow weight is set to 0 and
+    redistributed proportionally to vol, edge, trend.
+    """
+    _threshold = getattr(config, "FLOW_WEIGHT_NONE_THRESHOLD", 0.50)
+    wv = config.WEIGHT_VOL
+    we = config.WEIGHT_EDGE
+    wt = config.WEIGHT_TREND
+    wf = config.WEIGHT_FLOW
+    if flow_none_frac > _threshold and wf > 0:
+        # Redistribute flow weight proportionally to other three modules
+        _other_sum = wv + we + wt
+        if _other_sum > 0:
+            _scale = (wv + we + wt + wf) / _other_sum
+            wv = round(wv * _scale, 6)
+            we = round(we * _scale, 6)
+            wt = round(wt * _scale, 6)
+            wf = 0.0
     return {
-        "vol":   config.WEIGHT_VOL,
-        "edge":  config.WEIGHT_EDGE,
-        "trend": config.WEIGHT_TREND,
-        "flow":  config.WEIGHT_FLOW,
+        "vol":   wv,
+        "edge":  we,
+        "trend": wt,
+        "flow":  wf,
     }
 WEIGHTS = _build_weights()
 
@@ -414,6 +433,10 @@ class RegimeEngine:
             self.raw_composite = float(
                 max(-1.0, min(1.0, composite))
             )
+            # PATCHED R-02: populate composite history for FILTER-11c
+            self._composite_history.append(self.raw_composite)
+            # PATCH R-02: populate composite history for FILTER-11c
+            self._composite_history.append(self.raw_composite)
             # RE-B2: gate STRONG_SELL on minimum confirming modules.
             # Count modules with a non-zero confirmed score AND a
             # non-None raw reading this cycle (genuinely live).
@@ -502,9 +525,7 @@ class RegimeEngine:
         # _live_weights was computed earlier in this method;
         # rebuild it here so the log captures what was actually used.
         try:
-            _log_weights = _build_weights(
-                getattr(self, "_last_flow_none_frac", 0.0)
-            )
+            _log_weights = _build_weights()
         except Exception:
             _log_weights = {
                 "vol": config.WEIGHT_VOL,
@@ -578,10 +599,53 @@ class RegimeEngine:
                 f"({'CONTANGO' if term_score==1 else 'BACKWARDATION' if term_score==-1 else 'FLAT'})"
             )
         elif _fwd_is_vix_proxy:
-            # RE-01: VIX proxy — not a real term spread, return None
-            term_score = None
-            term_txt   = "T_spread n/a (forward_iv is VIX proxy)"
-            notes.append("forward IV is VIX/100 proxy — not a term spread")
+            # PATCH R-10: when no 30-45 DTE expiry, use near vs far weekly.
+            # Near = active expiry (DTE=4-8), Far = next weekly (DTE=10-16).
+            # This is always computable in the NIFTY weekly series.
+            _near_iv_val = _near_iv  # already set above
+            _far_iv_val = None
+            try:
+                _today_ts = __import__("datetime").date.today()
+                _avail = self.dm.get_available_expiries()
+                for _exp_str in sorted(_avail):
+                    _exp_d = __import__("datetime").datetime.strptime(
+                        _exp_str, "%Y-%m-%d"
+                    ).date()
+                    _dte_chk = (_exp_d - _today_ts).days
+                    if 10 <= _dte_chk <= 16:
+                        _far_chain = self.dm.get_chain_for_expiry(_exp_str)
+                        if _far_chain and spot:
+                            _far_atm = min(
+                                _far_chain.keys(),
+                                key=lambda k: abs(k - spot)
+                            )
+                            _fc = _far_chain[_far_atm].get("call", {})
+                            _fp = _far_chain[_far_atm].get("put", {})
+                            _fc_iv = _fc.get("iv", 0)
+                            _fp_iv = _fp.get("iv", 0)
+                            if _fc_iv > 0 and _fp_iv > 0:
+                                _far_iv_val = (_fc_iv + _fp_iv) / 2.0
+                        break
+            except Exception:
+                _far_iv_val = None
+            if _far_iv_val is not None and _near_iv_val is not None and _near_iv_val > 0:
+                _near_pct = _near_iv_val * 100.0
+                _far_pct  = _far_iv_val * 100.0
+                t_spread  = _far_pct - _near_pct
+                if t_spread > TERM_THRESHOLD:
+                    term_score = 1
+                elif t_spread < -TERM_THRESHOLD:
+                    term_score = -1
+                else:
+                    term_score = 0
+                term_txt = (
+                    f"T_spread(weekly) {t_spread:+.2f}%% "
+                    f"near={_near_pct:.1f}%% far={_far_pct:.1f}%%"
+                )
+            else:
+                term_score = None
+                term_txt   = "T_spread n/a (forward_iv is VIX proxy, no far weekly)"
+                notes.append("forward IV is VIX/100 proxy — not a term spread")
         else:
             term_score = 0
             term_txt   = "T_spread n/a (no far expiry)"
@@ -632,8 +696,8 @@ class RegimeEngine:
         # 0.20-0.30 delta range for a meaningful skew signal.
         if (
             best_c and best_p
-            and abs(best_c[0] - 0.25) < 0.05
-            and abs(best_p[0] + 0.25) < 0.05
+            and abs(best_c[0] - 0.25) < 0.08  # PATCHED: 0.05→0.08
+            and abs(best_p[0] + 0.25) < 0.08  # PATCHED: 0.05→0.08
         ):
             # iv stored as decimal → convert to % for skew
             iv_c = best_c[2]["iv"] * 100.0
@@ -782,15 +846,21 @@ class RegimeEngine:
         iv_atm = statistics.mean(ivs)
         edge   = iv_atm - rv_pct
 
-        if edge > EDGE_RICH:
+        # PATCH R-06: use relative VRP (IV/RV ratio) as primary signal.
+        # Absolute spread (EDGE_RICH=2.0pp) only fires at VIX>14.
+        # Relative VRP fires at VIX=11 (22%>15%) through VIX=22.
+        _vrp_relative = (iv_atm - rv_pct) / rv_pct if rv_pct > 0 else 0.0
+        _vrp_rich_threshold = 0.15   # 15% relative premium
+        _vrp_cheap_threshold = -0.05  # IV below RV by 5%
+        if _vrp_relative >= _vrp_rich_threshold or edge > EDGE_RICH:
             raw = 1
-            tag = "RICH (seller edge)"
-        elif edge < EDGE_CHEAP:
+            tag = f"RICH (VRP_rel={_vrp_relative:.2%} seller edge)"
+        elif _vrp_relative <= _vrp_cheap_threshold or edge < EDGE_CHEAP:
             raw = -1
-            tag = "CHEAP (buyer edge)"
+            tag = f"CHEAP (VRP_rel={_vrp_relative:.2%} buyer edge)"
         else:
             raw = 0
-            tag = "FAIR"
+            tag = f"FAIR (VRP_rel={_vrp_relative:.2%})"
 
         rv_src = "actual" if self.dm.rv_20d else "est(VIX×0.70)"
         # AUDIT RE-N01: cap at 0 when RV is estimated (circular signal)
@@ -1210,24 +1280,25 @@ class RegimeEngine:
         else:
             _required = _slow_n
 
-        # RE-T02: confirm when the last N readings have the same sign.
+        # PATCH R-05: confirm on sign-of-average, not sign-stability.
+        # Sign-stability breaks for float scores (e.g. vol=0.5 then 0.0
+        # then 0.5 never confirms because set([+1,0,+1])={0,1}).
+        # Using the average sign handles mixed sub-signals correctly.
         if len(buf) >= _required:
             _lastN = buf[-_required:]
-            _signs = [_math_p.copysign(1, v) if v != 0 else 0
-                      for v in _lastN]
-            if len(set(_signs)) == 1:  # all same sign
-                _confirmed = sum(_lastN) / len(_lastN)
-                self._conf[name] = _confirmed
+            _avg = sum(_lastN) / len(_lastN)
+            if abs(_avg) >= 0.10:  # meaningful average signal
+                self._conf[name] = _avg
                 logger.info(
                     f"Persistence confirmed: "
-                    f"{name}={_confirmed:.3f} "
-                    f"(sign-stable over {_required} readings, "
+                    f"{name}={_avg:.3f} "
+                    f"(avg-sign over {_required} readings, "
                     f"composite={_composite_mag:.3f})"
                 )
             else:
                 logger.info(
                     f"Persistence unconfirmed: {name} "
-                    f"buf={[round(v,3) for v in buf[-_required:]]} "
+                    f"avg={_avg:.3f} < 0.10 threshold "
                     f"holding={self._conf[name]:.3f}"
                 )
         return self._conf[name]
@@ -1258,13 +1329,19 @@ class RegimeEngine:
                         second=0, microsecond=0,
                     )
                 )
-                # Pre-window starts EVENT_PRE_HOURS before market open
-                pre_window_start = (
-                    event_market_open
-                    - __import__("datetime").timedelta(
-                        hours=EVENT_PRE_HOURS
+                # PATCH R-09: pre-window starts at T-1 market close (15:30).
+                # Old: event_open - 6h = 03:15 IST (market closed, never fires).
+                # New: previous trading day 15:30 IST so engine de-risks
+                # during the last session BEFORE the event.
+                _prev_close = self._IST.localize(
+                    __import__("datetime").datetime.strptime(
+                        event_date_str, "%Y-%m-%d"
+                    ).replace(
+                        hour=15, minute=30,
+                        second=0, microsecond=0,
                     )
-                )
+                ) - __import__("datetime").timedelta(days=1)
+                pre_window_start = _prev_close
                 post_window_end = (
                     event_market_open
                     + __import__("datetime").timedelta(
