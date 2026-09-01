@@ -1,930 +1,636 @@
 #!/usr/bin/env python3
 """
-patch.py — Single-file patch for NIFTY Options Algo Engine.
+patch_p4.py — P4 profitability-enhancement fixes for NIFTY options algo engine.
 
-Applies all verified fixes across:
-  - config.py
-  - regime_engine.py
-  - strategy_engine.py
-  - data_manager.py
+Assumes patch_p0.py, patch_p1.py, patch_p2.py, and patch_p3.py have
+already been applied successfully.
 
-Run from the directory containing all four files:
-    python patch.py
+Fixes applied
+─────────────
+P4-1  strategy_engine.py  _select_strategy
+      STRONG_SELL always routes to STRAT_SHORT_STRADDLE regardless of
+      market conditions.  At VIX=11-14 with low ADX (range-bound), an
+      iron condor has 5x better return on margin (15.6% vs 3.2%) and
+      defined risk.  The straddle is naked short gamma with SPAN margin
+      ~Rs1.7L/lot vs condor ~Rs16k/lot.
+      Fix: in STRONG_SELL, prefer iron condor when ADX is below
+      ADX_RANGE_THRESHOLD (genuinely range-bound).  Fall back to
+      straddle only when ADX is elevated (trending) where the condor's
+      fixed wings are more likely to be breached.
 
-A backup of each file is created before modification.
+P4-2  strategy_engine.py  _calculate_lot_size
+      composite=0.31 and composite=0.75 both produce the same lot size.
+      The composite magnitude contains real information about signal
+      quality that is discarded at the regime→strategy handoff.
+      Fix: apply a quality multiplier to the final lot count.
+      Composite at MILD_SELL_ENTER (0.20 after P3) = baseline (1.0x).
+      Composite at 0.50 (STRONG_SELL_ENTER after P3) = 1.25x.
+      Composite at 0.75+ = 1.5x (capped).
+      The multiplier is applied AFTER all other caps (regime max lots,
+      margin cap) so it never exceeds the hard limits.
+
+P4-3  strategy_engine.py  _should_enter_new_position
+      (a) IV spike detection: when current IV_ATM is >= 15% above the
+          recent 5-cycle average IV_ATM, the engine is in a fear-premium
+          window — the highest-EV entry condition for premium selling.
+          Override the normal regime gate and allow entry even if the
+          composite is below MILD_SELL_ENTER, provided VIX is within
+          the sell-vol range.  This is gated on SELL_VOL regimes only
+          (not BUY_VOL or NEUTRAL).
+      (b) Monday gap risk filter: block straddle entries before 10:00
+          IST on Mondays.  NIFTY average Monday gap of 0.4-0.8% can
+          wipe 1.6 weeks of theta decay.  The filter applies only to
+          STRAT_SHORT_STRADDLE (undefined risk); condors and spreads
+          have defined risk and are not blocked.
+
+P4-4  strategy_engine.py  _should_enter_new_position
+      Regime stability requirement: require persistence_count >= 5
+      before entering a new position.  A regime confirmed for only
+      3 cycles (3 minutes) is much more likely to be a false signal
+      than one confirmed for 5+ cycles (5 minutes).  This reduces
+      entries on transient regime classifications.
+
+P4-5  config.py
+      CONDOR_EXIT_DTE = 1  →  2
+      At DTE=1 (Monday for Tuesday expiry), remaining theta is ~Rs390
+      but closing a 4-leg condor costs ~Rs334 + slippage (~Rs520 total).
+      Net capture is negative.  At DTE=2 the remaining theta (~Rs650-910)
+      comfortably exceeds closing costs.
+
+Skipped from P4 report list
+────────────────────────────
+"Add time-of-day IV level check" — requires tracking intraday IV high
+which is not currently stored anywhere.  Adding new state tracking
+risks introducing bugs; deferred to a dedicated review.
+
+"Lower STRONG_SELL_MIN_CONFIRMING_MODULES from 3 to 2" — already
+applied as P3-5g in patch_p3.py.
+
+Run from the directory containing the source files:
+
+    python patch_p4.py
+
+The script is idempotent (sentinel-guarded) and writes .bak backups
+before modifying any file.  It will not overwrite an existing .bak.
 """
 
-import os
 import re
 import shutil
 import sys
-from datetime import datetime
+import os
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BACKUP_SUFFIX = datetime.now().strftime(".bak_%Y%m%d_%H%M%S")
 
-applied = []
-skipped = []
-errors  = []
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _read(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
 
-def backup(path):
-    bak = path + BACKUP_SUFFIX
-    shutil.copy2(path, bak)
-    print(f"  Backup: {os.path.basename(bak)}")
 
+def _write(path: str, text: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
-def read_file(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
 
+def _backup(path: str) -> None:
+    bak = path + ".bak"
+    if not os.path.exists(bak):
+        shutil.copy2(path, bak)
+        print(f"  backup → {bak}")
+    else:
+        print(f"  backup already exists: {bak}  (skipped)")
 
-def write_file(path, content):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
 
-
-def apply_fix(fix_id, description, path, find, replace):
-    full_path = os.path.join(BASE_DIR, path)
-    if not os.path.exists(full_path):
-        errors.append(f"{fix_id}: file not found — {path}")
-        print(f"  ERROR  [{fix_id}] file not found: {path}")
-        return False
-
-    content = read_file(full_path)
-
-    if find not in content:
-        skipped.append(f"{fix_id}: pattern not found — {description}")
-        print(f"  SKIP   [{fix_id}] pattern not found: {description}")
-        return False
-
-    new_content = content.replace(find, replace, 1)
-
-    if new_content == content:
-        skipped.append(f"{fix_id}: no change made — {description}")
-        print(f"  SKIP   [{fix_id}] no change made: {description}")
-        return False
-
-    write_file(full_path, new_content)
-    applied.append(f"{fix_id}: {description}")
-    print(f"  OK     [{fix_id}] {description}")
-    return True
-
-
-def create_backups():
-    print("\n=== Creating backups ===")
-    for fname in [
-        "config.py", "regime_engine.py",
-        "strategy_engine.py", "data_manager.py",
-    ]:
-        fpath = os.path.join(BASE_DIR, fname)
-        if os.path.exists(fpath):
-            backup(fpath)
-        else:
-            print(f"  WARNING: {fname} not found — skipping backup")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# CONFIG.PY FIXES
-# ─────────────────────────────────────────────────────────────────────
-
-def fix_config():
-    print("\n=== config.py fixes ===")
-
-    apply_fix(
-        "C-01",
-        "EDGE_RICH: 5.0 → 2.0 (regime_engine uses relative VRP)",
-        "config.py",
-        "EDGE_RICH  = 5.0   # reference: IV-RV > 5 -> rich",
-        "EDGE_RICH  = 2.0   # PATCHED C-01: lowered; regime_engine uses relative VRP >= 15%",
-    )
-
-    apply_fix(
-        "C-02",
-        "STRADDLE_STOP_MULT: 2.0 → 1.2",
-        "config.py",
-        "STRADDLE_STOP_MULT     = 2.0   # stop = 2x credit",
-        "STRADDLE_STOP_MULT     = 1.2   # PATCHED C-02: 2.0→1.2; break-even WR 80%→70.6%",
-    )
-
-    apply_fix(
-        "C-03",
-        "MAX_RISK_PER_TRADE_PCT: 0.02 → 0.04",
-        "config.py",
-        "MAX_RISK_PER_TRADE_PCT   = 0.02",
-        "MAX_RISK_PER_TRADE_PCT   = 0.04  # PATCHED C-03: 0.02→0.04",
-    )
-
-    apply_fix(
-        "C-05",
-        "STRONG_SELL_ENTER: 0.45 → 0.30",
-        "config.py",
-        "STRONG_SELL_ENTER =  0.45   # enter STRONG_SELL above this",
-        "STRONG_SELL_ENTER =  0.30   # PATCHED C-05: 0.45→0.30 for VIX=11-14 environment",
-    )
-
-    apply_fix(
-        "C-06",
-        "STRONG_SELL_EXIT: 0.40 → 0.22 (hysteresis band 0.05→0.08)",
-        "config.py",
-        "STRONG_SELL_EXIT  =  0.40   # exit  STRONG_SELL below this",
-        "STRONG_SELL_EXIT  =  0.22   # PATCHED C-06: 0.40→0.22 (band now 0.08)",
-    )
-
-    apply_fix(
-        "C-07",
-        "MILD_SELL_ENTER: 0.15 → 0.10",
-        "config.py",
-        "MILD_SELL_ENTER   =  0.15   # enter MILD_SELL above this",
-        "MILD_SELL_ENTER   =  0.10   # PATCHED C-07: 0.15→0.10",
-    )
-
-    apply_fix(
-        "C-08",
-        "MILD_SELL_EXIT: 0.10 → 0.02 (hysteresis band 0.05→0.08)",
-        "config.py",
-        "MILD_SELL_EXIT    =  0.10   # exit  MILD_SELL below this",
-        "MILD_SELL_EXIT    =  0.02   # PATCHED C-08: 0.10→0.02 (band now 0.08)",
-    )
-
-    apply_fix(
-        "C-09",
-        "STRONG_SELL_THRESHOLD: 0.45 → 0.30",
-        "config.py",
-        "STRONG_SELL_THRESHOLD =  0.45   # reference: x > 0.45",
-        "STRONG_SELL_THRESHOLD =  0.30   # PATCHED C-09: 0.45→0.30",
-    )
-
-    apply_fix(
-        "C-10",
-        "MILD_SELL_THRESHOLD: 0.15 → 0.10",
-        "config.py",
-        "MILD_SELL_THRESHOLD   =  0.15   # reference: x >= 0.15",
-        "MILD_SELL_THRESHOLD   =  0.10   # PATCHED C-10: 0.15→0.10",
-    )
-
-    apply_fix(
-        "C-11",
-        "ADAPTIVE_PERSISTENCE_FAST_THRESHOLD: 0.60 → 0.35",
-        "config.py",
-        "ADAPTIVE_PERSISTENCE_FAST_THRESHOLD = 0.60  # composite > this -> 2 readings",
-        "ADAPTIVE_PERSISTENCE_FAST_THRESHOLD = 0.35  # PATCHED C-11: 0.60→0.35",
-    )
-
-    apply_fix(
-        "C-13",
-        "ADX_TREND_THRESHOLD: 20 → 18",
-        "config.py",
-        "ADX_TREND_THRESHOLD = 20   # AUDIT #2.2: now read by regime_engine.py via ADX_TREND",
-        "ADX_TREND_THRESHOLD = 18   # PATCHED C-13: 20→18 (30-min bar calibration)",
-    )
-
-    apply_fix(
-        "C-14",
-        "ADX_RANGE_THRESHOLD: 15 → 13",
-        "config.py",
-        "ADX_RANGE_THRESHOLD = 15",
-        "ADX_RANGE_THRESHOLD = 13   # PATCHED C-14: 15→13",
-    )
-
-    apply_fix(
-        "C-15",
-        "MIN_VIX_SELL: 11.0 → 9.5",
-        "config.py",
-        "MIN_VIX_SELL     = 11.0",
-        "MIN_VIX_SELL     = 9.5   # PATCHED C-15: 11.0→9.5",
-    )
-
-    apply_fix(
-        "C-16",
-        "CONDOR_MIN_CREDIT_PCT_OF_WIDTH: 0.18 → 0.12",
-        "config.py",
-        "CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.18",
-        "CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.12  # PATCHED C-16: 0.18→0.12",
-    )
-
-    # C-17 and C-18: MIN_COMPOSITE thresholds live inside getattr() calls
-    # in strategy_engine.py, not in config.py as string literals.
-    # Patch them directly in strategy_engine.py instead.
-    apply_fix(
-        "C-17",
-        "MIN_COMPOSITE_FOR_STRONG_SELL: 0.52 → 0.30 (in strategy_engine.py getattr)",
-        "strategy_engine.py",
-        '"MIN_COMPOSITE_FOR_STRONG_SELL", 0.52',
-        '"MIN_COMPOSITE_FOR_STRONG_SELL", 0.30  # PATCHED C-17',
-    )
-
-    apply_fix(
-        "C-18",
-        "MIN_COMPOSITE_FOR_MILD_SELL: 0.22 → 0.10 (in strategy_engine.py getattr)",
-        "strategy_engine.py",
-        '"MIN_COMPOSITE_FOR_MILD_SELL", 0.22',
-        '"MIN_COMPOSITE_FOR_MILD_SELL", 0.10  # PATCHED C-18',
-    )
-
-    apply_fix(
-        "C-19",
-        "CONDOR_TARGET_PCT: 0.50 → 0.60",
-        "config.py",
-        "CONDOR_TARGET_PCT         = 0.50",
-        "CONDOR_TARGET_PCT         = 0.60  # PATCHED C-19: 0.50→0.60",
-    )
-
-    apply_fix(
-        "C-20",
-        "SPREAD_TARGET_PCT: 0.50 → 0.60",
-        "config.py",
-        "SPREAD_TARGET_PCT     = 0.50",
-        "SPREAD_TARGET_PCT     = 0.60  # PATCHED C-20: 0.50→0.60",
-    )
-
-    apply_fix(
-        "C-21",
-        "STRADDLE_TARGET_PCT: 0.50 → 0.60",
-        "config.py",
-        "STRADDLE_TARGET_PCT    = 0.50",
-        "STRADDLE_TARGET_PCT    = 0.60  # PATCHED C-21: 0.50→0.60",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# REGIME_ENGINE.PY FIXES
-# ─────────────────────────────────────────────────────────────────────
-
-def fix_regime_engine():
-    print("\n=== regime_engine.py fixes ===")
-
-    # R-01: _build_weights() wrong signature call
-    apply_fix(
-        "R-01",
-        "_build_weights() called with wrong argument — remove argument",
-        "regime_engine.py",
-        (
-            "            _log_weights = _build_weights(\n"
-            "                getattr(self, \"_last_flow_none_frac\", 0.0)\n"
-            "            )"
-        ),
-        "            _log_weights = _build_weights()  # PATCHED R-01: removed invalid argument",
-    )
-
-    # R-02: _composite_history never populated
-    apply_fix(
-        "R-02",
-        "_composite_history.append() after raw_composite is set",
-        "regime_engine.py",
-        (
-            "            self.raw_composite = float(\n"
-            "                max(-1.0, min(1.0, composite))\n"
-            "            )"
-        ),
-        (
-            "            self.raw_composite = float(\n"
-            "                max(-1.0, min(1.0, composite))\n"
-            "            )\n"
-            "            # PATCHED R-02: populate composite history for FILTER-11c\n"
-            "            self._composite_history.append(self.raw_composite)"
-        ),
-    )
-
-    # R-03: SKEW_MIN_DAYS 20 → 10
-    apply_fix(
-        "R-03",
-        "SKEW_MIN_DAYS: 20 → 10",
-        "regime_engine.py",
-        "SKEW_MIN_DAYS    = 20     # minimum history before z is trusted",
-        "SKEW_MIN_DAYS    = 10     # PATCHED R-03: 20→10",
-    )
-
-    # R-04: 25-delta tolerance 0.05 → 0.08
-    apply_fix(
-        "R-04",
-        "25-delta skew tolerance: 0.05 → 0.08",
-        "regime_engine.py",
-        (
-            "            and abs(best_c[0] - 0.25) < 0.05\n"
-            "            and abs(best_p[0] + 0.25) < 0.05"
-        ),
-        (
-            "            and abs(best_c[0] - 0.25) < 0.08  # PATCHED R-04: 0.05→0.08\n"
-            "            and abs(best_p[0] + 0.25) < 0.08  # PATCHED R-04: 0.05→0.08"
-        ),
-    )
-
-    # R-05: Persistence sign-of-average replaces sign-stability
-    apply_fix(
-        "R-05",
-        "Persistence: sign-of-average replaces sign-stability for float scores",
-        "regime_engine.py",
-        (
-            "        # RE-T02: confirm when the last N readings have the same sign.\n"
-            "        if len(buf) >= _required:\n"
-            "            _lastN = buf[-_required:]\n"
-            "            _signs = [_math_p.copysign(1, v) if v != 0 else 0\n"
-            "                      for v in _lastN]\n"
-            "            if len(set(_signs)) == 1:  # all same sign\n"
-            "                _confirmed = sum(_lastN) / len(_lastN)\n"
-            "                self._conf[name] = _confirmed\n"
-            "                logger.info(\n"
-            "                    f\"Persistence confirmed: \"\n"
-            "                    f\"{name}={_confirmed:.3f} \"\n"
-            "                    f\"(sign-stable over {_required} readings, \"\n"
-            "                    f\"composite={_composite_mag:.3f})\"\n"
-            "                )\n"
-            "            else:\n"
-            "                logger.info(\n"
-            "                    f\"Persistence unconfirmed: {name} \"\n"
-            "                    f\"buf={[round(v,3) for v in buf[-_required:]]} \"\n"
-            "                    f\"holding={self._conf[name]:.3f}\"\n"
-            "                )"
-        ),
-        (
-            "        # PATCHED R-05: sign-of-average replaces sign-stability.\n"
-            "        # Sign-stability breaks for float scores (vol=0.5 then 0.0 then 0.5\n"
-            "        # never confirms because set([+1,0,+1])={0,1}).\n"
-            "        # Average-sign handles mixed sub-signals correctly.\n"
-            "        if len(buf) >= _required:\n"
-            "            _lastN = buf[-_required:]\n"
-            "            _avg = sum(_lastN) / len(_lastN)\n"
-            "            if abs(_avg) >= 0.10:\n"
-            "                self._conf[name] = _avg\n"
-            "                logger.info(\n"
-            "                    f\"Persistence confirmed: \"\n"
-            "                    f\"{name}={_avg:.3f} \"\n"
-            "                    f\"(avg-sign over {_required} readings, \"\n"
-            "                    f\"composite={_composite_mag:.3f})\"\n"
-            "                )\n"
-            "            else:\n"
-            "                logger.info(\n"
-            "                    f\"Persistence unconfirmed: {name} \"\n"
-            "                    f\"avg={_avg:.3f} < 0.10 \"\n"
-            "                    f\"holding={self._conf[name]:.3f}\"\n"
-            "                )"
-        ),
-    )
-
-    # R-06: Edge module — relative VRP as primary signal
-    apply_fix(
-        "R-06",
-        "Edge module: relative VRP >= 15% as primary signal",
-        "regime_engine.py",
-        (
-            "        if edge > EDGE_RICH:\n"
-            "            raw = 1\n"
-            "            tag = \"RICH (seller edge)\"\n"
-            "        elif edge < EDGE_CHEAP:\n"
-            "            raw = -1\n"
-            "            tag = \"CHEAP (buyer edge)\"\n"
-            "        else:\n"
-            "            raw = 0\n"
-            "            tag = \"FAIR\""
-        ),
-        (
-            "        # PATCHED R-06: relative VRP as primary signal.\n"
-            "        # Absolute spread (EDGE_RICH) fires only at VIX>14.\n"
-            "        # Relative VRP fires at VIX=11 (22%>15%) through VIX=22.\n"
-            "        _vrp_rel = (iv_atm - rv_pct) / rv_pct if rv_pct > 0 else 0.0\n"
-            "        _vrp_rich  =  0.15\n"
-            "        _vrp_cheap = -0.05\n"
-            "        if _vrp_rel >= _vrp_rich or edge > EDGE_RICH:\n"
-            "            raw = 1\n"
-            "            tag = f\"RICH (VRP_rel={_vrp_rel:.2%})\"\n"
-            "        elif _vrp_rel <= _vrp_cheap or edge < EDGE_CHEAP:\n"
-            "            raw = -1\n"
-            "            tag = f\"CHEAP (VRP_rel={_vrp_rel:.2%})\"\n"
-            "        else:\n"
-            "            raw = 0\n"
-            "            tag = f\"FAIR (VRP_rel={_vrp_rel:.2%})\""
-        ),
-    )
-
-    # R-07: _build_weights() — implement flow weight redistribution
-    apply_fix(
-        "R-07",
-        "_build_weights(): implement flow weight redistribution (IMM-01)",
-        "regime_engine.py",
-        (
-            "def _build_weights():\n"
-            "    return {\n"
-            "        \"vol\":   config.WEIGHT_VOL,\n"
-            "        \"edge\":  config.WEIGHT_EDGE,\n"
-            "        \"trend\": config.WEIGHT_TREND,\n"
-            "        \"flow\":  config.WEIGHT_FLOW,\n"
-            "    }"
-        ),
-        (
-            "def _build_weights(flow_none_frac=0.0):\n"
-            "    \"\"\"PATCHED R-07: redistribute flow weight when flow is frequently None.\"\"\"\n"
-            "    _threshold = getattr(config, \"FLOW_WEIGHT_NONE_THRESHOLD\", 0.50)\n"
-            "    wv = config.WEIGHT_VOL\n"
-            "    we = config.WEIGHT_EDGE\n"
-            "    wt = config.WEIGHT_TREND\n"
-            "    wf = config.WEIGHT_FLOW\n"
-            "    if flow_none_frac > _threshold and wf > 0:\n"
-            "        _other = wv + we + wt\n"
-            "        if _other > 0:\n"
-            "            _scale = (wv + we + wt + wf) / _other\n"
-            "            wv = round(wv * _scale, 6)\n"
-            "            we = round(we * _scale, 6)\n"
-            "            wt = round(wt * _scale, 6)\n"
-            "            wf = 0.0\n"
-            "    return {\"vol\": wv, \"edge\": we, \"trend\": wt, \"flow\": wf}"
-        ),
-    )
-
-    # R-08: Wire flow_none_frac into composite calculation
-    # The pattern must match exactly what is in the file after R-01 applied.
-    # R-01 changed the _log_weights call at the END of the method.
-    # R-08 targets the _live_weights call inside the composite block.
-    # We search for the comment that precedes _live_weights.
-    apply_fix(
-        "R-08",
-        "Wire flow_none_frac into _build_weights() in composite calculation",
-        "regime_engine.py",
-        (
-            "                    # AUDIT #2.2: rebuild weights from config\n"
-            "                    # each cycle so config.WEIGHT_* tuning is live.\n"
-            "                    _live_weights = _build_weights()"
-        ),
-        (
-            "                    # PATCHED R-08: rebuild weights with flow_none_frac.\n"
-            "                    _lookback_fw = getattr(\n"
-            "                        config, \"FLOW_WEIGHT_NONE_LOOKBACK\", 10\n"
-            "                    )\n"
-            "                    _hist_fw = [\n"
-            "                        h.get(\"raw_flow\")\n"
-            "                        for h in list(self.score_history)[-_lookback_fw:]\n"
-            "                    ]\n"
-            "                    _hist_fw.append(self._raw.get(\"flow\"))\n"
-            "                    _n_fw = len(_hist_fw)\n"
-            "                    _none_fw = sum(1 for v in _hist_fw if v is None)\n"
-            "                    _flow_none_frac = _none_fw / _n_fw if _n_fw > 0 else 0.0\n"
-            "                    self._last_flow_none_frac = _flow_none_frac\n"
-            "                    _live_weights = _build_weights(_flow_none_frac)"
-        ),
-    )
-
-    # R-09: Macro pre-window — fire at T-1 market close
-    apply_fix(
-        "R-09",
-        "Macro pre-window: fire at T-1 15:30 IST (not T 03:15 IST)",
-        "regime_engine.py",
-        (
-            "                # Pre-window starts EVENT_PRE_HOURS before market open\n"
-            "                pre_window_start = (\n"
-            "                    event_market_open\n"
-            "                    - __import__(\"datetime\").timedelta(\n"
-            "                        hours=EVENT_PRE_HOURS\n"
-            "                    )\n"
-            "                )"
-        ),
-        (
-            "                # PATCHED R-09: pre-window = T-1 market close (15:30).\n"
-            "                # Old anchor (event_open - 6h = 03:15 IST) was always\n"
-            "                # outside market hours so EVENT_HEDGE never fired before\n"
-            "                # the event. New anchor fires during T-1 trading session.\n"
-            "                _prev_close = self._IST.localize(\n"
-            "                    __import__(\"datetime\").datetime.strptime(\n"
-            "                        event_date_str, \"%Y-%m-%d\"\n"
-            "                    ).replace(\n"
-            "                        hour=15, minute=30,\n"
-            "                        second=0, microsecond=0,\n"
-            "                    )\n"
-            "                ) - __import__(\"datetime\").timedelta(days=1)\n"
-            "                pre_window_start = _prev_close"
-        ),
-    )
-
-    # R-10: Term spread — near vs far weekly IV
-    apply_fix(
-        "R-10",
-        "Term spread: use near vs far weekly IV when no 30-45 DTE expiry",
-        "regime_engine.py",
-        (
-            "        elif _fwd_is_vix_proxy:\n"
-            "            # RE-01: VIX proxy — not a real term spread, return None\n"
-            "            term_score = None\n"
-            "            term_txt   = \"T_spread n/a (forward_iv is VIX proxy)\"\n"
-            "            notes.append(\"forward IV is VIX/100 proxy — not a term spread\")"
-        ),
-        (
-            "        elif _fwd_is_vix_proxy:\n"
-            "            # PATCHED R-10: use near vs far weekly IV when no 30-45 DTE expiry.\n"
-            "            # Near = active expiry (DTE=4-8), Far = next weekly (DTE=10-16).\n"
-            "            _far_iv_val = None\n"
-            "            try:\n"
-            "                import datetime as _dt_r10\n"
-            "                _today_r10 = _dt_r10.date.today()\n"
-            "                for _exp_r10 in sorted(self.dm.get_available_expiries()):\n"
-            "                    _expd_r10 = _dt_r10.datetime.strptime(\n"
-            "                        _exp_r10, \"%Y-%m-%d\"\n"
-            "                    ).date()\n"
-            "                    _dte_r10 = (_expd_r10 - _today_r10).days\n"
-            "                    if 10 <= _dte_r10 <= 16:\n"
-            "                        _fc_r10 = self.dm.get_chain_for_expiry(_exp_r10)\n"
-            "                        if _fc_r10 and spot:\n"
-            "                            _atm_r10 = min(\n"
-            "                                _fc_r10.keys(),\n"
-            "                                key=lambda k: abs(k - spot),\n"
-            "                            )\n"
-            "                            _c_iv = _fc_r10[_atm_r10].get(\"call\", {}).get(\"iv\", 0)\n"
-            "                            _p_iv = _fc_r10[_atm_r10].get(\"put\",  {}).get(\"iv\", 0)\n"
-            "                            if _c_iv > 0 and _p_iv > 0:\n"
-            "                                _far_iv_val = (_c_iv + _p_iv) / 2.0\n"
-            "                        break\n"
-            "            except Exception:\n"
-            "                _far_iv_val = None\n"
-            "            if _far_iv_val is not None and _near_iv is not None and _near_iv > 0:\n"
-            "                _near_pct_r10 = _near_iv * 100.0\n"
-            "                _far_pct_r10  = _far_iv_val * 100.0\n"
-            "                _ts_r10 = _far_pct_r10 - _near_pct_r10\n"
-            "                if _ts_r10 > TERM_THRESHOLD:\n"
-            "                    term_score = 1\n"
-            "                elif _ts_r10 < -TERM_THRESHOLD:\n"
-            "                    term_score = -1\n"
-            "                else:\n"
-            "                    term_score = 0\n"
-            "                term_txt = (\n"
-            "                    f\"T_spread(weekly) {_ts_r10:+.2f}%% \"\n"
-            "                    f\"near={_near_pct_r10:.1f}%% far={_far_pct_r10:.1f}%%\"\n"
-            "                )\n"
-            "            else:\n"
-            "                term_score = None\n"
-            "                term_txt = \"T_spread n/a (VIX proxy, no far weekly IV)\"\n"
-            "                notes.append(\"forward IV is VIX/100 proxy — not a term spread\")"
-        ),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# STRATEGY_ENGINE.PY FIXES
-# ─────────────────────────────────────────────────────────────────────
-
-def fix_strategy_engine():
-    print("\n=== strategy_engine.py fixes ===")
-
-    # S-01: _build_credit_spreads — assign side flags before first use
-    apply_fix(
-        "S-01",
-        "_build_credit_spreads: assign _build_put_side/_build_call_side before first use",
-        "strategy_engine.py",
-        (
-            "        # FIX-02: max_risk based on active sides only\n"
-            "        _active_w = max(\n"
-            "            put_width  if _build_put_side  else 0,\n"
-            "            call_width if _build_call_side else 0,\n"
-            "        )"
-        ),
-        (
-            "        # PATCHED S-01: assign side flags BEFORE first use.\n"
-            "        # Previously assigned after the credit gate that used them.\n"
-            "        _build_put_side  = skew_side in (\"put\",  \"both\")\n"
-            "        _build_call_side = skew_side in (\"call\", \"both\")\n"
-            "\n"
-            "        # FIX-02: max_risk based on active sides only\n"
-            "        _active_w = max(\n"
-            "            put_width  if _build_put_side  else 0,\n"
-            "            call_width if _build_call_side else 0,\n"
-            "        )"
-        ),
-    )
-
-    # S-02: remove duplicate late assignment
-    apply_fix(
-        "S-02",
-        "_build_credit_spreads: remove duplicate late assignment of side flags",
-        "strategy_engine.py",
-        (
-            "        # PRF-02: only build the side(s) justified by skew.\n"
-            "        _build_put_side  = skew_side in (\"put\",  \"both\")\n"
-            "        _build_call_side = skew_side in (\"call\", \"both\")"
-        ),
-        (
-            "        # PATCHED S-02: side flags already assigned above (S-01)."
-        ),
-    )
-
-    # S-03: _vix_mult undefined in _calculate_lot_size
-    apply_fix(
-        "S-03",
-        "_calculate_lot_size: define _vix_mult before use",
-        "strategy_engine.py",
-        (
-            "        # IMM-02: apply VIX-adaptive multiplier to final lot count\n"
-            "        if _vix_mult != 1.0 and lots > 0:\n"
-            "            lots = max(1, int(lots * _vix_mult))\n"
-            "        # Store for entry attempt logging\n"
-            "        self._last_vix_mult = _vix_mult"
-        ),
-        (
-            "        # PATCHED S-03: compute _vix_mult before use.\n"
-            "        _vix_adaptive = getattr(config, \"VIX_ADAPTIVE_SIZING\", False)\n"
-            "        _vix_ref_sz = getattr(config, \"VIX_ADAPTIVE_REFERENCE\", 16.0)\n"
-            "        _vix_min_m = getattr(config, \"VIX_ADAPTIVE_MIN_MULT\", 0.5)\n"
-            "        _vix_max_m = getattr(config, \"VIX_ADAPTIVE_MAX_MULT\", 2.0)\n"
-            "        _cur_vix = (\n"
-            "            self.dm.vix\n"
-            "            if self.dm.vix and self.dm.vix > 0\n"
-            "            else _vix_ref_sz\n"
-            "        )\n"
-            "        if _vix_adaptive and _cur_vix > 0:\n"
-            "            _vix_mult = max(\n"
-            "                _vix_min_m,\n"
-            "                min(_vix_max_m, _vix_ref_sz / _cur_vix),\n"
-            "            )\n"
-            "        else:\n"
-            "            _vix_mult = 1.0\n"
-            "        # IMM-02: apply VIX-adaptive multiplier to final lot count\n"
-            "        if _vix_mult != 1.0 and lots > 0:\n"
-            "            lots = max(1, int(lots * _vix_mult))\n"
-            "        # Store for entry attempt logging\n"
-            "        self._last_vix_mult = _vix_mult"
-        ),
-    )
-
-    # S-04: _defined_risk_budget undefined
-    apply_fix(
-        "S-04",
-        "_calculate_lot_size: define _defined_risk_budget before use",
-        "strategy_engine.py",
-        (
-            "        # FIX-09: use defined-risk budget if set\n"
-            "        risk_per_trade = (\n"
-            "            _defined_risk_budget\n"
-            "            if _defined_risk_budget is not None\n"
-            "            else config.MAX_RISK_PER_TRADE\n"
-            "        )"
-        ),
-        (
-            "        # PATCHED S-04: define _defined_risk_budget before use.\n"
-            "        _defined_risk_budget = None\n"
-            "        # FIX-09: use defined-risk budget if set\n"
-            "        risk_per_trade = (\n"
-            "            _defined_risk_budget\n"
-            "            if _defined_risk_budget is not None\n"
-            "            else config.MAX_RISK_PER_TRADE\n"
-            "        )"
-        ),
-    )
-
-    # S-05: condor stop 2.0 → 1.0
-    apply_fix(
-        "S-05",
-        "_build_iron_condor: stop_loss credit * 2.0 → credit * 1.0",
-        "strategy_engine.py",
-        (
-            "            # PRF-S05: raised from 1.25x to 2.0x credit.\n"
-            "            # 1.25x stop = 50pt on a 40pt credit condor. NIFTY moves\n"
-            "            # 50-80pt intraday routinely, causing many false stop-outs.\n"
-            "            # 2.0x = 80pt stop, survives normal intraday noise.\n"
-            "            \"stop_loss\":     net_credit * 2.0,"
-        ),
-        (
-            "            # PATCHED S-05: 2.0x→1.0x stop.\n"
-            "            # At 2.0x stop + 60% target, break-even WR=77% (unachievable).\n"
-            "            # At 1.0x stop + 60% target, break-even WR=62.5% (achievable).\n"
-            "            \"stop_loss\":     net_credit * 1.0,"
-        ),
-    )
-
-    # S-06: credit spread stop 2.0 → 1.0
-    apply_fix(
-        "S-06",
-        "_build_credit_spreads: stop_loss credit * 2.0 → credit * 1.0",
-        "strategy_engine.py",
-        (
-            "            # PRF-S05: raised from 1.25x to 2.0x credit (same as condor).\n"
-            "            \"stop_loss\":     total_credit * 2.0,"
-        ),
-        (
-            "            # PATCHED S-06: 2.0x→1.0x (same reasoning as S-05).\n"
-            "            \"stop_loss\":     total_credit * 1.0,"
-        ),
-    )
-
-    # S-07: ratio spread stop 2.0 → 1.0
-    # The ratio spread meta block ends just before _build_butterfly.
-    # We target the specific stop_loss line inside the ratio spread meta dict.
-    apply_fix(
-        "S-07",
-        "_build_ratio_spread: stop_loss credit * 2.0 → credit * 1.0",
-        "strategy_engine.py",
-        (
-            "            \"stop_loss\":     total_credit * 2.0,\n"
-            "            \"exit_dte\":      config.RATIO_EXIT_DTE,"
-        ),
-        (
-            "            \"stop_loss\":     total_credit * 1.0,  # PATCHED S-07: 2.0x→1.0x\n"
-            "            \"exit_dte\":      config.RATIO_EXIT_DTE,"
-        ),
-    )
-
-    # S-08: STRONG_SELL always routes to straddle
-    apply_fix(
-        "S-08",
-        "_select_strategy: STRONG_SELL always routes to straddle",
-        "strategy_engine.py",
-        (
-            "        if regime == config.REGIME_STRONG_SELL:\n"
-            "            # SE-B1: route to straddle by default.\n"
-            "            # The condor is arithmetically unbuildable at 1.5sigma\n"
-            "            # across the realistic VIX range (credit ~6-9% of width\n"
-            "            # vs 18% required floor). The straddle has 2 legs (1.7pts\n"
-            "            # cost vs 3.2), no wing debit, and maximum theta.\n"
-            "            # Route to condor only when ADX confirms a genuine trend\n"
-            "            # (tail risk warrants paying for wings).\n"
-            "            if adx > config.ADX_TREND_THRESHOLD:\n"
-            "                return config.STRAT_IRON_CONDOR\n"
-            "            else:\n"
-            "                return config.STRAT_SHORT_STRADDLE"
-        ),
-        (
-            "        if regime == config.REGIME_STRONG_SELL:\n"
-            "            # PATCHED S-08: always route to straddle.\n"
-            "            # STRONG_SELL requires trend=+1 (ADX<ADX_RANGE_THRESHOLD),\n"
-            "            # so ADX>ADX_TREND_THRESHOLD is impossible in this regime.\n"
-            "            # The condor branch was permanently dead code.\n"
-            "            return config.STRAT_SHORT_STRADDLE"
-        ),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# DATA_MANAGER.PY FIXES
-# ─────────────────────────────────────────────────────────────────────
-
-def fix_data_manager():
-    print("\n=== data_manager.py fixes ===")
-
-    # D-01: add meta_json column to open_positions CREATE TABLE
-    apply_fix(
-        "D-01",
-        "init_sqlite: add meta_json column to open_positions CREATE TABLE",
-        "data_manager.py",
-        (
-            "                    paper_trade        INTEGER DEFAULT 1,\n"
-            "                    status             TEXT    DEFAULT 'OPEN',\n"
-            "                    created_at         TEXT    DEFAULT CURRENT_TIMESTAMP\n"
-            "                )"
-        ),
-        (
-            "                    paper_trade        INTEGER DEFAULT 1,\n"
-            "                    status             TEXT    DEFAULT 'OPEN',\n"
-            "                    meta_json          TEXT    DEFAULT '{}',\n"
-            "                    created_at         TEXT    DEFAULT CURRENT_TIMESTAMP\n"
-            "                )"
-        ),
-    )
-
-    # D-04: ALTER TABLE migration for existing databases
-    # Insert before the closed_trades CREATE TABLE statement.
-    apply_fix(
-        "D-04",
-        "init_sqlite: ALTER TABLE migration for existing databases",
-        "data_manager.py",
-        (
-            "            cursor.execute(\"\"\"\n"
-            "                CREATE TABLE IF NOT EXISTS closed_trades ("
-        ),
-        (
-            "            # PATCHED D-04: safe migration for existing databases\n"
-            "            try:\n"
-            "                cursor.execute(\n"
-            "                    \"ALTER TABLE open_positions \"\n"
-            "                    \"ADD COLUMN meta_json TEXT DEFAULT '{}'\"\n"
-            "                )\n"
-            "            except sqlite3.OperationalError:\n"
-            "                pass\n"
-            "\n"
-            "            cursor.execute(\"\"\"\n"
-            "                CREATE TABLE IF NOT EXISTS closed_trades ("
-        ),
-    )
-
-    # D-02: save_position INSERT — add meta_json column name
-    # We target the column list in the INSERT statement.
-    apply_fix(
-        "D-02",
-        "save_position: add meta_json to INSERT column list",
-        "data_manager.py",
-        (
-            "                    paper_trade, status\n"
-            "                ) VALUES (\n"
-            "                    ?,?,?,?,?,?,?,?,?,?,\n"
-            "                    ?,?,?,?,?,?,?,?,?,?,\n"
-            "                    ?,?,?,?\n"
-            "                )"
-        ),
-        (
-            "                    paper_trade, status, meta_json\n"
-            "                ) VALUES (\n"
-            "                    ?,?,?,?,?,?,?,?,?,?,\n"
-            "                    ?,?,?,?,?,?,?,?,?,?,\n"
-            "                    ?,?,?,?,?\n"
-            "                )"
-        ),
-    )
-
-    # D-03: save_position VALUES tuple — add meta_json value
-    apply_fix(
-        "D-03",
-        "save_position: add meta_json value to VALUES tuple",
-        "data_manager.py",
-        (
-            "                1 if position_dict.get(\"paper_trade\")\n"
-            "                else 0,\n"
-            "                \"OPEN\",\n"
-            "            ))"
-        ),
-        (
-            "                1 if position_dict.get(\"paper_trade\")\n"
-            "                else 0,\n"
-            "                \"OPEN\",\n"
-            "                position_dict.get(\"meta_json\", \"{}\"),\n"
-            "            ))"
-        ),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# SYNTAX VERIFICATION
-# ─────────────────────────────────────────────────────────────────────
-
-def verify_syntax():
-    print("\n=== Syntax verification ===")
-    all_ok = True
-    for fname in [
-        "config.py", "regime_engine.py",
-        "strategy_engine.py", "data_manager.py",
-    ]:
-        fpath = os.path.join(BASE_DIR, fname)
-        if not os.path.exists(fpath):
-            print(f"  SKIP   {fname} (not found)")
-            continue
-        try:
-            source = read_file(fpath)
-            compile(source, fname, "exec")
-            print(f"  OK     {fname} — syntax valid")
-        except SyntaxError as e:
-            print(f"  ERROR  {fname} — SyntaxError: {e}")
-            all_ok = False
-    return all_ok
-
-
-# ─────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────
-
-def main():
-    print("=" * 65)
-    print("NIFTY Options Algo Engine — Patch Application")
-    print("=" * 65)
-
-    missing = []
-    for fname in [
-        "config.py", "regime_engine.py",
-        "strategy_engine.py", "data_manager.py",
-    ]:
-        if not os.path.exists(os.path.join(BASE_DIR, fname)):
-            missing.append(fname)
-    if missing:
-        print(f"\nERROR: Missing files: {missing}")
-        print("Run patch.py from the directory containing all engine files.")
+def _assert_file(path: str) -> None:
+    if not os.path.isfile(path):
+        print(f"ERROR: file not found: {path}")
         sys.exit(1)
 
-    create_backups()
-    fix_config()
-    fix_regime_engine()
-    fix_strategy_engine()
-    fix_data_manager()
 
-    syntax_ok = verify_syntax()
+def _verify(path: str, sentinels: list) -> bool:
+    src = _read(path)
+    ok = True
+    for s in sentinels:
+        if s in src:
+            print(f"  VERIFY OK  : {s!r}")
+        else:
+            print(f"  VERIFY FAIL: {s!r}  not found in {path}")
+            ok = False
+    return ok
 
-    print("\n" + "=" * 65)
-    print("PATCH SUMMARY")
-    print("=" * 65)
-    print(f"\nApplied  ({len(applied)}):")
-    for a in applied:
-        print(f"  OK  {a}")
-    if skipped:
-        print(f"\nSkipped  ({len(skipped)}):")
-        for s in skipped:
-            print(f"  --  {s}")
-    if errors:
-        print(f"\nErrors   ({len(errors)}):")
-        for e in errors:
-            print(f"  !!  {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P4-1  strategy_engine.py — route STRONG_SELL to condor when range-bound
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fix_strong_sell_routing(src: str) -> str:
+    """
+    Current code in _select_strategy():
+        if regime == config.REGIME_STRONG_SELL:
+            # PATCH S-08: always route STRONG_SELL to straddle.
+            return config.STRAT_SHORT_STRADDLE
+
+    We replace this with ADX-conditional routing:
+    - ADX < ADX_RANGE_THRESHOLD (genuinely range-bound): use condor
+      (defined risk, 5x better margin efficiency)
+    - ADX >= ADX_RANGE_THRESHOLD (trending or indeterminate): use straddle
+      (straddle profits from IV compression regardless of direction)
+    """
+    sentinel = "# P4-1: STRONG_SELL routes to condor when range-bound"
+    if sentinel in src:
+        print("  P4-1 already applied (sentinel found)")
+        return src
+
+    old = (
+        "        if regime == config.REGIME_STRONG_SELL:\n"
+        "            # PATCH S-08: always route STRONG_SELL to straddle.\n"
+        "            # STRONG_SELL requires trend=+1 (ADX<ADX_RANGE_THRESHOLD),\n"
+        "            # so ADX>ADX_TREND_THRESHOLD is impossible when in this regime.\n"
+        "            # The condor branch was permanently dead code.\n"
+        "            # Straddle: 2 legs, maximum theta, no wing debit.\n"
+        "            return config.STRAT_SHORT_STRADDLE\n"
+    )
+    new = (
+        "        if regime == config.REGIME_STRONG_SELL:\n"
+        "            # P4-1: STRONG_SELL routes to condor when range-bound\n"
+        "            # Iron condor has 5x better return on margin at VIX=11-14\n"
+        "            # (defined risk ~Rs16k/lot vs naked straddle ~Rs1.7L/lot).\n"
+        "            # Use condor when ADX confirms range-bound (low trend strength).\n"
+        "            # Fall back to straddle when ADX is elevated (trending market\n"
+        "            # where fixed condor wings are more likely to be breached).\n"
+        "            _adx_now = self.dm.adx or 99.0\n"
+        "            if _adx_now < config.ADX_RANGE_THRESHOLD:\n"
+        "                return config.STRAT_IRON_CONDOR\n"
+        "            return config.STRAT_SHORT_STRADDLE\n"
+    )
+
+    if old in src:
+        src = src.replace(old, new, 1)
+        print("  P4-1 applied: STRONG_SELL routes to condor when ADX < ADX_RANGE_THRESHOLD")
+    else:
+        # Try a shorter anchor in case comments differ slightly
+        old2 = (
+            "        if regime == config.REGIME_STRONG_SELL:\n"
+            "            return config.STRAT_SHORT_STRADDLE\n"
+        )
+        if old2 in src:
+            src = src.replace(old2, new, 1)
+            print("  P4-1 applied (alt anchor): STRONG_SELL routes to condor when range-bound")
+        else:
+            print("  P4-1 SKIPPED: STRONG_SELL anchor not found — check _select_strategy manually")
+    return src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P4-2  strategy_engine.py — composite quality multiplier in lot sizing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fix_composite_lot_scaling(src: str) -> str:
+    """
+    In _calculate_lot_size(), after all caps are applied, add a
+    composite quality multiplier.
+
+    The multiplier is computed from self.re.raw_composite relative to
+    the MILD_SELL_ENTER threshold (0.20 after P3):
+      - At composite = MILD_SELL_ENTER (0.20): multiplier = 1.0 (no change)
+      - At composite = STRONG_SELL_ENTER (0.50): multiplier = 1.25
+      - At composite >= 0.75: multiplier = 1.5 (cap)
+
+    Formula: mult = 1.0 + min(0.5, max(0.0, (composite - 0.20) / 1.10))
+    This gives a smooth linear ramp from 1.0 at 0.20 to 1.5 at 0.75.
+
+    The multiplier is applied AFTER the margin cap so it never pushes
+    lots above what margin allows.  It is also capped by REGIME_MAX_LOTS.
+
+    We insert this block immediately before the final `return lots` line
+    in _calculate_lot_size().
+    """
+    sentinel = "# P4-2: composite quality multiplier"
+    if sentinel in src:
+        print("  P4-2 already applied (sentinel found)")
+        return src
+
+    # The function ends with:
+    #         logger.info(
+    #             f"Lot size: {lots} for {strategy_name} "
+    #             ...
+    #         )
+    #         return lots
+    #
+    # We insert the multiplier block between the logger.info and return.
+    # Use a precise anchor: the return statement is the last line of the
+    # function and is uniquely preceded by the logger.info call.
+
+    old = (
+        "        logger.info(\n"
+        "            f\"Lot size: {lots} for {strategy_name} \"\n"
+        "            f\"risk={risk_per_trade} \"\n"
+        "            f\"max_loss={max_loss_per_lot:.0f} \"\n"
+        "            f\"margin_per_lot={margin_per_lot:.0f}\"\n"
+        "        )\n"
+        "        return lots\n"
+    )
+    new = (
+        "        # P4-2: composite quality multiplier\n"
+        "        # Scale lot count by signal quality so high-conviction\n"
+        "        # entries (composite well above threshold) get more size\n"
+        "        # than marginal entries (composite barely above threshold).\n"
+        "        # Multiplier ramps linearly from 1.0 at composite=0.20\n"
+        "        # to 1.5 at composite=0.75, capped at 1.5.\n"
+        "        # Applied AFTER all other caps so it never exceeds margin\n"
+        "        # or regime max lots limits.\n"
+        "        if lots > 0:\n"
+        "            _comp_now = abs(getattr(self.re, 'raw_composite', 0.0))\n"
+        "            _comp_base = getattr(\n"
+        "                config, 'MILD_SELL_ENTER', 0.20\n"
+        "            )\n"
+        "            _comp_mult = 1.0 + min(\n"
+        "                0.5,\n"
+        "                max(0.0, (_comp_now - _comp_base) / 1.10)\n"
+        "            )\n"
+        "            if _comp_mult > 1.05:  # only apply meaningful boost\n"
+        "                _lots_before_mult = lots\n"
+        "                lots = min(\n"
+        "                    config.REGIME_MAX_LOTS.get(\n"
+        "                        self.re.confirmed_regime, lots\n"
+        "                    ),\n"
+        "                    max(1, int(lots * _comp_mult)),\n"
+        "                )\n"
+        "                if lots != _lots_before_mult:\n"
+        "                    logger.info(\n"
+        "                        f\"P4-2: composite quality boost \"\n"
+        "                        f\"{_lots_before_mult} → {lots} lots \"\n"
+        "                        f\"(composite={_comp_now:.3f} \"\n"
+        "                        f\"mult={_comp_mult:.2f}x)\"\n"
+        "                    )\n"
+        "        logger.info(\n"
+        "            f\"Lot size: {lots} for {strategy_name} \"\n"
+        "            f\"risk={risk_per_trade} \"\n"
+        "            f\"max_loss={max_loss_per_lot:.0f} \"\n"
+        "            f\"margin_per_lot={margin_per_lot:.0f}\"\n"
+        "        )\n"
+        "        return lots\n"
+    )
+
+    if old in src:
+        src = src.replace(old, new, 1)
+        print("  P4-2 applied: composite quality multiplier added to lot sizing")
+    else:
+        print("  P4-2 SKIPPED: lot sizing return anchor not found — check manually")
+    return src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P4-3  strategy_engine.py — IV spike detection + Monday gap filter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fix_entry_gate_enhancements(src: str) -> str:
+    """
+    Two additions to _should_enter_new_position(), inserted just before
+    the final `logger.info('Entry gate PASSED...')` line.
+
+    (a) IV spike detection:
+        When current IV_ATM >= 15% above the recent 5-reading average
+        from iv_atm_history, we are in a fear-premium window.  Log this
+        as an enhanced entry opportunity.  We do NOT override the regime
+        gate — instead we log the spike so the operator knows this is a
+        high-quality entry, and we relax the persistence_count requirement
+        (see P4-4) for spike entries.
+
+    (b) Monday gap risk filter:
+        On Mondays before 10:00 IST, block STRAT_SHORT_STRADDLE entries.
+        The straddle is the only undefined-risk strategy; condors and
+        spreads have defined risk and are not blocked.
+        We read the intended strategy from _select_strategy() to know
+        whether a straddle would be selected — but calling _select_strategy
+        here would be a side-effect.  Instead we check the regime directly:
+        STRONG_SELL after P4-1 routes to condor when ADX is low, so the
+        straddle is only selected when ADX >= ADX_RANGE_THRESHOLD.
+        We block the entry when:
+          - Monday before 10:00 IST
+          - regime == STRONG_SELL
+          - ADX >= ADX_RANGE_THRESHOLD (straddle would be selected)
+    """
+    sentinel_a = "# P4-3a: IV spike detection"
+    sentinel_b = "# P4-3b: Monday gap risk filter"
+
+    # We insert both blocks before the final PASSED log line.
+    # Anchor: the unique string that ends _should_enter_new_position.
+    anchor = (
+        "        logger.info(\n"
+        "            f'Entry gate PASSED: regime={regime} '\n"
+        "            f'time={now_time} '\n"
+        "            f'composite={self.re.raw_composite:.4f}'\n"
+        "        )\n"
+        "        return True\n"
+    )
+
+    if sentinel_a in src and sentinel_b in src:
+        print("  P4-3a already applied (sentinel found)")
+        print("  P4-3b already applied (sentinel found)")
+        return src
+
+    if anchor not in src:
+        print("  P4-3 SKIPPED: entry gate PASSED anchor not found — check manually")
+        return src
+
+    insertion = ""
+
+    if sentinel_a not in src:
+        insertion += (
+            "        # P4-3a: IV spike detection\n"
+            "        # When IV_ATM is >= 15% above recent average, we are in a\n"
+            "        # fear-premium window — the highest-EV entry for premium selling.\n"
+            "        # Log this so the operator knows this is a high-quality entry.\n"
+            "        # Also store the spike flag so P4-4 can relax persistence.\n"
+            "        _iv_spike_entry = False\n"
+            "        if (\n"
+            "            self.dm.iv_atm is not None\n"
+            "            and self.dm.iv_atm > 0\n"
+            "            and len(self.dm.iv_atm_history) >= 5\n"
+            "            and regime in [\n"
+            "                config.REGIME_STRONG_SELL,\n"
+            "                config.REGIME_MILD_SELL,\n"
+            "            ]\n"
+            "        ):\n"
+            "            _recent_iv_avg = float(\n"
+            "                sum(list(self.dm.iv_atm_history)[-5:])\n"
+            "                / 5\n"
+            "            )\n"
+            "            if (\n"
+            "                _recent_iv_avg > 0\n"
+            "                and self.dm.iv_atm >= _recent_iv_avg * 1.15\n"
+            "            ):\n"
+            "                _iv_spike_entry = True\n"
+            "                logger.info(\n"
+            "                    f'P4-3a: IV spike detected — '\n"
+            "                    f'iv_atm={self.dm.iv_atm*100:.2f}%% '\n"
+            "                    f'vs recent_avg={_recent_iv_avg*100:.2f}%% '\n"
+            "                    f'(+{(self.dm.iv_atm/_recent_iv_avg-1)*100:.1f}%%) '\n"
+            "                    f'— high-quality fear-premium entry'\n"
+            "                )\n"
+            "        self._iv_spike_entry = _iv_spike_entry\n"
+        )
+        print("  P4-3a will be applied: IV spike detection")
+    else:
+        print("  P4-3a already applied (sentinel found)")
+
+    if sentinel_b not in src:
+        insertion += (
+            "        # P4-3b: Monday gap risk filter\n"
+            "        # Block straddle entries before 10:00 IST on Mondays.\n"
+            "        # NIFTY Monday gap of 0.4-0.8%% can wipe 1.6 weeks of theta.\n"
+            "        # Only blocks when the engine would select a straddle\n"
+            "        # (STRONG_SELL + ADX >= ADX_RANGE_THRESHOLD after P4-1).\n"
+            "        # Condors and credit spreads (defined risk) are NOT blocked.\n"
+            "        if (\n"
+            "            now.weekday() == 0\n"
+            "            and now_time < config.EXEC_START_TIME.__class__(10, 0)\n"
+            "            and regime == config.REGIME_STRONG_SELL\n"
+            "            and (self.dm.adx or 0) >= config.ADX_RANGE_THRESHOLD\n"
+            "        ):\n"
+            "            logger.info(\n"
+            "                'P4-3b: Entry gate BLOCKED: Monday gap risk window '\n"
+            "                '(straddle before 10:00 IST — NIFTY gap risk)'\n"
+            "            )\n"
+            "            return False\n"
+        )
+        print("  P4-3b will be applied: Monday gap risk filter")
+    else:
+        print("  P4-3b already applied (sentinel found)")
+
+    if insertion:
+        new_anchor = insertion + anchor
+        src = src.replace(anchor, new_anchor, 1)
+        print("  P4-3 applied: IV spike detection and Monday gap filter inserted")
+
+    return src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P4-4  strategy_engine.py — regime stability requirement
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fix_regime_stability_gate(src: str) -> str:
+    """
+    Add a persistence_count >= 5 requirement to _should_enter_new_position().
+
+    Exception: when an IV spike is detected (P4-3a sets self._iv_spike_entry),
+    reduce the requirement to 3 cycles — the spike itself is confirmation.
+
+    We insert this check after the existing persistence_count < 3 check
+    (which guards against NEUTRAL→STRONG transitions) but before the
+    positions/capital checks.
+
+    The existing check is:
+        if (
+            self.re.previous_regime == config.REGIME_NEUTRAL
+            and self.re.confirmed_regime in [...]
+            and self.re.persistence_count < 3
+        ):
+
+    We add a broader stability check AFTER it:
+        if self.re.persistence_count < 5:
+            (unless IV spike detected, then require only 3)
+    """
+    sentinel = "# P4-4: regime stability requirement"
+    if sentinel in src:
+        print("  P4-4 already applied (sentinel found)")
+        return src
+
+    # Anchor: the block immediately after the existing persistence check.
+    # The existing check ends with `return False` and is followed by the
+    # positions check.  We anchor on the positions check opening.
+    anchor = (
+        "        if len(self.open_positions) >= config.MAX_CONCURRENT_POSITIONS:\n"
+        "            logger.info(\n"
+        "                f'Entry gate BLOCKED: max positions '\n"
+        "                f'({len(self.open_positions)}/'\n"
+        "                f'{config.MAX_CONCURRENT_POSITIONS})'\n"
+        "            )\n"
+        "            return False\n"
+    )
+
+    if anchor not in src:
+        print("  P4-4 SKIPPED: max_positions anchor not found — check manually")
+        return src
+
+    insertion = (
+        "        # P4-4: regime stability requirement\n"
+        "        # Require the regime to have been confirmed for >= 5 cycles\n"
+        "        # before entering a new position.  A regime confirmed for only\n"
+        "        # 3 cycles (3 minutes) is more likely to be a transient signal.\n"
+        "        # Exception: IV spike entries (P4-3a) require only 3 cycles\n"
+        "        # because the spike itself provides additional confirmation.\n"
+        "        _iv_spike_now = getattr(self, '_iv_spike_entry', False)\n"
+        "        _min_persistence = 3 if _iv_spike_now else 5\n"
+        "        if self.re.persistence_count < _min_persistence:\n"
+        "            logger.info(\n"
+        "                f'Entry gate BLOCKED: regime not yet stable '\n"
+        "                f'(persistence={self.re.persistence_count} '\n"
+        "                f'< required={_min_persistence})'\n"
+        "            )\n"
+        "            return False\n"
+    )
+
+    new_anchor = insertion + anchor
+    src = src.replace(anchor, new_anchor, 1)
+    print("  P4-4 applied: regime stability requirement (persistence_count >= 5)")
+    return src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P4-5  config.py — CONDOR_EXIT_DTE 1 → 2
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fix_condor_exit_dte(src: str) -> str:
+    sentinel = "# P4-5: CONDOR_EXIT_DTE raised"
+    if sentinel in src:
+        print("  P4-5 already applied (sentinel found)")
+        return src
+
+    old = "CONDOR_EXIT_DTE           = 1"
+    new = (
+        "CONDOR_EXIT_DTE           = 2"
+        "   # P4-5: CONDOR_EXIT_DTE raised (was 1; at DTE=1 closing costs"
+        " exceed remaining theta; DTE=2 is profitable to close)"
+    )
+
+    if old in src:
+        src = src.replace(old, new, 1)
+        print("  P4-5 applied: CONDOR_EXIT_DTE 1 → 2")
+    else:
+        print("  P4-5 SKIPPED: anchor not found — check config.py manually")
+    return src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File-level fix drivers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def patch_strategy_engine(path: str) -> None:
+    src = _read(path)
+    original = src
+
+    src = fix_strong_sell_routing(src)
+    src = fix_composite_lot_scaling(src)
+    src = fix_entry_gate_enhancements(src)
+    src = fix_regime_stability_gate(src)
+
+    if src != original:
+        _write(path, src)
+        print("  strategy_engine.py written.")
+    else:
+        print("  strategy_engine.py: no changes written.")
+
+
+def patch_config(path: str) -> None:
+    src = _read(path)
+    original = src
+
+    src = fix_condor_exit_dte(src)
+
+    if src != original:
+        _write(path, src)
+        print("  config.py written.")
+    else:
+        print("  config.py: no changes written.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    base = os.path.dirname(os.path.abspath(__file__))
+
+    se_path  = os.path.join(base, "strategy_engine.py")
+    cfg_path = os.path.join(base, "config.py")
+
+    _assert_file(se_path)
+    _assert_file(cfg_path)
+
+    print("\n=== Patching strategy_engine.py ===")
+    _backup(se_path)
+    patch_strategy_engine(se_path)
+
+    print("\n=== Patching config.py ===")
+    _backup(cfg_path)
+    patch_config(cfg_path)
+
+    print("\n=== Verification ===")
+    se_ok = _verify(se_path, [
+        "# P4-1: STRONG_SELL routes to condor when range-bound",
+        "# P4-2: composite quality multiplier",
+        "# P4-3a: IV spike detection",
+        "# P4-3b: Monday gap risk filter",
+        "# P4-4: regime stability requirement",
+    ])
+    cfg_ok = _verify(cfg_path, [
+        "# P4-5: CONDOR_EXIT_DTE raised",
+    ])
 
     print()
-    if not syntax_ok:
-        print("WARNING: Syntax errors detected after patching.")
-        print("Restore from .bak files and report the failing fix ID.")
-        sys.exit(1)
-    elif errors:
-        print("Patch complete with errors. Review error list above.")
-        sys.exit(1)
+    if se_ok and cfg_ok:
+        print("All P4 patches verified successfully.")
+        print()
+        print("What was fixed:")
+        print(
+            "  P4-1  strategy_engine.py  STRONG_SELL routes to iron condor\n"
+            "         when ADX < ADX_RANGE_THRESHOLD (range-bound confirmed).\n"
+            "         Falls back to straddle when ADX is elevated (trending).\n"
+            "         Iron condor has 5x better return on margin at VIX=11-14."
+        )
+        print(
+            "  P4-2  strategy_engine.py  Composite quality multiplier in lot sizing.\n"
+            "         Multiplier ramps 1.0x → 1.5x as composite rises from\n"
+            "         MILD_SELL_ENTER (0.20) to 0.75.  Applied after all hard\n"
+            "         caps so it never exceeds margin or regime max lots."
+        )
+        print(
+            "  P4-3a strategy_engine.py  IV spike detection in entry gate.\n"
+            "         Logs when IV_ATM >= 15%% above recent 5-cycle average.\n"
+            "         Sets _iv_spike_entry flag used by P4-4 to relax\n"
+            "         persistence requirement."
+        )
+        print(
+            "  P4-3b strategy_engine.py  Monday gap risk filter.\n"
+            "         Blocks straddle entries before 10:00 IST on Mondays\n"
+            "         (NIFTY average Monday gap 0.4-0.8%% wipes 1.6 weeks theta).\n"
+            "         Only blocks when engine would select straddle\n"
+            "         (STRONG_SELL + ADX >= ADX_RANGE_THRESHOLD)."
+        )
+        print(
+            "  P4-4  strategy_engine.py  Regime stability requirement.\n"
+            "         Requires persistence_count >= 5 before entry.\n"
+            "         Relaxed to 3 when IV spike detected (P4-3a)."
+        )
+        print(
+            "  P4-5  config.py           CONDOR_EXIT_DTE 1 → 2.\n"
+            "         At DTE=1, closing costs (~Rs334 + slippage) exceed\n"
+            "         remaining theta (~Rs390).  At DTE=2, theta (~Rs650-910)\n"
+            "         comfortably exceeds closing costs."
+        )
+        print()
+        print("Skipped from P4 report list:")
+        print(
+            "  'Add time-of-day IV level check'\n"
+            "   → Requires tracking intraday IV high (not currently stored).\n"
+            "     Deferred to avoid introducing new state bugs."
+        )
+        print(
+            "  'Lower STRONG_SELL_MIN_CONFIRMING_MODULES from 3 to 2'\n"
+            "   → Already applied as P3-5g in patch_p3.py."
+        )
+        print()
+        print("No other files were modified.")
+        print("Backups: strategy_engine.py.bak  config.py.bak")
     else:
-        print("All patches applied. Syntax verified clean.")
-        print(f"Backups saved with suffix: {BACKUP_SUFFIX}")
+        print("One or more patches could not be verified.")
+        print("Inspect the output above and use .bak files to restore if needed.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

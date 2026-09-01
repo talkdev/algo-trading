@@ -233,8 +233,8 @@ TERM_SPREAD_BACKWARDATION = -1.5   # reference: -TERM_THRESHOLD
 
 # PRF-C11: thresholds tightened. In low-VIX (11-14), z-scores
 # rarely exceed ±1.0. 1.2/-0.8 makes skew contribute more often.
-SKEW_ZSCORE_FEAR       =  1.2
-SKEW_ZSCORE_COMPLACENT = -0.8   # reference: SKEW_Z_FLAT = -1.0
+SKEW_ZSCORE_FEAR       =  2.0   # P3-3: SKEW_ZSCORE_FEAR raised (was 1.2; fired on pre-event nervousness, suppressing good entries)
+SKEW_ZSCORE_COMPLACENT = -1.2   # P3-4: SKEW_ZSCORE_COMPLACENT lowered (was -0.8; fired on normal calm days, not genuine complacency)   # reference: SKEW_Z_FLAT = -1.0
 SKEW_LOOKBACK_DAYS     = 60
 EDGE_LOOKBACK_DAYS     = 60
 
@@ -343,8 +343,15 @@ OTM_STRIKE_OFFSET       = 6
 # LIVE FIX: recalibrated for VIX=11 environment
 # Max achievable composite ≈ 0.55 (edge=1 + trend=0.5)
 # Old STRONG_SELL=0.45 was unreachable.
-STRONG_SELL_THRESHOLD =  0.30   # PATCHED: 0.45→0.30
-MILD_SELL_THRESHOLD   =  0.10   # PATCHED: 0.15→0.10
+STRONG_SELL_THRESHOLD =  0.50   # P3-5e: STRONG_SELL_THRESHOLD synced with STRONG_SELL_ENTER
+# P3-5g: STRONG_SELL_MIN_CONFIRMING_MODULES
+# RE-B2 gate: STRONG_SELL requires this many live non-zero
+# confirmed modules.  Was implicit 3 via getattr fallback,
+# making STRONG_SELL unreachable at VIX=11 where only edge
+# module is live.  Lowered to 2 so edge + any one other
+# module can confirm STRONG_SELL.
+STRONG_SELL_MIN_CONFIRMING_MODULES = 2   # PATCHED: 0.45→0.30
+MILD_SELL_THRESHOLD   =  0.20   # P3-5f: MILD_SELL_THRESHOLD synced with MILD_SELL_ENTER   # PATCHED: 0.15→0.10
 MILD_BUY_THRESHOLD    = -0.15   # reference: x > -0.15 = NEUTRAL
 STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL
 
@@ -354,10 +361,10 @@ STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL
 # direction. This prevents churn near boundaries without
 # creating hidden thresholds that contradict the base values.
 # Band = 0.05 composite units (tune here, not inline).
-STRONG_SELL_ENTER =  0.30   # PATCHED: 0.45→0.30 for VIX=11-14 environment
-STRONG_SELL_EXIT  =  0.22   # PATCHED: 0.40→0.22 (band now 0.08)
-MILD_SELL_ENTER   =  0.10   # PATCHED: 0.15→0.10
-MILD_SELL_EXIT    =  0.02   # PATCHED: 0.10→0.02 (band now 0.08)
+STRONG_SELL_ENTER =  0.50   # P3-5a: STRONG_SELL_ENTER raised (was 0.30 = composite baseline; now requires 2+ modules)   # PATCHED: 0.45→0.30 for VIX=11-14 environment
+STRONG_SELL_EXIT  =  0.38   # P3-5b: STRONG_SELL_EXIT raised (was 0.22; band maintained at 0.12)   # PATCHED: 0.40→0.22 (band now 0.08)
+MILD_SELL_ENTER   =  0.20   # P3-5c: MILD_SELL_ENTER raised (was 0.10; always exceeded by 0.30 baseline)   # PATCHED: 0.15→0.10
+MILD_SELL_EXIT    =  0.08   # P3-5d: MILD_SELL_EXIT raised (was 0.02; band maintained at 0.12)   # PATCHED: 0.10→0.02 (band now 0.08)
 MILD_BUY_ENTER    = -0.15   # enter NEUTRAL above this (from BUY_VOL)
 MILD_BUY_EXIT     = -0.20   # exit  NEUTRAL below this
 STRONG_BUY_ENTER  = -0.45   # enter BUY_VOL above this (from STRONG_BUY)
@@ -425,7 +432,7 @@ CONDOR_DTE_MAX            = 8    # was 5     # widened from 7
 # EXE-02: set to 1. With TIME_EXIT_EXPIRY=13:30, holding to DTE=0
 # is dangerous. Exit at DTE=1 harvests 95%+ of theta without the
 # terminal gamma tail risk from 0-DTE institutional hedging flows.
-CONDOR_EXIT_DTE           = 1
+CONDOR_EXIT_DTE           = 2   # P4-5: CONDOR_EXIT_DTE raised (was 1; at DTE=1 closing costs exceed remaining theta; DTE=2 is profitable to close)
 # PRF-C01: lowered from 0.60 to 0.50. 50% target is reached faster
 # (typically 1-2 days vs 3-4 days for 65%), reducing time-in-trade
 # and gamma exposure. With 2.0x stop: R:R = 0.50/2.0 = 0.25.
@@ -438,8 +445,8 @@ CONDOR_TARGET_PCT         = 0.60  # PATCHED: 0.50→0.60
 # PRF-C04: lowered from 0.22 to 0.18. At VIX=11-13 with dynamic
 # wing widths, 22% is often unattainable. 18% still ensures
 # meaningful credit/risk ratio while allowing more entries.
-CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.12  # PATCHED: 0.18→0.12
-CONDOR_MIN_CREDIT         = 40   # legacy absolute floor; builder uses PCT_OF_WIDTH above
+CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.04  # P1-1c: CONDOR_MIN_CREDIT_PCT_OF_WIDTH lowered (was 0.12)  # PATCHED: 0.18→0.12
+CONDOR_MIN_CREDIT         = 10   # P1-1b: CONDOR_MIN_CREDIT lowered (was 40, achievable at VIX=11 ~11pts)   # legacy absolute floor; builder uses PCT_OF_WIDTH above
 # C4-06: DEAD CONSTANT — no condor adjustment logic exists.
 CONDOR_ADJUSTMENT_DELTA   = 0.35
 CONDOR_TESTED_SIDE_BUFFER = 100
@@ -465,8 +472,8 @@ SPREAD_EXIT_DTE       = 1
 SPREAD_TARGET_PCT     = 0.60  # PATCHED: 0.50→0.60
 # AUDIT CFG-01: spread min credit as % of wing width.
 # PRF-C05: lowered from 0.25 to 0.20 (same reasoning as condor).
-SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.20
-SPREAD_MIN_CREDIT     = 25   # legacy absolute floor; builder uses PCT_OF_WIDTH above
+SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.08  # P1-1d: SPREAD_MIN_CREDIT_PCT_OF_WIDTH lowered (was 0.20)
+SPREAD_MIN_CREDIT     = 12   # P1-1a: SPREAD_MIN_CREDIT lowered (was 25, achievable at VIX=11 ~17pts)   # legacy absolute floor; builder uses PCT_OF_WIDTH above
 # C4-06: DEAD CONSTANT — no roll logic exists in strategy_engine.
 SPREAD_ROLL_DELTA_TRIGGER  = 0.35
 SPREAD_SKEW_THRESHOLD      = 2.0
@@ -813,7 +820,7 @@ REGIME_MAX_LOTS = {
 # gates still apply on top of this.
 MAX_TRANCHES_PER_STRATEGY = 2
 
-REENTRY_COOLDOWN_SEC       = 300
+REENTRY_COOLDOWN_SEC       = 1800  # P2-3: REENTRY_COOLDOWN_SEC raised (was 300s; NIFTY mean-reversion takes 15-30 min after stop)
 # REENTRY_MAX_SPOT_MOVE_PCT lowered to 0.002 (0.2%). At 0.02 (2%,
 # ~500pt NIFTY move) the 300s timer always expires first, making
 # the price guard useless. 0.2% detects sharp intraday reversals.
