@@ -209,8 +209,12 @@ assert abs(
 # Weekly IV always > VIX by ~2-3% (normal term structure).
 # Old 0.02 threshold caused term_score=-1 permanently.
 # New 0.05: only flag as stress when spread > 5%.
-TERM_SPREAD_CONTANGO      =  0.5   # reference: TERM_THRESHOLD = 0.5
-TERM_SPREAD_BACKWARDATION = -0.5   # reference: -TERM_THRESHOLD
+# CAL-05: raised from 0.5 to 1.5pp. At VIX=11, far-month ATM IV
+# is typically 12-13% giving a spread of 1-2% — always > 0.5pp.
+# This permanently injected +0.15 into the composite (structural
+# sell-vol bias). 1.5pp only fires in pronounced contango.
+TERM_SPREAD_CONTANGO      =  1.5   # reference: TERM_THRESHOLD = 0.5
+TERM_SPREAD_BACKWARDATION = -1.5   # reference: -TERM_THRESHOLD
 
 SKEW_ZSCORE_FEAR       =  1.5
 SKEW_ZSCORE_COMPLACENT = -1.0   # reference: SKEW_Z_FLAT = -1.0
@@ -240,7 +244,12 @@ EMA_PERIOD          = 50
 # regime_engine computes slope_pct = slope/spot*100 (a percentage
 # like 0.05 for 0.05%). The old value 0.0005 made the condition
 # abs(slope_pct) > EMA_SLOPE_PCT perpetually true.
-EMA_SLOPE_THRESHOLD = 0.05
+# CAL-04: raised from 0.05 to 0.15. At 0.05% (~12.5 pts over 10h)
+# the slope condition fires on minor drift, making trend score=-1
+# (trending/unfavorable) ~80%+ of sessions. The +1 (range-bound,
+# favorable for premium selling) almost never fired. 0.15% (~37.5 pts)
+# better separates genuine directional trends from intraday noise.
+EMA_SLOPE_THRESHOLD = 0.15
 
 # LIVE FIX: "30minute" is valid Upstox interval
 # "15minute" and "1day" return HTTP 400
