@@ -378,6 +378,11 @@ EVENT_STRANGLE_DELTA           = 0.30
 EVENT_STRANGLE_STOP_PCT        = 0.50
 EVENT_STRANGLE_TARGET_PCT      = 1.00
 EVENT_STRANGLE_MAX_SPREAD_PTS  = 3
+# AUDIT #N2: named DTE constants for event strangle so the
+# builder can enforce an upper bound (previously a bare
+# literal 7 with no upper-bound check).
+EVENT_STRANGLE_DTE_TARGET      = 7   # target days to expiry
+EVENT_STRANGLE_DTE_MAX         = 14  # reject if DTE > this
 EVENT_HOLD                     = "EVENT_PLUS_1_DAY"
 EVENT_WINDOW_BEFORE_HOURS      = 6
 EVENT_WINDOW_AFTER_HOURS       = 2
