@@ -1279,36 +1279,49 @@ class DataManager:
         opt_data: Dict,
         fallback: float = 0.0,
         max_quote_age_sec: float = 15.0,
+        max_ltp_age_sec: float = 30.0,
+        max_rest_fallback_age_sec: float = 90.0,
     ) -> float:
         """
-        AUDIT DM-01: bid/ask are only updated by the 60s REST
-        poll, never by the WebSocket. LTP is updated by WS on
-        every tick. Use bid/ask midpoint only when the REST
-        quote is fresh (< max_quote_age_sec); otherwise prefer
-        the live-ticking LTP.
+        DM-R01/R02: Returns the best available mark price.
+        Priority:
+          1. Fresh REST bid/ask midpoint (< max_quote_age_sec)
+          2. Fresh WS LTP (< max_ltp_age_sec, uses _ltp_ts)
+          3. Stale REST bid/ask midpoint (< max_rest_fallback_age_sec)
+          4. fallback (entry price or 0)
+        Returns fallback when all sources exceed their age limits
+        so callers can detect a genuinely stale mark.
         """
+        now_ist = datetime.now(self._IST)
         bid = float(opt_data.get("bid", 0) or 0)
         ask = float(opt_data.get("ask", 0) or 0)
         ltp = float(opt_data.get("ltp", 0) or 0)
-        rest_ts = opt_data.get("_rest_ts")
-        quote_fresh = False
-        if rest_ts:
+
+        def _age(ts_key):
+            ts = opt_data.get(ts_key)
+            if not ts:
+                return float("inf")
             try:
-                ts_dt = datetime.fromisoformat(rest_ts)
+                ts_dt = datetime.fromisoformat(ts)
                 if ts_dt.tzinfo is None:
                     ts_dt = self._IST.localize(ts_dt)
-                age = (
-                    datetime.now(self._IST) - ts_dt
-                ).total_seconds()
-                quote_fresh = age <= max_quote_age_sec
+                return (now_ist - ts_dt).total_seconds()
             except Exception:
-                pass
-        if quote_fresh and bid > 0 and ask > 0:
+                return float("inf")
+
+        rest_age = _age("_rest_ts")
+        ltp_age  = _age("_ltp_ts")
+
+        # 1. Fresh REST midpoint
+        if rest_age <= max_quote_age_sec and bid > 0 and ask > 0:
             return (bid + ask) / 2.0
-        if ltp > 0:
+        # 2. Fresh WS LTP
+        if ltp_age <= max_ltp_age_sec and ltp > 0:
             return ltp
-        if bid > 0 and ask > 0:
+        # 3. Stale REST midpoint (bounded age)
+        if rest_age <= max_rest_fallback_age_sec and bid > 0 and ask > 0:
             return (bid + ask) / 2.0
+        # 4. fallback
         return fallback
 
     def _compute_skew(self) -> None:
@@ -2815,8 +2828,14 @@ class DataManager:
                             )
                         else:
                             opt_ref["ltp"] = ltp
+                        opt_ref["_ltp_ts"] = datetime.now(
+                            pytz.timezone(config.TZ)
+                        ).isoformat()
                     else:
                         opt_ref["ltp"] = ltp
+                        opt_ref["_ltp_ts"] = datetime.now(
+                            pytz.timezone(config.TZ)
+                        ).isoformat()
 
     def _update_instrument_greeks(
         self,
