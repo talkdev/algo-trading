@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # At 0.5pp, far-month ATM IV vs VIX always exceeded the threshold
 # at VIX=11 (typical spread 1-2pp), permanently injecting +0.15
 # into the composite as a structural sell-vol bias.
-TERM_THRESHOLD   = 1.5    # V_fwd - V_spot contango/backwardation
+TERM_THRESHOLD   = 0.8    # P3-2: TERM_THRESHOLD lowered (was 1.5pp; NIFTY near-vs-far weekly spread is 0.3-1.0pp so 1.5 never fired)
 SKEW_Z_STEEP = config.SKEW_ZSCORE_FEAR        # AUDIT #2.2: reads from config
 SKEW_Z_FLAT = config.SKEW_ZSCORE_COMPLACENT  # AUDIT #2.2: reads from config
 # CFG-01: reads from config (now symmetric ±2.0)
@@ -300,6 +300,8 @@ class RegimeEngine:
 
         # Score history for debugging
         self.score_history: deque = deque(maxlen=288 * 10)
+        # P0-1: composite history deque (was never initialised)
+        self._composite_history: deque = deque(maxlen=288)
 
         # Public state
         self.raw_composite:     float = 0.0
@@ -425,7 +427,29 @@ class RegimeEngine:
             # Step 7: Weighted aggregation
             # AUDIT #2.2: rebuild weights from config
             # each cycle so config.WEIGHT_* tuning is live.
-            _live_weights = _build_weights()
+            # P2-2: flow_none_frac computed and passed to _build_weights
+            # so weight redistribution actually fires when flow is
+            # frequently None (first 20 min of session, expiry days, etc.)
+            _flow_lookback = getattr(
+                config, "FLOW_WEIGHT_NONE_LOOKBACK", 10
+            )
+            _recent_score_history = list(
+                self.score_history
+            )[-_flow_lookback:]
+            if _recent_score_history:
+                _flow_none_count = sum(
+                    1 for _e in _recent_score_history
+                    if _e.get("raw_flow") is None
+                )
+                _flow_none_frac = (
+                    _flow_none_count
+                    / len(_recent_score_history)
+                )
+            else:
+                _flow_none_frac = 0.0
+            _live_weights = _build_weights(
+                flow_none_frac=_flow_none_frac
+            )
             composite = sum(
                 _live_weights[m] * self._conf[m]
                 for m in MODULES
@@ -433,9 +457,7 @@ class RegimeEngine:
             self.raw_composite = float(
                 max(-1.0, min(1.0, composite))
             )
-            # PATCHED R-02: populate composite history for FILTER-11c
-            self._composite_history.append(self.raw_composite)
-            # PATCH R-02: populate composite history for FILTER-11c
+            # P0-2: single append (duplicate removed)
             self._composite_history.append(self.raw_composite)
             # RE-B2: gate STRONG_SELL on minimum confirming modules.
             # Count modules with a non-zero confirmed score AND a
@@ -850,7 +872,7 @@ class RegimeEngine:
         # Absolute spread (EDGE_RICH=2.0pp) only fires at VIX>14.
         # Relative VRP fires at VIX=11 (22%>15%) through VIX=22.
         _vrp_relative = (iv_atm - rv_pct) / rv_pct if rv_pct > 0 else 0.0
-        _vrp_rich_threshold = 0.15   # 15% relative premium
+        _vrp_rich_threshold = 0.35   # P3-1: VRP rich threshold raised (was 0.15; NIFTY structural VRP 27-50%% made edge=+1 always)
         _vrp_cheap_threshold = -0.05  # IV below RV by 5%
         if _vrp_relative >= _vrp_rich_threshold or edge > EDGE_RICH:
             raw = 1
