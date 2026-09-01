@@ -894,6 +894,9 @@ def _display_console(dm, re, se, cached_greeks=None):
     def ps(ok, na=False):
         return NA_S if na else (PASS_S if ok else FAIL_S)
 
+    # MN8-P2-01 FIX: greeks was computed but never displayed.
+    # For a short-vol engine, portfolio delta/gamma/vega/theta
+    # are the four numbers that matter most to the operator.
     greeks = cached_greeks or se._get_portfolio_greeks()
     regime = re.confirmed_regime
     rc     = RCOLORS.get(regime, "")
@@ -1095,6 +1098,15 @@ def _display_console(dm, re, se, cached_greeks=None):
         f" Capital:   Rs{se.current_capital:>12,.2f}  "
         f"Peak: Rs{se.peak_capital:>12,.2f}"
     )
+    # MN8-P2-01 FIX: display portfolio Greeks
+    if greeks and se.open_positions:
+        print(
+            f" Greeks:    "
+            f"Delta={greeks.get('delta', 0):>8.3f}  "
+            f"Gamma={greeks.get('gamma', 0):>8.5f}  "
+            f"Vega=Rs{greeks.get('vega', 0):>8,.0f}  "
+            f"Theta=Rs{greeks.get('theta', 0):>8,.0f}/day"
+        )
     if se.open_positions:
         print("\u2500" * W)
         for pos in se.open_positions:
@@ -1144,9 +1156,14 @@ def _generate_eod_report(
         _conn.close()
     except Exception:
         _db_pnls = []
-    # Merge in-memory today trades with DB records
+    # MN8-P1-03 FIX: wire _db_pnls into the report.
+    # Previously fetched but never read — restarts still showed 0.
+    # Supplement today's in-memory trades with DB records for
+    # positions closed before this process started.
     _mem_ids = {p.trade_id for p in _today_closed}
-    total_trades = len(_today_closed)
+    # Count DB-only trades (not already in memory)
+    _db_only_count = max(0, len(_db_pnls) - len(_today_closed))
+    total_trades = len(_today_closed) + _db_only_count
     winning = [
         p for p in _today_closed
         if p.net_pnl > 0
@@ -1161,14 +1178,17 @@ def _generate_eod_report(
         if total_trades > 0 else 0.0
     )
 
+    # MN8-P1-01 FIX: use _today_closed for all aggregates.
+    # Previously counts/rates used today's trades but P&L sums
+    # used lifetime se.closed_positions — inconsistent population.
     total_gross_pnl = sum(
-        p.realized_pnl for p in se.closed_positions
+        p.realized_pnl for p in _today_closed
     )
     total_tx_costs  = sum(
-        p.transaction_costs for p in se.closed_positions
+        p.transaction_costs for p in _today_closed
     )
     total_net_pnl   = sum(
-        p.net_pnl for p in se.closed_positions
+        p.net_pnl for p in _today_closed
     )
 
     avg_win_net  = (

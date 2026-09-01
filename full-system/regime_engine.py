@@ -1275,16 +1275,19 @@ class RegimeEngine:
                             for m in MODULES
                         }
                     elif key == "confirmed_regime":
-                        if isinstance(data, str) and data:
-                            self.confirmed_regime = data
+                        # RE8-P1-01 FIX: only restore regime when
+                        # saved today. If _conf was cleared (stale
+                        # date), restoring the regime creates a
+                        # contradiction: STRONG_SELL with zero evidence.
+                        # Regime is restored after the date check below.
+                        _restored_regime = data if isinstance(data, str) else ""
                     elif key == "previous_regime":
-                        if isinstance(data, str) and data:
-                            self.previous_regime = data
+                        _restored_prev_regime = data if isinstance(data, str) else ""
                     elif key == "raw_composite":
                         try:
-                            self.raw_composite = float(data)
+                            _restored_composite = float(data)
                         except (TypeError, ValueError):
-                            pass
+                            _restored_composite = 0.0
                     elif key == "last_valid_at":
                         for m in MODULES:
                             ts_str = data.get(m)
@@ -1333,6 +1336,10 @@ class RegimeEngine:
                         pass
                     break
             _today_iso = datetime.now(self._IST).date().isoformat()
+            # RE8-P1-01 FIX: initialise deferred restore vars
+            _restored_regime       = getattr(self, "_restored_regime", "")
+            _restored_prev_regime  = getattr(self, "_restored_prev_regime", "")
+            _restored_composite    = getattr(self, "_restored_composite", 0.0)
             if _last_save and _last_save != _today_iso:
                 logger.info(
                     f"RE7-P1-02: last save was {_last_save}, "
@@ -1341,6 +1348,20 @@ class RegimeEngine:
                 )
                 self._conf = {m: 0.0 for m in MODULES}
                 self._buf  = {m: []  for m in MODULES}
+                # RE8-P1-01: do NOT restore regime when evidence cleared.
+                # Starting NEUTRAL is safe; starting STRONG_SELL with
+                # zero evidence is dangerous.
+                logger.info(
+                    "RE8-P1-01: regime reset to NEUTRAL (stale save date)"
+                )
+            else:
+                # Same day: safe to restore regime alongside evidence
+                if _restored_regime:
+                    self.confirmed_regime = _restored_regime
+                if _restored_prev_regime:
+                    self.previous_regime = _restored_prev_regime
+                if _restored_composite:
+                    self.raw_composite = _restored_composite
             logger.info("Regime algo state loaded from SQLite")
         except sqlite3.OperationalError:
             logger.info("No regime_algo_state table — fresh start")
