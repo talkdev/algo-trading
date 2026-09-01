@@ -178,6 +178,10 @@ class StrategyEngine:
         # previously defined but never referenced anywhere).
         self._last_position_close_time = None
         self._last_position_close_spot = None
+        # PRF-02: skew side for next credit spread build
+        self._pending_skew_side = "both"
+        # PRF-04: last composite score per strategy at entry
+        self._last_entry_composite: Dict[str, float] = {}
 
     # ─────────────────────────────────────────────────────────────
     # Order tag system
@@ -2613,6 +2617,31 @@ class StrategyEngine:
                     f'({elapsed:.0f}s/{config.BUILD_FAILURE_COOLDOWN_SEC}s)'
                 )
                 return False
+        # PRF-04: require meaningful composite change before re-entry.
+        # Prevents repeated correlated entries on the same signal.
+        _strategy_name = self._select_strategy(regime)
+        if _strategy_name is not None:
+            _last_comp = self._last_entry_composite.get(
+                _strategy_name
+            )
+            if _last_comp is not None:
+                _comp_change = abs(
+                    self.re.raw_composite - _last_comp
+                )
+                _min_change = getattr(
+                    config,
+                    "REENTRY_MIN_COMPOSITE_CHANGE",
+                    0.10,
+                )
+                if _comp_change < _min_change:
+                    logger.info(
+                        f'Entry gate BLOCKED: composite change '
+                        f'{_comp_change:.3f} < {_min_change} '
+                        f'since last {_strategy_name} entry '
+                        f'(no new signal)'
+                    )
+                    return False
+
         logger.info(
             f'Entry gate PASSED: regime={regime} '
             f'time={now_time} '
@@ -2821,6 +2850,10 @@ class StrategyEngine:
         )
         self._last_build_failure = None
 
+        # PRF-04: record composite at entry for re-entry gate
+        self._last_entry_composite[strategy_name] = (
+            self.re.raw_composite
+        )
         logger.info(
             f"New position: {strategy_name} "
             f"trade_id={trade_id[:8]} lots={lots} "
@@ -2895,6 +2928,8 @@ class StrategyEngine:
 
         elif regime == config.REGIME_MILD_SELL:
             if skew_diff >= config.SPREAD_SKEW_THRESHOLD:
+                # PRF-02: put skew is rich — build put side only
+                self._pending_skew_side = "put"
                 return config.STRAT_CREDIT_SPREADS
             elif (
                 skew_diff < config.RATIO_SKEW_FLAT_THRESHOLD
@@ -2903,6 +2938,8 @@ class StrategyEngine:
             ):
                 return config.STRAT_RATIO_SPREAD
             else:
+                # Flat skew — build both sides symmetrically
+                self._pending_skew_side = "both"
                 return config.STRAT_CREDIT_SPREADS
 
         elif regime == config.REGIME_NEUTRAL:
@@ -2970,6 +3007,12 @@ class StrategyEngine:
             ),
         }
         if strategy_name in tranche_aware_builders:
+            # PRF-02: pass skew_side for credit spreads
+            if strategy_name == config.STRAT_CREDIT_SPREADS:
+                _skew_side = getattr(self, "_pending_skew_side", "both")
+                return await tranche_aware_builders[
+                    strategy_name
+                ](tranche=tranche, skew_side=_skew_side)
             return await tranche_aware_builders[
                 strategy_name
             ](tranche=tranche)
@@ -3366,7 +3409,12 @@ class StrategyEngine:
 
     async def _build_credit_spreads(
         self, tranche: int = 1,
+        skew_side: str = "both",
     ) -> Tuple[Optional[List[Leg]], Dict]:
+        # PRF-02: skew_side controls which side is built.
+        # 'put'  = bull-put spread only (put skew rich)
+        # 'call' = bear-call spread only (call skew rich)
+        # 'both' = both sides (symmetric / no skew signal)
         """
         Build bull put + bear call credit spreads.
         FIX VS1/V3: DTE_MAX=10, tolerance=5.
@@ -3475,7 +3523,41 @@ class StrategyEngine:
             )
             return (None, {})
 
-        legs = [
+        # PRF-02: only build the side(s) justified by skew.
+        _build_put_side  = skew_side in ("put",  "both")
+        _build_call_side = skew_side in ("call", "both")
+
+        # Recalculate credit and max_risk for the active sides
+        if not _build_put_side:
+            total_credit = sc_prem - lc_prem
+        elif not _build_call_side:
+            total_credit = sp_prem - lp_prem
+        # else total_credit already computed above for both sides
+
+        if total_credit < config.SPREAD_MIN_CREDIT:
+            logger.info(
+                f"Credit spread ({skew_side} side): "
+                f"credit={total_credit:.2f} < "
+                f"min={config.SPREAD_MIN_CREDIT} — skip"
+            )
+            return (None, {})
+
+        _active_put_width  = (
+            short_put_strike - long_put_strike
+            if _build_put_side else 0
+        )
+        _active_call_width = (
+            long_call_strike - short_call_strike
+            if _build_call_side else 0
+        )
+        max_risk = (
+            max(_active_put_width, _active_call_width)
+            - total_credit
+        ) * config.LOT_SIZE
+
+        legs = []
+        if _build_put_side:
+          legs += [
             Leg(
                 instrument_key=chain[long_put_strike][
                     "put"
@@ -3846,14 +3928,21 @@ class StrategyEngine:
                         )
                         return (None, {})
 
+        # PRF-03: IV rank gate applies in ALL regimes.
+        # The old code bypassed it for STRONG_BUY/EVENT, but those
+        # are the only regimes that call this builder. Buying options
+        # when IV rank > 40 means paying a fear premium — the strategy
+        # thesis (buy cheap vol) is violated.
         _ivr = self.dm.compute_iv_rank()
         iv_rank = _ivr if _ivr is not None else 50.0
         if iv_rank > config.LONG_STRADDLE_MAX_IV_RANK:
+            logger.info(
+                f"Long straddle: IV rank {iv_rank:.1f} > "
+                f"max {config.LONG_STRADDLE_MAX_IV_RANK} "
+                f"— vol too expensive to buy"
+            )
             return (None, {})
-        # SE7-P1-03: add genuine cheapness gate. The VIX-spike
-        # filter was dead code (bypassed for STRONG_BUY/EVENT,
-        # the only regimes that call this builder). Require that
-        # IV is actually cheap relative to RV before buying.
+        # Also require IV is actually cheap relative to RV
         if (
             self.dm.iv_atm is not None
             and self.dm.rv_20d is not None

@@ -229,8 +229,12 @@ EDGE_CHEAP = 0.0   # reference: IV-RV < 0 -> cheap
 EDGE_PERCENTILE_HIGH = 70
 EDGE_PERCENTILE_LOW  = 30
 
-# LIVE FIX: minimum 3 entries (was 10 = 2 weeks wait)
-EDGE_SCORE_MIN_HISTORY = 3
+# PRF-01: raised from 3 to 20. Three observations cannot establish
+# whether IV-RV spread is unusually rich or cheap — the sample std
+# has ~40% error at N=3. 20 sessions gives a meaningful baseline.
+# Until then the edge module stays neutral (score=0), which is
+# safer than acting on a near-meaningless statistic.
+EDGE_SCORE_MIN_HISTORY = 20
 
 # ADX calibrated for 30-min bars
 # AUDIT #2.3: ADX_PERIOD=14 matches the reference algorithm

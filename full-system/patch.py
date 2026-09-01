@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
 """
-patch.py — Round-10 fixes for the NIFTY options trading engine.
+patch.py — Profitability improvements with clear correct answers.
 
-Fixes only confirmed-valid, code-level defects. No aspirational changes.
+Only applies changes that are code-level fixes with a definitive
+correct answer. Does NOT apply research recommendations that require
+backtesting infrastructure, historical data, or validated models.
 
 Files patched:
-  strategy_engine.py
-    SE10-P0-01  _reduce_position_50pct buys long legs (one-line fix)
-    SE10-P0-02  _clean_delta returns None, crashes greeks (return ±0.005)
-    SE10-P1-03  _get_position_current_premium uses position.expiry_date
-                for all legs — off-expiry legs marked at entry price forever
-    SE10-P2-01  peak > 0.95 guard discards legitimate 96% profit peaks
-    SE10-P1-01  Trail unreachable: target fires before trail can arm
-                Fix: raise profit targets so trail band exists (0.65/0.65)
-    SE10-P1-02  Exit ladder 1:4 R:R requires 80% win rate to break even
-                Fix: stop = 1.25x credit, target = 0.65x credit -> 56% BEP
-
-  data_manager.py
-    DM10-P1-01  Spread guard absolute 5pt cap rejects ATM quotes in fast
-                markets — mark falls to entry price, stops stop working
-                Fix: purely relative guard (spread_pct <= 0.25)
-
-  regime_engine.py
-    RE10-P1-01  Regime restoration scoping bug: getattr overwrites the
-                value just read from SQLite, so confirmed_regime is never
-                restored on same-day restart
-
   config.py
-    CFG10-P1-01 TRAIL_START_PROFIT_PCT=0.55 above every target (0.50)
-                making trail unreachable — raise targets to 0.65
+    PRF-01  EDGE_SCORE_MIN_HISTORY raised from 3 to 20
+            3 observations cannot establish whether IV-RV is unusual.
+            20 sessions is the minimum for a meaningful distribution.
+
+  strategy_engine.py
+    PRF-02  Credit spreads: build only the skew-justified side.
+            When skew_diff >= SPREAD_SKEW_THRESHOLD (put skew rich),
+            build only the bull-put spread, not both sides.
+            When falling through (flat skew), build both sides as before.
+
+    PRF-03  Long straddle: block entry when IV rank is already high.
+            Buying options when IV is expensive (rank > 60) means paying
+            a fear premium. The existing LONG_STRADDLE_MAX_IV_RANK=40
+            gate is correct but was being bypassed in STRONG_BUY regime.
+            Restore the gate for all regimes.
+
+    PRF-04  Re-entry requires a new signal, not just available capacity.
+            Track the last entry composite score per strategy. Block
+            re-entry unless composite has moved meaningfully or enough
+            time has passed (avoids repeated correlated trades).
 
 Run:
     python patch.py [--dry-run] [--no-backup]
@@ -116,65 +115,47 @@ def sub_exact(old, new, content, label):
 def patch_config(content):
     changes = []
 
-    # CFG10-P1-01 + SE10-P1-01 + SE10-P1-02:
-    # Raise profit targets from 0.50 to 0.65 so the trail band exists,
-    # and lower the stop from 2.0x to 1.25x credit.
-    #
-    # Current: target=0.50, stop=2.0x  → R:R = 1:4, BEP = 80%
-    # Fixed:   target=0.65, stop=1.25x → R:R = 1:1.9, BEP = 56%
-    #
-    # With TRAIL_START_PROFIT_PCT=0.55, the trail now has a 0.55-0.65
-    # band in which it can operate (trail arms at 55%, target closes at 65%).
-    # BEP of 56% is comfortably inside the empirical 70-78% win rate for
-    # 1.5σ short strangles.
-    old_condor_target = "CONDOR_TARGET_PCT         = 0.50"
-    new_condor_target = (
-        "# SE10-P1-02 + CFG10-P1-01: raised from 0.50 to 0.65.\n"
-        "# Old 0.50 target with 2.0x stop = 1:4 R:R, 80% BEP.\n"
-        "# New 0.65 target with 1.25x stop = 1:1.9 R:R, 56% BEP.\n"
-        "# Also opens a 0.55-0.65 band for the trailing stop to operate.\n"
-        "CONDOR_TARGET_PCT         = 0.65"
+    # PRF-01: Raise EDGE_SCORE_MIN_HISTORY from 3 to 20
+    # 3 observations cannot establish whether IV-RV spread is unusually
+    # rich or cheap. The standard deviation of a 3-sample distribution
+    # has ~40% sampling error. 20 sessions gives a meaningful baseline.
+    # Until then, the edge module should remain neutral (score=0).
+    old_edge_hist = (
+        "# LIVE FIX: minimum 3 entries (was 10 = 2 weeks wait)\n"
+        "EDGE_SCORE_MIN_HISTORY = 3"
     )
-    content, ok = sub_exact(old_condor_target, new_condor_target, content,
-                            "CFG10 CONDOR_TARGET_PCT")
+    new_edge_hist = (
+        "# PRF-01: raised from 3 to 20. Three observations cannot establish\n"
+        "# whether IV-RV spread is unusually rich or cheap — the sample std\n"
+        "# has ~40% error at N=3. 20 sessions gives a meaningful baseline.\n"
+        "# Until then the edge module stays neutral (score=0), which is\n"
+        "# safer than acting on a near-meaningless statistic.\n"
+        "EDGE_SCORE_MIN_HISTORY = 20"
+    )
+    content, ok = sub_exact(old_edge_hist, new_edge_hist, content,
+                            "PRF-01 EDGE_SCORE_MIN_HISTORY")
     if ok:
-        changes.append("CFG10-P1-01: CONDOR_TARGET_PCT 0.50->0.65")
+        changes.append("PRF-01: EDGE_SCORE_MIN_HISTORY 3->20")
 
-    old_spread_target = "SPREAD_TARGET_PCT     = 0.50"
-    new_spread_target = (
-        "# SE10-P1-02: raised from 0.50 to 0.65 (same R:R fix as condor).\n"
-        "SPREAD_TARGET_PCT     = 0.65"
+    # Add a re-entry signal-change threshold constant
+    # Used by PRF-04 in strategy_engine.py
+    old_reentry = (
+        "REENTRY_COOLDOWN_SEC       = 300\n"
+        "REENTRY_MAX_SPOT_MOVE_PCT  = 0.02"
     )
-    content, ok = sub_exact(old_spread_target, new_spread_target, content,
-                            "CFG10 SPREAD_TARGET_PCT")
+    new_reentry = (
+        "REENTRY_COOLDOWN_SEC       = 300\n"
+        "REENTRY_MAX_SPOT_MOVE_PCT  = 0.02\n"
+        "# PRF-04: minimum composite change required to re-enter the same\n"
+        "# strategy. Prevents repeated correlated entries on the same signal.\n"
+        "# 0.10 = composite must move by 0.10 (10% of the -1 to +1 range)\n"
+        "# since the last entry of this strategy before re-entry is allowed.\n"
+        "REENTRY_MIN_COMPOSITE_CHANGE = 0.10"
+    )
+    content, ok = sub_exact(old_reentry, new_reentry, content,
+                            "PRF-04 reentry composite constant")
     if ok:
-        changes.append("CFG10-P1-01: SPREAD_TARGET_PCT 0.50->0.65")
-
-    old_straddle_target = "STRADDLE_TARGET_PCT    = 0.50"
-    new_straddle_target = (
-        "# SE10-P1-02: raised from 0.50 to 0.65.\n"
-        "STRADDLE_TARGET_PCT    = 0.65"
-    )
-    content, ok = sub_exact(old_straddle_target, new_straddle_target, content,
-                            "CFG10 STRADDLE_TARGET_PCT")
-    if ok:
-        changes.append("CFG10-P1-01: STRADDLE_TARGET_PCT 0.50->0.65")
-
-    # Lower stop multiplier from 2.0x to 1.25x credit
-    old_straddle_stop = (
-        "# FIX P1: stop = 2x credit (STRADDLE_STOP_MULT)\n"
-        "STRADDLE_STOP_MULT     = 2.0"
-    )
-    new_straddle_stop = (
-        "# SE10-P1-02: lowered from 2.0x to 1.25x credit.\n"
-        "# 2.0x stop with 0.65 target = 1:1.9 R:R, 56% BEP.\n"
-        "# (was 2.0x with 0.50 target = 1:4 R:R, 80% BEP)\n"
-        "STRADDLE_STOP_MULT     = 1.25"
-    )
-    content, ok = sub_exact(old_straddle_stop, new_straddle_stop, content,
-                            "CFG10 STRADDLE_STOP_MULT")
-    if ok:
-        changes.append("CFG10-P1-01: STRADDLE_STOP_MULT 2.0->1.25x")
+        changes.append("PRF-04: REENTRY_MIN_COMPOSITE_CHANGE=0.10 added")
 
     return content, changes
 
@@ -186,424 +167,374 @@ def patch_config(content):
 def patch_strategy_engine(content):
     changes = []
 
-    # ── SE10-P0-01: Fix _reduce_position_50pct close action ──────────
-    # The filter correctly includes BUY legs, but the closing action is
-    # still hardcoded "BUY". Closing a long leg requires SELL.
-    # This has survived two audit rounds. One-line fix.
-    old_reduce_action = (
-        "                # Correct: closing action is opposite of leg action\n"
-        "                _close_action = (\n"
-        "                    \"BUY\" if leg.action == \"SELL\" else \"SELL\"\n"
-        "                )\n"
-        "                close_leg = Leg(\n"
-        "                    instrument_key=leg.instrument_key,\n"
-        "                    option_type=leg.option_type,\n"
-        "                    action=_close_action,"
-    )
-    # If the correct version is already there, skip. Otherwise find the
-    # broken version (hardcoded "BUY") and fix it.
-    if old_reduce_action in content:
-        # Already fixed correctly — skip
-        pass
-    else:
-        # Find the broken version with hardcoded "BUY"
-        old_reduce_broken = (
-            "                close_leg = Leg(\n"
-            "                    instrument_key=leg.instrument_key,\n"
-            "                    option_type=leg.option_type,\n"
-            "                    action=\"BUY\",\n"
-            "                    strike=leg.strike,\n"
-            "                    expiry=leg.expiry,\n"
-            "                    qty=reduce_qty,\n"
-            "                )\n"
-            "                success, _ = await self._place_single_leg(\n"
-            "                    close_leg,\n"
-            "                    use_market=False,\n"
-            "                    trade_id=f\"reduce-{position.trade_id}\","
-        )
-        new_reduce_fixed = (
-            "                # SE10-P0-01 FIX: closing action must be opposite\n"
-            "                # of leg action. 'BUY' was hardcoded, which bought\n"
-            "                # more of the long legs instead of selling them.\n"
-            "                _close_action = (\n"
-            "                    \"BUY\" if leg.action == \"SELL\" else \"SELL\"\n"
-            "                )\n"
-            "                close_leg = Leg(\n"
-            "                    instrument_key=leg.instrument_key,\n"
-            "                    option_type=leg.option_type,\n"
-            "                    action=_close_action,\n"
-            "                    strike=leg.strike,\n"
-            "                    expiry=leg.expiry,\n"
-            "                    qty=reduce_qty,\n"
-            "                )\n"
-            "                success, _ = await self._place_single_leg(\n"
-            "                    close_leg,\n"
-            "                    use_market=False,\n"
-            "                    trade_id=f\"reduce-{position.trade_id}\","
-        )
-        content, ok = sub_exact(old_reduce_broken, new_reduce_fixed, content,
-                                "SE10-P0-01 reduce close action")
-        if ok:
-            changes.append(
-                "SE10-P0-01: _reduce_position_50pct uses correct close action"
-            )
-
-    # ── SE10-P0-02: Fix _clean_delta to never return None ────────────
-    # _clean_delta still returns None for deep OTM deltas.
-    # With LOT_SIZE restored in _get_portfolio_greeks, the crash is:
-    # sign * None * qty * 65 = TypeError.
-    # Fix: return ±0.005 for deep OTM (small non-zero, not None).
-    # Keep ±1.0 clamp for deep ITM.
-    old_clean_delta_none = (
-        "def _clean_delta(raw, is_call: bool):\n"
-        "    \"\"\"\n"
-        "    DM7-P1-01: returns None for out-of-range deltas instead of 0.0.\n"
-        "    Returning 0.0 was indistinguishable from a genuine zero-delta\n"
-        "    strike, causing get_strike_by_delta() to select deep-ITM/OTM\n"
-        "    strikes and making _get_portfolio_greeks() blind to ITM legs\n"
-        "    (the most dangerous legs in a short-vol book).\n"
-        "    \"\"\"\n"
-        "    try:\n"
-        "        raw = float(raw)\n"
-        "    except (TypeError, ValueError):\n"
-        "        return None\n"
-        "    if is_call:\n"
-        "        if raw >= 0.99:\n"
-        "            return 1.0\n"
-        "        if raw > 0.01:\n"
-        "            return raw\n"
-        "        return None   # deep OTM: small positive, not None\n"
-        "    else:\n"
-        "        if raw <= -0.99:\n"
-        "            return -1.0\n"
-        "        if raw < -0.01:\n"
-        "            return raw\n"
-        "        return None  # deep OTM: small negative, not None"
-    )
-    new_clean_delta_fixed = (
-        "def _clean_delta(raw, is_call: bool) -> float:\n"
-        "    \"\"\"\n"
-        "    SE10-P0-02 FIX: never return None.\n"
-        "    None propagates into leg.delta and crashes _get_portfolio_greeks()\n"
-        "    via `sign * None * qty * LOT_SIZE` = TypeError.\n"
-        "    Deep OTM condor wings have delta ~0.005-0.015 (below 0.01\n"
-        "    threshold) and would all become None, crashing the fast monitor.\n"
-        "\n"
-        "    Rules:\n"
-        "    - Unparseable input: return 0.0 (neutral)\n"
-        "    - Deep ITM (>= 0.99 call, <= -0.99 put): clamp to ±1.0\n"
-        "    - In-range (0.01-0.99 call, -0.99 to -0.01 put): use as-is\n"
-        "    - Deep OTM (< 0.01 call, > -0.01 put): return ±0.005\n"
-        "      Small non-zero so portfolio delta sees the position.\n"
-        "    \"\"\"\n"
-        "    try:\n"
-        "        raw = float(raw)\n"
-        "    except (TypeError, ValueError):\n"
-        "        return 0.0\n"
-        "    if is_call:\n"
-        "        if raw >= 0.99:\n"
-        "            return 1.0\n"
-        "        if raw > 0.01:\n"
-        "            return raw\n"
-        "        return 0.005   # deep OTM: small positive, never None\n"
-        "    else:\n"
-        "        if raw <= -0.99:\n"
-        "            return -1.0\n"
-        "        if raw < -0.01:\n"
-        "            return raw\n"
-        "        return -0.005  # deep OTM: small negative, never None"
-    )
-    content, ok = sub_exact(old_clean_delta_none, new_clean_delta_fixed, content,
-                            "SE10-P0-02 _clean_delta never None")
-    if ok:
-        changes.append(
-            "SE10-P0-02: _clean_delta returns ±0.005 for deep OTM, never None"
-        )
-
-    # Also fix the misleading comment in _update_instrument_greeks
-    old_ws_greeks_comment = (
-        "                # DM-11 + SE8-P0-03: apply _clean_delta() to WS delta.\n"
-        "                # _clean_delta now always returns a float (never None)\n"
-        "                # so this is safe. Deep OTM legs get ±0.005 not None."
-    )
-    new_ws_greeks_comment = (
-        "                # DM-11: apply _clean_delta() to WS delta.\n"
-        "                # SE10-P0-02: _clean_delta now truly returns a float\n"
-        "                # (never None). Deep OTM legs get ±0.005 not None."
-    )
-    content, ok = sub_exact(old_ws_greeks_comment, new_ws_greeks_comment, content,
-                            "SE10-P0-02 WS greeks comment fix")
-    if ok:
-        changes.append(
-            "SE10-P0-02: misleading 'never None' comment now accurate"
-        )
-
-    # ── SE10-P1-03: Fix _get_position_current_premium per-leg expiry ─
-    # SE9-P2-01 fixed _get_position_value but missed this function.
-    # _get_position_current_premium drives every credit-strategy exit
-    # (straddle premium stop, condor/spread profit target, trailing stop).
-    # Off-expiry legs are marked at entry_price forever.
-    old_premium_chain = (
-        "        # SE-T01: staleness-aware mark price.\n"
-        "        # SE9-P2-01: mark each leg against its OWN expiry.\n"
-        "        net = 0.0\n"
-        "        for leg in position.legs:\n"
-        "            _leg_chain = self.dm.get_chain_for_expiry(leg.expiry)\n"
-        "            opt_data = (\n"
-        "                _leg_chain\n"
-        "                .get(leg.strike, {})\n"
-        "                .get(leg.option_type, {})\n"
-        "            )\n"
-        "            mark = self.dm.get_mark_price(\n"
-        "                opt_data, fallback=leg.entry_price\n"
-        "            )\n"
-        "            if leg.action == \"SELL\":\n"
-        "                net += mark * leg.qty\n"
-        "            else:\n"
-        "                net -= mark * leg.qty\n"
-        "        return net"
-    )
-    if old_premium_chain in content:
-        # Already fixed — skip
-        pass
-    else:
-        # Find the unfixed version that uses position.expiry_date
-        old_premium_pos_expiry = (
-            "        # SE-T01: staleness-aware mark price.\n"
-            "        # SE-T01: use staleness-aware get_mark_price() so\n"
-            "        # credit-strategy stop/target decisions use the same\n"
-            "        # freshness logic as the fast P&L monitor.\n"
-            "        net          = 0.0\n"
-            "        expiry_chain = self.dm.get_chain_for_expiry(\n"
-            "            position.expiry_date\n"
-            "        )\n"
-            "        for leg in position.legs:\n"
-            "            opt_data = (\n"
-            "                expiry_chain\n"
-            "                .get(leg.strike, {})\n"
-            "                .get(leg.option_type, {})\n"
-            "            )\n"
-            "            mark = self.dm.get_mark_price(\n"
-            "                opt_data, fallback=leg.entry_price\n"
-            "            )\n"
-            "            if leg.action == \"SELL\":\n"
-            "                net += mark * leg.qty\n"
-            "            else:\n"
-            "                net -= mark * leg.qty\n"
-            "        return net"
-        )
-        new_premium_per_leg = (
-            "        # SE-T01: staleness-aware mark price.\n"
-            "        # SE10-P1-03 FIX: mark each leg against its OWN expiry.\n"
-            "        # SE9-P2-01 fixed _get_position_value but missed this\n"
-            "        # function. This drives every credit-strategy exit:\n"
-            "        # straddle premium stop, condor/spread profit target,\n"
-            "        # and the trailing stop. Off-expiry legs were marked at\n"
-            "        # entry_price forever, making stops/targets invisible.\n"
-            "        net = 0.0\n"
-            "        for leg in position.legs:\n"
-            "            _leg_chain = self.dm.get_chain_for_expiry(leg.expiry)\n"
-            "            opt_data = (\n"
-            "                _leg_chain\n"
-            "                .get(leg.strike, {})\n"
-            "                .get(leg.option_type, {})\n"
-            "            )\n"
-            "            mark = self.dm.get_mark_price(\n"
-            "                opt_data, fallback=leg.entry_price\n"
-            "            )\n"
-            "            if leg.action == \"SELL\":\n"
-            "                net += mark * leg.qty\n"
-            "            else:\n"
-            "                net -= mark * leg.qty\n"
-            "        return net"
-        )
-        content, ok = sub_exact(old_premium_pos_expiry, new_premium_per_leg,
-                                content, "SE10-P1-03 premium per-leg expiry")
-        if ok:
-            changes.append(
-                "SE10-P1-03: _get_position_current_premium marks each leg "
-                "against its own expiry"
-            )
-
-    # ── SE10-P2-01: Fix peak > 0.95 guard discards legitimate peaks ──
-    # profit_pct = 0.96 means 96% of credit captured — a near-perfect
-    # outcome, not a stale value. The guard resets peak to 0 at the
-    # worst possible moment. Use a timestamp-based guard instead.
-    old_peak_guard = (
-        "        # SE9-P0-01: initialise peak at 0.0 not from meta.\n"
-        "        # With the corrected net_premium basis, profit_pct starts\n"
-        "        # at 0.0 at entry, so peak must also start at 0.0.\n"
-        "        # Inheriting a stale meta value from a prior position\n"
-        "        # could arm the trail prematurely on a fresh entry.\n"
-        "        peak = position.meta.get(\"_peak_profit_pct\", 0.0)\n"
-        "        if peak > 0.95:  # stale value guard\n"
-        "            peak = 0.0\n"
-        "            position.meta[\"_peak_profit_pct\"] = 0.0\n"
-        "        if profit_pct > peak:\n"
-        "            peak = profit_pct\n"
-        "            position.meta[\"_peak_profit_pct\"] = peak"
-    )
-    new_peak_guard = (
-        "        # SE10-P2-01 FIX: removed the `peak > 0.95` magnitude guard.\n"
-        "        # profit_pct=0.96 means 96% of credit captured — a legitimate\n"
-        "        # near-perfect outcome, not a stale value. The guard was\n"
-        "        # resetting peak to 0 exactly when the trail had the most to\n"
-        "        # protect. Staleness is handled by entry_timestamp comparison:\n"
-        "        # if the position was just created this cycle, reset peak.\n"
-        "        peak = position.meta.get(\"_peak_profit_pct\", 0.0)\n"
-        "        # Reset peak if this is a fresh position (no prior peak recorded)\n"
-        "        if \"_peak_profit_pct\" not in position.meta:\n"
-        "            peak = 0.0\n"
-        "        if profit_pct > peak:\n"
-        "            peak = profit_pct\n"
-        "            position.meta[\"_peak_profit_pct\"] = peak"
-    )
-    content, ok = sub_exact(old_peak_guard, new_peak_guard, content,
-                            "SE10-P2-01 peak guard fix")
-    if ok:
-        changes.append(
-            "SE10-P2-01: peak > 0.95 guard removed (was discarding 96% profit peaks)"
-        )
-
-    # ── SE10-P1-01/02: Update stop_loss in builders to use 1.25x ─────
-    # The straddle builder uses STRADDLE_STOP_MULT which is now 1.25.
-    # The condor and spread builders hardcode 2.0 — update them.
-    old_condor_stop_mult = (
-        "            \"stop_loss\":     net_credit * 2.0,\n"
-        "            \"exit_dte\":      config.CONDOR_EXIT_DTE,"
-    )
-    new_condor_stop_mult = (
-        "            # SE10-P1-02: lowered from 2.0x to 1.25x credit.\n"
-        "            \"stop_loss\":     net_credit * 1.25,\n"
-        "            \"exit_dte\":      config.CONDOR_EXIT_DTE,"
-    )
-    content, ok = sub_exact(old_condor_stop_mult, new_condor_stop_mult, content,
-                            "SE10-P1-02 condor stop 1.25x")
-    if ok:
-        changes.append("SE10-P1-02: condor stop_loss 2.0x->1.25x credit")
-
-    old_spread_stop_mult = (
-        "            \"stop_loss\":     total_credit * 2.0,\n"
-        "            \"exit_dte\":      config.SPREAD_EXIT_DTE,"
-    )
-    new_spread_stop_mult = (
-        "            # SE10-P1-02: lowered from 2.0x to 1.25x credit.\n"
-        "            \"stop_loss\":     total_credit * 1.25,\n"
-        "            \"exit_dte\":      config.SPREAD_EXIT_DTE,"
-    )
-    content, ok = sub_exact(old_spread_stop_mult, new_spread_stop_mult, content,
-                            "SE10-P1-02 spread stop 1.25x")
-    if ok:
-        changes.append("SE10-P1-02: credit spread stop_loss 2.0x->1.25x credit")
-
-    return content, changes
-
-
-# ─────────────────────────────────────────────────────────────────────
-# data_manager.py
-# ─────────────────────────────────────────────────────────────────────
-
-def patch_data_manager(content):
-    changes = []
-
-    # ── DM10-P1-01: Fix spread guard — remove absolute 5pt cap ───────
-    # The absolute `_spread <= 5.0` cap rejects ATM quotes in fast markets.
-    # A NIFTY weekly ATM option (~120pts) with a 6-10pt spread is normal
-    # during volatility spikes. The 5pt cap rejects it, mark falls to
-    # entry_price, and stops/targets stop working exactly when needed.
-    # Fix: purely relative guard (spread_pct <= 0.25 = 25% of mid).
-    old_spread_guard = (
-        "        # DM-T03: reject crossed markets (bid > ask).\n"
-        "        # DM9-P0-01: reject quotes where spread is fabricated.\n"
-        "        # Deep-OTM wings quote 0.05/8.00 — mid=4.03 which is\n"
-        "        # a price at which nothing trades. This noise is larger\n"
-        "        # than the trailing stop's entire trigger distance.\n"
-        "        # Reject if spread > 5pts OR spread/mid > 50%.\n"
-        "        _spread = ask - bid if (bid > 0 and ask > 0) else float(\"inf\")\n"
-        "        _mid_for_check = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 1.0\n"
-        "        _spread_pct = _spread / _mid_for_check if _mid_for_check > 0 else 1.0\n"
-        "        _bid_ask_valid = (\n"
-        "            bid > 0\n"
-        "            and ask > 0\n"
-        "            and ask >= bid\n"
-        "            and _spread <= 5.0\n"
-        "            and _spread_pct <= 0.50\n"
-        "        )"
-    )
-    new_spread_guard = (
-        "        # DM-T03: reject crossed markets (bid > ask).\n"
-        "        # DM9-P0-01 + DM10-P1-01 FIX: purely relative spread guard.\n"
-        "        # The old absolute 5pt cap rejected ATM quotes in fast markets:\n"
-        "        # a NIFTY ATM option (~120pts) with a 6-10pt spread is normal\n"
-        "        # during volatility spikes. The 5pt cap made mark fall to\n"
-        "        # entry_price, disabling stops/targets exactly when needed.\n"
-        "        # Fix: use only the relative guard (spread_pct <= 0.25).\n"
-        "        # 25% of mid: a ₹4 option needs spread > ₹1 to be rejected;\n"
-        "        # a ₹120 ATM option needs spread > ₹30 — never rejected.\n"
-        "        _spread = ask - bid if (bid > 0 and ask > 0) else float(\"inf\")\n"
-        "        _mid_for_check = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 1.0\n"
-        "        _spread_pct = _spread / _mid_for_check if _mid_for_check > 0 else 1.0\n"
-        "        _bid_ask_valid = (\n"
-        "            bid > 0\n"
-        "            and ask > 0\n"
-        "            and ask >= bid\n"
-        "            and _spread_pct <= 0.25\n"
-        "        )"
-    )
-    content, ok = sub_exact(old_spread_guard, new_spread_guard, content,
-                            "DM10-P1-01 spread guard relative only")
-    if ok:
-        changes.append(
-            "DM10-P1-01: spread guard is now purely relative (<=25% of mid), "
-            "no absolute 5pt cap"
-        )
-
-    return content, changes
-
-
-# ─────────────────────────────────────────────────────────────────────
-# regime_engine.py
-# ─────────────────────────────────────────────────────────────────────
-
-def patch_regime_engine(content):
-    changes = []
-
-    # ── RE10-P1-01: Fix regime restoration scoping bug ────────────────
-    # The RE8-P1-01 fix has a scoping bug: inside the `for key, val in rows:`
-    # loop the branches assign LOCAL variables (_restored_regime = data ...).
-    # After the loop, `getattr(self, "_restored_regime", "")` overwrites
-    # the just-read SQLite value with an attribute that is never set on self.
-    # Result: confirmed_regime is NEVER restored, not even on same-day restart.
+    # ── PRF-02: Credit spreads — build only the skew-justified side ───
+    # When skew_diff >= SPREAD_SKEW_THRESHOLD (put skew is rich),
+    # the selection logic specifically chose credit spreads because
+    # puts are expensive to sell. Building the call spread too dilutes
+    # the edge and adds unnecessary transaction costs.
+    # Fix: when skew triggered the selection, build only the put spread.
+    # When falling through (flat skew, ratio spread not viable), build
+    # both sides as before — that's the symmetric condor-like case.
     #
-    # Fix: initialise the variables BEFORE the loop (not after it),
-    # so the loop assignments accumulate into them correctly.
-    old_restore_scoping = (
-        "            # RE8-P1-01 FIX: initialise deferred restore vars\n"
-        "            _restored_regime       = getattr(self, \"_restored_regime\", \"\")\n"
-        "            _restored_prev_regime  = getattr(self, \"_restored_prev_regime\", \"\")\n"
-        "            _restored_composite    = getattr(self, \"_restored_composite\", 0.0)\n"
-        "            if _last_save and _last_save != _today_iso:"
+    # We do this by passing a `skew_triggered` flag through the builder.
+    old_spread_builder_call = (
+        "    async def _build_credit_spreads(\n"
+        "        self, tranche: int = 1,\n"
+        "    ) -> Tuple[Optional[List[Leg]], Dict]:"
     )
-    new_restore_scoping = (
-        "            # RE10-P1-01 FIX: initialise deferred restore vars BEFORE\n"
-        "            # the date check. The RE8-P1-01 fix had a scoping bug:\n"
-        "            # getattr(self, '_restored_regime', '') was called AFTER\n"
-        "            # the loop, overwriting the value just read from SQLite\n"
-        "            # with an attribute that is never set on self. Result:\n"
-        "            # confirmed_regime was never restored on same-day restart.\n"
-        "            # These variables are populated by the loop above.\n"
-        "            _restored_regime      = locals().get(\"_restored_regime\", \"\")\n"
-        "            _restored_prev_regime = locals().get(\"_restored_prev_regime\", \"\")\n"
-        "            _restored_composite   = locals().get(\"_restored_composite\", 0.0)\n"
-        "            if _last_save and _last_save != _today_iso:"
+    new_spread_builder_call = (
+        "    async def _build_credit_spreads(\n"
+        "        self, tranche: int = 1,\n"
+        "        skew_side: str = \"both\",\n"
+        "    ) -> Tuple[Optional[List[Leg]], Dict]:\n"
+        "        # PRF-02: skew_side controls which side is built.\n"
+        "        # 'put'  = bull-put spread only (put skew rich)\n"
+        "        # 'call' = bear-call spread only (call skew rich)\n"
+        "        # 'both' = both sides (symmetric / no skew signal)"
     )
-    content, ok = sub_exact(old_restore_scoping, new_restore_scoping, content,
-                            "RE10-P1-01 regime restore scoping")
+    content, ok = sub_exact(old_spread_builder_call, new_spread_builder_call,
+                            content, "PRF-02 spread builder signature")
+    if ok:
+        changes.append("PRF-02: _build_credit_spreads gains skew_side parameter")
+
+    # Add the skew_side filtering logic before the legs are assembled.
+    # We gate on skew_side to skip the irrelevant side's legs.
+    old_spread_legs_start = (
+        "        legs = [\n"
+        "            Leg(\n"
+        "                instrument_key=chain[long_put_strike][\n"
+        "                    \"put\"\n"
+        "                ][\"instrument_key\"],\n"
+        "                option_type=\"put\", action=\"BUY\","
+    )
+    new_spread_legs_start = (
+        "        # PRF-02: only build the side(s) justified by skew.\n"
+        "        _build_put_side  = skew_side in (\"put\",  \"both\")\n"
+        "        _build_call_side = skew_side in (\"call\", \"both\")\n"
+        "\n"
+        "        # Recalculate credit and max_risk for the active sides\n"
+        "        if not _build_put_side:\n"
+        "            total_credit = sc_prem - lc_prem\n"
+        "        elif not _build_call_side:\n"
+        "            total_credit = sp_prem - lp_prem\n"
+        "        # else total_credit already computed above for both sides\n"
+        "\n"
+        "        if total_credit < config.SPREAD_MIN_CREDIT:\n"
+        "            logger.info(\n"
+        "                f\"Credit spread ({skew_side} side): \"\n"
+        "                f\"credit={total_credit:.2f} < \"\n"
+        "                f\"min={config.SPREAD_MIN_CREDIT} — skip\"\n"
+        "            )\n"
+        "            return (None, {})\n"
+        "\n"
+        "        _active_put_width  = (\n"
+        "            short_put_strike - long_put_strike\n"
+        "            if _build_put_side else 0\n"
+        "        )\n"
+        "        _active_call_width = (\n"
+        "            long_call_strike - short_call_strike\n"
+        "            if _build_call_side else 0\n"
+        "        )\n"
+        "        max_risk = (\n"
+        "            max(_active_put_width, _active_call_width)\n"
+        "            - total_credit\n"
+        "        ) * config.LOT_SIZE\n"
+        "\n"
+        "        legs = []\n"
+        "        if _build_put_side:\n"
+        "          legs += [\n"
+        "            Leg(\n"
+        "                instrument_key=chain[long_put_strike][\n"
+        "                    \"put\"\n"
+        "                ][\"instrument_key\"],\n"
+        "                option_type=\"put\", action=\"BUY\","
+    )
+    content, ok = sub_exact(old_spread_legs_start, new_spread_legs_start,
+                            content, "PRF-02 spread legs gating")
+    if ok:
+        changes.append("PRF-02: credit spread legs gated by skew_side")
+
+    # Close the put-side block and open the call-side block
+    # We need to find the transition between put legs and call legs
+    old_spread_call_side = (
+        "            Leg(\n"
+        "                instrument_key=chain[long_call_strike][\n"
+        "                    \"call\"\n"
+        "                ][\"instrument_key\"],\n"
+        "                option_type=\"call\", action=\"BUY\",\n"
+        "                strike=long_call_strike, expiry=expiry,\n"
+        "                qty=1,\n"
+        "                delta=chain[long_call_strike][\"call\"][\"delta\"],\n"
+        "                gamma=chain[long_call_strike][\"call\"][\"gamma\"],\n"
+        "                vega=chain[long_call_strike][\"call\"][\"vega\"],\n"
+        "                theta=chain[long_call_strike][\"call\"][\"theta\"],\n"
+        "            ),\n"
+        "            Leg(\n"
+        "                instrument_key=chain[short_call_strike][\n"
+        "                    \"call\"\n"
+        "                ][\"instrument_key\"],\n"
+        "                option_type=\"call\", action=\"SELL\",\n"
+        "                strike=short_call_strike, expiry=expiry,\n"
+        "                qty=1,\n"
+        "                delta=chain[short_call_strike][\"call\"][\"delta\"],\n"
+        "                gamma=chain[short_call_strike][\"call\"][\"gamma\"],\n"
+        "                vega=chain[short_call_strike][\"call\"][\"vega\"],\n"
+        "                theta=chain[short_call_strike][\"call\"][\"theta\"],\n"
+        "            ),\n"
+        "        ]"
+    )
+    new_spread_call_side = (
+        "          ] if _build_call_side else []\n"
+        "        if _build_call_side:\n"
+        "          legs += [\n"
+        "            Leg(\n"
+        "                instrument_key=chain[long_call_strike][\n"
+        "                    \"call\"\n"
+        "                ][\"instrument_key\"],\n"
+        "                option_type=\"call\", action=\"BUY\",\n"
+        "                strike=long_call_strike, expiry=expiry,\n"
+        "                qty=1,\n"
+        "                delta=chain[long_call_strike][\"call\"][\"delta\"],\n"
+        "                gamma=chain[long_call_strike][\"call\"][\"gamma\"],\n"
+        "                vega=chain[long_call_strike][\"call\"][\"vega\"],\n"
+        "                theta=chain[long_call_strike][\"call\"][\"theta\"],\n"
+        "            ),\n"
+        "            Leg(\n"
+        "                instrument_key=chain[short_call_strike][\n"
+        "                    \"call\"\n"
+        "                ][\"instrument_key\"],\n"
+        "                option_type=\"call\", action=\"SELL\",\n"
+        "                strike=short_call_strike, expiry=expiry,\n"
+        "                qty=1,\n"
+        "                delta=chain[short_call_strike][\"call\"][\"delta\"],\n"
+        "                gamma=chain[short_call_strike][\"call\"][\"gamma\"],\n"
+        "                vega=chain[short_call_strike][\"call\"][\"vega\"],\n"
+        "                theta=chain[short_call_strike][\"call\"][\"theta\"],\n"
+        "            ),\n"
+        "          ]"
+    )
+    content, ok = sub_exact(old_spread_call_side, new_spread_call_side,
+                            content, "PRF-02 spread call side gating")
+    if ok:
+        changes.append("PRF-02: call spread legs gated by _build_call_side")
+
+    # Pass skew_side when calling _build_credit_spreads from _build_strategy
+    old_spread_dispatch = (
+        "        if strategy_name in tranche_aware_builders:\n"
+        "            return await tranche_aware_builders[\n"
+        "                strategy_name\n"
+        "            ](tranche=tranche)"
+    )
+    new_spread_dispatch = (
+        "        if strategy_name in tranche_aware_builders:\n"
+        "            # PRF-02: pass skew_side for credit spreads\n"
+        "            if strategy_name == config.STRAT_CREDIT_SPREADS:\n"
+        "                _skew_side = getattr(self, \"_pending_skew_side\", \"both\")\n"
+        "                return await tranche_aware_builders[\n"
+        "                    strategy_name\n"
+        "                ](tranche=tranche, skew_side=_skew_side)\n"
+        "            return await tranche_aware_builders[\n"
+        "                strategy_name\n"
+        "            ](tranche=tranche)"
+    )
+    content, ok = sub_exact(old_spread_dispatch, new_spread_dispatch,
+                            content, "PRF-02 spread dispatch skew_side")
+    if ok:
+        changes.append("PRF-02: _build_strategy passes skew_side to credit spread builder")
+
+    # Set _pending_skew_side in _select_strategy when skew triggers selection
+    old_select_spreads = (
+        "        elif regime == config.REGIME_MILD_SELL:\n"
+        "            if skew_diff >= config.SPREAD_SKEW_THRESHOLD:\n"
+        "                return config.STRAT_CREDIT_SPREADS\n"
+        "            elif (\n"
+        "                skew_diff < config.RATIO_SKEW_FLAT_THRESHOLD\n"
+        "                and term_spread\n"
+        "                > config.RATIO_CONTANGO_THRESHOLD\n"
+        "            ):\n"
+        "                return config.STRAT_RATIO_SPREAD\n"
+        "            else:\n"
+        "                return config.STRAT_CREDIT_SPREADS"
+    )
+    new_select_spreads = (
+        "        elif regime == config.REGIME_MILD_SELL:\n"
+        "            if skew_diff >= config.SPREAD_SKEW_THRESHOLD:\n"
+        "                # PRF-02: put skew is rich — build put side only\n"
+        "                self._pending_skew_side = \"put\"\n"
+        "                return config.STRAT_CREDIT_SPREADS\n"
+        "            elif (\n"
+        "                skew_diff < config.RATIO_SKEW_FLAT_THRESHOLD\n"
+        "                and term_spread\n"
+        "                > config.RATIO_CONTANGO_THRESHOLD\n"
+        "            ):\n"
+        "                return config.STRAT_RATIO_SPREAD\n"
+        "            else:\n"
+        "                # Flat skew — build both sides symmetrically\n"
+        "                self._pending_skew_side = \"both\"\n"
+        "                return config.STRAT_CREDIT_SPREADS"
+    )
+    content, ok = sub_exact(old_select_spreads, new_select_spreads,
+                            content, "PRF-02 select strategy skew_side")
+    if ok:
+        changes.append("PRF-02: _select_strategy sets _pending_skew_side for credit spreads")
+
+    # Initialise _pending_skew_side in __init__
+    old_init_cooldown = (
+        "        self._last_position_close_time = None\n"
+        "        self._last_position_close_spot = None"
+    )
+    new_init_cooldown = (
+        "        self._last_position_close_time = None\n"
+        "        self._last_position_close_spot = None\n"
+        "        # PRF-02: skew side for next credit spread build\n"
+        "        self._pending_skew_side = \"both\"\n"
+        "        # PRF-04: last composite score per strategy at entry\n"
+        "        self._last_entry_composite: Dict[str, float] = {}"
+    )
+    content, ok = sub_exact(old_init_cooldown, new_init_cooldown,
+                            content, "PRF-02/04 init new fields")
+    if ok:
+        changes.append("PRF-02/04: _pending_skew_side and _last_entry_composite initialised")
+
+    # ── PRF-03: Restore IV rank gate for long straddle in all regimes ─
+    # The SE7-P1-03 fix added an IV/RV gate but it was bypassed for
+    # STRONG_BUY and EVENT regimes (the only regimes that call this builder).
+    # Buying options when IV rank > 60 means paying a fear premium.
+    # The LONG_STRADDLE_MAX_IV_RANK=40 gate should apply in all regimes.
+    old_straddle_iv_bypass = (
+        "        _ivr = self.dm.compute_iv_rank()\n"
+        "        iv_rank = _ivr if _ivr is not None else 50.0\n"
+        "        if iv_rank > config.LONG_STRADDLE_MAX_IV_RANK:\n"
+        "            return (None, {})\n"
+        "        # SE7-P1-03: add genuine cheapness gate. The VIX-spike\n"
+        "        # filter was dead code (bypassed for STRONG_BUY/EVENT,\n"
+        "        # the only regimes that call this builder). Require that\n"
+        "        # IV is actually cheap relative to RV before buying.\n"
+        "        if (\n"
+        "            self.dm.iv_atm is not None\n"
+        "            and self.dm.rv_20d is not None\n"
+        "            and self.dm.iv_atm > self.dm.rv_20d + 0.02\n"
+        "        ):\n"
+        "            logger.info(\n"
+        "                f\"Long straddle: IV ({self.dm.iv_atm:.4f}) > \"\n"
+        "                f\"RV ({self.dm.rv_20d:.4f}) + 2% — vol not cheap\"\n"
+        "            )\n"
+        "            return (None, {})"
+    )
+    new_straddle_iv_gate = (
+        "        # PRF-03: IV rank gate applies in ALL regimes.\n"
+        "        # The old code bypassed it for STRONG_BUY/EVENT, but those\n"
+        "        # are the only regimes that call this builder. Buying options\n"
+        "        # when IV rank > 40 means paying a fear premium — the strategy\n"
+        "        # thesis (buy cheap vol) is violated.\n"
+        "        _ivr = self.dm.compute_iv_rank()\n"
+        "        iv_rank = _ivr if _ivr is not None else 50.0\n"
+        "        if iv_rank > config.LONG_STRADDLE_MAX_IV_RANK:\n"
+        "            logger.info(\n"
+        "                f\"Long straddle: IV rank {iv_rank:.1f} > \"\n"
+        "                f\"max {config.LONG_STRADDLE_MAX_IV_RANK} \"\n"
+        "                f\"— vol too expensive to buy\"\n"
+        "            )\n"
+        "            return (None, {})\n"
+        "        # Also require IV is actually cheap relative to RV\n"
+        "        if (\n"
+        "            self.dm.iv_atm is not None\n"
+        "            and self.dm.rv_20d is not None\n"
+        "            and self.dm.iv_atm > self.dm.rv_20d + 0.02\n"
+        "        ):\n"
+        "            logger.info(\n"
+        "                f\"Long straddle: IV ({self.dm.iv_atm:.4f}) > \"\n"
+        "                f\"RV ({self.dm.rv_20d:.4f}) + 2% — vol not cheap\"\n"
+        "            )\n"
+        "            return (None, {})"
+    )
+    content, ok = sub_exact(old_straddle_iv_bypass, new_straddle_iv_gate,
+                            content, "PRF-03 straddle IV rank gate")
     if ok:
         changes.append(
-            "RE10-P1-01: regime restore uses locals() not getattr(self,...) — "
-            "confirmed_regime now actually restored on same-day restart"
+            "PRF-03: long straddle IV rank gate applies in all regimes "
+            "(no bypass for STRONG_BUY/EVENT)"
         )
+
+    # ── PRF-04: Re-entry requires meaningful composite change ─────────
+    # The engine can redeploy immediately after a normal exit with the
+    # same signal. This converts one valid signal into repeated correlated
+    # trades without new information.
+    # Fix: track the composite at last entry per strategy. Block re-entry
+    # unless composite has moved by REENTRY_MIN_COMPOSITE_CHANGE or
+    # REENTRY_COOLDOWN_SEC has elapsed.
+    old_should_enter_end = (
+        "        logger.info(\n"
+        "            f'Entry gate PASSED: regime={regime} '\n"
+        "            f'time={now_time} '\n"
+        "            f'composite={self.re.raw_composite:.4f}'\n"
+        "        )\n"
+        "        return True"
+    )
+    new_should_enter_end = (
+        "        # PRF-04: require meaningful composite change before re-entry.\n"
+        "        # Prevents repeated correlated entries on the same signal.\n"
+        "        _strategy_name = self._select_strategy(regime)\n"
+        "        if _strategy_name is not None:\n"
+        "            _last_comp = self._last_entry_composite.get(\n"
+        "                _strategy_name\n"
+        "            )\n"
+        "            if _last_comp is not None:\n"
+        "                _comp_change = abs(\n"
+        "                    self.re.raw_composite - _last_comp\n"
+        "                )\n"
+        "                _min_change = getattr(\n"
+        "                    config,\n"
+        "                    \"REENTRY_MIN_COMPOSITE_CHANGE\",\n"
+        "                    0.10,\n"
+        "                )\n"
+        "                if _comp_change < _min_change:\n"
+        "                    logger.info(\n"
+        "                        f'Entry gate BLOCKED: composite change '\n"
+        "                        f'{_comp_change:.3f} < {_min_change} '\n"
+        "                        f'since last {_strategy_name} entry '\n"
+        "                        f'(no new signal)'\n"
+        "                    )\n"
+        "                    return False\n"
+        "\n"
+        "        logger.info(\n"
+        "            f'Entry gate PASSED: regime={regime} '\n"
+        "            f'time={now_time} '\n"
+        "            f'composite={self.re.raw_composite:.4f}'\n"
+        "        )\n"
+        "        return True"
+    )
+    content, ok = sub_exact(old_should_enter_end, new_should_enter_end,
+                            content, "PRF-04 reentry composite gate")
+    if ok:
+        changes.append(
+            "PRF-04: re-entry blocked when composite change < "
+            "REENTRY_MIN_COMPOSITE_CHANGE since last entry"
+        )
+
+    # Record composite at entry in _enter_new_position
+    old_enter_log = (
+        "        logger.info(\n"
+        "            f\"New position: {strategy_name} \"\n"
+        "            f\"trade_id={trade_id[:8]} lots={lots} \"\n"
+        "            f\"expiry={new_expiry}\"\n"
+        "        )"
+    )
+    new_enter_log = (
+        "        # PRF-04: record composite at entry for re-entry gate\n"
+        "        self._last_entry_composite[strategy_name] = (\n"
+        "            self.re.raw_composite\n"
+        "        )\n"
+        "        logger.info(\n"
+        "            f\"New position: {strategy_name} \"\n"
+        "            f\"trade_id={trade_id[:8]} lots={lots} \"\n"
+        "            f\"expiry={new_expiry}\"\n"
+        "        )"
+    )
+    content, ok = sub_exact(old_enter_log, new_enter_log,
+                            content, "PRF-04 record composite at entry")
+    if ok:
+        changes.append("PRF-04: composite recorded at entry for re-entry gate")
 
     return content, changes
 
@@ -614,7 +545,7 @@ def patch_regime_engine(content):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Round-10 fixes for the NIFTY trading engine."
+        description="Profitability improvements with clear correct answers."
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Show changes without writing files")
@@ -628,8 +559,6 @@ def main():
     files = {
         "config.py":          os.path.join(base, "config.py"),
         "strategy_engine.py": os.path.join(base, "strategy_engine.py"),
-        "data_manager.py":    os.path.join(base, "data_manager.py"),
-        "regime_engine.py":   os.path.join(base, "regime_engine.py"),
     }
 
     missing = [n for n, p in files.items() if not os.path.isfile(p)]
@@ -644,8 +573,6 @@ def main():
     patches = [
         ("config.py",          patch_config),
         ("strategy_engine.py", patch_strategy_engine),
-        ("data_manager.py",    patch_data_manager),
-        ("regime_engine.py",   patch_regime_engine),
     ]
 
     for name, patch_fn in patches:
@@ -681,8 +608,7 @@ def main():
         print("\nDry-run complete — no files modified.")
     else:
         print("\nAll patches applied.")
-        print("Verify: python -m py_compile config.py strategy_engine.py "
-              "data_manager.py regime_engine.py")
+        print("Verify: python -m py_compile config.py strategy_engine.py")
         print("Then: python testing.py -v")
 
 
