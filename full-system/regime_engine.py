@@ -493,15 +493,24 @@ class RegimeEngine:
         vix = self.dm.vix or 0.0
 
         # ── Term spread ───────────────────────────────────────────────
-        # V_fwd = ATM IV from far expiry (30-45 DTE)
-        # V_spot = VIX (30-day implied vol proxy)
+        # BUG-02 FIX: use near-expiry ATM IV as spot vol proxy instead
+        # of India VIX. VIX is a variance-swap integral across all OTM
+        # strikes and naturally trades 1-2.5pts higher than ATM IV due
+        # to put skew. Comparing far-month ATM IV against VIX creates a
+        # structural negative bias (t_spread almost always negative),
+        # making term_score permanently -1 or 0.
+        # Fix: compare far ATM IV vs near ATM IV (same methodology,
+        # different tenors). Fall back to VIX only if iv_atm unavailable.
         v_fwd = self.dm.forward_iv
+        _near_iv = self.dm.iv_atm  # near-expiry ATM IV (decimal)
         if v_fwd is not None:
-            # forward_iv is stored as decimal (e.g. 0.138)
-            # vix is in percentage (e.g. 11.35)
-            # Convert to same units: both as percentage
             v_fwd_pct  = v_fwd * 100.0
-            v_spot_pct = vix
+            # Use near ATM IV if available (apples-to-apples comparison)
+            # Fall back to VIX only when iv_atm is missing
+            if _near_iv is not None and _near_iv > 0:
+                v_spot_pct = _near_iv * 100.0
+            else:
+                v_spot_pct = vix
             t_spread   = v_fwd_pct - v_spot_pct
             if t_spread > TERM_THRESHOLD:
                 term_score = 1    # contango = sell vol
@@ -745,9 +754,15 @@ class RegimeEngine:
             {"h": b["high"], "l": b["low"], "c": b["close"]}
             for b in bars
         ])
-        # RE-EMA-01: use intraday closes for EMA slope to avoid
-        # overnight gap contamination. ADX uses all bars.
-        ema = ema_series(_slope_closes, min(50, len(_slope_closes)))
+        # BUG-01 FIX: compute EMA on ALL historical bars so span=50
+        # always has sufficient data. The old code used intraday bars
+        # for both the EMA computation AND the slope, which caused
+        # ema_series(N_bars, span=N_bars) to return a 1-element list
+        # (seed consumes all values, leaving nothing to recurse on).
+        # Slope is still measured over intraday bars only (overnight
+        # gap fix preserved) by indexing the full EMA at intraday
+        # positions rather than recomputing from intraday closes.
+        ema = ema_series(closes, 50)
 
         if ax is None or len(ema) < 2:
             return None, "indicator warmup"
@@ -892,15 +907,16 @@ class RegimeEngine:
         })
 
         # Net delta-weighted OI change vs ~15 min ago
-        # CAL-02: lowered from min=600/target=900 to min=120/target=180.
-        # The old 10-15 minute window made flow inactive for the first
-        # 10 min of every cycle and used stale OI deltas. A 3-minute
-        # window (120-180s) is more relevant for intraday regime shifts
-        # while still avoiding single-tick noise.
+        # BUG-04 FIX: restored to min=600s/target=900s.
+        # NSE OI data via Upstox REST API updates at ~3-5 min intervals.
+        # The CAL-02 patch lowered to 120/180s, but this often captured
+        # two readings from the same OI snapshot (ΔOI=0, flow=None).
+        # 10/15 min window aligns with actual API update cadence and
+        # provides a meaningful OI delta for institutional flow detection.
         ref = self._snapshot_near(
             now,
-            min_age_s=120,
-            target_age_s=180,
+            min_age_s=600,
+            target_age_s=900,
             max_age_s=1800,
         )
         net_flow = None
@@ -943,7 +959,7 @@ class RegimeEngine:
         if net_flow is None or spr_avg is None:
             why = []
             if net_flow is None:
-                why.append("net-flow warming (needs 2-3 min old snapshot)")
+                why.append("net-flow warming (needs 10-15 min old snapshot)")
             if spr_avg is None:
                 why.append("spread baseline warming (needs ~20 min history)")
             detail = (
@@ -955,9 +971,15 @@ class RegimeEngine:
             )
             return None, detail
 
-        if spr < spr_avg * 0.985:
+        # BUG-03 FIX: widened from ±1.5% to ±10%.
+        # For a ₹4-8 OTM put, tick size ₹0.05 = 0.8-1.5% of mid.
+        # The old ±1.5% threshold was smaller than a single tick
+        # move, causing false WIDENING/CONTRACTING on every tick
+        # change in best bid/ask. ±10% requires a meaningful spread
+        # change (e.g., bid halves from ₹1 to ₹0.50) to signal.
+        if spr < spr_avg * 0.90:
             spr_state = "CONTRACTING"
-        elif spr > spr_avg * 1.015:
+        elif spr > spr_avg * 1.10:
             spr_state = "WIDENING"
         else:
             spr_state = "FLAT"
