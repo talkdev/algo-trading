@@ -1840,6 +1840,12 @@ async def main() -> None:
                             f"compute_realized_vol: {e}"
                         )
 
+                    # ARCH-9: compute_adx in 60s refresh cycle
+                    # ADX was only recomputed when new candles arrived
+                    # (every 30 min), creating a cadence mismatch with
+                    # IV (updated every 60s).  Recomputing from existing
+                    # candles every 60s costs ~1ms and keeps ADX current
+                    # relative to the regime refresh cycle.
                     try:
                         await asyncio.to_thread(
                             dm.compute_adx

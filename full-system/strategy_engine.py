@@ -185,6 +185,16 @@ class StrategyEngine:
         # previously defined but never referenced anywhere).
         self._last_position_close_time = None
         self._last_position_close_spot = None
+        # ARCH-5a: regime confidence tracking
+        # Decays 15% per consecutive sell-vol loss, floor 40%%.
+        # Recovers 15% per win.  Scales lot size proportionally.
+        self._regime_confidence: float = 1.0
+        self._consecutive_regime_losses: int = 0
+        # ARCH-7a: last stop composite tracking
+        # Stores composite at the time of a stop-loss exit.
+        # Re-entry is blocked unless composite has changed >= 0.10
+        # (prevents re-entry into same adverse conditions).
+        self._last_stop_composite: Optional[float] = None
         # PRF-02: skew side for next credit spread build
         self._pending_skew_side = "both"
         # PRF-04: last composite score per strategy at entry
@@ -2765,12 +2775,27 @@ class StrategyEngine:
                         move_pct
                         >= config.REENTRY_MAX_SPOT_MOVE_PCT
                     )
-                if not spot_moved_enough:
+                # ARCH-7c: composite change gate on re-entry
+                # Block re-entry unless composite has changed >= 0.10
+                # since the stop fired (prevents re-entry into same
+                # adverse conditions that triggered the stop).
+                _composite_changed = True
+                _comp_change_val = 0.0
+                _last_stop_comp = getattr(
+                    self, '_last_stop_composite', None
+                )
+                if _last_stop_comp is not None:
+                    _comp_change_val = abs(
+                        self.re.raw_composite - _last_stop_comp
+                    )
+                    _composite_changed = _comp_change_val >= 0.10
+                if not spot_moved_enough and not _composite_changed:
                     logger.info(
                         f'Entry gate BLOCKED: re-entry cooldown '
                         f'({elapsed_since_close:.0f}s/'
                         f'{config.REENTRY_COOLDOWN_SEC}s, '
-                        f'spot_moved={spot_moved_enough})'
+                        f'spot_moved={spot_moved_enough}, '
+                        f'composite_change={_comp_change_val:.3f} < 0.10)'
                     )
                     return False
         if (
@@ -3781,6 +3806,19 @@ class StrategyEngine:
             return (None, {})
 
         vix = self.dm.vix or 16.0
+
+        # ARCH-1d: MIN_VIX_CONDOR gate in builder
+        # At VIX < 13, condor credit (~11pts) is too thin to be
+        # profitable after transaction costs at realistic lot sizes.
+        # Only build condors when VIX >= MIN_VIX_CONDOR.
+        _min_vix_condor = getattr(config, 'MIN_VIX_CONDOR', 13.0)
+        if vix < _min_vix_condor:
+            logger.info(
+                f"Condor skipped: VIX={vix:.1f} < "
+                f"MIN_VIX_CONDOR={_min_vix_condor:.1f} "
+                f"(credit too thin at low VIX)"
+            )
+            return (None, {})
 
         # AUDIT SE-03: VIX is annualised on 252 trading days.
         # Using calendar days (dte/365) understates the move and
@@ -5858,6 +5896,10 @@ class StrategyEngine:
                 self._IST
             )
             self._last_position_close_spot = self.dm.spot
+            # ARCH-7b: store composite at stop-loss
+            self._last_stop_composite = getattr(
+                self.re, 'raw_composite', None
+            )
 
         self.weekly_pnl      += net_pnl
         self.current_capital += net_pnl
@@ -5869,6 +5911,41 @@ class StrategyEngine:
             self._position_to_dict(position),
         )
 
+        # ARCH-5b: update regime confidence after trade
+        # Only sell-vol strategies affect regime confidence.
+        # Long-vol strategies (straddle, backspread) are
+        # expected to have lower win rates and should not
+        # decay confidence when they lose.
+        _sell_vol_strategies = (
+            config.STRAT_IRON_CONDOR,
+            config.STRAT_CREDIT_SPREADS,
+            config.STRAT_SHORT_STRADDLE,
+            config.STRAT_RATIO_SPREAD,
+        )
+        if position.strategy_name in _sell_vol_strategies:
+            if net_pnl < 0:
+                self._consecutive_regime_losses += 1
+                self._regime_confidence = max(
+                    0.40,
+                    self._regime_confidence * 0.85,
+                )
+                logger.info(
+                    f"ARCH-5b: regime confidence decayed to "
+                    f"{self._regime_confidence:.2f} "
+                    f"({self._consecutive_regime_losses} "
+                    f"consecutive losses)"
+                )
+            else:
+                self._consecutive_regime_losses = 0
+                self._regime_confidence = min(
+                    1.0,
+                    self._regime_confidence * 1.15,
+                )
+                if self._regime_confidence < 1.0:
+                    logger.info(
+                        f"ARCH-5b: regime confidence restored to "
+                        f"{self._regime_confidence:.2f}"
+                    )
         logger.info(
             f"Closed: {position.trade_id[:8]} "
             f"gross=₹{gross_pnl:,.2f} "
@@ -6302,6 +6379,19 @@ class StrategyEngine:
                         f"(composite={_comp_now:.3f} "
                         f"mult={_comp_mult:.2f}x)"
                     )
+        # ARCH-5c: apply regime confidence to lot size
+        # Scale down lot count when confidence is low
+        # (consecutive sell-vol losses signal regime misclassification).
+        _conf = getattr(self, '_regime_confidence', 1.0)
+        if _conf < 0.85 and lots > 0:
+            _conf_lots = max(1, int(lots * _conf))
+            if _conf_lots < lots:
+                logger.info(
+                    f"ARCH-5c: confidence-adjusted lots: "
+                    f"{lots} → {_conf_lots} "
+                    f"(confidence={_conf:.2f})"
+                )
+                lots = _conf_lots
         # S13-1: minimum lot size for credit spreads
         # At VIX=11, credit spread net_credit ~12pts.
         # Transaction costs (Rs334-450/round trip) exceed EV at 1-3 lots.

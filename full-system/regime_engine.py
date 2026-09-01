@@ -880,15 +880,68 @@ class RegimeEngine:
         _vrp_relative = (iv_atm - rv_pct) / rv_pct if rv_pct > 0 else 0.0
         _vrp_rich_threshold = 0.35   # P3-1: VRP rich threshold raised (was 0.15; NIFTY structural VRP 27-50%% made edge=+1 always)
         _vrp_cheap_threshold = -0.05  # IV below RV by 5%
-        if _vrp_relative >= _vrp_rich_threshold or edge > EDGE_RICH:
-            raw = 1
-            tag = f"RICH (VRP_rel={_vrp_relative:.2%} seller edge)"
-        elif _vrp_relative <= _vrp_cheap_threshold or edge < EDGE_CHEAP:
-            raw = -1
-            tag = f"CHEAP (VRP_rel={_vrp_relative:.2%} buyer edge)"
+        # ARCH-3: rolling z-score edge signal
+        # Replaces fixed VRP threshold (0.35) which still fired on
+        # ~70%% of sessions at VIX=11-14 (structural VRP 38-50%%).
+        # Z-score answers: 'Is today's VRP elevated vs recent history?'
+        # Self-calibrating: adapts to any VIX regime automatically.
+        _spread_history = list(self.dm.iv_rv_spread_history)
+        _min_hist_edge = getattr(
+            config, 'EDGE_SCORE_MIN_HISTORY', 20
+        )
+        if len(_spread_history) >= _min_hist_edge:
+            _sp_mean = sum(_spread_history) / len(_spread_history)
+            _sp_var = (
+                sum((x - _sp_mean) ** 2 for x in _spread_history)
+                / len(_spread_history)
+            )
+            _sp_std = _sp_var ** 0.5
+            if _sp_std > 0.001:
+                _vrp_zscore = (edge - _sp_mean) / _sp_std
+                # Rich: VRP is 0.8 std devs above recent mean (~21%% of sessions)
+                # Cheap: VRP is 0.5 std devs below recent mean (~31%% of sessions)
+                if _vrp_zscore >= 0.8:
+                    raw = 1
+                    tag = (
+                        f"RICH (z={_vrp_zscore:.2f}, "
+                        f"edge={edge:+.2f}pp above mean={_sp_mean:.2f}pp)"
+                    )
+                elif _vrp_zscore <= -0.5:
+                    raw = -1
+                    tag = (
+                        f"CHEAP (z={_vrp_zscore:.2f}, "
+                        f"edge={edge:+.2f}pp below mean={_sp_mean:.2f}pp)"
+                    )
+                else:
+                    raw = 0
+                    tag = (
+                        f"FAIR (z={_vrp_zscore:.2f}, "
+                        f"within +-0.8 std of mean={_sp_mean:.2f}pp)"
+                    )
+            else:
+                # Insufficient variance in history — fixed fallback
+                raw = 1 if _vrp_relative >= _vrp_rich_threshold else 0
+                tag = f"FIXED_FALLBACK (std too low, VRP_rel={_vrp_relative:.2%})"
         else:
-            raw = 0
-            tag = f"FAIR (VRP_rel={_vrp_relative:.2%})"
+            # Warmup: use fixed threshold until history is sufficient
+            if _vrp_relative >= _vrp_rich_threshold or edge > EDGE_RICH:
+                raw = 1
+                tag = (
+                    f"RICH_WARMUP (VRP_rel={_vrp_relative:.2%}, "
+                    f"{len(_spread_history)}/{_min_hist_edge} days)"
+                )
+            elif _vrp_relative <= _vrp_cheap_threshold or edge < EDGE_CHEAP:
+                raw = -1
+                tag = (
+                    f"CHEAP_WARMUP (VRP_rel={_vrp_relative:.2%}, "
+                    f"{len(_spread_history)}/{_min_hist_edge} days)"
+                )
+            else:
+                raw = 0
+                tag = (
+                    f"FAIR_WARMUP (VRP_rel={_vrp_relative:.2%}, "
+                    f"{len(_spread_history)}/{_min_hist_edge} days)"
+                )
 
         rv_src = "actual" if self.dm.rv_20d else "est(VIX×0.70)"
         # AUDIT RE-N01: cap at 0 when RV is estimated (circular signal)
@@ -995,49 +1048,56 @@ class RegimeEngine:
         slope_pct = slope / spot * 100.0 if spot else 0.0
         above     = spot > ema[-1]
 
-        # RE-R02: require three-way directional agreement to
-        # avoid false signals at EMA crossings:
-        #   bullish: spot > EMA AND slope > 0 AND +DI > -DI
-        #   bearish: spot < EMA AND slope < 0 AND -DI > +DI
-        # Without this, a falling EMA with spot marginally above
-        # it scores +1 (bullish) despite a bearish trend.
-        # RE-P1-01: restore bipolar trend score.
-        # RE-02 made trend always -1 or 0, making STRONG_SELL_VOL
-        # unreachable (max composite = 0.75 without trend's 0.25).
-        # Correct semantics for a premium-selling engine:
-        #   +1 = range-bound (low ADX, flat EMA) = favorable for selling
-        #    0 = neutral / mixed signals
-        #   -1 = strong confirmed trend = unfavorable (gamma risk)
-        # This preserves the RE-02 intent (trend reduces short-vol
-        # conviction) while allowing the composite to reach STRONG_SELL.
-        if adx_v > ADX_TREND and abs(slope_pct) > EMA_SLOPE_PCT:
-            _slope_up = slope > 0
-            _di_bull  = pdi > ndi
-            if above and _slope_up and _di_bull:
-                # C4-08: asymmetric penalty. Bullish trend is less
-                # dangerous to short-vol than bearish (IV compresses
-                # on up moves, expands on down moves). Partial penalty.
-                raw  = -0.4
-                dirn = "bullish trend (partial -0.4 short-vol penalty)"
-            elif not above and not _slope_up and not _di_bull:
-                # Full penalty: bearish trend expands IV, kills short-gamma
-                raw  = -1.0
-                dirn = "bearish trend (full -1.0 short-vol penalty)"
-            else:
-                raw  = 0
-                dirn = "mixed signals (no 3-way agreement)"
-        elif adx_v < ADX_RANGE_THRESHOLD and abs(slope_pct) < EMA_SLOPE_PCT * 0.5:
-            # RE-B1: range-bound requires positive evidence, not just
-            # absence of trend. ADX_RANGE_THRESHOLD=15 already exists
-            # in config but was never wired here. Require BOTH low ADX
-            # AND flat slope to score +1 (genuinely range-bound).
-            raw  = 1
-            dirn = "range-bound (confirmed: low ADX + flat slope)"
+        # ARCH-2: continuous ADX scoring
+        # Replaces discrete thresholds (ADX<13=+1, 13-18=0, >18=-1)
+        # which created a 45%% dead zone where trend_score=0.
+        # Continuous score: ADX=10→+1 (range-bound), ADX=25→-1 (trending)
+        # Every ADX value contributes a proportional signal.
+        _adx_score = 1.0 - 2.0 * (adx_v - 10.0) / (25.0 - 10.0)
+        _adx_score = max(-1.0, min(1.0, _adx_score))
+        # Slope score: flat=+1, steep=-1
+        # EMA_SLOPE_THRESHOLD is the 'full trend' slope level
+        _slope_thresh = getattr(
+            config, 'EMA_SLOPE_THRESHOLD', 0.15
+        )
+        if _slope_thresh > 0:
+            _slope_score = 1.0 - abs(slope_pct) / _slope_thresh
+            _slope_score = max(-1.0, min(1.0, _slope_score))
         else:
-            # Indeterminate: ADX between range and trend thresholds,
-            # or slope inconsistent with ADX. Honest answer is 0.
-            raw  = 0
-            dirn = "indeterminate (between range and trend thresholds)"
+            _slope_score = 0.0
+        # Combined: average of ADX and slope scores
+        raw = (_adx_score + _slope_score) / 2.0
+        # Asymmetric bearish penalty: bearish trend expands IV
+        # and is more dangerous for short-vol than bullish trend.
+        # Apply 1.5x amplification for confirmed bearish direction.
+        _slope_up = slope > 0
+        _di_bull  = pdi > ndi
+        if (
+            raw < 0
+            and not above
+            and not _slope_up
+            and not _di_bull
+        ):
+            raw = max(-1.0, raw * 1.5)
+            dirn = (
+                f"bearish trend (continuous score={raw:.2f}, "
+                f"ADX={adx_v:.1f}, slope={slope_pct:+.3f}%%)"
+            )
+        elif raw > 0:
+            dirn = (
+                f"range-bound (continuous score={raw:.2f}, "
+                f"ADX={adx_v:.1f}, slope={slope_pct:+.3f}%%)"
+            )
+        elif raw < 0:
+            dirn = (
+                f"trending (continuous score={raw:.2f}, "
+                f"ADX={adx_v:.1f}, slope={slope_pct:+.3f}%%)"
+            )
+        else:
+            dirn = (
+                f"neutral (continuous score=0.0, "
+                f"ADX={adx_v:.1f}, slope={slope_pct:+.3f}%%)"
+            )
 
         detail = (
             f"ADX {adx_v:.1f} "

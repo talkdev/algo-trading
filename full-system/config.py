@@ -425,7 +425,11 @@ STRADDLE_SPOT_STOP_PCT = 0.03
 # CONDOR_WING_WIDTH narrowed to 250. At 1.5σ a 400-wide condor
 # yields only 15-26pts credit vs the 88pt floor — never buildable.
 # At 250-wide the credit/width ratio is achievable at VIX 11-16.
-CONDOR_WING_WIDTH         = 250
+CONDOR_WING_WIDTH         = 150   # ARCH-1b: CONDOR_WING_WIDTH narrowed (was 250; 150pt wings reduce max_loss from Rs46k to Rs18k/lot, break-even win rate drops from 95%% to 79%%)
+# ARCH-1c: MIN_VIX_CONDOR — only build condors when VIX >= 13
+# At VIX=11, condor credit ~11pts is too thin to be profitable.
+# At VIX=13+, credit ~18-22pts gives positive EV at 65%% win rate.
+MIN_VIX_CONDOR            = 13.0
 # CFG-02: widened (same reasoning as straddle).
 CONDOR_DTE_MIN            = 2
 CONDOR_DTE_MAX            = 8    # was 5     # widened from 7
@@ -461,7 +465,7 @@ CONDOR_SIGMA_MULTIPLIER   = 1.2
 # SPREAD_DELTA_SHORT lowered to 0.20. At 0.30 delta (~30% ITM
 # probability per side), ~50% chance at least one side is tested
 # inside a week. 0.20 delta improves risk/reward materially.
-SPREAD_DELTA_SHORT    = 0.20
+SPREAD_DELTA_SHORT    = 0.25   # ARCH-1a: SPREAD_DELTA_SHORT raised (was 0.20; 0.25 delta gives ~22pts credit vs 12pts, improving credit/max-loss ratio from 5%% to 17%%)
 # CAL-DELTA: lowered from 0.15 to 0.08 to maintain meaningful
 # spread width with the new 0.16 short delta. 0.16-0.08=0.08
 # delta spread gives adequate wing protection and defined risk.
