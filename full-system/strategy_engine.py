@@ -190,18 +190,24 @@ class StrategyEngine:
         action:         str,
         leg_index:      int = 0,
     ) -> str:
-        # SE-T04: use IST date, not server-local date.
-        # On UTC servers, date.today() rolls at 05:30 IST,
-        # causing tag mismatches and wrong session cleanup.
+        # SE-T04: use IST date.
+        # SE7-P0-02: add a monotonic counter so repeated same-day
+        # operations (two RULE-B reductions, two _close_one_side
+        # calls) produce distinct tags. Without this, the second
+        # call finds the first order via EP_ORDER_HISTORY?tag= and
+        # returns success without placing a new order.
         _ist_date = datetime.now(
             self._IST
         ).date().isoformat()
+        _counter = getattr(self, "_tag_counter", 0) + 1
+        self._tag_counter = _counter
         raw = (
             f"{trade_id[:12]}-"
             f"{instrument_key[-8:]}-"
             f"{action}-"
             f"{leg_index}-"
-            f"{_ist_date}"
+            f"{_ist_date}-"
+            f"{_counter}"
         )
         tag_hash = hashlib.md5(raw.encode()).hexdigest()[:8]
         return f"{self.ORDER_TAG_PREFIX}-{tag_hash}"
@@ -1300,6 +1306,7 @@ class StrategyEngine:
             f"Aborting — reversing "
             f"{len(filled_legs)} filled legs"
         )
+        _orphaned: List[Leg] = []
         for leg in reversed(filled_legs):
             reverse_action = (
                 "BUY" if leg.action == "SELL" else "SELL"
@@ -1331,7 +1338,7 @@ class StrategyEngine:
                     expiry=leg.expiry,
                     qty=leg.qty,
                 )
-                await self._place_single_leg(
+                retry_ok, _ = await self._place_single_leg(
                     retry_leg,
                     use_market=True,
                     trade_id=(
@@ -1340,8 +1347,28 @@ class StrategyEngine:
                     ),
                     leg_index=0,
                 )
+                # SE7-P0-01: if both reversal attempts fail, the
+                # leg is still live at the broker with no Position
+                # tracking it. Trip the kill switch and log CRITICAL
+                # so the operator knows manual intervention is needed.
+                if not retry_ok:
+                    _orphaned.append(leg)
+                    logger.critical(
+                        f"SE7-P0-01: ORPHANED LEG — reversal failed "
+                        f"twice for {leg.option_type} {leg.strike} "
+                        f"{leg.expiry}. Leg is live at broker with no "
+                        f"local tracking. MANUAL INTERVENTION REQUIRED."
+                    )
             await asyncio.sleep(
                 config.ORDER_BETWEEN_LEGS_DELAY_SEC
+            )
+        if _orphaned:
+            self.kill_switch_active = True
+            self._save_capital_state()
+            logger.critical(
+                f"SE7-P0-01: Kill switch activated due to "
+                f"{len(_orphaned)} orphaned leg(s). "
+                f"Reconcile broker positions before restarting."
             )
 
     # ─────────────────────────────────────────────────────────────
@@ -1579,7 +1606,13 @@ class StrategyEngine:
                     )
                 position_value += leg_pnl
 
-            position.realized_pnl = position_value
+            # SE-P1-04: include banked_pnl from _close_one_side.
+            # Without this, a one-side close's realised loss is
+            # invisible to CB L1/L2 and the console Net figure.
+            position.realized_pnl = (
+                position_value
+                + getattr(position, "banked_pnl", 0.0)
+            )
 
         realized_today = sum(
             p.net_pnl
@@ -1789,18 +1822,19 @@ class StrategyEngine:
             if stop_hit:
                 continue
 
-            # PATCH: previously config.TRAIL_START_PROFIT_PCT /
-            # TRAIL_RETAIN_PCT were defined but never wired up —
-            # no mechanism existed to lock in interim gains before
-            # a full round-trip back toward breakeven/loss.
-            trail_hit = await self._check_trailing_stop(position)
-            if trail_hit:
-                continue
-
+            # SE-P1-05: profit target runs BEFORE trailing stop.
+            # Previously the trail ran first with TRAIL_START=0.30
+            # and TRAIL_RETAIN=0.85, capping wins at 25-43% of
+            # credit while the stop stayed at 2x credit. The trail
+            # should only protect gains beyond the profit target.
             target_hit = await self._check_profit_target(
                 position
             )
             if target_hit:
+                continue
+
+            trail_hit = await self._check_trailing_stop(position)
+            if trail_hit:
                 continue
 
             dte_hit = await self._check_dte_exit(position)
@@ -2382,8 +2416,28 @@ class StrategyEngine:
             )
             return
 
-        if self._same_category(from_regime, to_regime):
-            logger.info("RULE F: Move stops to breakeven")
+        # SE-P1-08: RULE F should only tighten stops on category
+        # DOWNGRADES (STRONG->MILD within a side), never upgrades.
+        # On an upgrade (MILD_SELL->STRONG_SELL) it was halving
+        # loss tolerance exactly when the model says sell more vol.
+        _sell_regimes = {
+            config.REGIME_STRONG_SELL, config.REGIME_MILD_SELL
+        }
+        _buy_regimes = {
+            config.REGIME_BUY_VOL, config.REGIME_STRONG_BUY
+        }
+        _is_sell_downgrade = (
+            from_regime == config.REGIME_STRONG_SELL
+            and to_regime == config.REGIME_MILD_SELL
+        )
+        _is_buy_downgrade = (
+            from_regime == config.REGIME_STRONG_BUY
+            and to_regime == config.REGIME_BUY_VOL
+        )
+        if self._same_category(from_regime, to_regime) and (
+            _is_sell_downgrade or _is_buy_downgrade
+        ):
+            logger.info("RULE F: Move stops to breakeven (downgrade)")
             for position in self.open_positions:
                 self._move_stop_to_breakeven(position)
             return
@@ -2460,7 +2514,8 @@ class StrategyEngine:
             )
             return False
         if regime == config.REGIME_NEUTRAL:
-            iv_rank = self.dm.compute_iv_rank()
+            _ivr    = self.dm.compute_iv_rank()
+            iv_rank = _ivr if _ivr is not None else 50.0
             adx     = self.dm.adx or 99
             if iv_rank <= 50 or adx >= 20:
                 logger.info(
@@ -2790,6 +2845,11 @@ class StrategyEngine:
         atr_contract = self.dm.is_atr_contracting()
         put_iv       = self._get_25d_put_iv()
         call_iv      = self._get_25d_call_iv()
+        # SE-P0-01: compute_iv_rank() returns None on cold start
+        # (DM-13 fix). Guard all comparisons against None to prevent
+        # TypeError crashing run_cycle() for the first ~10 sessions.
+        _iv_rank_raw = self.dm.compute_iv_rank()
+        iv_rank      = _iv_rank_raw if _iv_rank_raw is not None else 50.0
         # PATCH (S3): put_iv/call_iv/forward_iv/vix are all stored
         # as DECIMALS (e.g. 0.15 for 15%), but SPREAD_SKEW_THRESHOLD
         # (2.0), RATIO_CONTANGO_THRESHOLD (1.5), and
@@ -2839,15 +2899,17 @@ class StrategyEngine:
             return None
 
         elif regime == config.REGIME_BUY_VOL:
-            if not has_shorts and spot > ema_200:
-                return config.STRAT_BUTTERFLY
-            elif (
+            # SE7-P1-02: butterfly is short vega/short gamma at
+            # the body — it profits from vol contraction, the
+            # opposite of BUY_VOL intent. Use long strangle instead
+            # (long gamma, benefits from vol expansion).
+            if (
                 has_shorts
                 and self._gamma_above_50pct_limit()
             ):
                 return config.STRAT_DEFENSIVE
             else:
-                return config.STRAT_BUTTERFLY
+                return config.STRAT_STRANGLE
 
         elif regime == config.REGIME_STRONG_BUY:
             if (
@@ -3192,14 +3254,15 @@ class StrategyEngine:
             sc_prem + sp_prem - lc_prem - lp_prem
         )
 
-        # SE-02: the old check (0.22 * 400 = 88pts) was never
-        # achievable at 1.5σ strikes (typical credit 15-26pts).
-        # Replace with a viable ratio: credit/width >= 0.15.
-        # At 400-wide: min = 60pts. At 1.5σ this is still hard;
-        # the condor builder should be called with a tighter wing
-        # (200-250pts) for this to work in practice — but at least
-        # the gate no longer permanently blocks every build.
-        _min_credit_ratio = 0.15
+        # CFG-P1-01: read from config, not a hardcoded literal.
+        # The old code had _min_credit_ratio = 0.15 hardcoded here
+        # while config.CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.22 was
+        # ignored — tuning the config had no effect.
+        _min_credit_ratio = getattr(
+            config,
+            "CONDOR_MIN_CREDIT_PCT_OF_WIDTH",
+            0.15,
+        )
         _min_credit_required = max(
             config.CONDOR_MIN_CREDIT,
             _min_credit_ratio * config.CONDOR_WING_WIDTH,
@@ -3514,34 +3577,38 @@ class StrategyEngine:
         if total_credit <= 0:
             return (None, {})
 
+        # SE-P1-06: genuine 1x2 ratio spread = sell 2x OTM,
+        # buy 1x ATM. The old structure (buy 2x OTM, sell 1x ATM)
+        # was a backspread (net debit), which always returned
+        # total_credit <= 0 and was rejected immediately.
         legs = [
-            Leg(
-                instrument_key=chain[call_long]["call"][
-                    "instrument_key"
-                ],
-                option_type="call", action="BUY",
-                strike=call_long, expiry=expiry, qty=2,
-            ),
-            Leg(
-                instrument_key=chain[put_long]["put"][
-                    "instrument_key"
-                ],
-                option_type="put", action="BUY",
-                strike=put_long, expiry=expiry, qty=2,
-            ),
             Leg(
                 instrument_key=chain[call_short]["call"][
                     "instrument_key"
                 ],
-                option_type="call", action="SELL",
+                option_type="call", action="BUY",
                 strike=call_short, expiry=expiry, qty=1,
             ),
             Leg(
                 instrument_key=chain[put_short]["put"][
                     "instrument_key"
                 ],
-                option_type="put", action="SELL",
+                option_type="put", action="BUY",
                 strike=put_short, expiry=expiry, qty=1,
+            ),
+            Leg(
+                instrument_key=chain[call_long]["call"][
+                    "instrument_key"
+                ],
+                option_type="call", action="SELL",
+                strike=call_long, expiry=expiry, qty=2,
+            ),
+            Leg(
+                instrument_key=chain[put_long]["put"][
+                    "instrument_key"
+                ],
+                option_type="put", action="SELL",
+                strike=put_long, expiry=expiry, qty=2,
             ),
         ]
 
@@ -3765,8 +3832,23 @@ class StrategyEngine:
                         )
                         return (None, {})
 
-        iv_rank = self.dm.compute_iv_rank()
+        _ivr = self.dm.compute_iv_rank()
+        iv_rank = _ivr if _ivr is not None else 50.0
         if iv_rank > config.LONG_STRADDLE_MAX_IV_RANK:
+            return (None, {})
+        # SE7-P1-03: add genuine cheapness gate. The VIX-spike
+        # filter was dead code (bypassed for STRONG_BUY/EVENT,
+        # the only regimes that call this builder). Require that
+        # IV is actually cheap relative to RV before buying.
+        if (
+            self.dm.iv_atm is not None
+            and self.dm.rv_20d is not None
+            and self.dm.iv_atm > self.dm.rv_20d + 0.02
+        ):
+            logger.info(
+                f"Long straddle: IV ({self.dm.iv_atm:.4f}) > "
+                f"RV ({self.dm.rv_20d:.4f}) + 2% — vol not cheap"
+            )
             return (None, {})
 
         if (
@@ -3843,12 +3925,27 @@ class StrategyEngine:
         if vix > config.BACKSPREAD_MAX_VIX:
             return (None, {})
 
+        # SE-P1-07: after RE-02, confirmed_trend is always -1
+        # (trending) or 0 (range-bound) — never +1. The backspread
+        # needs the actual directional signal (+DI vs -DI).
+        # Read the raw trend direction from the regime engine's
+        # last computed +DI/-DI comparison stored in _detail.
         trend = self.re.confirmed_trend
+        _trend_detail = self.re._detail.get("trend", "")
+        _is_bullish = "bullish" in _trend_detail.lower()
+        _is_bearish = "bearish" in _trend_detail.lower()
+        # Use directional signal: bullish -> call backspread,
+        # bearish -> put backspread, neutral -> call (default)
+        _trend_direction = (
+            1 if _is_bullish
+            else -1 if _is_bearish
+            else 1
+        )
         chain = self.dm.get_chain_for_expiry(expiry)
         if not chain:
             return (None, {})
 
-        if trend >= 0:
+        if _trend_direction >= 0:
             long_strike  = self.dm.get_strike_by_delta(
                 "call", config.BACKSPREAD_LONG_DELTA,
                 expiry=expiry,
@@ -4128,9 +4225,14 @@ class StrategyEngine:
         if put_spread > config.EVENT_STRANGLE_MAX_SPREAD_PTS:
             logger.info(
                 f"Strangle: put spread={put_spread:.2f} "
-                f"too wide — falling back to straddle"
+                f"too wide — returning None (not falling back)"
             )
-            return await self._build_long_straddle()
+            # SE7-P2-01: the old fallback returned straddle legs
+            # with straddle meta but the caller still held
+            # strategy_name=STRAT_STRANGLE, corrupting attribution
+            # and MAX_TRANCHES_PER_STRATEGY counting.
+            # Return None so the caller can try a genuine straddle.
+            return (None, {})
 
         total_debit   = (
             chain[call_strike]["call"]["ltp"]
@@ -5125,22 +5227,15 @@ class StrategyEngine:
         for position in self.open_positions:
             for leg in position.legs:
                 sign = +1 if leg.action == "BUY" else -1
-                total_delta += (
-                    sign * leg.delta * leg.qty
-                    * config.LOT_SIZE
-                )
-                total_gamma += (
-                    sign * leg.gamma * leg.qty
-                    * config.LOT_SIZE
-                )
-                total_vega  += (
-                    sign * leg.vega  * leg.qty
-                    * config.LOT_SIZE
-                )
-                total_theta += (
-                    sign * leg.theta * leg.qty
-                    * config.LOT_SIZE
-                )
+                # Greeks over-multiplication fix: API-supplied Greeks
+                # are per-contract (per-lot), not per-share. Multiplying
+                # by LOT_SIZE again overstated portfolio Greeks by 65x,
+                # making every Greek limit 65x too strict and making
+                # delta hedge quantities wrong.
+                total_delta += sign * leg.delta * leg.qty
+                total_gamma += sign * leg.gamma * leg.qty
+                total_vega  += sign * leg.vega  * leg.qty
+                total_theta += sign * leg.theta * leg.qty
 
         return {
             "delta": total_delta,
@@ -5461,8 +5556,11 @@ class StrategyEngine:
     async def _reduce_position_50pct(
         self, position: Position
     ) -> None:
+        # SE-P2-02: reduce both SELL and BUY legs proportionally.
+        # Previously only SELL legs were reduced, leaving 100% of
+        # long wings against 50% of shorts — pure decaying premium.
         for idx, leg in enumerate(position.legs):
-            if leg.action == "SELL":
+            if leg.action in ("SELL", "BUY"):
                 # AUDIT SE-16: for a 1-lot position,
                 # floor(1*0.5)=0, max(1,0)=1 closes the whole
                 # leg leaving a naked remnant. Close the whole
@@ -5505,6 +5603,17 @@ class StrategyEngine:
     async def _reduce_position_pct(
         self, position: Position, pct: float
     ) -> None:
+        # SE-P0-06: for a 1-lot position, floor(1*pct)=0,
+        # max(1,0)=1 closes the entire leg, leaving orphaned
+        # long wings. Close the whole position instead.
+        if any(
+            l.action == "SELL" and l.qty <= 1
+            for l in position.legs
+        ):
+            await self._close_position(
+                position, config.EXIT_REASONS["MANUAL"]
+            )
+            return
         for idx, leg in enumerate(position.legs):
             if leg.action == "SELL":
                 reduce_qty = max(
