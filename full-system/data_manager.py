@@ -1150,9 +1150,26 @@ class DataManager:
             async with self._data_lock:
                 self.option_chain[expiry_date] = parsed
 
+            # DM-05: prune expired expiries so they don't fill
+            # the [:3] refresh slot in main.py, starving the live chain.
+            _today_ist = datetime.now(self._IST).date()
+            _expired = [
+                e for e in list(self._known_expiries)
+                if datetime.strptime(
+                    e, "%Y-%m-%d"
+                ).date() < _today_ist
+            ]
+            for _e in _expired:
+                self._known_expiries.discard(_e)
+                self.option_chain.pop(_e, None)
+            if _expired:
+                logger.info(
+                    f"DM-05: pruned {len(_expired)} expired "
+                    f"expiries: {_expired}"
+                )
+
             # LIVE FIX: _active_expiry = nearest FUTURE expiry
-            # Strictly after today so expired expiry is not active
-            today = date.today()
+            today = _today_ist
             future_expiries = sorted([
                 e for e in self._known_expiries
                 if datetime.strptime(
@@ -2156,7 +2173,8 @@ class DataManager:
         daily_history = self._load_iv_rank_history()
         if len(daily_history) >= 10:
             if self.iv_atm is None:
-                return 55.0
+                # DM-13: return None so callers block on no evidence
+                return None
             try:
                 iv_high = max(daily_history)
                 iv_low  = min(daily_history)
@@ -2172,9 +2190,12 @@ class DataManager:
                 return 55.0
 
         if len(self.iv_atm_history) < 10:
-            return 55.0
+            # DM-13: return None (not 55.0) so the NEUTRAL-regime
+            # gate blocks entry on no evidence. 55>50 was passing
+            # the iv_rank gate and opening condors on a magic number.
+            return None
         if self.iv_atm is None:
-            return 55.0
+            return None
         try:
             history = list(self.iv_atm_history)
             iv_high = max(history)
@@ -2578,11 +2599,26 @@ class DataManager:
         self.kill_switch_triggered = True
 
     def _build_ws_subscription_keys(self) -> List[str]:
-        """Build instrument keys from active expiry only."""
+        """Build instrument keys from active expiry + open positions."""
         keys = [
             config.INSTRUMENT_NIFTY,
             config.INSTRUMENT_VIX,
         ]
+        # DM-07: include all open-position instrument keys so
+        # stop-loss and profit-target decisions use live WS data
+        # rather than 60s-stale REST data. Condor wings sit
+        # ~1000pts OTM, well outside the ATM±10 window.
+        _open_keys = set()
+        try:
+            for _pos in getattr(
+                self, "_open_position_keys", []
+            ):
+                _open_keys.add(_pos)
+        except Exception:
+            pass
+        for _k in _open_keys:
+            if _k and _k not in keys:
+                keys.append(_k)
 
         active = self.get_active_chain()
         if not active or not self.atm_strike:
@@ -2887,7 +2923,12 @@ class DataManager:
                 opt = self.option_chain[expiry][strike][
                     option_type
                 ]
-                opt["delta"] = delta
+                # DM-11: apply _clean_delta() to WS delta.
+                # The REST path bounds delta to (0.01, 0.99);
+                # the WS path previously wrote raw values.
+                # A garbage tick poisons get_strike_by_delta().
+                _is_call = (option_type == "call")
+                opt["delta"] = _clean_delta(delta, _is_call)
                 opt["gamma"] = gamma
                 opt["vega"]  = vega
                 opt["theta"] = theta

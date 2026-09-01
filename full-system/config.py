@@ -79,6 +79,7 @@ POSITION_SIZE_PCT        = 0.15
 TRANSACTION_COST_PCT     = 0.0005
 MAX_CONCURRENT_POSITIONS = 4
 
+# SE-03: derived from MAX_RISK_PER_TRADE_PCT above
 MAX_RISK_PER_TRADE = int(
     MAX_RISK_PER_TRADE_PCT * TOTAL_CAPITAL
 )
@@ -430,8 +431,13 @@ SL_REFERENCE_VIX   = 14.0
 SL_MIN_PERCENT     = 0.18
 SL_MAX_PERCENT     = 0.40
 
-TRAIL_START_PROFIT_PCT = 0.15
-TRAIL_RETAIN_PCT       = 0.65
+# SE-06: was 0.15/0.65 — converted every winner into a ~10% scalp
+# while keeping the full 2x credit stop on losers. At 0.15 arm and
+# 0.65 retain, the stop fires at 9.75% of credit — within normal
+# intraday theta oscillation. Raised to 0.30/0.85 so the trail
+# only activates on genuine profit and retains most of it.
+TRAIL_START_PROFIT_PCT = 0.30
+TRAIL_RETAIN_PCT       = 0.85
 
 # ─────────────────────────────────────────────────────────────────────
 # ORDER EXECUTION
