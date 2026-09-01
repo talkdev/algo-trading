@@ -247,6 +247,26 @@ async def _run_preflight_checks(
             f"Holiday calendar last reviewed "
             f"{days_since} days ago — please update"
         )
+    # AUDIT CFG-06: hard-fail if the calendar does not cover
+    # the current year. On Jan 1 2027 the engine would treat
+    # all 2027 NSE holidays as trading days.
+    _cal_max_year = getattr(
+        config, "HOLIDAY_CALENDAR_MAX_YEAR", 0
+    )
+    if _cal_max_year > 0 and today.year > _cal_max_year:
+        if not config.ALLOW_NON_TRADING_DAY_RUN:
+            logger.critical(
+                f"Holiday calendar only covers up to "
+                f"{_cal_max_year}. Current year is "
+                f"{today.year}. Update NSE_MARKET_HOLIDAYS "
+                f"before running."
+            )
+            return False
+        else:
+            logger.warning(
+                f"Holiday calendar stale (max={_cal_max_year}) "
+                f"but ALLOW_NON_TRADING_DAY_RUN=True"
+            )
 
     # CHECK 7 — High impact events today
     if today_str in config.HIGH_IMPACT_EVENTS:
@@ -569,15 +589,23 @@ async def _end_of_day(
             and dm.vix < config.VIX_SELL_VOL_MAX
         )
 
-        # LIVE FIX: dte>5 (was dte>3)
-        # dte>3 allowed DTE=8 positions overnight for 6 days.
-        # dte>5 limits overnight hold to Mon/Tue entry only.
+        # AUDIT MN-02: was dte>5, which forced closure on day 2
+        # for 6-DTE entries (capturing ~1/6 of theta while paying
+        # full round-trip friction). Changed to dte>=2 for
+        # defined-risk structures (condor, spreads) so theta is
+        # actually harvested. Naked straddles keep dte>5 because
+        # they carry undefined overnight risk.
+        _is_defined_risk = position.strategy_name in [
+            config.STRAT_IRON_CONDOR,
+            config.STRAT_CREDIT_SPREADS,
+        ]
+        _dte_ok = dte >= 2 if _is_defined_risk else dte > 5
         if (
             regime in [
                 config.REGIME_STRONG_SELL,
                 config.REGIME_MILD_SELL,
             ]
-            and dte > 5
+            and _dte_ok
             and position.strategy_name in [
                 config.STRAT_SHORT_STRADDLE,
                 config.STRAT_IRON_CONDOR,
@@ -1678,13 +1706,29 @@ async def main() -> None:
                         )
 
                 finally:
-                    # LIVE FIX: always set in finally
-                    # so regime can run even after errors
-                    last_data_refresh     = now
-                    data_refresh_complete = True
-                    logger.info(
-                        "Data refresh cycle complete"
-                    )
+                    # AUDIT MN-N01: only mark complete when
+                    # mandatory data succeeded. Spot and chain
+                    # are mandatory; candles/OI are optional.
+                    _spot_ok  = dm.spot is not None and dm.spot > 0
+                    _chain_ok = len(dm.option_chain) > 0
+                    if _spot_ok and _chain_ok:
+                        last_data_refresh     = now
+                        data_refresh_complete = True
+                        logger.info(
+                            "Data refresh cycle complete"
+                        )
+                    else:
+                        # Still update timestamp so we don't
+                        # spin-retry every second, but mark
+                        # incomplete so regime skips this cycle.
+                        last_data_refresh     = now
+                        data_refresh_complete = False
+                        logger.warning(
+                            "Data refresh incomplete: "
+                            f"spot_ok={_spot_ok} "
+                            f"chain_ok={_chain_ok} "
+                            "— regime refresh skipped"
+                        )
 
             # ─────────────────────────────────────────────────────
             # REGIME REFRESH (sequenced after data refresh)
@@ -1745,6 +1789,10 @@ async def main() -> None:
                         )
 
                     try:
+                        # AUDIT MN-06: run_cycle handles entries
+                        # (gated on regime). Position monitoring
+                        # is now also called every loop iteration
+                        # (see fast-monitor block below).
                         await se.run_cycle()
                     except Exception as e:
                         logger.error(
@@ -1770,6 +1818,21 @@ async def main() -> None:
                 logger.info(
                     "Regime refresh cycle complete"
                 )
+
+            # ─────────────────────────────────────────────────────
+            # AUDIT MN-06: FAST POSITION MONITOR (every loop ~1s)
+            # Stop-loss and P&L checks run independently of the
+            # 60s regime timer so exits are not delayed by up to
+            # 60s during data-refresh or regime-skip cycles.
+            # ─────────────────────────────────────────────────────
+            if se.open_positions and dm.spot is not None:
+                try:
+                    await se._update_all_pnls()
+                    await se._monitor_all_positions()
+                except Exception as _mon_e:
+                    logger.error(
+                        f"Fast monitor error: {_mon_e}"
+                    )
 
             # ─────────────────────────────────────────────────────
             # HEARTBEAT

@@ -1531,20 +1531,17 @@ class StrategyEngine:
                     .get(leg.strike, {})
                     .get(leg.option_type, {})
                 )
-                # PATCH: prefer bid/ask midpoint over raw ltp for
-                # MTM — a single stale/thin ltp print can cause
-                # phantom P&L swings unrelated to real price moves.
-                bid = opt_data.get("bid", 0)
-                ask = opt_data.get("ask", 0)
-                ltp = opt_data.get("ltp", 0)
-                if bid > 0 and ask > 0:
-                    mark = (bid + ask) / 2.0
-                elif ltp > 0:
-                    mark = ltp
-                else:
+                # AUDIT DM-01: bid/ask are only updated by the
+                # 60s REST poll; LTP is updated by WS on every
+                # tick. Use staleness-aware get_mark_price() so
+                # we prefer live LTP when the REST quote is stale.
+                mark = self.dm.get_mark_price(
+                    opt_data, fallback=leg.entry_price
+                )
+                if mark <= 0:
                     mark = leg.entry_price
                     logger.warning(
-                        f"No bid/ask/ltp for {leg.option_type} "
+                        f"No mark price for {leg.option_type} "
                         f"{leg.strike} expiry="
                         f"{position.expiry_date} "
                         f"— using entry"
@@ -1601,9 +1598,18 @@ class StrategyEngine:
             # it directly against a rupee threshold made the floor
             # an effective no-op. Multiply by LOT_SIZE to convert
             # to rupees before comparing.
+            # AUDIT SE-06: CB L1 must not fire before the
+            # position's own designed stop-loss. Use the larger
+            # of: 2% of capital, or the position's stop_loss
+            # (which is already 2x credit for credit strategies).
+            _designed_stop_rupees = (
+                position.stop_loss * config.LOT_SIZE
+                if position.stop_loss and position.stop_loss > 0
+                else 0.0
+            )
             cb_l1_threshold = max(
                 config.CB_LEVEL_1_PCT * config.TOTAL_CAPITAL,
-                position.total_credit * config.LOT_SIZE,
+                _designed_stop_rupees,
             )
             if position_net_estimate < -cb_l1_threshold:
                 logger.critical(
@@ -1710,6 +1716,12 @@ class StrategyEngine:
         """Monitor all open positions for exit conditions."""
         for position in list(self.open_positions):
             if position.status != "OPEN":
+                continue
+
+            # AUDIT SE-05: skip this cycle if one side was just
+            # closed — let the next cycle re-evaluate cleanly.
+            if position.meta.get("_one_side_closed_cycle"):
+                position.meta.pop("_one_side_closed_cycle", None)
                 continue
 
             pending_legs = [
@@ -1899,6 +1911,10 @@ class StrategyEngine:
                     position, "call",
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
+                # AUDIT SE-05: mark position so _monitor_all_positions
+                # skips trailing/profit checks this cycle on the
+                # now-mutated one-sided structure.
+                position.meta["_one_side_closed_cycle"] = True
                 return False
             if short_put and self.dm.spot <= (
                 short_put
@@ -1908,6 +1924,7 @@ class StrategyEngine:
                     position, "put",
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
+                position.meta["_one_side_closed_cycle"] = True
                 return False
 
         elif strategy == config.STRAT_RATIO_SPREAD:
@@ -2638,6 +2655,26 @@ class StrategyEngine:
             )
             return
 
+        # AUDIT SE-N03: if any leg partially filled, the lot count
+        # was reduced. Rescale stop, target, max_risk to actual fills.
+        _filled_lots = min(
+            (l.qty for l in legs if l.qty > 0), default=lots
+        )
+        if _filled_lots < lots and lots > 0:
+            _scale = _filled_lots / lots
+            meta["max_risk"] = meta.get("max_risk", 0) * _scale
+            if meta.get("stop_loss"):
+                meta["stop_loss"] = meta["stop_loss"] * _scale
+            if meta.get("profit_target"):
+                meta["profit_target"] = (
+                    meta["profit_target"] * _scale
+                )
+            logger.info(
+                f"SE-N03: partial fill rescale "
+                f"{lots}->{_filled_lots} lots, "
+                f"scale={_scale:.3f}"
+            )
+
         self._refresh_leg_greeks(legs)
 
         position = self._create_position_record(
@@ -3016,10 +3053,15 @@ class StrategyEngine:
 
         vix = self.dm.vix or 16.0
 
+        # AUDIT SE-03: VIX is annualised on 252 trading days.
+        # Using calendar days (dte/365) understates the move and
+        # places short strikes too close to spot.
+        # Approximate trading days: calendar_days * (252/365).
+        _trading_days = max(1, dte * 252 / 365)
         expected_move = (
             spot
             * (vix / 100)
-            * ((dte / 365) ** 0.5)
+            * ((_trading_days / 252) ** 0.5)
         )
 
         # FIX S1: round to 100-pt step
@@ -3082,10 +3124,21 @@ class StrategyEngine:
             sc_prem + sp_prem - lc_prem - lp_prem
         )
 
-        if net_credit < config.CONDOR_MIN_CREDIT:
+        # AUDIT SE-04/CFG-01: check credit as % of wing width.
+        # Absolute floor kept as secondary check.
+        _min_credit_pct = getattr(
+            config, "CONDOR_MIN_CREDIT_PCT_OF_WIDTH", 0.22
+        )
+        _min_credit_required = max(
+            config.CONDOR_MIN_CREDIT,
+            _min_credit_pct * config.CONDOR_WING_WIDTH,
+        )
+        if net_credit < _min_credit_required:
             logger.warning(
                 f"Condor: credit={net_credit:.2f} "
-                f"< min={config.CONDOR_MIN_CREDIT}"
+                f"< min={_min_credit_required:.1f} "
+                f"({_min_credit_pct*100:.0f}% of "
+                f"{config.CONDOR_WING_WIDTH}pt wing)"
             )
             return (None, {})
 
@@ -3250,10 +3303,19 @@ class StrategyEngine:
             (sp_prem - lp_prem) + (sc_prem - lc_prem)
         )
 
-        if total_credit < config.SPREAD_MIN_CREDIT:
+        # AUDIT CFG-01: check credit as % of max spread width.
+        _spread_min_pct = getattr(
+            config, "SPREAD_MIN_CREDIT_PCT_OF_WIDTH", 0.25
+        )
+        _spread_min_required = max(
+            config.SPREAD_MIN_CREDIT,
+            _spread_min_pct * max(put_width, call_width),
+        )
+        if total_credit < _spread_min_required:
             logger.info(
                 f"Credit spread: credit={total_credit:.2f} "
-                f"< min={config.SPREAD_MIN_CREDIT}"
+                f"< min={_spread_min_required:.1f} "
+                f"({_spread_min_pct*100:.0f}% of width)"
             )
             return (None, {})
 
@@ -4401,35 +4463,42 @@ class StrategyEngine:
             f"for {strategy_name}"
         )
 
-        # PATCH: if any leg only partially filled, trim the
-        # others down to match so the strategy stays balanced
-        # instead of leaving a lopsided position.
+        # AUDIT SE-N07: rebalance failure must fail the execution.
+        # An imbalanced condor/spread is a naked position.
         try:
-            await self._rebalance_partial_fills(filled_legs)
+            _rebalance_ok = await self._rebalance_partial_fills(
+                filled_legs
+            )
         except Exception as e:
             logger.error(
                 f"_rebalance_partial_fills error: {e}"
             )
+            _rebalance_ok = False
+        if not _rebalance_ok:
+            logger.error(
+                f"SE-N07: rebalance failed for {strategy_name} — "
+                f"reversing all filled legs"
+            )
+            await self._cancel_and_reverse(filled_legs)
+            return False
 
         return True
 
     async def _rebalance_partial_fills(
         self, legs: List[Leg]
-    ) -> None:
+    ) -> bool:
         """
-        PATCH: if any leg in this strategy partially filled, trim
-        every other leg down to the same (minimum) filled
-        quantity so the overall structure stays balanced rather
-        than lopsided (e.g. a condor with 6/6/4/6 lots across its
-        four legs after one leg only partially filled).
+        AUDIT SE-N07: returns True if balanced (or no rebalance
+        needed), False if a trim failed and the position is
+        imbalanced. Caller must reverse all legs on False.
         """
         if not any(l.fill_status == "PARTIAL" for l in legs):
-            return
+            return True
         min_qty = min(
             (l.qty for l in legs if l.qty > 0), default=0
         )
         if min_qty <= 0:
-            return
+            return True
         for idx, leg in enumerate(legs):
             excess = leg.qty - min_qty
             if excess > 0:
@@ -4464,12 +4533,13 @@ class StrategyEngine:
                     logger.error(
                         f"Rebalance trim FAILED for "
                         f"{leg.option_type} {leg.strike} — "
-                        f"position may be imbalanced, "
-                        f"manual review needed"
+                        f"returning False for caller to reverse"
                     )
+                    return False
                 await asyncio.sleep(
                     config.ORDER_BETWEEN_LEGS_DELAY_SEC
                 )
+        return True
 
     def _log_order_detail(
         self,
@@ -4650,6 +4720,26 @@ class StrategyEngine:
             )
 
         IST = pytz.timezone(config.TZ)
+        # AUDIT SE-N01: verify that every leg has a confirmed
+        # exit price before marking the position closed.
+        # A leg with exit_price==0 and fill_status not
+        # EXPIRED_WORTHLESS means the exit order failed.
+        _unconfirmed = [
+            l for l in position.legs
+            if l.exit_price <= 0
+            and l.fill_status != "EXPIRED_WORTHLESS"
+            and l.qty > 0
+        ]
+        if _unconfirmed:
+            logger.error(
+                f"SE-N01: {len(_unconfirmed)} leg(s) have no "
+                f"confirmed exit price for "
+                f"{position.trade_id[:8]} — "
+                f"position remains OPEN. Manual review required."
+            )
+            # Mark legs that did exit so we don't re-close them,
+            # but keep the position OPEN for the next cycle.
+            return
         position.exit_reason    = exit_reason
         position.exit_timestamp = datetime.now(
             IST
@@ -5195,6 +5285,23 @@ class StrategyEngine:
             )
             return
 
+        # AUDIT SE-15: INSTRUMENT_NIFTY_FUT is a series prefix,
+        # not a specific contract key. In live mode this will 400.
+        # The real key must be resolved from the instrument master
+        # at startup. Until that is implemented, skip live hedging
+        # and log CRITICAL so the operator knows delta is unhedged.
+        fut_key = getattr(
+            config, "INSTRUMENT_NIFTY_FUT_RESOLVED",
+            config.INSTRUMENT_NIFTY_FUT,
+        )
+        if fut_key == config.INSTRUMENT_NIFTY_FUT:
+            logger.critical(
+                f"SE-15: INSTRUMENT_NIFTY_FUT is not a tradeable "
+                f"key. Resolve from instrument master and set "
+                f"config.INSTRUMENT_NIFTY_FUT_RESOLVED. "
+                f"Delta hedge SKIPPED: {action} {futures_lots} lots."
+            )
+            return
         payload = {
             "quantity":           (
                 futures_lots * config.LOT_SIZE
@@ -5202,7 +5309,7 @@ class StrategyEngine:
             "product":            "D",
             "validity":           "DAY",
             "price":              0,
-            "instrument_token":   config.INSTRUMENT_NIFTY_FUT,
+            "instrument_token":   fut_key,
             "order_type":         "MARKET",
             "transaction_type":   action,
             "disclosed_quantity": 0,
@@ -5225,9 +5332,19 @@ class StrategyEngine:
     ) -> None:
         for idx, leg in enumerate(position.legs):
             if leg.action == "SELL":
-                reduce_qty = max(
-                    1, math.floor(leg.qty * 0.50)
-                )
+                # AUDIT SE-16: for a 1-lot position,
+                # floor(1*0.5)=0, max(1,0)=1 closes the whole
+                # leg leaving a naked remnant. Close the whole
+                # position instead of leaving an unbalanced structure.
+                if leg.qty <= 1:
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS["MANUAL"],
+                    )
+                    return
+                reduce_qty = math.floor(leg.qty * 0.50)
+                if reduce_qty < 1:
+                    reduce_qty = 1
                 if reduce_qty > leg.qty:
                     reduce_qty = leg.qty
                 close_leg = Leg(

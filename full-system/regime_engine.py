@@ -273,7 +273,11 @@ class RegimeEngine:
 
         self._refresh_lock  = asyncio.Lock()
         self._refresh_count = 0
-        self._warmup_required = 1
+        # AUDIT RE-07: was 1 cycle. After a restart, _conf values
+        # are reloaded from SQLite (potentially stale). Require 3
+        # cycles before acting so the persistence filter has had
+        # a chance to confirm or reject the reloaded values.
+        self._warmup_required = 3
 
         self._load_state()
 
@@ -353,16 +357,18 @@ class RegimeEngine:
         # Step 6: Macro override
         macro_active, macro_name = self._check_macro_override(now)
 
-        # Warmup gate
-        if self._refresh_count <= self._warmup_required:
+        # AUDIT RE-N03: macro override must precede warmup gate.
+        # A restart on an event day must not suppress EVENT_HEDGE.
+        if macro_active:
+            new_regime = config.REGIME_EVENT
+            logger.info(f"Macro override: {macro_name}")
+        # Warmup gate (after macro check)
+        elif self._refresh_count <= self._warmup_required:
             new_regime = config.REGIME_NEUTRAL
             logger.info(
                 f"Warmup ({self._refresh_count}/"
                 f"{self._warmup_required}) — NEUTRAL"
             )
-        elif macro_active:
-            new_regime = config.REGIME_EVENT
-            logger.info(f"Macro override: {macro_name}")
         else:
             # Step 7: Weighted aggregation
             # AUDIT #2.2: rebuild weights from config
@@ -586,6 +592,14 @@ class RegimeEngine:
         rv = self.dm.get_estimated_rv()
         if rv is None:
             return None, "RV unavailable (no daily candles or VIX)"
+        # AUDIT RE-N01: track whether we are using actual or
+        # estimated (VIX-derived) RV. Estimated RV is circular
+        # (IV vs VIX*0.70 is not independent evidence). We still
+        # compute the score but cap it at 0 when using estimated RV
+        # so it does not push the composite toward sell-vol.
+        _rv_is_estimated = (
+            self.dm.rv_20d is None or self.dm.rv_20d <= 0
+        )
 
         # rv is in decimal (e.g. 0.08 = 8%)
         # Convert to percentage
@@ -630,6 +644,14 @@ class RegimeEngine:
             tag = "FAIR"
 
         rv_src = "actual" if self.dm.rv_20d else "est(VIX×0.70)"
+        # AUDIT RE-N01: cap at 0 when RV is estimated (circular signal)
+        if _rv_is_estimated and raw != 0:
+            logger.info(
+                f"Edge: estimated RV in use — capping score 0 "
+                f"(was {raw})"
+            )
+            raw = 0
+            tag = "ESTIMATED_RV (neutral)"
         detail = (
             f"IV_atm {iv_atm:.2f}% - "
             f"RV{RV_WINDOW} {rv_pct:.2f}%({rv_src}) = "
@@ -852,7 +874,12 @@ class RegimeEngine:
         if raw is None:
             return self._conf[name]
 
-        raw_int = int(round(raw))
+        # AUDIT RE-01: int(round(0.5)) == 0 in Python (banker's
+        # rounding). A vol_score of +0.5 (normal contango + neutral
+        # skew) was silently becoming 0, making STRONG_SELL_VOL
+        # unreachable. Use standard half-up rounding instead.
+        import math as _math
+        raw_int = int(_math.floor(float(raw) + 0.5))
         buf     = self._buf[name]
         buf.append(raw_int)
         if len(buf) > 3:
@@ -1013,11 +1040,13 @@ class RegimeEngine:
                 )
             """)
             now_str = datetime.now(self._IST).isoformat()
+            _today_save = datetime.now(self._IST).date().isoformat()
             for key, value in [
                 ("skew_history",    self._skew_history),
                 ("flow_snapshots",  self._flow_snapshots[-20:]),
                 ("buffers",         self._buf),
                 ("confirmed",       self._conf),
+                ("last_save_date",  _today_save),
             ]:
                 cursor.execute("""
                     INSERT OR REPLACE INTO regime_algo_state
@@ -1061,6 +1090,24 @@ class RegimeEngine:
                         }
                 except Exception:
                     pass
+            # AUDIT RE-05: clear confirmed scores on a new trading day
+            # so stale yesterday values don't bias today's composite.
+            today_iso = datetime.now(self._IST).date().isoformat()
+            last_save_str = ""
+            try:
+                for _k, _v in rows:
+                    if _k == "last_save_date":
+                        last_save_str = json.loads(_v)
+                        break
+            except Exception:
+                pass
+            if last_save_str and last_save_str != today_iso:
+                logger.info(
+                    "RE-05: new trading day — clearing stale "
+                    "confirmed module scores"
+                )
+                self._conf = {m: 0 for m in MODULES}
+                self._buf  = {m: [] for m in MODULES}
             logger.info("Regime algo state loaded from SQLite")
         except sqlite3.OperationalError:
             logger.info("No regime_algo_state table — fresh start")
