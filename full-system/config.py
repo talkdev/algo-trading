@@ -60,7 +60,10 @@ TOTAL_CAPITAL = 1_000_000
 #   constant in production — cross-check there before going live.
 #   Verification date: 2026-08-31 (as supplied).
 LOT_SIZE          = 65
-NIFTY_STRIKE_STEP = 100    # weekly options 100-pt steps
+# Strike step corrected to 50: NSE NIFTY weekly options
+# trade at 50-point intervals. Using 100 discards half the
+# strike universe and degrades ATM selection by up to 25 pts.
+NIFTY_STRIKE_STEP = 50
 
 # AUDIT CFG-02: was 0.08 (8%). One max-risk loss = 2.7x daily CB.
 # CB L1 (2%) fired before the designed stop on almost every trade.
@@ -233,7 +236,11 @@ ADX_PERIOD          = 14
 ADX_TREND_THRESHOLD = 20   # AUDIT #2.2: now read by regime_engine.py via ADX_TREND
 ADX_RANGE_THRESHOLD = 15
 EMA_PERIOD          = 50
-EMA_SLOPE_THRESHOLD = 0.0005   # reference: EMA_SLOPE_PCT = 0.05% of spot
+# EMA_SLOPE_THRESHOLD corrected to 0.05 (percentage units).
+# regime_engine computes slope_pct = slope/spot*100 (a percentage
+# like 0.05 for 0.05%). The old value 0.0005 made the condition
+# abs(slope_pct) > EMA_SLOPE_PCT perpetually true.
+EMA_SLOPE_THRESHOLD = 0.05
 
 # LIVE FIX: "30minute" is valid Upstox interval
 # "15minute" and "1day" return HTTP 400
@@ -322,7 +329,10 @@ STRADDLE_POLL_SECONDS  = 5
 STRADDLE_SPOT_STOP_PCT = 0.03
 
 # ── Iron condor ───────────────────────────────────────────────────────
-CONDOR_WING_WIDTH         = 400    # was 500 (liquidity)
+# CONDOR_WING_WIDTH narrowed to 250. At 1.5σ a 400-wide condor
+# yields only 15-26pts credit vs the 88pt floor — never buildable.
+# At 250-wide the credit/width ratio is achievable at VIX 11-16.
+CONDOR_WING_WIDTH         = 250
 CONDOR_DTE_MIN            = 4
 CONDOR_DTE_MAX            = 10     # widened from 7
 CONDOR_EXIT_DTE           = 1
@@ -339,7 +349,10 @@ CONDOR_TESTED_SIDE_BUFFER = 100
 CONDOR_SIGMA_MULTIPLIER   = 1.5
 
 # ── Credit spreads ────────────────────────────────────────────────────
-SPREAD_DELTA_SHORT    = 0.30
+# SPREAD_DELTA_SHORT lowered to 0.20. At 0.30 delta (~30% ITM
+# probability per side), ~50% chance at least one side is tested
+# inside a week. 0.20 delta improves risk/reward materially.
+SPREAD_DELTA_SHORT    = 0.20
 SPREAD_DELTA_LONG     = 0.15
 SPREAD_EXIT_DTE       = 1
 SPREAD_TARGET_PCT     = 0.50
@@ -365,7 +378,10 @@ BUTTERFLY_DELTA_C          = 0.10
 BUTTERFLY_MAX_DEBIT_PTS    = 50     # was 20 (too tight)
 BUTTERFLY_MIN_RR_RATIO     = 2.0
 BUTTERFLY_EXIT_DTE         = 1
-BUTTERFLY_PROFIT_PCT       = 0.50
+# BUTTERFLY_PROFIT_PCT lowered to 0.20. At 0.50 the engine demands
+# 50% of max expiration payoff — nearly impossible before expiry day
+# due to the tent-shaped T+0 curve. 0.20 captures realistic spikes.
+BUTTERFLY_PROFIT_PCT       = 0.20
 BUTTERFLY_DTE_MAX          = 10     # widened
 BUTTERFLY_WING_BUFFER_PTS  = 100
 
@@ -394,7 +410,10 @@ LONG_STRADDLE_HOLD_DAYS        = 3
 LONG_STRADDLE_MAX_DEBIT_PCT    = 0.025
 LONG_STRADDLE_VIX_SMA_PERIOD   = 10
 LONG_STRADDLE_VIX_SPIKE_PCT    = 0.05
-LONG_STRADDLE_MAX_IV_RANK      = 95
+# LONG_STRADDLE_MAX_IV_RANK lowered to 40. At 95 the engine buys
+# straddles at near-peak IV — the opposite of the strategy's thesis
+# (buy cheap vol). 40 ensures entries only when vol is genuinely cheap.
+LONG_STRADDLE_MAX_IV_RANK      = 40
 
 # ── Defensive hedge ───────────────────────────────────────────────────
 DEFENSIVE_REDUCTION_PCT      = 0.60
@@ -480,6 +499,12 @@ TIME_EXIT_NORMAL   = time(15, 15)
 # Closing at market costs 20-40 pts unnecessarily.
 # At 15:10, options near-zero — closing cost minimal.
 TIME_EXIT_EXPIRY   = time(15, 10)
+# Safety assertion: expiry exit must be before normal EOD exit.
+# If TIME_EXIT_EXPIRY >= TIME_EXIT_NORMAL, expiry-day closing is
+# silently disabled and positions go to physical settlement.
+assert TIME_EXIT_EXPIRY < time(15, 15), (
+    "TIME_EXIT_EXPIRY must be before TIME_EXIT_NORMAL (15:15)"
+)
 
 MARKET_OPEN            = time(9, 15)
 MARKET_CLOSE           = time(15, 30)
@@ -661,7 +686,10 @@ REGIME_MAX_LOTS = {
 MAX_TRANCHES_PER_STRATEGY = 2
 
 REENTRY_COOLDOWN_SEC       = 300
-REENTRY_MAX_SPOT_MOVE_PCT  = 0.02
+# REENTRY_MAX_SPOT_MOVE_PCT lowered to 0.002 (0.2%). At 0.02 (2%,
+# ~500pt NIFTY move) the 300s timer always expires first, making
+# the price guard useless. 0.2% detects sharp intraday reversals.
+REENTRY_MAX_SPOT_MOVE_PCT  = 0.002
 BUILD_FAILURE_COOLDOWN_SEC = 300
 
 # ─────────────────────────────────────────────────────────────────────

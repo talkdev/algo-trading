@@ -203,9 +203,13 @@ def atm_strike_from_chain(
 def years_to_expiry(expiry_iso: str, now: datetime) -> float:
     try:
         IST = pytz.timezone("Asia/Kolkata")
-        exp_dt = datetime.strptime(
+        # RE-P2-04: use localize() not replace(tzinfo=IST).
+        # replace() attaches LMT offset (+05:53), not IST (+05:30)
+        # — a 23-minute error in T that distorts every BS delta.
+        exp_naive = datetime.strptime(
             expiry_iso, "%Y-%m-%d"
-        ).replace(hour=15, minute=30, tzinfo=IST)
+        ).replace(hour=15, minute=30)
+        exp_dt = IST.localize(exp_naive)
         return max(
             (exp_dt - now).total_seconds(), 1.0
         ) / (365.0 * 24 * 3600)
@@ -698,29 +702,31 @@ class RegimeEngine:
         #   bearish: spot < EMA AND slope < 0 AND -DI > +DI
         # Without this, a falling EMA with spot marginally above
         # it scores +1 (bullish) despite a bearish trend.
+        # RE-P1-01: restore bipolar trend score.
+        # RE-02 made trend always -1 or 0, making STRONG_SELL_VOL
+        # unreachable (max composite = 0.75 without trend's 0.25).
+        # Correct semantics for a premium-selling engine:
+        #   +1 = range-bound (low ADX, flat EMA) = favorable for selling
+        #    0 = neutral / mixed signals
+        #   -1 = strong confirmed trend = unfavorable (gamma risk)
+        # This preserves the RE-02 intent (trend reduces short-vol
+        # conviction) while allowing the composite to reach STRONG_SELL.
         if adx_v > ADX_TREND and abs(slope_pct) > EMA_SLOPE_PCT:
             _slope_up = slope > 0
             _di_bull  = pdi > ndi
             if above and _slope_up and _di_bull:
-                # RE-02: a confirmed bullish trend means the market
-                # is moving directionally — exactly when a short-gamma
-                # book gets run over. Score -1 (reduce short-vol
-                # conviction) rather than +1 (increase it).
-                # The directional information is preserved in `dirn`
-                # for logging and future strike-skew logic.
                 raw  = -1
                 dirn = "bullish trend (reduces short-vol score)"
             elif not above and not _slope_up and not _di_bull:
-                # Bearish trend also reduces short-vol conviction
-                # (gap-down risk for short puts).
                 raw  = -1
                 dirn = "bearish trend (reduces short-vol score)"
             else:
                 raw  = 0
                 dirn = "mixed signals (no 3-way agreement)"
         else:
-            raw  = 0
-            dirn = "range-bound"
+            # Range-bound: favorable for premium selling
+            raw  = 1
+            dirn = "range-bound (favorable for short-vol)"
 
         detail = (
             f"ADX {adx_v:.1f} "
@@ -1211,6 +1217,9 @@ class RegimeEngine:
                 ("buffers",         self._buf),
                 ("confirmed",       self._conf),
                 ("last_save_date",  _today_save),
+                ("confirmed_regime", self.confirmed_regime),
+                ("previous_regime",  self.previous_regime),
+                ("raw_composite",    self.raw_composite),
                 ("last_valid_at", {
                     m: getattr(
                         self,
@@ -1265,6 +1274,17 @@ class RegimeEngine:
                             m: float(data.get(m, 0))
                             for m in MODULES
                         }
+                    elif key == "confirmed_regime":
+                        if isinstance(data, str) and data:
+                            self.confirmed_regime = data
+                    elif key == "previous_regime":
+                        if isinstance(data, str) and data:
+                            self.previous_regime = data
+                    elif key == "raw_composite":
+                        try:
+                            self.raw_composite = float(data)
+                        except (TypeError, ValueError):
+                            pass
                     elif key == "last_valid_at":
                         for m in MODULES:
                             ts_str = data.get(m)
@@ -1302,6 +1322,25 @@ class RegimeEngine:
                 )
                 self._conf = {m: 0 for m in MODULES}
                 self._buf  = {m: [] for m in MODULES}
+            # RE7-P1-02: read last_save_date and clear stale
+            # module scores if saved on a different day.
+            _last_save = ""
+            for _k, _v in rows:
+                if _k == "last_save_date":
+                    try:
+                        _last_save = json.loads(_v)
+                    except Exception:
+                        pass
+                    break
+            _today_iso = datetime.now(self._IST).date().isoformat()
+            if _last_save and _last_save != _today_iso:
+                logger.info(
+                    f"RE7-P1-02: last save was {_last_save}, "
+                    f"today is {_today_iso} — clearing stale "
+                    f"module scores to prevent spurious transitions"
+                )
+                self._conf = {m: 0.0 for m in MODULES}
+                self._buf  = {m: []  for m in MODULES}
             logger.info("Regime algo state loaded from SQLite")
         except sqlite3.OperationalError:
             logger.info("No regime_algo_state table — fresh start")
