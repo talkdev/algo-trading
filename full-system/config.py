@@ -258,6 +258,21 @@ MILD_SELL_THRESHOLD   =  0.15   # reference: x >= 0.15
 MILD_BUY_THRESHOLD    = -0.15   # reference: x > -0.15 = NEUTRAL
 STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL
 
+# RE-T01: explicit hysteresis enter/exit thresholds.
+# Enter a regime when composite crosses the ENTER threshold;
+# exit only when it crosses the EXIT threshold in the opposite
+# direction. This prevents churn near boundaries without
+# creating hidden thresholds that contradict the base values.
+# Band = 0.05 composite units (tune here, not inline).
+STRONG_SELL_ENTER =  0.45   # enter STRONG_SELL above this
+STRONG_SELL_EXIT  =  0.40   # exit  STRONG_SELL below this
+MILD_SELL_ENTER   =  0.15   # enter MILD_SELL above this
+MILD_SELL_EXIT    =  0.10   # exit  MILD_SELL below this
+MILD_BUY_ENTER    = -0.15   # enter NEUTRAL above this (from BUY_VOL)
+MILD_BUY_EXIT     = -0.20   # exit  NEUTRAL below this
+STRONG_BUY_ENTER  = -0.45   # enter BUY_VOL above this (from STRONG_BUY)
+STRONG_BUY_EXIT   = -0.50   # exit  STRONG_BUY above this
+
 REGIME_STRONG_SELL = "STRONG_SELL_VOL"
 REGIME_MILD_SELL   = "MILD_SELL_VOL"
 REGIME_NEUTRAL     = "NEUTRAL"
