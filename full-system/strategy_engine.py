@@ -1864,6 +1864,27 @@ class StrategyEngine:
         ]:
             if self.dm.spot is None:
                 return False
+            # AUDIT #1.3: premium-based stop (2x credit)
+            # Catches IV-expansion moves that don't breach a
+            # strike by CONDOR_TESTED_SIDE_BUFFER but still
+            # exceed the designed loss threshold.
+            if position.stop_loss and position.stop_loss > 0:
+                current_premium = (
+                    self._get_position_current_premium(
+                        position
+                    )
+                )
+                if current_premium >= position.stop_loss:
+                    logger.info(
+                        f"Condor/Spread premium stop: "
+                        f"current={current_premium:.2f} "
+                        f"stop={position.stop_loss:.2f}"
+                    )
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS["STOP_LOSS"],
+                    )
+                    return True
             short_call = self._get_short_strike(
                 position, "call"
             )
@@ -2876,8 +2897,14 @@ class StrategyEngine:
             )
             return (None, {})
 
-        # FIX NS4: max_risk = 1x credit × LOT_SIZE
-        max_risk = total_premium * 1.0 * config.LOT_SIZE
+        # FIX NS4 (AUDIT #1.1): max_risk = stop level × LOT_SIZE
+        # Stop is 2x credit (STRADDLE_STOP_MULT=2.0), so size to that
+        # to prevent systematic over-leverage vs all capital guardrails.
+        max_risk = (
+            total_premium
+            * config.STRADDLE_STOP_MULT
+            * config.LOT_SIZE
+        )
 
         legs = [
             Leg(
