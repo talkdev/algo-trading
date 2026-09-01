@@ -82,18 +82,35 @@ def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def bs_delta(spot, strike, T, iv_pct, r, is_call) -> Optional[float]:
-    """Black-Scholes delta fallback."""
+def bs_delta(
+    spot, strike, T, iv_pct, r, is_call,
+    q: float = 0.012,
+) -> Optional[float]:
+    """Black-Scholes delta fallback with dividend yield.
+
+    RE-IV-02: NIFTY 50 has ~1.2% annual dividend yield.
+    Omitting q overestimates call deltas and underestimates put
+    deltas by ~0.5-1.0 delta points for 30-day ATM options,
+    creating a persistent upward skew bias in the vol module.
+    Uses cost-of-carry model: F = S * exp((r - q) * T).
+    q defaults to 0.012 (1.2% NIFTY historical dividend yield).
+    """
     if T <= 0 or iv_pct <= 0 or spot <= 0 or strike <= 0:
         if is_call:
             return 1.0 if spot > strike else 0.0
         return -1.0 if spot < strike else 0.0
     sq = math.sqrt(T)
+    sigma = iv_pct / 100.0
+    # Cost-of-carry: use forward price F = S * exp((r-q)*T)
+    # d1 = [ln(F/K) + 0.5*sigma^2*T] / (sigma*sqrt(T))
+    forward = spot * math.exp((r - q) * T)
     d1 = (
-        math.log(spot / strike)
-        + (r + 0.5 * (iv_pct / 100.0) ** 2) * T
-    ) / (iv_pct / 100.0 * sq)
-    return norm_cdf(d1) if is_call else norm_cdf(d1) - 1.0
+        math.log(forward / strike)
+        + 0.5 * sigma ** 2 * T
+    ) / (sigma * sq)
+    # Delta = exp(-q*T) * N(d1) for call, exp(-q*T) * (N(d1)-1) for put
+    disc = math.exp(-q * T)
+    return disc * norm_cdf(d1) if is_call else disc * (norm_cdf(d1) - 1.0)
 
 
 def _wilder(vals: List[float], n: int) -> List[float]:
@@ -531,10 +548,15 @@ class RegimeEngine:
                 ):
                     best_p = (d, strike, p_leg)
 
+        # RE-SK-01: tightened tolerance from 0.15 to 0.05.
+        # The old 0.15 tolerance accepted deltas 0.10-0.40 — a
+        # 5-10 vol point range that introduced interpolation
+        # artifacts into the skew Z-score. 0.05 restricts to
+        # 0.20-0.30 delta range for a meaningful skew signal.
         if (
             best_c and best_p
-            and abs(best_c[0] - 0.25) < 0.15
-            and abs(best_p[0] + 0.25) < 0.15
+            and abs(best_c[0] - 0.25) < 0.05
+            and abs(best_p[0] + 0.25) < 0.05
         ):
             # iv stored as decimal → convert to % for skew
             iv_c = best_c[2]["iv"] * 100.0
@@ -681,18 +703,43 @@ class RegimeEngine:
         if not spot:
             return None, "no spot"
 
+        # RE-EMA-01: filter to intraday bars only for EMA slope.
+        # The 21-bar lookback spans ~1.7 trading days. Overnight
+        # gaps (12h of global moves) contaminate the slope, causing
+        # trend flips at the open based on gap size not intraday trend.
+        # ADX uses all bars (it measures trend strength, not direction)
+        # but EMA slope uses only today's session bars.
+        try:
+            _today_str = datetime.now(self._IST).strftime("%Y-%m-%d")
+            _intraday = [
+                b for b in bars
+                if str(b.get("timestamp", "")).startswith(_today_str)
+            ]
+            # Fall back to all bars if today has fewer than 5
+            # (e.g. early morning before enough bars accumulate)
+            _slope_bars = _intraday if len(_intraday) >= 5 else bars
+        except Exception:
+            _slope_bars = bars
+
         closes = [b.get("close", b.get("c", 0)) for b in bars]
+        _slope_closes = [
+            b.get("close", b.get("c", 0)) for b in _slope_bars
+        ]
         ax = adx14([
             {"h": b["high"], "l": b["low"], "c": b["close"]}
             for b in bars
         ])
-        ema = ema_series(closes, 50)
+        # RE-EMA-01: use intraday closes for EMA slope to avoid
+        # overnight gap contamination. ADX uses all bars.
+        ema = ema_series(_slope_closes, min(50, len(_slope_closes)))
 
-        if ax is None or len(ema) < 21:
+        if ax is None or len(ema) < 2:
             return None, "indicator warmup"
 
         adx_v, pdi, ndi = ax
-        slope     = ema[-1] - ema[-21]
+        # Use available lookback (capped at 21) for intraday EMA
+        _lookback = min(21, len(ema))
+        slope     = ema[-1] - ema[-_lookback]
         slope_pct = slope / spot * 100.0 if spot else 0.0
         above     = spot > ema[-1]
 
@@ -762,6 +809,27 @@ class RegimeEngine:
 
         # Record this cycle's snapshot
         strikes_snap = {}
+        # RE-OI-01: skip strikes with DTE < 3 to avoid expiry
+        # rollover contamination. On weekly expiry day, OI drops
+        # mechanically as positions roll, creating false flow signals.
+        # DTE is computed from near_expiry which is already set above.
+        _flow_dte = 999
+        if near_expiry:
+            try:
+                from datetime import date as _date
+                _exp_d = datetime.strptime(
+                    near_expiry, "%Y-%m-%d"
+                ).date()
+                _flow_dte = (_exp_d - _date.today()).days
+            except Exception:
+                _flow_dte = 999
+        if _flow_dte < 3:
+            logger.info(
+                f"Flow: skipping OI snapshot (DTE={_flow_dte} < 3, "
+                f"expiry rollover contamination risk)"
+            )
+            return None, "flow skipped: DTE < 3 (expiry rollover)"
+
         for strike, data in active.items():
             c_leg = data.get("call", {})
             p_leg = data.get("put",  {})
