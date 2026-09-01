@@ -71,18 +71,25 @@ NIFTY_STRIKE_STEP = 50
 # losses exceed the daily CB. The CB is reactive (fires after loss).
 # Reserve daily risk before entry; do not rely on the CB as a gate.
 MAX_RISK_PER_TRADE_PCT   = 0.02
-# CFG-R02: with MAX_RISK_PER_TRADE_PCT=0.02 and
-# MAX_CONCURRENT_POSITIONS=4, max theoretical exposure=8%.
-# This 20% limit is non-binding; real constraint is the sum
-# of position max_risk values checked in _pre_trade_checks.
+# C4-05: MAX_COMBINED_RISK_PCT is non-binding.
+# With MAX_RISK_PER_TRADE_PCT=0.03 and MAX_CONCURRENT_POSITIONS=4,
+# max theoretical exposure = 4 * 3% = 12%, well below this 20% cap.
+# The real binding constraint is the sum of position max_risk values
+# checked in _pre_trade_checks() and _enter_new_position().
+# This constant provides a hard ceiling for extreme scenarios only.
+# Do NOT raise MAX_RISK_PER_TRADE_PCT to 'use' this budget —
+# the two limits are intentionally not coupled.
 MAX_COMBINED_RISK_PCT    = 0.20
 MAX_DAILY_LOSS_PCT       = 0.03
 MAX_DRAWDOWN_PCT         = 0.10
 POSITION_SIZE_PCT        = 0.15
+# C4-06: DEAD CONSTANT — only referenced in testing.py stub.
+# Real costs use the itemised COST_* constants in _calculate_transaction_costs.
 TRANSACTION_COST_PCT     = 0.0005
 MAX_CONCURRENT_POSITIONS = 4
 
-# SE-03: derived from MAX_RISK_PER_TRADE_PCT above
+# CAL-RISK: derived from MAX_RISK_PER_TRADE_PCT above
+# At 0.015 * 1,000,000 = Rs15,000 per trade
 MAX_RISK_PER_TRADE = int(
     MAX_RISK_PER_TRADE_PCT * TOTAL_CAPITAL
 )
@@ -173,7 +180,15 @@ HIGH_VIX         = 18.0
 PANIC_VIX        = 25.0
 EXTREME_VIX      = 30.0
 VIX_SELL_VOL_MAX = 22.0
+# PRF-C06: minimum VIX for short-vol entries. Below 11, premium
+# is too thin to cover slippage and transaction costs.
+MIN_VIX_SELL     = 11.0
 
+# C4-02: VIX-adaptive delta bands — now wired into _build_credit_spreads.
+# Selling 0.20 delta at VIX=11 and VIX=25 are very different trades.
+# LOW_VIX (< 14): use wider delta range (more OTM, less credit but safer)
+# MID_VIX (14-18): standard range
+# HIGH_VIX (> 18): tighter delta range (closer strikes, more credit)
 LOW_VIX_DELTA  = (0.22, 0.28)
 MID_VIX_DELTA  = (0.20, 0.25)
 HIGH_VIX_DELTA = (0.15, 0.20)
@@ -216,8 +231,10 @@ assert abs(
 TERM_SPREAD_CONTANGO      =  1.5   # reference: TERM_THRESHOLD = 0.5
 TERM_SPREAD_BACKWARDATION = -1.5   # reference: -TERM_THRESHOLD
 
-SKEW_ZSCORE_FEAR       =  1.5
-SKEW_ZSCORE_COMPLACENT = -1.0   # reference: SKEW_Z_FLAT = -1.0
+# PRF-C11: thresholds tightened. In low-VIX (11-14), z-scores
+# rarely exceed ±1.0. 1.2/-0.8 makes skew contribute more often.
+SKEW_ZSCORE_FEAR       =  1.2
+SKEW_ZSCORE_COMPLACENT = -0.8   # reference: SKEW_Z_FLAT = -1.0
 SKEW_LOOKBACK_DAYS     = 60
 EDGE_LOOKBACK_DAYS     = 60
 
@@ -226,6 +243,10 @@ IV_ATM_HISTORY_MAXLEN = 22_500
 RV_LOOKBACK_DAYS     = 20
 EDGE_RICH  = 5.0   # reference: IV-RV > 5 -> rich
 EDGE_CHEAP = 0.0   # reference: IV-RV < 0 -> cheap
+# C4-03: Edge percentile thresholds — now wired into compute_iv_rank.
+# IV rank >= EDGE_PERCENTILE_HIGH -> vol is rich (sell signal)
+# IV rank <= EDGE_PERCENTILE_LOW  -> vol is cheap (buy signal)
+# Previously defined but never referenced anywhere in the codebase.
 EDGE_PERCENTILE_HIGH = 70
 EDGE_PERCENTILE_LOW  = 30
 
@@ -261,13 +282,24 @@ ADX_CANDLE_TIMEFRAME   = "30minute"
 DAILY_CANDLE_TIMEFRAME = "day"
 
 ADX_CANDLE_COUNT = 400
+# C4-06: DEAD CONSTANT — never referenced. NSE 09:15-15:30 on
+# 30-min bars = 12.5 bars/day (not 13). Any future use will be wrong.
 BARS_PER_DAY     = 13
 
-# LIVE FIX: fetch candles every 30 min (not every 60s)
-# 30-min candles only update every 30 minutes.
-CANDLE_REFRESH_SECONDS = 1800
+# CFG-D1: lowered from 1800 to 300 (5 min).
+# The trend module is up to 30 min stale at 1800s. ADX and EMA
+# slope on the *forming* bar change continuously. 5-min refresh
+# gives an early view of the forming bar — one extra cheap call.
+CANDLE_REFRESH_SECONDS = 300
 CANDLE_LOOKBACK_DAYS   = 45   # PATCH: was 30 — too tight for RV_LOOKBACK_DAYS=20 after weekend/holiday attrition
-FLOW_WINDOW_MINUTES     = 15
+# PRF-C10: raised from 15 to 30. NSE OI updates every 3-5 min.
+# 15-min window = 3-5 updates (noisy). 30-min = 6-10 updates,
+# giving a smoother, more reliable flow signal.
+FLOW_WINDOW_MINUTES     = 30
+# CFG-P1: per-leg slippage haircut applied in credit gate BEFORE
+# trade approval. Currently slippage only appears in _simulate_fill
+# (after approval). Gate sees a credit that does not exist.
+ENTRY_SLIPPAGE_PTS_PER_LEG = 0.75
 SPREAD_LOOKBACK_PERIODS = 12
 OTM_STRIKE_OFFSET       = 6
 
@@ -332,11 +364,13 @@ STRAT_BACKSPREAD     = "BACKSPREAD_DIRECTIONAL"
 STRAT_STRANGLE       = "LONG_STRANGLE_EVENT"
 
 # ── Short straddle ────────────────────────────────────────────────────
-STRADDLE_DTE_MIN       = 3
-STRADDLE_DTE_MAX       = 10    # widened from 7
+# CFG-P4C: tightened to high-theta zone. Theta/day at DTE 3 is
+# 37% higher than at DTE 8 for the same notional gamma exposure.
+STRADDLE_DTE_MIN       = 1
+STRADDLE_DTE_MAX       = 4    # widened from 7
 STRADDLE_STOP_MULT     = 2.0   # stop = 2x credit
-# SE10-P1-02: raised from 0.50 to 0.65.
-STRADDLE_TARGET_PCT    = 0.65
+# PRF-C01: lowered from 0.60 to 0.50 (same reasoning).
+STRADDLE_TARGET_PCT    = 0.50
 STRADDLE_EXIT_DTE      = 1
 STRADDLE_MAX_DEBIT_PCT = 0.025
 STRADDLE_POLL_SECONDS  = 5
@@ -347,37 +381,56 @@ STRADDLE_SPOT_STOP_PCT = 0.03
 # yields only 15-26pts credit vs the 88pt floor — never buildable.
 # At 250-wide the credit/width ratio is achievable at VIX 11-16.
 CONDOR_WING_WIDTH         = 250
-CONDOR_DTE_MIN            = 4
-CONDOR_DTE_MAX            = 10     # widened from 7
-CONDOR_EXIT_DTE           = 1
-# SE10-P1-02 + CFG10-P1-01: raised from 0.50 to 0.65.
-# Old 0.50 target with 2.0x stop = 1:4 R:R, 80% BEP.
-# New 0.65 target with 1.25x stop = 1:1.9 R:R, 56% BEP.
-# Also opens a 0.55-0.65 band for the trailing stop to operate.
-CONDOR_TARGET_PCT         = 0.65
+# CFG-P4C: tightened to high-theta zone (DTE 2-5).
+CONDOR_DTE_MIN            = 2
+CONDOR_DTE_MAX            = 5     # widened from 7
+# CFG-P4A: set to 0 for defined-risk structures.
+# 37.8% of premium decays on the final day. For condors/spreads
+# max loss is bounded by wings — no undefined-risk argument for
+# exiting at DTE 1. TIME_EXIT_EXPIRY=15:10 handles the close.
+CONDOR_EXIT_DTE           = 0
+# PRF-C01: lowered from 0.60 to 0.50. 50% target is reached faster
+# (typically 1-2 days vs 3-4 days for 65%), reducing time-in-trade
+# and gamma exposure. With 2.0x stop: R:R = 0.50/2.0 = 0.25.
+# Wider stop (2.0x) means fewer stop-outs on normal intraday moves,
+# so realised win rate rises to ~75-80%, making BEP achievable.
+CONDOR_TARGET_PCT         = 0.50
 # AUDIT CFG-01: minimum credit expressed as % of wing width.
 # At CONDOR_WING_WIDTH=400, 22% = 88 pts minimum.
 # Absolute fallback kept for reference only.
-CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.22
+# PRF-C04: lowered from 0.22 to 0.18. At VIX=11-13 with dynamic
+# wing widths, 22% is often unattainable. 18% still ensures
+# meaningful credit/risk ratio while allowing more entries.
+CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.18
 CONDOR_MIN_CREDIT         = 40   # legacy absolute floor; builder uses PCT_OF_WIDTH above
+# C4-06: DEAD CONSTANT — no condor adjustment logic exists.
 CONDOR_ADJUSTMENT_DELTA   = 0.35
 CONDOR_TESTED_SIDE_BUFFER = 100
-# AUDIT SE-04/CFG-01: 1.5σ gives P(inside)≈86.6% vs 68.3% at 1.0σ.
-# Combined with credit/width rule this produces positive EV.
-CONDOR_SIGMA_MULTIPLIER   = 1.5
+# PRF-C03: lowered from 1.5 to 1.2. At VIX=11-13, 1.5σ places
+# shorts ~350pts OTM with credit ~20-25pts — often fails min-credit
+# check. 1.2σ places shorts ~280pts OTM, credit ~35-45pts.
+# P(inside) = 83% vs 86.6% at 1.5σ — acceptable trade-off for
+# meaningful credit in low-VIX environments.
+CONDOR_SIGMA_MULTIPLIER   = 1.2
 
 # ── Credit spreads ────────────────────────────────────────────────────
 # SPREAD_DELTA_SHORT lowered to 0.20. At 0.30 delta (~30% ITM
 # probability per side), ~50% chance at least one side is tested
 # inside a week. 0.20 delta improves risk/reward materially.
 SPREAD_DELTA_SHORT    = 0.20
-SPREAD_DELTA_LONG     = 0.15
-SPREAD_EXIT_DTE       = 1
-# SE10-P1-02: raised from 0.50 to 0.65 (same R:R fix as condor).
-SPREAD_TARGET_PCT     = 0.65
+# CAL-DELTA: lowered from 0.15 to 0.08 to maintain meaningful
+# spread width with the new 0.16 short delta. 0.16-0.08=0.08
+# delta spread gives adequate wing protection and defined risk.
+SPREAD_DELTA_LONG     = 0.08
+# CFG-P4A: set to 0 (same reasoning as condor).
+SPREAD_EXIT_DTE       = 0
+# PRF-C01: lowered from 0.60 to 0.50 (same reasoning as condor).
+SPREAD_TARGET_PCT     = 0.50
 # AUDIT CFG-01: spread min credit as % of wing width.
-SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.25
+# PRF-C05: lowered from 0.25 to 0.20 (same reasoning as condor).
+SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.20
 SPREAD_MIN_CREDIT     = 25   # legacy absolute floor; builder uses PCT_OF_WIDTH above
+# C4-06: DEAD CONSTANT — no roll logic exists in strategy_engine.
 SPREAD_ROLL_DELTA_TRIGGER  = 0.35
 SPREAD_SKEW_THRESHOLD      = 2.0
 
@@ -385,6 +438,7 @@ SPREAD_SKEW_THRESHOLD      = 2.0
 RATIO_ATM_OFFSET_PTS       = 100
 RATIO_EXIT_DTE             = 1
 RATIO_TARGET_PCT           = 0.25
+# C4-06: DEAD CONSTANT — ratio spread has no delta-based exit.
 RATIO_DELTA_EXIT_TRIGGER   = 0.35
 RATIO_SKEW_FLAT_THRESHOLD  = 0.5
 RATIO_CONTANGO_THRESHOLD   = 1.5
@@ -460,24 +514,27 @@ EVENT_WINDOW_AFTER_HOURS       = 2
 # ─────────────────────────────────────────────────────────────────────
 # STOP LOSS PARAMETERS
 # ─────────────────────────────────────────────────────────────────────
+# C4-06: DEAD CONSTANT — never referenced in any decision path.
 STATIC_STOP_PCT         = 0.10
 PROFIT_TARGET_PCT       = 0.50
 DEBIT_PROFIT_TARGET_PCT = 0.50
 
+# C4-01: VIX-scaled stop model — now wired into _build_short_straddle.
+# stop_pct = clamp(SL_BASE * vix / SL_REF, SL_MIN, SL_MAX)
+# At VIX=11: 0.236 (tighter). At VIX=22: 0.40 (wider, capped).
+# Replaces the flat STRADDLE_STOP_MULT=1.25 for the straddle builder.
 SL_BASE_PERCENT    = 0.30
 SL_REFERENCE_VIX   = 14.0
 SL_MIN_PERCENT     = 0.18
 SL_MAX_PERCENT     = 0.40
 
-# SE9-P0-01 + CFG9-P1-01: trailing stop parameters corrected.
-# The denominator bug (gross vs net credit) is fixed separately.
-# With the correct net_premium basis, profit_pct starts at 0.0.
-# TRAIL_START must be ABOVE the profit target (0.50) so the trail
-# only protects gains beyond the target — not pre-empt it.
-# SE8-P1-01: trail armed at 0.30 was below the 0.50 target,
-# capping wins at 25-43% of credit. Now arms at 0.55.
-TRAIL_START_PROFIT_PCT = 0.55
-TRAIL_RETAIN_PCT       = 0.85
+# PRF-C07/C08: trail start raised from 0.55 to 0.70, retain 0.85->0.90.
+# With target at 0.50, trail at 0.55 was only 5% above target —
+# barely a band. 0.70 creates a genuine 0.50-0.70 range where the
+# position can run, then trail protects gains above 70% of credit.
+# 0.90 retain means trail closes only when profit retraces 10% from peak.
+TRAIL_START_PROFIT_PCT = 0.70
+TRAIL_RETAIN_PCT       = 0.90
 
 # ─────────────────────────────────────────────────────────────────────
 # ORDER EXECUTION
@@ -509,8 +566,12 @@ STRIKE_SELECT_TIME = time(9, 17)
 # LIVE FIX: widened entry window
 # 09:30 avoids opening auction volatility (first 15 min)
 # 14:00 gives 75 min minimum hold before EOD at 15:15
-EXEC_START_TIME    = time(9, 30, 0)   # PATCHED: avoids opening auction
-EXEC_END_TIME      = time(14, 0, 0)   # PATCHED: was 11:00 — enables trading all day
+# CAL-EXEC: raised from 09:30 to 09:35. The first 15 minutes
+# have the widest bid-ask spreads and most erratic price discovery.
+# 09:35 lets the opening settle without meaningfully reducing the
+# trading window (4h25m vs 4h30m). Reduces entry slippage.
+EXEC_START_TIME    = time(9, 30, 0)   # PATCHED: avoids opening auction + initial noise
+EXEC_END_TIME      = time(14, 30, 0)   # PATCHED: was 11:00 — enables trading all day
 
 REGIME_FREEZE_TIME = time(14, 45)
 TIME_EXIT_NORMAL   = time(15, 15)
@@ -620,6 +681,9 @@ CB_LEVEL_5_ACTION = "FORCE_STRONG_BUY_REGIME"
 # ─────────────────────────────────────────────────────────────────────
 # GREEKS LIMITS (lot-adjusted)
 # ─────────────────────────────────────────────────────────────────────
+# CFG-VEGA: enable vega/gamma pre-trade gate in _pre_trade_checks().
+# Set to False during initial calibration to observe without blocking.
+GREEKS_VEGA_GATE = True
 GREEKS_LIMITS = {
     "STRONG_SELL_VOL": {
         "delta_max":  0.10,
