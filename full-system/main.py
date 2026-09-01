@@ -1446,22 +1446,7 @@ async def main() -> None:
                 cached_greeks         = None
                 data_refresh_complete = True
                 logger.info(f"New trading day: {today}")
-                # AUDIT #1.2: weekly reset — wire up the
-                # previously-defined-but-never-called
-                # reset_weekly_state() so CB_LEVEL_3 resets
-                # each week instead of latching forever.
-                # NSE weekly cycle: Tuesday expiry, so reset
-                # on Wednesday (weekday==2) each week.
-                if today.weekday() == 2:
-                    _last_reset = getattr(
-                        se, '_last_weekly_reset', None
-                    )
-                    if _last_reset != today:
-                        se.reset_weekly_state()
-                        logger.info(
-                            f"Weekly state reset "
-                            f"(Wednesday: {today})"
-                        )
+
 
             # Market hours check — EOD
             # PATCH: guarded with eod_done_today to stop the
