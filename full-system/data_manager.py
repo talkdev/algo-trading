@@ -1357,7 +1357,21 @@ class DataManager:
         ltp_age  = _age("_ltp_ts")
 
         # DM-T03: reject crossed markets (bid > ask).
-        _bid_ask_valid = bid > 0 and ask > 0 and ask >= bid
+        # DM9-P0-01: reject quotes where spread is fabricated.
+        # Deep-OTM wings quote 0.05/8.00 — mid=4.03 which is
+        # a price at which nothing trades. This noise is larger
+        # than the trailing stop's entire trigger distance.
+        # Reject if spread > 5pts OR spread/mid > 50%.
+        _spread = ask - bid if (bid > 0 and ask > 0) else float("inf")
+        _mid_for_check = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 1.0
+        _spread_pct = _spread / _mid_for_check if _mid_for_check > 0 else 1.0
+        _bid_ask_valid = (
+            bid > 0
+            and ask > 0
+            and ask >= bid
+            and _spread <= 5.0
+            and _spread_pct <= 0.50
+        )
 
         # 1. Fresh REST midpoint
         if rest_age <= max_quote_age_sec and _bid_ask_valid:
@@ -2648,10 +2662,22 @@ class DataManager:
             range(len(strikes_sorted)),
             key=lambda i: abs(strikes_sorted[i] - atm),
         )
-        low_idx  = max(0, atm_index - 10)
-        high_idx = min(
-            len(strikes_sorted) - 1, atm_index + 10
-        )
+        # CFG8-P1-01 FIX: use points-based window not index-count.
+        # With NIFTY_STRIKE_STEP=50, ±10 strikes = ±500pts.
+        # Condor wings sit ~600-750pts OTM — outside that window.
+        # Use ±1000pts to cover all open-position legs regardless
+        # of strike step. Find indices within ±1000pts of ATM.
+        _span_pts = 1000
+        low_idx  = 0
+        high_idx = len(strikes_sorted) - 1
+        for _i, _s in enumerate(strikes_sorted):
+            if _s >= atm - _span_pts:
+                low_idx = _i
+                break
+        for _i in range(len(strikes_sorted) - 1, -1, -1):
+            if strikes_sorted[_i] <= atm + _span_pts:
+                high_idx = _i
+                break
 
         for strike in strikes_sorted[low_idx: high_idx + 1]:
             ck = active[strike]["call"].get(
@@ -2941,10 +2967,9 @@ class DataManager:
                 opt = self.option_chain[expiry][strike][
                     option_type
                 ]
-                # DM-11: apply _clean_delta() to WS delta.
-                # The REST path bounds delta to (0.01, 0.99);
-                # the WS path previously wrote raw values.
-                # A garbage tick poisons get_strike_by_delta().
+                # DM-11 + SE8-P0-03: apply _clean_delta() to WS delta.
+                # _clean_delta now always returns a float (never None)
+                # so this is safe. Deep OTM legs get ±0.005 not None.
                 _is_call = (option_type == "call")
                 opt["delta"] = _clean_delta(delta, _is_call)
                 opt["gamma"] = gamma

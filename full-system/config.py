@@ -450,12 +450,14 @@ SL_REFERENCE_VIX   = 14.0
 SL_MIN_PERCENT     = 0.18
 SL_MAX_PERCENT     = 0.40
 
-# SE-06: was 0.15/0.65 — converted every winner into a ~10% scalp
-# while keeping the full 2x credit stop on losers. At 0.15 arm and
-# 0.65 retain, the stop fires at 9.75% of credit — within normal
-# intraday theta oscillation. Raised to 0.30/0.85 so the trail
-# only activates on genuine profit and retains most of it.
-TRAIL_START_PROFIT_PCT = 0.30
+# SE9-P0-01 + CFG9-P1-01: trailing stop parameters corrected.
+# The denominator bug (gross vs net credit) is fixed separately.
+# With the correct net_premium basis, profit_pct starts at 0.0.
+# TRAIL_START must be ABOVE the profit target (0.50) so the trail
+# only protects gains beyond the target — not pre-empt it.
+# SE8-P1-01: trail armed at 0.30 was below the 0.50 target,
+# capping wins at 25-43% of credit. Now arms at 0.55.
+TRAIL_START_PROFIT_PCT = 0.55
 TRAIL_RETAIN_PCT       = 0.85
 
 # ─────────────────────────────────────────────────────────────────────
@@ -500,10 +502,10 @@ TIME_EXIT_NORMAL   = time(15, 15)
 # At 15:10, options near-zero — closing cost minimal.
 TIME_EXIT_EXPIRY   = time(15, 10)
 # Safety assertion: expiry exit must be before normal EOD exit.
-# If TIME_EXIT_EXPIRY >= TIME_EXIT_NORMAL, expiry-day closing is
-# silently disabled and positions go to physical settlement.
-assert TIME_EXIT_EXPIRY < time(15, 15), (
-    "TIME_EXIT_EXPIRY must be before TIME_EXIT_NORMAL (15:15)"
+# CFG8-P3-01: compare against TIME_EXIT_NORMAL not a hardcoded
+# time(15,15) so the invariant holds if TIME_EXIT_NORMAL changes.
+assert TIME_EXIT_EXPIRY < TIME_EXIT_NORMAL, (
+    "TIME_EXIT_EXPIRY must be before TIME_EXIT_NORMAL"
 )
 
 MARKET_OPEN            = time(9, 15)
