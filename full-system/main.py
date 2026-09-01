@@ -676,7 +676,12 @@ async def _expiry_day_close_all(
         except (ValueError, TypeError):
             continue
 
-        if expiry == date.today():
+        # MN-03: use IST date, not server-local date.
+        # On UTC hosts, date.today() rolls at 05:30 IST.
+        _ist_today = datetime.now(
+            pytz.timezone(config.TZ)
+        ).date()
+        if expiry == _ist_today:
             await se._close_position(
                 position,
                 config.EXIT_REASONS["EXPIRY"],
@@ -1776,34 +1781,29 @@ async def main() -> None:
                         dm.spot is not None and dm.spot > 0
                     )
                     _chain_exists = _chain_len_now > 0
-                    # MN-T05: require that spot was actually
-                    # updated this cycle OR that this is the
-                    # first cycle after startup (no prev value).
-                    # Pre-existing restored state satisfies
-                    # _spot_exists but not _spot_changed.
+                    # MN-01: accept a refresh as valid when the
+                    # chain was re-fetched, even if spot is unchanged.
+                    # The old code required spot_changed, blocking
+                    # entries in a quiet tape (exactly the low-vol
+                    # conditions best for premium selling).
+                    # _chain_updated is now wired into the decision.
                     _is_first_cycle = _cycle_start_spot is None
                     _refresh_valid = (
                         _spot_exists
                         and _chain_exists
-                        and (_spot_changed or _is_first_cycle)
+                        and (
+                            _spot_changed
+                            or _chain_updated
+                            or _is_first_cycle
+                        )
                     )
                     if _refresh_valid:
                         last_data_refresh     = now
                         data_refresh_complete = True
                         logger.info(
-                            "Data refresh cycle complete"
-                        )
-                    elif _spot_exists and _chain_exists:
-                        # Data exists but spot didn't change —
-                        # could be a genuine flat market or a
-                        # stale API response. Update timestamp
-                        # to avoid spin-retry but mark incomplete
-                        # so regime uses previous confirmed data.
-                        last_data_refresh     = now
-                        data_refresh_complete = False
-                        logger.debug(
-                            "Data refresh: spot unchanged "
-                            "— marking incomplete"
+                            "Data refresh cycle complete "
+                            f"(spot_changed={_spot_changed} "
+                            f"chain_updated={_chain_updated})"
                         )
                     else:
                         last_data_refresh     = now
@@ -1812,6 +1812,8 @@ async def main() -> None:
                             "Data refresh incomplete: "
                             f"spot_exists={_spot_exists} "
                             f"chain_exists={_chain_exists} "
+                            f"spot_changed={_spot_changed} "
+                            f"chain_updated={_chain_updated} "
                             "— regime refresh skipped"
                         )
 
@@ -1893,6 +1895,21 @@ async def main() -> None:
                         logger.warning(
                             f"save_buffers error: {e}"
                         )
+                    # DM-07: push open-position instrument keys
+                    # to dm so the WS subscription covers them.
+                    try:
+                        _pos_keys = set()
+                        for _p in se.open_positions:
+                            for _l in _p.legs:
+                                if _l.instrument_key:
+                                    _pos_keys.add(
+                                        _l.instrument_key
+                                    )
+                        dm._open_position_keys = list(
+                            _pos_keys
+                        )
+                    except Exception:
+                        pass
 
                     if len(se.closed_positions) > 500:
                         se.closed_positions = (

@@ -390,6 +390,7 @@ class StrategyEngine:
                     current_capital REAL,
                     peak_capital REAL,
                     weekly_pnl REAL,
+                    daily_pnl REAL DEFAULT 0,
                     cb_level_2_active INTEGER,
                     cb_level_3_active INTEGER,
                     cb_level_4_active INTEGER,
@@ -409,18 +410,22 @@ class StrategyEngine:
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            # SE-13: include daily_pnl so a mid-day restart
+            # does not reset the CB L2 daily-loss counter.
             cursor.execute("""
                 INSERT OR REPLACE INTO engine_capital_state (
                     id, current_capital, peak_capital, weekly_pnl,
+                    daily_pnl,
                     cb_level_2_active, cb_level_3_active,
                     cb_level_4_active, kill_switch_active,
                     daily_trading_halted, last_trading_date,
                     last_weekly_reset, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 self.current_capital,
                 self.peak_capital,
                 self.weekly_pnl,
+                self.daily_pnl,
                 1 if self.cb_level_2_active else 0,
                 1 if self.cb_level_3_active else 0,
                 1 if self.cb_level_4_active else 0,
@@ -467,6 +472,10 @@ class StrategyEngine:
                 )
                 self.weekly_pnl = float(
                     data.get("weekly_pnl") or 0.0
+                )
+                # SE-13: restore daily_pnl
+                self.daily_pnl = float(
+                    data.get("daily_pnl") or 0.0
                 )
                 self.cb_level_2_active = bool(
                     data.get("cb_level_2_active")
@@ -1682,8 +1691,15 @@ class StrategyEngine:
                 self.cb_level_3_active = True
                 self._save_capital_state()  # PATCH: persist immediately
 
-        # LEVEL 4 — Max drawdown
-        drawdown = self.peak_capital - self.current_capital
+        # LEVEL 4 — Max drawdown (includes unrealized MTM)
+        # SE-15: current_capital only updates on close.
+        # A book -12% on open MTM shows drawdown=0 without this.
+        _unrealized_mtm = sum(
+            p.realized_pnl for p in self.open_positions
+        )
+        drawdown = self.peak_capital - (
+            self.current_capital + _unrealized_mtm
+        )
         if drawdown > (
             config.CB_LEVEL_4_PCT * config.TOTAL_CAPITAL
         ):
@@ -1955,11 +1971,12 @@ class StrategyEngine:
                     position, "call",
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
-                # AUDIT SE-05: mark position so _monitor_all_positions
-                # skips trailing/profit checks this cycle on the
-                # now-mutated one-sided structure.
+                # SE-18: return True (not False) so _monitor_all_positions
+                # stops processing this position for the current cycle.
+                # Returning False let trailing/profit checks run on the
+                # now half-closed structure in the same iteration.
                 position.meta["_one_side_closed_cycle"] = True
-                return False
+                return True
             if short_put and self.dm.spot <= (
                 short_put
                 - config.CONDOR_TESTED_SIDE_BUFFER
@@ -1969,7 +1986,7 @@ class StrategyEngine:
                     config.EXIT_REASONS["STOP_LOSS"],
                 )
                 position.meta["_one_side_closed_cycle"] = True
-                return False
+                return True
 
         elif strategy == config.STRAT_RATIO_SPREAD:
             # PATCH: previously RATIO_SPREAD had NO stop-loss
@@ -2309,6 +2326,13 @@ class StrategyEngine:
         ):
             logger.info("RULE B: Close 50% of shorts")
             for position in list(self.open_positions):
+                # SE-19: skip long-vol positions (butterfly, straddle,
+                # strangle, backspread, defensive) — these are hedges
+                # that should be kept as you rotate out of short vol.
+                if position.meta.get(
+                    "strategy_type", "SHORT"
+                ) == "LONG":
+                    continue
                 await self._reduce_position_50pct(
                     position
                 )
@@ -3168,21 +3192,23 @@ class StrategyEngine:
             sc_prem + sp_prem - lc_prem - lp_prem
         )
 
-        # AUDIT SE-04/CFG-01: check credit as % of wing width.
-        # Absolute floor kept as secondary check.
-        _min_credit_pct = getattr(
-            config, "CONDOR_MIN_CREDIT_PCT_OF_WIDTH", 0.22
-        )
+        # SE-02: the old check (0.22 * 400 = 88pts) was never
+        # achievable at 1.5σ strikes (typical credit 15-26pts).
+        # Replace with a viable ratio: credit/width >= 0.15.
+        # At 400-wide: min = 60pts. At 1.5σ this is still hard;
+        # the condor builder should be called with a tighter wing
+        # (200-250pts) for this to work in practice — but at least
+        # the gate no longer permanently blocks every build.
+        _min_credit_ratio = 0.15
         _min_credit_required = max(
             config.CONDOR_MIN_CREDIT,
-            _min_credit_pct * config.CONDOR_WING_WIDTH,
+            _min_credit_ratio * config.CONDOR_WING_WIDTH,
         )
         if net_credit < _min_credit_required:
             logger.warning(
                 f"Condor: credit={net_credit:.2f} "
                 f"< min={_min_credit_required:.1f} "
-                f"({_min_credit_pct*100:.0f}% of "
-                f"{config.CONDOR_WING_WIDTH}pt wing)"
+                f"(15% of {config.CONDOR_WING_WIDTH}pt wing)"
             )
             return (None, {})
 
@@ -3347,6 +3373,16 @@ class StrategyEngine:
             (sp_prem - lp_prem) + (sc_prem - lc_prem)
         )
 
+        # SE-01: put_width and call_width MUST be computed before
+        # _spread_min_required which references them. The original
+        # order caused an UnboundLocalError on every call, making
+        # MILD_SELL_VOL permanently unable to enter.
+        put_width  = short_put_strike  - long_put_strike
+        call_width = long_call_strike  - short_call_strike
+        max_risk   = (
+            max(put_width, call_width) - total_credit
+        ) * config.LOT_SIZE
+
         # AUDIT CFG-01: check credit as % of max spread width.
         _spread_min_pct = getattr(
             config, "SPREAD_MIN_CREDIT_PCT_OF_WIDTH", 0.25
@@ -3362,12 +3398,6 @@ class StrategyEngine:
                 f"({_spread_min_pct*100:.0f}% of width)"
             )
             return (None, {})
-
-        put_width  = short_put_strike  - long_put_strike
-        call_width = long_call_strike  - short_call_strike
-        max_risk   = (
-            max(put_width, call_width) - total_credit
-        ) * config.LOT_SIZE
 
         legs = [
             Leg(
@@ -4723,6 +4753,12 @@ class StrategyEngine:
                     leg.fill_status = "EXPIRED_WORTHLESS"
                     continue
 
+            # SE-11: skip legs already closed by a previous
+            # attempt (qty=0) or a partial one-side close.
+            if leg.qty <= 0:
+                continue
+            if leg.exit_price > 0 and leg.fill_status == "CLOSED_EXIT":
+                continue
             close_action = (
                 "BUY" if leg.action == "SELL" else "SELL"
             )
@@ -4918,13 +4954,22 @@ class StrategyEngine:
     def _calculate_lot_size(
         self, strategy_name: str, meta: Dict
     ) -> int:
-        # AUDIT #N1: defensive hedge pre-computes its own
-        # absolute quantity; return 1 so the generic pipeline
-        # never silently drops the hedge when capital is tight
-        # (which is exactly when it is needed most).
+        # AUDIT #N1: defensive hedge pre-computes its own quantity.
         if strategy_name == config.STRAT_DEFENSIVE:
             return 1
-        max_loss_per_lot = meta.get("max_risk", 0)
+        # SE-03: size off the DESIGNED STOP LOSS, not the theoretical
+        # max loss. For a condor, max_risk = (wing-credit)*LOT_SIZE
+        # (~Rs24k) which exceeds MAX_RISK_PER_TRADE (Rs40k after fix),
+        # returning 1 lot. For a straddle, stop = 2*credit*LOT_SIZE
+        # (~Rs38k at VIX 11), also returning 1 lot.
+        # Use stop_loss * LOT_SIZE as the sizing denominator for
+        # credit strategies; fall back to max_risk for debit ones.
+        _strategy_type = meta.get("strategy_type", "SHORT")
+        _stop_pts = meta.get("stop_loss", 0)
+        if _strategy_type == "SHORT" and _stop_pts and _stop_pts > 0:
+            max_loss_per_lot = _stop_pts * config.LOT_SIZE
+        else:
+            max_loss_per_lot = meta.get("max_risk", 0)
         if max_loss_per_lot <= 0:
             return 0
 
@@ -5023,9 +5068,12 @@ class StrategyEngine:
     def _get_position_value(
         self, position: Position
     ) -> float:
-        # SE-T01: use staleness-aware get_mark_price() so
-        # profit-target and stop-loss decisions use the same
-        # freshness logic as the fast P&L monitor.
+        # SE-T01: staleness-aware mark price.
+        # SE-05: apply BUY/SELL sign. Without this, a butterfly
+        # (BUY wing_a, BUY wing_c, SELL body x2) returns
+        # P_a + P_c + 2*P_b instead of P_a + P_c - 2*P_b.
+        # The unsigned sum immediately exceeds max_profit*0.5,
+        # so every butterfly opens and instantly closes.
         total        = 0.0
         expiry_chain = self.dm.get_chain_for_expiry(
             position.expiry_date
@@ -5039,7 +5087,8 @@ class StrategyEngine:
             mark = self.dm.get_mark_price(
                 opt_data, fallback=leg.entry_price
             )
-            total += mark * leg.qty
+            sign = 1 if leg.action == "BUY" else -1
+            total += sign * mark * leg.qty
         return total
 
     def _get_position_current_premium(
@@ -5145,7 +5194,10 @@ class StrategyEngine:
                 self._leg_price(l) for l in legs
                 if l.action == "SELL"
             )
-            return total_prem * 1.0 * config.LOT_SIZE
+            # SE-16: use 2x credit (matching STRADDLE_STOP_MULT)
+            # not 1x. The pre-trade combined-risk gate was
+            # undercounting straddle risk by exactly 2x.
+            return total_prem * config.STRADDLE_STOP_MULT * config.LOT_SIZE
 
         elif strategy_name == config.STRAT_IRON_CONDOR:
             net_credit = (
@@ -5562,7 +5614,11 @@ class StrategyEngine:
             config.STRAT_IRON_CONDOR,
             config.STRAT_CREDIT_SPREADS,
         ]:
-            position.stop_loss = 0.0
+            # Breakeven fix: 0.0 is falsy so the stop check
+            # `if position.stop_loss and stop_loss > 0` evaluates
+            # False, disabling the stop entirely. Use total_credit
+            # so the stop fires when all premium is given back.
+            position.stop_loss = position.total_credit
 
     async def _emergency_flatten_all(self) -> None:
         logger.critical(
@@ -5623,10 +5679,16 @@ class StrategyEngine:
         option_type: str,
         exit_reason: str,
     ) -> None:
-        side_legs = [
-            l for l in position.legs
-            if l.option_type == option_type
-        ]
+        # SE-12: sort shorts first so we buy back the short
+        # before selling the long. If the long-sell order fails
+        # we have a flat position, not a naked short.
+        side_legs = sorted(
+            [
+                l for l in position.legs
+                if l.option_type == option_type
+            ],
+            key=lambda l: 0 if l.action == "SELL" else 1,
+        )
         for idx, leg in enumerate(side_legs):
             close_action = (
                 "BUY" if leg.action == "SELL" else "SELL"
@@ -5960,6 +6022,11 @@ class StrategyEngine:
             "profit_target":              position.profit_target,
             "exit_dte":                   position.exit_dte,
             "max_hold_date":              position.max_hold_date,
+            # SE-14: persist meta so max_profit, strategy_type,
+            # trend_direction, banked_pnl etc. survive restarts.
+            "meta_json":                  json.dumps(
+                position.meta or {}
+            ),
         }
 
     # ─────────────────────────────────────────────────────────────
@@ -6210,6 +6277,15 @@ class StrategyEngine:
                     )
                     legs.append(leg)
 
+                # SE-14: restore meta from SQLite
+                _meta_json = row_dict.get("meta_json", "{}")
+                try:
+                    _restored_meta = json.loads(
+                        _meta_json or "{}"
+                    )
+                except Exception:
+                    _restored_meta = {}
+
                 position = Position(
                     trade_id=row_dict["trade_id"],
                     strategy_name=row_dict["strategy_name"],
@@ -6275,6 +6351,7 @@ class StrategyEngine:
                         row_dict.get("paper_trade", 1)
                     ),
                     status="OPEN",
+                    meta=_restored_meta,
                 )
                 self.open_positions.append(position)
                 logger.info(
