@@ -286,20 +286,57 @@ ADX_CANDLE_COUNT = 400
 # 30-min bars = 12.5 bars/day (not 13). Any future use will be wrong.
 BARS_PER_DAY     = 13
 
-# CFG-D1: lowered from 1800 to 300 (5 min).
-# The trend module is up to 30 min stale at 1800s. ADX and EMA
-# slope on the *forming* bar change continuously. 5-min refresh
-# gives an early view of the forming bar — one extra cheap call.
-CANDLE_REFRESH_SECONDS = 300
+# IMM-06: lowered from 300 to 60 to align with main loop cadence.
+# ADX and EMA can be stale for up to 5 minutes at 300s, causing
+# delayed regime changes. At 60s the trend module is always fresh.
+CANDLE_REFRESH_SECONDS = 60
 CANDLE_LOOKBACK_DAYS   = 45   # PATCH: was 30 — too tight for RV_LOOKBACK_DAYS=20 after weekend/holiday attrition
 # PRF-C10: raised from 15 to 30. NSE OI updates every 3-5 min.
 # 15-min window = 3-5 updates (noisy). 30-min = 6-10 updates,
 # giving a smoother, more reliable flow signal.
 FLOW_WINDOW_MINUTES     = 30
 # CFG-P1: per-leg slippage haircut applied in credit gate BEFORE
-# trade approval. Currently slippage only appears in _simulate_fill
-# (after approval). Gate sees a credit that does not exist.
+# trade approval.
 ENTRY_SLIPPAGE_PTS_PER_LEG = 0.75
+
+# ─── IMM-01: Dynamic flow weight ───────────────────────────────
+# If flow score is None for more than this fraction of recent cycles,
+# set flow weight to 0 and redistribute to other modules.
+# The flow module frequently returns None (DTE<3, warming up, etc.)
+# and a fixed 15% weight on a missing signal distorts the composite.
+FLOW_WEIGHT_NONE_THRESHOLD = 0.50   # >50% None -> weight = 0
+FLOW_WEIGHT_NONE_LOOKBACK  = 10     # last N cycles to check
+
+# ─── IMM-02: VIX-adaptive lot sizing ────────────────────────────
+# Scale MAX_RISK_PER_TRADE by (VIX_REFERENCE / current_VIX).
+# In high VIX, premium is larger but so is risk — reduce size.
+# In low VIX, premium is thin — increase size to maintain returns.
+VIX_ADAPTIVE_SIZING        = True
+VIX_ADAPTIVE_REFERENCE     = 16.0   # neutral VIX level
+VIX_ADAPTIVE_MIN_MULT      = 0.5    # minimum size multiplier
+VIX_ADAPTIVE_MAX_MULT      = 2.0    # maximum size multiplier
+
+# ─── IMM-03: Distance-based secondary stop ───────────────────────
+# For condors/spreads: close when spot reaches this fraction of the
+# distance from entry spot to the short strike. Prevents holding
+# through a strike breach when the premium stop hasn't fired yet.
+STOP_SPOT_FRACTION_OF_DISTANCE = 0.80
+
+# ─── IMM-04: Partial profit-taking ladder ────────────────────────
+# Close PARTIAL_PROFIT_CLOSE_PCT of the position when profit reaches
+# PARTIAL_PROFIT_TRIGGER_PCT of the full profit target.
+# Locks in gains early while letting the remainder run to full target.
+PARTIAL_PROFIT_ENABLED         = True
+PARTIAL_PROFIT_TRIGGER_PCT     = 0.25   # close partial at 25% of target
+PARTIAL_PROFIT_CLOSE_PCT       = 0.50   # close 50% of position
+
+# ─── IMM-05: Adaptive persistence ────────────────────────────────
+# Use fewer confirmation readings when the composite signal is strong.
+# Strong signals (high conviction) should not be delayed by 3 readings.
+ADAPTIVE_PERSISTENCE_ENABLED   = True
+ADAPTIVE_PERSISTENCE_FAST_THRESHOLD = 0.60  # composite > this -> 2 readings
+ADAPTIVE_PERSISTENCE_FAST_READINGS  = 2     # readings for strong signal
+ADAPTIVE_PERSISTENCE_SLOW_READINGS  = 3     # readings for weak signal
 SPREAD_LOOKBACK_PERIODS = 12
 OTM_STRIKE_OFFSET       = 6
 
@@ -384,11 +421,10 @@ CONDOR_WING_WIDTH         = 250
 # CFG-P4C: tightened to high-theta zone (DTE 2-5).
 CONDOR_DTE_MIN            = 2
 CONDOR_DTE_MAX            = 5     # widened from 7
-# CFG-P4A: set to 0 for defined-risk structures.
-# 37.8% of premium decays on the final day. For condors/spreads
-# max loss is bounded by wings — no undefined-risk argument for
-# exiting at DTE 1. TIME_EXIT_EXPIRY=15:10 handles the close.
-CONDOR_EXIT_DTE           = 0
+# EXE-02: set to 1. With TIME_EXIT_EXPIRY=13:30, holding to DTE=0
+# is dangerous. Exit at DTE=1 harvests 95%+ of theta without the
+# terminal gamma tail risk from 0-DTE institutional hedging flows.
+CONDOR_EXIT_DTE           = 1
 # PRF-C01: lowered from 0.60 to 0.50. 50% target is reached faster
 # (typically 1-2 days vs 3-4 days for 65%), reducing time-in-trade
 # and gamma exposure. With 2.0x stop: R:R = 0.50/2.0 = 0.25.
@@ -422,8 +458,8 @@ SPREAD_DELTA_SHORT    = 0.20
 # spread width with the new 0.16 short delta. 0.16-0.08=0.08
 # delta spread gives adequate wing protection and defined risk.
 SPREAD_DELTA_LONG     = 0.08
-# CFG-P4A: set to 0 (same reasoning as condor).
-SPREAD_EXIT_DTE       = 0
+# EXE-02: set to 1 (same reasoning as condor).
+SPREAD_EXIT_DTE       = 1
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning as condor).
 SPREAD_TARGET_PCT     = 0.50
 # AUDIT CFG-01: spread min credit as % of wing width.
@@ -580,7 +616,13 @@ TIME_EXIT_NORMAL   = time(15, 15)
 # At 14:45, OTM options still have 45 min of theta.
 # Closing at market costs 20-40 pts unnecessarily.
 # At 15:10, options near-zero — closing cost minimal.
-TIME_EXIT_EXPIRY   = time(15, 10)
+# EXE-01: moved from 15:10 to 13:30.
+# After 13:30 on expiry day, gamma scales exponentially and
+# liquidity providers widen quotes. Institutional 0-DTE delta-
+# hedging flows create violent moves. The risk/reward of holding
+# the last 90 minutes is empirically negative — collecting pennies
+# of residual theta while risking a full max-loss stop-out.
+TIME_EXIT_EXPIRY   = time(13, 30)
 # Safety assertion: expiry exit must be before normal EOD exit.
 # CFG8-P3-01: compare against TIME_EXIT_NORMAL not a hardcoded
 # time(15,15) so the invariant holds if TIME_EXIT_NORMAL changes.
