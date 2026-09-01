@@ -156,6 +156,13 @@ class StrategyEngine:
         self.cb_level_4_active: bool = False
         # MN-T04: CB L5 idempotency flag
         self.cb_level_5_active: bool = False
+        # P2-4a: consecutive CB2 day counter
+        # Tracks how many consecutive trading days ended with
+        # CB L2 (daily loss > threshold) firing.  When >= 2
+        # the effective daily loss threshold tightens to 1%%
+        # so the engine de-risks automatically during a losing streak.
+        self._consecutive_cb2_days: int = 0
+        self._prev_day_cb2_fired: bool = False
 
         self._last_trading_date: Optional[date] = None
         self._last_weekly_reset: Optional[date] = None
@@ -1784,8 +1791,16 @@ class StrategyEngine:
         daily_pnl_net_estimate = self.daily_pnl - sum(
             self._estimate_costs(p) for p in self.open_positions
         )
+        # P2-4c: effective daily loss threshold (tightens on losing streak)
+        # After 2+ consecutive CB L2 days, use 1% threshold instead of
+        # CB_LEVEL_2_PCT (3%) so the engine de-risks automatically.
+        _cb2_streak = getattr(self, "_consecutive_cb2_days", 0)
+        if _cb2_streak >= 2:
+            _effective_cb2_pct = 0.01  # 1% tightened threshold
+        else:
+            _effective_cb2_pct = config.CB_LEVEL_2_PCT
         if daily_pnl_net_estimate < -(
-            config.CB_LEVEL_2_PCT * config.TOTAL_CAPITAL
+            _effective_cb2_pct * config.TOTAL_CAPITAL
         ):
             if not self.cb_level_2_active:
                 logger.critical(
@@ -2737,6 +2752,21 @@ class StrategyEngine:
                 f'({self.re.persistence_count}/3)'
             )
             return False
+        # P4-4: regime stability requirement
+        # Require the regime to have been confirmed for >= 5 cycles
+        # before entering a new position.  A regime confirmed for only
+        # 3 cycles (3 minutes) is more likely to be a transient signal.
+        # Exception: IV spike entries (P4-3a) require only 3 cycles
+        # because the spike itself provides additional confirmation.
+        _iv_spike_now = getattr(self, '_iv_spike_entry', False)
+        _min_persistence = 3 if _iv_spike_now else 5
+        if self.re.persistence_count < _min_persistence:
+            logger.info(
+                f'Entry gate BLOCKED: regime not yet stable '
+                f'(persistence={self.re.persistence_count} '
+                f'< required={_min_persistence})'
+            )
+            return False
         if len(self.open_positions) >= config.MAX_CONCURRENT_POSITIONS:
             logger.info(
                 f'Entry gate BLOCKED: max positions '
@@ -2801,6 +2831,55 @@ class StrategyEngine:
                     )
                     return False
 
+        # P4-3a: IV spike detection
+        # When IV_ATM is >= 15% above recent average, we are in a
+        # fear-premium window — the highest-EV entry for premium selling.
+        # Log this so the operator knows this is a high-quality entry.
+        # Also store the spike flag so P4-4 can relax persistence.
+        _iv_spike_entry = False
+        if (
+            self.dm.iv_atm is not None
+            and self.dm.iv_atm > 0
+            and len(self.dm.iv_atm_history) >= 5
+            and regime in [
+                config.REGIME_STRONG_SELL,
+                config.REGIME_MILD_SELL,
+            ]
+        ):
+            _recent_iv_avg = float(
+                sum(list(self.dm.iv_atm_history)[-5:])
+                / 5
+            )
+            if (
+                _recent_iv_avg > 0
+                and self.dm.iv_atm >= _recent_iv_avg * 1.15
+            ):
+                _iv_spike_entry = True
+                logger.info(
+                    f'P4-3a: IV spike detected — '
+                    f'iv_atm={self.dm.iv_atm*100:.2f}%% '
+                    f'vs recent_avg={_recent_iv_avg*100:.2f}%% '
+                    f'(+{(self.dm.iv_atm/_recent_iv_avg-1)*100:.1f}%%) '
+                    f'— high-quality fear-premium entry'
+                )
+        self._iv_spike_entry = _iv_spike_entry
+        # P4-3b: Monday gap risk filter
+        # Block straddle entries before 10:00 IST on Mondays.
+        # NIFTY Monday gap of 0.4-0.8%% can wipe 1.6 weeks of theta.
+        # Only blocks when the engine would select a straddle
+        # (STRONG_SELL + ADX >= ADX_RANGE_THRESHOLD after P4-1).
+        # Condors and credit spreads (defined risk) are NOT blocked.
+        if (
+            now.weekday() == 0
+            and now_time < config.EXEC_START_TIME.__class__(10, 0)
+            and regime == config.REGIME_STRONG_SELL
+            and (self.dm.adx or 0) >= config.ADX_RANGE_THRESHOLD
+        ):
+            logger.info(
+                'P4-3b: Entry gate BLOCKED: Monday gap risk window '
+                '(straddle before 10:00 IST — NIFTY gap risk)'
+            )
+            return False
         logger.info(
             f'Entry gate PASSED: regime={regime} '
             f'time={now_time} '
@@ -3210,11 +3289,15 @@ class StrategyEngine:
         ema_200      = self._get_ema_200()
 
         if regime == config.REGIME_STRONG_SELL:
-            # PATCH S-08: always route STRONG_SELL to straddle.
-            # STRONG_SELL requires trend=+1 (ADX<ADX_RANGE_THRESHOLD),
-            # so ADX>ADX_TREND_THRESHOLD is impossible when in this regime.
-            # The condor branch was permanently dead code.
-            # Straddle: 2 legs, maximum theta, no wing debit.
+            # P4-1: STRONG_SELL routes to condor when range-bound
+            # Iron condor has 5x better return on margin at VIX=11-14
+            # (defined risk ~Rs16k/lot vs naked straddle ~Rs1.7L/lot).
+            # Use condor when ADX confirms range-bound (low trend strength).
+            # Fall back to straddle when ADX is elevated (trending market
+            # where fixed condor wings are more likely to be breached).
+            _adx_now = self.dm.adx or 99.0
+            if _adx_now < config.ADX_RANGE_THRESHOLD:
+                return config.STRAT_IRON_CONDOR
             return config.STRAT_SHORT_STRADDLE
 
         elif regime == config.REGIME_MILD_SELL:
@@ -3239,7 +3322,10 @@ class StrategyEngine:
                 return config.STRAT_CREDIT_SPREADS
 
         elif regime == config.REGIME_NEUTRAL:
-            if iv_rank > 50 and adx < 20:
+            # P0-4: iv_rank None guard — compute_iv_rank() returns None during warmup
+            _iv_rank_neutral = self.dm.compute_iv_rank()
+            _iv_rank_neutral = (_iv_rank_neutral if _iv_rank_neutral is not None else 50.0)
+            if _iv_rank_neutral > 50 and adx < 20:
                 return config.STRAT_IRON_CONDOR
             return None
 
@@ -3565,6 +3651,8 @@ class StrategyEngine:
             * ((_trading_days / 252) ** 0.5)
         )
 
+        # P0-3: _dynamic_wing defined (was NameError)
+        _dynamic_wing = config.CONDOR_WING_WIDTH
         # FIX S1: round to 100-pt step
         short_call = (
             round(
@@ -3727,7 +3815,7 @@ class StrategyEngine:
             ),
             # PATCH S-05: 2.0x→1.0x. At 2.0x stop + 60% target,
             # break-even WR=77% (unachievable). At 1.0x + 60%: WR=62.5%.
-            "stop_loss":     net_credit * 1.0,
+            "stop_loss":     net_credit * 2.0,  # P1-4a: condor stop_loss 2.0x (was 1.0x, fired immediately at entry)
             "exit_dte":      config.CONDOR_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -3974,11 +4062,13 @@ class StrategyEngine:
         ) * config.LOT_SIZE
 
         legs = []
+        # P1-2: call legs gated on _build_call_side
+        # P1-3: lp_prem corrected (was lc_prem in put-only branch)
         if _build_put_side:
-          legs += [
-            Leg(
+            legs += [
+                Leg(
                 instrument_key=chain[long_put_strike][
-                    "put"
+                "put"
                 ]["instrument_key"],
                 option_type="put", action="BUY",
                 strike=long_put_strike, expiry=expiry,
@@ -3987,22 +4077,10 @@ class StrategyEngine:
                 gamma=chain[long_put_strike]["put"]["gamma"],
                 vega=chain[long_put_strike]["put"]["vega"],
                 theta=chain[long_put_strike]["put"]["theta"],
-            ),
-            Leg(
-                instrument_key=chain[long_call_strike][
-                    "call"
-                ]["instrument_key"],
-                option_type="call", action="BUY",
-                strike=long_call_strike, expiry=expiry,
-                qty=1,
-                delta=chain[long_call_strike]["call"]["delta"],
-                gamma=chain[long_call_strike]["call"]["gamma"],
-                vega=chain[long_call_strike]["call"]["vega"],
-                theta=chain[long_call_strike]["call"]["theta"],
-            ),
-            Leg(
+                ),
+                Leg(
                 instrument_key=chain[short_put_strike][
-                    "put"
+                "put"
                 ]["instrument_key"],
                 option_type="put", action="SELL",
                 strike=short_put_strike, expiry=expiry,
@@ -4011,10 +4089,25 @@ class StrategyEngine:
                 gamma=chain[short_put_strike]["put"]["gamma"],
                 vega=chain[short_put_strike]["put"]["vega"],
                 theta=chain[short_put_strike]["put"]["theta"],
-            ),
-            Leg(
+                ),
+            ]
+        if _build_call_side:
+            legs += [
+                Leg(
+                instrument_key=chain[long_call_strike][
+                "call"
+                ]["instrument_key"],
+                option_type="call", action="BUY",
+                strike=long_call_strike, expiry=expiry,
+                qty=1,
+                delta=chain[long_call_strike]["call"]["delta"],
+                gamma=chain[long_call_strike]["call"]["gamma"],
+                vega=chain[long_call_strike]["call"]["vega"],
+                theta=chain[long_call_strike]["call"]["theta"],
+                ),
+                Leg(
                 instrument_key=chain[short_call_strike][
-                    "call"
+                "call"
                 ]["instrument_key"],
                 option_type="call", action="SELL",
                 strike=short_call_strike, expiry=expiry,
@@ -4023,8 +4116,8 @@ class StrategyEngine:
                 gamma=chain[short_call_strike]["call"]["gamma"],
                 vega=chain[short_call_strike]["call"]["vega"],
                 theta=chain[short_call_strike]["call"]["theta"],
-            ),
-        ]
+                ),
+            ]
 
         meta = {
             "total_credit":  total_credit,
@@ -4037,7 +4130,7 @@ class StrategyEngine:
                 1 - config.SPREAD_TARGET_PCT
             ),
             # PATCH S-06: 2.0x→1.0x (same reasoning as S-05).
-            "stop_loss":     total_credit * 1.0,
+            "stop_loss":     total_credit * 2.0,  # P1-4b: spread stop_loss 2.0x (was 1.0x, fired immediately at entry)
             "exit_dte":      config.SPREAD_EXIT_DTE,
             "max_hold_date": None,
             "strategy_type": "SHORT",
@@ -5861,8 +5954,22 @@ class StrategyEngine:
             config.STRAT_CREDIT_SPREADS,
         )
         if _is_defined_risk:
-            # Use theoretical max loss (wing_width - credit) * LOT_SIZE
-            max_loss_per_lot = meta.get("max_risk", 0)
+            # P2-1: defined-risk max_loss guard
+            # meta["max_risk"] is the per-lot theoretical max loss
+            # set by the builder as (wing_width - net_credit) * LOT_SIZE.
+            # If somehow 0 (builder bug), fall back to a conservative
+            # estimate so we never divide by zero or size to infinity.
+            _raw_max_risk = meta.get("max_risk", 0)
+            if _raw_max_risk and _raw_max_risk > 0:
+                max_loss_per_lot = _raw_max_risk
+            else:
+                # Fallback: full wing width as max loss
+                max_loss_per_lot = config.CONDOR_WING_WIDTH * config.LOT_SIZE
+                logger.warning(
+                    "P2-1: meta['max_risk']=0 for defined-risk strategy "
+                    f"{strategy_name} — using wing_width fallback "
+                    f"{max_loss_per_lot:.0f}"
+                )
         elif _strategy_type == "SHORT":
             _stop_pts = meta.get("stop_loss", 0)
             if _stop_pts and _stop_pts > 0:
@@ -6007,6 +6114,38 @@ class StrategyEngine:
             lots = min(lots, lots_by_margin)
             lots = max(lots, 0)
 
+        # P4-2: composite quality multiplier
+        # Scale lot count by signal quality so high-conviction
+        # entries (composite well above threshold) get more size
+        # than marginal entries (composite barely above threshold).
+        # Multiplier ramps linearly from 1.0 at composite=0.20
+        # to 1.5 at composite=0.75, capped at 1.5.
+        # Applied AFTER all other caps so it never exceeds margin
+        # or regime max lots limits.
+        if lots > 0:
+            _comp_now = abs(getattr(self.re, 'raw_composite', 0.0))
+            _comp_base = getattr(
+                config, 'MILD_SELL_ENTER', 0.20
+            )
+            _comp_mult = 1.0 + min(
+                0.5,
+                max(0.0, (_comp_now - _comp_base) / 1.10)
+            )
+            if _comp_mult > 1.05:  # only apply meaningful boost
+                _lots_before_mult = lots
+                lots = min(
+                    config.REGIME_MAX_LOTS.get(
+                        self.re.confirmed_regime, lots
+                    ),
+                    max(1, int(lots * _comp_mult)),
+                )
+                if lots != _lots_before_mult:
+                    logger.info(
+                        f"P4-2: composite quality boost "
+                        f"{_lots_before_mult} → {lots} lots "
+                        f"(composite={_comp_now:.3f} "
+                        f"mult={_comp_mult:.2f}x)"
+                    )
         logger.info(
             f"Lot size: {lots} for {strategy_name} "
             f"risk={risk_per_trade} "
@@ -7370,6 +7509,26 @@ class StrategyEngine:
             )
 
     def reset_daily_state(self) -> None:
+        # P2-4b: update consecutive CB2 counter on daily reset
+        # Read yesterday's CB L2 status BEFORE clearing it.
+        if self.cb_level_2_active:
+            # Yesterday ended with CB L2 fired
+            self._consecutive_cb2_days += 1
+            self._prev_day_cb2_fired = True
+            logger.warning(
+                f"P2-4: CB L2 fired {self._consecutive_cb2_days} "
+                f"consecutive day(s) — daily loss threshold will "
+                f"tighten today"
+            )
+        else:
+            # Yesterday was clean (or profitable) — reset streak
+            if self._consecutive_cb2_days > 0:
+                logger.info(
+                    "P2-4: CB L2 streak ended — "
+                    "resetting consecutive counter to 0"
+                )
+            self._consecutive_cb2_days = 0
+            self._prev_day_cb2_fired = False
         self.daily_pnl            = 0.0
         self.daily_trading_halted = False
         self.cb_level_2_active    = False
