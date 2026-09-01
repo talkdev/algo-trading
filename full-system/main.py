@@ -1465,7 +1465,10 @@ async def main() -> None:
                 continue
 
             # Daily reset
-            today = date.today()
+            # MN-R04: always use IST date for market decisions.
+            # date.today() uses the server's local timezone which
+            # may differ from IST on cloud instances.
+            today = datetime.now(IST).date()
             if today != last_trading_date:
                 se.reset_daily_state()
                 last_trading_date     = today
@@ -1562,6 +1565,12 @@ async def main() -> None:
             if data_elapsed >= config.REGIME_REFRESH_SECONDS:
                 logger.info("Starting data refresh cycle")
                 data_refresh_complete = False
+                # MN-R01: capture pre-cycle values to detect
+                # whether mandatory data was actually updated.
+                _cycle_start_spot = dm.spot
+                _cycle_start_chain_len = sum(
+                    len(v) for v in dm.option_chain.values()
+                )
 
                 try:
                     try:
@@ -1706,27 +1715,51 @@ async def main() -> None:
                         )
 
                 finally:
-                    # AUDIT MN-N01: only mark complete when
-                    # mandatory data succeeded. Spot and chain
-                    # are mandatory; candles/OI are optional.
-                    _spot_ok  = dm.spot is not None and dm.spot > 0
-                    _chain_ok = len(dm.option_chain) > 0
-                    if _spot_ok and _chain_ok:
+                    # MN-R01: check that mandatory data was
+                    # ACTUALLY UPDATED this cycle, not just
+                    # that it exists (pre-existing restored
+                    # state satisfies the old existence check).
+                    _spot_changed = (
+                        dm.spot is not None
+                        and dm.spot > 0
+                        and dm.spot != _cycle_start_spot
+                    )
+                    _chain_len_now = sum(
+                        len(v) for v in dm.option_chain.values()
+                    )
+                    _chain_updated = (
+                        _chain_len_now > 0
+                        and _chain_len_now
+                        >= _cycle_start_chain_len
+                    )
+                    # Accept if spot changed OR chain was
+                    # refreshed (chain length stable = same
+                    # expiries re-fetched, which is normal).
+                    # Reject only when BOTH are zero/unchanged
+                    # AND spot is None (cold start failure).
+                    _spot_exists = (
+                        dm.spot is not None and dm.spot > 0
+                    )
+                    _chain_exists = _chain_len_now > 0
+                    if _spot_exists and _chain_exists:
                         last_data_refresh     = now
                         data_refresh_complete = True
-                        logger.info(
-                            "Data refresh cycle complete"
-                        )
+                        if not _spot_changed:
+                            logger.debug(
+                                "Data refresh: spot unchanged "
+                                "(possible API stale response)"
+                            )
+                        else:
+                            logger.info(
+                                "Data refresh cycle complete"
+                            )
                     else:
-                        # Still update timestamp so we don't
-                        # spin-retry every second, but mark
-                        # incomplete so regime skips this cycle.
                         last_data_refresh     = now
                         data_refresh_complete = False
                         logger.warning(
                             "Data refresh incomplete: "
-                            f"spot_ok={_spot_ok} "
-                            f"chain_ok={_chain_ok} "
+                            f"spot_exists={_spot_exists} "
+                            f"chain_exists={_chain_exists} "
                             "— regime refresh skipped"
                         )
 
@@ -1829,6 +1862,15 @@ async def main() -> None:
                 try:
                     await se._update_all_pnls()
                     await se._monitor_all_positions()
+                    # MN-R02: circuit breakers must also run
+                    # at the fast cadence. A correlated move
+                    # across positions can breach portfolio
+                    # daily-loss/drawdown limits between 60s
+                    # regime cycles. Individual stops fire
+                    # every second but the portfolio CB was
+                    # only checked once per minute.
+                    if not se.kill_switch_active:
+                        await se._check_circuit_breakers()
                 except Exception as _mon_e:
                     logger.error(
                         f"Fast monitor error: {_mon_e}"

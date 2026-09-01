@@ -692,9 +692,24 @@ class RegimeEngine:
         slope_pct = slope / spot * 100.0 if spot else 0.0
         above     = spot > ema[-1]
 
+        # RE-R02: require three-way directional agreement to
+        # avoid false signals at EMA crossings:
+        #   bullish: spot > EMA AND slope > 0 AND +DI > -DI
+        #   bearish: spot < EMA AND slope < 0 AND -DI > +DI
+        # Without this, a falling EMA with spot marginally above
+        # it scores +1 (bullish) despite a bearish trend.
         if adx_v > ADX_TREND and abs(slope_pct) > EMA_SLOPE_PCT:
-            raw  = 1 if above else -1
-            dirn = "bullish" if above else "bearish"
+            _slope_up = slope > 0
+            _di_bull  = pdi > ndi
+            if above and _slope_up and _di_bull:
+                raw  = 1
+                dirn = "bullish (3-way confirmed)"
+            elif not above and not _slope_up and not _di_bull:
+                raw  = -1
+                dirn = "bearish (3-way confirmed)"
+            else:
+                raw  = 0
+                dirn = "mixed signals (no 3-way agreement)"
         else:
             raw  = 0
             dirn = "range-bound"
@@ -872,15 +887,41 @@ class RegimeEngine:
         raw=None -> hold previous confirmed value.
         """
         if raw is None:
+            # RE-R03: decay stale scores toward 0 intraday.
+            # Track consecutive None readings per module.
+            _none_key = "_none_count_" + name
+            _none_count = getattr(self, _none_key, 0) + 1
+            setattr(self, _none_key, _none_count)
+            # After 10 consecutive None readings (~10 min at
+            # 60s refresh), decay the confirmed score toward 0
+            # by 1 step so stale flow/vol doesn't drive entries.
+            _decay_after = 10
+            if _none_count > _decay_after and self._conf[name] != 0:
+                _old = self._conf[name]
+                self._conf[name] = (
+                    _old - 1 if _old > 0 else _old + 1
+                )
+                logger.info(
+                    f"RE-R03: {name} score decayed "
+                    f"{_old} -> {self._conf[name]} "
+                    f"(none_count={_none_count})"
+                )
             return self._conf[name]
 
-        # AUDIT RE-01: int(round(0.5)) == 0 in Python (banker's
-        # rounding). A vol_score of +0.5 (normal contango + neutral
-        # skew) was silently becoming 0, making STRONG_SELL_VOL
-        # unreachable. Use standard half-up rounding instead.
+        # RE-R01: floor(x+0.5) is asymmetric: +0.5->1 but -0.5->0.
+        # This introduced a sell-vol bias (buy-vol signals zeroed).
+        # Use copysign for symmetric rounding away from zero:
+        #   +0.5 -> +1,  -0.5 -> -1,  +0.0 -> 0
         import math as _math
-        raw_int = int(_math.floor(float(raw) + 0.5))
+        _raw_f  = float(raw)
+        raw_int = int(
+            _math.copysign(
+                _math.floor(abs(_raw_f) + 0.5), _raw_f
+            )
+        )
         buf     = self._buf[name]
+        # Reset decay counter when a real value arrives
+        setattr(self, "_none_count_" + name, 0)
         buf.append(raw_int)
         if len(buf) > 3:
             buf.pop(0)
@@ -938,9 +979,39 @@ class RegimeEngine:
     # ─────────────────────────────────────────────────────────────────
 
     def _map_regime(self, composite: float) -> str:
-        """Reference algorithm regime mapping.
-        AUDIT #2.2: reads thresholds from config.
+        """Reference algorithm regime mapping with hysteresis.
+        RE-R04: use entry/exit bands to prevent churn near
+        boundaries. Entry requires crossing a tighter threshold;
+        exit requires crossing a looser threshold in the opposite
+        direction. Hysteresis band = 0.05 composite units.
         """
+        _hyst = 0.05
+        current = self.confirmed_regime
+
+        # Staying in current regime unless exit threshold crossed
+        if current == config.REGIME_STRONG_SELL:
+            if composite > (config.STRONG_SELL_THRESHOLD - _hyst):
+                return config.REGIME_STRONG_SELL
+        elif current == config.REGIME_MILD_SELL:
+            if (config.MILD_SELL_THRESHOLD - _hyst
+                    <= composite
+                    <= config.STRONG_SELL_THRESHOLD + _hyst):
+                return config.REGIME_MILD_SELL
+        elif current == config.REGIME_NEUTRAL:
+            if (config.MILD_BUY_THRESHOLD - _hyst
+                    < composite
+                    < config.MILD_SELL_THRESHOLD + _hyst):
+                return config.REGIME_NEUTRAL
+        elif current == config.REGIME_BUY_VOL:
+            if (config.STRONG_BUY_THRESHOLD - _hyst
+                    <= composite
+                    <= config.MILD_BUY_THRESHOLD + _hyst):
+                return config.REGIME_BUY_VOL
+        elif current == config.REGIME_STRONG_BUY:
+            if composite < (config.STRONG_BUY_THRESHOLD + _hyst):
+                return config.REGIME_STRONG_BUY
+
+        # Entry into new regime (tighter thresholds)
         if composite > config.STRONG_SELL_THRESHOLD:
             return config.REGIME_STRONG_SELL
         if composite >= config.MILD_SELL_THRESHOLD:
