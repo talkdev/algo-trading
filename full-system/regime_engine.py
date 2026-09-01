@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Reference algorithm constants (from nifty_regime_monitor.py)
 # ─────────────────────────────────────────────────────────────────────
 TERM_THRESHOLD   = 0.5    # V_fwd - V_spot contango/backwardation
-SKEW_Z_STEEP     = 1.5    # z > 1.5  -> fear    (Skew_Score = -1)
+SKEW_Z_STEEP = config.SKEW_ZSCORE_FEAR        # AUDIT #2.2: reads from config
 SKEW_Z_FLAT = config.SKEW_ZSCORE_COMPLACENT  # AUDIT #2.2: reads from config
 EDGE_RICH = config.EDGE_RICH        # AUDIT #2.2: reads from config
 EDGE_CHEAP = config.EDGE_CHEAP       # AUDIT #2.2: reads from config
