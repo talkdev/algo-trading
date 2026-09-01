@@ -70,7 +70,7 @@ NIFTY_STRIKE_STEP = 50
 # CFG-R01: 2x2%=4% > 3% daily limit, so two simultaneous max-risk
 # losses exceed the daily CB. The CB is reactive (fires after loss).
 # Reserve daily risk before entry; do not rely on the CB as a gate.
-MAX_RISK_PER_TRADE_PCT   = 0.02
+MAX_RISK_PER_TRADE_PCT   = 0.04  # PATCHED: 0.02→0.04
 # C4-05: MAX_COMBINED_RISK_PCT is non-binding.
 # With MAX_RISK_PER_TRADE_PCT=0.03 and MAX_CONCURRENT_POSITIONS=4,
 # max theoretical exposure = 4 * 3% = 12%, well below this 20% cap.
@@ -182,7 +182,7 @@ EXTREME_VIX      = 30.0
 VIX_SELL_VOL_MAX = 22.0
 # PRF-C06: minimum VIX for short-vol entries. Below 11, premium
 # is too thin to cover slippage and transaction costs.
-MIN_VIX_SELL     = 11.0
+MIN_VIX_SELL     = 9.5   # PATCHED: 11.0→9.5 (VRP positive below 11)
 
 # C4-02: VIX-adaptive delta bands — now wired into _build_credit_spreads.
 # Selling 0.20 delta at VIX=11 and VIX=25 are very different trades.
@@ -241,7 +241,7 @@ EDGE_LOOKBACK_DAYS     = 60
 IV_ATM_HISTORY_MAXLEN = 22_500
 
 RV_LOOKBACK_DAYS     = 20
-EDGE_RICH  = 5.0   # reference: IV-RV > 5 -> rich
+EDGE_RICH  = 2.0   # PATCHED: lowered; regime_engine uses relative VRP >= 15%
 EDGE_CHEAP = 0.0   # reference: IV-RV < 0 -> cheap
 # C4-03: Edge percentile thresholds — now wired into compute_iv_rank.
 # IV rank >= EDGE_PERCENTILE_HIGH -> vol is rich (sell signal)
@@ -262,8 +262,8 @@ EDGE_SCORE_MIN_HISTORY = 20
 # (regime_engine.adx14 default n=14). The old value of 26
 # was never passed anywhere and has been corrected here.
 ADX_PERIOD          = 14
-ADX_TREND_THRESHOLD = 20   # AUDIT #2.2: now read by regime_engine.py via ADX_TREND
-ADX_RANGE_THRESHOLD = 15
+ADX_TREND_THRESHOLD = 18   # PATCHED: 20→18 (30-min bar calibration)
+ADX_RANGE_THRESHOLD = 13   # PATCHED: 15→13
 EMA_PERIOD          = 50
 # EMA_SLOPE_THRESHOLD corrected to 0.05 (percentage units).
 # regime_engine computes slope_pct = slope/spot*100 (a percentage
@@ -334,7 +334,7 @@ PARTIAL_PROFIT_CLOSE_PCT       = 0.50   # close 50% of position
 # Use fewer confirmation readings when the composite signal is strong.
 # Strong signals (high conviction) should not be delayed by 3 readings.
 ADAPTIVE_PERSISTENCE_ENABLED   = True
-ADAPTIVE_PERSISTENCE_FAST_THRESHOLD = 0.60  # composite > this -> 2 readings
+ADAPTIVE_PERSISTENCE_FAST_THRESHOLD = 0.35  # PATCHED: 0.60→0.35 (reachable at VIX=11-14)
 ADAPTIVE_PERSISTENCE_FAST_READINGS  = 2     # readings for strong signal
 ADAPTIVE_PERSISTENCE_SLOW_READINGS  = 3     # readings for weak signal
 SPREAD_LOOKBACK_PERIODS = 12
@@ -343,8 +343,8 @@ OTM_STRIKE_OFFSET       = 6
 # LIVE FIX: recalibrated for VIX=11 environment
 # Max achievable composite ≈ 0.55 (edge=1 + trend=0.5)
 # Old STRONG_SELL=0.45 was unreachable.
-STRONG_SELL_THRESHOLD =  0.45   # reference: x > 0.45
-MILD_SELL_THRESHOLD   =  0.15   # reference: x >= 0.15
+STRONG_SELL_THRESHOLD =  0.30   # PATCHED: 0.45→0.30
+MILD_SELL_THRESHOLD   =  0.10   # PATCHED: 0.15→0.10
 MILD_BUY_THRESHOLD    = -0.15   # reference: x > -0.15 = NEUTRAL
 STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL
 
@@ -354,10 +354,10 @@ STRONG_BUY_THRESHOLD  = -0.45   # reference: x >= -0.45 = BUY_VOL
 # direction. This prevents churn near boundaries without
 # creating hidden thresholds that contradict the base values.
 # Band = 0.05 composite units (tune here, not inline).
-STRONG_SELL_ENTER =  0.45   # enter STRONG_SELL above this
-STRONG_SELL_EXIT  =  0.40   # exit  STRONG_SELL below this
-MILD_SELL_ENTER   =  0.15   # enter MILD_SELL above this
-MILD_SELL_EXIT    =  0.10   # exit  MILD_SELL below this
+STRONG_SELL_ENTER =  0.30   # PATCHED: 0.45→0.30 for VIX=11-14 environment
+STRONG_SELL_EXIT  =  0.22   # PATCHED: 0.40→0.22 (band now 0.08)
+MILD_SELL_ENTER   =  0.10   # PATCHED: 0.15→0.10
+MILD_SELL_EXIT    =  0.02   # PATCHED: 0.10→0.02 (band now 0.08)
 MILD_BUY_ENTER    = -0.15   # enter NEUTRAL above this (from BUY_VOL)
 MILD_BUY_EXIT     = -0.20   # exit  NEUTRAL below this
 STRONG_BUY_ENTER  = -0.45   # enter BUY_VOL above this (from STRONG_BUY)
@@ -406,9 +406,9 @@ STRAT_STRANGLE       = "LONG_STRANGLE_EVENT"
 # Confining to DTE<=4 was the least favourable point on the curve.
 STRADDLE_DTE_MIN       = 1
 STRADDLE_DTE_MAX       = 8    # was 4    # widened from 7
-STRADDLE_STOP_MULT     = 2.0   # stop = 2x credit
+STRADDLE_STOP_MULT     = 1.2   # PATCHED: 2.0→1.2; break-even WR 80%→70.6%
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning).
-STRADDLE_TARGET_PCT    = 0.50
+STRADDLE_TARGET_PCT    = 0.60  # PATCHED: 0.50→0.60
 STRADDLE_EXIT_DTE      = 1
 STRADDLE_MAX_DEBIT_PCT = 0.025
 STRADDLE_POLL_SECONDS  = 5
@@ -431,14 +431,14 @@ CONDOR_EXIT_DTE           = 1
 # and gamma exposure. With 2.0x stop: R:R = 0.50/2.0 = 0.25.
 # Wider stop (2.0x) means fewer stop-outs on normal intraday moves,
 # so realised win rate rises to ~75-80%, making BEP achievable.
-CONDOR_TARGET_PCT         = 0.50
+CONDOR_TARGET_PCT         = 0.60  # PATCHED: 0.50→0.60
 # AUDIT CFG-01: minimum credit expressed as % of wing width.
 # At CONDOR_WING_WIDTH=400, 22% = 88 pts minimum.
 # Absolute fallback kept for reference only.
 # PRF-C04: lowered from 0.22 to 0.18. At VIX=11-13 with dynamic
 # wing widths, 22% is often unattainable. 18% still ensures
 # meaningful credit/risk ratio while allowing more entries.
-CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.18
+CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.12  # PATCHED: 0.18→0.12
 CONDOR_MIN_CREDIT         = 40   # legacy absolute floor; builder uses PCT_OF_WIDTH above
 # C4-06: DEAD CONSTANT — no condor adjustment logic exists.
 CONDOR_ADJUSTMENT_DELTA   = 0.35
@@ -462,7 +462,7 @@ SPREAD_DELTA_LONG     = 0.08
 # EXE-02: set to 1 (same reasoning as condor).
 SPREAD_EXIT_DTE       = 1
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning as condor).
-SPREAD_TARGET_PCT     = 0.50
+SPREAD_TARGET_PCT     = 0.60  # PATCHED: 0.50→0.60
 # AUDIT CFG-01: spread min credit as % of wing width.
 # PRF-C05: lowered from 0.25 to 0.20 (same reasoning as condor).
 SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.20
