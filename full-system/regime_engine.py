@@ -1450,10 +1450,16 @@ class RegimeEngine:
                         pass
                     break
             _today_iso = datetime.now(self._IST).date().isoformat()
-            # RE8-P1-01 FIX: initialise deferred restore vars
-            _restored_regime       = getattr(self, "_restored_regime", "")
-            _restored_prev_regime  = getattr(self, "_restored_prev_regime", "")
-            _restored_composite    = getattr(self, "_restored_composite", 0.0)
+            # RE10-P1-01 FIX: initialise deferred restore vars BEFORE
+            # the date check. The RE8-P1-01 fix had a scoping bug:
+            # getattr(self, '_restored_regime', '') was called AFTER
+            # the loop, overwriting the value just read from SQLite
+            # with an attribute that is never set on self. Result:
+            # confirmed_regime was never restored on same-day restart.
+            # These variables are populated by the loop above.
+            _restored_regime      = locals().get("_restored_regime", "")
+            _restored_prev_regime = locals().get("_restored_prev_regime", "")
+            _restored_composite   = locals().get("_restored_composite", 0.0)
             if _last_save and _last_save != _today_iso:
                 logger.info(
                     f"RE7-P1-02: last save was {_last_save}, "
