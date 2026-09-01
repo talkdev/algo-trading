@@ -33,7 +33,11 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────
 # Reference algorithm constants (from nifty_regime_monitor.py)
 # ─────────────────────────────────────────────────────────────────────
-TERM_THRESHOLD   = 0.5    # V_fwd - V_spot contango/backwardation
+# CAL-05: raised to 1.5 to match config.TERM_SPREAD_CONTANGO.
+# At 0.5pp, far-month ATM IV vs VIX always exceeded the threshold
+# at VIX=11 (typical spread 1-2pp), permanently injecting +0.15
+# into the composite as a structural sell-vol bias.
+TERM_THRESHOLD   = 1.5    # V_fwd - V_spot contango/backwardation
 SKEW_Z_STEEP = config.SKEW_ZSCORE_FEAR        # AUDIT #2.2: reads from config
 SKEW_Z_FLAT = config.SKEW_ZSCORE_COMPLACENT  # AUDIT #2.2: reads from config
 EDGE_RICH = config.EDGE_RICH        # AUDIT #2.2: reads from config
@@ -41,7 +45,11 @@ EDGE_CHEAP = config.EDGE_CHEAP       # AUDIT #2.2: reads from config
 # AUDIT #2.2/#2.3: ADX_TREND now reads from config.
 # config.ADX_TREND_THRESHOLD = 20 (calibrated for 30-min bars).
 ADX_TREND = config.ADX_TREND_THRESHOLD
-EMA_SLOPE_PCT    = 0.05   # |slope| > 0.05% of spot
+# CAL-04: raised to 0.15 to match config.EMA_SLOPE_THRESHOLD.
+# At 0.05% (~12.5 pts over 10h), the condition fired on minor drift
+# making trend=-1 (trending) ~80%+ of sessions. The +1 (range-bound,
+# favorable for premium selling) almost never fired.
+EMA_SLOPE_PCT    = 0.15   # |slope| > 0.15% of spot
 RV_WINDOW        = 20     # trading days
 RV_ANNUALISE     = 252
 SKEW_HISTORY_DAYS = 30
@@ -627,9 +635,17 @@ class RegimeEngine:
             self.dm.rv_20d is None or self.dm.rv_20d <= 0
         )
 
-        # rv is in decimal (e.g. 0.08 = 8%)
-        # Convert to percentage
-        rv_pct = rv * 100.0
+        # CAL-01: defensive unit normalisation guard.
+        # get_estimated_rv() returns decimal (e.g. 0.08 for 8%).
+        # But if rv somehow arrives as percentage (e.g. 8.0 for 8%),
+        # multiplying by 100 gives 800% -> edge always -1 (buy vol).
+        # Guard: values > 5.0 are already percentage-scale.
+        # Normal NIFTY RV is 8-25% (decimal 0.08-0.25, pct 8-25).
+        # A decimal > 5.0 would mean 500%+ RV — impossible in practice.
+        if rv > 5.0:
+            rv_pct = rv          # already in percentage
+        else:
+            rv_pct = rv * 100.0  # convert decimal to percentage
 
         active = self.dm.get_active_chain()
         if not active:
@@ -876,10 +892,15 @@ class RegimeEngine:
         })
 
         # Net delta-weighted OI change vs ~15 min ago
+        # CAL-02: lowered from min=600/target=900 to min=120/target=180.
+        # The old 10-15 minute window made flow inactive for the first
+        # 10 min of every cycle and used stale OI deltas. A 3-minute
+        # window (120-180s) is more relevant for intraday regime shifts
+        # while still avoiding single-tick noise.
         ref = self._snapshot_near(
             now,
-            min_age_s=600,
-            target_age_s=900,
+            min_age_s=120,
+            target_age_s=180,
             max_age_s=1800,
         )
         net_flow = None
@@ -913,13 +934,16 @@ class RegimeEngine:
             span_min = (
                 now - datetime.fromisoformat(hist[0][0])
             ).total_seconds() / 60.0
+            # CAL-03: use median instead of mean for SPR baseline.
+            # A single extreme spread print pulls the arithmetic mean,
+            # biasing the ratio. Median is robust to outliers.
             if span_min >= 20:
-                spr_avg = statistics.mean(v for _, v in hist)
+                spr_avg = statistics.median(v for _, v in hist)
 
         if net_flow is None or spr_avg is None:
             why = []
             if net_flow is None:
-                why.append("net-flow warming (needs 10-30 min old snapshot)")
+                why.append("net-flow warming (needs 2-3 min old snapshot)")
             if spr_avg is None:
                 why.append("spread baseline warming (needs ~20 min history)")
             detail = (
