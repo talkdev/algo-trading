@@ -527,13 +527,18 @@ class DataManager:
         if state:
             ms = state.get("market_state", {})
             if ms:
-                self.spot   = ms.get("spot")   or self.spot
-                self.vix    = ms.get("vix")    or self.vix
-                self.iv_atm = ms.get("iv_atm") or self.iv_atm
-                self.rv_20d = ms.get("rv_20d") or self.rv_20d
-                self.skew   = ms.get("skew")   or self.skew
-                self.adx    = ms.get("adx")    or self.adx
-                self.ema_50 = ms.get("ema_50") or self.ema_50
+                # AUDIT DM-N03: use explicit None check so a
+                # valid 0.0 value is not discarded by `or`.
+                def _r(key, current):
+                    v = ms.get(key)
+                    return v if v is not None else current
+                self.spot   = _r("spot",   self.spot)
+                self.vix    = _r("vix",    self.vix)
+                self.iv_atm = _r("iv_atm", self.iv_atm)
+                self.rv_20d = _r("rv_20d", self.rv_20d)
+                self.skew   = _r("skew",   self.skew)
+                self.adx    = _r("adx",    self.adx)
+                self.ema_50 = _r("ema_50", self.ema_50)
                 logger.info(
                     f"Restored: spot={self.spot} "
                     f"vix={self.vix}"
@@ -617,6 +622,14 @@ class DataManager:
                             f"GET {resp.status} {url}: "
                             f"{body[:200]}"
                         )
+                        # AUDIT DM-10: do not retry permanent 4xx.
+                        # A 400/404 will never succeed; retrying
+                        # burns up to 31s in the data-refresh path.
+                        if 400 <= resp.status < 500:
+                            raise MaxRetriesError(
+                                f"Permanent {resp.status} GET {url}: "
+                                f"{body[:100]}"
+                            )
                         backoff = min(
                             config.RETRY_BACKOFF_BASE
                             * (2 ** attempt),
@@ -910,16 +923,37 @@ class DataManager:
             return (self.spot, self.vix)
 
     def _append_daily_return(self) -> None:
+        """
+        AUDIT DM-02: prev_spot is the spot from ~60s ago, not
+        yesterday's close. Annualising a 60s return with sqrt(252)
+        understates RV by ~an order of magnitude.
+        Fix: store the first spot of each session as
+        _prev_session_close and use that for daily returns.
+        compute_realized_vol() prefers candles_daily anyway;
+        this path is only a fallback.
+        """
         today = date.today()
         if self._last_return_date == today:
+            # Update today's session close for tomorrow's return
+            if self.spot and self.spot > 0:
+                self._current_session_close = float(self.spot)
             return
+        # New day: compute return from yesterday's session close
+        prev_close = getattr(self, "_prev_session_close", None)
         if (
-            self.spot and self.prev_spot
-            and self.prev_spot > 0
+            self.spot and self.spot > 0
+            and prev_close and prev_close > 0
         ):
             self.log_returns.append(
-                np.log(self.spot / self.prev_spot)
+                np.log(self.spot / prev_close)
             )
+        # Roll: today's open becomes tomorrow's prev_close
+        self._prev_session_close = getattr(
+            self, "_current_session_close", self.spot
+        )
+        self._current_session_close = (
+            float(self.spot) if self.spot else None
+        )
         self._last_return_date = today
 
     def _append_daily_vix(self) -> None:
@@ -1239,6 +1273,43 @@ class DataManager:
                 self._active_expiry, {}
             )
         return {}
+
+    def get_mark_price(
+        self,
+        opt_data: Dict,
+        fallback: float = 0.0,
+        max_quote_age_sec: float = 15.0,
+    ) -> float:
+        """
+        AUDIT DM-01: bid/ask are only updated by the 60s REST
+        poll, never by the WebSocket. LTP is updated by WS on
+        every tick. Use bid/ask midpoint only when the REST
+        quote is fresh (< max_quote_age_sec); otherwise prefer
+        the live-ticking LTP.
+        """
+        bid = float(opt_data.get("bid", 0) or 0)
+        ask = float(opt_data.get("ask", 0) or 0)
+        ltp = float(opt_data.get("ltp", 0) or 0)
+        rest_ts = opt_data.get("_rest_ts")
+        quote_fresh = False
+        if rest_ts:
+            try:
+                ts_dt = datetime.fromisoformat(rest_ts)
+                if ts_dt.tzinfo is None:
+                    ts_dt = self._IST.localize(ts_dt)
+                age = (
+                    datetime.now(self._IST) - ts_dt
+                ).total_seconds()
+                quote_fresh = age <= max_quote_age_sec
+            except Exception:
+                pass
+        if quote_fresh and bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        if ltp > 0:
+            return ltp
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        return fallback
 
     def _compute_skew(self) -> None:
         try:
@@ -2226,7 +2297,9 @@ class DataManager:
 
         except Exception as e:
             logger.error(f"check_margin error: {e}")
-            return (True, 0.0)
+            # AUDIT DM-08: fail CLOSED on exception.
+            # An API failure must not be interpreted as margin approved.
+            return (False, 0.0)
 
     # ─────────────────────────────────────────────────────────────
     # WebSocket

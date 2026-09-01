@@ -62,7 +62,10 @@ TOTAL_CAPITAL = 1_000_000
 LOT_SIZE          = 65
 NIFTY_STRIKE_STEP = 100    # weekly options 100-pt steps
 
-MAX_RISK_PER_TRADE_PCT   = 0.08
+# AUDIT CFG-02: was 0.08 (8%). One max-risk loss = 2.7x daily CB.
+# CB L1 (2%) fired before the designed stop on almost every trade.
+# 0.02 = two full losers fit within MAX_DAILY_LOSS_PCT=0.03.
+MAX_RISK_PER_TRADE_PCT   = 0.02
 MAX_COMBINED_RISK_PCT    = 0.20
 MAX_DAILY_LOSS_PCT       = 0.03
 MAX_DRAWDOWN_PCT         = 0.10
@@ -165,8 +168,9 @@ LOW_VIX_DELTA  = (0.22, 0.28)
 MID_VIX_DELTA  = (0.20, 0.25)
 HIGH_VIX_DELTA = (0.15, 0.20)
 
-MIN_PREMIUM_PCT = 0.008
-MAX_PREMIUM_PCT = 0.006
+# AUDIT CFG-N03: was inverted (MIN 0.008 > MAX 0.006).
+MIN_PREMIUM_PCT = 0.004
+MAX_PREMIUM_PCT = 0.012
 
 # ─────────────────────────────────────────────────────────────────────
 # REGIME DETECTION
@@ -185,7 +189,7 @@ WEIGHT_VOL   = 0.30   # reference: 0.30
 WEIGHT_EDGE  = 0.30   # reference: 0.30
 WEIGHT_TREND = 0.25   # reference: 0.25
 WEIGHT_FLOW  = 0.15   # reference: 0.15
-WEIGHT_FLOW  = 0.15
+# AUDIT CFG-05: removed duplicate WEIGHT_FLOW assignment
 assert abs(
     WEIGHT_VOL + WEIGHT_EDGE + WEIGHT_TREND + WEIGHT_FLOW
     - 1.0
@@ -301,19 +305,25 @@ CONDOR_DTE_MIN            = 4
 CONDOR_DTE_MAX            = 10     # widened from 7
 CONDOR_EXIT_DTE           = 1
 CONDOR_TARGET_PCT         = 0.50
-# LIVE FIX: 15 pts achievable at VIX=11 (was 100 — never met)
-CONDOR_MIN_CREDIT         = 40   # PATCH: raised from 15 (was thinner than modeled slippage+brokerage on a 400pt wing condor)
+# AUDIT CFG-01: minimum credit expressed as % of wing width.
+# At CONDOR_WING_WIDTH=400, 22% = 88 pts minimum.
+# Absolute fallback kept for reference only.
+CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.22
+CONDOR_MIN_CREDIT         = 40   # legacy absolute floor; builder uses PCT_OF_WIDTH above
 CONDOR_ADJUSTMENT_DELTA   = 0.35
 CONDOR_TESTED_SIDE_BUFFER = 100
-CONDOR_SIGMA_MULTIPLIER   = 1.0    # 1.0σ not 1.5σ
+# AUDIT SE-04/CFG-01: 1.5σ gives P(inside)≈86.6% vs 68.3% at 1.0σ.
+# Combined with credit/width rule this produces positive EV.
+CONDOR_SIGMA_MULTIPLIER   = 1.5
 
 # ── Credit spreads ────────────────────────────────────────────────────
 SPREAD_DELTA_SHORT    = 0.30
 SPREAD_DELTA_LONG     = 0.15
 SPREAD_EXIT_DTE       = 1
 SPREAD_TARGET_PCT     = 0.50
-# LIVE FIX: 10 pts achievable at VIX=11 (was 50 — never met)
-SPREAD_MIN_CREDIT     = 25   # PATCH: raised from 10 (was thinner than modeled slippage+brokerage)
+# AUDIT CFG-01: spread min credit as % of wing width.
+SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.25
+SPREAD_MIN_CREDIT     = 25   # legacy absolute floor; builder uses PCT_OF_WIDTH above
 SPREAD_ROLL_DELTA_TRIGGER  = 0.35
 SPREAD_SKEW_THRESHOLD      = 2.0
 
@@ -666,6 +676,10 @@ HIGH_IMPACT_EVENTS = {
 }
 
 HOLIDAY_CALENDAR_REVIEWED_ON = date(2026, 8, 31)
+# AUDIT CFG-06: max calendar year covered by NSE_MARKET_HOLIDAYS.
+# Preflight checks this against the current year and hard-fails
+# if the calendar does not cover the current year.
+HOLIDAY_CALENDAR_MAX_YEAR = 2026
 
 # ─────────────────────────────────────────────────────────────────────
 # TRADE CSV COLUMNS
