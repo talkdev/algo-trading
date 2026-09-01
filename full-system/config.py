@@ -64,8 +64,14 @@ NIFTY_STRIKE_STEP = 100    # weekly options 100-pt steps
 
 # AUDIT CFG-02: was 0.08 (8%). One max-risk loss = 2.7x daily CB.
 # CB L1 (2%) fired before the designed stop on almost every trade.
-# 0.02 = two full losers fit within MAX_DAILY_LOSS_PCT=0.03.
+# CFG-R01: 2x2%=4% > 3% daily limit, so two simultaneous max-risk
+# losses exceed the daily CB. The CB is reactive (fires after loss).
+# Reserve daily risk before entry; do not rely on the CB as a gate.
 MAX_RISK_PER_TRADE_PCT   = 0.02
+# CFG-R02: with MAX_RISK_PER_TRADE_PCT=0.02 and
+# MAX_CONCURRENT_POSITIONS=4, max theoretical exposure=8%.
+# This 20% limit is non-binding; real constraint is the sum
+# of position max_risk values checked in _pre_trade_checks.
 MAX_COMBINED_RISK_PCT    = 0.20
 MAX_DAILY_LOSS_PCT       = 0.03
 MAX_DRAWDOWN_PCT         = 0.10
