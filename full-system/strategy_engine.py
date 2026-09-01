@@ -2557,8 +2557,16 @@ class StrategyEngine:
             )
             return
 
-        for leg in legs:
-            leg.qty = leg.qty * lots
+        # AUDIT #N1: skip lot-scaling for strategies that
+        # pre-compute an absolute quantity (e.g. defensive hedge).
+        _already_sized = meta.get("already_sized", False)
+        if not _already_sized:
+            for leg in legs:
+                leg.qty = leg.qty * lots
+        else:
+            # Force lots=1 so downstream position-record
+            # fields (max_risk scaling etc.) stay consistent.
+            lots = 1
 
         # PATCH: store total estimated margin for this position
         # (per-lot heuristic estimate x final lot count), so
@@ -3921,8 +3929,25 @@ class StrategyEngine:
         self,
     ) -> Tuple[Optional[List[Leg]], Dict]:
         """Build long strangle for event volatility."""
-        expiry = self.dm.get_expiry_by_dte(7, tolerance=3)
+        expiry = self.dm.get_expiry_by_dte(
+            config.EVENT_STRANGLE_DTE_TARGET,
+            tolerance=config.EVENT_STRANGLE_DTE_TARGET - 2,
+        )
         if expiry is None:
+            return (None, {})
+        # AUDIT #N2: enforce upper DTE bound so a far-dated
+        # expiry is never silently used when the intended
+        # short-dated window is unavailable.
+        _n2_dte = (
+            datetime.strptime(expiry, "%Y-%m-%d").date()
+            - date.today()
+        ).days
+        if _n2_dte > config.EVENT_STRANGLE_DTE_MAX:
+            logger.info(
+                f"Strangle: expiry {expiry} DTE={_n2_dte} "
+                f"> max={config.EVENT_STRANGLE_DTE_MAX} "
+                f"— skip"
+            )
             return (None, {})
 
         call_strike = self.dm.get_strike_by_delta(
@@ -4149,6 +4174,10 @@ class StrategyEngine:
             "strategy_type":  "LONG",
             "reduction_legs": reduction_legs,
             "hedge_qty":      hedge_qty,
+            # AUDIT #N1: hedge_qty is already the correct
+            # absolute quantity — skip the generic lot-scaling
+            # multiplication in _enter_new_position().
+            "already_sized":  True,
         }
         return (legs, meta)
 
@@ -4745,6 +4774,12 @@ class StrategyEngine:
     def _calculate_lot_size(
         self, strategy_name: str, meta: Dict
     ) -> int:
+        # AUDIT #N1: defensive hedge pre-computes its own
+        # absolute quantity; return 1 so the generic pipeline
+        # never silently drops the hedge when capital is tight
+        # (which is exactly when it is needed most).
+        if strategy_name == config.STRAT_DEFENSIVE:
+            return 1
         max_loss_per_lot = meta.get("max_risk", 0)
         if max_loss_per_lot <= 0:
             return 0
