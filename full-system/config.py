@@ -189,7 +189,7 @@ MIN_VIX_SELL     = 9.5   # PATCHED: 11.0→9.5 (VRP positive below 11)
 # LOW_VIX (< 14): use wider delta range (more OTM, less credit but safer)
 # MID_VIX (14-18): standard range
 # HIGH_VIX (> 18): tighter delta range (closer strikes, more credit)
-LOW_VIX_DELTA  = (0.22, 0.28)
+LOW_VIX_DELTA  = (0.25, 0.32)   # SE-2/OPT-1: widened for VRP=80%+ at VIX<12
 MID_VIX_DELTA  = (0.20, 0.25)
 HIGH_VIX_DELTA = (0.15, 0.20)
 
@@ -436,7 +436,8 @@ MIN_VIX_CONDOR            = 16.0   # FIX-1a: MIN_VIX_CONDOR raised to 16.0 (Sep 
 # FIX-1i: MIN_VIX_STRADDLE and MIN_VIX_SPREAD
 # Straddle viable at VIX=12+ (2-leg slippage manageable)
 # Bull-put spread viable at VIX=12+ (NIFTY upward drift)
-MIN_VIX_STRADDLE          = 12.0
+MIN_VIX_STRADDLE          = 11.0   # MITIGATION-2C: lowered; VRP gate is primary guard
+MIN_VRP_STRADDLE_PP       = 3.0    # minimum VRP (pp) for straddle to be viable
 MIN_VIX_SPREAD            = 12.0
 # CFG-02: widened (same reasoning as straddle).
 CONDOR_DTE_MIN            = 2
@@ -485,7 +486,7 @@ SPREAD_TARGET_PCT     = 0.60  # PATCHED: 0.50→0.60
 # AUDIT CFG-01: spread min credit as % of wing width.
 # PRF-C05: lowered from 0.25 to 0.20 (same reasoning as condor).
 SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.08  # P1-1d: SPREAD_MIN_CREDIT_PCT_OF_WIDTH lowered (was 0.20)
-SPREAD_MIN_CREDIT     = 12   # P1-1a: SPREAD_MIN_CREDIT lowered (was 25, achievable at VIX=11 ~17pts)   # legacy absolute floor; builder uses PCT_OF_WIDTH above
+SPREAD_MIN_CREDIT     = 20   # SE-4/OPT-10: 2026 cost structure; 20pts = 15.4% cost ratio at 1 lot
 # C4-06: DEAD CONSTANT — no roll logic exists in strategy_engine.
 SPREAD_ROLL_DELTA_TRIGGER  = 0.35
 SPREAD_SKEW_THRESHOLD      = 3.0   # FIX-1g: SPREAD_SKEW_THRESHOLD raised to 3.0 (NIFTY structural put skew is 2-3pp; 2.0 fired on every session)
@@ -832,7 +833,7 @@ REGIME_MAX_LOTS = {
 # gates still apply on top of this.
 MAX_TRANCHES_PER_STRATEGY = 2
 
-REENTRY_COOLDOWN_SEC       = 1800  # P2-3: REENTRY_COOLDOWN_SEC raised (was 300s; NIFTY mean-reversion takes 15-30 min after stop)
+REENTRY_COOLDOWN_SEC       = 900   # SE-3/OPT-9: NIFTY mean-reverts in 15-20 min; composite change gate is primary guard
 # REENTRY_MAX_SPOT_MOVE_PCT lowered to 0.002 (0.2%). At 0.02 (2%,
 # ~500pt NIFTY move) the 300s timer always expires first, making
 # the price guard useless. 0.2% detects sharp intraday reversals.
