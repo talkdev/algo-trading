@@ -556,28 +556,48 @@ class DataManager:
                     f"vix={self.vix}"
                 )
 
-        # LIVE FIX: Bootstrap iv_rv_spread_history
-        # Without this, edge_score=0 for first 10 trading days.
-        # Seeds history with estimated spread so edge activates
-        # from day 1. Uses RV ≈ VIX × 0.70 (calm market estimate).
+        # RE-4 FIX: NIFTY-calibrated Gaussian bootstrap for
+        # iv_rv_spread_history.  The old code seeded identical values
+        # → std ≈ 0 → z-score explodes to 1000+ on first real data.
+        # Use a Gaussian with NIFTY structural VRP parameters so the
+        # z-score is meaningful from day 1.
+        #
+        # NIFTY VRP (IV - RV) characteristics 2026:
+        #   VIX < 12  : mean=3.5pp, std=0.7pp
+        #   VIX 12-15 : mean=4.5pp, std=0.9pp
+        #   VIX 15-20 : mean=5.5pp, std=1.2pp
+        #   VIX > 20  : mean=7.0pp, std=2.0pp
         if (
             self.iv_atm is not None
             and self.iv_atm > 0
             and self.vix is not None
             and self.vix > 0
-        ):
-            estimated_rv     = (self.vix / 100.0) * 0.70
-            estimated_spread = self.iv_atm - estimated_rv
-            min_hist = getattr(
-                config, "EDGE_SCORE_MIN_HISTORY", 3
+            and len(self.iv_rv_spread_history) < getattr(
+                config, "EDGE_SCORE_MIN_HISTORY", 20
             )
-            # edge_score=0 until real daily data accumulates (typically 3 trading days).
+        ):
+            _vix_b = self.vix
+            if _vix_b < 12:
+                _mean_b, _std_b = 0.035, 0.007
+            elif _vix_b < 15:
+                _mean_b, _std_b = 0.045, 0.009
+            elif _vix_b < 20:
+                _mean_b, _std_b = 0.055, 0.012
+            else:
+                _mean_b, _std_b = 0.070, 0.020
+            import random as _rand_b
+            _rand_b.seed(42)
+            _needed_b = getattr(
+                config, "EDGE_SCORE_MIN_HISTORY", 20
+            ) - len(self.iv_rv_spread_history)
+            for _ in range(_needed_b):
+                _s = max(0.005, _rand_b.gauss(_mean_b, _std_b))
+                self.iv_rv_spread_history.append(_s)
             logger.info(
-                f"Bootstrapped iv_rv_spread_history: "
-                f"iv_atm={self.iv_atm:.4f} "
-                f"est_rv={estimated_rv:.4f} "
-                f"spread={estimated_spread:.4f} "
-                f"({min_hist} entries)"
+                f"RE-4: Bootstrapped iv_rv_spread_history: "
+                f"{_needed_b} values "
+                f"mean={_mean_b*100:.1f}pp std={_std_b*100:.1f}pp "
+                f"at VIX={_vix_b:.1f}"
             )
 
         logger.info("DataManager initialized")
@@ -1320,33 +1340,40 @@ class DataManager:
                         f"({self.iv_atm*100:.2f}%)"
                     )
 
-                    # Bootstrap iv_rv_spread if empty
-                    # (also done in initialize() but
-                    #  chain may load after initialize)
+                    # RE-4 FIX: NIFTY-calibrated Gaussian bootstrap
+                    # (also applied in initialize(); chain may load
+                    #  after initialize so we repeat here).
                     if (
-                        len(self.iv_rv_spread_history) == 0
+                        len(self.iv_rv_spread_history) < getattr(
+                            config, "EDGE_SCORE_MIN_HISTORY", 20
+                        )
                         and self.vix is not None
                         and self.vix > 0
                     ):
-                        estimated_rv = (
-                            self.vix / 100.0
-                        ) * 0.70
-                        estimated_spread = (
-                            self.iv_atm - estimated_rv
-                        )
-                        min_hist = getattr(
-                            config,
-                            "EDGE_SCORE_MIN_HISTORY",
-                            3,
-                        )
-                        for _ in range(min_hist):
-                            self.iv_rv_spread_history.append(
-                                estimated_spread
+                        _vix_c = self.vix
+                        if _vix_c < 12:
+                            _mc, _sc = 0.035, 0.007
+                        elif _vix_c < 15:
+                            _mc, _sc = 0.045, 0.009
+                        elif _vix_c < 20:
+                            _mc, _sc = 0.055, 0.012
+                        else:
+                            _mc, _sc = 0.070, 0.020
+                        import random as _rand_c
+                        _rand_c.seed(43)
+                        _need_c = getattr(
+                            config, "EDGE_SCORE_MIN_HISTORY", 20
+                        ) - len(self.iv_rv_spread_history)
+                        for _ in range(_need_c):
+                            _s = max(
+                                0.005,
+                                _rand_c.gauss(_mc, _sc),
                             )
+                            self.iv_rv_spread_history.append(_s)
                         logger.info(
-                            f"Bootstrapped iv_rv_spread "
-                            f"(from chain): "
-                            f"spread={estimated_spread:.4f}"
+                            f"RE-4 (chain): Bootstrapped "
+                            f"{_need_c} VRP values "
+                            f"mean={_mc*100:.1f}pp at VIX={_vix_c:.1f}"
                         )
 
             self._compute_skew()
@@ -1889,6 +1916,22 @@ class DataManager:
             if not active:
                 return {}
 
+            # BUG-3 FIX (a): skip first 5 minutes after market open.
+            # Upstox OI data lags 3-5 min at the open; null values
+            # cause float(None) TypeError.
+            _now_ist = datetime.now(self._IST)
+            _open_dt = self._IST.localize(
+                datetime.combine(
+                    _now_ist.date(), config.MARKET_OPEN
+                )
+            )
+            if (_now_ist - _open_dt).total_seconds() < 300:
+                logger.debug(
+                    "fetch_oi_snapshot: skipping first 5 min "
+                    "(Upstox OI data lags at NIFTY open)"
+                )
+                return {}
+
             prev_snapshot = (
                 dict(self.oi_snapshots[-1])
                 if self.oi_snapshots
@@ -1896,11 +1939,21 @@ class DataManager:
             )
             snapshot: Dict[float, Dict] = {}
 
+            # BUG-3 FIX (b): safe OI extraction handles None values.
+            def _safe_oi(d: dict, key: str = "oi") -> float:
+                v = d.get(key)
+                if v is None:
+                    return 0.0
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return 0.0
+
             for strike, data in active.items():
                 call_data  = data["call"]
                 put_data   = data["put"]
-                call_oi    = float(call_data.get("oi", 0))
-                put_oi     = float(put_data.get("oi",  0))
+                call_oi    = _safe_oi(call_data)
+                put_oi     = _safe_oi(put_data)
                 call_delta = _sf(
                     call_data.get("delta"),
                     0.0,
@@ -2075,11 +2128,15 @@ class DataManager:
         if best_strike is not None and best_diff <= tolerance:
             return best_strike
 
-        if best_strike is not None and best_diff <= 0.05:
+        # DQ-4 FIX: at VIX=11-12 the delta curve is flat OTM so the
+        # nearest available strike can be 0.03-0.06 delta away from
+        # the target.  Widen the hard fallback from 0.05 to 0.08 to
+        # avoid returning None and causing builder failures.
+        if best_strike is not None and best_diff <= 0.08:
             logger.warning(
                 f"get_strike_by_delta: widened tolerance "
                 f"{option_type} delta={target_delta:.2f} "
-                f"strike={best_strike}"
+                f"strike={best_strike} diff={best_diff:.3f}"
             )
             return best_strike
 
@@ -2313,24 +2370,37 @@ class DataManager:
                 logger.error(f"compute_iv_rank error: {e}")
                 return 55.0
 
-        if len(self.iv_atm_history) < 10:
-            return None
+        # SE-5 FIX: fallback chain when daily history is insufficient.
+        # Priority:
+        #   1. Intraday iv_atm_history (up to 22,500 readings)
+        #   2. VIX percentile proxy (VIX 10→0%, VIX 25→100%)
+        #   3. 50.0 absolute last resort
         if self.iv_atm is None:
             return None
-        try:
-            history = list(self.iv_atm_history)
-            iv_high = max(history)
-            iv_low  = min(history)
-            if abs(iv_high - iv_low) < 1e-10:
-                return 50.0
-            rank = (
-                (self.iv_atm - iv_low)
-                / (iv_high - iv_low)
-            ) * 100.0
-            return float(max(0.0, min(100.0, rank)))
-        except Exception as e:
-            logger.error(f"compute_iv_rank error: {e}")
-            return 50.0
+
+        # Fallback 1: intraday ATM history
+        if len(self.iv_atm_history) >= 30:
+            try:
+                _intra = list(self.iv_atm_history)[-252:]
+                _hi = max(_intra)
+                _lo = min(_intra)
+                if (_hi - _lo) > 0.002:   # > 0.2pp meaningful range
+                    _rank = (
+                        (self.iv_atm - _lo) / (_hi - _lo)
+                    ) * 100.0
+                    return float(max(0.0, min(100.0, _rank)))
+            except Exception:
+                pass
+
+        # Fallback 2: VIX percentile proxy
+        if self.vix is not None and self.vix > 0:
+            _vix_rank = max(
+                0.0,
+                min(100.0, (self.vix - 10.0) / 15.0 * 100.0),
+            )
+            return float(_vix_rank)
+
+        return 50.0
 
     def iv_rank_edge_signal(self) -> Optional[int]:
         """C4-11: return edge signal from IV rank using config thresholds.
@@ -3134,45 +3204,95 @@ class DataManager:
             )
 
     async def _reconnect_websocket(self) -> None:
-        """Reconnect WS. Never sets kill_switch_triggered."""
-        # FIX-2-WS-MARKET-HOURS-GUARD
-        # Suppress reconnect outside market hours. After-hours WS
-        # tokens are expired; every attempt returns HTTP 403 and
-        # generates noisy CRITICAL log lines with no trading benefit.
+        """
+        Reconnect WS.  Never sets kill_switch_triggered.
+
+        BUG-4 / WS-2 FIX: HTTP 403 backoff.
+        After the Upstox access token expires, every reconnect
+        attempt returns HTTP 403.  The old code retried every ~16s
+        generating 38 errors/hour with no benefit.
+        Fix: after 3 consecutive 403s, back off for 15 minutes.
+        The engine continues in REST-only mode during the backoff.
+        """
         try:
-            _rw_now = datetime.now(pytz.timezone(config.TZ))
-            _rw_time = _rw_now.time()
+            _rw_now      = datetime.now(pytz.timezone(config.TZ))
+            _rw_time     = _rw_now.time()
             _rw_date_str = _rw_now.date().strftime("%Y-%m-%d")
-            _rw_is_trading = (
+            _is_trading  = (
                 _rw_now.date().weekday() < 5
                 and _rw_date_str not in config.NSE_MARKET_HOLIDAYS
             )
-            _rw_is_market = (
+            _is_market = (
                 config.MARKET_OPEN <= _rw_time <= config.MARKET_CLOSE
             )
-            if not (_rw_is_trading and _rw_is_market):
+            if not (_is_trading and _is_market):
                 logger.debug(
                     "WS reconnect suppressed: outside market hours "
-                    f"(time={_rw_time}, trading={_rw_is_trading})"
+                    f"(time={_rw_time}, trading={_is_trading})"
                 )
                 self.ws_last_msg_time = _rw_now
                 return
+
+            # 403 backoff check
+            _consec_403    = getattr(self, "_consecutive_403_count", 0)
+            _backoff_until = getattr(self, "_403_backoff_until", None)
+            if _consec_403 >= 3:
+                if _backoff_until and _rw_now < _backoff_until:
+                    logger.debug(
+                        "WS: 403 backoff active until "
+                        f"{_backoff_until.strftime('%H:%M:%S')} "
+                        "— REST-only mode"
+                    )
+                    self.ws_last_msg_time = _rw_now
+                    return
+                # Set a fresh 15-minute backoff window
+                from datetime import timedelta as _td
+                self._403_backoff_until = _rw_now + _td(minutes=15)
+                logger.warning(
+                    f"WS: {_consec_403} consecutive HTTP 403 errors. "
+                    "Access token likely expired. "
+                    "Backing off WS reconnect for 15 min. "
+                    "REST-only mode active. "
+                    "Refresh env.txt token to restore WS."
+                )
+                self.ws_last_msg_time = _rw_now
+                return
+
         except Exception:
-            pass  # timezone check failure: proceed with reconnect
-        logger.info('Attempting WS reconnect...')
+            pass
+
+        logger.info("Attempting WS reconnect...")
         self.ws_connected      = False
         self._ws_decode_errors = 0
+
         for attempt in range(config.WS_RECONNECT_ATTEMPTS):
             try:
                 await asyncio.sleep(config.WS_RECONNECT_DELAY_SEC)
                 await self.start_websocket()
-                logger.info('WS reconnected')
-                return
+                if self.ws_connected:
+                    self._consecutive_403_count = 0
+                    self._403_backoff_until      = None
+                    logger.info("WS reconnected successfully")
+                    return
             except Exception as e:
-                logger.error(f'WS reconnect {attempt+1} failed: {e}')
+                _err = str(e)
+                if "403" in _err:
+                    self._consecutive_403_count = (
+                        getattr(self, "_consecutive_403_count", 0) + 1
+                    )
+                    logger.warning(
+                        f"WS reconnect {attempt + 1}: HTTP 403 "
+                        f"(consecutive={self._consecutive_403_count})"
+                    )
+                else:
+                    self._consecutive_403_count = 0
+                    logger.error(
+                        f"WS reconnect {attempt + 1} failed: {e}"
+                    )
+
         logger.warning(
-            'All WS reconnect attempts failed. '
-            'Engine continues with REST-only data.'
+            "All WS reconnect attempts failed. "
+            "Engine continues with REST-only data."
         )
         self.ws_last_msg_time = datetime.now(
             pytz.timezone(config.TZ)
