@@ -3135,6 +3135,30 @@ class DataManager:
 
     async def _reconnect_websocket(self) -> None:
         """Reconnect WS. Never sets kill_switch_triggered."""
+        # FIX-2-WS-MARKET-HOURS-GUARD
+        # Suppress reconnect outside market hours. After-hours WS
+        # tokens are expired; every attempt returns HTTP 403 and
+        # generates noisy CRITICAL log lines with no trading benefit.
+        try:
+            _rw_now = datetime.now(pytz.timezone(config.TZ))
+            _rw_time = _rw_now.time()
+            _rw_date_str = _rw_now.date().strftime("%Y-%m-%d")
+            _rw_is_trading = (
+                _rw_now.date().weekday() < 5
+                and _rw_date_str not in config.NSE_MARKET_HOLIDAYS
+            )
+            _rw_is_market = (
+                config.MARKET_OPEN <= _rw_time <= config.MARKET_CLOSE
+            )
+            if not (_rw_is_trading and _rw_is_market):
+                logger.debug(
+                    "WS reconnect suppressed: outside market hours "
+                    f"(time={_rw_time}, trading={_rw_is_trading})"
+                )
+                self.ws_last_msg_time = _rw_now
+                return
+        except Exception:
+            pass  # timezone check failure: proceed with reconnect
         logger.info('Attempting WS reconnect...')
         self.ws_connected      = False
         self._ws_decode_errors = 0
