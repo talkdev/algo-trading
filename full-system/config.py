@@ -86,7 +86,7 @@ POSITION_SIZE_PCT        = 0.15
 # C4-06: DEAD CONSTANT — only referenced in testing.py stub.
 # Real costs use the itemised COST_* constants in _calculate_transaction_costs.
 TRANSACTION_COST_PCT     = 0.0005
-MAX_CONCURRENT_POSITIONS = 4
+MAX_CONCURRENT_POSITIONS = 2    # INTRADAY: max 2 positions
 
 # CAL-RISK: derived from MAX_RISK_PER_TRADE_PCT above
 # At 0.015 * 1,000,000 = Rs15,000 per trade
@@ -265,9 +265,9 @@ EDGE_MIN_SPREAD_STD_PP = 0.25
 # (regime_engine.adx14 default n=14). The old value of 26
 # was never passed anywhere and has been corrected here.
 ADX_PERIOD          = 14
-ADX_TREND_THRESHOLD = 18   # PATCHED: 20→18 (30-min bar calibration)
-ADX_RANGE_THRESHOLD = 13   # PATCHED: 15→13
-EMA_PERIOD          = 50
+ADX_TREND_THRESHOLD = 25   # INTRADAY: higher threshold for noisy 5-min bars
+ADX_RANGE_THRESHOLD = 18   # INTRADAY: calibrated for 5-min bars
+EMA_PERIOD          = 20    # INTRADAY: EMA-20 on 5-min = 100 minutes
 # EMA_SLOPE_THRESHOLD corrected to 0.05 (percentage units).
 # regime_engine computes slope_pct = slope/spot*100 (a percentage
 # like 0.05 for 0.05%). The old value 0.0005 made the condition
@@ -277,11 +277,11 @@ EMA_PERIOD          = 50
 # (trending/unfavorable) ~80%+ of sessions. The +1 (range-bound,
 # favorable for premium selling) almost never fired. 0.15% (~37.5 pts)
 # better separates genuine directional trends from intraday noise.
-EMA_SLOPE_THRESHOLD = 0.15
+EMA_SLOPE_THRESHOLD = 0.05  # INTRADAY: smaller for 5-min bars
 
 # LIVE FIX: "30minute" is valid Upstox interval
 # "15minute" and "1day" return HTTP 400
-ADX_CANDLE_TIMEFRAME   = "30minute"
+ADX_CANDLE_TIMEFRAME   = "5minute"    # INTRADAY: 5-min bars
 DAILY_CANDLE_TIMEFRAME = "day"
 
 ADX_CANDLE_COUNT = 400
@@ -292,7 +292,7 @@ BARS_PER_DAY     = 13
 # IMM-06: lowered from 300 to 60 to align with main loop cadence.
 # ADX and EMA can be stale for up to 5 minutes at 300s, causing
 # delayed regime changes. At 60s the trend module is always fresh.
-CANDLE_REFRESH_SECONDS = 1800  # NIFTY 30-minute candle refresh
+CANDLE_REFRESH_SECONDS = 300   # INTRADAY: refresh every 5 minutes
 CANDLE_LOOKBACK_DAYS   = 45   # PATCH: was 30 — too tight for RV_LOOKBACK_DAYS=20 after weekend/holiday attrition
 # PRF-C10: raised from 15 to 30. NSE OI updates every 3-5 min.
 # 15-min window = 3-5 updates (noisy). 30-min = 6-10 updates,
@@ -415,10 +415,10 @@ STRAT_STRANGLE       = "LONG_STRANGLE_EVENT"
 # monotonically with DTE while P(stop) does not increase.
 # Confining to DTE<=4 was the least favourable point on the curve.
 STRADDLE_DTE_MIN       = 1
-STRADDLE_DTE_MAX       = 8    # was 4    # widened from 7
+STRADDLE_DTE_MAX       = 1    # INTRADAY: straddles only 0DTE or 1DTE
 STRADDLE_STOP_MULT     = 1.5   # FIX-1e: STRADDLE_STOP_MULT raised to 1.5 (1.2x fired on noise at VIX=12-14; 1.5x calibrated for Sep 2026)   # PATCHED: 2.0→1.2; break-even WR 80%→70.6%
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning).
-STRADDLE_TARGET_PCT    = 0.60  # PATCHED: 0.50→0.60
+STRADDLE_TARGET_PCT    = 0.40  # INTRADAY: take profits faster
 STRADDLE_EXIT_DTE      = 2   # FIX-1d: STRADDLE_EXIT_DTE raised to 2 (Monday DTE=1 has 3-4x gamma of Wednesday; exit Monday morning safely)
 STRADDLE_MAX_DEBIT_PCT = 0.025
 STRADDLE_POLL_SECONDS  = 5
@@ -445,7 +445,7 @@ CONDOR_DTE_MAX            = 8    # was 5     # widened from 7
 # EXE-02: set to 1. With TIME_EXIT_EXPIRY=13:30, holding to DTE=0
 # is dangerous. Exit at DTE=1 harvests 95%+ of theta without the
 # terminal gamma tail risk from 0-DTE institutional hedging flows.
-CONDOR_EXIT_DTE           = 2   # P4-5: CONDOR_EXIT_DTE raised (was 1; at DTE=1 closing costs exceed remaining theta; DTE=2 is profitable to close)
+CONDOR_EXIT_DTE           = 0   # INTRADAY: always close same day
 # PRF-C01: lowered from 0.60 to 0.50. 50% target is reached faster
 # (typically 1-2 days vs 3-4 days for 65%), reducing time-in-trade
 # and gamma exposure. With 2.0x stop: R:R = 0.50/2.0 = 0.25.
@@ -480,7 +480,7 @@ SPREAD_DELTA_SHORT    = 0.25   # ARCH-1a: SPREAD_DELTA_SHORT raised (was 0.20; 0
 # delta spread gives adequate wing protection and defined risk.
 SPREAD_DELTA_LONG     = 0.12   # FIX-2026-C: SPREAD_DELTA_LONG raised to 0.12 (was 0.08; 0.08 delta long = 600pts OTM = 300pt wing; 0.12 delta long = 450pts OTM = 150pt wing; credit/risk improves from 7.3%% to 12%%)
 # EXE-02: set to 1 (same reasoning as condor).
-SPREAD_EXIT_DTE       = 1
+SPREAD_EXIT_DTE       = 0    # INTRADAY: always close same day
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning as condor).
 SPREAD_TARGET_PCT     = 0.60  # PATCHED: 0.50→0.60
 # AUDIT CFG-01: spread min credit as % of wing width.
@@ -573,7 +573,7 @@ EVENT_WINDOW_AFTER_HOURS       = 2
 # ─────────────────────────────────────────────────────────────────────
 # C4-06: DEAD CONSTANT — never referenced in any decision path.
 STATIC_STOP_PCT         = 0.10
-PROFIT_TARGET_PCT       = 0.50
+PROFIT_TARGET_PCT       = 0.40  # INTRADAY: take profits faster
 DEBIT_PROFIT_TARGET_PCT = 0.50
 
 # C4-01: VIX-scaled stop model — now wired into _build_short_straddle.
@@ -627,8 +627,8 @@ STRIKE_SELECT_TIME = time(9, 17)
 # have the widest bid-ask spreads and most erratic price discovery.
 # 09:35 lets the opening settle without meaningfully reducing the
 # trading window (4h25m vs 4h30m). Reduces entry slippage.
-EXEC_START_TIME    = time(9, 30, 0)   # PATCHED: avoids opening auction + initial noise
-EXEC_END_TIME      = time(14, 30, 0)   # PATCHED: was 11:00 — enables trading all day
+EXEC_START_TIME    = time(9, 20, 0)   # INTRADAY: catch early IV before 09:30
+EXEC_END_TIME      = time(12, 30, 0)   # INTRADAY: no new entries after 12:30
 
 REGIME_FREEZE_TIME = time(14, 45)
 TIME_EXIT_NORMAL   = time(15, 15)
@@ -650,6 +650,14 @@ TIME_EXIT_EXPIRY   = time(13, 30)
 assert TIME_EXIT_EXPIRY < TIME_EXIT_NORMAL, (
     "TIME_EXIT_EXPIRY must be before TIME_EXIT_NORMAL"
 )
+
+# INTRADAY: hard exit and 0DTE timing constants
+INTRADAY_HARD_EXIT_TIME  = time(14, 45, 0)   # hard close ALL positions
+ZERO_DTE_EXIT_TIME       = time(13, 30, 0)   # 0DTE force close (Tuesday)
+ZERO_DTE_ENTRY_CUTOFF    = time(11, 30, 0)   # no new 0DTE after 11:30
+MONDAY_STRADDLE_START    = time(10,  0, 0)   # Monday: no straddle before 10:00
+INTRADAY_MAX_HOLD_MINUTES = 180               # close after 3 hours max
+
 
 MARKET_OPEN            = time(9, 15)
 MARKET_CLOSE           = time(15, 30)
@@ -818,12 +826,13 @@ REGIME_CAPITAL_PCT = {
 }
 
 REGIME_MAX_LOTS = {
-    "STRONG_SELL_VOL": 8,
-    "MILD_SELL_VOL":   6,
-    "NEUTRAL":         3,
-    "BUY_VOL":         3,
-    "STRONG_BUY_VOL":  4,
-    "EVENT_HEDGE":     2,
+    # INTRADAY: halved from multi-day values (gamma risk)
+    "STRONG_SELL_VOL": 3,
+    "MILD_SELL_VOL":   2,
+    "NEUTRAL":         1,
+    "BUY_VOL":         2,
+    "STRONG_BUY_VOL":  2,
+    "EVENT_HEDGE":     1,
 }
 
 # PATCH: allow up to this many concurrent positions of the SAME
@@ -832,6 +841,22 @@ REGIME_MAX_LOTS = {
 # position outright. Existing capital / MAX_CONCURRENT_POSITIONS
 # gates still apply on top of this.
 MAX_TRANCHES_PER_STRATEGY = 2
+
+# INTRADAY: VWAP and Opening Range parameters
+VWAP_NEAR_THRESHOLD_PCT   = 0.15
+VWAP_FAR_THRESHOLD_PCT    = 0.30
+VWAP_ENTRY_BLOCK_PCT      = 0.30
+VWAP_MIN_BARS             = 6
+OR_NARROW_PCT             = 0.20
+OR_WIDE_PCT               = 0.50
+OR_BUFFER_PCT             = 0.10
+IV_CRUSH_THRESHOLD        = 0.10
+IV_SPIKE_THRESHOLD        = 0.15
+IV_STABLE_BAND            = 0.05
+ZERO_DTE_STOP_MULT        = 1.30
+ZERO_DTE_TARGET_PCT       = 0.35
+ZERO_DTE_MAX_LOTS         = 2
+
 
 REENTRY_COOLDOWN_SEC       = 900   # SE-3/OPT-9: NIFTY mean-reverts in 15-20 min; composite change gate is primary guard
 # REENTRY_MAX_SPOT_MOVE_PCT lowered to 0.002 (0.2%). At 0.02 (2%,

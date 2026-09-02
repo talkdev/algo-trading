@@ -403,6 +403,9 @@ class RegimeEngine:
             logger.warning("Regime refresh skipped: chain empty")
             return self.confirmed_regime
 
+        # INTRADAY: reset session state at start of new day
+        self._intraday_session_reset()
+
         self._refresh_count += 1
         now = datetime.now(self._IST)
 
@@ -594,13 +597,95 @@ class RegimeEngine:
 
         return self.confirmed_regime
 
+    # ----------------------------------------------------------------
+    # INTRADAY SESSION RESET
+    # ----------------------------------------------------------------
+
+    def _intraday_session_reset(self) -> None:
+        # Reset intraday state at start of new session.
+        today = datetime.now(self._IST).date()
+        if getattr(self, '_intraday_session_date', None) == today:
+            return
+        self._intraday_session_date = today
+        self._buf  = {m: [] for m in MODULES}
+        self._conf = {m: 0.0 for m in MODULES}
+        logger.info(
+            f'RegimeEngine: intraday session reset for {today}'
+        )
+
     # ─────────────────────────────────────────────────────────────────
     # Step 1: Vol surface
     # ─────────────────────────────────────────────────────────────────
 
     def _module_vol(
         self, now: datetime
+    ) -> Tuple[Optional[float], str]:
+        # INTRADAY MODULE 1: Opening Range + VWAP structure score.
+        # Narrow OR = range-bound day. Spot inside OR near VWAP = sell premium.
+        spot = self.dm.spot
+        if spot is None:
+            return None, 'no spot'
+        if not self.dm.opening_range_set:
+            return None, 'opening range not established'
+        or_high  = self.dm.opening_range_high
+        or_low   = self.dm.opening_range_low
+        or_width = self.dm.opening_range_width
+        if or_high is None or or_low is None or or_width is None:
+            return None, 'opening range values missing'
+        or_width_pct = or_width / spot * 100.0
+        narrow_pct   = getattr(config, 'OR_NARROW_PCT', 0.20)
+        wide_pct     = getattr(config, 'OR_WIDE_PCT',   0.50)
+        if or_width_pct < narrow_pct:
+            width_score = 1.0
+            width_tag   = f'NARROW({or_width:.0f}pts)'
+        elif or_width_pct < wide_pct:
+            frac        = (or_width_pct - narrow_pct) / (wide_pct - narrow_pct)
+            width_score = 1.0 - 2.0 * frac
+            width_tag   = f'MODERATE({or_width:.0f}pts)'
+        else:
+            width_score = -1.0
+            width_tag   = f'WIDE({or_width:.0f}pts)'
+        buf = or_width * getattr(config, 'OR_BUFFER_PCT', 0.10)
+        if or_low + buf <= spot <= or_high - buf:
+            or_score = 1.0
+            or_tag   = 'INSIDE_OR'
+        elif spot > or_high + buf:
+            excess   = min(1.0, (spot - or_high) / or_width)
+            or_score = -excess
+            or_tag   = f'ABOVE_OR(+{spot - or_high:.0f})'
+        elif spot < or_low - buf:
+            excess   = min(1.0, (or_low - spot) / or_width)
+            or_score = -excess
+            or_tag   = f'BELOW_OR(-{or_low - spot:.0f})'
+        else:
+            or_score = 0.0
+            or_tag   = 'AT_OR_BOUNDARY'
+        vwap_score = self.dm.get_vwap_trend_score()
+        vwap_tag   = (
+            f'VWAP={self.dm.vwap:.0f}({self.dm.vwap_distance_pct:+.2f}%%)'
+            f'[{self.dm.vwap_signal}]'
+            if self.dm.vwap else 'VWAP_PENDING'
+        )
+        raw = max(-1.0, min(1.0,
+            0.40 * width_score
+            + 0.35 * or_score
+            + 0.25 * vwap_score
+        ))
+        detail = (
+            f'OR={or_low:.0f}-{or_high:.0f} [{width_tag}] | '
+            f'spot={spot:.0f} [{or_tag}] | {vwap_tag}'
+        )
+        logger.info(f'Vol(structure): score={raw:.3f} | {detail}')
+        self._last_vol_detail = {
+            'term_score': None, 'skew_score': None,
+            'fwd_iv_is_vix_proxy': 0,
+        }
+        return raw, detail
+
+    def _module_vol_SKIP(
+        self, now: datetime
     ) -> Tuple[Optional[int], str]:
+        # Original multi-day vol surface kept for reference.
         """
         Reference algorithm Step 1:
         Term spread (V_fwd - V_spot) + 25d-Put/Call skew z-score.
@@ -826,7 +911,58 @@ class RegimeEngine:
     # Step 2: Edge (RV vs IV)
     # ─────────────────────────────────────────────────────────────────
 
-    def _module_edge(self) -> Tuple[Optional[int], str]:
+    def _module_edge(self) -> Tuple[Optional[float], str]:
+        # INTRADAY MODULE 2: IV behavior score.
+        # CRUSHING=+1.0, DECLINING=+0.6, STABLE=+0.4, RISING=0.0, SPIKING=-1.0
+        iv_atm = self.dm.iv_atm
+        if iv_atm is None or iv_atm <= 0:
+            return None, 'no IV_ATM'
+        iv_behavior = self.dm.iv_behavior
+        iv_chg      = self.dm.iv_atm_change_pct
+        iv_score_map = {
+            'CRUSHING':  1.0,
+            'DECLINING': 0.6,
+            'STABLE':    0.4,
+            'RISING':    0.0,
+            'SPIKING':  -1.0,
+        }
+        iv_beh_score = iv_score_map.get(iv_behavior, 0.0)
+        iv_tag       = f'{iv_behavior}({iv_chg * 100:+.1f}%%)'
+        rv = self.dm.get_estimated_rv()
+        if rv is not None and rv > 0:
+            rv_pct  = rv * 100.0
+            iv_pct  = iv_atm * 100.0
+            vrp_pp  = iv_pct - rv_pct
+            vrp_rel = vrp_pp / rv_pct if rv_pct > 0 else 0.0
+            if vrp_rel >= 0.50:
+                vrp_score = 1.0
+                vrp_tag   = f'RICH(VRP={vrp_pp:.1f}pp)'
+            elif vrp_rel >= 0.25:
+                vrp_score = 0.5
+                vrp_tag   = f'MODERATE(VRP={vrp_pp:.1f}pp)'
+            elif vrp_rel >= 0.0:
+                vrp_score = 0.0
+                vrp_tag   = f'FAIR(VRP={vrp_pp:.1f}pp)'
+            else:
+                vrp_score = -1.0
+                vrp_tag   = f'CHEAP(VRP={vrp_pp:.1f}pp)'
+        else:
+            vrp_score = 0.0
+            vrp_tag   = 'VRP_UNAVAILABLE'
+            vrp_pp    = 0.0
+        raw = max(-1.0, min(1.0, 0.60 * iv_beh_score + 0.40 * vrp_score))
+        detail = f'IV={iv_atm * 100:.2f}%% [{iv_tag}] | {vrp_tag}'
+        logger.info(f'Edge(IV): score={raw:.3f} | {detail}')
+        self._last_edge_detail = {
+            'iv_atm_pct': iv_atm * 100.0,
+            'rv_pct': rv * 100.0 if rv else None,
+            'vrp_pp': vrp_pp,
+            'rv_is_estimated': 1,
+        }
+        return raw, detail
+
+    def _module_edge_SKIP(self) -> Tuple[Optional[int], str]:
+        # Original multi-day edge module kept for reference.
         """
         Reference algorithm Step 2:
         IV_atm - RV(20d). Rich = sell vol, Cheap = buy vol.
@@ -1043,7 +1179,68 @@ class RegimeEngine:
     # Step 3: Trend (ADX + EMA slope)
     # ─────────────────────────────────────────────────────────────────
 
-    def _module_trend(self) -> Tuple[Optional[int], str]:
+    def _module_trend(self) -> Tuple[Optional[float], str]:
+        # INTRADAY MODULE 3: 5-min ADX + VWAP direction.
+        # ADX < 18 = range-bound = +1.0 (sell both sides)
+        # ADX 18-25 = mild trend = 0.0 (defined risk only)
+        # ADX > 25 = trending = -1.0 (avoid selling)
+        bars = list(self.dm.candles_5m)
+        if len(bars) < 30:
+            return None, f'insufficient 5-min bars: {len(bars)}/30'
+        spot = self.dm.spot
+        if not spot:
+            return None, 'no spot'
+        ax = adx14([
+            {'h': b['high'], 'l': b['low'], 'c': b['close']}
+            for b in bars
+        ], n=14)
+        if ax is None:
+            return None, 'ADX computation failed'
+        adx_v, pdi, ndi = ax
+        trend_thresh = getattr(config, 'ADX_TREND_THRESHOLD', 25)
+        range_thresh = getattr(config, 'ADX_RANGE_THRESHOLD', 18)
+        if adx_v < range_thresh:
+            adx_score = 1.0
+            adx_tag   = f'RANGE_BOUND(ADX={adx_v:.1f})'
+        elif adx_v < trend_thresh:
+            adx_score = 0.0
+            adx_tag   = f'MILD_TREND(ADX={adx_v:.1f})'
+        else:
+            adx_score = -1.0
+            adx_tag   = f'TRENDING(ADX={adx_v:.1f})'
+        vwap_sig = self.dm.vwap_signal
+        if vwap_sig == 'NEAR_VWAP':
+            vwap_mod = 0.3
+        elif vwap_sig in ('BULLISH', 'BEARISH'):
+            vwap_mod = -0.2
+        elif vwap_sig in ('DIVERGENCE_UP', 'DIVERGENCE_DOWN'):
+            vwap_mod = 0.1
+        else:
+            vwap_mod = 0.0
+        raw = max(-1.0, min(1.0, adx_score + 0.30 * vwap_mod))
+        if pdi > ndi and self.dm.vwap_distance_pct > 0.10:
+            direction = 'BULLISH'
+        elif ndi > pdi and self.dm.vwap_distance_pct < -0.10:
+            direction = 'BEARISH'
+        else:
+            direction = 'NEUTRAL'
+        detail = (
+            f'ADX(5min)={adx_v:.1f} [{adx_tag}] | '
+            f'+DI={pdi:.1f} -DI={ndi:.1f} | '
+            f'VWAP={vwap_sig}(mod={vwap_mod:+.1f}) | '
+            f'direction={direction}'
+        )
+        logger.info(f'Trend(5min): score={raw:.3f} | {detail}')
+        self._last_trend_detail = {
+            'adx_score':      adx_score,
+            'slope_score':    vwap_mod,
+            'slope_pct':      self.dm.vwap_distance_pct,
+            'spot_above_ema': 1 if self.dm.vwap_distance_pct > 0 else 0,
+        }
+        return raw, detail
+
+    def _module_trend_SKIP(self) -> Tuple[Optional[int], str]:
+        # Original multi-day trend module kept for reference.
         """
         Reference algorithm Step 3:
         ADX(14) on 30-min bars + EMA-50 slope.
@@ -1226,7 +1423,76 @@ class RegimeEngine:
 
     def _module_flow(
         self, now: datetime
+    ) -> Tuple[Optional[float], str]:
+        # INTRADAY MODULE 4: PCR change + spread ratio.
+        # PCR stable = balanced = sell both sides.
+        # PCR extreme = contrarian opportunity.
+        pcr_current = self.dm.pcr_current
+        pcr_open    = self.dm.pcr_open
+        pcr_change  = self.dm.pcr_change
+        if pcr_current is None or pcr_open is None:
+            return self._module_flow_legacy(now)
+        if pcr_current > 1.5:
+            pcr_score = 0.8
+            pcr_tag   = f'EXTREME_PUT_HEAVY(PCR={pcr_current:.2f})'
+        elif pcr_current < 0.7:
+            pcr_score = 0.8
+            pcr_tag   = f'EXTREME_CALL_HEAVY(PCR={pcr_current:.2f})'
+        elif abs(pcr_change) < 0.05:
+            pcr_score = 0.5
+            pcr_tag   = f'STABLE(PCR={pcr_current:.2f} chg={pcr_change:+.3f})'
+        elif pcr_change > 0.10:
+            pcr_score = -0.3
+            pcr_tag   = f'FEAR_RISING(PCR={pcr_current:.2f} chg={pcr_change:+.3f})'
+        elif pcr_change < -0.10:
+            pcr_score = -0.3
+            pcr_tag   = f'GREED_RISING(PCR={pcr_current:.2f} chg={pcr_change:+.3f})'
+        else:
+            pcr_score = 0.2
+            pcr_tag   = f'NORMAL(PCR={pcr_current:.2f} chg={pcr_change:+.3f})'
+        spr = self.dm.spread_ratio
+        if spr is not None:
+            if spr < 0.75:
+                spr_score = 0.5
+                spr_tag   = f'CONTRACTING({spr:.2f})'
+            elif spr > 1.25:
+                spr_score = -0.5
+                spr_tag   = f'WIDENING({spr:.2f})'
+            else:
+                spr_score = 0.2
+                spr_tag   = f'FLAT({spr:.2f})'
+        else:
+            spr_score = 0.0
+            spr_tag   = 'SPR_UNAVAILABLE'
+        raw = max(-1.0, min(1.0, 0.70 * pcr_score + 0.30 * spr_score))
+        detail = f'{pcr_tag} | {spr_tag}'
+        logger.info(f'Flow(PCR): score={raw:.3f} | {detail}')
+        self._last_flow_detail = {
+            'net_oi_delta': None,
+            'spread_ratio': spr,
+            'spread_ratio_avg': None,
+            'flow_dte': None,
+        }
+        return raw, detail
+
+    def _module_flow_legacy(
+        self, now: datetime
+    ) -> Tuple[Optional[float], str]:
+        # Legacy OI-based flow used when PCR data unavailable.
+        net_flow = self.dm.net_flow
+        spr      = self.dm.spread_ratio
+        if net_flow is None or spr is None:
+            return None, 'flow data warming up'
+        if net_flow < 0 and spr > 1.25:
+            return 1.0, f'fear premium (legacy) net={net_flow:+,.0f}'
+        if net_flow > 0 and spr < 0.75:
+            return -1.0, f'complacency (legacy) net={net_flow:+,.0f}'
+        return 0.0, f'mixed (legacy) net={net_flow:+,.0f}'
+
+    def _module_flow_SKIP(
+        self, now: datetime
     ) -> Tuple[Optional[int], str]:
+        # Original multi-day flow module kept for reference.
         """
         Reference algorithm Step 4:
         Net delta-weighted OI change (15 min) +

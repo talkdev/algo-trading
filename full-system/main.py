@@ -20,6 +20,7 @@ import signal
 import sys
 import os
 import logging
+# MN-3: time available for intraday hard exit
 import traceback
 import aiohttp
 import numpy as np
