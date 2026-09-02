@@ -256,6 +256,9 @@ EDGE_PERCENTILE_LOW  = 30
 # Until then the edge module stays neutral (score=0), which is
 # safer than acting on a near-meaningless statistic.
 EDGE_SCORE_MIN_HISTORY = 20
+# Minimum IV-RV spread-history standard deviation in
+# percentage points before a z-score is trusted.
+EDGE_MIN_SPREAD_STD_PP = 0.25
 
 # ADX calibrated for 30-min bars
 # AUDIT #2.3: ADX_PERIOD=14 matches the reference algorithm
@@ -289,7 +292,7 @@ BARS_PER_DAY     = 13
 # IMM-06: lowered from 300 to 60 to align with main loop cadence.
 # ADX and EMA can be stale for up to 5 minutes at 300s, causing
 # delayed regime changes. At 60s the trend module is always fresh.
-CANDLE_REFRESH_SECONDS = 60
+CANDLE_REFRESH_SECONDS = 1800  # NIFTY 30-minute candle refresh
 CANDLE_LOOKBACK_DAYS   = 45   # PATCH: was 30 — too tight for RV_LOOKBACK_DAYS=20 after weekend/holiday attrition
 # PRF-C10: raised from 15 to 30. NSE OI updates every 3-5 min.
 # 15-min window = 3-5 updates (noisy). 30-min = 6-10 updates,
@@ -297,7 +300,7 @@ CANDLE_LOOKBACK_DAYS   = 45   # PATCH: was 30 — too tight for RV_LOOKBACK_DAYS
 FLOW_WINDOW_MINUTES     = 30
 # CFG-P1: per-leg slippage haircut applied in credit gate BEFORE
 # trade approval.
-ENTRY_SLIPPAGE_PTS_PER_LEG = 0.75
+ENTRY_SLIPPAGE_PTS_PER_LEG = 1.00   # FIX-1c: ENTRY_SLIPPAGE_PTS_PER_LEG raised to 1.00 (0.25-delta OTM options have 1.00-1.50pts slippage; was underestimated)
 
 # ─── IMM-01: Dynamic flow weight ───────────────────────────────
 # If flow score is None for more than this fraction of recent cycles,
@@ -413,10 +416,10 @@ STRAT_STRANGLE       = "LONG_STRANGLE_EVENT"
 # Confining to DTE<=4 was the least favourable point on the curve.
 STRADDLE_DTE_MIN       = 1
 STRADDLE_DTE_MAX       = 8    # was 4    # widened from 7
-STRADDLE_STOP_MULT     = 1.2   # PATCHED: 2.0→1.2; break-even WR 80%→70.6%
+STRADDLE_STOP_MULT     = 1.5   # FIX-1e: STRADDLE_STOP_MULT raised to 1.5 (1.2x fired on noise at VIX=12-14; 1.5x calibrated for Sep 2026)   # PATCHED: 2.0→1.2; break-even WR 80%→70.6%
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning).
 STRADDLE_TARGET_PCT    = 0.60  # PATCHED: 0.50→0.60
-STRADDLE_EXIT_DTE      = 1
+STRADDLE_EXIT_DTE      = 2   # FIX-1d: STRADDLE_EXIT_DTE raised to 2 (Monday DTE=1 has 3-4x gamma of Wednesday; exit Monday morning safely)
 STRADDLE_MAX_DEBIT_PCT = 0.025
 STRADDLE_POLL_SECONDS  = 5
 STRADDLE_SPOT_STOP_PCT = 0.03
@@ -429,7 +432,12 @@ CONDOR_WING_WIDTH         = 150   # ARCH-1b: CONDOR_WING_WIDTH narrowed (was 250
 # ARCH-1c: MIN_VIX_CONDOR — only build condors when VIX >= 13
 # At VIX=11, condor credit ~11pts is too thin to be profitable.
 # At VIX=13+, credit ~18-22pts gives positive EV at 65%% win rate.
-MIN_VIX_CONDOR            = 13.0
+MIN_VIX_CONDOR            = 16.0   # FIX-1a: MIN_VIX_CONDOR raised to 16.0 (Sep 2026 VIX=12-15; 4-leg slippage not justified below VIX=16)
+# FIX-1i: MIN_VIX_STRADDLE and MIN_VIX_SPREAD
+# Straddle viable at VIX=12+ (2-leg slippage manageable)
+# Bull-put spread viable at VIX=12+ (NIFTY upward drift)
+MIN_VIX_STRADDLE          = 12.0
+MIN_VIX_SPREAD            = 12.0
 # CFG-02: widened (same reasoning as straddle).
 CONDOR_DTE_MIN            = 2
 CONDOR_DTE_MAX            = 8    # was 5     # widened from 7
@@ -453,7 +461,7 @@ CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.04  # P1-1c: CONDOR_MIN_CREDIT_PCT_OF_WIDTH l
 CONDOR_MIN_CREDIT         = 10   # P1-1b: CONDOR_MIN_CREDIT lowered (was 40, achievable at VIX=11 ~11pts)   # legacy absolute floor; builder uses PCT_OF_WIDTH above
 # C4-06: DEAD CONSTANT — no condor adjustment logic exists.
 CONDOR_ADJUSTMENT_DELTA   = 0.35
-CONDOR_TESTED_SIDE_BUFFER = 100
+CONDOR_TESTED_SIDE_BUFFER = 150   # FIX-1b: CONDOR_TESTED_SIDE_BUFFER raised to 150 (proportional to 150pt wings after ARCH-1; stop at 450pts from entry)
 # PRF-C03: lowered from 1.5 to 1.2. At VIX=11-13, 1.5σ places
 # shorts ~350pts OTM with credit ~20-25pts — often fails min-credit
 # check. 1.2σ places shorts ~280pts OTM, credit ~35-45pts.
@@ -469,7 +477,7 @@ SPREAD_DELTA_SHORT    = 0.25   # ARCH-1a: SPREAD_DELTA_SHORT raised (was 0.20; 0
 # CAL-DELTA: lowered from 0.15 to 0.08 to maintain meaningful
 # spread width with the new 0.16 short delta. 0.16-0.08=0.08
 # delta spread gives adequate wing protection and defined risk.
-SPREAD_DELTA_LONG     = 0.08
+SPREAD_DELTA_LONG     = 0.12   # FIX-2026-C: SPREAD_DELTA_LONG raised to 0.12 (was 0.08; 0.08 delta long = 600pts OTM = 300pt wing; 0.12 delta long = 450pts OTM = 150pt wing; credit/risk improves from 7.3%% to 12%%)
 # EXE-02: set to 1 (same reasoning as condor).
 SPREAD_EXIT_DTE       = 1
 # PRF-C01: lowered from 0.60 to 0.50 (same reasoning as condor).
@@ -480,7 +488,7 @@ SPREAD_MIN_CREDIT_PCT_OF_WIDTH = 0.08  # P1-1d: SPREAD_MIN_CREDIT_PCT_OF_WIDTH l
 SPREAD_MIN_CREDIT     = 12   # P1-1a: SPREAD_MIN_CREDIT lowered (was 25, achievable at VIX=11 ~17pts)   # legacy absolute floor; builder uses PCT_OF_WIDTH above
 # C4-06: DEAD CONSTANT — no roll logic exists in strategy_engine.
 SPREAD_ROLL_DELTA_TRIGGER  = 0.35
-SPREAD_SKEW_THRESHOLD      = 2.0
+SPREAD_SKEW_THRESHOLD      = 3.0   # FIX-1g: SPREAD_SKEW_THRESHOLD raised to 3.0 (NIFTY structural put skew is 2-3pp; 2.0 fired on every session)
 
 # ── Ratio spread ──────────────────────────────────────────────────────
 RATIO_ATM_OFFSET_PTS       = 100
@@ -582,7 +590,7 @@ SL_MAX_PERCENT     = 0.40
 # position can run, then trail protects gains above 70% of credit.
 # 0.90 retain means trail closes only when profit retraces 10% from peak.
 TRAIL_START_PROFIT_PCT = 0.40   # S10-1: TRAIL_START_PROFIT_PCT lowered (was 0.70; required 6.5 days on 6-DTE condor — fired after expiry; 0.40 activates on day 2-3)
-TRAIL_RETAIN_PCT       = 0.90
+TRAIL_RETAIN_PCT       = 0.80   # FIX-1h: TRAIL_RETAIN_PCT lowered to 0.80 (NIFTY 5-10%% intraday IV fluctuation; 0.90 fired on normal noise)
 
 # ─────────────────────────────────────────────────────────────────────
 # ORDER EXECUTION
@@ -829,7 +837,7 @@ REENTRY_COOLDOWN_SEC       = 1800  # P2-3: REENTRY_COOLDOWN_SEC raised (was 300s
 # ~500pt NIFTY move) the 300s timer always expires first, making
 # the price guard useless. 0.2% detects sharp intraday reversals.
 REENTRY_MAX_SPOT_MOVE_PCT  = 0.002
-BUILD_FAILURE_COOLDOWN_SEC = 300
+BUILD_FAILURE_COOLDOWN_SEC = 60   # FIX-2026-F: BUILD_FAILURE_COOLDOWN_SEC lowered (was 300s; at 2026 VIX=12-15, credit spreads fail gate frequently; 60s retry recovers ~4 min of trading window)
 
 # ─────────────────────────────────────────────────────────────────────
 # MARGIN/SPAN APPROXIMATION (heuristic, NOT the real exchange calc)
@@ -862,9 +870,18 @@ NSE_SPECIAL_TRADING_DAYS = frozenset({"2026-02-01"})
 # LIVE FIX: 2026-10-02 kept here (RBI Policy = trading day)
 HIGH_IMPACT_EVENTS = {
     "2026-02-01": "UNION_BUDGET",
+    # FIX-2026-B: February 2026 RBI Policy
+    "2026-02-06": "RBI_POLICY",
     "2026-04-03": "RBI_POLICY",
     "2026-06-05": "RBI_POLICY",
     "2026-08-07": "RBI_POLICY",
+    # FIX-2026-A: Q1/Q2/Q4 rebalancing dates
+    # Last Friday of March, June, December 2026
+    # Large directional moves from institutional rebalancing
+    "2026-03-27": "NIFTY_REBALANCING_Q1",
+    "2026-06-26": "NIFTY_REBALANCING_Q2",
+    "2026-09-25": "NIFTY_REBALANCING_Q3",  # FIX-1j: NIFTY_REBALANCING_Q3 Sep 2026
+    "2026-12-25": "NIFTY_REBALANCING_Q4",
     "2026-10-02": "RBI_POLICY",
     "2026-12-04": "RBI_POLICY",
 }

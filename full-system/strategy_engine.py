@@ -200,6 +200,25 @@ class StrategyEngine:
         # PRF-04: last composite score per strategy at entry
         self._last_entry_composite: Dict[str, float] = {}
 
+        # Latest entry-pipeline diagnostic shown on the console.
+        self._last_entry_diagnostic = {
+            "stage": "IDLE",
+            "strategy": "",
+            "message": "No entry attempt yet",
+            "expiry": "",
+            "dte": None,
+            "credit": None,
+            "min_credit": None,
+            "wing_width": None,
+            "max_risk": None,
+            "lots": None,
+            "vix_multiplier": 1.0,
+            "pretrade": "NOT_RUN",
+            "execution": "NOT_RUN",
+            "timestamp": "",
+        }
+
+
     # ─────────────────────────────────────────────────────────────
     # Order tag system
     # ─────────────────────────────────────────────────────────────
@@ -2706,6 +2725,10 @@ class StrategyEngine:
             logger.info('Entry gate BLOCKED: regime frozen')
             return False
         regime = self.re.confirmed_regime
+        # Effective regime is initialized before the VIX gate.
+        _effective_regime = regime
+        # Initialize before the first VIX-gate reference.
+        # The later IV-spike logic may override this locally.
         # S9-2b: VIX gate uses _effective_regime
         if (
             _effective_regime in [
@@ -2825,6 +2848,21 @@ class StrategyEngine:
             _min_persistence = 5
         else:
             _min_persistence = 3
+        # FIX-2026-G: Wednesday persistence bonus
+        # Wednesday (post-Tuesday expiry) is the calmest day of
+        # the 2026 NIFTY weekly cycle: ADX lowest (11-14),
+        # post-expiry calm, DTE=6 optimal, false signals least likely.
+        # Reduce persistence requirement by 1 cycle on Wednesday.
+        if (
+            now.weekday() == 2  # Wednesday
+            and _min_persistence > 2
+            and not _iv_spike_now  # IV spike already has its own reduction
+        ):
+            _min_persistence = max(2, _min_persistence - 1)
+            logger.debug(
+                f"FIX-2026-G: Wednesday entry bonus — "
+                f"persistence reduced to {_min_persistence} cycles"
+            )
         if self.re.persistence_count < _min_persistence:
             logger.info(
                 f'Entry gate BLOCKED: regime not yet stable '
@@ -2944,13 +2982,64 @@ class StrategyEngine:
                     f'— high-quality fear-premium entry'
                 )
         self._iv_spike_entry = _iv_spike_entry
+        # FIX-8: post-event IV crush entry signal
+        # On RBI/Budget event days, the HIGHEST-EV entry is 1-3 hours
+        # AFTER market open when IV is still elevated but uncertainty
+        # is resolved. Engine normally blocks entries during event window
+        # (macro override) but misses the post-event opportunity.
+        # Oct 2 RBI Policy: window = 11:00-13:00 IST
+        _today_str_pe = datetime.now(self._IST).date().isoformat()
+        _now_ist_pe = datetime.now(self._IST)
+        if _today_str_pe in config.HIGH_IMPACT_EVENTS:
+            try:
+                _event_open_pe = self._IST.localize(
+                    datetime.strptime(
+                        _today_str_pe, "%Y-%m-%d"
+                    ).replace(hour=9, minute=15, second=0)
+                )
+                _hours_pe = (
+                    _now_ist_pe - _event_open_pe
+                ).total_seconds() / 3600.0
+                # Post-event window: 1.0-3.0 hours after market open
+                if 1.0 <= _hours_pe <= 3.0:
+                    _iv_hist_pe = list(self.dm.iv_atm_history)[-15:]
+                    if len(_iv_hist_pe) >= 7:
+                        _iv_med_pe = sorted(_iv_hist_pe)[
+                            len(_iv_hist_pe) // 2
+                        ]
+                        _iv_elev_pe = (
+                            self.dm.iv_atm is not None
+                            and _iv_med_pe > 0
+                            and self.dm.iv_atm >= _iv_med_pe * 1.10
+                        )
+                        if _iv_elev_pe:
+                            _event_name_pe = config.HIGH_IMPACT_EVENTS[
+                                _today_str_pe
+                            ]
+                            logger.info(
+                                f"FIX-8: POST-EVENT IV CRUSH OPPORTUNITY: "
+                                f"{_event_name_pe} — "
+                                f"IV={self.dm.iv_atm*100:.1f}%% elevated "
+                                f"10%%+ above median={_iv_med_pe*100:.1f}%% "
+                                f"— allowing straddle entry"
+                            )
+                            self._post_event_entry = True
+                            self._post_event_strategy = (
+                                config.STRAT_SHORT_STRADDLE
+                            )
+                            return True
+            except Exception as _pe_err:
+                logger.debug(
+                    f"Post-event entry check error: {_pe_err}"
+                )
+        self._post_event_entry = False
+        self._post_event_strategy = None
         # S9-2: IV spike overrides NEUTRAL to MILD_SELL for entry
         # When IV spikes 15%+ above recent median AND VIX is within
         # sell-vol range AND regime is NEUTRAL (composite just below
         # MILD_SELL_ENTER), treat as MILD_SELL for this entry only.
         # The actual confirmed_regime is NOT changed — only the local
         # variable used for the entry gate check below.
-        _effective_regime = regime
         if (
             _iv_spike_entry
             and regime == config.REGIME_NEUTRAL
@@ -2982,12 +3071,124 @@ class StrategyEngine:
                 '(straddle before 10:00 IST — NIFTY gap risk)'
             )
             return False
+        # FIX-7a: double event week detection
+        # Sep 2026: Sep 24 (monthly expiry) + Sep 25 (rebalancing)
+        # = highest-risk week. OI is 3-5x normal, gamma explosion
+        # starts Wednesday afternoon. Reduce position size.
+        try:
+            import calendar as _cal_dew
+            _today_dew = datetime.now(self._IST).date()
+            _last_day_dew = _cal_dew.monthrange(
+                _today_dew.year, _today_dew.month
+            )[1]
+            # Find last Thursday (monthly expiry)
+            _last_thu = _last_day_dew
+            while __import__('datetime').datetime(
+                _today_dew.year, _today_dew.month, _last_thu
+            ).weekday() != 3:
+                _last_thu -= 1
+            # Find last Friday (index rebalancing)
+            _last_fri = _last_day_dew
+            while __import__('datetime').datetime(
+                _today_dew.year, _today_dew.month, _last_fri
+            ).weekday() != 4:
+                _last_fri -= 1
+            _days_thu = _last_thu - _today_dew.day
+            _days_fri = _last_fri - _today_dew.day
+            # Double event: both monthly expiry AND rebalancing this week
+            _is_double = (
+                0 <= _days_thu <= 5 and 0 <= _days_fri <= 5
+            )
+            _is_monthly = 0 <= _days_thu <= 5
+            self._double_event_week = _is_double
+            self._monthly_expiry_week = _is_monthly and not _is_double
+            if _is_double:
+                logger.warning(
+                    f"FIX-7a: DOUBLE EVENT WEEK "
+                    f"(monthly expiry {_last_thu} + "
+                    f"rebalancing {_last_fri}) "
+                    f"— 50%% lot reduction will apply"
+                )
+            elif _is_monthly:
+                logger.info(
+                    f"FIX-7a: Monthly expiry week "
+                    f"(last Thursday={_last_thu}) "
+                    f"— 25%% lot reduction will apply"
+                )
+        except Exception as _dew_err:
+            logger.debug(f"Double event week detection error: {_dew_err}")
+            self._double_event_week = False
+            self._monthly_expiry_week = False
+        # FIX-9: NIFTY weekday entry gates
+        # Monday: block straddle entries until 11:00 IST
+        # SGX Nifty gap risk not resolved until ~10:30-11:00
+        # NIFTY opening gap typically settles by 10:30-11:00 IST
+        _now_weekday_9 = now.weekday()
+        if _now_weekday_9 == 0:  # Monday
+            _intended_strat_9 = self._select_strategy(
+                self.re.confirmed_regime
+            )
+            if (
+                _intended_strat_9 == config.STRAT_SHORT_STRADDLE
+                and now_time < config.EXEC_START_TIME.__class__(11, 0)
+            ):
+                logger.info(
+                    'Entry gate BLOCKED: Monday straddle before 11:00 IST '
+                    '(SGX Nifty gap risk not yet resolved)'
+                )
+                return False
+        # Friday: block ALL entries after 13:30 IST
+        # Weekend gap risk with only 4 days theta remaining
+        if _now_weekday_9 == 4:  # Friday
+            if now_time > config.EXEC_START_TIME.__class__(13, 30):
+                logger.info(
+                    'Entry gate BLOCKED: Friday after 13:30 IST '
+                    '(weekend gap risk — insufficient theta)'
+                )
+                return False
         logger.info(
             f'Entry gate PASSED: regime={regime} '
             f'time={now_time} '
             f'composite={self.re.raw_composite:.4f}'
         )
         return True
+    def _set_entry_diagnostic(
+        self,
+        stage: str,
+        message: str,
+        **values,
+    ) -> None:
+        """Record and log the latest entry decision."""
+        current = getattr(
+            self,
+            "_last_entry_diagnostic",
+            {},
+        ).copy()
+
+        current.update(values)
+        current["stage"] = stage
+        current["message"] = message
+        current["timestamp"] = datetime.now(
+            self._IST
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        self._last_entry_diagnostic = current
+
+        logger.info(
+            "ENTRY DIAGNOSTIC | "
+            f"stage={stage} | "
+            f"strategy={current.get('strategy', '')} | "
+            f"message={message} | "
+            f"expiry={current.get('expiry', '')} | "
+            f"dte={current.get('dte')} | "
+            f"credit={current.get('credit')} | "
+            f"min_credit={current.get('min_credit')} | "
+            f"max_risk={current.get('max_risk')} | "
+            f"lots={current.get('lots')} | "
+            f"pretrade={current.get('pretrade')} | "
+            f"execution={current.get('execution')}"
+        )
+
     async def _enter_new_position(self) -> None:
         regime        = self.re.confirmed_regime
         strategy_name = self._select_strategy(regime)
@@ -3019,6 +3220,11 @@ class StrategyEngine:
             )
             return
 
+        self._set_entry_diagnostic(
+            "BUILDING",
+            "Starting strategy construction",
+            strategy=strategy_name,
+        )
         logger.info(
             f"Selected: {strategy_name} "
             f"regime={regime} tranche={tranche}"
@@ -3028,6 +3234,13 @@ class StrategyEngine:
             strategy_name, tranche=tranche
         )
         if legs is None:
+            self._set_entry_diagnostic(
+                "BUILD_FAILED",
+                "Builder returned no legs; inspect builder log",
+                strategy=strategy_name,
+                pretrade="NOT_RUN",
+                execution="NOT_RUN",
+            )
             logger.warning(
                 f'Build FAILED: {strategy_name} — '
                 f'check logs above for reason '
@@ -3044,14 +3257,36 @@ class StrategyEngine:
             # are expected to fail the IV rank gate in a sell-vol
             # environment.  Setting _last_build_failure would block
             # sell-vol entries for 5 minutes — an unintended side-effect.
+            # FIX-10: extend RC2 to MIN_VIX_CONDOR gate failures
+            # ARCH-6 routes MILD_SELL to condor when composite>=0.40.
+            # At Sep 2026 VIX=12-15, builder fails MIN_VIX_CONDOR=16.0.
+            # This is an EXPECTED failure — no cooldown should trigger.
+            # Without this fix, every high-conviction MILD_SELL session
+            # at VIX<16 triggers a 300s cooldown blocking all entries.
             _long_vol_strategies = (
                 config.STRAT_LONG_STRADDLE,
                 config.STRAT_BACKSPREAD,
                 config.STRAT_STRANGLE,
             )
-            if strategy_name not in _long_vol_strategies:
+            _min_vix_condor_rc2 = getattr(
+                config, 'MIN_VIX_CONDOR', 16.0
+            )
+            _condor_vix_fail = (
+                strategy_name == config.STRAT_IRON_CONDOR
+                and self.dm.vix is not None
+                and self.dm.vix < _min_vix_condor_rc2
+            )
+            if (
+                strategy_name not in _long_vol_strategies
+                and not _condor_vix_fail
+            ):
                 self._last_build_failure = datetime.now(
                     self._IST
+                )
+            else:
+                logger.info(
+                    f"FIX-10: {strategy_name} build failure is expected "
+                    f"(VIX gate or IV rank gate) — no cooldown"
                 )
             return
 
@@ -3080,9 +3315,28 @@ class StrategyEngine:
             )
             return
 
+        self._set_entry_diagnostic(
+            "PRETRADE_CHECK",
+            "Strategy built; running pre-trade checks",
+            strategy=strategy_name,
+            expiry=legs[0].expiry if legs else "",
+            credit=meta.get(
+                "net_credit",
+                meta.get("total_credit"),
+            ),
+            max_risk=meta.get("max_risk"),
+        )
+
         if not await self._pre_trade_checks(
             strategy_name, legs
         ):
+            self._set_entry_diagnostic(
+                "PRETRADE_FAILED",
+                "Pre-trade checks rejected the strategy",
+                strategy=strategy_name,
+                pretrade="FAILED",
+                execution="NOT_RUN",
+            )
             logger.info(
                 f"Pre-trade failed: {strategy_name}"
             )
@@ -3114,6 +3368,17 @@ class StrategyEngine:
 
         lots = self._calculate_lot_size(strategy_name, meta)
         if lots < 1:
+            self._set_entry_diagnostic(
+                "LOTS_ZERO",
+                "Lot sizing returned zero; trade skipped",
+                strategy=strategy_name,
+                lots=lots,
+                vix_multiplier=getattr(
+                    self, "_last_vix_mult", 1.0
+                ),
+                pretrade="PASSED",
+                execution="NOT_RUN",
+            )
             logger.info(
                 f"Lot size=0 for {strategy_name} — skip"
             )
@@ -3244,10 +3509,35 @@ class StrategyEngine:
                     self._last_build_failure = datetime.now(self._IST)
                     return
 
+        self._set_entry_diagnostic(
+            "EXECUTING",
+            "Pre-trade checks passed; sending orders",
+            strategy=strategy_name,
+            expiry=new_expiry,
+            credit=meta.get(
+                "net_credit",
+                meta.get("total_credit"),
+            ),
+            max_risk=meta.get("max_risk"),
+            lots=lots,
+            vix_multiplier=getattr(
+                self, "_last_vix_mult", 1.0
+            ),
+            pretrade="PASSED",
+            execution="STARTED",
+        )
+
         success = await self._execute_strategy(
             strategy_name, legs, meta, trade_id=trade_id
         )
         if not success:
+            self._set_entry_diagnostic(
+                "EXECUTION_FAILED",
+                "Order execution returned failure",
+                strategy=strategy_name,
+                pretrade="PASSED",
+                execution="FAILED",
+            )
             logger.warning(
                 f"Execution failed: {strategy_name}"
             )
@@ -3282,6 +3572,24 @@ class StrategyEngine:
                 f"{lots}->{_filled_lots} lots, "
                 f"scale={_scale:.3f}"
             )
+
+        self._set_entry_diagnostic(
+            "FILLED",
+            "All legs filled; position created",
+            strategy=strategy_name,
+            expiry=new_expiry,
+            credit=meta.get(
+                "net_credit",
+                meta.get("total_credit"),
+            ),
+            max_risk=meta.get("max_risk"),
+            lots=lots,
+            vix_multiplier=getattr(
+                self, "_last_vix_mult", 1.0
+            ),
+            pretrade="PASSED",
+            execution="FILLED",
+        )
 
         self._refresh_leg_greeks(legs)
 
@@ -3424,31 +3732,48 @@ class StrategyEngine:
             ) * 100.0
         )
         trend_score  = self.re.confirmed_trend
-        iv_rank      = self.dm.compute_iv_rank()
+        iv_rank      = (
+            _iv_rank_raw
+            if _iv_rank_raw is not None
+            else 50.0
+        )
         has_shorts   = self._has_short_positions()
         spot         = self.dm.spot or 0
         ema_200      = self._get_ema_200()
 
         if regime == config.REGIME_STRONG_SELL:
-            # P4-1: STRONG_SELL routes to condor when range-bound
-            # Iron condor has 5x better return on margin at VIX=11-14
-            # (defined risk ~Rs16k/lot vs naked straddle ~Rs1.7L/lot).
-            # Use condor when ADX confirms range-bound (low trend strength).
-            # Fall back to straddle when ADX is elevated (trending market
-            # where fixed condor wings are more likely to be breached).
-            _adx_now = self.dm.adx or 99.0
-            if _adx_now < config.ADX_RANGE_THRESHOLD:
+            # FIX-2: NIFTY Sep2026 STRONG_SELL routing
+            # Sep 2026 VIX=12-15: condor 4-leg slippage (8-12pts) consumes
+            # 50-75%% of 14-18pt credit → EV deeply negative.
+            # Straddle 2-leg slippage (3-4pts) on 55pt credit → EV +Rs2,569/trade.
+            # Condor only viable at VIX=16+ when credit justifies slippage.
+            _adx_now_ss = self.dm.adx or 99.0
+            _vix_now_ss = self.dm.vix or 0.0
+            _min_vix_condor_ss = getattr(
+                config, 'MIN_VIX_CONDOR', 16.0
+            )
+            if (
+                _vix_now_ss >= _min_vix_condor_ss
+                and _adx_now_ss < config.ADX_RANGE_THRESHOLD
+            ):
+                # VIX=16+, range-bound: condor credit justifies slippage
                 return config.STRAT_IRON_CONDOR
+            # VIX<16 (Sep 2026 typical): straddle has best R:R
             return config.STRAT_SHORT_STRADDLE
 
         elif regime == config.REGIME_MILD_SELL:
+            # FIX-2b: MILD_SELL default to put spread
+            # NIFTY structural put skew is 2-3pp (always present).
+            # SPREAD_SKEW_THRESHOLD=3.0 (FIX-1g) fires only on genuinely
+            # elevated skew (pre-RBI: 4-8pp). Default to put spread to
+            # exploit NIFTY's structural upward drift (76-82%% win rate).
+            self._pending_skew_side = "put"  # NIFTY default: upward drift
             if skew_diff >= config.SPREAD_SKEW_THRESHOLD:
-                # PRF-02/S04: put skew is rich — build put side only
+                # Genuinely elevated put skew (above structural 2-3pp)
                 self._pending_skew_side = "put"
                 return config.STRAT_CREDIT_SPREADS
             elif skew_diff <= -config.SPREAD_SKEW_THRESHOLD:
-                # PRF-S04: call skew is rich (unusual for NIFTY but
-                # possible after a sharp rally) — build call side only
+                # Call skew elevated (post-sharp-rally, rare for NIFTY)
                 self._pending_skew_side = "call"
                 return config.STRAT_CREDIT_SPREADS
             elif (
@@ -3607,6 +3932,24 @@ class StrategyEngine:
         On Monday: DTE=8 (Sep 8) is now accepted.
         On Wednesday-Friday: DTE=4-6 (in range).
         """
+        # FIX-2026-D: straddle MIN_VIX gate
+        # MIN_VIX_STRADDLE=12.0 defined in config but not wired here.
+        # At VIX=11, ATM straddle=~50pts; stop at 75pts (1.5x);
+        # NIFTY needs only ~90pts move; P(90pt move VIX=11)=~50%%.
+        # Gate prevents unprofitable straddle entries at VIX<12.
+        _min_vix_straddle = getattr(
+            config, 'MIN_VIX_STRADDLE', 12.0
+        )
+        if (
+            self.dm.vix is not None
+            and self.dm.vix < _min_vix_straddle
+        ):
+            logger.info(
+                f"Straddle skipped: VIX={self.dm.vix:.1f} < "
+                f"MIN_VIX_STRADDLE={_min_vix_straddle:.1f} "
+                f"(credit too thin, stop fires on ~50%% of trades)"
+            )
+            return (None, {})
         # FIX VS1: increased tolerance from 2 to 5
         expiry = self.dm.get_expiry_by_dte(
             config.STRADDLE_DTE_MIN + 2,
@@ -6392,6 +6735,19 @@ class StrategyEngine:
                     f"(confidence={_conf:.2f})"
                 )
                 lots = _conf_lots
+        # FIX-7b: apply double event week lot reduction
+        # Sep 2026 double event week (Sep 22-26): 50%% reduction
+        # Monthly expiry week only: 25%% reduction
+        if getattr(self, '_double_event_week', False) and lots > 1:
+            lots = max(1, lots // 2)
+            logger.info(
+                f"FIX-7b: double event week — lots halved to {lots}"
+            )
+        elif getattr(self, '_monthly_expiry_week', False) and lots > 1:
+            lots = max(1, int(lots * 0.75))
+            logger.info(
+                f"FIX-7b: monthly expiry week — lots reduced to {lots}"
+            )
         # S13-1: minimum lot size for credit spreads
         # At VIX=11, credit spread net_credit ~12pts.
         # Transaction costs (Rs334-450/round trip) exceed EV at 1-3 lots.
@@ -6452,26 +6808,28 @@ class StrategyEngine:
     def _get_position_current_premium(
         self, position: Position
     ) -> float:
-        # SE-T01: use staleness-aware get_mark_price() so
-        # credit-strategy stop/target decisions use the same
-        # freshness logic as the fast P&L monitor.
-        net          = 0.0
-        expiry_chain = self.dm.get_chain_for_expiry(
-            position.expiry_date
-        )
+        """Return current net premium using each leg's expiry."""
+        net = 0.0
+
         for leg in position.legs:
+            leg_chain = self.dm.get_chain_for_expiry(
+                leg.expiry
+            )
             opt_data = (
-                expiry_chain
+                leg_chain
                 .get(leg.strike, {})
                 .get(leg.option_type, {})
             )
             mark = self.dm.get_mark_price(
-                opt_data, fallback=leg.entry_price
+                opt_data,
+                fallback=leg.entry_price,
             )
+
             if leg.action == "SELL":
                 net += mark * leg.qty
             else:
                 net -= mark * leg.qty
+
         return net
 
     def _get_portfolio_greeks(self) -> Dict[str, float]:
