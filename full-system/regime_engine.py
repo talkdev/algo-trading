@@ -64,17 +64,28 @@ EVENT_POST_HOURS = 2
 MODULES          = ["vol", "edge", "trend", "flow"]
 # AUDIT #2.2: weights now read from config so tuning
 # config.WEIGHT_* actually takes effect at runtime.
-def _build_weights(flow_none_frac=0.0):
+def _build_weights(flow_none_frac=0.0, regime_confidence=1.0):
     """PATCH R-07: redistribute flow weight when flow is frequently None.
     flow_none_frac: fraction of recent cycles where flow returned None.
     When > FLOW_WEIGHT_NONE_THRESHOLD, flow weight is set to 0 and
     redistributed proportionally to vol, edge, trend.
+    FIX-2026-I: regime_confidence parameter shifts weight from edge
+    to trend when confidence is low (consecutive sell-vol losses).
+    At low confidence, the VRP signal (edge) may be misclassified;
+    the ADX trend signal is more objective and reliable.
     """
     _threshold = getattr(config, "FLOW_WEIGHT_NONE_THRESHOLD", 0.50)
     wv = config.WEIGHT_VOL
     we = config.WEIGHT_EDGE
     wt = config.WEIGHT_TREND
     wf = config.WEIGHT_FLOW
+    # FIX-2026-I: regime weight decay based on confidence
+    # At low confidence: shift 25%% of edge weight to trend
+    # (trend = objective ADX signal; edge = VRP may be misclassified)
+    if regime_confidence < 0.70 and we > 0:
+        _shift = we * 0.25 * (1.0 - regime_confidence / 0.70)
+        we = round(we - _shift, 6)
+        wt = round(wt + _shift, 6)
     if flow_none_frac > _threshold and wf > 0:
         # Redistribute flow weight proportionally to other three modules
         _other_sum = wv + we + wt
@@ -447,8 +458,13 @@ class RegimeEngine:
                 )
             else:
                 _flow_none_frac = 0.0
+            # FIX-2026-I: pass regime_confidence to _build_weights
+            # _external_confidence is set by strategy_engine after
+            # each sell-vol trade close (ARCH-5 confidence decay).
+            _ext_conf = getattr(self, '_external_confidence', 1.0)
             _live_weights = _build_weights(
-                flow_none_frac=_flow_none_frac
+                flow_none_frac=_flow_none_frac,
+                regime_confidence=_ext_conf,
             )
             composite = sum(
                 _live_weights[m] * self._conf[m]
@@ -885,7 +901,14 @@ class RegimeEngine:
         # ~70%% of sessions at VIX=11-14 (structural VRP 38-50%%).
         # Z-score answers: 'Is today's VRP elevated vs recent history?'
         # Self-calibrating: adapts to any VIX regime automatically.
-        _spread_history = list(self.dm.iv_rv_spread_history)
+        # Stored IV-RV history is decimal volatility (e.g. 0.0469),
+        # while `edge` below is in percentage points (e.g. 4.69).
+        # Convert history to percentage points before z-scoring.
+        _spread_history = [
+            float(value) * 100.0
+            for value in self.dm.iv_rv_spread_history
+            if value is not None
+        ]
         _min_hist_edge = getattr(
             config, 'EDGE_SCORE_MIN_HISTORY', 20
         )
@@ -896,7 +919,12 @@ class RegimeEngine:
                 / len(_spread_history)
             )
             _sp_std = _sp_var ** 0.5
-            if _sp_std > 0.001:
+            _min_edge_std_pp = getattr(
+                config,
+                'EDGE_MIN_SPREAD_STD_PP',
+                0.25,
+            )
+            if _sp_std >= _min_edge_std_pp:
                 _vrp_zscore = (edge - _sp_mean) / _sp_std
                 # Rich: VRP is 0.8 std devs above recent mean (~21%% of sessions)
                 # Cheap: VRP is 0.5 std devs below recent mean (~31%% of sessions)
@@ -943,6 +971,19 @@ class RegimeEngine:
                     f"{len(_spread_history)}/{_min_hist_edge} days)"
                 )
 
+        # FIX-5: NIFTY VRP floor — edge never -1 when IV>RV
+        # NIFTY's structural VRP means IV is almost always above RV.
+        # Z-score fires edge=-1 when VRP is below recent mean but still
+        # positive (e.g., VRP=30%% vs mean=42%%). In NIFTY context this
+        # is NEUTRAL, not CHEAP. Only fire -1 when IV is genuinely
+        # below RV (absolute cheap — extremely rare in NIFTY).
+        if raw == -1 and edge > EDGE_CHEAP:
+            raw = 0
+            tag = tag + " [NIFTY VRP floor: IV>RV, capped at 0]"
+            logger.info(
+                f"Edge: z-score suggests cheap but VRP={edge:.2f}pp > 0 "
+                f"— NIFTY structural VRP floor applied, score=0"
+            )
         rv_src = "actual" if self.dm.rv_20d else "est(VIX×0.70)"
         # AUDIT RE-N01: cap at 0 when RV is estimated (circular signal)
         if _rv_is_estimated and raw != 0:
@@ -992,6 +1033,32 @@ class RegimeEngine:
             # Fall back to all bars if today has fewer than 5
             # (e.g. early morning before enough bars accumulate)
             _slope_bars = _intraday if len(_intraday) >= 5 else bars
+
+            # FIX-13: Monday EMA slope gap exclusion
+            # Monday's first 30-min bar (09:15-09:45) contains the
+            # SGX Nifty opening gap. This inflates the EMA slope and
+            # creates false trend signals (gap size ≠ intraday trend).
+            # Exclude the first bar on Monday mornings.
+            _is_monday_slope = (
+                datetime.now(self._IST).weekday() == 0
+            )
+            if _is_monday_slope:
+                _slope_bars_filtered = [
+                    b for b in _slope_bars
+                    if not str(
+                        b.get("timestamp", "")
+                    ).startswith(_today_str)
+                    or str(
+                        b.get("timestamp", "")
+                    )[11:16] >= "09:45"
+                ]
+                # Only use filtered bars if we have enough
+                if len(_slope_bars_filtered) >= 5:
+                    _slope_bars = _slope_bars_filtered
+                    logger.debug(
+                        "FIX-13: Monday slope — excluded first bar "
+                        "(SGX gap exclusion)"
+                    )
         except Exception:
             _slope_bars = bars
 
@@ -1153,6 +1220,48 @@ class RegimeEngine:
                 f"expiry rollover contamination risk)"
             )
             return None, "flow skipped: DTE < 3 (expiry rollover)"
+
+        # FIX-6: month-end flow filter with pre-event exception
+        # FII routine put-buying for portfolio hedging happens every
+        # month-end (last 2 trading days). This creates false fear
+        # signals (wide spreads + negative net_flow) that look like
+        # genuine fear premium but have no selling edge.
+        # EXCEPTION: if a HIGH_IMPACT_EVENT is upcoming within 3 days,
+        # the put-buying is genuine pre-event hedging — allow the signal.
+        try:
+            import calendar as _cal_flow
+            _today_flow = datetime.now(self._IST).date()
+            _last_day_flow = _cal_flow.monthrange(
+                _today_flow.year, _today_flow.month
+            )[1]
+            _days_to_month_end = _last_day_flow - _today_flow.day
+            if _days_to_month_end <= 2:
+                # Check for upcoming HIGH_IMPACT_EVENT in next 3 days
+                _upcoming_event_flow = False
+                for _offset_flow in range(1, 4):
+                    _check_date_flow = (
+                        _today_flow
+                        + __import__('datetime').timedelta(
+                            days=_offset_flow
+                        )
+                    ).isoformat()
+                    if _check_date_flow in config.HIGH_IMPACT_EVENTS:
+                        _upcoming_event_flow = True
+                        break
+                if not _upcoming_event_flow:
+                    logger.info(
+                        f"Flow: skipping month-end period "
+                        f"({_days_to_month_end} days to month-end) "
+                        f"— routine FII hedging, no upcoming event"
+                    )
+                    return None, "flow skipped: month-end FII hedging"
+                else:
+                    logger.info(
+                        "Flow: month-end BUT upcoming event detected "
+                        "— allowing genuine pre-event fear signal"
+                    )
+        except Exception as _flow_filter_err:
+            logger.debug(f"Flow month-end filter error: {_flow_filter_err}")
 
         for strike, data in active.items():
             c_leg = data.get("call", {})
