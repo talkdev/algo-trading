@@ -210,10 +210,10 @@ PERSISTENCE_READINGS = 3   # PATCHED: 3 min to confirm
 # Weight redistribution: vol_score=0 for first 60 days
 # (no skew history, term spread always neutral at VIX=11)
 # Redistribute weight to edge and trend which activate sooner.
-WEIGHT_VOL   = 0.30   # reference: 0.30
-WEIGHT_EDGE  = 0.30   # reference: 0.30
-WEIGHT_TREND = 0.25   # reference: 0.25
-WEIGHT_FLOW  = 0.15   # reference: 0.15
+WEIGHT_VOL   = 0.35   # PROFIT-P6: OR+VWAP is now intraday leading signal
+WEIGHT_EDGE  = 0.25   # PROFIT-P6: IV behavior intraday reliable
+WEIGHT_TREND = 0.20   # PROFIT-P6: 5-min ADX is lagging, reduce weight
+WEIGHT_FLOW  = 0.20   # PROFIT-P6: PCR change is leading intraday signal
 # AUDIT CFG-05: removed duplicate WEIGHT_FLOW assignment
 assert abs(
     WEIGHT_VOL + WEIGHT_EDGE + WEIGHT_TREND + WEIGHT_FLOW
@@ -300,7 +300,7 @@ CANDLE_LOOKBACK_DAYS   = 45   # PATCH: was 30 — too tight for RV_LOOKBACK_DAYS
 FLOW_WINDOW_MINUTES     = 30
 # CFG-P1: per-leg slippage haircut applied in credit gate BEFORE
 # trade approval.
-ENTRY_SLIPPAGE_PTS_PER_LEG = 1.00   # FIX-1c: ENTRY_SLIPPAGE_PTS_PER_LEG raised to 1.00 (0.25-delta OTM options have 1.00-1.50pts slippage; was underestimated)
+ENTRY_SLIPPAGE_PTS_PER_LEG = 2.00   # PROFIT-P3: realistic NIFTY OTM slippage 1.0-2.0pts/leg; 8pts total on 4-leg condor
 
 # ─── IMM-01: Dynamic flow weight ───────────────────────────────
 # If flow score is None for more than this fraction of recent cycles,
@@ -458,8 +458,8 @@ CONDOR_TARGET_PCT         = 0.60  # PATCHED: 0.50→0.60
 # PRF-C04: lowered from 0.22 to 0.18. At VIX=11-13 with dynamic
 # wing widths, 22% is often unattainable. 18% still ensures
 # meaningful credit/risk ratio while allowing more entries.
-CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.04  # P1-1c: CONDOR_MIN_CREDIT_PCT_OF_WIDTH lowered (was 0.12)  # PATCHED: 0.18→0.12
-CONDOR_MIN_CREDIT         = 10   # P1-1b: CONDOR_MIN_CREDIT lowered (was 40, achievable at VIX=11 ~11pts)   # legacy absolute floor; builder uses PCT_OF_WIDTH above
+CONDOR_MIN_CREDIT_PCT_OF_WIDTH = 0.12  # PROFIT-P2: 12% of wing width (professional minimum for NIFTY condors)  # PATCHED: 0.18→0.12
+CONDOR_MIN_CREDIT         = 18   # PROFIT-P1: 12% of 150pt wing; viable after 2pt/leg slippage at VIX=11
 # C4-06: DEAD CONSTANT — no condor adjustment logic exists.
 CONDOR_ADJUSTMENT_DELTA   = 0.35
 CONDOR_TESTED_SIDE_BUFFER = 150   # FIX-1b: CONDOR_TESTED_SIDE_BUFFER raised to 150 (proportional to 150pt wings after ARCH-1; stop at 450pts from entry)
@@ -653,7 +653,7 @@ assert TIME_EXIT_EXPIRY < TIME_EXIT_NORMAL, (
 
 # INTRADAY: hard exit and 0DTE timing constants
 INTRADAY_HARD_EXIT_TIME  = time(14, 45, 0)   # hard close ALL positions
-ZERO_DTE_EXIT_TIME       = time(13, 30, 0)   # 0DTE force close (Tuesday)
+ZERO_DTE_EXIT_TIME       = time(14, 45, 0)   # PROFIT-P5: 14:45 optimal; avoids 15:00 gamma spikes, captures extra theta vs 13:30
 ZERO_DTE_ENTRY_CUTOFF    = time(11, 30, 0)   # no new 0DTE after 11:30
 MONDAY_STRADDLE_START    = time(10,  0, 0)   # Monday: no straddle before 10:00
 INTRADAY_MAX_HOLD_MINUTES = 180               # close after 3 hours max
@@ -843,6 +843,14 @@ REGIME_MAX_LOTS = {
 MAX_TRANCHES_PER_STRATEGY = 2
 
 # INTRADAY: VWAP and Opening Range parameters
+# PROFIT-P7: Momentum velocity filter (VIX-scaled)
+# Blocks premium-selling entries during fast directional moves.
+# Base: 3.5pts/min at VIX=11. Scales linearly with VIX.
+# At VIX=18: 3.5 * 18/11 = 5.7pts/min threshold.
+MOMENTUM_BASE_PTS_PER_MIN = 3.5   # base velocity at VIX=11
+MOMENTUM_VIX_REFERENCE    = 11.0  # reference VIX for base threshold
+MOMENTUM_LOOKBACK_BARS    = 3     # number of 5-min bars to measure
+
 VWAP_NEAR_THRESHOLD_PCT   = 0.15
 VWAP_FAR_THRESHOLD_PCT    = 0.30
 VWAP_ENTRY_BLOCK_PCT      = 0.30

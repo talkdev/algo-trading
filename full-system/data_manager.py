@@ -2814,7 +2814,53 @@ class DataManager:
         except Exception as e:
             logger.warning(f'_update_intraday_pcr error: {e}')
 
+    def compute_live_skew_ratio(self) -> float:
+        # PROFIT-P9: Live put/call IV ratio for intraday skew detection.
+        # Uses 25-delta strikes from active chain.
+        # Ratio > 1.25: fear premium (put skew elevated)
+        # Ratio < 0.90: call skew (post-rally complacency)
+        # Ratio 0.90-1.25: balanced (normal NIFTY structural skew)
+        # Returns 1.0 (neutral) when data unavailable.
+        try:
+            active = self.get_active_chain()
+            if not active or not self.spot:
+                return 1.0
+            put_strike  = self.get_strike_by_delta('put',  0.25)
+            call_strike = self.get_strike_by_delta('call', 0.25)
+            if put_strike is None or call_strike is None:
+                return 1.0
+            put_iv  = float(
+                active.get(put_strike,  {}).get('put',  {}).get('iv', 0) or 0
+            )
+            call_iv = float(
+                active.get(call_strike, {}).get('call', {}).get('iv', 0) or 0
+            )
+            if call_iv <= 0 or put_iv <= 0:
+                return 1.0
+            ratio = put_iv / call_iv
+            logger.debug(
+                f'Live skew ratio: put_iv={put_iv*100:.2f}%% '
+                f'call_iv={call_iv*100:.2f}%% ratio={ratio:.3f}'
+            )
+            return float(ratio)
+        except Exception as e:
+            logger.warning(f'compute_live_skew_ratio error: {e}')
+            return 1.0
+
+    def get_intraday_skew_signal(self) -> str:
+        # PROFIT-P9: Convert live skew ratio to intraday signal.
+        # FEAR:     ratio > 1.25 (put skew elevated, sell calls safer)
+        # NORMAL:   ratio 0.90-1.25 (balanced, sell both sides)
+        # COMPLACENT: ratio < 0.90 (call skew, sell puts safer)
+        ratio = self.compute_live_skew_ratio()
+        if ratio > 1.25:
+            return 'FEAR'
+        if ratio < 0.90:
+            return 'COMPLACENT'
+        return 'NORMAL'
+
     def get_vwap_trend_score(self) -> float:
+
         # Convert VWAP signal to trend score for regime engine.
         return {
             'NEAR_VWAP':       1.0,
