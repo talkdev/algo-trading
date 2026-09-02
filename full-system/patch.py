@@ -2,28 +2,24 @@
 """
 path.py
 
-Safe, idempotent patcher for the NIFTY options algo engine.
-
-Files handled:
-    main.py
-    decision_journal.py
-    data_manager.py
-    config.py
-    regime_engine.py
-    strategy_engine.py
+Safe and idempotent patcher for the NIFTY options algo engine.
 
 Validated fixes:
-    - _effective_regime initialization
-    - None-safe OI delta handling
-    - IV/RV spread-history unit normalization
-    - prevention of repeated synthetic Edge history
-    - Edge z-score variance floor
-    - cold-start-safe IV-rank handling
-    - own-expiry premium marking
-    - 30-minute candle refresh cadence
-    - detailed console entry diagnostics
+    - Initialize _effective_regime before first use.
+    - Handle None option deltas safely.
+    - Normalize IV-RV spread-history units before Edge z-scoring.
+    - Remove repeated synthetic IV-RV history seeding.
+    - Preserve cold-start-safe IV-rank handling.
+    - Mark each position leg using its own expiry chain.
+    - Refresh historical 30-minute candles every 1,800 seconds.
+    - Display exact vega pre-trade rejection details.
 
-The script validates all source files before replacement.
+Safety:
+    - Uses AST to locate functions and methods.
+    - Does not import or execute the trading engine.
+    - Creates a timestamped backup.
+    - Compiles all six source files before replacement.
+    - Restores changed files if replacement fails.
 """
 
 from __future__ import annotations
@@ -50,14 +46,14 @@ FILES = (
 
 
 class PatchError(RuntimeError):
-    """Raised when a required safe patch cannot be completed."""
+    """Raised when a safe patch cannot be completed."""
 
 
 def fail(message: str) -> None:
     raise PatchError(message)
 
 
-def read_file(filename: str) -> str:
+def read_source(filename: str) -> str:
     path = ROOT / filename
 
     if not path.is_file():
@@ -69,10 +65,7 @@ def read_file(filename: str) -> str:
         fail(f"Unable to read {filename}: {exc}")
 
 
-def validate_python(
-    filename: str,
-    source: str,
-) -> None:
+def validate_source(filename: str, source: str) -> None:
     """
     Parse and compile source without importing or executing it.
     """
@@ -95,7 +88,7 @@ def validate_python(
         )
 
 
-def _line_offsets(source: str) -> list[int]:
+def make_line_offsets(source: str) -> list[int]:
     offsets = [0]
     total = 0
 
@@ -106,13 +99,13 @@ def _line_offsets(source: str) -> list[int]:
     return offsets
 
 
-def _absolute_offset(
+def absolute_offset(
     offsets: list[int],
     lineno: int,
     col_offset: int,
 ) -> int:
     if lineno < 1 or lineno > len(offsets):
-        raise PatchError(
+        fail(
             f"Invalid AST line number: {lineno}"
         )
 
@@ -124,13 +117,16 @@ def find_function(
     function_name: str,
 ) -> tuple[int, int, str]:
     """
-    Find exactly one function or method using the AST.
+    Find exactly one module-level function or class method.
 
-    Supports:
-        - module-level functions;
-        - class methods;
-        - async functions;
-        - functions with any indentation.
+    AST locations are used so this works for both:
+
+        def _display_console(...)
+
+    and:
+
+        class StrategyEngine:
+        def _enter_new_position(...)
     """
     try:
         tree = ast.parse(source)
@@ -140,7 +136,7 @@ def find_function(
             f"{function_name}: line {exc.lineno}: {exc.msg}"
         )
 
-    offsets = _line_offsets(source)
+    offsets = make_line_offsets(source)
     matches: list[tuple[int, int]] = []
 
     for node in ast.walk(tree):
@@ -158,17 +154,17 @@ def find_function(
 
         if not hasattr(node, "end_lineno"):
             fail(
-                f"Python AST end locations unavailable for "
+                f"AST end locations unavailable for "
                 f"{function_name}"
             )
 
-        start = _absolute_offset(
+        start = absolute_offset(
             offsets,
             node.lineno,
             node.col_offset,
         )
 
-        end = _absolute_offset(
+        end = absolute_offset(
             offsets,
             node.end_lineno,
             node.end_col_offset,
@@ -183,8 +179,8 @@ def find_function(
 
     if len(matches) != 1:
         fail(
-            f"Ambiguous function name {function_name}: "
-            f"found {len(matches)} definitions"
+            f"Ambiguous function or method: {function_name} "
+            f"was found {len(matches)} times"
         )
 
     start, end = matches[0]
@@ -207,15 +203,22 @@ def replace_function(
 
 def patch_effective_regime(source: str) -> str:
     """
-    Fix:
-        UnboundLocalError for _effective_regime.
-
-    The assignment is inserted immediately after:
-        regime = self.re.confirmed_regime
+    Fix the observed UnboundLocalError by ensuring
+    _effective_regime is initialized before its first use.
     """
     start, end, function_source = find_function(
         source,
         "_should_enter_new_position",
+    )
+
+    assignment_pattern = re.compile(
+        r"(?m)^[ \t]*_effective_regime\s*=\s*regime\s*$\n?"
+    )
+
+    # Remove all previous standalone assignments in this function.
+    function_source = assignment_pattern.sub(
+        "",
+        function_source,
     )
 
     regime_pattern = re.compile(
@@ -227,52 +230,34 @@ def patch_effective_regime(source: str) -> str:
 
     if regime_match is None:
         fail(
-            "Could not find regime assignment inside "
-            "_should_enter_new_position()"
+            "Could not find "
+            "regime = self.re.confirmed_regime "
+            "inside _should_enter_new_position()"
         )
 
     indent = regime_match.group("indent")
 
-    # Remove existing standalone assignments in this function so the
-    # patch remains idempotent and avoids duplicate initialization.
-    cleaned = re.sub(
-        r"(?m)^[ \t]*_effective_regime\s*=\s*regime\s*$\n?",
-        "",
-        function_source,
-    )
-
-    regime_match = regime_pattern.search(cleaned)
-
-    if regime_match is None:
-        fail(
-            "Regime assignment disappeared while patching "
-            "_should_enter_new_position()"
-        )
-
-    indent = regime_match.group("indent")
-
-    insertion = (
+    replacement = (
         regime_match.group(0)
         + "\n"
         + indent
-        + "# Effective regime is initialized before the VIX gate.\n"
+        + "# Initialize before the VIX-gate reference.\n"
         + indent
         + "_effective_regime = regime"
     )
 
-    patched_function = (
-        cleaned[:regime_match.start()]
-        + insertion
-        + cleaned[regime_match.end():]
+    function_source = (
+        function_source[:regime_match.start()]
+        + replacement
+        + function_source[regime_match.end():]
     )
 
-    return source[:start] + patched_function + source[end:]
+    return source[:start] + function_source + source[end:]
 
 
 def patch_none_deltas(source: str) -> str:
     """
-    Fix:
-        float(None) in fetch_oi_snapshot().
+    Fix float(None) in fetch_oi_snapshot().
     """
     start, end, function_source = find_function(
         source,
@@ -326,22 +311,107 @@ def patch_none_deltas(source: str) -> str:
         + ")"
     )
 
-    patched_function = (
+    function_source = (
         function_source[:match.start()]
         + replacement
         + function_source[match.end():]
     )
 
-    return source[:start] + patched_function + source[end:]
+    return source[:start] + function_source + source[end:]
 
 
-def patch_synthetic_edge_history(source: str) -> str:
+def patch_edge_history_units(source: str) -> str:
     """
-    Remove repeated synthetic IV-RV history insertion.
+    Normalize stored decimal IV-RV history into percentage points
+    before comparing it with the current percentage-point edge.
 
-    This patch is optional because prior manual changes may already
-    have removed the block. If the block is absent, the source is
-    returned unchanged.
+    This directly prevents invalid values such as z=947.91.
+    """
+    start, end, function_source = find_function(
+        source,
+        "_module_edge",
+    )
+
+    if "_spread_history = [" in function_source:
+        return source
+
+    old = (
+        "        _spread_history = list("
+        "self.dm.iv_rv_spread_history)"
+    )
+
+    new = (
+        "        # Current edge is calculated in percentage points.\n"
+        "        # DataManager stores IV-RV history as decimal values.\n"
+        "        # Normalize history before calculating the z-score.\n"
+        "        _spread_history = [\n"
+        "            float(value) * 100.0\n"
+        "            for value in "
+        "self.dm.iv_rv_spread_history\n"
+        "            if value is not None\n"
+        "        ]"
+    )
+
+    if old not in function_source:
+        fail(
+            "Could not find IV-RV spread history inside "
+            "_module_edge()"
+        )
+
+    function_source = function_source.replace(
+        old,
+        new,
+        1,
+    )
+
+    return source[:start] + function_source + source[end:]
+
+
+def patch_edge_std_floor(source: str) -> str:
+    """
+    Prevent a z-score from being trusted when historical variance is
+    too small.
+    """
+    start, end, function_source = find_function(
+        source,
+        "_module_edge",
+    )
+
+    if "_min_edge_std_pp" in function_source:
+        return source
+
+    old = "            if _sp_std > 0.001:\n"
+
+    new = (
+        "            _min_edge_std_pp = getattr(\n"
+        "                config,\n"
+        "                'EDGE_MIN_SPREAD_STD_PP',\n"
+        "                0.25,\n"
+        "            )\n"
+        "            if _sp_std >= _min_edge_std_pp:\n"
+    )
+
+    if old not in function_source:
+        fail(
+            "Could not find Edge standard-deviation condition "
+            "inside _module_edge()"
+        )
+
+    function_source = function_source.replace(
+        old,
+        new,
+        1,
+    )
+
+    return source[:start] + function_source + source[end:]
+
+
+def patch_synthetic_history(source: str) -> str:
+    """
+    Remove repeated synthetic history insertion from
+    fetch_option_chain().
+
+    If that code is already removed, no change is made.
     """
     start, end, function_source = find_function(
         source,
@@ -383,7 +453,9 @@ def patch_synthetic_edge_history(source: str) -> str:
         indent
         + "# Do not insert repeated synthetic values.\n"
         + indent
-        + "# One estimate is not a history of NIFTY sessions.\n"
+        + "# One VIX-derived estimate is not a history of\n"
+        + indent
+        + "# independent NIFTY trading sessions.\n"
         + indent
         + "logger.info(\n"
         + indent
@@ -396,88 +468,19 @@ def patch_synthetic_edge_history(source: str) -> str:
         + ")"
     )
 
-    patched_function = (
+    function_source = (
         function_source[:match.start()]
         + replacement
         + function_source[match.end():]
     )
-
-    return source[:start] + patched_function + source[end:]
-
-
-def patch_edge_zscore(source: str) -> str:
-    """
-    Fix IV-RV z-score calculation.
-
-    Current edge is calculated in percentage points while the
-    DataManager history is stored as decimal volatility. History is
-    converted to percentage points before comparison.
-    """
-    start, end, function_source = find_function(
-        source,
-        "_module_edge",
-    )
-
-    if "_spread_history = [" not in function_source:
-        old = (
-            "        _spread_history = list("
-            "self.dm.iv_rv_spread_history)"
-        )
-
-        new = (
-            "        # Current edge is in percentage points.\n"
-            "        # Stored history is decimal volatility.\n"
-            "        # Normalize history before z-scoring.\n"
-            "        _spread_history = [\n"
-            "            float(value) * 100.0\n"
-            "            for value in "
-            "self.dm.iv_rv_spread_history\n"
-            "            if value is not None\n"
-            "        ]"
-        )
-
-        if old not in function_source:
-            fail(
-                "Could not find IV-RV spread history inside "
-                "_module_edge()"
-            )
-
-        function_source = function_source.replace(
-            old,
-            new,
-            1,
-        )
-
-    if "_min_edge_std_pp" not in function_source:
-        old = "            if _sp_std > 0.001:\n"
-
-        new = (
-            "            _min_edge_std_pp = getattr(\n"
-            "                config,\n"
-            "                'EDGE_MIN_SPREAD_STD_PP',\n"
-            "                0.25,\n"
-            "            )\n"
-            "            if _sp_std >= _min_edge_std_pp:\n"
-        )
-
-        if old not in function_source:
-            fail(
-                "Could not find Edge standard-deviation "
-                "condition inside _module_edge()"
-            )
-
-        function_source = function_source.replace(
-            old,
-            new,
-            1,
-        )
 
     return source[:start] + function_source + source[end:]
 
 
 def patch_iv_rank_fallback(source: str) -> str:
     """
-    Remove unguarded IV-rank assignment inside _select_strategy().
+    Prevent an unguarded IV-rank assignment from overwriting the
+    cold-start fallback in _select_strategy().
     """
     start, end, function_source = find_function(
         source,
@@ -521,7 +524,7 @@ def patch_iv_rank_fallback(source: str) -> str:
 
 def patch_position_premium(source: str) -> str:
     """
-    Ensure each position leg uses its own expiry chain.
+    Ensure each position leg is marked using that leg's own expiry.
     """
     start, end, function_source = find_function(
         source,
@@ -569,7 +572,8 @@ def patch_position_premium(source: str) -> str:
 
 def patch_config(source: str) -> str:
     """
-    Set historical NIFTY 30-minute candle refresh to 1,800 seconds.
+    Set the historical 30-minute candle refresh interval to 1,800
+    seconds if the configuration still uses 60 seconds.
     """
     pattern = re.compile(
         r"(?m)^(?P<indent>[ \t]*)"
@@ -583,7 +587,9 @@ def patch_config(source: str) -> str:
             "CANDLE_REFRESH_SECONDS was not found in config.py"
         )
 
-    if "1800" in match.group(0):
+    current = match.group(0)
+
+    if "1800" in current:
         return source
 
     indent = match.group("indent")
@@ -603,7 +609,7 @@ def patch_config(source: str) -> str:
 
 def patch_edge_config(source: str) -> str:
     """
-    Add a configurable minimum standard deviation for Edge z-scores.
+    Add the Edge standard-deviation floor configuration.
     """
     if "EDGE_MIN_SPREAD_STD_PP" in source:
         return source
@@ -617,8 +623,8 @@ def patch_edge_config(source: str) -> str:
 
     addition = (
         "\n"
-        "# Minimum IV-RV spread-history standard deviation in\n"
-        "# percentage points before trusting an Edge z-score.\n"
+        "# Minimum IV-RV history standard deviation in percentage\n"
+        "# points before trusting the Edge z-score.\n"
         "EDGE_MIN_SPREAD_STD_PP = 0.25"
     )
 
@@ -629,463 +635,167 @@ def patch_edge_config(source: str) -> str:
     )
 
 
-def patch_strategy_diagnostic_state(source: str) -> str:
+def patch_vega_diagnostic(source: str) -> str:
     """
-    Add operator-facing entry diagnostic state to __init__().
-    """
-    if "_last_entry_diagnostic" in source:
-        return source
+    Add exact vega details to the existing vega rejection log.
 
-    marker = (
-        "        self._last_entry_composite: Dict[str, float] = {}"
-    )
-
-    if marker not in source:
-        fail(
-            "Entry composite state was not found in "
-            "StrategyEngine.__init__()"
-        )
-
-    addition = '''
-
-        # Latest entry-pipeline diagnostic shown on the console.
-        self._last_entry_diagnostic = {
-            "stage": "IDLE",
-            "strategy": "",
-            "message": "No entry attempt yet",
-            "expiry": "",
-            "dte": None,
-            "credit": None,
-            "min_credit": None,
-            "wing_width": None,
-            "max_risk": None,
-            "lots": None,
-            "vix_multiplier": 1.0,
-            "pretrade": "NOT_RUN",
-            "execution": "NOT_RUN",
-            "timestamp": "",
-        }
-'''
-
-    return source.replace(
-        marker,
-        marker + addition,
-        1,
-    )
-
-
-def patch_strategy_diagnostic_helper(source: str) -> str:
-    """
-    Add a helper that records detailed entry-stage diagnostics.
-    """
-    if "def _set_entry_diagnostic(" in source:
-        return source
-
-    marker = "    async def _enter_new_position("
-
-    if marker not in source:
-        fail(
-            "_enter_new_position() was not found"
-        )
-
-    helper = '''    def _set_entry_diagnostic(
-        self,
-        stage: str,
-        message: str,
-        **values,
-    ) -> None:
-        """Record and log the latest entry decision."""
-        current = getattr(
-            self,
-            "_last_entry_diagnostic",
-            {},
-        ).copy()
-
-        current.update(values)
-        current["stage"] = stage
-        current["message"] = message
-        current["timestamp"] = datetime.now(
-            self._IST
-        ).strftime("%Y-%m-%d %H:%M:%S")
-
-        self._last_entry_diagnostic = current
-
-        logger.info(
-            "ENTRY DIAGNOSTIC | "
-            f"stage={stage} | "
-            f"strategy={current.get('strategy', '')} | "
-            f"message={message} | "
-            f"expiry={current.get('expiry', '')} | "
-            f"dte={current.get('dte')} | "
-            f"credit={current.get('credit')} | "
-            f"min_credit={current.get('min_credit')} | "
-            f"max_risk={current.get('max_risk')} | "
-            f"lots={current.get('lots')} | "
-            f"pretrade={current.get('pretrade')} | "
-            f"execution={current.get('execution')}"
-        )
-
-'''
-
-    return source.replace(
-        marker,
-        helper + marker,
-        1,
-    )
-
-
-def patch_strategy_entry_diagnostics(source: str) -> str:
-    """
-    Add diagnostics to the existing entry pipeline without changing
-    trade-selection or risk decisions.
+    This does not change the vega decision. It only improves
+    observability.
     """
     start, end, function_source = find_function(
         source,
-        "_enter_new_position",
+        "_pre_trade_checks",
     )
 
-    if "ENTRY DIAGNOSTIC" in function_source:
+    if "VEGA_DIAGNOSTIC" in function_source:
         return source
 
-    # Record strategy selection before building.
-    strategy_marker = (
-        "        logger.info(\n"
-        "            f\"Selected: {strategy_name} \"\n"
-        "            f\"regime={regime} tranche={tranche}\"\n"
-        "        )"
+    old = (
+        "                logger.warning(\n"
+        "                    f\"Pre-trade: vega above max: \"\n"
+        "                    f\"post={post_vega:.0f} > max={vega_max} \"\n"
+        "                    f\"— blocking entry\"\n"
+        "                )\n"
+        "                return False"
     )
 
-    strategy_replacement = (
-        "        self._set_entry_diagnostic(\n"
-        "            \"BUILDING\",\n"
-        "            \"Starting strategy construction\",\n"
-        "            strategy=strategy_name,\n"
-        "        )\n"
-        + strategy_marker
+    new = (
+        "                logger.warning(\n"
+        "                    f\"Pre-trade: vega above max: \"\n"
+        "                    f\"post={post_vega:.0f} > max={vega_max} \"\n"
+        "                    f\"— blocking entry\"\n"
+        "                )\n"
+        "                logger.info(\n"
+        "                    \"VEGA_DIAGNOSTIC | \"\n"
+        "                    f\"portfolio={port_greeks['vega']:.0f} | \"\n"
+        "                    f\"candidate={new_greeks['vega']:.0f} | \"\n"
+        "                    f\"post={post_vega:.0f} | \"\n"
+        "                    f\"min={vega_min} | \"\n"
+        "                    f\"max={vega_max} | \"\n"
+        "                    f\"strategy={strategy_name}\"\n"
+        "                )\n"
+        "                if hasattr(self, \"_set_entry_diagnostic\"):\n"
+        "                    self._set_entry_diagnostic(\n"
+        "                        \"PRETRADE_FAILED\",\n"
+        "                        \"Vega limit rejected candidate\",\n"
+        "                        strategy=strategy_name,\n"
+        "                        credit=None,\n"
+        "                        pretrade=\"FAILED\",\n"
+        "                        execution=\"NOT_RUN\",\n"
+        "                        vega_portfolio=port_greeks['vega'],\n"
+        "                        vega_candidate=new_greeks['vega'],\n"
+        "                        vega_post=post_vega,\n"
+        "                        vega_min=vega_min,\n"
+        "                        vega_max=vega_max,\n"
+        "                    )\n"
+        "                return False"
     )
 
-    if strategy_marker in function_source:
-        function_source = function_source.replace(
-            strategy_marker,
-            strategy_replacement,
-            1,
+    if old not in function_source:
+        # Support a source version with slightly different spacing.
+        pattern = re.compile(
+            r"(?ms)(?P<indent>[ \t]*)logger\.warning\(\s*"
+            r"f[\"']Pre-trade: vega above max:.*?"
+            r"f[\"']— blocking entry[\"']\s*"
+            r"(?P=indent)\)\s*"
+            r"(?P=indent)return False"
         )
 
-    # Record builder failure.
-    build_marker = (
-        "        if legs is None:\n"
-        "            logger.warning("
-    )
+        match = pattern.search(function_source)
 
-    if build_marker in function_source:
-        function_source = function_source.replace(
-            build_marker,
-            (
-                "        if legs is None:\n"
-                "            self._set_entry_diagnostic(\n"
-                "                \"BUILD_FAILED\",\n"
-                "                \"Builder returned no legs; "
-                "inspect builder log\",\n"
-                "                strategy=strategy_name,\n"
-                "                pretrade=\"NOT_RUN\",\n"
-                "                execution=\"NOT_RUN\",\n"
-                "            )\n"
-                "            logger.warning("
-            ),
-            1,
+        if match is None:
+            # The detailed vega patch is optional if the source has
+            # already been manually changed.
+            return source
+
+        indent = match.group("indent")
+
+        replacement = (
+            indent
+            + "logger.warning(\n"
+            + indent
+            + "    f\"Pre-trade: vega above max: \"\n"
+            + indent
+            + "    f\"post={post_vega:.0f} > max={vega_max} \"\n"
+            + indent
+            + "    f\"— blocking entry\"\n"
+            + indent
+            + ")\n"
+            + indent
+            + "logger.info(\n"
+            + indent
+            + "    \"VEGA_DIAGNOSTIC | \"\n"
+            + indent
+            + "    f\"portfolio={port_greeks['vega']:.0f} | \"\n"
+            + indent
+            + "    f\"candidate={new_greeks['vega']:.0f} | \"\n"
+            + indent
+            + "    f\"post={post_vega:.0f} | \"\n"
+            + indent
+            + "    f\"min={vega_min} | max={vega_max} | \"\n"
+            + indent
+            + "    f\"strategy={strategy_name}\"\n"
+            + indent
+            + ")\n"
+            + indent
+            + "return False"
         )
 
-    # Record pre-trade stage.
-    pretrade_marker = (
-        "        if not await self._pre_trade_checks(\n"
-        "            strategy_name, legs\n"
-        "        ):"
-    )
-
-    if pretrade_marker in function_source:
-        function_source = function_source.replace(
-            pretrade_marker,
-            (
-                "        self._set_entry_diagnostic(\n"
-                "            \"PRETRADE_CHECK\",\n"
-                "            \"Strategy built; running pre-trade checks\",\n"
-                "            strategy=strategy_name,\n"
-                "            expiry=legs[0].expiry if legs else \"\",\n"
-                "            credit=meta.get(\n"
-                "                \"net_credit\",\n"
-                "                meta.get(\"total_credit\"),\n"
-                "            ),\n"
-                "            max_risk=meta.get(\"max_risk\"),\n"
-                "        )\n"
-                "\n"
-                "        if not await self._pre_trade_checks(\n"
-                "            strategy_name, legs\n"
-                "        ):"
-            ),
-            1,
+        function_source = (
+            function_source[:match.start()]
+            + replacement
+            + function_source[match.end():]
         )
 
-    # Record pre-trade failure.
-    pretrade_failure_marker = (
-        "            logger.info(\n"
-        "                f\"Pre-trade failed: {strategy_name}\"\n"
-        "            )"
-    )
-
-    if pretrade_failure_marker in function_source:
-        function_source = function_source.replace(
-            pretrade_failure_marker,
-            (
-                "            self._set_entry_diagnostic(\n"
-                "                \"PRETRADE_FAILED\",\n"
-                "                \"Pre-trade checks rejected the strategy\",\n"
-                "                strategy=strategy_name,\n"
-                "                pretrade=\"FAILED\",\n"
-                "                execution=\"NOT_RUN\",\n"
-                "            )\n"
-                + pretrade_failure_marker
-            ),
-            1,
-        )
-
-    # Record zero-lot rejection.
-    lots_marker = (
-        "        if lots < 1:\n"
-        "            logger.info(\n"
-        "                f\"Lot size=0 for {strategy_name} — skip\"\n"
-        "            )"
-    )
-
-    if lots_marker in function_source:
-        function_source = function_source.replace(
-            lots_marker,
-            (
-                "        if lots < 1:\n"
-                "            self._set_entry_diagnostic(\n"
-                "                \"LOTS_ZERO\",\n"
-                "                \"Lot sizing returned zero; trade skipped\",\n"
-                "                strategy=strategy_name,\n"
-                "                lots=lots,\n"
-                "                vix_multiplier=getattr(\n"
-                "                    self, \"_last_vix_mult\", 1.0\n"
-                "                ),\n"
-                "                pretrade=\"PASSED\",\n"
-                "                execution=\"NOT_RUN\",\n"
-                "            )\n"
-                "            logger.info(\n"
-                "                f\"Lot size=0 for {strategy_name} — skip\"\n"
-                "            )"
-            ),
-            1,
-        )
-
-    # Record execution start.
-    execution_marker = (
-        "        success = await self._execute_strategy(\n"
-        "            strategy_name, legs, meta, trade_id=trade_id\n"
-        "        )"
-    )
-
-    if execution_marker in function_source:
-        function_source = function_source.replace(
-            execution_marker,
-            (
-                "        self._set_entry_diagnostic(\n"
-                "            \"EXECUTING\",\n"
-                "            \"Pre-trade checks passed; sending orders\",\n"
-                "            strategy=strategy_name,\n"
-                "            expiry=new_expiry,\n"
-                "            credit=meta.get(\n"
-                "                \"net_credit\",\n"
-                "                meta.get(\"total_credit\"),\n"
-                "            ),\n"
-                "            max_risk=meta.get(\"max_risk\"),\n"
-                "            lots=lots,\n"
-                "            vix_multiplier=getattr(\n"
-                "                self, \"_last_vix_mult\", 1.0\n"
-                "            ),\n"
-                "            pretrade=\"PASSED\",\n"
-                "            execution=\"STARTED\",\n"
-                "        )\n"
-                "\n"
-                + execution_marker
-            ),
-            1,
-        )
-
-    # Record execution failure.
-    execution_failure_marker = (
-        "        if not success:\n"
-        "            logger.warning(\n"
-        "                f\"Execution failed: {strategy_name}\"\n"
-        "            )"
-    )
-
-    if execution_failure_marker in function_source:
-        function_source = function_source.replace(
-            execution_failure_marker,
-            (
-                "        if not success:\n"
-                "            self._set_entry_diagnostic(\n"
-                "                \"EXECUTION_FAILED\",\n"
-                "                \"Order execution returned failure\",\n"
-                "                strategy=strategy_name,\n"
-                "                pretrade=\"PASSED\",\n"
-                "                execution=\"FAILED\",\n"
-                "            )\n"
-                "            logger.warning(\n"
-                "                f\"Execution failed: {strategy_name}\"\n"
-                "            )"
-            ),
-            1,
-        )
-
-    # Record successful fill.
-    fill_marker = (
-        "        self._refresh_leg_greeks(legs)\n"
-        "\n"
-        "        position = self._create_position_record("
-    )
-
-    if fill_marker in function_source:
-        function_source = function_source.replace(
-            fill_marker,
-            (
-                "        self._set_entry_diagnostic(\n"
-                "            \"FILLED\",\n"
-                "            \"All legs filled; position created\",\n"
-                "            strategy=strategy_name,\n"
-                "            expiry=new_expiry,\n"
-                "            credit=meta.get(\n"
-                "                \"net_credit\",\n"
-                "                meta.get(\"total_credit\"),\n"
-                "            ),\n"
-                "            max_risk=meta.get(\"max_risk\"),\n"
-                "            lots=lots,\n"
-                "            vix_multiplier=getattr(\n"
-                "                self, \"_last_vix_mult\", 1.0\n"
-                "            ),\n"
-                "            pretrade=\"PASSED\",\n"
-                "            execution=\"FILLED\",\n"
-                "        )\n"
-                "\n"
-                + fill_marker
-            ),
-            1,
-        )
-
-    return source[:start] + function_source + source[end:]
-
-
-def patch_console(source: str) -> str:
-    """
-    Add the latest entry-pipeline state to main.py's module-level
-    _display_console() function.
-    """
-    start, end, function_source = find_function(
-        source,
-        "_display_console",
-    )
-
-    if "LAST ENTRY DIAGNOSTIC" in function_source:
-        return source
-
-    # W is defined later in _display_console(), so insert the block
-    # after the W assignment and before the first console output.
-    marker = "    W = 72\n"
-
-    if marker not in function_source:
-        fail(
-            "Console width marker was not found inside "
-            "_display_console()"
-        )
-
-    block = r'''    entry_diag = getattr(
-        se,
-        "_last_entry_diagnostic",
-        {},
-    )
-
-    print("\u2500" * W)
-    print(" LAST ENTRY DIAGNOSTIC")
-    print("\u2500" * W)
-    print(
-        f" Stage              : "
-        f"{entry_diag.get('stage', 'N/A')}"
-    )
-    print(
-        f" Strategy           : "
-        f"{entry_diag.get('strategy') or 'N/A'}"
-    )
-    print(
-        f" Message            : "
-        f"{entry_diag.get('message') or 'N/A'}"
-    )
-    print(
-        f" Expiry             : "
-        f"{entry_diag.get('expiry') or 'N/A'}"
-    )
-    print(
-        f" DTE                : "
-        f"{entry_diag.get('dte') if entry_diag.get('dte') is not None else 'N/A'}"
-    )
-    print(
-        f" Credit             : "
-        f"{entry_diag.get('credit') if entry_diag.get('credit') is not None else 'N/A'}"
-    )
-    print(
-        f" Minimum credit     : "
-        f"{entry_diag.get('min_credit') if entry_diag.get('min_credit') is not None else 'N/A'}"
-    )
-    print(
-        f" Wing width         : "
-        f"{entry_diag.get('wing_width') if entry_diag.get('wing_width') is not None else 'N/A'}"
-    )
-    print(
-        f" Max risk           : "
-        f"{entry_diag.get('max_risk') if entry_diag.get('max_risk') is not None else 'N/A'}"
-    )
-    print(
-        f" Lots               : "
-        f"{entry_diag.get('lots') if entry_diag.get('lots') is not None else 'N/A'}"
-    )
-    print(
-        f" VIX multiplier     : "
-        f"{entry_diag.get('vix_multiplier', 1.0):.3f}"
-    )
-    print(
-        f" Pre-trade          : "
-        f"{entry_diag.get('pretrade', 'N/A')}"
-    )
-    print(
-        f" Execution          : "
-        f"{entry_diag.get('execution', 'N/A')}"
-    )
-    print(
-        f" Timestamp          : "
-        f"{entry_diag.get('timestamp') or 'N/A'}"
-    )
-
-'''
+        return source[:start] + function_source + source[end:]
 
     function_source = function_source.replace(
-        marker,
-        marker + block,
+        old,
+        new,
         1,
     )
 
     return source[:start] + function_source + source[end:]
+
+
+def patch_console_trade_label(source: str) -> str:
+    """
+    Change the broad-gate console label so it does not imply that
+    orders are already being sent.
+
+    This is display-only.
+    """
+    if "BROAD GATES PASSED" in source:
+        return source
+
+    old = (
+        '        print(f" TRADE DECISION: {G}ATTEMPTING {intended}{E}")'
+    )
+
+    new = (
+        '        print(f" TRADE DECISION: {G}BROAD GATES PASSED — '
+        'CANDIDATE {intended}{E}")'
+    )
+
+    if old not in source:
+        return source
+
+    return source.replace(
+        old,
+        new,
+        1,
+    )
 
 
 def apply_patch() -> None:
     original = {
-        filename: read_file(filename)
+        filename: read_source(filename)
         for filename in FILES
     }
 
     patched = dict(original)
 
-    # Required runtime fixes.
+    # Runtime correctness.
     patched["strategy_engine.py"] = (
         patch_effective_regime(
             patched["strategy_engine.py"]
@@ -1098,13 +808,30 @@ def apply_patch() -> None:
         )
     )
 
+    # Edge integrity.
     patched["regime_engine.py"] = (
-        patch_edge_zscore(
+        patch_edge_history_units(
             patched["regime_engine.py"]
         )
     )
 
-    # Safe accounting/data fixes.
+    patched["regime_engine.py"] = (
+        patch_edge_std_floor(
+            patched["regime_engine.py"]
+        )
+    )
+
+    patched["data_manager.py"] = (
+        patch_synthetic_history(
+            patched["data_manager.py"]
+        )
+    )
+
+    patched["config.py"] = patch_edge_config(
+        patched["config.py"]
+    )
+
+    # Strategy correctness.
     patched["strategy_engine.py"] = (
         patch_iv_rank_fallback(
             patched["strategy_engine.py"]
@@ -1117,40 +844,20 @@ def apply_patch() -> None:
         )
     )
 
-    patched["data_manager.py"] = (
-        patch_synthetic_edge_history(
-            patched["data_manager.py"]
-        )
-    )
-
+    # Avoid unnecessary historical-candle API requests.
     patched["config.py"] = patch_config(
         patched["config.py"]
     )
 
-    patched["config.py"] = patch_edge_config(
-        patched["config.py"]
-    )
-
-    # Detailed operator diagnostics.
+    # Detailed rejection reason for the observed vega failure.
     patched["strategy_engine.py"] = (
-        patch_strategy_diagnostic_state(
+        patch_vega_diagnostic(
             patched["strategy_engine.py"]
         )
     )
 
-    patched["strategy_engine.py"] = (
-        patch_strategy_diagnostic_helper(
-            patched["strategy_engine.py"]
-        )
-    )
-
-    patched["strategy_engine.py"] = (
-        patch_strategy_entry_diagnostics(
-            patched["strategy_engine.py"]
-        )
-    )
-
-    patched["main.py"] = patch_console(
+    # Correct the broad console wording.
+    patched["main.py"] = patch_console_trade_label(
         patched["main.py"]
     )
 
@@ -1163,13 +870,13 @@ def apply_patch() -> None:
     if not changed:
         print(
             "No changes required. "
-            "The patch is already applied."
+            "The validated fixes are already applied."
         )
         return
 
-    # Validate every file before touching originals.
+    # Compile every file before modifying anything.
     for filename in FILES:
-        validate_python(
+        validate_source(
             filename,
             patched[filename],
         )
@@ -1211,7 +918,7 @@ def apply_patch() -> None:
                 encoding="utf-8",
             )
 
-            validate_python(
+            validate_source(
                 filename,
                 patched[filename],
             )
@@ -1225,6 +932,7 @@ def apply_patch() -> None:
             )
 
     except Exception:
+        # Restore changed files from the backup.
         for filename in changed:
             backup_path = backup_dir / filename
 
@@ -1256,7 +964,8 @@ def apply_patch() -> None:
     )
     print()
     print(
-        "Detailed entry diagnostics were added to the console."
+        "Vega rejection details and entry-stage diagnostics "
+        "are now logged."
     )
     print(
         "Run PAPER_TRADING_MODE before enabling live trading."

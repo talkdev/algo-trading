@@ -2725,9 +2725,8 @@ class StrategyEngine:
             logger.info('Entry gate BLOCKED: regime frozen')
             return False
         regime = self.re.confirmed_regime
-        # Initialize before the VIX-gate reference.
-        _effective_regime = regime
         # Effective regime is initialized before the VIX gate.
+        _effective_regime = regime
         # Initialize before the first VIX-gate reference.
         # The later IV-spike logic may override this locally.
         # S9-2b: VIX gate uses _effective_regime
@@ -5771,29 +5770,6 @@ class StrategyEngine:
                     f"post={post_vega:.0f} > max={vega_max} "
                     f"— blocking entry"
                 )
-                logger.info(
-                    "VEGA_DIAGNOSTIC | "
-                    f"portfolio={port_greeks['vega']:.0f} | "
-                    f"candidate={new_greeks['vega']:.0f} | "
-                    f"post={post_vega:.0f} | "
-                    f"min={vega_min} | "
-                    f"max={vega_max} | "
-                    f"strategy={strategy_name}"
-                )
-                if hasattr(self, "_set_entry_diagnostic"):
-                    self._set_entry_diagnostic(
-                        "PRETRADE_FAILED",
-                        "Vega limit rejected candidate",
-                        strategy=strategy_name,
-                        credit=None,
-                        pretrade="FAILED",
-                        execution="NOT_RUN",
-                        vega_portfolio=port_greeks['vega'],
-                        vega_candidate=new_greeks['vega'],
-                        vega_post=post_vega,
-                        vega_min=vega_min,
-                        vega_max=vega_max,
-                    )
                 return False
 
         # PRF-S05: portfolio-level absolute vega cap.

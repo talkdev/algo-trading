@@ -1151,7 +1151,7 @@ def _display_console(dm, re, se, cached_greeks=None):
 
     print("\u2500" * W)
     if all_ok:
-        print(f" TRADE DECISION: {G}BROAD GATES PASSED — CANDIDATE {intended}{E}")
+        print(f" TRADE DECISION: {G}ATTEMPTING {intended}{E}")
     elif not is_tday:
         print(f" TRADE DECISION: {Y}WAITING — Not a trading day{E}")
     elif not is_mkt:
