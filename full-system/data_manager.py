@@ -1901,8 +1901,14 @@ class DataManager:
                 put_data   = data["put"]
                 call_oi    = float(call_data.get("oi", 0))
                 put_oi     = float(put_data.get("oi",  0))
-                call_delta = float(call_data.get("delta", 0))
-                put_delta  = float(put_data.get("delta",  0))
+                call_delta = _sf(
+                    call_data.get("delta"),
+                    0.0,
+                )
+                put_delta = _sf(
+                    put_data.get("delta"),
+                    0.0,
+                )
 
                 prev_call = prev_snapshot.get(
                     strike, {}

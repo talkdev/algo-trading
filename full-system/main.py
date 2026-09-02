@@ -1021,6 +1021,72 @@ def _display_console(dm, re, se, cached_greeks=None):
     pbuf_full   = len(re.trend_buffer) >= config.PERSISTENCE_READINGS
 
     W = 72
+    entry_diag = getattr(
+        se,
+        "_last_entry_diagnostic",
+        {},
+    )
+
+    print("\u2500" * W)
+    print(" LAST ENTRY DIAGNOSTIC")
+    print("\u2500" * W)
+    print(
+        f" Stage              : "
+        f"{entry_diag.get('stage', 'N/A')}"
+    )
+    print(
+        f" Strategy           : "
+        f"{entry_diag.get('strategy') or 'N/A'}"
+    )
+    print(
+        f" Message            : "
+        f"{entry_diag.get('message') or 'N/A'}"
+    )
+    print(
+        f" Expiry             : "
+        f"{entry_diag.get('expiry') or 'N/A'}"
+    )
+    print(
+        f" DTE                : "
+        f"{entry_diag.get('dte') if entry_diag.get('dte') is not None else 'N/A'}"
+    )
+    print(
+        f" Credit             : "
+        f"{entry_diag.get('credit') if entry_diag.get('credit') is not None else 'N/A'}"
+    )
+    print(
+        f" Minimum credit     : "
+        f"{entry_diag.get('min_credit') if entry_diag.get('min_credit') is not None else 'N/A'}"
+    )
+    print(
+        f" Wing width         : "
+        f"{entry_diag.get('wing_width') if entry_diag.get('wing_width') is not None else 'N/A'}"
+    )
+    print(
+        f" Max risk           : "
+        f"{entry_diag.get('max_risk') if entry_diag.get('max_risk') is not None else 'N/A'}"
+    )
+    print(
+        f" Lots               : "
+        f"{entry_diag.get('lots') if entry_diag.get('lots') is not None else 'N/A'}"
+    )
+    print(
+        f" VIX multiplier     : "
+        f"{entry_diag.get('vix_multiplier', 1.0):.3f}"
+    )
+    print(
+        f" Pre-trade          : "
+        f"{entry_diag.get('pretrade', 'N/A')}"
+    )
+    print(
+        f" Execution          : "
+        f"{entry_diag.get('execution', 'N/A')}"
+    )
+    print(
+        f" Timestamp          : "
+        f"{entry_diag.get('timestamp') or 'N/A'}"
+    )
+
     print()
     print("\u2501" * W)
     print(f" [{now_str}]  {eng}")
