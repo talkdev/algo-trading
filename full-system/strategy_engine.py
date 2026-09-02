@@ -1958,8 +1958,86 @@ class StrategyEngine:
                 self.cb_level_5_active = False
 
     async def _monitor_all_positions(self) -> None:
-        """Monitor all open positions for exit conditions."""
+        # Monitor all open positions for exit conditions.
         for position in list(self.open_positions):
+            # INTRADAY: hard time exits checked first
+            _now_ist  = datetime.now(self._IST)
+            _now_time = _now_ist.time()
+            _weekday  = _now_ist.weekday()
+            _hard_exit = getattr(
+                config, 'INTRADAY_HARD_EXIT_TIME', time(14, 45)
+            )
+            if _now_time >= _hard_exit:
+                logger.info(
+                    f'INTRADAY HARD EXIT: {position.trade_id[:8]} '
+                    f'strategy={position.strategy_name}'
+                )
+                await self._close_position(
+                    position,
+                    config.EXIT_REASONS['TIME_EXIT'],
+                    use_market=True,
+                )
+                continue
+            if _weekday == 1:  # Tuesday 0DTE force close
+                _zero_exit = getattr(
+                    config, 'ZERO_DTE_EXIT_TIME', time(13, 30)
+                )
+                if _now_time >= _zero_exit:
+                    logger.info(
+                        f'0DTE FORCE EXIT: {position.trade_id[:8]} '
+                        f'Tuesday {_zero_exit}'
+                    )
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS['TIME_EXIT'],
+                        use_market=True,
+                    )
+                    continue
+            _max_hold = getattr(
+                config, 'INTRADAY_MAX_HOLD_MINUTES', 180
+            )
+            try:
+                _entry_dt = datetime.fromisoformat(
+                    position.entry_timestamp
+                )
+                if _entry_dt.tzinfo is None:
+                    _entry_dt = self._IST.localize(_entry_dt)
+                _held_min = (
+                    _now_ist - _entry_dt
+                ).total_seconds() / 60.0
+                if _held_min >= _max_hold:
+                    logger.info(
+                        f'MAX HOLD EXIT: {position.trade_id[:8]} '
+                        f'held {_held_min:.0f} min (max={_max_hold})'
+                    )
+                    await self._close_position(
+                        position,
+                        config.EXIT_REASONS['TIME_EXIT'],
+                    )
+                    continue
+            except Exception:
+                pass
+            _vwap_sig = self.dm.vwap_signal
+            _or_low   = self.dm.opening_range_low
+            _spot     = self.dm.spot
+            if (
+                position.strategy_name == config.STRAT_CREDIT_SPREADS
+                and position.meta.get('skew_side') == 'put'
+                and _vwap_sig == 'BEARISH'
+                and _or_low is not None
+                and _spot is not None
+                and _spot < _or_low * 0.998
+            ):
+                logger.info(
+                    f'VWAP ADVERSE EXIT: {position.trade_id[:8]} '
+                    f'put spread, BEARISH VWAP, spot below OR low'
+                )
+                await self._close_position(
+                    position,
+                    config.EXIT_REASONS['REGIME_CHANGE'],
+                )
+                continue
+            # end intraday time exits
             if position.status != "OPEN":
                 continue
 
@@ -3200,6 +3278,71 @@ class StrategyEngine:
                     '(weekend gap risk — insufficient theta)'
                 )
                 return False
+        # INTRADAY GATE A: Opening range must be established
+        if not self.dm.opening_range_set:
+            logger.info(
+                'Entry gate BLOCKED: opening range not established. '
+                'Wait for 09:30 (3 five-min bars needed).'
+            )
+            return False
+
+        # INTRADAY GATE B: VWAP entry timing filter
+        _vwap      = self.dm.vwap
+        _vwap_dist = self.dm.vwap_distance_pct
+        _vwap_bars = len(self.dm.candles_5m)
+        _block_pct = getattr(config, 'VWAP_ENTRY_BLOCK_PCT', 0.30)
+        _min_bars  = getattr(config, 'VWAP_MIN_BARS', 6)
+        if _vwap is not None and _vwap_bars >= _min_bars:
+            _skew_side = getattr(self, '_pending_skew_side', 'put')
+            if _skew_side == 'put' and _vwap_dist < -_block_pct:
+                logger.info(
+                    f'Entry gate BLOCKED: VWAP filter. '
+                    f'Spot {_vwap_dist:.3f}%% below VWAP={_vwap:.0f}. '
+                    f'Sellers in control.'
+                )
+                return False
+            if _skew_side == 'call' and _vwap_dist > _block_pct:
+                logger.info(
+                    f'Entry gate BLOCKED: VWAP filter. '
+                    f'Spot {_vwap_dist:.3f}%% above VWAP={_vwap:.0f}. '
+                    f'Buyers in control.'
+                )
+                return False
+
+        # INTRADAY GATE C: IV spiking
+        if self.dm.iv_behavior == 'SPIKING':
+            logger.info(
+                f'Entry gate BLOCKED: IV spiking '
+                f'({self.dm.iv_atm_change_pct * 100:+.1f}%% from open).'
+            )
+            return False
+
+        # INTRADAY GATE D: Day-of-week time restrictions
+        _weekday = now.weekday()
+        if _weekday == 1:  # Tuesday 0DTE
+            _zero_cutoff = getattr(
+                config, 'ZERO_DTE_ENTRY_CUTOFF', time(11, 30)
+            )
+            if now_time > _zero_cutoff:
+                logger.info(
+                    f'Entry gate BLOCKED: Tuesday 0DTE cutoff ({_zero_cutoff}).'
+                )
+                return False
+        if _weekday == 0:  # Monday
+            _straddle_start = getattr(
+                config, 'MONDAY_STRADDLE_START', time(10, 0)
+            )
+            _intended_strat = self._select_strategy(regime)
+            if (
+                _intended_strat == config.STRAT_SHORT_STRADDLE
+                and now_time < _straddle_start
+            ):
+                logger.info(
+                    'Entry gate BLOCKED: Monday straddle before 10:00 '
+                    '(SGX gap risk).'
+                )
+                return False
+
         logger.info(
             f'Entry gate PASSED: regime={regime} '
             f'time={now_time} '
@@ -3884,21 +4027,18 @@ class StrategyEngine:
             ):
                 return config.STRAT_RATIO_SPREAD
             else:
-                # OPT-2 / MITIGATION-1A: NIFTY structural put skew
-                # (2-3pp always present) gives put spreads 76-82% win
-                # rate vs 65-70% for call spreads.  When NIFTY is also
-                # below EMA-50 (bearish trend), put spreads are further
-                # aligned with the directional bias.
-                _spot_m1a = self.dm.spot or 0
-                _ema_m1a  = self.dm.ema_50 or 0
-                _slope_m1a = self.dm.ema_slope or 0
-                if _ema_m1a > 0 and _spot_m1a < _ema_m1a and _slope_m1a < 0:
+                # INTRADAY: use VWAP signal to determine skew side.
+                # BEARISH VWAP = spot below VWAP = sell calls.
+                # Default: put side (NIFTY structural upward bias).
+                _vwap_sig_sel = self.dm.vwap_signal
+                if _vwap_sig_sel == 'BEARISH':
+                    self._pending_skew_side = 'call'
                     logger.info(
-                        "MITIGATION-1A: NIFTY below EMA-50 + "
-                        "negative slope — put spread only "
-                        "(trend-aligned premium selling)"
+                        'INTRADAY: VWAP BEARISH -> call spread '
+                        '(spot below VWAP)'
                     )
-                self._pending_skew_side = "put"
+                else:
+                    self._pending_skew_side = 'put'
                 return config.STRAT_CREDIT_SPREADS
 
         elif regime == config.REGIME_NEUTRAL:
@@ -7050,6 +7190,41 @@ class StrategyEngine:
             except Exception:
                 pass
 
+        # INTRADAY: 0DTE gamma lot reduction (Tuesday)
+        _now_lot  = datetime.now(self._IST)
+        _wday_lot = _now_lot.weekday()
+        _time_lot = _now_lot.time()
+        if _wday_lot == 1:  # Tuesday 0DTE
+            _zero_max = getattr(config, 'ZERO_DTE_MAX_LOTS', 2)
+            lots = min(lots, _zero_max)
+            if _time_lot >= time(11, 30):
+                lots = max(1, lots // 2)
+                logger.info(
+                    f'0DTE gamma reduction (after 11:30): lots -> {lots}'
+                )
+            elif _time_lot >= time(10, 30):
+                lots = max(1, int(lots * 0.75))
+                logger.info(
+                    f'0DTE gamma reduction (after 10:30): lots -> {lots}'
+                )
+        # INTRADAY: VWAP extension lot reduction
+        _vwap_dist_lot = abs(self.dm.vwap_distance_pct)
+        if _vwap_dist_lot > 0.40:
+            lots = max(1, lots // 2)
+            logger.info(
+                f'VWAP extension reduction '
+                f'(dist={_vwap_dist_lot:.3f}%%): lots -> {lots}'
+            )
+        elif _vwap_dist_lot > 0.25:
+            lots = max(1, int(lots * 0.75))
+            logger.info(
+                f'VWAP extension reduction '
+                f'(dist={_vwap_dist_lot:.3f}%%): lots -> {lots}'
+            )
+        # INTRADAY: IV rising lot reduction
+        if self.dm.iv_behavior == 'RISING':
+            lots = max(1, int(lots * 0.75))
+            logger.info(f'IV rising reduction: lots -> {lots}')
         logger.info(
             f"Lot size: {lots} for {strategy_name} "
             f"risk={risk_per_trade} "
