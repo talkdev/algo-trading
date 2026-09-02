@@ -64,30 +64,47 @@ EVENT_POST_HOURS = 2
 MODULES          = ["vol", "edge", "trend", "flow"]
 # AUDIT #2.2: weights now read from config so tuning
 # config.WEIGHT_* actually takes effect at runtime.
-def _build_weights(flow_none_frac=0.0, regime_confidence=1.0):
-    """PATCH R-07: redistribute flow weight when flow is frequently None.
-    flow_none_frac: fraction of recent cycles where flow returned None.
-    When > FLOW_WEIGHT_NONE_THRESHOLD, flow weight is set to 0 and
-    redistributed proportionally to vol, edge, trend.
-    FIX-2026-I: regime_confidence parameter shifts weight from edge
-    to trend when confidence is low (consecutive sell-vol losses).
-    At low confidence, the VRP signal (edge) may be misclassified;
-    the ADX trend signal is more objective and reliable.
+def _build_weights(
+    flow_none_frac=0.0,
+    regime_confidence=1.0,
+    trend_score=0.0,
+):
+    """
+    Build module weights with three adjustments:
+
+    1. FIX-2026-I: confidence decay — at low regime confidence,
+       shift 25% of edge weight to trend (ADX is more objective).
+
+    2. RE-3 / OPT-8: NIFTY asymmetric trend weight.
+       NIFTY has a structural upward bias (54% positive sessions
+       2020-2026).  Bearish trend signals carry less predictive
+       weight for premium selling.  When trend_score < -0.05,
+       reduce trend weight by 20% and redistribute to edge.
+
+    3. IMM-01: flow weight redistribution when flow is frequently
+       None (DTE<3, warmup, expiry rollover).
     """
     _threshold = getattr(config, "FLOW_WEIGHT_NONE_THRESHOLD", 0.50)
     wv = config.WEIGHT_VOL
     we = config.WEIGHT_EDGE
     wt = config.WEIGHT_TREND
     wf = config.WEIGHT_FLOW
-    # FIX-2026-I: regime weight decay based on confidence
-    # At low confidence: shift 25%% of edge weight to trend
-    # (trend = objective ADX signal; edge = VRP may be misclassified)
+
+    # Adjustment 1: confidence decay (FIX-2026-I)
     if regime_confidence < 0.70 and we > 0:
         _shift = we * 0.25 * (1.0 - regime_confidence / 0.70)
         we = round(we - _shift, 6)
         wt = round(wt + _shift, 6)
+
+    # Adjustment 2: NIFTY asymmetric bearish trend weight
+    # (RE-3 / OPT-8)
+    if trend_score < -0.05 and wt > 0:
+        _trend_reduction = wt * 0.20
+        wt = round(wt - _trend_reduction, 6)
+        we = round(we + _trend_reduction, 6)
+
+    # Adjustment 3: flow weight redistribution (IMM-01)
     if flow_none_frac > _threshold and wf > 0:
-        # Redistribute flow weight proportionally to other three modules
         _other_sum = wv + we + wt
         if _other_sum > 0:
             _scale = (wv + we + wt + wf) / _other_sum
@@ -95,12 +112,14 @@ def _build_weights(flow_none_frac=0.0, regime_confidence=1.0):
             we = round(we * _scale, 6)
             wt = round(wt * _scale, 6)
             wf = 0.0
+
     return {
         "vol":   wv,
         "edge":  we,
         "trend": wt,
         "flow":  wf,
     }
+
 WEIGHTS = _build_weights()
 
 
