@@ -510,6 +510,30 @@ class DataManager:
         # Active expiry = nearest future expiry
         self._active_expiry: Optional[str] = None
 
+        # INTRADAY: session state resets daily at 09:15
+        self.vwap                   = None
+        self.vwap_distance_pct      = 0.0
+        self.vwap_signal            = 'NEUTRAL'
+        self._vwap_cum_pv           = 0.0
+        self._vwap_cum_vol          = 0.0
+        self._session_total_vol     = 0.0
+        self.cumulative_delta       = 0.0
+        self.cumulative_delta_pct   = 0.0
+        self._vwap_session_date     = None
+        self.opening_range_high     = None
+        self.opening_range_low      = None
+        self.opening_range_mid      = None
+        self.opening_range_width    = None
+        self.opening_range_set      = False
+        self._or_session_date       = None
+        self.iv_atm_open            = None
+        self.iv_atm_change_pct      = 0.0
+        self.iv_behavior            = 'STABLE'
+        self.pcr_open               = None
+        self.pcr_current            = None
+        self.pcr_change             = 0.0
+        self.candles_5m             = deque(maxlen=80)
+        self._5m_session_date       = None
         self._data_lock = asyncio.Lock()
         self._IST       = pytz.timezone(config.TZ)
 
@@ -2566,7 +2590,243 @@ class DataManager:
     # ─────────────────────────────────────────────────────────────
 
 
+    # ----------------------------------------------------------------
+    # INTRADAY METHODS
+    # ----------------------------------------------------------------
+
+    async def fetch_5min_candles(self) -> list:
+        # Fetch today 5-min candles; compute VWAP, OR, IV, PCR.
+        try:
+            today     = datetime.now(self._IST).date()
+            today_str = today.strftime('%Y-%m-%d')
+            if self._5m_session_date != today:
+                self._5m_session_date    = today
+                self._vwap_cum_pv        = 0.0
+                self._vwap_cum_vol       = 0.0
+                self._session_total_vol  = 0.0
+                self.cumulative_delta    = 0.0
+                self.vwap                = None
+                self.vwap_signal         = 'NEUTRAL'
+                self.vwap_distance_pct   = 0.0
+                self.candles_5m.clear()
+                self.opening_range_set   = False
+                self.opening_range_high  = None
+                self.opening_range_low   = None
+                self.opening_range_mid   = None
+                self.opening_range_width = None
+                self.iv_atm_open         = None
+                self.iv_atm_change_pct   = 0.0
+                self.iv_behavior         = 'STABLE'
+                self.pcr_open            = None
+                self.pcr_current         = None
+                self.pcr_change          = 0.0
+                logger.info('Intraday session reset')
+            raw = await self.fetch_historical_candles(
+                config.INSTRUMENT_NIFTY, '5minute',
+                today_str, today_str,
+            )
+            if not raw:
+                return []
+            session = [
+                c for c in raw
+                if today_str in str(c.get('timestamp', ''))
+            ]
+            if not session:
+                return []
+            cum_pv = cum_vol = cum_delta = total_vol = 0.0
+            processed = []
+            for c in session:
+                o  = float(c.get('open',   0) or 0)
+                h  = float(c.get('high',   0) or 0)
+                l  = float(c.get('low',    0) or 0)
+                cl = float(c.get('close',  0) or 0)
+                v  = float(c.get('volume', 0) or 0)
+                if v <= 0 or h <= 0 or cl <= 0:
+                    continue
+                typical   = (h + l + cl) / 3.0
+                cum_pv   += typical * v
+                cum_vol  += v
+                total_vol += v
+                bar_range = max(h - l, 0.05)
+                if cl >= o:
+                    bar_delta = v * (cl - l) / bar_range
+                else:
+                    bar_delta = -v * (h - cl) / bar_range
+                cum_delta += bar_delta
+                vwap_now   = cum_pv / cum_vol if cum_vol > 0 else 0.0
+                processed.append({
+                    'timestamp': c.get('timestamp'),
+                    'open': o, 'high': h, 'low': l, 'close': cl,
+                    'volume': v,
+                    'bar_delta': bar_delta,
+                    'cum_delta': cum_delta,
+                    'vwap': vwap_now,
+                })
+            if not processed or cum_vol <= 0:
+                return []
+            self._vwap_cum_pv       = cum_pv
+            self._vwap_cum_vol      = cum_vol
+            self._session_total_vol = total_vol
+            self.vwap               = cum_pv / cum_vol
+            self.cumulative_delta   = cum_delta
+            self.cumulative_delta_pct = (
+                cum_delta / total_vol * 100.0 if total_vol > 0 else 0.0
+            )
+            self.candles_5m.clear()
+            for c in processed[-80:]:
+                self.candles_5m.append(c)
+            if self.spot and self.spot > 0 and self.vwap and self.vwap > 0:
+                self.vwap_distance_pct = (
+                    (self.spot - self.vwap) / self.vwap * 100.0
+                )
+            self.vwap_signal = self._compute_vwap_signal()
+            self._update_opening_range(processed, today_str)
+            self._update_iv_behavior()
+            self._update_intraday_pcr()
+            logger.info(
+                f'5min: {len(processed)} bars | '
+                f'VWAP={self.vwap:.2f} | '
+                f'dist={self.vwap_distance_pct:+.3f}%% | '
+                f'signal={self.vwap_signal} | '
+                f'OR={"SET" if self.opening_range_set else "PENDING"} | '
+                f'IV={self.iv_behavior}'
+            )
+            return list(self.candles_5m)
+        except Exception as e:
+            logger.error(f'fetch_5min_candles error: {e}')
+            return []
+
+    def _compute_vwap_signal(self) -> str:
+        # VWAP signal for intraday premium selling.
+        if self.spot is None or self.vwap is None or self.vwap <= 0:
+            return 'NEUTRAL'
+        near_pct = getattr(config, 'VWAP_NEAR_THRESHOLD_PCT', 0.15)
+        dist     = self.vwap_distance_pct
+        total    = self._session_total_vol
+        thresh   = total * 0.15 if total > 0 else 1e18
+        d_pos    = self.cumulative_delta > +thresh
+        d_neg    = self.cumulative_delta < -thresh
+        if abs(dist) < near_pct:
+            return 'NEAR_VWAP'
+        if dist > near_pct and d_pos:
+            return 'BULLISH'
+        if dist < -near_pct and d_neg:
+            return 'BEARISH'
+        if dist > near_pct and d_neg:
+            return 'DIVERGENCE_UP'
+        if dist < -near_pct and d_pos:
+            return 'DIVERGENCE_DOWN'
+        return 'NEUTRAL'
+
+    def _update_opening_range(self, candles: list, today_str: str) -> None:
+        # Compute opening range from 09:15-09:30 (first 3 five-min bars).
+        today = datetime.now(self._IST).date()
+        if self._or_session_date == today and self.opening_range_set:
+            return
+        or_c = [
+            c for c in candles
+            if today_str in str(c.get('timestamp', ''))
+            and '09:15' <= str(c.get('timestamp', ''))[11:16] <= '09:29'
+        ]
+        if len(or_c) < 3:
+            return
+        self.opening_range_high  = max(c['high'] for c in or_c)
+        self.opening_range_low   = min(c['low']  for c in or_c)
+        self.opening_range_mid   = (
+            self.opening_range_high + self.opening_range_low
+        ) / 2.0
+        self.opening_range_width = (
+            self.opening_range_high - self.opening_range_low
+        )
+        self.opening_range_set  = True
+        self._or_session_date   = today
+        logger.info(
+            f'Opening range: H={self.opening_range_high:.0f} '
+            f'L={self.opening_range_low:.0f} '
+            f'W={self.opening_range_width:.0f}pts'
+        )
+
+    def _update_iv_behavior(self) -> None:
+        # Track intraday IV vs opening IV.
+        if self.iv_atm is None or self.iv_atm <= 0:
+            return
+        now_time = datetime.now(self._IST).time()
+        if (
+            self.iv_atm_open is None
+            and now_time >= config.EXEC_START_TIME
+            and len(self.candles_5m) >= 3
+        ):
+            self.iv_atm_open = self.iv_atm
+            logger.info(
+                f'Opening IV recorded: {self.iv_atm_open * 100:.2f}%%'
+            )
+            return
+        if self.iv_atm_open is None or self.iv_atm_open <= 0:
+            return
+        self.iv_atm_change_pct = (
+            (self.iv_atm - self.iv_atm_open) / self.iv_atm_open
+        )
+        crush = getattr(config, 'IV_CRUSH_THRESHOLD', 0.10)
+        spike = getattr(config, 'IV_SPIKE_THRESHOLD', 0.15)
+        band  = getattr(config, 'IV_STABLE_BAND',     0.05)
+        chg   = self.iv_atm_change_pct
+        if chg < -crush:
+            self.iv_behavior = 'CRUSHING'
+        elif chg > spike:
+            self.iv_behavior = 'SPIKING'
+        elif abs(chg) < band:
+            self.iv_behavior = 'STABLE'
+        elif chg < 0:
+            self.iv_behavior = 'DECLINING'
+        else:
+            self.iv_behavior = 'RISING'
+
+    def _update_intraday_pcr(self) -> None:
+        # Compute intraday PCR from active chain.
+        try:
+            active = self.get_active_chain()
+            if not active:
+                return
+            total_call = sum(
+                int(d.get('call', {}).get('oi', 0) or 0)
+                for d in active.values()
+            )
+            total_put = sum(
+                int(d.get('put', {}).get('oi', 0) or 0)
+                for d in active.values()
+            )
+            if total_call <= 0:
+                return
+            self.pcr_current = total_put / total_call
+            now_time = datetime.now(self._IST).time()
+            if (
+                self.pcr_open is None
+                and now_time >= config.EXEC_START_TIME
+                and len(self.candles_5m) >= 3
+            ):
+                self.pcr_open = self.pcr_current
+                logger.info(
+                    f'Opening PCR recorded: {self.pcr_open:.3f}'
+                )
+                return
+            if self.pcr_open is not None and self.pcr_open > 0:
+                self.pcr_change = self.pcr_current - self.pcr_open
+        except Exception as e:
+            logger.warning(f'_update_intraday_pcr error: {e}')
+
+    def get_vwap_trend_score(self) -> float:
+        # Convert VWAP signal to trend score for regime engine.
+        return {
+            'NEAR_VWAP':       1.0,
+            'BULLISH':         0.3,
+            'BEARISH':        -0.3,
+            'DIVERGENCE_UP':  -0.5,
+            'DIVERGENCE_DOWN': 0.5,
+            'NEUTRAL':         0.0,
+        }.get(self.vwap_signal, 0.0)
+
     def get_estimated_rv(self) -> Optional[float]:
+
         """
         Get RV, using VIX-based estimate when not available.
         FIX: rv_20d=None on first run causes edge_score=0.
