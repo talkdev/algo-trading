@@ -673,7 +673,7 @@ class RegimeEngine:
         ))
         detail = (
             f'OR={or_low:.0f}-{or_high:.0f} [{width_tag}] | '
-            f'spot={spot:.0f} [{or_tag}] | {vwap_tag}'
+            f'spot={spot:.0f} [{or_tag}] | {vwap_tag} | {skew_tag}'
         )
         logger.info(f'Vol(structure): score={raw:.3f} | {detail}')
         self._last_vol_detail = {

@@ -3278,6 +3278,32 @@ class StrategyEngine:
                     '(weekend gap risk — insufficient theta)'
                 )
                 return False
+        # PROFIT-P12: Momentum velocity gate (VIX-scaled)
+        # Blocks premium-selling entries during fast directional moves.
+        # Base threshold: 3.5pts/min at VIX=11, scales with VIX.
+        # Measured over last 3 five-min bars (15 minutes).
+        _mom_base  = getattr(config, 'MOMENTUM_BASE_PTS_PER_MIN', 3.5)
+        _mom_vix_r = getattr(config, 'MOMENTUM_VIX_REFERENCE',    11.0)
+        _mom_bars  = getattr(config, 'MOMENTUM_LOOKBACK_BARS',     3)
+        _vix_now_m = self.dm.vix or _mom_vix_r
+        _mom_thresh = _mom_base * (_vix_now_m / _mom_vix_r)
+        _bars_5m   = list(self.dm.candles_5m)
+        if len(_bars_5m) >= _mom_bars + 1:
+            _recent = _bars_5m[-_mom_bars:]
+            _oldest_close = _bars_5m[-(  _mom_bars + 1)]['close']
+            _newest_close = _recent[-1]['close']
+            _pts_moved    = abs(_newest_close - _oldest_close)
+            _mins_elapsed = _mom_bars * 5.0
+            _velocity     = _pts_moved / _mins_elapsed
+            if _velocity > _mom_thresh:
+                logger.info(
+                    f'Entry gate BLOCKED: momentum velocity '
+                    f'{_velocity:.2f}pts/min > threshold '
+                    f'{_mom_thresh:.2f}pts/min '
+                    f'(VIX={_vix_now_m:.1f})'
+                )
+                return False
+
         # INTRADAY GATE A: Opening range must be established
         if not self.dm.opening_range_set:
             logger.info(
