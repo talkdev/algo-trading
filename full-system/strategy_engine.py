@@ -3152,6 +3152,9 @@ class StrategyEngine:
             f'time={now_time} '
             f'composite={self.re.raw_composite:.4f}'
         )
+        # PATCH-SE-4: gate feedback to regime engine
+        self.re._last_entry_gate_passed = True
+        self.re._last_entry_gate_reason = ""
         return True
     def _set_entry_diagnostic(
         self,
@@ -3342,6 +3345,7 @@ class StrategyEngine:
                 f"Pre-trade failed: {strategy_name}"
             )
             # LOG-SE-03b: log pre-trade failure
+            # PATCH-SE-2: enriched FAILED_PRETRADE log
             _exp = legs[0].expiry if legs else None
             _dte_val = None
             if _exp:
@@ -3353,17 +3357,40 @@ class StrategyEngine:
                     ).days
                 except Exception:
                     pass
+            _pt_wing = None
+            if meta.get("short_call") and meta.get("long_call"):
+                _pt_wing = (
+                    meta["long_call"] - meta["short_call"]
+                )
+            elif meta.get("short_put") and meta.get("long_put"):
+                _pt_wing = (
+                    meta["short_put"] - meta["long_put"]
+                )
+            _pt_reason = getattr(
+                self, "_pretrade_fail_reason",
+                "pre-trade checks failed"
+            ) or "pre-trade checks failed"
             self._log_entry_attempt(
                 strategy_name,
                 "FAILED_PRETRADE",
-                "pre-trade checks failed",
+                _pt_reason,
                 expiry_date=_exp,
                 dte=_dte_val,
                 net_credit=meta.get(
                     "net_credit",
                     meta.get("total_credit", 0),
                 ),
+                min_credit_required=meta.get(
+                    "_min_credit_required"
+                ),
+                wing_width=_pt_wing,
+                expected_move=meta.get("expected_move"),
                 pretrade_passed=False,
+                pretrade_fail_reason=_pt_reason,
+                max_risk_used=meta.get("max_risk", 0),
+                vix_adaptive_mult=getattr(
+                    self, "_last_vix_mult", 1.0
+                ),
             )
             return
 
@@ -4337,6 +4364,8 @@ class StrategyEngine:
             "profit_target": net_credit * (
                 1 - config.CONDOR_TARGET_PCT
             ),
+            # PATCH-SE-3-IC-META
+            "_min_credit_required": _min_credit_required,
             # PATCH S-05: 2.0x→1.0x. At 2.0x stop + 60% target,
             # break-even WR=77% (unachievable). At 1.0x + 60%: WR=62.5%.
             "stop_loss":     0.0,  # RC1a: condor premium stop disabled (spot-distance stop via CONDOR_TESTED_SIDE_BUFFER is sufficient)  # P1-4a: condor stop_loss 2.0x (was 1.0x, fired immediately at entry)
@@ -4542,6 +4571,8 @@ class StrategyEngine:
             + (2 if _build_call_side else 0)
         )
         _exec_credit_gated = _exec_credit - _slip * _n_active_legs
+        # PATCH-SE-3-CS: store _min_credit_required
+        _meta_min_credit_cs = _spread_min_required
         if _exec_credit_gated < _spread_min_required:
             logger.info(
                 f"Credit spread ({skew_side}): "
@@ -4652,6 +4683,10 @@ class StrategyEngine:
             "long_call":     long_call_strike,
             "profit_target": total_credit * (
                 1 - config.SPREAD_TARGET_PCT
+            ),
+            # PATCH-SE-3-CS-META
+            "_min_credit_required": getattr(
+                self, "_meta_min_credit_cs", None
             ),
             # PATCH S-06: 2.0x→1.0x (same reasoning as S-05).
             "stop_loss":     0.0,  # RC1b: spread premium stop disabled (spot-distance stop via CONDOR_TESTED_SIDE_BUFFER is sufficient)  # P1-4b: spread stop_loss 2.0x (was 1.0x, fired immediately at entry)
@@ -5654,6 +5689,8 @@ class StrategyEngine:
     async def _pre_trade_checks(
         self, strategy_name: str, legs: List[Leg]
     ) -> bool:
+        # PATCH-SE-1: pretrade_fail_reason reset
+        self._pretrade_fail_reason = ""
         for leg in legs:
             if leg.action == "SELL":
                 try:
@@ -5685,6 +5722,12 @@ class StrategyEngine:
                     f"{leg.option_type} {leg.strike} "
                     f"expiry={leg.expiry} — aborting"
                 )
+                # PATCH-SE-1-LTP
+                self._pretrade_fail_reason = (
+                    f"LTP_ZERO:{leg.option_type}"
+                    f":{leg.strike}"
+                    f":expiry={leg.expiry}"
+                )
                 return False
 
         # Spread check
@@ -5713,6 +5756,14 @@ class StrategyEngine:
                     f"max={max_spread} "
                     f"{leg.option_type} {leg.strike}"
                 )
+                # PATCH-SE-1-SPREAD
+                self._pretrade_fail_reason = (
+                    f"SPREAD_TOO_WIDE"
+                    f":{leg.option_type}"
+                    f":{leg.strike}"
+                    f":spread={spread:.2f}"
+                    f">max={max_spread}"
+                )
                 return False
 
         estimated_risk = self._estimate_max_loss(
@@ -5728,6 +5779,13 @@ class StrategyEngine:
                 f"Pre-trade: portfolio risk limit "
                 f"current={current_risk:.0f} "
                 f"new={estimated_risk:.0f}"
+            )
+            # PATCH-SE-1-RISK
+            self._pretrade_fail_reason = (
+                f"RISK_LIMIT"
+                f":current={current_risk:.0f}"
+                f":new={estimated_risk:.0f}"
+                f":limit={config.MAX_COMBINED_RISK}"
             )
             return False
 
@@ -5749,6 +5807,12 @@ class StrategyEngine:
                 f"Pre-trade: delta limit "
                 f"post={post_delta_normalized:.3f} max={delta_max}"
             )
+            # PATCH-SE-1-DELTA
+            self._pretrade_fail_reason = (
+                f"DELTA_LIMIT"
+                f":post={post_delta_normalized:.3f}"
+                f":max={delta_max}"
+            )
             return False
 
         # SE-VEGA FIX: extend pre-trade gate to vega.
@@ -5764,12 +5828,35 @@ class StrategyEngine:
                     f"post={post_vega:.0f} < min={vega_min} "
                     f"— blocking entry"
                 )
+                # PATCH-SE-1-VEGA-MIN
+                self._pretrade_fail_reason = (
+                    f"VEGA_GATE_MIN"
+                    f":post={post_vega:.0f}"
+                    f":min={vega_min}"
+                )
                 return False
-            if vega_max is not None and post_vega > vega_max:
+            # FIX-1-VEGA-GATE-EMPTY-PORTFOLIO
+            # vega_max (e.g. -1000 for MILD_SELL_VOL) is the least-negative
+            # vega the portfolio may have.  With zero open positions the
+            # portfolio vega is 0, and a single credit spread contributes
+            # only ~-450 vega — above -1000.  The check '-448 > -1000' was
+            # True and blocked every first entry.  Skip vega_max when the
+            # existing portfolio has no vega (no open positions).
+            if (
+                vega_max is not None
+                and port_greeks.get("vega", 0) != 0
+                and post_vega > vega_max
+            ):
                 logger.warning(
                     f"Pre-trade: vega above max: "
                     f"post={post_vega:.0f} > max={vega_max} "
                     f"— blocking entry"
+                )
+                # PATCH-SE-1-VEGA-MAX
+                self._pretrade_fail_reason = (
+                    f"VEGA_GATE_MAX"
+                    f":post={post_vega:.0f}"
+                    f":max={vega_max}"
                 )
                 logger.info(
                     "VEGA_DIAGNOSTIC | "
@@ -5818,6 +5905,12 @@ class StrategyEngine:
                     f"({_vega_cap_pct*100:.1f}% of capital) "
                     f"— blocking entry"
                 )
+                # PATCH-SE-1-VEGA-CAP
+                self._pretrade_fail_reason = (
+                    f"PORTFOLIO_VEGA_CAP"
+                    f":post={_post_vega_abs:.0f}"
+                    f":cap={_vega_cap_rupees:.0f}"
+                )
                 return False
 
         if not config.PAPER_TRADING_MODE:
@@ -5840,6 +5933,11 @@ class StrategyEngine:
                 logger.warning(
                     f"Pre-trade: insufficient margin "
                     f"required={required:.0f}"
+                )
+                # PATCH-SE-1-MARGIN
+                self._pretrade_fail_reason = (
+                    f"MARGIN_INSUFFICIENT"
+                    f":required={required:.0f}"
                 )
                 return False
 
@@ -8186,6 +8284,12 @@ class StrategyEngine:
         self.daily_trading_halted = False
         self.cb_level_2_active    = False
         self.cb_level_1_count     = 0
+        # PATCH-SE-5: clear per-day caches
+        self._last_entry_composite.clear()
+        self._pretrade_fail_reason = ""
+        self._iv_spike_entry = False
+        self.re._last_entry_gate_passed = False
+        self.re._last_entry_gate_reason = ""
         logger.info("Daily state reset")
 
     def reset_weekly_state(self) -> None:

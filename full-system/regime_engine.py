@@ -792,6 +792,15 @@ class RegimeEngine:
             f"term={term_score} skew={skew_score} | "
             f"{detail}"
         )
+        # PATCH-RE-1-VOL: store sub-score detail
+        self._last_vol_detail = {
+            "term_score":        term_score,
+            "skew_score":        skew_score,
+            "fwd_iv_is_vix_proxy": int(
+                _fwd_is_vix_proxy
+                if 'v_fwd' in dir() else 0
+            ),
+        }
         return vol_score, detail
 
     # ─────────────────────────────────────────────────────────────────
@@ -999,6 +1008,16 @@ class RegimeEngine:
             f"{edge:+.2f} -> {tag}"
         )
         logger.info(f"Edge: score={raw} | {detail}")
+        # PATCH-RE-1-EDGE: store sub-score detail
+        self._last_edge_detail = {
+            "iv_atm_pct":    iv_atm if 'iv_atm' in dir() else None,
+            "rv_pct":        rv_pct if 'rv_pct' in dir() else None,
+            "vrp_pp":        edge   if 'edge'   in dir() else None,
+            "rv_is_estimated": int(
+                _rv_is_estimated
+                if '_rv_is_estimated' in dir() else 0
+            ),
+        }
         return raw, detail
 
     # ─────────────────────────────────────────────────────────────────
@@ -1173,6 +1192,13 @@ class RegimeEngine:
             f"spot {'>' if above else '<'} EMA50 -> {dirn}"
         )
         logger.info(f"Trend: score={raw} | {detail}")
+        # PATCH-RE-1-TREND: store sub-score detail
+        self._last_trend_detail = {
+            "adx_score":     _adx_score   if '_adx_score'   in dir() else None,
+            "slope_score":   _slope_score if '_slope_score' in dir() else None,
+            "slope_pct":     slope_pct    if 'slope_pct'    in dir() else None,
+            "spot_above_ema": int(above)  if 'above'        in dir() else None,
+        }
         return raw, detail
 
     # ─────────────────────────────────────────────────────────────────
@@ -1438,6 +1464,13 @@ class RegimeEngine:
             detail += " | warmup-transition suppressed"
             return None, detail
         logger.info(f"Flow: score={raw} | {detail}")
+        # PATCH-RE-1-FLOW: store sub-score detail
+        self._last_flow_detail = {
+            "net_oi_delta":   net_flow  if 'net_flow'  in dir() else None,
+            "spread_ratio":   spr       if 'spr'       in dir() else None,
+            "spread_ratio_avg": spr_avg if 'spr_avg'   in dir() else None,
+            "flow_dte":       _flow_dte if '_flow_dte' in dir() else None,
+        }
         return raw, detail
 
     # ─────────────────────────────────────────────────────────────────
@@ -1866,6 +1899,31 @@ class RegimeEngine:
                 CREATE INDEX IF NOT EXISTS idx_regime_cycle_ts
                 ON regime_cycle_log(timestamp)
             """)
+            # PATCH-RE-3: safe ALTER TABLE for new columns
+            _new_cols_re3 = [
+                ("term_score",          "REAL"),
+                ("skew_score",          "REAL"),
+                ("fwd_iv_is_vix_proxy", "INTEGER"),
+                ("iv_atm_pct",          "REAL"),
+                ("rv_pct",              "REAL"),
+                ("vrp_pp",              "REAL"),
+                ("rv_is_estimated",     "INTEGER"),
+                ("adx_score",           "REAL"),
+                ("slope_score",         "REAL"),
+                ("slope_pct",           "REAL"),
+                ("spot_above_ema",      "INTEGER"),
+                ("net_oi_delta",        "REAL"),
+                ("spread_ratio_val",    "REAL"),
+                ("flow_dte",            "INTEGER"),
+            ]
+            for _col_re3, _typ_re3 in _new_cols_re3:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE regime_cycle_log "
+                        f"ADD COLUMN {_col_re3} {_typ_re3}"
+                    )
+                except Exception:
+                    pass  # column already exists
             now_str = datetime.now(self._IST).isoformat()
             _today_save = datetime.now(self._IST).date().isoformat()
             for key, value in [
@@ -1911,6 +1969,19 @@ class RegimeEngine:
         entry_gate_passed: bool = False,
         blocked_reason: str = "",
     ) -> None:
+        # PATCH-RE-2: gate feedback + sub-score detail
+        # Read gate result written by strategy engine
+        entry_gate_passed = getattr(
+            self, "_last_entry_gate_passed",
+            entry_gate_passed
+        )
+        blocked_reason = getattr(
+            self, "_last_entry_gate_reason",
+            blocked_reason
+        ) or blocked_reason
+        # Reset after reading so next cycle starts clean
+        self._last_entry_gate_passed = False
+        self._last_entry_gate_reason = ""
         """LOG-RE-01: log every regime refresh cycle for walk-forward analysis.
 
         Called at the end of _refresh_locked() so every cycle
@@ -1933,6 +2004,11 @@ class RegimeEngine:
                     pass
 
             conn = sqlite3.connect(self.db_path)
+            # PATCH-RE-2-INSERT: extended with sub-score detail
+            _vd = getattr(self, "_last_vol_detail",   {})
+            _ed = getattr(self, "_last_edge_detail",  {})
+            _td = getattr(self, "_last_trend_detail", {})
+            _fd = getattr(self, "_last_flow_detail",  {})
             conn.execute("""
                 INSERT INTO regime_cycle_log (
                     timestamp, spot, vix, iv_atm, rv_20d,
@@ -1943,9 +2019,14 @@ class RegimeEngine:
                     composite_score, confirmed_regime,
                     regime_changed, persistence_count,
                     entry_gate_passed, entry_gate_blocked_reason,
-                    active_expiry, active_expiry_dte
+                    active_expiry, active_expiry_dte,
+                    term_score, skew_score, fwd_iv_is_vix_proxy,
+                    iv_atm_pct, rv_pct, vrp_pp, rv_is_estimated,
+                    adx_score, slope_score, slope_pct, spot_above_ema,
+                    net_oi_delta, spread_ratio_val, flow_dte
                 ) VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
             """, (
                 now.isoformat(),
@@ -1975,6 +2056,20 @@ class RegimeEngine:
                 blocked_reason or "",
                 _active,
                 _dte,
+                _vd.get("term_score"),
+                _vd.get("skew_score"),
+                _vd.get("fwd_iv_is_vix_proxy"),
+                _ed.get("iv_atm_pct"),
+                _ed.get("rv_pct"),
+                _ed.get("vrp_pp"),
+                _ed.get("rv_is_estimated"),
+                _td.get("adx_score"),
+                _td.get("slope_score"),
+                _td.get("slope_pct"),
+                _td.get("spot_above_ema"),
+                _fd.get("net_oi_delta"),
+                _fd.get("spread_ratio"),
+                _fd.get("flow_dte"),
             ))
             # Keep last 30 days only to avoid unbounded growth
             conn.execute("""

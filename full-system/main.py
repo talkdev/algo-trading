@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 # Console line tracking for overwrite
 _CONSOLE_LINE_COUNT = 0
 
+# FIX-3-EOD-REPORT-ONCE: prevents _generate_eod_report
+# printing twice (once from _end_of_day and once from
+# _graceful_shutdown on the same session).
+_EOD_REPORT_DONE = False
+
 
 def setup_logging() -> logging.Logger:
     """Configure file and console logging."""
