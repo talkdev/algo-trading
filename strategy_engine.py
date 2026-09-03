@@ -66,11 +66,11 @@ DTE_REQUIREMENTS = {
 }
 
 MIN_CREDITS = {
-    "IRON_BUTTERFLY": 15, "IRON_CONDOR": 8,
-    "BULL_PUT_SPREAD": 7, "BEAR_CALL_SPREAD": 6, "POST_EVENT_STRADDLE": 20,
+    "IRON_BUTTERFLY": 18, "IRON_CONDOR": 12,
+    "BULL_PUT_SPREAD": 10, "BEAR_CALL_SPREAD": 9, "POST_EVENT_STRADDLE": 22,
 }
 MIN_CREDITS_TUESDAY = {
-    "IRON_BUTTERFLY": 18, "IRON_CONDOR": 10, "BULL_PUT_SPREAD": 8, "BEAR_CALL_SPREAD": 7,
+    "IRON_BUTTERFLY": 22, "IRON_CONDOR": 14, "BULL_PUT_SPREAD": 11, "BEAR_CALL_SPREAD": 10,
 }
 
 PRICE_STOPS = {
@@ -171,7 +171,8 @@ class StrategyEngine:
             return "WAIT", ["last_30min_gamma_spread_blowout"]
 
         trend_cond = s.get("trend_condition", "")
-        if s["vwap_signal"] in ("BULLISH_EXTENDED", "BEARISH_EXTENDED"):
+        vwap_signal_active = s["vwap_signal"] not in ("UNKNOWN", None) and current_time < dtime(14, 30)
+        if vwap_signal_active and s["vwap_signal"] in ("BULLISH_EXTENDED", "BEARISH_EXTENDED"):
             if trend_cond not in ("TRENDING", "STRONG_TREND"):
                 timing = "WAIT"
                 dist = s.get("vwap_dist_pct")
@@ -338,13 +339,13 @@ class StrategyEngine:
                 return "NO_TRADE", "uncertain_trend_neutral_direction_no_edge"
 
             elif trend in ("MILD_TREND", "TRENDING"):
-                if adx_dir == "BULLISH" and dirn in ("BULLISH", "MILD_BULLISH", "NEUTRAL") \
+                if adx_dir == "BULLISH" and dirn in ("BULLISH", "MILD_BULLISH") \
                         and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
-                    return "BEAR_CALL_SPREAD", f"bullish_trend_sell_calls_safe_side+{vol}_vrp"
-                if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH", "NEUTRAL") \
+                    return "BULL_PUT_SPREAD", f"bullish_trend_sell_puts_aligned+{vol}_vrp"
+                if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH") \
                         and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
-                    return "BULL_PUT_SPREAD", f"bearish_trend_sell_puts_safe_side+{vol}_vrp"
-                return "NO_TRADE", f"trending_no_safe_side_adx_dir={adx_dir}_direction={dirn}"
+                    return "BEAR_CALL_SPREAD", f"bearish_trend_sell_calls_aligned+{vol}_vrp"
+                return "NO_TRADE", f"trending_no_aligned_side_adx_dir={adx_dir}_direction={dirn}"
 
             elif trend == "STRONG_TREND":
                 return "NO_TRADE", "strong_trend_dangerous_to_sell_premium"
@@ -362,6 +363,14 @@ class StrategyEngine:
                 if dirn == "NEUTRAL" and straddle_allowed:
                     return "IRON_CONDOR", "neutral+fair_vrp+range_quarter_size"
                 return "NO_TRADE", "fair_vrp_neutral_direction_insufficient_edge"
+            elif trend == "MILD_TREND":
+                if adx_dir == "BULLISH" and dirn in ("BULLISH", "MILD_BULLISH") \
+                        and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
+                    return "BULL_PUT_SPREAD", "bullish+fair_vrp+mild_trend_aligned_half_size"
+                if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH") \
+                        and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
+                    return "BEAR_CALL_SPREAD", "bearish+fair_vrp+mild_trend_aligned_half_size"
+                return "NO_TRADE", "fair_vrp_mild_trend_no_aligned_side"
             return "NO_TRADE", "fair_vrp_trending_no_trade"
 
         elif vol in ("THIN", "CHEAP", "INVERTED") and buy_ok:
@@ -488,8 +497,13 @@ class StrategyEngine:
             except Exception:
                 hard_exit = self.config.hard_exit_time
             mins_to_exit = self._time_diff_minutes(current_time, hard_exit)
-            if mins_to_exit < 120:
-                return False, f"iron_condor_needs_2hr_before_exit_only_{mins_to_exit:.0f}min"
+            actual_dte_condor = state.get("actual_dte")
+            if actual_dte_condor == 0:
+                if mins_to_exit < 90:
+                    return False, f"iron_condor_0dte_needs_90min_before_exit_only_{mins_to_exit:.0f}min"
+            else:
+                if mins_to_exit < 120:
+                    return False, f"iron_condor_needs_2hr_before_exit_only_{mins_to_exit:.0f}min"
             if s["adx_condition"] in ("STRONG", "VERY_STRONG"):
                 return False, "iron_condor_blocked_adx_trending"
 
@@ -848,10 +862,12 @@ class StrategyEngine:
             if net_credit < min_credit:
                 return {"valid": False, "reason": f"net_credit_{net_credit:.2f}pts_below_minimum_{min_credit:.2f}pts"}
 
+            _dte_for_ratio = s.get("actual_dte", 5)
+            _min_ratio = 0.15 if _dte_for_ratio == 0 else 0.10
             if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "POST_EVENT_STRADDLE"):
                 actual_wing_pts = abs(validated_legs[2]["strike"] - validated_legs[0]["strike"])
-                if actual_wing_pts > 0 and (net_credit / actual_wing_pts) < 0.10:
-                    return {"valid": False, "reason": f"credit_ratio_below_0.10_insufficient_edge"}
+                if actual_wing_pts > 0 and (net_credit / actual_wing_pts) < _min_ratio:
+                    return {"valid": False, "reason": f"credit_ratio_below_{_min_ratio}_insufficient_edge"}
             elif strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
                 actual_wing_pts = abs(validated_legs[0]["strike"] - validated_legs[1]["strike"])
                 # FIX vs original spec: apply the same 10% ratio discipline to
@@ -865,6 +881,10 @@ class StrategyEngine:
             net_profit_at_target = net_credit - target_premium_at_target - exit_costs_pts
             if net_profit_at_target <= 0:
                 return {"valid": False, "reason": f"net_profit_at_target_{net_profit_at_target:.2f}pts_non_positive"}
+            _min_rupee_profit = 500.0
+            _projected_rupee_profit = net_profit_at_target * C02
+            if _projected_rupee_profit < _min_rupee_profit:
+                return {"valid": False, "reason": f"projected_profit_Rs{_projected_rupee_profit:.0f}_below_minimum_Rs{_min_rupee_profit:.0f}"}
 
         current_capital = state.get("current_capital", self.config.starting_capital)
         risk_pct = self.config.max_risk_per_trade_pct
@@ -917,10 +937,19 @@ class StrategyEngine:
             final_lots = min(final_lots, lots_by_margin)
             total_estimated_margin = estimated_margin_per_lot * final_lots
 
-        price_stop_pts = PRICE_STOPS.get(strategy_name, 80)
-        if actual_dte == 0: price_stop_pts = int(price_stop_pts * 0.60)
-        elif actual_dte == 1: price_stop_pts = int(price_stop_pts * 0.75)
-        elif actual_dte <= 3: price_stop_pts = int(price_stop_pts * 0.90)
+        if strategy_type == "SELL" and net_credit and net_credit > 0:
+            _credit_stop_multiplier = 2.5 if actual_dte == 0 else 3.0
+            _credit_based_stop = net_credit * _credit_stop_multiplier
+            _static_stop = PRICE_STOPS.get(strategy_name, 80)
+            if actual_dte == 0: _static_stop = int(_static_stop * 0.60)
+            elif actual_dte == 1: _static_stop = int(_static_stop * 0.75)
+            elif actual_dte <= 3: _static_stop = int(_static_stop * 0.90)
+            price_stop_pts = int(min(_static_stop, max(_credit_based_stop * 2.0, 30)))
+        else:
+            price_stop_pts = PRICE_STOPS.get(strategy_name, 80)
+            if actual_dte == 0: price_stop_pts = int(price_stop_pts * 0.60)
+            elif actual_dte == 1: price_stop_pts = int(price_stop_pts * 0.75)
+            elif actual_dte <= 3: price_stop_pts = int(price_stop_pts * 0.90)
 
         hard_exit_str = state.get("hard_exit_time", self.config.hard_exit_time.strftime("%H:%M"))
         target_pct_final = self._get_target_pct(s)

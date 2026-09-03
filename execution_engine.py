@@ -137,12 +137,14 @@ class LiveOrderExecutor:
         opt = chain.get(strike, {}).get(opt_type, {}) if chain else {}
         bid, ask = opt.get("bid", 0) or 0, opt.get("ask", 0) or 0
         tick = 0.05
-        if transaction_type == "BUY":
-            base = ask if ask > 0 else fallback
-            price = base + max(2.5, base * 0.02)
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
         else:
-            base = bid if bid > 0 else fallback
-            price = base - max(2.5, base * 0.02)
+            mid = fallback
+        if transaction_type == "BUY":
+            price = mid + tick
+        else:
+            price = mid - tick
             price = max(price, tick)
         return round(round(price / tick) * tick, 2)
 
@@ -429,11 +431,17 @@ class ExecutionEngine:
         if self._time_diff_minutes(current_time, hard_exit) < 60:
             return "NO_GO", {"reason": "only_minutes_before_hard_exit_insufficient"}
 
-        if state.get("day_label") == "TUESDAY":
-            if current_time > dtime(11, 30):
-                return "NO_GO", {"reason": "tuesday_past_11:30_entry_cutoff"}
-            if self._time_diff_minutes(current_time, dtime(13, 30)) < 90:
-                return "NO_GO", {"reason": "tuesday_insufficient_time_before_13:30_exit"}
+        _actual_dte_gate = self.market_engine.state.get("actual_dte")
+        if _actual_dte_gate == 0:
+            if current_time > dtime(13, 30):
+                return "NO_GO", {"reason": "0dte_past_13:30_entry_cutoff"}
+            hard_exit_0dte_str = state.get("hard_exit_time", "15:00")
+            try:
+                hard_exit_0dte = datetime.strptime(hard_exit_0dte_str, "%H:%M").time()
+            except Exception:
+                hard_exit_0dte = dtime(15, 0)
+            if self._time_diff_minutes(current_time, hard_exit_0dte) < 90:
+                return "NO_GO", {"reason": "0dte_insufficient_time_before_hard_exit"}
 
         params["final_lots"] = final_lots
         params["total_max_risk"] = params["max_loss_per_lot"] * final_lots
@@ -655,7 +663,15 @@ class ExecutionEngine:
                 except Exception:
                     pass
 
-        if strategy_type == "SELL" and effective_stop is not None and current_premium >= effective_stop:
+        if strategy_type == "SELL" and position.get("entry_credit") and position["entry_credit"] > 0:
+            _credit_stop_limit = position["entry_credit"] * 2.5
+            _actual_stop = min(
+                effective_stop if effective_stop is not None else _credit_stop_limit,
+                _credit_stop_limit
+            )
+            if current_premium >= _actual_stop:
+                return "CLOSE_STOP", {"current_premium": current_premium, "effective_stop": _actual_stop}
+        elif strategy_type == "SELL" and effective_stop is not None and current_premium >= effective_stop:
             return "CLOSE_STOP", {"current_premium": current_premium, "effective_stop": effective_stop}
         if strategy_type == "BUY" and position.get("stop_value") is not None \
                 and current_premium <= position["stop_value"]:
@@ -667,7 +683,26 @@ class ExecutionEngine:
             if abs(spot - position["entry_spot"]) >= price_stop_pts:
                 return "CLOSE_STOP", {"reason_detail": f"price_stop_{abs(spot - position['entry_spot']):.0f}pts"}
 
-        if strategy_type == "SELL" and position.get("target_premium") is not None \
+        if strategy_type == "SELL" and position.get("entry_credit"):
+            _entry_credit_td = position["entry_credit"]
+            _now_time_td = now_ist().time()
+            if _now_time_td >= dtime(13, 30):
+                _time_target_pct = 0.30
+            elif _now_time_td >= dtime(13, 0):
+                _time_target_pct = 0.40
+            else:
+                _time_target_pct = None
+            if _time_target_pct is not None:
+                _time_target_premium = _entry_credit_td * (1.0 - _time_target_pct)
+                _effective_target = min(
+                    position["target_premium"] if position.get("target_premium") is not None else _time_target_premium,
+                    _time_target_premium
+                )
+                if current_premium <= _effective_target:
+                    return "CLOSE_TARGET", {"current_premium": current_premium, "time_decay_target": True}
+            elif position.get("target_premium") is not None and current_premium <= position["target_premium"]:
+                return "CLOSE_TARGET", {"current_premium": current_premium}
+        elif strategy_type == "SELL" and position.get("target_premium") is not None \
                 and current_premium <= position["target_premium"]:
             return "CLOSE_TARGET", {"current_premium": current_premium}
         if strategy_type == "BUY" and position.get("target_value") is not None \
@@ -694,7 +729,10 @@ class ExecutionEngine:
                 return "TIGHTEN_STOP", {}
 
         vwap_dist = signals.get("vwap_dist_pct")
-        if vwap_dist is not None:
+        from datetime import time as _dtime
+        _now_time = now_ist().time()
+        _vwap_exits_active = _now_time < _dtime(14, 30)
+        if vwap_dist is not None and _vwap_exits_active:
             if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.20:
                 return "CLOSE_VWAP", {"vwap_dist": vwap_dist}
             if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.20:
@@ -704,6 +742,23 @@ class ExecutionEngine:
                     return "CLOSE_CALL_SIDE", {"vwap_dist": vwap_dist}
                 if vwap_dist < -0.30:
                     return "CLOSE_PUT_SIDE", {"vwap_dist": vwap_dist}
+
+        _now_time_cheap = now_ist().time()
+        if strategy_type == "SELL" and _now_time_cheap >= dtime(14, 30):
+            _cheap_threshold = 2.00
+            _all_cheap = True
+            for _leg_cheap in legs:
+                if _leg_cheap["leg_status"] != "OPEN" or _leg_cheap["action"] != "SELL":
+                    continue
+                _opt_cheap = chain.get(_leg_cheap["strike"], {}).get(_leg_cheap["option_type"], {}) if chain else {}
+                _bid_cheap = _opt_cheap.get("bid", 0) or 0
+                _ask_cheap = _opt_cheap.get("ask", 0) or 0
+                _mark_cheap = (_bid_cheap + _ask_cheap) / 2.0 if (_bid_cheap > 0 and _ask_cheap > 0) else _bid_cheap
+                if _mark_cheap > _cheap_threshold:
+                    _all_cheap = False
+                    break
+            if _all_cheap:
+                return "CLOSE_TARGET", {"reason_detail": "all_short_legs_below_2pt_cheap_buyback"}
 
         adx_value = signals.get("adx")
         if (adx_value is not None and adx_value > 25 and strategy_type == "SELL"

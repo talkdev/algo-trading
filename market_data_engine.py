@@ -404,8 +404,15 @@ class MarketDataEngine:
             return None
         return rv
 
-    def compute_parkinson_rv(self, vix: Optional[float]) -> tuple[Optional[float], str]:
+    def compute_parkinson_rv(self, vix: Optional[float], candles_today: Optional[list] = None) -> tuple[Optional[float], str]:
         today_str = today_ist().isoformat()
+        if candles_today and len(candles_today) >= 12:
+            rolling_bars = candles_today[-30:]
+            rolling_rv = self.compute_intraday_parkinson_rv(rolling_bars)
+            if rolling_rv is not None:
+                self.state["parkinson_rv_pct"] = rolling_rv
+                self.state["parkinson_rv_computed_date"] = today_str
+                return rolling_rv, "rolling_intraday"
         if (self.state.get("parkinson_rv_computed_date") == today_str
                 and self.state.get("parkinson_rv_pct") is not None):
             return self.state["parkinson_rv_pct"], "cached"
@@ -686,15 +693,15 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     def _compute_base_regime(self, vix: float) -> str:
         if vix < 11.0: return "SUPPRESSED"
-        if vix < 13.0: return "LOW"
-        if vix < 16.0: return "NORMAL"
-        if vix < 20.0: return "ELEVATED"
+        if vix < 14.0: return "LOW"
+        if vix < 18.0: return "NORMAL"
+        if vix < 24.0: return "ELEVATED"
         return "HIGH"
 
     def _compute_regime_with_hysteresis(self, vix: float, prev_regime: str) -> str:
         bands = {
-            "SUPPRESSED": (None, 11.5), "LOW": (10.5, 13.5), "NORMAL": (12.5, 16.5),
-            "ELEVATED": (15.5, 20.5), "HIGH": (19.5, None),
+            "SUPPRESSED": (None, 11.5), "LOW": (10.5, 14.5), "NORMAL": (13.5, 18.5),
+            "ELEVATED": (17.5, 24.5), "HIGH": (23.5, None),
         }
         if prev_regime in bands:
             lo, hi = bands[prev_regime]
@@ -778,7 +785,7 @@ class MarketDataEngine:
         dow_size = {"MONDAY": 0.50, "TUESDAY": 1.0, "WEDNESDAY": 1.0, "THURSDAY": 0.90, "FRIDAY": 0.80}
         self.state["stop_multiplier"] = dow_stop.get(day_label, 2.0)
 
-        vix_size = {"SUPPRESSED": 0.0, "LOW": 1.0, "NORMAL": 1.0,
+        vix_size = {"SUPPRESSED": 0.0, "LOW": 0.75, "NORMAL": 1.0,
                     "ELEVATED": 0.75, "HIGH": 0.50}.get(vix_regime, 1.0)
         self.state["size_multiplier"] = max(vix_size * dow_size.get(day_label, 1.0), 0.25)
 
@@ -856,10 +863,12 @@ class MarketDataEngine:
         if or_width <= 0:
             return None
 
-        if or_width < 40: or_condition, or_score = "VERY_NARROW", 2
-        elif or_width < 70: or_condition, or_score = "NARROW", 1
-        elif or_width < 110: or_condition, or_score = "MODERATE", 0
-        elif or_width < 150: or_condition, or_score = "WIDE", -1
+        _or_mid = (or_high + or_low) / 2.0 if or_high and or_low else 24000.0
+        _or_width_pct = (or_width / _or_mid) * 100.0
+        if _or_width_pct < 0.18: or_condition, or_score = "VERY_NARROW", 2
+        elif _or_width_pct < 0.32: or_condition, or_score = "NARROW", 1
+        elif _or_width_pct < 0.50: or_condition, or_score = "MODERATE", 0
+        elif _or_width_pct < 0.70: or_condition, or_score = "WIDE", -1
         else: or_condition, or_score = "VERY_WIDE", -2
 
         return {"or_high": or_high, "or_low": or_low, "or_width": or_width,
@@ -1297,7 +1306,7 @@ class MarketDataEngine:
                 self.logger.info(f"Session initialized: opening_iv={self.state['opening_iv']*100:.2f}% "
                                   f"opening_pcr={self.state['opening_pcr']:.3f}")
 
-        parkinson_rv, rv_source = self.compute_parkinson_rv(vix)
+        parkinson_rv, rv_source = self.compute_parkinson_rv(vix, candles_today)
         intraday_rv = self.compute_intraday_parkinson_rv(candles_today)
         effective_rv = parkinson_rv
         if intraday_rv is not None and parkinson_rv is not None:
@@ -1305,7 +1314,12 @@ class MarketDataEngine:
         elif intraday_rv is not None:
             effective_rv = intraday_rv
         vrp = (atm_iv * 100.0 - effective_rv * 100.0) if (atm_iv is not None and effective_rv is not None) else None
-        intraday_rv_selling_veto = (intraday_rv is not None and atm_iv is not None and intraday_rv > atm_iv)
+        intraday_rv_selling_veto = (
+            len(candles_today) >= 18
+            and intraday_rv is not None
+            and atm_iv is not None
+            and intraday_rv > atm_iv * 1.10
+        )
 
         vol_result = self.assess_volatility_condition(
             vrp, atm_iv, self.state.get("opening_iv"), self.state.get("vix_regime"), vix_spike
