@@ -699,6 +699,9 @@ class StrategyEngine:
                 return None, "condor_long_call_not_further_otm"
             if long_put >= short_put:
                 return None, "condor_long_put_not_further_otm"
+            condor_short_strike_gap_check = True
+            if short_call <= short_put + self.config.nifty_strike_step:
+                return None, f"condor_short_strikes_too_close_{short_put:.0f}_{short_call:.0f}"
             return [
                 {"strike": short_call, "option_type": "call", "action": "SELL"},
                 {"strike": short_put, "option_type": "put", "action": "SELL"},
