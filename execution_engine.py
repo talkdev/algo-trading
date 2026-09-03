@@ -247,8 +247,15 @@ class ExecutionEngine:
                 if leg["leg_status"] != "OPEN":
                     continue
                 opt = chain.get(leg["strike"], {}).get(leg["option_type"], {}) if chain else {}
-                live_vega = opt.get("vega", leg["entry_vega"]) or 0
-                live_gamma = opt.get("gamma", leg["entry_gamma"]) or 0
+                _entry_vega = leg["entry_vega"] or 0
+                _entry_gamma = leg["entry_gamma"] or 0
+                if opt:
+                    live_vega = opt.get("vega") or _entry_vega
+                    live_gamma = opt.get("gamma") or _entry_gamma
+                else:
+                    vega_dte_scaled_fallback = True
+                    live_vega = _entry_vega * 0.5
+                    live_gamma = _entry_gamma * 2.0
                 sign = -1 if leg["action"] == "SELL" else 1
                 total_vega += sign * live_vega * leg["qty"]
                 total_gamma += sign * live_gamma * leg["qty"]
@@ -348,7 +355,11 @@ class ExecutionEngine:
                     (-1 if leg["action"] == "SELL" else 1) * leg["delta"] * reduced_lots * C02
                     for leg in params["legs"]
                 )
-                if abs(current_portfolio_delta + new_delta_r) <= (0.20 * reduced_lots * C02):
+                _total_lots_reduced = sum(
+                    p["final_lots"] for p in self._get_open_positions()
+                ) + reduced_lots
+                delta_reduction_total_lots = True
+                if abs(current_portfolio_delta + new_delta_r) <= (0.20 * _total_lots_reduced * C02):
                     final_lots, found = reduced_lots, True
                     break
                 reduced_lots -= 1

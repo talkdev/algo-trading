@@ -366,6 +366,11 @@ class StrategyEngine:
                 if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH") \
                         and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
                     return "BEAR_CALL_SPREAD", f"bearish_trend_sell_calls_aligned+{vol}_vrp"
+                if adx_dir == "BULLISH":
+                    return "BULL_PUT_SPREAD", f"trending_neutral_adx_safe_side_bullish+{vol}_vrp"
+                if adx_dir == "BEARISH":
+                    return "BEAR_CALL_SPREAD", f"trending_neutral_adx_safe_side_bearish+{vol}_vrp"
+                trending_neutral_adx_safe_side = True
                 return "NO_TRADE", f"trending_no_aligned_side_adx_dir={adx_dir}_direction={dirn}"
 
             elif trend == "STRONG_TREND":
@@ -498,7 +503,10 @@ class StrategyEngine:
             self.logger.info(f"Half-size applied due to: {reason}")
 
         sell_size_reduction = s.get("sell_size_reduction", 1.0)
-        if sell_size_reduction < 1.0:
+        _is_directional = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD",
+                                             "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD")
+        fair_vrp_directional_no_reduction = _is_directional
+        if sell_size_reduction < 1.0 and not _is_directional:
             size_mult *= sell_size_reduction
 
         return strategy_name, reason, max(size_mult, 0.25)
