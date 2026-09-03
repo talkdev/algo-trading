@@ -781,7 +781,7 @@ class MarketDataEngine:
         wing_map = {"SUPPRESSED": 150, "LOW": 150, "NORMAL": 150, "ELEVATED": 200, "HIGH": 250}
         self.state["wing_width"] = wing_map.get(vix_regime, 150)
 
-        dow_stop = {"MONDAY": 1.5, "TUESDAY": 1.2, "WEDNESDAY": 1.4, "THURSDAY": 1.5, "FRIDAY": 1.3}
+        dow_stop = {"MONDAY": 1.4, "TUESDAY": 1.2, "WEDNESDAY": 1.3, "THURSDAY": 1.4, "FRIDAY": 1.3}
         dow_size = {"MONDAY": 0.50, "TUESDAY": 1.0, "WEDNESDAY": 1.0, "THURSDAY": 0.90, "FRIDAY": 0.80}
         self.state["stop_multiplier"] = dow_stop.get(day_label, 2.0)
 
@@ -1046,6 +1046,20 @@ class MarketDataEngine:
         elif vwap_dist_pct > -0.15: vwap_signal, vwap_score = "NEUTRAL", 0
         elif vwap_dist_pct > -0.50: vwap_signal, vwap_score = "BEARISH", -1
         else: vwap_signal, vwap_score = "BEARISH_EXTENDED", -1
+
+        or_high_val = self.state.get("or_high")
+        or_low_val = self.state.get("or_low")
+        spot_val = self.state.get("prev_spot")
+        or_breakout_score = 0
+        if or_high_val and or_low_val and spot_val and self.state.get("or_computed"):
+            or_width_val = or_high_val - or_low_val
+            confirm_buffer = max(or_width_val * 0.10, 10.0)
+            if spot_val > or_high_val + confirm_buffer:
+                or_breakout_score = 1
+            elif spot_val < or_low_val - confirm_buffer:
+                or_breakout_score = -1
+        if vwap_signal == "UNKNOWN" and or_breakout_score != 0:
+            vwap_score = or_breakout_score
 
         pcr_signal, pcr_score, pcr_change = "UNKNOWN", 0, None
         if opening_pcr and opening_pcr > 0 and pcr and pcr > 0:
