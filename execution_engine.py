@@ -77,9 +77,10 @@ class PaperOrderExecutor:
 
     def execute_leg_entry(self, leg: dict, lots: int, chain: dict) -> dict:
         order_id = self._next_order_id()
+        exec_price = leg["exec_price"]
         self.logger.info(f"[PAPER] ENTRY FILL: {leg['action']} {leg['option_type'].upper()} "
-                          f"{leg['strike']:.0f} x{lots} @ {leg['exec_price']:.2f} (order_id={order_id})")
-        return {"order_id": order_id, "fill_price": leg["exec_price"], "status": "FILLED"}
+                          f"{leg['strike']:.0f} x{lots} @ {exec_price:.2f} (order_id={order_id})")
+        return {"order_id": order_id, "fill_price": exec_price, "status": "FILLED"}
 
     def execute_leg_exit(self, leg: dict, chain: dict, lots: int) -> dict:
         opt = chain.get(leg["strike"], {}).get(leg["option_type"], {}) if chain else {}
@@ -135,13 +136,14 @@ class LiveOrderExecutor:
     def _aggressive_limit_price(self, chain: dict, strike: float, opt_type: str, transaction_type: str, fallback: float) -> float:
         opt = chain.get(strike, {}).get(opt_type, {}) if chain else {}
         bid, ask = opt.get("bid", 0) or 0, opt.get("ask", 0) or 0
+        tick = 0.05
         if transaction_type == "BUY":
             base = ask if ask > 0 else fallback
-            price = base * 1.05
+            price = base + max(2.5, base * 0.02)
         else:
             base = bid if bid > 0 else fallback
-            price = base * 0.95
-        tick = 0.05
+            price = base - max(2.5, base * 0.02)
+            price = max(price, tick)
         return round(round(price / tick) * tick, 2)
 
     def execute_leg_entry(self, leg: dict, lots: int, chain: dict) -> dict:
@@ -271,14 +273,13 @@ class ExecutionEngine:
         if total_turnover <= 0:
             return {"total_rupees": 0.0, "breakdown": {}}
 
-        stt = total_sell_premium * self.config.stt_rate
+        stt = total_sell_premium * self.config.stt_options_sell
         exchange = total_turnover * self.config.exchange_txn_rate
-        ipft = total_turnover * 0.000000001
-        sebi = total_turnover * 0.000001
-        stamp = total_buy_premium * 0.00003
+        sebi = total_turnover * self.config.sebi_rate
+        stamp = total_buy_premium * self.config.stamp_duty_buy_options
         brokerage = self.config.brokerage_per_order * num_orders
         gst = (brokerage + exchange + sebi) * 0.18
-        total_costs = stt + exchange + ipft + sebi + stamp + brokerage + gst
+        total_costs = stt + exchange + sebi + stamp + brokerage + gst
 
         self.logger.debug(f"Transaction costs ({action}): STT={stt:.2f} Brokerage={brokerage:.2f} "
                            f"GST={gst:.2f} Total={total_costs:.2f}")
@@ -465,7 +466,9 @@ class ExecutionEngine:
         filled_legs = []
 
         try:
-            entry_order = sorted(params["legs"], key=lambda l: 0 if l["action"] == "BUY" else 1)
+            buy_legs = [l for l in params["legs"] if l["action"] == "BUY"]
+            sell_legs = [l for l in params["legs"] if l["action"] == "SELL"]
+            entry_order = buy_legs + sell_legs
             for leg in entry_order:
                 fill = self.executor.execute_leg_entry(leg, lots, chain)
                 filled_legs.append({**leg, "fill": fill})
@@ -478,6 +481,9 @@ class ExecutionEngine:
             return None
 
         now = now_ist()
+        actual_fill_legs_for_cost = [{**fl, "entry_price": fl["fill"]["fill_price"]} for fl in filled_legs]
+        recomputed_entry_costs = self._compute_transaction_costs(actual_fill_legs_for_cost, lots, "ENTRY")
+        actual_entry_costs_rupees = recomputed_entry_costs["total_rupees"]
         self.db.insert("positions", {
             "position_id": position_id, "trading_date": today_ist().isoformat(),
             "strategy_name": params["strategy_name"], "strategy_type": params["strategy_type"],
@@ -487,7 +493,7 @@ class ExecutionEngine:
             "entry_vrp": params["entry_vrp"],
             "entry_credit": params.get("entry_credit"), "entry_debit": params.get("entry_debit"),
             "gross_credit": params.get("gross_credit"), "total_slippage": params["total_slippage"],
-            "entry_costs_rupees": params["total_costs_rupees_per_lot"] * lots,
+            "entry_costs_rupees": actual_entry_costs_rupees,
             "stop_premium": params.get("stop_premium"), "target_premium": params.get("target_premium"),
             "stop_value": params.get("stop_value"), "target_value": params.get("target_value"),
             "price_stop_pts": params["price_stop_pts"], "hard_exit_time": params["hard_exit_time"],
@@ -671,10 +677,15 @@ class ExecutionEngine:
         if strategy_type == "SELL" and position.get("entry_credit"):
             entry_credit = position["entry_credit"]
             profit_pct = (entry_credit - current_premium) / entry_credit
-            if profit_pct >= 0.25 and not position.get("stop_at_breakeven"):
-                self.db.update("positions", {"stop_premium": entry_credit, "stop_at_breakeven": 1},
+            C02_lock = self.config.lot_size
+            lots_lock = position.get("final_lots", 1)
+            entry_costs_pts = (position.get("entry_costs_rupees") or 0.0) / max(C02_lock * lots_lock, 1)
+            true_breakeven_premium = entry_credit - entry_costs_pts
+            if profit_pct >= 0.20 and not position.get("stop_at_breakeven"):
+                lock_stop = max(true_breakeven_premium, entry_credit * 0.95)
+                self.db.update("positions", {"stop_premium": lock_stop, "stop_at_breakeven": 1},
                                 {"position_id": position["position_id"]})
-                self.logger.info(f"PROFIT LOCK: {strategy_name} -> breakeven (profit={profit_pct*100:.0f}%)")
+                self.logger.info(f"PROFIT LOCK: {strategy_name} -> true breakeven (profit={profit_pct*100:.0f}%)")
                 return "TIGHTEN_STOP", {}
             if profit_pct >= 0.50 and not position.get("stop_moved_to_25pct"):
                 self.db.update("positions", {"stop_premium": entry_credit * 0.75, "stop_moved_to_25pct": 1},
@@ -752,7 +763,7 @@ class ExecutionEngine:
     def execute_close(self, position: dict, reason: str, context: Optional[dict] = None) -> None:
         legs = self._get_position_legs(position["position_id"])
         open_legs = [l for l in legs if l["leg_status"] == "OPEN"]
-        open_legs = sorted(open_legs, key=lambda l: 0 if l["action"] == "SELL" else 1)
+        open_legs = sorted(open_legs, key=lambda l: 0 if l["action"] == "BUY" else 1)
         lots = position["final_lots"]
         chain = self.market_engine.last_chain
 
