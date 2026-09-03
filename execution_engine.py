@@ -336,7 +336,10 @@ class ExecutionEngine:
         )
         current_portfolio_delta = self._compute_portfolio_delta()
         post_trade_delta = current_portfolio_delta + new_delta
-        delta_limit = 0.20 * final_lots * C02
+        total_open_lots_for_delta = sum(
+            p["final_lots"] for p in self._get_open_positions()
+        ) + final_lots
+        delta_limit = 0.20 * total_open_lots_for_delta * C02
 
         if abs(post_trade_delta) > delta_limit:
             reduced_lots, found = final_lots - 1, False
@@ -1002,6 +1005,12 @@ class ExecutionEngine:
             state["last_stop_time"] = now_ist().isoformat()
             state["last_stop_reason"] = reason
             state["consecutive_stops"] = state.get("consecutive_stops", 0) + 1
+            _open_pos_list = self._get_open_positions()
+            if not _open_pos_list:
+                from market_data_engine import MarketDataEngine as _MDE
+                _sig = self.market_engine.state
+                _combo = f"{_sig.get('volatility_condition', '')}_{_sig.get('trend_condition', '')}_{_sig.get('direction', '')}"
+                state["last_stop_signal_combo"] = _combo
             if state["consecutive_stops"] >= 3:
                 state["daily_halted"] = True
                 self.logger.warning("3 consecutive stops — halting trading for the day")
