@@ -571,7 +571,7 @@ class ExecutionEngine:
             "entry_credit": params.get("entry_credit"), "entry_debit": params.get("entry_debit"),
             "gross_credit": params.get("gross_credit"), "total_slippage": params["total_slippage"],
             "entry_costs_pts": params["total_costs_pts"],
-            "entry_costs_rupees": params["total_costs_rupees_per_lot"] * params["final_lots"],
+            "entry_costs_rupees": params["total_costs_rupees_per_lot"] * params["final_lots"] + params.get("total_fixed_costs_rupees", 0),
             "stop_premium": params.get("stop_premium"), "target_premium": params.get("target_premium"),
             "price_stop_pts": params["price_stop_pts"], "hard_exit_time": params["hard_exit_time"],
             "final_lots": params["final_lots"], "max_loss_per_lot": params["max_loss_per_lot"],
@@ -653,15 +653,16 @@ class ExecutionEngine:
 
         raw_params = json.loads(position.get("raw_params_json") or "{}")
         tightening_schedule = raw_params.get("tightening_schedule", [])
+        original_stop_premium_for_tightening = raw_params.get("stop_premium") or position.get("stop_premium")
         effective_stop = position.get("stop_premium")
-        if effective_stop is not None:
+        if effective_stop is not None and original_stop_premium_for_tightening:
             for tighten_time_str, factor in tightening_schedule:
                 try:
                     tighten_time = datetime.strptime(tighten_time_str, "%H:%M").time()
                 except Exception:
                     continue
                 if current_time >= tighten_time:
-                    effective_stop = position["stop_premium"] * factor
+                    effective_stop = original_stop_premium_for_tightening * factor
             if strategy_type == "SELL" and position.get("entry_time"):
                 try:
                     entry_dt = datetime.fromisoformat(position["entry_time"])
@@ -1018,9 +1019,10 @@ class ExecutionEngine:
             if state["consecutive_stops"] >= 3:
                 state["daily_halted"] = True
                 self.logger.warning("3 consecutive stops — halting trading for the day")
-        elif reason in ("CLOSE_ADX", "CLOSE_VWAP"):
+        elif reason in ("CLOSE_ADX", "CLOSE_VWAP", "CLOSE_DELTA"):
             state["last_stop_time"] = now_ist().isoformat()
             state["last_stop_reason"] = reason
+            CLOSE_DELTA_cooldown = True
         else:
             state["consecutive_stops"] = 0
 

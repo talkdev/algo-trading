@@ -637,8 +637,8 @@ class MarketDataEngine:
         if total_call_oi <= 0:
             return None
         pcr = total_put_oi / total_call_oi
-        if pcr < 0.3 or pcr > 3.0:
-            self.logger.warning(f"PCR {pcr:.3f} outside valid range [0.3,3.0] — discarding")
+        if pcr < 0.2 or pcr > 6.0:
+            self.logger.warning(f"PCR {pcr:.3f} outside valid range [0.2,6.0] — discarding")
             return None
         return pcr
 
@@ -989,13 +989,13 @@ class MarketDataEngine:
                     breakout_pts = 0.0
                 or_width = (or_high - or_low) if (or_high is not None and or_low is not None) else 0.0
                 if or_width > 0:
-                    if breakout_pts > or_width * 0.30 and trend_condition in ("RANGE_BOUND", "MILD_RANGE"):
+                    if breakout_pts > or_width * 0.50 and trend_condition in ("RANGE_BOUND", "MILD_RANGE"):
                         trend_condition, trend_score = "MILD_TREND", 0
-                    if breakout_pts > or_width * 0.70:
+                    if breakout_pts > or_width * 1.00:
                         trend_condition, trend_score = "TRENDING", -1
                     if breakout_pts > or_width * 1.20 and adx_condition in ("MODERATE", "STRONG", "VERY_STRONG"):
                         trend_condition, trend_score = "STRONG_TREND", -2
-            or_position_trend_override = True
+            or_breakout_threshold_restored = True
 
         return {"trend_condition": trend_condition, "trend_score": trend_score,
                 "adx_condition": adx_condition, "adx_value": adx_value,
