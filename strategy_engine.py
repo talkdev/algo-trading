@@ -355,6 +355,8 @@ class StrategyEngine:
                     if vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
                         return "BEAR_CALL_SPREAD", f"bearish+{vol}_vrp+uncertain_trend_half_size"
                     return "NO_TRADE", "uncertain_trend_vwap_contradicts_direction"
+                if dirn == "NEUTRAL" and straddle_allowed:
+                    return "IRON_CONDOR", f"rich_uncertain_neutral_condor_half+{vol}_vrp"
                 return "NO_TRADE", "uncertain_trend_neutral_direction_no_edge"
 
             elif trend in ("MILD_TREND", "TRENDING"):

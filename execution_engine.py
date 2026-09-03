@@ -360,8 +360,8 @@ class ExecutionEngine:
         current_vega, current_gamma = self._compute_portfolio_vega_gamma()
         post_trade_vega = current_vega + new_vega
         post_trade_gamma = current_gamma + new_gamma
-        vega_limit = 2000.0 * final_lots
-        gamma_limit = 50.0 * final_lots
+        vega_limit = 50.0 * final_lots
+        gamma_limit = 0.05 * final_lots
         if abs(post_trade_vega) > vega_limit:
             return "NO_GO", {"reason": f"portfolio_vega_{post_trade_vega:.1f}_exceeds_limit_{vega_limit:.1f}"}
         if abs(post_trade_gamma) > gamma_limit:
@@ -431,8 +431,11 @@ class ExecutionEngine:
             hard_exit = datetime.strptime(hard_exit_str, "%H:%M").time()
         except Exception:
             hard_exit = self.config.hard_exit_time
-        if self._time_diff_minutes(current_time, hard_exit) < 60:
-            return "NO_GO", {"reason": "only_minutes_before_hard_exit_insufficient"}
+        _actual_dte_buffer = self.market_engine.state.get("actual_dte")
+        _min_buffer = 90 if _actual_dte_buffer == 0 else 45
+        hard_exit_buffer_45min = True
+        if self._time_diff_minutes(current_time, hard_exit) < _min_buffer:
+            return "NO_GO", {"reason": f"only_{self._time_diff_minutes(current_time, hard_exit):.0f}min_before_hard_exit_need_{_min_buffer}"}
 
         _actual_dte_gate = self.market_engine.state.get("actual_dte")
         if _actual_dte_gate == 0:
@@ -719,7 +722,8 @@ class ExecutionEngine:
 
         if strategy_type == "SELL" and position.get("entry_credit"):
             entry_credit = position["entry_credit"]
-            profit_pct = (entry_credit - current_premium) / entry_credit
+            gross_credit_for_profit_pct = position.get("gross_credit") or entry_credit
+            profit_pct = (gross_credit_for_profit_pct - current_premium) / gross_credit_for_profit_pct
             C02_lock = self.config.lot_size
             lots_lock = position.get("final_lots", 1)
             entry_costs_pts = (position.get("entry_costs_rupees") or 0.0) / max(C02_lock * lots_lock, 1)
