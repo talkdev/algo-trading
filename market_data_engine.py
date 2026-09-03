@@ -860,8 +860,9 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     def compute_opening_range(self, candles_today: list) -> Optional[dict]:
         opening_bars = [b for b in candles_today if dtime(9, 30) <= b["timestamp"].time() <= dtime(9, 44)]
-        opening_bars = [b for b in opening_bars if not (b["volume"] == 0 and b["high"] == b["low"])]
+        opening_bars = [b for b in opening_bars if b["high"] > b["low"]]
         opening_bars = [b for b in opening_bars if (b["high"] - b["low"]) <= 1000]
+        or_volume_filter_removed = True
 
         if len(opening_bars) < 2:
             return None
@@ -1004,7 +1005,7 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     # MODULE 4: VOLATILITY CONDITION
     # ─────────────────────────────────────────────────────────────────
-    def assess_volatility_condition(self, vrp, atm_iv, opening_iv, vix_regime, vix_spike) -> dict:
+    def assess_volatility_condition(self, vrp, atm_iv, opening_iv, vix_regime, vix_spike, n_candles: int = 0) -> dict:
         if vrp is None:
             return {"volatility_condition": "UNKNOWN", "vol_score": 0, "sell_ok": False, "buy_ok": False,
                     "sell_size_reduction": 1.0, "iv_behavior": "UNKNOWN", "iv_change_pct": 0.0,
@@ -1028,7 +1029,7 @@ class MarketDataEngine:
             vol_score = min(vol_score, -1)
 
         iv_behavior, iv_change_pct, iv_mod = "UNKNOWN", 0.0, 0.0
-        if opening_iv and opening_iv > 0 and atm_iv and atm_iv > 0:
+        if n_candles >= 6 and opening_iv and opening_iv > 0 and atm_iv and atm_iv > 0:
             iv_change_pct = (atm_iv - opening_iv) / opening_iv * 100.0
             if iv_change_pct < -15.0: iv_behavior, iv_mod = "CRUSHING", 0.3
             elif iv_change_pct < -5.0: iv_behavior, iv_mod = "DECLINING", 0.1
@@ -1052,7 +1053,7 @@ class MarketDataEngine:
     # MODULE 6: DIRECTIONAL BIAS
     # ─────────────────────────────────────────────────────────────────
     def assess_directional_bias(self, vwap_dist_pct, pcr, opening_pcr, put_iv, call_iv, skew,
-                                  adx_direction, gap_direction) -> dict:
+                                  adx_direction, gap_direction, last_candle_close_val: float = 0.0) -> dict:
         if vwap_dist_pct is None:
             vwap_signal, vwap_score = "UNKNOWN", 0
         elif vwap_dist_pct > 0.50: vwap_signal, vwap_score = "BULLISH_EXTENDED", 1
@@ -1068,7 +1069,7 @@ class MarketDataEngine:
         if or_high_val and or_low_val and spot_val and self.state.get("or_computed"):
             or_width_val = or_high_val - or_low_val
             confirm_buffer = max(or_width_val * 0.10, 10.0)
-            last_candle_close = candles_today[-1]["close"] if candles_today else spot_val
+            last_candle_close = last_candle_close_val if last_candle_close_val > 0 else (spot_val or 0.0)
             or_breakout_candle_close = True
             if last_candle_close > or_high_val + confirm_buffer:
                 or_breakout_score = 1
@@ -1332,10 +1333,10 @@ class MarketDataEngine:
             if self.state.get("opening_iv") is not None:
                 self.state["session_initialized"] = True
                 self.logger.info(f"Session initialized: opening_iv={self.state['opening_iv']*100:.2f}%")
-        if current_time >= dtime(10, 0) and not self.state.get("pcr_baseline_set_at_10am"):
+        if current_time >= dtime(10, 0) and not getattr(self, "_pcr_baseline_set", False):
             if pcr:
                 self.state["opening_pcr"] = pcr
-                self.state["pcr_baseline_set_at_10am"] = True
+                self._pcr_baseline_set = True
                 self.logger.info(f"PCR baseline set at 10:00: opening_pcr={pcr:.3f}")
 
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, candles_today)
@@ -1355,15 +1356,18 @@ class MarketDataEngine:
         )
 
         vol_result = self.assess_volatility_condition(
-            vrp, atm_iv, self.state.get("opening_iv"), self.state.get("vix_regime"), vix_spike
+            vrp, atm_iv, self.state.get("opening_iv"), self.state.get("vix_regime"), vix_spike,
+            n_candles=len(candles_today)
         )
         trend_result = self.assess_trend_condition(candles_today, spot)
 
         vwap_dist_pct = ((spot - vwap) / vwap * 100.0) if (vwap and vwap > 0 and spot is not None) else None
 
+        _last_close = candles_today[-1]["close"] if candles_today else (spot or 0.0)
         dir_result = self.assess_directional_bias(
             vwap_dist_pct, pcr, self.state.get("opening_pcr"), put_iv, call_iv, skew,
             trend_result.get("adx_direction"), self.state.get("gap_direction"),
+            last_candle_close_val=_last_close,
         )
 
         atm_greeks = self._get_atm_greeks(chain, spot)

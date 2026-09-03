@@ -236,12 +236,12 @@ def recompute_cost_breakdown(sell_pts, buy_pts, num_orders, lots, lot_size, stt_
     stt = sell_pts * lot_size * lots * stt_rate
     exchange = turnover * lot_size * lots * exch_rate
     brokerage_total = brokerage * num_orders
-    sebi = turnover * lot_size * lots * 0.000001
-    stamp = buy_pts * lot_size * lots * 0.00003
-    gst = (brokerage_total + exchange + sebi) * 0.18
-    total = stt + exchange + brokerage_total + sebi + stamp + gst
+    sebi_fee_eod = turnover * lot_size * lots * 0.000001
+    stamp = buy_pts * lot_size * lots * 0.00002
+    gst = (brokerage_total + exchange + sebi_fee_eod) * 0.18
+    total = stt + exchange + brokerage_total + sebi_fee_eod + stamp + gst
     return {"stt": round(stt, 2), "exchange": round(exchange, 2), "brokerage": round(brokerage_total, 2),
-            "sebi": round(sebi, 4), "stamp": round(stamp, 4), "gst": round(gst, 2), "total": round(total, 2)}
+            "sebi": round(sebi_fee_eod, 4), "stamp": round(stamp, 4), "gst": round(gst, 2), "total": round(total, 2)}
 
 
 def analyze_trade_costs(trade_entries: list, trade_exits: list) -> list:
