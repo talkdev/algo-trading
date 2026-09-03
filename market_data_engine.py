@@ -849,7 +849,7 @@ class MarketDataEngine:
     # MODULE 2: OPENING RANGE
     # ─────────────────────────────────────────────────────────────────
     def compute_opening_range(self, candles_today: list) -> Optional[dict]:
-        opening_bars = [b for b in candles_today if dtime(9, 15) <= b["timestamp"].time() <= dtime(9, 44)]
+        opening_bars = [b for b in candles_today if dtime(9, 30) <= b["timestamp"].time() <= dtime(9, 44)]
         opening_bars = [b for b in opening_bars if not (b["volume"] == 0 and b["high"] == b["low"])]
         opening_bars = [b for b in opening_bars if (b["high"] - b["low"]) <= 1000]
 
@@ -978,10 +978,13 @@ class MarketDataEngine:
                     breakout_pts = 0.0
                 or_width = (or_high - or_low) if (or_high is not None and or_low is not None) else 0.0
                 if or_width > 0:
-                    if breakout_pts > or_width * 0.50 and trend_condition in ("RANGE_BOUND", "MILD_RANGE"):
+                    if breakout_pts > or_width * 0.30 and trend_condition in ("RANGE_BOUND", "MILD_RANGE"):
                         trend_condition, trend_score = "MILD_TREND", 0
-                    if breakout_pts > or_width * 1.0:
+                    if breakout_pts > or_width * 0.70:
                         trend_condition, trend_score = "TRENDING", -1
+                    if breakout_pts > or_width * 1.20 and adx_condition in ("MODERATE", "STRONG", "VERY_STRONG"):
+                        trend_condition, trend_score = "STRONG_TREND", -2
+            or_position_trend_override = True
 
         return {"trend_condition": trend_condition, "trend_score": trend_score,
                 "adx_condition": adx_condition, "adx_value": adx_value,
