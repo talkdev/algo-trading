@@ -66,11 +66,11 @@ DTE_REQUIREMENTS = {
 }
 
 MIN_CREDITS = {
-    "IRON_BUTTERFLY": 18, "IRON_CONDOR": 12,
-    "BULL_PUT_SPREAD": 10, "BEAR_CALL_SPREAD": 9, "POST_EVENT_STRADDLE": 22,
+    "IRON_BUTTERFLY": 20, "IRON_CONDOR": 18,
+    "BULL_PUT_SPREAD": 15, "BEAR_CALL_SPREAD": 14, "POST_EVENT_STRADDLE": 25,
 }
 MIN_CREDITS_TUESDAY = {
-    "IRON_BUTTERFLY": 22, "IRON_CONDOR": 14, "BULL_PUT_SPREAD": 11, "BEAR_CALL_SPREAD": 10,
+    "IRON_BUTTERFLY": 25, "IRON_CONDOR": 18, "BULL_PUT_SPREAD": 16, "BEAR_CALL_SPREAD": 15,
 }
 
 PRICE_STOPS = {
@@ -78,8 +78,8 @@ PRICE_STOPS = {
     "BEAR_CALL_SPREAD": 80, "POST_EVENT_STRADDLE": 120,
 }
 
-TARGET_PCT_BY_DAY = {"MONDAY": 0.50, "TUESDAY": 0.50, "WEDNESDAY": 0.55,
-                      "THURSDAY": 0.55, "FRIDAY": 0.50}
+TARGET_PCT_BY_DAY = {"MONDAY": 0.32, "TUESDAY": 0.30, "WEDNESDAY": 0.35,
+                      "THURSDAY": 0.35, "FRIDAY": 0.32}
 
 MIN_CREDIT_MULTIPLIER_BY_REGIME = {"SUPPRESSED": 1.0, "LOW": 1.1, "NORMAL": 1.0,
                                     "ELEVATED": 1.15, "HIGH": 1.3}
@@ -348,7 +348,13 @@ class StrategyEngine:
                 return "NO_TRADE", f"trending_no_aligned_side_adx_dir={adx_dir}_direction={dirn}"
 
             elif trend == "STRONG_TREND":
-                return "NO_TRADE", "strong_trend_dangerous_to_sell_premium"
+                if adx_dir == "BULLISH" and dirn in ("BULLISH", "MILD_BULLISH") \
+                        and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
+                    return "BULL_PUT_SPREAD", f"bullish_strong_trend_put_credit_safe_side+{vol}_vrp"
+                if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH") \
+                        and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
+                    return "BEAR_CALL_SPREAD", f"bearish_strong_trend_call_credit_safe_side+{vol}_vrp"
+                return "NO_TRADE", "strong_trend_no_aligned_direction_for_credit_spread"
 
         elif vol == "FAIR" and sell_ok:
             if trend in ("RANGE_BOUND", "MILD_RANGE", "RANGE_ASSUMED"):
@@ -896,10 +902,12 @@ class StrategyEngine:
 
         if strategy_type == "SELL":
             stop_premium = net_credit * stop_multiplier
-            # RISK FIX: 1.25x buffer on the theoretical stop-triggered loss so
-            # sizing doesn't understate risk if the exit fill is worse than
-            # the theoretical stop price (gap/slippage on a fast move).
-            max_loss_per_lot = (stop_premium - net_credit) * C02 * 1.25
+            stop_based_loss = (stop_premium - net_credit) * C02 * 1.25
+            if actual_wing_pts is not None and actual_wing_pts > 0 and net_credit > 0:
+                contractual_max_loss = (actual_wing_pts - net_credit) * C02
+                max_loss_per_lot = min(stop_based_loss, contractual_max_loss) if contractual_max_loss > 0 else stop_based_loss
+            else:
+                max_loss_per_lot = stop_based_loss
         else:
             max_loss_per_lot = net_debit * 0.50 * C02 * 1.25
 

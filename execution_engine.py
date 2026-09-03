@@ -664,7 +664,7 @@ class ExecutionEngine:
                     pass
 
         if strategy_type == "SELL" and position.get("entry_credit") and position["entry_credit"] > 0:
-            _credit_stop_limit = position["entry_credit"] * 2.5
+            _credit_stop_limit = position["entry_credit"] * 1.5
             _actual_stop = min(
                 effective_stop if effective_stop is not None else _credit_stop_limit,
                 _credit_stop_limit
@@ -687,9 +687,11 @@ class ExecutionEngine:
             _entry_credit_td = position["entry_credit"]
             _now_time_td = now_ist().time()
             if _now_time_td >= dtime(13, 30):
-                _time_target_pct = 0.30
+                _time_target_pct = 0.25
             elif _now_time_td >= dtime(13, 0):
-                _time_target_pct = 0.40
+                _time_target_pct = 0.30
+            elif _now_time_td >= dtime(12, 0):
+                _time_target_pct = 0.32
             else:
                 _time_target_pct = None
             if _time_target_pct is not None:
