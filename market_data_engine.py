@@ -652,7 +652,7 @@ class MarketDataEngine:
         equal_pv = sum((b["high"] + b["low"] + b["close"]) / 3.0 for b in candles_today)
         return equal_pv / total_bars, True
 
-    def _find_by_delta(self, chain: dict, opt_type: str, target: float, tolerance: float) -> Optional[float]:
+    def _find_by_delta(self, chain: dict, opt_type: str, target: float, tolerance: float = 0.05) -> Optional[float]:
         best_iv, best_diff = None, float("inf")
         for strike, legs in chain.items():
             leg = legs.get(opt_type, {})
@@ -667,8 +667,8 @@ class MarketDataEngine:
         return best_iv
 
     def compute_25d_ivs(self, chain: dict) -> tuple[Optional[float], Optional[float]]:
-        put_iv = self._find_by_delta(chain, "put", 0.25, tolerance=0.08)
-        call_iv = self._find_by_delta(chain, "call", 0.25, tolerance=0.08)
+        put_iv = self._find_by_delta(chain, "put", 0.25, tolerance=0.05)
+        call_iv = self._find_by_delta(chain, "call", 0.25, tolerance=0.05)
         return put_iv, call_iv
 
     def compute_skew_ratio(self, put_iv: Optional[float], call_iv: Optional[float]) -> Optional[float]:
@@ -1014,6 +1014,7 @@ class MarketDataEngine:
 
         if vix_regime == "SUPPRESSED":
             sell_ok = False
+            buy_ok = True
             vol_score = min(vol_score, -1)
 
         iv_behavior, iv_change_pct, iv_mod = "UNKNOWN", 0.0, 0.0
@@ -1092,9 +1093,9 @@ class MarketDataEngine:
         if adx_direction == "BULLISH" and direction_score > 0: direction_score += 0.3
         elif adx_direction == "BEARISH" and direction_score < 0: direction_score -= 0.3
 
-        if direction_score >= 1.5: direction = "BULLISH"
+        if direction_score >= 1.2: direction = "BULLISH"
         elif direction_score >= 0.5: direction = "MILD_BULLISH"
-        elif direction_score <= -1.5: direction = "BEARISH"
+        elif direction_score <= -1.2: direction = "BEARISH"
         elif direction_score <= -0.5: direction = "MILD_BEARISH"
         else: direction = "NEUTRAL"
 
@@ -1316,18 +1317,21 @@ class MarketDataEngine:
         if current_time >= dtime(9, 45) and not self.state.get("session_initialized"):
             if atm_iv:
                 self.state["opening_iv"] = atm_iv
+            if self.state.get("opening_iv") is not None:
+                self.state["session_initialized"] = True
+                self.logger.info(f"Session initialized: opening_iv={self.state['opening_iv']*100:.2f}%")
+        if current_time >= dtime(10, 0) and not self.state.get("pcr_baseline_set_at_10am"):
             if pcr:
                 self.state["opening_pcr"] = pcr
-            if self.state.get("opening_iv") is not None and self.state.get("opening_pcr") is not None:
-                self.state["session_initialized"] = True
-                self.logger.info(f"Session initialized: opening_iv={self.state['opening_iv']*100:.2f}% "
-                                  f"opening_pcr={self.state['opening_pcr']:.3f}")
+                self.state["pcr_baseline_set_at_10am"] = True
+                self.logger.info(f"PCR baseline set at 10:00: opening_pcr={pcr:.3f}")
 
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, candles_today)
         intraday_rv = self.compute_intraday_parkinson_rv(candles_today)
         effective_rv = parkinson_rv
         if intraday_rv is not None and parkinson_rv is not None:
-            effective_rv = max(parkinson_rv, intraday_rv)
+            vrp_blend_weight = min(len(candles_today) / 30.0, 1.0)
+            effective_rv = intraday_rv * vrp_blend_weight + parkinson_rv * (1.0 - vrp_blend_weight)
         elif intraday_rv is not None:
             effective_rv = intraday_rv
         vrp = (atm_iv * 100.0 - effective_rv * 100.0) if (atm_iv is not None and effective_rv is not None) else None

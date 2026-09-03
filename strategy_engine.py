@@ -139,7 +139,14 @@ class StrategyEngine:
         return row["cnt"] if row else 0
 
     def _straddle_allowed(self, s: dict) -> bool:
-        if s["vix_regime"] in ("SUPPRESSED", "ELEVATED", "HIGH"):
+        if s["vix_regime"] == "HIGH":
+            return False
+        if s["vix_regime"] == "SUPPRESSED":
+            return False
+        if s["vix_regime"] == "ELEVATED":
+            if s.get("or_condition") in ("VERY_NARROW", "NARROW") and (s.get("vrp") or 0) > 3.0:
+                elevated_vix_narrow_or_straddle_allowed = True
+                return True
             return False
         if s["day_mode"] == "PRE_EVENT":
             return False
@@ -444,12 +451,17 @@ class StrategyEngine:
             dirn_downgrade = s.get("direction", "NEUTRAL")
             side_downgrade = s.get("preferred_sell_side", "BOTH")
             if actual_dte_downgrade == 0:
-                if side_downgrade == "PUTS" or dirn_downgrade in ("BULLISH", "MILD_BULLISH"):
+                if dirn_downgrade in ("BULLISH", "MILD_BULLISH") and side_downgrade == "PUTS":
                     strategy_name = "BULL_PUT_SPREAD"
-                elif side_downgrade == "CALLS" or dirn_downgrade in ("BEARISH", "MILD_BEARISH"):
+                elif dirn_downgrade in ("BEARISH", "MILD_BEARISH") and side_downgrade == "CALLS":
                     strategy_name = "BEAR_CALL_SPREAD"
-                else:
+                elif dirn_downgrade == "NEUTRAL":
+                    strategy_name = "IRON_BUTTERFLY"
+                    reason += "_0dte_neutral_use_iron_butterfly"
+                elif side_downgrade == "PUTS":
                     strategy_name = "BULL_PUT_SPREAD"
+                else:
+                    strategy_name = "BEAR_CALL_SPREAD"
                 reason += "_downgraded_0dte_straddle_not_allowed"
                 self.logger.info(f"Strategy downgraded -> {strategy_name} (0DTE straddle not allowed)")
             else:
@@ -874,7 +886,7 @@ class StrategyEngine:
                 return {"valid": False, "reason": f"net_credit_{net_credit:.2f}pts_below_minimum_{min_credit:.2f}pts"}
 
             _dte_for_ratio = s.get("actual_dte", 5)
-            _min_ratio = 0.15 if _dte_for_ratio == 0 else 0.10
+            _min_ratio = 0.20 if _dte_for_ratio == 0 else (0.12 if _dte_for_ratio <= 1 else 0.10)
             if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "POST_EVENT_STRADDLE"):
                 actual_wing_pts = abs(validated_legs[2]["strike"] - validated_legs[0]["strike"])
                 if actual_wing_pts > 0 and (net_credit / actual_wing_pts) < _min_ratio:
