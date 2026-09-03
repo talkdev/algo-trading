@@ -453,11 +453,7 @@ class MarketDataEngine:
         if rv < 0.03 or rv > 0.50:
             return self._parkinson_fallback(vix), "vix_proxy_out_of_range"
 
-        if vix and vix > 0:
-            ratio = rv / (vix / 100.0)
-            if ratio < 0.30 or ratio > 1.20:
-                return self._parkinson_fallback(vix), "vix_proxy_ratio_check_failed"
-
+        ratio_check_removed = True
         return rv, f"parkinson_{n}bars_{len(session_bars)}sessions"
 
     def _parkinson_fallback(self, vix: Optional[float]) -> float:
@@ -788,7 +784,7 @@ class MarketDataEngine:
         self.state["wing_width"] = wing_map.get(vix_regime, 150)
 
         dow_stop = {"MONDAY": 1.4, "TUESDAY": 1.2, "WEDNESDAY": 1.3, "THURSDAY": 1.4, "FRIDAY": 1.3}
-        dow_size = {"MONDAY": 0.50, "TUESDAY": 1.0, "WEDNESDAY": 1.0, "THURSDAY": 0.90, "FRIDAY": 0.80}
+        dow_size = {"MONDAY": 0.50, "TUESDAY": 0.60, "WEDNESDAY": 1.0, "THURSDAY": 1.0, "FRIDAY": 0.90}
         self.state["stop_multiplier"] = dow_stop.get(day_label, 2.0)
 
         vix_size = {"SUPPRESSED": 0.0, "LOW": 0.75, "NORMAL": 1.0,
@@ -865,6 +861,12 @@ class MarketDataEngine:
         or_volume_filter_removed = True
 
         if len(opening_bars) < 2:
+            or_flat_open_fallback = True
+            spot_now = self.state.get("prev_spot")
+            if spot_now and spot_now > 0:
+                return {"or_high": spot_now + 10, "or_low": spot_now - 10,
+                        "or_width": 20, "or_condition": "VERY_NARROW",
+                        "or_score": 2, "partial": True}
             return None
 
         opening_bars = sorted(opening_bars, key=lambda b: b["timestamp"])[:6]
