@@ -234,6 +234,10 @@ class StrategyEngine:
             return "NO_TRADE", "vix_spike_detected_no_new_sells"
         if s.get("intraday_rv_selling_veto"):
             return "NO_TRADE", "intraday_rv_exceeds_atm_iv_no_premium_selling"
+        if s.get("iv_behavior") == "EXPANDING" and s.get("sell_ok"):
+            return "NO_TRADE", "iv_expanding_no_new_sells_wait_for_stable_or_declining"
+        if s.get("iv_behavior") == "SPIKING":
+            return "NO_TRADE", "iv_spiking_no_new_sells"
 
         try:
             entry_start = datetime.strptime(state["entry_start"], "%H:%M").time()
@@ -258,8 +262,9 @@ class StrategyEngine:
         last_stop_time = state.get("last_stop_time")
         if last_stop_time:
             last_stop_reason = state.get("last_stop_reason", "")
-            cooldown_map = {"CLOSE_ADX": 45, "CLOSE_VWAP": 20}
-            required_cooldown = cooldown_map.get(last_stop_reason, 30)
+            cooldown_map = {"CLOSE_ADX": 45, "CLOSE_VWAP": 20, "CLOSE_STOP": 30}
+            iv_expanding_cooldown = 20 if s.get("iv_behavior") in ("EXPANDING", "SPIKING") else 0
+            required_cooldown = cooldown_map.get(last_stop_reason, 30) + iv_expanding_cooldown
             try:
                 minutes_since = (now_ist() - datetime.fromisoformat(last_stop_time)).total_seconds() / 60.0
             except Exception:
@@ -920,8 +925,8 @@ class StrategyEngine:
         intended_lots = raw_base_lots * size_mult
         if intended_lots < 0.5:
             return {"valid": False, "reason": f"intended_lots_{intended_lots:.2f}_below_minimum_viable_0.5_size_throttled_to_no_trade"}
-        if base_lots == 1 and _size_mult_check < 0.6:
-            return {"valid": False, "reason": f"base_lots_1_size_mult_{_size_mult_check:.2f}_below_0.6_insufficient_for_required_reduction"}
+        if base_lots == 1 and _size_mult_check < 0.4:
+            return {"valid": False, "reason": f"base_lots_1_size_mult_{_size_mult_check:.2f}_below_0.4_insufficient_for_required_reduction"}
         final_lots = max(1, int(base_lots * size_mult))
         capital_scale = max(1, int(current_capital / self.config.starting_capital))
         day_cap = LOT_CAPS_BY_DAY.get(state.get("day_label"), 3) * capital_scale
@@ -955,9 +960,10 @@ class StrategyEngine:
             price_stop_pts = int(min(_static_stop, max(_credit_based_stop * 2.0, 30)))
         else:
             price_stop_pts = PRICE_STOPS.get(strategy_name, 80)
-            if actual_dte == 0: price_stop_pts = int(price_stop_pts * 0.60)
+            if actual_dte == 0: price_stop_pts = 35
             elif actual_dte == 1: price_stop_pts = int(price_stop_pts * 0.75)
             elif actual_dte <= 3: price_stop_pts = int(price_stop_pts * 0.90)
+            price_stop_pts_0dte_tightened = True
 
         hard_exit_str = state.get("hard_exit_time", self.config.hard_exit_time.strftime("%H:%M"))
         target_pct_final = self._get_target_pct(s)
