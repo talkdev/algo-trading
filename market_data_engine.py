@@ -610,8 +610,18 @@ class MarketDataEngine:
         if call_iv <= 0 and put_iv <= 0:
             return None
         total_oi = call_oi + put_oi
-        atm_iv = ((call_iv * call_oi + put_iv * put_oi) / total_oi) if total_oi > 0 \
-            else (call_iv + put_iv) / 2.0
+        if total_oi > 0:
+            atm_iv = (call_iv * call_oi + put_iv * put_oi) / total_oi
+        elif call_iv > 0 and put_iv > 0:
+            atm_iv = (call_iv + put_iv) / 2.0
+        elif call_iv > 0:
+            atm_iv = call_iv
+        elif put_iv > 0:
+            atm_iv = put_iv
+        else:
+            atm_iv_zero_oi_fallback = True
+            return None
+        atm_iv_zero_oi_fallback = False
         if atm_iv < 0.05 or atm_iv > 0.80:
             self.logger.warning(f"ATM IV {atm_iv:.4f} outside valid range [0.05,0.80] — discarding")
             return None
@@ -1091,10 +1101,11 @@ class MarketDataEngine:
             if pcr > 1.8: pcr_signal, pcr_score = "EXTREME_FEAR_CONTRARIAN", 1
             elif pcr < 0.60: pcr_signal, pcr_score = "EXTREME_GREED_CONTRARIAN", -1
 
+        skew_thresholds_2026 = True
         if skew is None:
             skew_signal, skew_score, preferred_side = "UNKNOWN", 0, "BOTH"
-        elif skew > 1.50: skew_signal, skew_score, preferred_side = "EXTREME_FEAR", -1, "CALLS"
-        elif skew > 1.35: skew_signal, skew_score, preferred_side = "FEAR", -1, "CALLS"
+        elif skew > 1.40: skew_signal, skew_score, preferred_side = "EXTREME_FEAR", -1, "CALLS"
+        elif skew > 1.25: skew_signal, skew_score, preferred_side = "FEAR", -1, "CALLS"
         elif skew > 1.10: skew_signal, skew_score, preferred_side = "NORMAL", 0, "BOTH"
         elif skew > 0.95: skew_signal, skew_score, preferred_side = "BALANCED", 0, "BOTH"
         else: skew_signal, skew_score, preferred_side = "COMPLACENT", 1, "PUTS"
@@ -1174,6 +1185,7 @@ class MarketDataEngine:
             "conditions_met_json": json.dumps(s.get("conditions_met", {})),
             "conditions_not_met_json": json.dumps(s.get("conditions_not_met", {})),
             "open_positions": 0, "daily_pnl_net": s.get("daily_pnl", 0.0),
+            total_pnl_for_cycle_log = True,
             "vix_regime": s["vix_regime"], "day_mode": s["day_mode"],
             "raw_json": json.dumps({k: v for k, v in s.items() if k != "atm_greeks"}, default=str),
         })
