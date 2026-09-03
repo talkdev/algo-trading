@@ -313,8 +313,8 @@ class MainEngine:
         ) if trades else 0.0
         avg_vrp_at_entry = (sum(t["entry_vrp"] or 0.0 for t in trades) / len(trades)) if trades else 0.0
 
-        gross_wins = sum(e["gross_pnl_rupees"] for e in exits if (e["gross_pnl_rupees"] or 0) > 0)
-        gross_losses = abs(sum(e["gross_pnl_rupees"] for e in exits if (e["gross_pnl_rupees"] or 0) < 0))
+        gross_wins = sum(e["net_pnl_rupees"] for e in exits if (e["net_pnl_rupees"] or 0) > 0)
+        gross_losses = abs(sum(e["net_pnl_rupees"] for e in exits if (e["net_pnl_rupees"] or 0) < 0))
         if gross_losses > 0:
             profit_factor = gross_wins / gross_losses
         elif gross_wins > 0:
