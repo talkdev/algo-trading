@@ -274,26 +274,22 @@ def load_high_impact_events(path: Path = DEFAULT_EVENTS_FILE) -> dict:
         return {}
     if not raw:
         return {}
-    first_val = next(iter(raw.values()), None)
-    if isinstance(first_val, dict) and "dates" in first_val:
-        flat = {}
-        for category, payload in raw.items():
-            if isinstance(payload, dict):
-                dates_list = payload.get("dates", [])
-                desc = payload.get("description", category)
-                for d in dates_list:
-                    if isinstance(d, str) and len(d) == 10:
-                        flat[d] = desc
+    flat = {}
+    for key, val in raw.items():
+        if isinstance(val, dict) and "dates" in val:
+            desc = val.get("description", key)
+            for d in val.get("dates", []):
+                if isinstance(d, str) and len(d) == 10:
+                    flat[d] = desc
+        elif isinstance(val, list):
+            for d in val:
+                if isinstance(d, str) and len(d) == 10:
+                    flat[d] = key
+        elif isinstance(val, str) and len(key) == 10:
+            flat[key] = val
+    if flat:
         return flat
-    if isinstance(first_val, list):
-        flat = {}
-        for category, dates_list in raw.items():
-            if isinstance(dates_list, list):
-                for d in dates_list:
-                    if isinstance(d, str) and len(d) == 10:
-                        flat[d] = category
-        return flat
-    return raw
+    return {k: v for k, v in raw.items() if isinstance(k, str) and len(k) == 10}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -430,7 +426,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
         exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003552),
         sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
-        stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00002),
+        stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00003),
 
         trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(10, 0)),
         trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),
