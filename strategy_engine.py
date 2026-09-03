@@ -59,18 +59,18 @@ from market_data_engine import MarketDataEngine, ensure_column
 # STRATEGY CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────
 DTE_REQUIREMENTS = {
-    "IRON_BUTTERFLY": (0, 7), "IRON_CONDOR": (2, 8),
-    "BULL_PUT_SPREAD": (1, 8), "BEAR_CALL_SPREAD": (1, 8),
+    "IRON_BUTTERFLY": (0, 7), "IRON_CONDOR": (1, 8),
+    "BULL_PUT_SPREAD": (0, 8), "BEAR_CALL_SPREAD": (0, 8),
     "BULL_CALL_SPREAD": (1, 5), "BEAR_PUT_SPREAD": (1, 5),
     "LONG_STRADDLE": (1, 5), "POST_EVENT_STRADDLE": (0, 3),
 }
 
 MIN_CREDITS = {
-    "IRON_BUTTERFLY": 25, "IRON_CONDOR": 15,
-    "BULL_PUT_SPREAD": 12, "BEAR_CALL_SPREAD": 10, "POST_EVENT_STRADDLE": 30,
+    "IRON_BUTTERFLY": 15, "IRON_CONDOR": 8,
+    "BULL_PUT_SPREAD": 7, "BEAR_CALL_SPREAD": 6, "POST_EVENT_STRADDLE": 20,
 }
 MIN_CREDITS_TUESDAY = {
-    "IRON_BUTTERFLY": 30, "IRON_CONDOR": 20, "BULL_PUT_SPREAD": 15, "BEAR_CALL_SPREAD": 12,
+    "IRON_BUTTERFLY": 18, "IRON_CONDOR": 10, "BULL_PUT_SPREAD": 8, "BEAR_CALL_SPREAD": 7,
 }
 
 PRICE_STOPS = {
@@ -78,8 +78,8 @@ PRICE_STOPS = {
     "BEAR_CALL_SPREAD": 80, "POST_EVENT_STRADDLE": 120,
 }
 
-TARGET_PCT_BY_DAY = {"MONDAY": 0.40, "TUESDAY": 0.35, "WEDNESDAY": 0.40,
-                      "THURSDAY": 0.40, "FRIDAY": 0.40}
+TARGET_PCT_BY_DAY = {"MONDAY": 0.50, "TUESDAY": 0.50, "WEDNESDAY": 0.55,
+                      "THURSDAY": 0.55, "FRIDAY": 0.50}
 
 MIN_CREDIT_MULTIPLIER_BY_REGIME = {"SUPPRESSED": 1.0, "LOW": 1.1, "NORMAL": 1.0,
                                     "ELEVATED": 1.15, "HIGH": 1.3}
@@ -154,11 +154,29 @@ class StrategyEngine:
     def _compute_entry_timing(self, s: dict) -> tuple[str, list]:
         notes = []
         timing = "GOOD"
+        current_time = now_ist().time()
+        state = self.market_engine.state
+        dte = state.get("actual_dte")
+
+        if dtime(9, 15) <= current_time < dtime(9, 30):
+            return "WAIT", ["first_15min_spread_too_wide_avoid_entry"]
+
+        if dte == 0 and dtime(12, 0) <= current_time < dtime(12, 30):
+            return "WAIT", ["0dte_avoid_12pm_eu_open_transition"]
+
+        if dte == 0 and current_time >= dtime(14, 0):
+            return "WAIT", ["0dte_no_new_positions_after_14:00"]
+
+        if current_time >= dtime(15, 0):
+            return "WAIT", ["last_30min_gamma_spread_blowout"]
+
+        trend_cond = s.get("trend_condition", "")
         if s["vwap_signal"] in ("BULLISH_EXTENDED", "BEARISH_EXTENDED"):
-            timing = "WAIT"
-            dist = s.get("vwap_dist_pct")
-            notes.append(f"Spot extended from VWAP ({dist:.2f}% if available) — wait for mean reversion"
-                         if dist is not None else "Spot extended from VWAP — wait for mean reversion")
+            if trend_cond not in ("TRENDING", "STRONG_TREND"):
+                timing = "WAIT"
+                dist = s.get("vwap_dist_pct")
+                notes.append(f"Spot extended from VWAP ({dist:.2f}%) — wait for mean reversion"
+                             if dist is not None else "Spot extended from VWAP — wait for mean reversion")
 
         spot_vs_or = s.get("spot_vs_or", "") or ""
         or_width = s.get("or_width") or 50
@@ -172,7 +190,6 @@ class StrategyEngine:
                     timing = "CAUTION"
                 notes.append(f"Spot has broken OR by {breakout_pts:.0f}pts — trend day risk")
 
-        current_time = now_ist().time()
         if current_time < dtime(10, 30):
             if timing == "GOOD":
                 timing = "CAUTION"
@@ -214,6 +231,8 @@ class StrategyEngine:
             return "NO_TRADE", "circuit_breaker_suspected_halt_trading"
         if s["vix_spike_detected"]:
             return "NO_TRADE", "vix_spike_detected_no_new_sells"
+        if s.get("intraday_rv_selling_veto"):
+            return "NO_TRADE", "intraday_rv_exceeds_atm_iv_no_premium_selling"
 
         try:
             entry_start = datetime.strptime(state["entry_start"], "%H:%M").time()
@@ -257,8 +276,11 @@ class StrategyEngine:
             return "NO_TRADE", "event_day_awaiting_announcement"
         if s["vix_regime"] == "SUPPRESSED":
             return "NO_TRADE", "vix_suppressed_no_edge"
+        gap_fade = self.market_engine.state.get("gap_fade_opportunity", False)
         if s["or_condition"] == "VERY_WIDE" and s["volatility_condition"] in ("RICH", "VERY_RICH"):
-            return "NO_TRADE", "very_wide_or_dangerous_to_sell_premium"
+            if not gap_fade:
+                return "NO_TRADE", "very_wide_or_dangerous_to_sell_premium"
+            self.logger.info("VERY_WIDE OR but gap_fade_opportunity active — allowing condor")
 
         entry_timing, timing_notes = self._compute_entry_timing(s)
         if entry_timing == "WAIT":
@@ -287,9 +309,9 @@ class StrategyEngine:
         if vol in ("VERY_RICH", "RICH") and sell_ok:
             if trend in ("RANGE_BOUND", "MILD_RANGE", "RANGE_ASSUMED"):
                 if dirn == "NEUTRAL":
-                    if (vol == "VERY_RICH" and s["or_condition"] in ("VERY_NARROW", "NARROW")
+                    if (vol in ("VERY_RICH", "RICH") and s["or_condition"] in ("VERY_NARROW", "NARROW")
                             and straddle_allowed):
-                        return "IRON_BUTTERFLY", f"neutral+very_rich_vrp+{s['or_condition']}_or+straddle_allowed"
+                        return "IRON_BUTTERFLY", f"neutral+{vol}_vrp+{s['or_condition']}_or+straddle_allowed"
                     return "IRON_CONDOR", f"neutral+{vol}_vrp+{s['or_condition']}_or"
                 elif dirn in ("BULLISH", "MILD_BULLISH"):
                     if vwap_sig == "BULLISH_EXTENDED":
@@ -337,6 +359,8 @@ class StrategyEngine:
                     if vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
                         return "BEAR_CALL_SPREAD", "bearish+fair_vrp+range_half_size"
                     return "NO_TRADE", "fair_vrp_vwap_contradicts_direction"
+                if dirn == "NEUTRAL" and straddle_allowed:
+                    return "IRON_CONDOR", "neutral+fair_vrp+range_quarter_size"
                 return "NO_TRADE", "fair_vrp_neutral_direction_insufficient_edge"
             return "NO_TRADE", "fair_vrp_trending_no_trade"
 
@@ -396,9 +420,22 @@ class StrategyEngine:
         straddle_allowed = self._straddle_allowed(s)
 
         if strategy_name in ("IRON_BUTTERFLY", "POST_EVENT_STRADDLE") and not straddle_allowed:
-            strategy_name = "IRON_CONDOR"
-            reason += "_downgraded_straddle_not_allowed"
-            self.logger.info("Strategy downgraded -> IRON_CONDOR (straddle not allowed)")
+            actual_dte_downgrade = self.market_engine.state.get("actual_dte")
+            dirn_downgrade = s.get("direction", "NEUTRAL")
+            side_downgrade = s.get("preferred_sell_side", "BOTH")
+            if actual_dte_downgrade == 0:
+                if side_downgrade == "PUTS" or dirn_downgrade in ("BULLISH", "MILD_BULLISH"):
+                    strategy_name = "BULL_PUT_SPREAD"
+                elif side_downgrade == "CALLS" or dirn_downgrade in ("BEARISH", "MILD_BEARISH"):
+                    strategy_name = "BEAR_CALL_SPREAD"
+                else:
+                    strategy_name = "BULL_PUT_SPREAD"
+                reason += "_downgraded_0dte_straddle_not_allowed"
+                self.logger.info(f"Strategy downgraded -> {strategy_name} (0DTE straddle not allowed)")
+            else:
+                strategy_name = "IRON_CONDOR"
+                reason += "_downgraded_straddle_not_allowed"
+                self.logger.info("Strategy downgraded -> IRON_CONDOR (straddle not allowed)")
 
         if strategy_name in ("IRON_BUTTERFLY", "IRON_CONDOR"):
             dirn, side = s["direction"], s["preferred_sell_side"]
@@ -412,7 +449,10 @@ class StrategyEngine:
                     strategy_name = "BEAR_CALL_SPREAD"
                     reason += "_downgraded_direction_shifted"
 
-        if "half_size" in reason or "uncertain" in reason or "fair_vrp" in reason:
+        if "quarter_size" in reason:
+            size_mult *= 0.25
+            self.logger.info(f"Quarter-size applied due to: {reason}")
+        elif "half_size" in reason or "uncertain" in reason or "fair_vrp" in reason:
             size_mult *= 0.50
             self.logger.info(f"Half-size applied due to: {reason}")
 
@@ -434,10 +474,12 @@ class StrategyEngine:
         if strategy_name == "IRON_BUTTERFLY":
             step = self.config.nifty_strike_step
             atm_strike = round(spot / step) * step if spot else None
-            if atm_strike is not None and abs(spot - atm_strike) > 15:
+            if atm_strike is not None and abs(spot - atm_strike) > 20:
                 return False, f"spot_{spot:.0f}_too_far_from_atm_{atm_strike:.0f}"
-            if day_label != "TUESDAY" and s["or_condition"] != "VERY_NARROW":
-                return False, "iron_butterfly_requires_tuesday_or_very_narrow_or"
+            if day_label not in ("TUESDAY", "MONDAY") and s["or_condition"] not in ("VERY_NARROW", "NARROW"):
+                return False, "iron_butterfly_requires_tuesday_monday_or_narrow_or"
+            if day_label == "MONDAY" and s["or_condition"] not in ("VERY_NARROW", "NARROW"):
+                return False, "iron_butterfly_monday_requires_narrow_or"
 
         elif strategy_name == "IRON_CONDOR":
             hard_exit_str = state.get("hard_exit_time")
@@ -575,7 +617,7 @@ class StrategyEngine:
             atm = round(spot / step) * step
             if atm not in chain:
                 atm = min(chain.keys(), key=lambda k: abs(k - spot))
-            butterfly_wing = max(wing, 100)
+            butterfly_wing = max(wing, 50)
             long_call, long_put = atm + butterfly_wing, atm - butterfly_wing
             if long_call not in chain:
                 long_call = min(chain.keys(), key=lambda k: abs(k - (atm + butterfly_wing)))
@@ -774,12 +816,13 @@ class StrategyEngine:
         total_turnover_pts = sell_premium_pts + buy_premium_pts
 
         C02 = self.config.lot_size
-        stt_per_lot = sell_premium_pts * C02 * self.config.stt_rate
+        stt_per_lot = sell_premium_pts * C02 * self.config.stt_options_sell
         exchange_per_lot = total_turnover_pts * C02 * self.config.exchange_txn_rate
+        sebi_per_lot = total_turnover_pts * C02 * self.config.sebi_rate
         brokerage_total = self.config.brokerage_per_order * num_legs
-        gst_total = (brokerage_total + exchange_per_lot) * 0.18
-        stamp_per_lot = buy_premium_pts * C02 * 0.00003
-        total_costs_rupees_per_lot = stt_per_lot + exchange_per_lot + brokerage_total + gst_total + stamp_per_lot
+        gst_total = (brokerage_total + exchange_per_lot + sebi_per_lot) * 0.18
+        stamp_per_lot = buy_premium_pts * C02 * self.config.stamp_duty_buy_options
+        total_costs_rupees_per_lot = stt_per_lot + exchange_per_lot + sebi_per_lot + brokerage_total + gst_total + stamp_per_lot
         total_costs_pts_per_lot = total_costs_rupees_per_lot / C02
 
         net_credit, net_debit = None, None
@@ -824,8 +867,12 @@ class StrategyEngine:
                 return {"valid": False, "reason": f"net_profit_at_target_{net_profit_at_target:.2f}pts_non_positive"}
 
         current_capital = state.get("current_capital", self.config.starting_capital)
-        max_risk_per_trade = current_capital * self.config.max_risk_per_trade_pct
+        risk_pct = self.config.max_risk_per_trade_pct
+        if s.get("actual_dte") == 0:
+            risk_pct = min(risk_pct, 0.003)
+        max_risk_per_trade = current_capital * risk_pct
         stop_multiplier = state.get("stop_multiplier", 2.0)
+        _size_mult_check = size_mult
 
         if strategy_type == "SELL":
             stop_premium = net_credit * stop_multiplier
@@ -845,6 +892,8 @@ class StrategyEngine:
         intended_lots = raw_base_lots * size_mult
         if intended_lots < 0.5:
             return {"valid": False, "reason": f"intended_lots_{intended_lots:.2f}_below_minimum_viable_0.5_size_throttled_to_no_trade"}
+        if base_lots == 1 and _size_mult_check < 0.6:
+            return {"valid": False, "reason": f"base_lots_1_size_mult_{_size_mult_check:.2f}_below_0.6_insufficient_for_required_reduction"}
         final_lots = max(1, int(base_lots * size_mult))
         capital_scale = max(1, int(current_capital / self.config.starting_capital))
         day_cap = LOT_CAPS_BY_DAY.get(state.get("day_label"), 3) * capital_scale

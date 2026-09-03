@@ -391,6 +391,19 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     # MODULE 3: PARKINSON RV (cached once per trading day)
     # ─────────────────────────────────────────────────────────────────
+    def compute_intraday_parkinson_rv(self, candles_today: list) -> Optional[float]:
+        valid = [b for b in candles_today if b["high"] > b["low"] and b["high"] > 0]
+        if len(valid) < 6:
+            return None
+        log_hl_sq = [math.log(b["high"] / b["low"]) ** 2 for b in valid]
+        park_const = 1.0 / (4.0 * math.log(2.0))
+        variance_per_bar = park_const * (sum(log_hl_sq) / len(log_hl_sq))
+        annual_variance = variance_per_bar * (75.0 * 252.0)
+        rv = math.sqrt(annual_variance)
+        if rv < 0.02 or rv > 0.80:
+            return None
+        return rv
+
     def compute_parkinson_rv(self, vix: Optional[float]) -> tuple[Optional[float], str]:
         today_str = today_ist().isoformat()
         if (self.state.get("parkinson_rv_computed_date") == today_str
@@ -448,7 +461,7 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     # OPTION CHAIN: expiry discovery + fetch + normalization
     # ─────────────────────────────────────────────────────────────────
-    def discover_active_expiry(self) -> tuple[Optional[date], Optional[int]]:
+    def discover_active_expiry(self, prefer_dte_min: int = 4) -> tuple[Optional[date], Optional[int]]:
         try:
             contracts = self.client.get_option_contracts(INSTRUMENT_KEY_NIFTY_SPOT)
         except Exception as e:
@@ -456,6 +469,10 @@ class MarketDataEngine:
             return None, None
 
         today = today_ist()
+        now_time = now_ist().time()
+        is_tuesday = today.weekday() == 1
+        is_0dte_window = is_tuesday and dtime(12, 30) <= now_time < dtime(14, 0)
+
         future = []
         seen = set()
         for c in contracts:
@@ -473,7 +490,18 @@ class MarketDataEngine:
 
         if not future:
             return None, None
+
         future.sort(key=lambda x: x[0])
+
+        if is_0dte_window:
+            zero_dte = [f for f in future if f[0] == 0]
+            if zero_dte:
+                return zero_dte[0][1], zero_dte[0][0]
+
+        preferred = [f for f in future if f[0] >= prefer_dte_min]
+        if preferred:
+            return preferred[0][1], preferred[0][0]
+
         return future[0][1], future[0][0]
 
     def _get_active_expiry(self) -> tuple[Optional[date], Optional[int]]:
@@ -580,11 +608,19 @@ class MarketDataEngine:
             return None
         return atm_iv
 
-    def compute_pcr(self, chain: dict) -> Optional[float]:
-        # NOTE: chain here is already scoped to the single active expiry only
-        # (fixes the multi-expiry PCR contamination issue from the original spec).
-        total_put_oi = sum(legs.get("put", {}).get("oi", 0) for legs in chain.values())
-        total_call_oi = sum(legs.get("call", {}).get("oi", 0) for legs in chain.values())
+    def compute_pcr(self, chain: dict, spot: Optional[float] = None) -> Optional[float]:
+        if spot is not None and spot > 0:
+            total_put_oi = sum(
+                legs.get("put", {}).get("oi", 0)
+                for strike, legs in chain.items() if strike > spot
+            )
+            total_call_oi = sum(
+                legs.get("call", {}).get("oi", 0)
+                for strike, legs in chain.items() if strike < spot
+            )
+        else:
+            total_put_oi = sum(legs.get("put", {}).get("oi", 0) for legs in chain.values())
+            total_call_oi = sum(legs.get("call", {}).get("oi", 0) for legs in chain.values())
         if total_call_oi <= 0:
             return None
         pcr = total_put_oi / total_call_oi
@@ -601,9 +637,13 @@ class MarketDataEngine:
             typical = (b["high"] + b["low"] + b["close"]) / 3.0
             cum_pv += typical * b["volume"]
             cum_vol += b["volume"]
-        if cum_vol <= 0:
+        if cum_vol > 0:
+            return cum_pv / cum_vol, True
+        total_bars = len(candles_today)
+        if total_bars < 3:
             return None, False
-        return cum_pv / cum_vol, True
+        equal_pv = sum((b["high"] + b["low"] + b["close"]) / 3.0 for b in candles_today)
+        return equal_pv / total_bars, True
 
     def _find_by_delta(self, chain: dict, opt_type: str, target: float, tolerance: float) -> Optional[float]:
         best_iv, best_diff = None, float("inf")
@@ -682,7 +722,7 @@ class MarketDataEngine:
 
     def _assess_gap(self) -> None:
         current_time = now_ist().time()
-        if current_time >= dtime(9, 15):
+        if current_time >= dtime(9, 30):
             return  # gap assessment only meaningful pre-market
 
         if not GIFT_NIFTY_KEY:
@@ -719,6 +759,11 @@ class MarketDataEngine:
         elif abs_gap < 0.70: self.state["gap_size"] = "MODERATE"
         elif abs_gap < 1.00: self.state["gap_size"] = "LARGE"
         else: self.state["gap_size"] = "VERY_LARGE"
+        if abs_gap >= 1.00:
+            self.state["gap_fade_opportunity"] = True
+            self.logger.info(f"GAP FADE OPPORTUNITY: gap={gap_pct:.2f}% — large gap favours mean-reversion condor")
+        else:
+            self.state["gap_fade_opportunity"] = False
 
     def _apply_day_of_week_params(self, today: date) -> None:
         labels = {0: "MONDAY", 1: "TUESDAY", 2: "WEDNESDAY", 3: "THURSDAY", 4: "FRIDAY"}
@@ -729,7 +774,7 @@ class MarketDataEngine:
         wing_map = {"SUPPRESSED": 150, "LOW": 150, "NORMAL": 150, "ELEVATED": 200, "HIGH": 250}
         self.state["wing_width"] = wing_map.get(vix_regime, 150)
 
-        dow_stop = {"MONDAY": 2.2, "TUESDAY": 1.4, "WEDNESDAY": 1.8, "THURSDAY": 1.9, "FRIDAY": 1.6}
+        dow_stop = {"MONDAY": 1.5, "TUESDAY": 1.2, "WEDNESDAY": 1.4, "THURSDAY": 1.5, "FRIDAY": 1.3}
         dow_size = {"MONDAY": 0.50, "TUESDAY": 1.0, "WEDNESDAY": 1.0, "THURSDAY": 0.90, "FRIDAY": 0.80}
         self.state["stop_multiplier"] = dow_stop.get(day_label, 2.0)
 
@@ -742,12 +787,13 @@ class MarketDataEngine:
         hard_exit = self.config.hard_exit_time
 
         if day_label == "TUESDAY" and TUESDAY_EARLY_EXIT_ENABLED:
-            last_entry = min(last_entry, dtime(12, 0))
-            hard_exit = min(hard_exit, dtime(13, 30))
+            last_entry = min(last_entry, dtime(14, 0))
+            hard_exit = min(hard_exit, dtime(15, 0))
             self.logger.info(
-                f"TUESDAY (0DTE) RISK OVERRIDE: tightening to last_entry={last_entry}, "
-                f"hard_exit={hard_exit} due to gamma risk. "
-                f"Set TUESDAY_EARLY_EXIT_ENABLED=false in env.txt to use the flat 10-15 window instead."
+                f"TUESDAY (0DTE) RISK OVERRIDE: last_entry={last_entry}, "
+                f"hard_exit={hard_exit}. Morning entries use next-week contract. "
+                f"0DTE entries only 12:30-14:00. "
+                f"Set TUESDAY_EARLY_EXIT_ENABLED=false in env.txt to disable."
             )
 
         gap_size = self.state.get("gap_size", "SMALL")
@@ -796,14 +842,14 @@ class MarketDataEngine:
     # MODULE 2: OPENING RANGE
     # ─────────────────────────────────────────────────────────────────
     def compute_opening_range(self, candles_today: list) -> Optional[dict]:
-        opening_bars = [b for b in candles_today if dtime(9, 15) <= b["timestamp"].time() <= dtime(9, 29)]
+        opening_bars = [b for b in candles_today if dtime(9, 15) <= b["timestamp"].time() <= dtime(9, 44)]
         opening_bars = [b for b in opening_bars if not (b["volume"] == 0 and b["high"] == b["low"])]
-        opening_bars = [b for b in opening_bars if (b["high"] - b["low"]) <= 500]
+        opening_bars = [b for b in opening_bars if (b["high"] - b["low"]) <= 1000]
 
         if len(opening_bars) < 2:
             return None
 
-        opening_bars = sorted(opening_bars, key=lambda b: b["timestamp"])[:3]
+        opening_bars = sorted(opening_bars, key=lambda b: b["timestamp"])[:6]
         or_high = max(b["high"] for b in opening_bars)
         or_low = min(b["low"] for b in opening_bars)
         or_width = or_high - or_low
@@ -873,10 +919,10 @@ class MarketDataEngine:
         return adx_value, pdi_last, ndi_last, direction
 
     def _classify_adx(self, adx_value: float) -> tuple[str, int]:
-        if adx_value < 15: return "FLAT", 2
-        if adx_value < 20: return "WEAK", 1
-        if adx_value < 25: return "MODERATE", 0
-        if adx_value < 30: return "STRONG", -1
+        if adx_value < 22: return "FLAT", 2
+        if adx_value < 28: return "WEAK", 1
+        if adx_value < 35: return "MODERATE", 0
+        if adx_value < 42: return "STRONG", -1
         return "VERY_STRONG", -2
 
     def _spot_vs_or(self, spot, or_high, or_low) -> tuple[str, int]:
@@ -947,11 +993,11 @@ class MarketDataEngine:
                     "high_quality_sell_day": False}
 
         sell_ok, buy_ok, sell_reduction = False, False, 1.0
-        if vrp > 8.0: vol_cond, vol_score, sell_ok = "VERY_RICH", 2, True
-        elif vrp > 4.0: vol_cond, vol_score, sell_ok = "RICH", 1, True
-        elif vrp > 2.0: vol_cond, vol_score, sell_ok, sell_reduction = "FAIR", 0, True, 0.5
-        elif vrp > 0.5: vol_cond, vol_score = "THIN", -1
-        elif vrp > 0.0: vol_cond, vol_score, buy_ok = "CHEAP", -2, True
+        if vrp > 5.0: vol_cond, vol_score, sell_ok = "VERY_RICH", 2, True
+        elif vrp > 3.0: vol_cond, vol_score, sell_ok = "RICH", 1, True
+        elif vrp > 1.5: vol_cond, vol_score, sell_ok, sell_reduction = "FAIR", 0, True, 0.5
+        elif vrp > 0.0: vol_cond, vol_score = "THIN", -1
+        elif vrp > -2.0: vol_cond, vol_score, buy_ok = "CHEAP", -2, True
         else: vol_cond, vol_score, buy_ok = "INVERTED", -3, True
 
         if vix_regime == "SUPPRESSED":
@@ -1215,17 +1261,21 @@ class MarketDataEngine:
         self.last_chain_expiry = expiry
 
         atm_iv = self.compute_atm_iv(chain, spot)
-        pcr = self.compute_pcr(chain)
+        pcr = self.compute_pcr(chain, spot)
         put_iv, call_iv = self.compute_25d_ivs(chain)
         skew = self.compute_skew_ratio(put_iv, call_iv)
 
         if atm_iv is not None and dte is not None and spot is not None:
-            expected_move = spot * atm_iv * ((max(dte, 1) / 365.0) ** 0.5)
-            computed_wing = int(round((expected_move * 0.60) / self.config.nifty_strike_step) * self.config.nifty_strike_step)
-            self.state["wing_width"] = max(100, min(computed_wing, 400))
+            dte_wing_map = {0: 50, 1: 75, 2: 100, 3: 100, 4: 150, 5: 150, 6: 200, 7: 200, 8: 250}
+            if dte in dte_wing_map:
+                self.state["wing_width"] = dte_wing_map[dte]
+            else:
+                expected_move = spot * atm_iv * ((max(dte, 1) / 365.0) ** 0.5)
+                computed_wing = int(round((expected_move * 0.60) / self.config.nifty_strike_step) * self.config.nifty_strike_step)
+                self.state["wing_width"] = max(100, min(computed_wing, 400))
 
         current_time = now_ist().time()
-        if current_time >= dtime(9, 30) and not self.state.get("or_computed"):
+        if current_time >= dtime(9, 45) and not self.state.get("or_computed"):
             or_result = self.compute_opening_range(candles_today)
             if or_result:
                 self.state["or_high"] = or_result["or_high"]
@@ -1237,7 +1287,7 @@ class MarketDataEngine:
                                   f"L={or_result['or_low']:.0f} W={or_result['or_width']:.0f} "
                                   f"[{or_result['or_condition']}]")
 
-        if current_time >= dtime(9, 30) and not self.state.get("session_initialized"):
+        if current_time >= dtime(9, 45) and not self.state.get("session_initialized"):
             if atm_iv:
                 self.state["opening_iv"] = atm_iv
             if pcr:
@@ -1248,7 +1298,14 @@ class MarketDataEngine:
                                   f"opening_pcr={self.state['opening_pcr']:.3f}")
 
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix)
-        vrp = (atm_iv * 100.0 - parkinson_rv * 100.0) if (atm_iv is not None and parkinson_rv is not None) else None
+        intraday_rv = self.compute_intraday_parkinson_rv(candles_today)
+        effective_rv = parkinson_rv
+        if intraday_rv is not None and parkinson_rv is not None:
+            effective_rv = max(parkinson_rv, intraday_rv)
+        elif intraday_rv is not None:
+            effective_rv = intraday_rv
+        vrp = (atm_iv * 100.0 - effective_rv * 100.0) if (atm_iv is not None and effective_rv is not None) else None
+        intraday_rv_selling_veto = (intraday_rv is not None and atm_iv is not None and intraday_rv > atm_iv)
 
         vol_result = self.assess_volatility_condition(
             vrp, atm_iv, self.state.get("opening_iv"), self.state.get("vix_regime"), vix_spike
@@ -1266,6 +1323,7 @@ class MarketDataEngine:
 
         signals = {
             "trading_date": trading_date, "spot": spot, "vix": vix,
+            "intraday_rv_selling_veto": intraday_rv_selling_veto,
             "vix_regime": self.state.get("vix_regime"), "day_mode": self.state.get("day_mode"),
             "day_label": self.state.get("day_label"),
             "circuit_breaker_suspected": circuit, "vix_spike_detected": vix_spike,

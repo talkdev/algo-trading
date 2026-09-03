@@ -177,7 +177,7 @@ PAPER_TRADE_MODE=true
 # ── CAPITAL & RISK ──────────────────────────────────────────────────────
 STARTING_CAPITAL=1000000
 MAX_DAILY_LOSS_PCT=0.02
-MAX_RISK_PER_TRADE_PCT=0.006
+MAX_RISK_PER_TRADE_PCT=0.010
 
 # ── CONTRACT SPECS (verify against current NSE circular / broker) ───────
 NIFTY_LOT_SIZE=65
@@ -190,12 +190,12 @@ EXCHANGE_TXN_RATE=0.0003552
 
 # ── TRADING WINDOW (per your explicit requirement: 10:00 - 15:00) ──────
 TRADING_WINDOW_START=10:00
-TRADING_WINDOW_LAST_ENTRY=14:00
+TRADING_WINDOW_LAST_ENTRY=15:00
 HARD_EXIT_TIME=15:00
 
 # ── POSITION LIMITS ──────────────────────────────────────────────────────
 MAX_CONCURRENT_POSITIONS=2
-MAX_ENTRIES_PER_DAY=2
+MAX_ENTRIES_PER_DAY=3
 
 # ── INFRA ────────────────────────────────────────────────────────────────
 DB_PATH=data/nifty_algo.db
@@ -261,12 +261,6 @@ def _get_time(env: dict, key: str, default: dtime) -> dtime:
 
 
 def load_high_impact_events(path: Path = DEFAULT_EVENTS_FILE) -> dict:
-    """
-    Loads the high-impact-events calendar from an external JSON file
-    (date_str -> event_name). Intentionally NOT hardcoded with any dates —
-    populate this file yourself with verified event dates.
-    Expected format: {"2026-02-01": "Union Budget", "2026-02-06": "RBI MPC", ...}
-    """
     if not path.exists():
         path.write_text("{}\n", encoding="utf-8")
         print(f"[SETUP] {path} did not exist — created empty calendar. "
@@ -274,10 +268,32 @@ def load_high_impact_events(path: Path = DEFAULT_EVENTS_FILE) -> dict:
               f"CPI/WPI, expiry dates, etc.) for event-day handling to work.")
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         print(f"[WARNING] {path} is not valid JSON ({e}); treating as empty calendar.")
         return {}
+    if not raw:
+        return {}
+    first_val = next(iter(raw.values()), None)
+    if isinstance(first_val, dict) and "dates" in first_val:
+        flat = {}
+        for category, payload in raw.items():
+            if isinstance(payload, dict):
+                dates_list = payload.get("dates", [])
+                desc = payload.get("description", category)
+                for d in dates_list:
+                    if isinstance(d, str) and len(d) == 10:
+                        flat[d] = desc
+        return flat
+    if isinstance(first_val, list):
+        flat = {}
+        for category, dates_list in raw.items():
+            if isinstance(dates_list, list):
+                for d in dates_list:
+                    if isinstance(d, str) and len(d) == 10:
+                        flat[d] = category
+        return flat
+    return raw
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -305,8 +321,12 @@ class Config:
 
     # Transaction costs (C07 / C08 / C09)
     stt_rate: float
+    stt_options_sell: float
+    stt_options_exercise: float
     brokerage_per_order: float
     exchange_txn_rate: float
+    sebi_rate: float
+    stamp_duty_buy_options: float
 
     # Trading window — per explicit requirement: 10:00 to 15:00
     trading_window_start: dtime
@@ -405,8 +425,12 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),
 
         stt_rate=_get_float(env, "STT_RATE", 0.0015),
+        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),
+        stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
         exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003552),
+        sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
+        stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00002),
 
         trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(10, 0)),
         trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),

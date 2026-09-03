@@ -174,7 +174,11 @@ class MainEngine:
         if not current_cap or current_cap <= 0:
             return
         total_pnl = self.compute_total_daily_pnl()
-        loss_pct = max(0.0, -total_pnl) / current_cap
+        realized_pnl = state.get("daily_pnl", 0.0)
+        day_start_cap = current_cap - realized_pnl
+        if day_start_cap <= 0:
+            day_start_cap = current_cap
+        loss_pct = max(0.0, -total_pnl) / day_start_cap
         if loss_pct >= self.config.max_daily_loss_pct and not state.get("daily_halted"):
             state["daily_halted"] = True
             self.logger.warning(f"DAILY LOSS LIMIT (incl. unrealized): {loss_pct*100:.2f}% "
@@ -188,16 +192,11 @@ class MainEngine:
         current_time = now_ist().time()
         day_label = self.market_engine.state.get("day_label")
 
-        if day_label == "TUESDAY" and current_time >= dtime(13, 30):
+        if current_time >= dtime(15, 0):
             open_positions = self.execution_engine._get_open_positions()
             if open_positions:
-                self.logger.info(f"TUESDAY HARD EXIT SWEEP @ 13:30 — closing {len(open_positions)} position(s)")
-                self.execution_engine.close_all_positions("TUESDAY_HARD_EXIT_13:30")
-        elif current_time >= dtime(14, 45):
-            open_positions = self.execution_engine._get_open_positions()
-            if open_positions:
-                self.logger.info(f"HARD EXIT SWEEP @ 14:45 — closing {len(open_positions)} position(s)")
-                self.execution_engine.close_all_positions("HARD_EXIT_14:45")
+                self.logger.info(f"HARD EXIT SWEEP @ 15:00 — closing {len(open_positions)} position(s)")
+                self.execution_engine.close_all_positions("HARD_EXIT_15:00")
 
     # ─────────────────────────────────────────────────────────────────
     # ONE CYCLE
