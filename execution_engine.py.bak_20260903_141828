@@ -132,18 +132,6 @@ class LiveOrderExecutor:
         self.logger.warning(f"Using fallback price for order {order_id} (could not confirm fill price)")
         return fallback
 
-    def _aggressive_limit_price(self, chain: dict, strike: float, opt_type: str, transaction_type: str, fallback: float) -> float:
-        opt = chain.get(strike, {}).get(opt_type, {}) if chain else {}
-        bid, ask = opt.get("bid", 0) or 0, opt.get("ask", 0) or 0
-        if transaction_type == "BUY":
-            base = ask if ask > 0 else fallback
-            price = base * 1.05
-        else:
-            base = bid if bid > 0 else fallback
-            price = base * 0.95
-        tick = 0.05
-        return round(round(price / tick) * tick, 2)
-
     def execute_leg_entry(self, leg: dict, lots: int, chain: dict) -> dict:
         instrument_key = self._resolve_instrument_key(leg, chain)
         if not instrument_key:
@@ -151,10 +139,9 @@ class LiveOrderExecutor:
                                 f"— cannot place live order")
         qty = lots * self.config.lot_size
         transaction_type = "SELL" if leg["action"] == "SELL" else "BUY"
-        limit_price = self._aggressive_limit_price(chain, leg["strike"], leg["option_type"], transaction_type, leg["exec_price"])
         result = self.client.place_order(
             instrument_token=instrument_key, quantity=qty, transaction_type=transaction_type,
-            order_type="LIMIT", price=limit_price, product="I",
+            order_type="MARKET", product="I",
         )
         order_id = result.get("order_id", "")
         self.logger.info(f"[LIVE] ENTRY ORDER PLACED: {transaction_type} {leg['option_type'].upper()} "
@@ -169,10 +156,9 @@ class LiveOrderExecutor:
                                 f"— cannot place live order")
         qty = lots * self.config.lot_size
         transaction_type = "BUY" if leg["action"] == "SELL" else "SELL"
-        limit_price = self._aggressive_limit_price(chain, leg["strike"], leg["option_type"], transaction_type, leg.get("entry_price", 0) or 0)
         result = self.client.place_order(
             instrument_token=instrument_key, quantity=qty, transaction_type=transaction_type,
-            order_type="LIMIT", price=limit_price, product="I",
+            order_type="MARKET", product="I",
         )
         order_id = result.get("order_id", "")
         self.logger.info(f"[LIVE] EXIT ORDER PLACED: {transaction_type} {leg['option_type'].upper()} "
@@ -233,22 +219,6 @@ class ExecutionEngine:
                 # do NOT multiply by lot_size again here.
                 total_delta += sign * live_delta * leg["qty"]
         return total_delta
-
-    def _compute_portfolio_vega_gamma(self) -> tuple[float, float]:
-        chain = self.market_engine.last_chain
-        total_vega = 0.0
-        total_gamma = 0.0
-        for pos in self._get_open_positions():
-            for leg in self._get_position_legs(pos["position_id"]):
-                if leg["leg_status"] != "OPEN":
-                    continue
-                opt = chain.get(leg["strike"], {}).get(leg["option_type"], {}) if chain else {}
-                live_vega = opt.get("vega", leg["entry_vega"]) or 0
-                live_gamma = opt.get("gamma", leg["entry_gamma"]) or 0
-                sign = -1 if leg["action"] == "SELL" else 1
-                total_vega += sign * live_vega * leg["qty"]
-                total_gamma += sign * live_gamma * leg["qty"]
-        return total_vega, total_gamma
 
     def _compute_transaction_costs(self, legs: list, lots: int, action: str) -> dict:
         total_sell_premium, total_buy_premium = 0.0, 0.0
@@ -349,18 +319,7 @@ class ExecutionEngine:
             if not found:
                 return "NO_GO", {"reason": "portfolio_delta_exceeds_limit_cannot_reduce_further"}
 
-        new_vega = sum((-1 if leg["action"] == "SELL" else 1) * (leg.get("vega") or 0) * final_lots * C02 for leg in params["legs"])
-        new_gamma = sum((-1 if leg["action"] == "SELL" else 1) * (leg.get("gamma") or 0) * final_lots * C02 for leg in params["legs"])
-        current_vega, current_gamma = self._compute_portfolio_vega_gamma()
-        post_trade_vega = current_vega + new_vega
-        post_trade_gamma = current_gamma + new_gamma
-        vega_limit = 2000.0 * final_lots
-        gamma_limit = 50.0 * final_lots
-        if abs(post_trade_vega) > vega_limit:
-            return "NO_GO", {"reason": f"portfolio_vega_{post_trade_vega:.1f}_exceeds_limit_{vega_limit:.1f}"}
-        if abs(post_trade_gamma) > gamma_limit:
-            return "NO_GO", {"reason": f"portfolio_gamma_{post_trade_gamma:.4f}_exceeds_limit_{gamma_limit:.4f}"}
-
+        # Liquidity re-check at execution time
         chain = self.market_engine.last_chain
         if not chain:
             return "NO_GO", {"reason": "chain_unavailable_at_execution"}
@@ -465,8 +424,7 @@ class ExecutionEngine:
         filled_legs = []
 
         try:
-            entry_order = sorted(params["legs"], key=lambda l: 0 if l["action"] == "BUY" else 1)
-            for leg in entry_order:
+            for leg in params["legs"]:
                 fill = self.executor.execute_leg_entry(leg, lots, chain)
                 filled_legs.append({**leg, "fill": fill})
         except Exception as e:
@@ -752,7 +710,6 @@ class ExecutionEngine:
     def execute_close(self, position: dict, reason: str, context: Optional[dict] = None) -> None:
         legs = self._get_position_legs(position["position_id"])
         open_legs = [l for l in legs if l["leg_status"] == "OPEN"]
-        open_legs = sorted(open_legs, key=lambda l: 0 if l["action"] == "SELL" else 1)
         lots = position["final_lots"]
         chain = self.market_engine.last_chain
 
@@ -836,7 +793,6 @@ class ExecutionEngine:
     def close_one_side(self, position: dict, side: str, reason: str) -> None:
         legs = self._get_position_legs(position["position_id"])
         side_legs = [l for l in legs if l["option_type"] == side and l["leg_status"] == "OPEN"]
-        side_legs = sorted(side_legs, key=lambda l: 0 if l["action"] == "SELL" else 1)
         lots = position["final_lots"]
         chain = self.market_engine.last_chain
 

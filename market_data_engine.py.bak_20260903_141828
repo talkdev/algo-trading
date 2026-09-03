@@ -362,7 +362,7 @@ class MarketDataEngine:
         bars.sort(key=lambda b: b["timestamp"])
         return bars[-1]["close"]
 
-    def _fetch_last_n_complete_sessions_5min(self, n: int = 5) -> dict:
+    def _fetch_last_n_complete_sessions_5min(self, n: int = 3) -> dict:
         today = today_ist()
         from_date = (today - timedelta(days=n * 3 + 7)).isoformat()  # buffer for weekends/holidays
         to_date = (today - timedelta(days=1)).isoformat()
@@ -404,7 +404,7 @@ class MarketDataEngine:
 
     def _compute_parkinson_rv_fresh(self, vix: Optional[float]) -> tuple[float, str]:
         try:
-            session_bars = self._fetch_last_n_complete_sessions_5min(n=5)
+            session_bars = self._fetch_last_n_complete_sessions_5min(n=3)
         except Exception as e:
             self.logger.warning(f"Parkinson RV: historical fetch failed ({e}), using VIX proxy")
             session_bars = {}
@@ -413,7 +413,7 @@ class MarketDataEngine:
         valid_bars = [b for b in all_bars
                       if b["high"] > 0 and b["low"] > 0 and b["high"] >= b["low"] and b["volume"] > 0]
 
-        if len(valid_bars) < 30:
+        if len(valid_bars) < 20:
             return self._parkinson_fallback(vix), "vix_proxy_insufficient_bars"
 
         log_hl_sq = []
@@ -687,9 +687,6 @@ class MarketDataEngine:
 
         if not GIFT_NIFTY_KEY:
             self.state["gap_size"], self.state["gap_direction"] = "SMALL", "FLAT"
-            if not self.config.paper_trade_mode:
-                self.state["daily_halted"] = True
-                self.logger.critical("GIFT_NIFTY_INSTRUMENT_KEY is not configured and PAPER_TRADE_MODE is false. Gap risk cannot be assessed before live trading. Halting trading for today.")
             return
 
         try:
@@ -729,7 +726,7 @@ class MarketDataEngine:
         wing_map = {"SUPPRESSED": 150, "LOW": 150, "NORMAL": 150, "ELEVATED": 200, "HIGH": 250}
         self.state["wing_width"] = wing_map.get(vix_regime, 150)
 
-        dow_stop = {"MONDAY": 2.2, "TUESDAY": 1.4, "WEDNESDAY": 1.8, "THURSDAY": 1.9, "FRIDAY": 1.6}
+        dow_stop = {"MONDAY": 2.5, "TUESDAY": 1.5, "WEDNESDAY": 2.0, "THURSDAY": 2.0, "FRIDAY": 1.8}
         dow_size = {"MONDAY": 0.50, "TUESDAY": 1.0, "WEDNESDAY": 1.0, "THURSDAY": 0.90, "FRIDAY": 0.80}
         self.state["stop_multiplier"] = dow_stop.get(day_label, 2.0)
 
@@ -1218,11 +1215,6 @@ class MarketDataEngine:
         pcr = self.compute_pcr(chain)
         put_iv, call_iv = self.compute_25d_ivs(chain)
         skew = self.compute_skew_ratio(put_iv, call_iv)
-
-        if atm_iv is not None and dte is not None and spot is not None:
-            expected_move = spot * atm_iv * ((max(dte, 1) / 365.0) ** 0.5)
-            computed_wing = int(round((expected_move * 0.60) / self.config.nifty_strike_step) * self.config.nifty_strike_step)
-            self.state["wing_width"] = max(100, min(computed_wing, 400))
 
         current_time = now_ist().time()
         if current_time >= dtime(9, 30) and not self.state.get("or_computed"):

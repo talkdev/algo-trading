@@ -67,7 +67,7 @@ DTE_REQUIREMENTS = {
 
 MIN_CREDITS = {
     "IRON_BUTTERFLY": 25, "IRON_CONDOR": 15,
-    "BULL_PUT_SPREAD": 12, "BEAR_CALL_SPREAD": 10, "POST_EVENT_STRADDLE": 30,
+    "BULL_PUT_SPREAD": 12, "BEAR_CALL_SPREAD": 10, "POST_EVENT_STRADDLE": 0,
 }
 MIN_CREDITS_TUESDAY = {
     "IRON_BUTTERFLY": 30, "IRON_CONDOR": 20, "BULL_PUT_SPREAD": 15, "BEAR_CALL_SPREAD": 12,
@@ -81,8 +81,8 @@ PRICE_STOPS = {
 TARGET_PCT_BY_DAY = {"MONDAY": 0.40, "TUESDAY": 0.35, "WEDNESDAY": 0.40,
                       "THURSDAY": 0.40, "FRIDAY": 0.40}
 
-MIN_CREDIT_MULTIPLIER_BY_REGIME = {"SUPPRESSED": 1.0, "LOW": 1.1, "NORMAL": 1.0,
-                                    "ELEVATED": 1.15, "HIGH": 1.3}
+MIN_CREDIT_MULTIPLIER_BY_REGIME = {"SUPPRESSED": 1.0, "LOW": 1.2, "NORMAL": 1.0,
+                                    "ELEVATED": 0.9, "HIGH": 0.8}
 
 LOT_CAPS_BY_DAY = {"TUESDAY": 2, "MONDAY": 1, "FRIDAY": 2}
 
@@ -517,20 +517,18 @@ class StrategyEngine:
             return None, None
         return best_strike, best_delta
 
-    def _validate_strike(self, chain: dict, strike: float, opt_type: str, action: str = "SELL") -> tuple[bool, str]:
+    def _validate_strike(self, chain: dict, strike: float, opt_type: str) -> tuple[bool, str]:
         if strike not in chain:
             return False, f"strike_{strike}_not_in_chain"
         opt = chain[strike].get(opt_type, {})
         bid, ask, oi, ltp = opt.get("bid", 0), opt.get("ask", 0), opt.get("oi", 0), opt.get("ltp", 0)
         if bid <= 0 and ask <= 0:
             return False, f"strike_{strike}_{opt_type}_no_bid_ask"
-        min_oi = 500 if action == "SELL" else 100
-        max_spread_pct = 0.15 if action == "SELL" else 0.30
-        if oi < min_oi:
-            return False, f"strike_{strike}_{opt_type}_oi_{oi}_below_{min_oi}"
+        if oi < 100:
+            return False, f"strike_{strike}_{opt_type}_oi_{oi}_below_100"
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2.0
-            if mid > 0 and (ask - bid) / mid > max_spread_pct:
+            if mid > 0 and (ask - bid) / mid > 0.30:
                 return False, f"strike_{strike}_{opt_type}_spread_too_wide"
         effective_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else ltp
         if effective_price < 0.50:
@@ -552,21 +550,8 @@ class StrategyEngine:
             return ltp
         return 0.0
 
-    def _dte_adjusted_short_delta(self, base_delta: float, actual_dte) -> float:
-        if actual_dte is None:
-            return base_delta
-        if actual_dte <= 0:
-            return max(0.12, base_delta - 0.10)
-        if actual_dte == 1:
-            return max(0.15, base_delta - 0.07)
-        if actual_dte == 2:
-            return max(0.18, base_delta - 0.05)
-        if actual_dte == 3:
-            return max(0.20, base_delta - 0.03)
-        return base_delta
-
     def _build_legs_spec(self, strategy_name: str, chain: dict, spot: float,
-                           wing: float, actual_dte: Optional[int] = None) -> tuple[Optional[list], Optional[str]]:
+                           wing: float) -> tuple[Optional[list], Optional[str]]:
         step = self.config.nifty_strike_step
         if not chain:
             return None, "empty_chain"
@@ -575,12 +560,11 @@ class StrategyEngine:
             atm = round(spot / step) * step
             if atm not in chain:
                 atm = min(chain.keys(), key=lambda k: abs(k - spot))
-            butterfly_wing = max(wing, 100)
-            long_call, long_put = atm + butterfly_wing, atm - butterfly_wing
+            long_call, long_put = atm + 100, atm - 100
             if long_call not in chain:
-                long_call = min(chain.keys(), key=lambda k: abs(k - (atm + butterfly_wing)))
+                long_call = min(chain.keys(), key=lambda k: abs(k - (atm + 100)))
             if long_put not in chain:
-                long_put = min(chain.keys(), key=lambda k: abs(k - (atm - butterfly_wing)))
+                long_put = min(chain.keys(), key=lambda k: abs(k - (atm - 100)))
             return [
                 {"strike": atm, "option_type": "call", "action": "SELL"},
                 {"strike": atm, "option_type": "put", "action": "SELL"},
@@ -589,9 +573,8 @@ class StrategyEngine:
             ], None
 
         if strategy_name == "IRON_CONDOR":
-            target_delta = self._dte_adjusted_short_delta(0.25, actual_dte)
-            short_call, _ = self._find_strike_by_delta(chain, "call", target_delta)
-            short_put, _ = self._find_strike_by_delta(chain, "put", target_delta)
+            short_call, _ = self._find_strike_by_delta(chain, "call", 0.25)
+            short_put, _ = self._find_strike_by_delta(chain, "put", 0.25)
             if short_call is None or short_put is None:
                 return None, "cannot_find_0.25_delta_strikes_for_condor"
             long_call, long_put = short_call + wing, short_put - wing
@@ -611,8 +594,7 @@ class StrategyEngine:
             ], None
 
         if strategy_name == "BULL_PUT_SPREAD":
-            target_delta = self._dte_adjusted_short_delta(0.25, actual_dte)
-            short_put, _ = self._find_strike_by_delta(chain, "put", target_delta)
+            short_put, _ = self._find_strike_by_delta(chain, "put", 0.25)
             if short_put is None:
                 return None, "cannot_find_0.25_delta_put"
             long_put = short_put - wing
@@ -628,8 +610,7 @@ class StrategyEngine:
             ], None
 
         if strategy_name == "BEAR_CALL_SPREAD":
-            target_delta = self._dte_adjusted_short_delta(0.25, actual_dte)
-            short_call, _ = self._find_strike_by_delta(chain, "call", target_delta)
+            short_call, _ = self._find_strike_by_delta(chain, "call", 0.25)
             if short_call is None:
                 return None, "cannot_find_0.25_delta_call"
             long_call = short_call + wing
@@ -668,31 +649,14 @@ class StrategyEngine:
                 {"strike": short_put, "option_type": "put", "action": "SELL"},
             ], None
 
-        if strategy_name == "LONG_STRADDLE":
+        if strategy_name in ("LONG_STRADDLE", "POST_EVENT_STRADDLE"):
             atm = round(spot / step) * step
             if atm not in chain:
                 atm = min(chain.keys(), key=lambda k: abs(k - spot))
+            action = "BUY" if strategy_name == "LONG_STRADDLE" else "SELL"
             return [
-                {"strike": atm, "option_type": "call", "action": "BUY"},
-                {"strike": atm, "option_type": "put", "action": "BUY"},
-            ], None
-
-        if strategy_name == "POST_EVENT_STRADDLE":
-            atm = round(spot / step) * step
-            if atm not in chain:
-                atm = min(chain.keys(), key=lambda k: abs(k - spot))
-            event_wing = max(wing, 150)
-            long_call = atm + event_wing
-            long_put = atm - event_wing
-            if long_call not in chain:
-                long_call = min(chain.keys(), key=lambda k: abs(k - (atm + event_wing)))
-            if long_put not in chain:
-                long_put = min(chain.keys(), key=lambda k: abs(k - (atm - event_wing)))
-            return [
-                {"strike": atm, "option_type": "call", "action": "SELL"},
-                {"strike": atm, "option_type": "put", "action": "SELL"},
-                {"strike": long_call, "option_type": "call", "action": "BUY"},
-                {"strike": long_put, "option_type": "put", "action": "BUY"},
+                {"strike": atm, "option_type": "call", "action": action},
+                {"strike": atm, "option_type": "put", "action": action},
             ], None
 
         return None, f"unknown_strategy_{strategy_name}"
@@ -729,7 +693,7 @@ class StrategyEngine:
         spot = s["spot"]
         wing = state.get("wing_width", 150)
 
-        legs_spec, err = self._build_legs_spec(strategy_name, chain, spot, wing, actual_dte)
+        legs_spec, err = self._build_legs_spec(strategy_name, chain, spot, wing)
         if legs_spec is None:
             return {"valid": False, "reason": err}
 
@@ -738,7 +702,7 @@ class StrategyEngine:
         validated_legs = []
         for leg_spec in legs_spec:
             strike, opt_type, action = leg_spec["strike"], leg_spec["option_type"], leg_spec["action"]
-            ok, reason = self._validate_strike(chain, strike, opt_type, action)
+            ok, reason = self._validate_strike(chain, strike, opt_type)
             if not ok:
                 return {"valid": False, "reason": f"leg_validation_failed: {reason}"}
             exec_price = self._get_executable_price(chain, strike, opt_type, action)
@@ -798,15 +762,14 @@ class StrategyEngine:
             min_credits = dict(MIN_CREDITS)
             if day_label == "TUESDAY":
                 min_credits.update(MIN_CREDITS_TUESDAY)
-            static_floor = min_credits.get(strategy_name, 12) * self._get_min_credit_multiplier(s)
-            cost_floor = total_costs_pts_per_lot * 3.0
-            min_credit = max(static_floor, cost_floor)
+            min_credit = min_credits.get(strategy_name, 12) * self._get_min_credit_multiplier(s)
 
             if net_credit < min_credit:
                 return {"valid": False, "reason": f"net_credit_{net_credit:.2f}pts_below_minimum_{min_credit:.2f}pts"}
 
-            if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "POST_EVENT_STRADDLE"):
-                actual_wing_pts = abs(validated_legs[2]["strike"] - validated_legs[0]["strike"])
+            if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY"):
+                actual_wing_pts = (abs(validated_legs[2]["strike"] - validated_legs[0]["strike"])
+                                    if strategy_name == "IRON_CONDOR" else 100)
                 if actual_wing_pts > 0 and (net_credit / actual_wing_pts) < 0.10:
                     return {"valid": False, "reason": f"credit_ratio_below_0.10_insufficient_edge"}
             elif strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
@@ -840,21 +803,15 @@ class StrategyEngine:
             max_loss_per_lot = wing * C02 * 0.5
             self.logger.warning("max_loss_per_lot was <= 0, using fallback")
 
-        raw_base_lots = max_risk_per_trade / max_loss_per_lot
-        base_lots = max(1, int(raw_base_lots))
-        intended_lots = raw_base_lots * size_mult
-        if intended_lots < 0.5:
-            return {"valid": False, "reason": f"intended_lots_{intended_lots:.2f}_below_minimum_viable_0.5_size_throttled_to_no_trade"}
+        base_lots = max(1, int(max_risk_per_trade / max_loss_per_lot))
         final_lots = max(1, int(base_lots * size_mult))
-        capital_scale = max(1, int(current_capital / self.config.starting_capital))
-        day_cap = LOT_CAPS_BY_DAY.get(state.get("day_label"), 3) * capital_scale
-        final_lots = min(final_lots, day_cap)
+        final_lots = min(final_lots, LOT_CAPS_BY_DAY.get(state.get("day_label"), 3))
 
         if max_loss_per_lot * final_lots > max_risk_per_trade * 1.5:
             final_lots = max(1, int(max_risk_per_trade / max_loss_per_lot))
 
         if strategy_type == "SELL":
-            if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD", "POST_EVENT_STRADDLE"):
+            if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
                 estimated_margin_per_lot = (actual_wing_pts or wing) * C02 * 1.15
             else:
                 estimated_margin_per_lot = spot * C02 * 0.11
