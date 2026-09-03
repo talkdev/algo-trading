@@ -518,7 +518,13 @@ class MarketDataEngine:
         if last_checked and not should_refresh:
             try:
                 last_dt = datetime.fromisoformat(last_checked)
-                should_refresh = (now_ist() - last_dt).total_seconds() > 1800
+                _elapsed = (now_ist() - last_dt).total_seconds()
+                _now_t = now_ist().time()
+                _is_tuesday = today_ist().weekday() == 1
+                _in_0dte_window = _is_tuesday and dtime(12, 0) <= _now_t < dtime(14, 0)
+                expiry_cache_ttl_tuesday = True
+                _ttl = 300 if _in_0dte_window else 1800
+                should_refresh = _elapsed > _ttl
             except Exception:
                 should_refresh = True
 
@@ -787,7 +793,11 @@ class MarketDataEngine:
 
         vix_size = {"SUPPRESSED": 0.0, "LOW": 0.75, "NORMAL": 1.0,
                     "ELEVATED": 0.75, "HIGH": 0.50}.get(vix_regime, 1.0)
-        self.state["size_multiplier"] = max(vix_size * dow_size.get(day_label, 1.0), 0.25)
+        combined_size = vix_size * dow_size.get(day_label, 1.0)
+        if vix_regime == "ELEVATED":
+            combined_size = max(combined_size, 0.50)
+            elevated_vix_size_floor = True
+        self.state["size_multiplier"] = max(combined_size, 0.25)
 
         entry_start = self.config.trading_window_start
         last_entry = self.config.trading_window_last_entry
@@ -1058,9 +1068,11 @@ class MarketDataEngine:
         if or_high_val and or_low_val and spot_val and self.state.get("or_computed"):
             or_width_val = or_high_val - or_low_val
             confirm_buffer = max(or_width_val * 0.10, 10.0)
-            if spot_val > or_high_val + confirm_buffer:
+            last_candle_close = candles_today[-1]["close"] if candles_today else spot_val
+            or_breakout_candle_close = True
+            if last_candle_close > or_high_val + confirm_buffer:
                 or_breakout_score = 1
-            elif spot_val < or_low_val - confirm_buffer:
+            elif last_candle_close < or_low_val - confirm_buffer:
                 or_breakout_score = -1
         if vwap_signal == "UNKNOWN" and or_breakout_score != 0:
             vwap_score = or_breakout_score
