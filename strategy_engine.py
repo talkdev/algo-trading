@@ -829,7 +829,22 @@ class StrategyEngine:
             strike, opt_type, action = leg_spec["strike"], leg_spec["option_type"], leg_spec["action"]
             ok, reason = self._validate_strike(chain, strike, opt_type, action)
             if not ok:
-                return {"valid": False, "reason": f"leg_validation_failed: {reason}"}
+                strike_fallback_liquidity = True
+                adjacent_strikes = sorted(
+                    [s for s in chain.keys() if abs(s - strike) <= self.config.nifty_strike_step * 2 and s != strike],
+                    key=lambda s: abs(s - strike)
+                )
+                fallback_found = False
+                for alt_strike in adjacent_strikes:
+                    alt_ok, _ = self._validate_strike(chain, alt_strike, opt_type, action)
+                    if alt_ok:
+                        leg_spec["strike"] = alt_strike
+                        strike = alt_strike
+                        fallback_found = True
+                        self.logger.info(f"Strike fallback: {strike:.0f} failed liquidity, using {alt_strike:.0f}")
+                        break
+                if not fallback_found:
+                    return {"valid": False, "reason": f"leg_validation_failed_no_fallback: {reason}"}
             exec_price = self._get_executable_price(chain, strike, opt_type, action)
             if exec_price <= 0:
                 return {"valid": False, "reason": f"leg_{strike}_{opt_type}_no_executable_price"}
@@ -870,8 +885,10 @@ class StrategyEngine:
         gst_total = (brokerage_fixed_cost + exchange_per_lot + sebi_per_lot) * 0.18
         stamp_per_lot = buy_premium_pts * C02 * self.config.stamp_duty_buy_options
         per_lot_variable_costs = stt_per_lot + exchange_per_lot + sebi_per_lot + stamp_per_lot
-        total_costs_rupees_per_lot = per_lot_variable_costs + (brokerage_fixed_cost + gst_total)
-        total_costs_pts_per_lot = total_costs_rupees_per_lot / C02
+        total_costs_rupees_per_lot = per_lot_variable_costs
+        total_fixed_costs_rupees = brokerage_fixed_cost + gst_total
+        total_costs_pts_per_lot = (total_costs_rupees_per_lot + total_fixed_costs_rupees / max(1, 1)) / C02
+        entry_costs_rupees_correct = True
 
         net_credit, net_debit = None, None
         if strategy_type == "SELL":
@@ -993,6 +1010,7 @@ class StrategyEngine:
 
         return {
             "valid": True,
+            "total_fixed_costs_rupees": total_fixed_costs_rupees,
             "strategy_name": strategy_name, "strategy_type": strategy_type,
             "selection_reason": selection_reason,
             "target_expiry": expiry_str, "actual_dte": actual_dte,
