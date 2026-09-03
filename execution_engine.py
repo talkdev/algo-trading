@@ -630,9 +630,12 @@ class ExecutionEngine:
     def monitor_position(self, position: dict, signals: dict) -> tuple[str, dict]:
         legs = self._get_position_legs(position["position_id"])
         chain_expiry = self.market_engine.last_chain_expiry
-        chain = self.market_engine.last_chain if (
-            chain_expiry and chain_expiry.isoformat() == position["target_expiry"]
-        ) else {}
+        _chain_matches = chain_expiry and chain_expiry.isoformat() == position["target_expiry"]
+        chain = self.market_engine.last_chain if _chain_matches else {}
+        if not _chain_matches and position.get("last_known_premium") is not None:
+            self.logger.debug(f"Chain expiry mismatch for {position['position_id']} — "
+                              f"using last_known_premium as mark fallback")
+        last_known_premium_fallback = not _chain_matches
 
         current_premium = self._compute_current_premium(legs, chain)
         self.db.update("positions", {"last_known_premium": current_premium, "updated_at": now_ist().isoformat()},
@@ -719,10 +722,10 @@ class ExecutionEngine:
             entry_costs_pts = (position.get("entry_costs_rupees") or 0.0) / max(C02_lock * lots_lock, 1)
             true_breakeven_premium = entry_credit - entry_costs_pts
             if profit_pct >= 0.20 and not position.get("stop_at_breakeven"):
-                lock_stop = max(true_breakeven_premium, entry_credit * 0.95)
+                lock_stop = max(true_breakeven_premium, current_premium * 1.05)
                 self.db.update("positions", {"stop_premium": lock_stop, "stop_at_breakeven": 1},
                                 {"position_id": position["position_id"]})
-                self.logger.info(f"PROFIT LOCK: {strategy_name} -> true breakeven (profit={profit_pct*100:.0f}%)")
+                self.logger.info(f"PROFIT LOCK: {strategy_name} -> current_premium lock (profit={profit_pct*100:.0f}%)")
                 return "TIGHTEN_STOP", {}
             if profit_pct >= 0.50 and not position.get("stop_moved_to_25pct"):
                 self.db.update("positions", {"stop_premium": entry_credit * 0.75, "stop_moved_to_25pct": 1},
@@ -763,7 +766,7 @@ class ExecutionEngine:
                 return "CLOSE_TARGET", {"reason_detail": "all_short_legs_below_2pt_cheap_buyback"}
 
         adx_value = signals.get("adx")
-        if (adx_value is not None and adx_value > 25 and strategy_type == "SELL"
+        if (adx_value is not None and adx_value > 35 and strategy_type == "SELL"
                 and strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")):
             return "CLOSE_ADX", {"adx": adx_value}
 
