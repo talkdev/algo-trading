@@ -265,6 +265,13 @@ class StrategyEngine:
 
         if state.get("consecutive_stops", 0) >= 3:
             return "NO_TRADE", "3_consecutive_stops_today_halt"
+        _last_stop_reason = state.get("last_stop_reason", "")
+        _last_stop_signal = state.get("last_stop_signal_combo", "")
+        _current_signal_combo = f"{s.get('volatility_condition')}_{s.get('trend_condition')}_{s.get('direction')}"
+        stop_reason_suppression = True
+        if (_last_stop_reason == "CLOSE_STOP" and _last_stop_signal == _current_signal_combo
+                and state.get("consecutive_stops", 0) >= 1):
+            return "NO_TRADE", f"same_signal_combo_caused_last_stop_{_current_signal_combo}"
 
         last_stop_time = state.get("last_stop_time")
         if last_stop_time:
@@ -779,7 +786,8 @@ class StrategyEngine:
     def _build_tightening_schedule(self, day_label: Optional[str]) -> list:
         if day_label == "TUESDAY":
             return [("11:00", 0.80), ("12:00", 0.65), ("13:00", 0.50)]
-        return [("12:00", 0.85), ("13:00", 0.70), ("14:00", 0.55)]
+        return [("13:00", 0.80), ("14:00", 0.65)]
+        tightening_profit_gated = True
 
     # ─────────────────────────────────────────────────────────────────
     # MODULE 8: FULL PARAMETER COMPUTATION
@@ -856,10 +864,11 @@ class StrategyEngine:
         stt_per_lot = sell_premium_pts * C02 * self.config.stt_options_sell
         exchange_per_lot = total_turnover_pts * C02 * self.config.exchange_txn_rate
         sebi_per_lot = total_turnover_pts * C02 * self.config.sebi_rate
-        brokerage_total = self.config.brokerage_per_order * num_legs
-        gst_total = (brokerage_total + exchange_per_lot + sebi_per_lot) * 0.18
+        brokerage_fixed_cost = self.config.brokerage_per_order * num_legs
+        gst_total = (brokerage_fixed_cost + exchange_per_lot + sebi_per_lot) * 0.18
         stamp_per_lot = buy_premium_pts * C02 * self.config.stamp_duty_buy_options
-        total_costs_rupees_per_lot = stt_per_lot + exchange_per_lot + sebi_per_lot + brokerage_total + gst_total + stamp_per_lot
+        per_lot_variable_costs = stt_per_lot + exchange_per_lot + sebi_per_lot + stamp_per_lot
+        total_costs_rupees_per_lot = per_lot_variable_costs + (brokerage_fixed_cost + gst_total)
         total_costs_pts_per_lot = total_costs_rupees_per_lot / C02
 
         net_credit, net_debit = None, None
