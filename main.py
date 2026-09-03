@@ -241,6 +241,15 @@ class MainEngine:
             if decision.get("action") == "ENTER":
                 self.execution_engine.process_entry_decision(decision, signals)
 
+        _total_pnl_cycle = self.compute_total_daily_pnl()
+        finalize_cycle_with_total_pnl = True
+        latest_cycle = self.db.query_one(
+            "SELECT cycle_id FROM cycle_log WHERE trading_date=? ORDER BY cycle_id DESC LIMIT 1",
+            (today_ist().isoformat(),),
+        )
+        if latest_cycle:
+            self.db.update("cycle_log", {"daily_pnl_net": _total_pnl_cycle},
+                           {"cycle_id": latest_cycle["cycle_id"]})
         self._print_cycle_footer()
         self.loop_count += 1
 

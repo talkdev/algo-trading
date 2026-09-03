@@ -876,7 +876,8 @@ class ExecutionEngine:
         gross_pnl_rupees = gross_pnl_pts * C02 * lots
         entry_costs_rupees = position.get("entry_costs_rupees") or 0.0
         total_costs_rupees = entry_costs_rupees + total_exit_costs_rupees
-        net_pnl_rupees = gross_pnl_rupees - total_exit_costs_rupees
+        net_pnl_rupees = gross_pnl_rupees - total_costs_rupees
+        net_pnl_includes_entry_costs = True
         net_pnl_pts = net_pnl_rupees / (C02 * lots) if (C02 * lots) else 0.0
 
         current_capital = self.market_engine.state.get("current_capital", self.config.starting_capital)
@@ -972,8 +973,11 @@ class ExecutionEngine:
 
         costs = self._compute_transaction_costs(legs, lots, "EXIT")
         total_exit_costs_rupees = costs["total_rupees"]
+        entry_costs_for_partial = position.get("entry_costs_rupees") or 0.0
+        total_costs_for_partial = entry_costs_for_partial + total_exit_costs_rupees
         gross_pnl_rupees = gross_pnl_pts * C02 * lots
-        net_pnl_rupees = gross_pnl_rupees - total_exit_costs_rupees
+        net_pnl_rupees = gross_pnl_rupees - total_costs_for_partial
+        partial_close_net_pnl_fixed = True
         net_pnl_pts = net_pnl_rupees / (C02 * lots) if (C02 * lots) else 0.0
         result = "WIN" if net_pnl_rupees > 0 else ("LOSS" if net_pnl_rupees < 0 else "BREAKEVEN")
 
@@ -1003,7 +1007,7 @@ class ExecutionEngine:
             "exit_premium": exit_premium, "gross_pnl_pts": gross_pnl_pts, "gross_pnl_rupees": gross_pnl_rupees,
             "exit_slippage": None, "exit_costs_pts": (costs["total_rupees"] / C02) if C02 else None,
             "exit_costs_rupees": total_exit_costs_rupees,
-            "total_costs_rupees": (position.get("entry_costs_rupees") or 0.0) + total_exit_costs_rupees,
+            "total_costs_rupees": total_costs_for_partial,
             "net_pnl_pts": net_pnl_pts, "net_pnl_rupees": net_pnl_rupees, "net_pnl_pct": net_pnl_pct,
             "result": result, "profit_pct_of_credit": profit_pct_of_credit, "created_at": now.isoformat(),
         })
