@@ -1,5 +1,5 @@
 # NIFTY Intraday Options Engine — EOD Forensic Report
-**Target Date:** 2026-01-15  |  **Report Generated:** 2026-09-03T11:34:23.816432
+**Target Date:** 2026-01-15  |  **Report Generated:** 2026-09-03T14:16:05.207768
 
 ## 0. How to Read This Report (context for an LLM/analyst with no prior context)
 

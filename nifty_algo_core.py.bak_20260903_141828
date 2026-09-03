@@ -383,19 +383,13 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
     if not log_dir.is_absolute():
         log_dir = BASE_DIR / log_dir
 
-    paper_trade_mode = _get_bool(env, "PAPER_TRADE_MODE", True)
-    live_rates_verified = _get_bool(env, "LIVE_RATES_VERIFIED", False)
-    if not paper_trade_mode and not live_rates_verified:
-        print("[SAFETY] PAPER_TRADE_MODE=false but LIVE_RATES_VERIFIED is not true in env.txt. Forcing paper trade mode until NIFTY lot size, STT rate, and weekly expiry weekday are manually verified against the current NSE contract specification.")
-        paper_trade_mode = True
-
     return Config(
         upstox_api_key=env.get("UPSTOX_API_KEY", ""),
         upstox_api_secret=env.get("UPSTOX_API_SECRET", ""),
         upstox_redirect_uri=env.get("UPSTOX_REDIRECT_URI", ""),
         upstox_access_token=env.get("UPSTOX_ACCESS_TOKEN", ""),
 
-        paper_trade_mode=paper_trade_mode,
+        paper_trade_mode=_get_bool(env, "PAPER_TRADE_MODE", True),
 
         starting_capital=_get_float(env, "STARTING_CAPITAL", 1_000_000.0),
         max_daily_loss_pct=max_daily_loss_pct,
