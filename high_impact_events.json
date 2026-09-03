@@ -1,0 +1,200 @@
+{
+  "calendar_year": 2026,
+  "timezone": "Asia/Kolkata",
+
+  "events": {
+
+    "RBI_MPC": {
+      "description": "RBI Monetary Policy Committee – bi-monthly meetings",
+      "dates": [
+        "2026-02-06",
+        "2026-04-08",
+        "2026-06-05",
+        "2026-08-05",
+        "2026-10-09",
+        "2026-12-04"
+      ]
+    },
+
+    "Union_Budget": {
+      "description": "Indian Union Budget presentation",
+      "dates": [
+        "2026-02-01"
+      ]
+    },
+
+    "Economic_Survey": {
+      "description": "Economic Survey of India",
+      "dates": [
+        "2026-01-31"
+      ]
+    },
+
+    "CPI_India": {
+      "description": "India Consumer Price Index (MoSPI) – monthly release",
+      "dates": [
+        "2026-01-12",
+        "2026-02-12",
+        "2026-03-12",
+        "2026-04-13",
+        "2026-05-12",
+        "2026-06-12",
+        "2026-07-13",
+        "2026-08-12",
+        "2026-09-14",
+        "2026-10-12",
+        "2026-11-12",
+        "2026-12-14"
+      ]
+    },
+
+    "WPI_India": {
+      "description": "India Wholesale Price Index – monthly release",
+      "dates": [
+        "2026-01-14",
+        "2026-02-16",
+        "2026-03-16",
+        "2026-04-14",
+        "2026-05-14",
+        "2026-06-15",
+        "2026-07-14",
+        "2026-08-14",
+        "2026-09-14",
+        "2026-10-14",
+        "2026-11-16",
+        "2026-12-14"
+      ]
+    },
+
+    "IIP_India": {
+      "description": "India Index of Industrial Production – monthly release",
+      "dates": [
+        "2026-03-02",
+        "2026-04-10",
+        "2026-05-12",
+        "2026-06-11",
+        "2026-07-10",
+        "2026-08-12"
+      ]
+    },
+
+    "GDP_India": {
+      "description": "India quarterly GDP release",
+      "dates": [
+        "2026-03-02",
+        "2026-06-05",
+        "2026-08-31",
+        "2026-11-30"
+      ]
+    },
+
+    "NSE_NIFTY_WEEKLY_EXPIRY": {
+      "description": "NIFTY weekly options expiry according to the applicable NSE contract calendar",
+      "dates": []
+    },
+
+    "NSE_MONTHLY_EXPIRY": {
+      "description": "NSE monthly index derivatives expiry according to the applicable NSE contract calendar",
+      "dates": []
+    },
+
+    "NSE_BANKNIFTY_EXPIRY": {
+      "description": "BANKNIFTY expiry according to the applicable NSE contract calendar",
+      "dates": []
+    },
+
+    "NSE_FINNIFTY_EXPIRY": {
+      "description": "FINNIFTY expiry according to the applicable NSE contract calendar",
+      "dates": []
+    },
+
+    "NSE_MARKET_HOLIDAYS": {
+      "description": "NSE trading holidays",
+      "dates": []
+    },
+
+    "Muhurat_Trading": {
+      "description": "Diwali Muhurat Trading session",
+      "dates": []
+    },
+
+    "FOMC": {
+      "description": "US Federal Reserve FOMC meetings",
+      "dates": [
+        "2026-01-27",
+        "2026-03-17",
+        "2026-04-28",
+        "2026-06-16",
+        "2026-07-28",
+        "2026-09-15",
+        "2026-10-27",
+        "2026-12-08"
+      ]
+    },
+
+    "US_CPI": {
+      "description": "US Consumer Price Index release",
+      "dates": []
+    },
+
+    "US_NFP": {
+      "description": "US Non-Farm Payrolls release",
+      "dates": []
+    },
+
+    "US_PCE": {
+      "description": "US Personal Consumption Expenditures inflation release",
+      "dates": []
+    },
+
+    "US_ISM_Manufacturing": {
+      "description": "US ISM Manufacturing PMI",
+      "dates": []
+    },
+
+    "US_ISM_Services": {
+      "description": "US ISM Services PMI",
+      "dates": []
+    },
+
+    "US_GDP": {
+      "description": "US quarterly GDP release",
+      "dates": []
+    },
+
+    "ECB_RATE_DECISION": {
+      "description": "European Central Bank monetary policy decision",
+      "dates": []
+    },
+
+    "BOJ_RATE_DECISION": {
+      "description": "Bank of Japan monetary policy decision",
+      "dates": []
+    },
+
+    "OPEC_MEETING": {
+      "description": "OPEC/OPEC+ production and oil-market policy meeting",
+      "dates": []
+    },
+
+    "MAJOR_BANK_RESULTS": {
+      "description": "Major Indian banking-sector quarterly earnings",
+      "dates": []
+    },
+
+    "NIFTY_MAJOR_RESULTS": {
+      "description": "Major NIFTY constituent quarterly earnings",
+      "dates": []
+    },
+
+    "MAJOR_POLICY_EVENT": {
+      "description": "Major Indian government, RBI, SEBI or financial-policy announcement",
+      "dates": []
+    },
+
+    "ELECTION_EVENT": {
+      "description": "Major Indian election results / significant political events",
+      "dates": []
+    }
+  }
+}
