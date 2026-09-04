@@ -332,7 +332,7 @@ def simulate_trade(entry_cycle, subsequent, strategy, legs_spec,
             break
 
         adx = meta.get("adx") or 0
-        if strategy in ("IRON_CONDOR", "IRON_BUTTERFLY") and adx > 28:
+        if strategy in ("IRON_CONDOR", "IRON_BUTTERFLY") and adx > 25:
             exit_reason = "CLOSE_ADX"
             exit_prem = cur_prem
             break
@@ -373,7 +373,7 @@ def simulate_trade(entry_cycle, subsequent, strategy, legs_spec,
         lots
     )
 
-    gross_pnl_pts = net_credit - exit_prem
+    gross_pnl_pts = gross_credit - exit_prem
     gross_pnl_rs = gross_pnl_pts * LOT_SIZE * lots
     total_costs = entry_costs + exit_costs
     net_pnl_rs = gross_pnl_rs - total_costs
@@ -668,18 +668,17 @@ def run_backtest(start_date=None, end_date=None, stop_mult=2.5, target_pct=0.50,
             if gross_credit <= 0:
                 continue
 
-            entry_costs_pts = compute_costs(
-                [{"exec_price": l["exec_price"], "action": l["action"]} for l in legs], lots
-            ) / (LOT_SIZE * lots)
-
             slip = sum(
                 min((chain.get(l["strike"], {}).get(l["option_type"], {}).get("ask", 0) -
                      chain.get(l["strike"], {}).get(l["option_type"], {}).get("bid", 0)) / 2.0, 3.0)
                 for l in legs
             )
-            net_credit = gross_credit - entry_costs_pts - slip
+            net_credit = gross_credit - slip
             if net_credit <= 0:
                 continue
+            entry_costs_pts = compute_costs(
+                [{"exec_price": l["exec_price"], "action": l["action"]} for l in legs], lots
+            ) / (LOT_SIZE * lots)
 
             subsequent = [s for s in all_cyc[i+1:] if s["chain"]]
             if not subsequent:
@@ -696,6 +695,7 @@ def run_backtest(start_date=None, end_date=None, stop_mult=2.5, target_pct=0.50,
                 target_pct=target_pct,
                 lots=lots,
             )
+            result["entry_costs_pts"] = entry_costs_pts
 
             cell_key = f"{cyc.get('volatility_condition')}|{cyc.get('trend_condition')}|{cyc.get('direction')}|{strategy}"
             trade_rec = {

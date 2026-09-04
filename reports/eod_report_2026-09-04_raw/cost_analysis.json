@@ -12,12 +12,12 @@
       "total": 58.4
     },
     "recorded_entry_costs_rupees": 58.153184736,
-    "recorded_exit_costs_rupees": null,
-    "cost_discrepancy_entry_only_rupees": null,
-    "net_pnl_rupees": null,
-    "gross_pnl_rupees": null,
-    "result": "STILL_OPEN_OR_MISSING_EXIT",
-    "hold_minutes": null,
-    "exit_reason": null
+    "recorded_exit_costs_rupees": 59.19,
+    "cost_discrepancy_entry_only_rupees": 58.94,
+    "net_pnl_rupees": -772.4365690719992,
+    "gross_pnl_rupees": -654.8465690719992,
+    "result": "LOSS",
+    "hold_minutes": 200.4580389,
+    "exit_reason": "CLOSE_TIME"
   }
 ]

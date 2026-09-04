@@ -84,7 +84,7 @@ TARGET_PCT_BY_DAY = {"MONDAY": 0.50, "TUESDAY": 0.45, "WEDNESDAY": 0.50,
 MIN_CREDIT_MULTIPLIER_BY_REGIME = {"SUPPRESSED": 1.0, "LOW": 1.1, "NORMAL": 1.0,
                                     "ELEVATED": 1.15, "HIGH": 1.3}
 
-LOT_CAPS_BY_DAY = {"TUESDAY": 1, "MONDAY": 1, "FRIDAY": 2}
+LOT_CAPS_BY_DAY = {"MONDAY": 3, "TUESDAY": 2, "WEDNESDAY": 1, "THURSDAY": 1, "FRIDAY": 1}
 
 STRATEGY_STATE_EXTRA_COLUMNS = [
     ("pre_event_spot", "REAL"),
@@ -1051,6 +1051,9 @@ class StrategyEngine:
                 _gross_credit_for_stop = gross_credit if gross_credit and gross_credit > 0 else net_credit
                 stop_premium = _gross_credit_for_stop * 2.5
                 stop_based_loss = (_gross_credit_for_stop * 1.5) * C02 * 1.25
+                if actual_wing_pts and actual_wing_pts > 0:
+                    _structural_max = (actual_wing_pts - (net_credit or 0)) * C02
+                    stop_based_loss = min(stop_based_loss, _structural_max * 1.10)
             else:
                 stop_premium = net_credit * stop_multiplier
                 stop_based_loss = (stop_premium - net_credit) * C02 * 1.25
@@ -1114,6 +1117,77 @@ class StrategyEngine:
         hard_exit_str = state.get("hard_exit_time", self.config.hard_exit_time.strftime("%H:%M"))
         target_pct_final = self._get_target_pct(s)
 
+        _net_theta_per_day = sum(
+            abs(l.get("theta", 0) or 0) if l["action"] == "SELL" else -(abs(l.get("theta", 0) or 0))
+            for l in validated_legs
+        )
+        _hard_exit_str_theta = state.get("hard_exit_time", "15:00")
+        try:
+            _hard_exit_t = datetime.strptime(_hard_exit_str_theta, "%H:%M").time()
+        except Exception:
+            _hard_exit_t = dtime(15, 0)
+        _now_t = now_ist().time()
+        _entry_dt = datetime.combine(today_ist(), _now_t)
+        _exit_dt = datetime.combine(today_ist(), _hard_exit_t)
+        _hold_hours = max(0.5, (_exit_dt - _entry_dt).total_seconds() / 3600.0)
+        _theta_capture_pts = _net_theta_per_day * (_hold_hours / 24.0)
+        _round_trip_cost_pts = total_costs_pts_per_lot * 2.0
+        if strategy_type == "SELL" and _round_trip_cost_pts > 0 and _theta_capture_pts < (2.0 * _round_trip_cost_pts):
+            return {"valid": False, "reason": f"theta_capture_{_theta_capture_pts:.3f}pts_below_2x_round_trip_cost_{_round_trip_cost_pts:.3f}pts_dte={actual_dte}"}
+        if strategy_type == "SELL":
+            _net_theta_per_day = sum(
+                (abs(l.get("theta", 0) or 0) if l["action"] == "SELL" else -(abs(l.get("theta", 0) or 0)))
+                for l in validated_legs
+            )
+            _hard_exit_str_theta = state.get("hard_exit_time", "15:00")
+            try:
+                _hard_exit_t = datetime.strptime(_hard_exit_str_theta, "%H:%M").time()
+            except Exception:
+                _hard_exit_t = dtime(15, 0)
+            _now_t = now_ist().time()
+            _entry_dt_theta = datetime.combine(today_ist(), _now_t)
+            _exit_dt_theta = datetime.combine(today_ist(), _hard_exit_t)
+            _hold_hours = max(0.5, (_exit_dt_theta - _entry_dt_theta).total_seconds() / 3600.0)
+            _theta_capture_pts = _net_theta_per_day * (_hold_hours / 24.0)
+            _round_trip_cost_pts = total_costs_pts_per_lot * 2.0
+            if _round_trip_cost_pts > 0 and _theta_capture_pts < (2.0 * _round_trip_cost_pts):
+                return {"valid": False, "reason": f"theta_capture_{_theta_capture_pts:.3f}pts_below_2x_round_trip_{_round_trip_cost_pts:.3f}pts_dte={actual_dte}"}
+        if strategy_type == "SELL":
+            _net_theta_per_day = sum(
+                (abs(l.get("theta", 0) or 0) if l["action"] == "SELL" else -(abs(l.get("theta", 0) or 0)))
+                for l in validated_legs
+            )
+            _hard_exit_str_theta = state.get("hard_exit_time", "15:00")
+            try:
+                _hard_exit_t = datetime.strptime(_hard_exit_str_theta, "%H:%M").time()
+            except Exception:
+                _hard_exit_t = dtime(15, 0)
+            _now_t = now_ist().time()
+            _entry_dt_theta = datetime.combine(today_ist(), _now_t)
+            _exit_dt_theta = datetime.combine(today_ist(), _hard_exit_t)
+            _hold_hours = max(0.5, (_exit_dt_theta - _entry_dt_theta).total_seconds() / 3600.0)
+            _theta_capture_pts = _net_theta_per_day * (_hold_hours / 24.0)
+            _round_trip_cost_pts = total_costs_pts_per_lot * 2.0
+            if _round_trip_cost_pts > 0 and _theta_capture_pts < (2.0 * _round_trip_cost_pts):
+                return {"valid": False, "reason": f"theta_capture_{_theta_capture_pts:.3f}pts_below_2x_round_trip_{_round_trip_cost_pts:.3f}pts_dte={actual_dte}"}
+        if strategy_type == "SELL":
+            _net_theta_per_day = sum(
+                (abs(l.get("theta", 0) or 0) if l["action"] == "SELL" else -(abs(l.get("theta", 0) or 0)))
+                for l in validated_legs
+            )
+            _hard_exit_str_theta = state.get("hard_exit_time", "15:00")
+            try:
+                _hard_exit_t = datetime.strptime(_hard_exit_str_theta, "%H:%M").time()
+            except Exception:
+                _hard_exit_t = dtime(15, 0)
+            _now_t = now_ist().time()
+            _entry_dt_theta = datetime.combine(today_ist(), _now_t)
+            _exit_dt_theta = datetime.combine(today_ist(), _hard_exit_t)
+            _hold_hours = max(0.5, (_exit_dt_theta - _entry_dt_theta).total_seconds() / 3600.0)
+            _theta_capture_pts = _net_theta_per_day * (_hold_hours / 24.0)
+            _round_trip_cost_pts = total_costs_pts_per_lot * 2.0
+            if _round_trip_cost_pts > 0 and _theta_capture_pts < (2.0 * _round_trip_cost_pts):
+                return {"valid": False, "reason": f"theta_capture_{_theta_capture_pts:.3f}pts_below_2x_round_trip_{_round_trip_cost_pts:.3f}pts_dte={actual_dte}"}
         return {
             "valid": True,
             "total_fixed_costs_rupees": total_fixed_costs_rupees,

@@ -1,4 +1,3 @@
 [
-  "[FLAG] NIFTY moved only 0.21% intraday \u2014 very low move day, premium may have been thin.",
-  "[OK] Single position engine working correctly: 'position_already_open_single_position_engine' fired 20/21 times \u2014 expected behavior while a position is open."
+  "[FLAG] Single no-trade reason dominates: 'past_entry_window_end_13:00:00' fired 24/46 times (52%) \u2014 gate may be miscalibrated."
 ]

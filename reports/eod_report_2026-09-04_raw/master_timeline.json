@@ -5,6 +5,11 @@
     "nifty_algo               | PCR 4.095 outside valid range [0.3,4.0] \u2014 discarding"
   ],
   [
+    "2026-09-04 15:28:48",
+    "LOG:WARNING",
+    "nifty_algo               | PCR 8.068 outside valid range [0.3,4.0] \u2014 discarding"
+  ],
+  [
     "2026-09-04T11:43:21.444630+05:30",
     "CYCLE",
     "spot=23984.05 vix=10.75 vrp=3.7457485147422505 vol=RICH trend=STRONG_TREND dir=BULLISH adx=49.0275836633565 pcr=1.8878511111843346 skew=1.0207684319833852 action=STRATEGY_SELECTED:BULL_PUT_SPREAD no_trade_reason=None open_pos=0 daily_pnl=0.0"
@@ -218,5 +223,300 @@
     "2026-09-04T12:53:49.093569+05:30",
     "DECISION",
     "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:58:48.983676+05:30",
+    "CYCLE",
+    "spot=23931.85 vix=10.93 vrp=3.7885358992612526 vol=RICH trend=MILD_TREND dir=NEUTRAL adx=29.958725849676863 pcr=2.771758300743808 skew=0.9800210304942166 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-1002.5965690719997"
+  ],
+  [
+    "2026-09-04T12:58:49.065529+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T13:03:48.976910+05:30",
+    "CYCLE",
+    "spot=23936.9 vix=10.81 vrp=3.831919579889213 vol=RICH trend=TRENDING dir=NEUTRAL adx=29.960712480078964 pcr=2.722858598629956 skew=0.9728601252609604 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-810.846569072"
+  ],
+  [
+    "2026-09-04T13:03:49.002208+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:08:49.001186+05:30",
+    "CYCLE",
+    "spot=23939.85 vix=10.82 vrp=3.8569002139571404 vol=RICH trend=TRENDING dir=NEUTRAL adx=29.962557208309487 pcr=2.7104999831352665 skew=0.9727463312368974 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-758.8465690719997"
+  ],
+  [
+    "2026-09-04T13:08:49.030971+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:13:48.984567+05:30",
+    "CYCLE",
+    "spot=23947.9 vix=10.79 vrp=3.859514877704804 vol=RICH trend=STRONG_TREND dir=NEUTRAL adx=28.104540358151805 pcr=2.6902251037542793 skew=0.9903948772678762 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-521.5965690719994"
+  ],
+  [
+    "2026-09-04T13:13:49.016757+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:18:49.098521+05:30",
+    "CYCLE",
+    "spot=23955.05 vix=10.95 vrp=3.8298396918760815 vol=RICH trend=STRONG_TREND dir=NEUTRAL adx=26.159133984502258 pcr=1.0173537288811019 skew=0.972340425531915 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-251.84656907199852"
+  ],
+  [
+    "2026-09-04T13:18:49.124735+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:23:48.959527+05:30",
+    "CYCLE",
+    "spot=23949.85 vix=10.94 vrp=3.8515381746178345 vol=RICH trend=TRENDING dir=NEUTRAL adx=24.352685208970534 pcr=2.733225080897977 skew=0.9628844114528103 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-346.0965690719996"
+  ],
+  [
+    "2026-09-04T13:23:48.977863+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:28:48.988510+05:30",
+    "CYCLE",
+    "spot=23941.15 vix=10.96 vrp=3.8081665002892118 vol=RICH trend=TRENDING dir=NEUTRAL adx=23.461541238164987 pcr=2.8454457383656724 skew=0.9713679745493108 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-612.5965690719993"
+  ],
+  [
+    "2026-09-04T13:28:49.050502+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:33:48.997697+05:30",
+    "CYCLE",
+    "spot=23937.7 vix=10.97 vrp=3.8255548042227367 vol=RICH trend=TRENDING dir=NEUTRAL adx=23.827842058915696 pcr=2.848554310194919 skew=0.9767195767195769 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-768.5965690719992"
+  ],
+  [
+    "2026-09-04T13:33:49.027673+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:38:48.948009+05:30",
+    "CYCLE",
+    "spot=23938.6 vix=10.96 vrp=3.8837044270601755 vol=RICH trend=TRENDING dir=NEUTRAL adx=23.543196039704476 pcr=2.7411907373364435 skew=0.9819341126461211 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-843.3465690719995"
+  ],
+  [
+    "2026-09-04T13:38:48.974432+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:43:48.930921+05:30",
+    "CYCLE",
+    "spot=23948.5 vix=10.96 vrp=3.863668950781526 vol=RICH trend=TRENDING dir=NEUTRAL adx=22.647877387149148 pcr=2.675558863966092 skew=1.026344676180022 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-641.8465690719989"
+  ],
+  [
+    "2026-09-04T13:43:48.950136+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:48:48.955555+05:30",
+    "CYCLE",
+    "spot=23948.9 vix=10.94 vrp=3.83968678162394 vol=RICH trend=TRENDING dir=NEUTRAL adx=20.831293381665027 pcr=2.68499050956344 skew=0.9816810344827587 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-495.5965690719999"
+  ],
+  [
+    "2026-09-04T13:48:48.977319+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:53:49.015458+05:30",
+    "CYCLE",
+    "spot=23941.85 vix=10.97 vrp=3.839360199863659 vol=RICH trend=TRENDING dir=NEUTRAL adx=20.231791033986585 pcr=2.7300654704919554 skew=1.0 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-713.3465690719995"
+  ],
+  [
+    "2026-09-04T13:53:49.041318+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T13:58:48.940482+05:30",
+    "CYCLE",
+    "spot=23942.0 vix=10.97 vrp=3.871887034555895 vol=RICH trend=TRENDING dir=NEUTRAL adx=19.675110282570895 pcr=2.692931705728157 skew=0.997837837837838 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-713.3465690719995"
+  ],
+  [
+    "2026-09-04T13:58:48.979793+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:03:48.916039+05:30",
+    "CYCLE",
+    "spot=23941.25 vix=10.96 vrp=3.9197784687438313 vol=RICH trend=TRENDING dir=NEUTRAL adx=19.15819244197061 pcr=2.713672244040694 skew=0.980728051391863 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-687.3465690720001"
+  ],
+  [
+    "2026-09-04T14:03:48.956282+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:08:48.927256+05:30",
+    "CYCLE",
+    "spot=23941.85 vix=10.96 vrp=3.9310247064703496 vol=RICH trend=TRENDING dir=NEUTRAL adx=18.17041154160489 pcr=2.7360733333596516 skew=0.9733475479744136 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-609.3465690719989"
+  ],
+  [
+    "2026-09-04T14:08:48.956016+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:13:48.905515+05:30",
+    "CYCLE",
+    "spot=23949.6 vix=10.94 vrp=3.9397911772912213 vol=RICH trend=TRENDING dir=NEUTRAL adx=17.25318641983672 pcr=2.744881233613855 skew=0.9881081081081082 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-466.3465690719988"
+  ],
+  [
+    "2026-09-04T14:13:48.931772+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:18:48.900686+05:30",
+    "CYCLE",
+    "spot=23944.5 vix=10.96 vrp=3.9455694715499092 vol=RICH trend=TRENDING dir=NEUTRAL adx=16.066885166974973 pcr=2.775052676937187 skew=1.002183406113537 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-589.8465690720001"
+  ],
+  [
+    "2026-09-04T14:18:48.926002+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:23:48.903986+05:30",
+    "CYCLE",
+    "spot=23946.9 vix=10.92 vrp=3.950583762041875 vol=RICH trend=TRENDING dir=MILD_BULLISH adx=15.261220312772698 pcr=2.7525657661908696 skew=0.9848320693391115 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-472.84656907199843"
+  ],
+  [
+    "2026-09-04T14:23:48.934059+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:28:48.976690+05:30",
+    "CYCLE",
+    "spot=23957.95 vix=10.91 vrp=3.92464254522492 vol=RICH trend=TRENDING dir=MILD_BULLISH adx=15.334821462774098 pcr=1.0518302321638846 skew=0.9416216216216218 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-134.84656907199917"
+  ],
+  [
+    "2026-09-04T14:28:49.004091+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:33:48.913901+05:30",
+    "CYCLE",
+    "spot=23959.3 vix=10.9 vrp=3.8338064392029194 vol=RICH trend=TRENDING dir=MILD_BULLISH adx=15.94964412826234 pcr=1.1154058871980383 skew=0.9507658643326038 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-73.09656907199852"
+  ],
+  [
+    "2026-09-04T14:33:48.943938+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:38:48.890791+05:30",
+    "CYCLE",
+    "spot=23945.65 vix=10.91 vrp=3.7319114267653415 vol=RICH trend=TRENDING dir=MILD_BULLISH adx=15.33465984501701 pcr=3.2317440357060625 skew=0.9966777408637875 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-443.5965690719987"
+  ],
+  [
+    "2026-09-04T14:38:48.969368+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:43:48.877773+05:30",
+    "CYCLE",
+    "spot=23940.5 vix=10.86 vrp=3.75379246026346 vol=RICH trend=TRENDING dir=NEUTRAL adx=14.571612913428664 pcr=3.140666530361889 skew=0.9933774834437086 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-576.8465690719989"
+  ],
+  [
+    "2026-09-04T14:43:48.897731+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:48:48.877290+05:30",
+    "CYCLE",
+    "spot=23939.05 vix=10.83 vrp=3.732148979069187 vol=RICH trend=TRENDING dir=NEUTRAL adx=14.706201970728841 pcr=2.9966812227074238 skew=0.9737417943107222 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-515.0965690720002"
+  ],
+  [
+    "2026-09-04T14:48:48.899122+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:53:48.898820+05:30",
+    "CYCLE",
+    "spot=23937.1 vix=10.85 vrp=3.8013258392534164 vol=RICH trend=TRENDING dir=NEUTRAL adx=14.128549435488761 pcr=2.9489850800628474 skew=0.9825136612021859 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-664.5965690719986"
+  ],
+  [
+    "2026-09-04T14:53:48.922824+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T14:58:48.888332+05:30",
+    "CYCLE",
+    "spot=23939.5 vix=10.84 vrp=3.830399877764375 vol=RICH trend=TRENDING dir=NEUTRAL adx=13.59215779562297 pcr=2.9633407453373324 skew=0.9835526315789475 action=NO_TRADE no_trade_reason=past_entry_window_end_13:00:00 open_pos=1 daily_pnl=-479.3465690719999"
+  ],
+  [
+    "2026-09-04T14:58:48.905812+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 past_entry_window_end_13:00:00"
+  ],
+  [
+    "2026-09-04T15:03:48.952447+05:30",
+    "CYCLE",
+    "spot=23936.7 vix=10.85 vrp=3.87244533750419 vol=RICH trend=MILD_TREND dir=NEUTRAL adx=13.187898098183918 pcr=2.8958076395282184 skew=0.9836601307189542 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
+  ],
+  [
+    "2026-09-04T15:03:48.986686+05:30",
+    "EXIT",
+    "BULL_PUT_SPREAD reason=CLOSE_TIME hold=200.4580389min net_pnl=-772.4365690719992 gross_pnl=-654.8465690719992 costs=117.59 result=LOSS"
+  ],
+  [
+    "2026-09-04T15:08:48.844001+05:30",
+    "CYCLE",
+    "spot=23936.85 vix=10.86 vrp=3.8822314491160945 vol=RICH trend=TRENDING dir=NEUTRAL adx=13.869538638146908 pcr=2.7999025371083373 skew=0.9759825327510916 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
+  ],
+  [
+    "2026-09-04T15:13:48.915108+05:30",
+    "CYCLE",
+    "spot=23939.5 vix=10.76 vrp=3.9373378956633696 vol=RICH trend=TRENDING dir=NEUTRAL adx=13.416358018483232 pcr=2.7291053124215234 skew=0.9560085836909871 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
+  ],
+  [
+    "2026-09-04T15:18:48.836232+05:30",
+    "CYCLE",
+    "spot=23937.9 vix=10.77 vrp=3.8226494447050348 vol=RICH trend=TRENDING dir=MILD_BULLISH adx=13.416358018483232 pcr=2.717208960220281 skew=0.9481081081081081 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
+  ],
+  [
+    "2026-09-04T15:23:48.855531+05:30",
+    "CYCLE",
+    "spot=23937.9 vix=10.68 vrp=3.6964950986758334 vol=RICH trend=TRENDING dir=NEUTRAL adx=13.416358018483232 pcr=2.498397051553759 skew=1.0669014084507042 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
+  ],
+  [
+    "2026-09-04T15:28:48.865723+05:30",
+    "CYCLE",
+    "spot=23897.7 vix=10.63 vrp=3.242583690037878 vol=RICH trend=RANGE_BOUND dir=MILD_BEARISH adx=13.416358018483232 pcr=None skew=0.831223628691983 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
+  ],
+  [
+    "2026-09-04T15:33:50.540013+05:30",
+    "CYCLE",
+    "spot=23897.7 vix=10.58 vrp=2.9788237066888943 vol=FAIR trend=RANGE_BOUND dir=MILD_BEARISH adx=15.38014471362951 pcr=0.6121647738878324 skew=0.820675105485232 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
+  ],
+  [
+    "2026-09-04T15:38:50.421574+05:30",
+    "CYCLE",
+    "spot=23897.7 vix=10.63 vrp=2.9029922504715557 vol=FAIR trend=RANGE_BOUND dir=MILD_BEARISH adx=15.38014471362951 pcr=0.6344050617141128 skew=0.8186638388123011 action=SIGNAL_ONLY no_trade_reason=None open_pos=0 daily_pnl=-772.4365690719992"
   ]
 ]

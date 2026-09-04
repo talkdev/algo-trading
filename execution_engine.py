@@ -723,8 +723,17 @@ class ExecutionEngine:
         price_stop_pts = position.get("price_stop_pts") or 0
         spot = signals.get("spot")
         if price_stop_pts > 0 and spot is not None and position.get("entry_spot"):
-            if abs(spot - position["entry_spot"]) >= price_stop_pts:
-                return "CLOSE_STOP", {"reason_detail": f"price_stop_{abs(spot - position['entry_spot']):.0f}pts"}
+            _sname_ps = position.get("strategy_name", "")
+            _entry_spot_ps = position["entry_spot"]
+            _spot_move = spot - _entry_spot_ps
+            if _sname_ps == "BULL_PUT_SPREAD":
+                _ps_triggered = _spot_move <= -price_stop_pts
+            elif _sname_ps == "BEAR_CALL_SPREAD":
+                _ps_triggered = _spot_move >= price_stop_pts
+            else:
+                _ps_triggered = abs(_spot_move) >= price_stop_pts
+            if _ps_triggered:
+                return "CLOSE_STOP", {"reason_detail": f"price_stop_{abs(_spot_move):.0f}pts"}
 
         if strategy_type == "SELL" and position.get("entry_credit"):
             _entry_credit_td = position["entry_credit"]
@@ -777,7 +786,7 @@ class ExecutionEngine:
             _lock_threshold = 0.25 if _is_directional_for_lock else 0.20
             _move_threshold = 0.55 if _is_directional_for_lock else 0.50
             if profit_pct >= _lock_threshold and not position.get("stop_at_breakeven"):
-                lock_stop = max(true_breakeven_premium, current_premium * 1.05)
+                lock_stop = max(true_breakeven_premium, entry_credit * 0.70)
                 self.db.update("positions", {"stop_premium": lock_stop, "stop_at_breakeven": 1},
                                 {"position_id": position["position_id"]})
                 self.logger.info(f"PROFIT LOCK: {strategy_name} -> breakeven lock (profit={profit_pct*100:.0f}%)")
@@ -931,7 +940,7 @@ class ExecutionEngine:
     def execute_close(self, position: dict, reason: str, context: Optional[dict] = None) -> None:
         legs = self._get_position_legs(position["position_id"])
         open_legs = [l for l in legs if l["leg_status"] == "OPEN"]
-        open_legs = sorted(open_legs, key=lambda l: 0 if l["action"] == "BUY" else 1)
+        open_legs = sorted(open_legs, key=lambda l: 0 if l["action"] == "SELL" else 1)
         lots = position["final_lots"]
         chain = self.market_engine.last_chain
 
