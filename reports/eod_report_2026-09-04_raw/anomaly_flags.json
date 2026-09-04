@@ -1,4 +1,4 @@
 [
-  "[FLAG] NIFTY moved only 0.20% intraday \u2014 very low move day, premium may have been thin.",
-  "[OK] Single position engine working correctly: 'position_already_open_single_position_engine' fired 17/18 times \u2014 expected behavior while a position is open."
+  "[FLAG] NIFTY moved only 0.21% intraday \u2014 very low move day, premium may have been thin.",
+  "[OK] Single position engine working correctly: 'position_already_open_single_position_engine' fired 18/19 times \u2014 expected behavior while a position is open."
 ]

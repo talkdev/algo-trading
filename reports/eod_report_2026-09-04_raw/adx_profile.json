@@ -1,15 +1,15 @@
 {
   "adx_open": 49.03,
-  "adx_close": 31.46,
-  "adx_mean": 41.47,
+  "adx_close": 30.92,
+  "adx_mean": 40.91,
   "adx_max": 49.03,
-  "adx_min": 31.46,
+  "adx_min": 30.92,
   "adx_condition_distribution": {
     "VERY_STRONG": 10,
     "STRONG": 7,
-    "MODERATE": 1
+    "MODERATE": 2
   },
-  "trending_cycles": 18,
+  "trending_cycles": 19,
   "strong_trend_cycles": 17,
   "flat_cycles": 0
 }

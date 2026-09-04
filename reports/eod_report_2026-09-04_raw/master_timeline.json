@@ -188,5 +188,15 @@
     "2026-09-04T12:42:26.472626+05:30",
     "DECISION",
     "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:47:26.514562+05:30",
+    "CYCLE",
+    "spot=23936.15 vix=10.78 vrp=3.8507418037030483 vol=RICH trend=MILD_TREND dir=NEUTRAL adx=30.920073120036733 pcr=2.9278511381146504 skew=1.016931216931217 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-1064.346569071999"
+  ],
+  [
+    "2026-09-04T12:47:26.584122+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
   ]
 ]

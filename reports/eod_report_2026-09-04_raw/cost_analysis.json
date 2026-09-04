@@ -3,13 +3,13 @@
     "position_id": "52c64b75-3ded-4313-a5fd-2b5dc118bdcb",
     "strategy": "BULL_PUT_SPREAD",
     "recomputed_entry_costs": {
-      "stt": 9.16,
-      "exchange": 3.11,
+      "stt": 7.94,
+      "exchange": 2.7,
       "brokerage": 40.0,
-      "sebi": 0.0088,
-      "stamp": 0.0796,
-      "gst": 7.76,
-      "total": 60.12
+      "sebi": 0.0076,
+      "stamp": 0.069,
+      "gst": 7.69,
+      "total": 58.4
     },
     "recorded_entry_costs_rupees": 58.153184736,
     "recorded_exit_costs_rupees": null,
