@@ -1192,7 +1192,6 @@ class MarketDataEngine:
             "conditions_met_json": json.dumps(s.get("conditions_met", {})),
             "conditions_not_met_json": json.dumps(s.get("conditions_not_met", {})),
             "open_positions": 0, "daily_pnl_net": s.get("daily_pnl", 0.0),
-            total_pnl_for_cycle_log = True,
             "vix_regime": s["vix_regime"], "day_mode": s["day_mode"],
             "raw_json": json.dumps({k: v for k, v in s.items() if k != "atm_greeks"}, default=str),
         })
