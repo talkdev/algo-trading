@@ -1,11 +1,11 @@
 {
   "pcr_open": 1.888,
-  "pcr_close": 2.928,
-  "pcr_mean": 2.477,
+  "pcr_close": 2.804,
+  "pcr_mean": 2.513,
   "pcr_min": 1.551,
   "pcr_max": 3.742,
-  "pcr_change_open_to_close": 1.04,
-  "extreme_fear_cycles": 18,
+  "pcr_change_open_to_close": 0.916,
+  "extreme_fear_cycles": 20,
   "extreme_greed_cycles": 0,
   "neutral_cycles": 0
 }

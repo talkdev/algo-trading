@@ -79,7 +79,7 @@ PRICE_STOPS = {
 }
 
 TARGET_PCT_BY_DAY = {"MONDAY": 0.50, "TUESDAY": 0.45, "WEDNESDAY": 0.50,
-                      "THURSDAY": 0.50, "FRIDAY": 0.45}
+                      "THURSDAY": 0.50, "FRIDAY": 0.50}
 
 MIN_CREDIT_MULTIPLIER_BY_REGIME = {"SUPPRESSED": 1.0, "LOW": 1.1, "NORMAL": 1.0,
                                     "ELEVATED": 1.15, "HIGH": 1.3}
