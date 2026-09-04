@@ -13,5 +13,85 @@
     "2026-09-04T11:43:21.505198+05:30",
     "ENTRY",
     "BULL_PUT_SPREAD lots=2 credit/debit=22.11271869944616 vrp=3.7457485147422505 vix=10.75 vol_cond=RICH trend=STRONG_TREND dir=BULLISH reason=bullish_strong_trend_put_credit_safe_side+RICH_vrp"
+  ],
+  [
+    "2026-09-04T11:48:21.362659+05:30",
+    "CYCLE",
+    "spot=23982.7 vix=10.75 vrp=3.77425489523469 vol=RICH trend=STRONG_TREND dir=BULLISH adx=48.99162189295276 pcr=1.8889067142008318 skew=1.0365726227795191 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-154.34656907199897"
+  ],
+  [
+    "2026-09-04T11:48:21.392145+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T11:53:21.402230+05:30",
+    "CYCLE",
+    "spot=23984.0 vix=10.76 vrp=3.902789135433869 vol=RICH trend=STRONG_TREND dir=BULLISH adx=48.970343001270734 pcr=1.9051007497102854 skew=1.0417536534446765 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-186.8465690719999"
+  ],
+  [
+    "2026-09-04T11:53:21.487355+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T11:55:36.789446+05:30",
+    "CYCLE",
+    "spot=23985.9 vix=10.77 vrp=3.8997805132864514 vol=RICH trend=STRONG_TREND dir=MILD_BULLISH adx=48.970343001270734 pcr=1.91999598563092 skew=1.0514705882352942 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-167.34656907199917"
+  ],
+  [
+    "2026-09-04T11:55:36.850515+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T11:59:19.357707+05:30",
+    "CYCLE",
+    "spot=23980.9 vix=10.74 vrp=3.9243926622635383 vol=RICH trend=STRONG_TREND dir=MILD_BULLISH adx=48.94931481066527 pcr=1.9477414900268775 skew=1.032258064516129 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-203.09656907199897"
+  ],
+  [
+    "2026-09-04T11:59:19.423357+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:01:18.853640+05:30",
+    "CYCLE",
+    "spot=23974.85 vix=10.74 vrp=4.007762919939564 vol=RICH trend=STRONG_TREND dir=MILD_BULLISH adx=47.539819484475785 pcr=1.9741156143229535 skew=1.0657620041753655 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-362.34656907199917"
+  ],
+  [
+    "2026-09-04T12:01:18.885232+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:03:37.245914+05:30",
+    "CYCLE",
+    "spot=23966.7 vix=10.8 vrp=3.8766525799733094 vol=RICH trend=STRONG_TREND dir=MILD_BULLISH adx=46.833293270145155 pcr=1.943483561733892 skew=1.039460020768432 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-453.3465690719995"
+  ],
+  [
+    "2026-09-04T12:03:37.283938+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:08:37.226187+05:30",
+    "CYCLE",
+    "spot=23959.95 vix=10.97 vrp=3.77331526374424 vol=RICH trend=STRONG_TREND dir=MILD_BULLISH adx=43.246885573301725 pcr=1.8035238799969702 skew=1.0259067357512954 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-524.8465690720001"
+  ],
+  [
+    "2026-09-04T12:08:37.295996+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:09:13.343321+05:30",
+    "CYCLE",
+    "spot=23965.35 vix=10.96 vrp=3.7521639997368705 vol=RICH trend=STRONG_TREND dir=NEUTRAL adx=43.246885573301725 pcr=1.789725750719988 skew=1.029136316337149 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-446.846569071999"
+  ],
+  [
+    "2026-09-04T12:09:13.387996+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
   ]
 ]

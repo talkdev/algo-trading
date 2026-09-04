@@ -189,9 +189,9 @@ BROKERAGE_PER_ORDER=20.0
 EXCHANGE_TXN_RATE=0.0003552
 
 # ── TRADING WINDOW (per your explicit requirement: 10:00 - 15:00) ──────
-TRADING_WINDOW_START=10:00
-TRADING_WINDOW_LAST_ENTRY=15:00
-HARD_EXIT_TIME=15:00
+TRADING_WINDOW_START=10:30
+TRADING_WINDOW_LAST_ENTRY=13:00
+HARD_EXIT_TIME=15:25
 
 # ── POSITION LIMITS ──────────────────────────────────────────────────────
 MAX_CONCURRENT_POSITIONS=2
@@ -428,9 +428,9 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
         stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00003),
 
-        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(10, 0)),
-        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),
-        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 0)),
+        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(10, 30)),
+        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(13, 0)),
+        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 25)),
 
         max_concurrent_positions=_get_int(env, "MAX_CONCURRENT_POSITIONS", 2),
         max_entries_per_day=_get_int(env, "MAX_ENTRIES_PER_DAY", 3),
