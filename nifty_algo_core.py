@@ -620,23 +620,32 @@ CREATE TABLE IF NOT EXISTS position_legs (
 CREATE INDEX IF NOT EXISTS idx_legs_position ON position_legs(position_id);
 
 CREATE TABLE IF NOT EXISTS option_chain_snapshot (
-    snapshot_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    capture_time      TEXT,
-    trading_date      TEXT,
-    expiry            TEXT,
-    strike            REAL,
-    option_type       TEXT,
-    bid               REAL,
-    ask               REAL,
-    ltp               REAL,
-    oi                INTEGER,
-    volume            INTEGER,
-    iv                REAL,
-    delta             REAL,
-    gamma             REAL,
-    theta             REAL,
-    vega              REAL,
-    data_timestamp    TEXT
+    snapshot_id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    capture_time                   TEXT,
+    trading_date                   TEXT,
+    expiry                         TEXT,
+    strike                         REAL,
+    option_type                    TEXT,
+    bid                            REAL,
+    ask                            REAL,
+    ltp                            REAL,
+    oi                             INTEGER,
+    volume                         INTEGER,
+    iv                             REAL,
+    delta                          REAL,
+    gamma                          REAL,
+    theta                          REAL,
+    vega                           REAL,
+    data_timestamp                 TEXT,
+    cycle_id                       INTEGER,
+    spot_at_capture                REAL,
+    vix_at_capture                 REAL,
+    vrp_at_capture                 REAL,
+    adx_at_capture                 REAL,
+    vwap_dist_at_capture           REAL,
+    trend_condition_at_capture     TEXT,
+    volatility_condition_at_capture TEXT,
+    direction_at_capture           TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_snapshot_time ON option_chain_snapshot(capture_time);
@@ -675,6 +684,10 @@ CREATE TABLE IF NOT EXISTS cycle_log (
     daily_pnl_net            REAL,
     vix_regime               TEXT,
     day_mode                 TEXT,
+    open_position_ids        TEXT,
+    vrp_percentile           REAL,
+    max_pain                 REAL,
+    atm_straddle_price       REAL,
     raw_json                 TEXT
 );
 

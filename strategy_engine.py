@@ -153,7 +153,20 @@ class StrategyEngine:
         return True
 
     def _get_target_pct(self, s: dict) -> float:
-        return TARGET_PCT_BY_DAY.get(self.market_engine.state.get("day_label"), 0.40)
+        day_label = self.market_engine.state.get("day_label")
+        base_pct = TARGET_PCT_BY_DAY.get(day_label, 0.50)
+        actual_dte = s.get("actual_dte")
+        if actual_dte is None:
+            return base_pct
+        if actual_dte == 0:
+            return min(base_pct, 0.35)
+        if actual_dte == 1:
+            return min(base_pct, 0.40)
+        if actual_dte == 2:
+            return min(base_pct, 0.45)
+        if actual_dte == 3:
+            return min(base_pct, 0.48)
+        return base_pct
 
     def _get_min_credit_multiplier(self, s: dict) -> float:
         return MIN_CREDIT_MULTIPLIER_BY_REGIME.get(s["vix_regime"], 1.0)
@@ -539,6 +552,9 @@ class StrategyEngine:
         elif "half_size" in reason or "uncertain" in reason or "fair_vrp" in reason:
             size_mult *= 0.50
             self.logger.info(f"Half-size applied due to: {reason}")
+        if s.get("high_quality_sell_day") and size_mult >= 0.50:
+            size_mult = min(size_mult * 1.25, 1.25)
+            self.logger.info(f"High quality sell day: size multiplier boosted to {size_mult:.2f}")
 
         sell_size_reduction = s.get("sell_size_reduction", 1.0)
         _is_directional = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD",
@@ -567,6 +583,9 @@ class StrategyEngine:
                 return False, "iron_butterfly_requires_tuesday_monday_or_narrow_or"
             if day_label == "MONDAY" and s["or_condition"] not in ("VERY_NARROW", "NARROW"):
                 return False, "iron_butterfly_monday_requires_narrow_or"
+            _adx_val_bf = s.get("adx") or 0
+            if _adx_val_bf > 20:
+                return False, f"iron_butterfly_blocked_adx_{_adx_val_bf:.0f}_too_high_for_butterfly"
 
         elif strategy_name == "IRON_CONDOR":
             hard_exit_str = state.get("hard_exit_time")
@@ -618,6 +637,9 @@ class StrategyEngine:
                     breakout = 0.0
                 if breakout > 50:
                     return False, f"bear_call_spread_spot_above_or_by_{breakout:.0f}pts"
+            _max_pain_bear = s.get("max_pain", 0)
+            if _max_pain_bear > 0 and spot and abs(spot - _max_pain_bear) < 30:
+                return False, f"bear_call_spread_spot_within_30pts_of_max_pain_{_max_pain_bear:.0f}"
 
         elif strategy_name == "BULL_CALL_SPREAD":
             if s["volatility_condition"] in ("FAIR", "RICH", "VERY_RICH"):
@@ -931,7 +953,14 @@ class StrategyEngine:
         total_slippage = 0.0
         for leg in validated_legs:
             bid, ask = leg["bid"], leg["ask"]
-            total_slippage += min((ask - bid) / 2.0, 2.0) if (bid > 0 and ask > 0) else 1.5
+            _leg_delta = abs(leg.get("delta", 0.25) or 0.25)
+            if _leg_delta > 0.35:
+                _slip_cap = 1.5
+            elif _leg_delta > 0.20:
+                _slip_cap = 2.0
+            else:
+                _slip_cap = 3.0
+            total_slippage += min((ask - bid) / 2.0, _slip_cap) if (bid > 0 and ask > 0) else _slip_cap
 
         sell_premium_pts = sum(l["exec_price"] for l in validated_legs if l["action"] == "SELL")
         buy_premium_pts = sum(l["exec_price"] for l in validated_legs if l["action"] == "BUY")

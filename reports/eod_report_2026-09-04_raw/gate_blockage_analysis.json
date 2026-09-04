@@ -1,9 +1,9 @@
 {
-  "total_cycles": 9,
-  "total_decisions": 9,
-  "no_trade_count": 8,
+  "total_cycles": 18,
+  "total_decisions": 18,
+  "no_trade_count": 17,
   "enter_count": 1,
-  "no_trade_rate_pct": 88.9,
+  "no_trade_rate_pct": 94.4,
   "gate_category_counts": {
     "risk_gates": 0,
     "data_gates": 0,
@@ -11,9 +11,9 @@
     "timing_gates": 0,
     "strategy_gates": 0,
     "event_gates": 0,
-    "other": 8
+    "other": 17
   },
   "top_10_reasons": {
-    "position_already_open_single_position_engine": 8
+    "position_already_open_single_position_engine": 17
   }
 }
