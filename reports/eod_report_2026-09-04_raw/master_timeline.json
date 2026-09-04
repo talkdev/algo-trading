@@ -1,0 +1,42 @@
+[
+  [
+    "2026-09-04 10:53:04",
+    "LOG:WARNING",
+    "nifty_algo               | PRE_TRADE_NO_GO: portfolio_vega_-294.1_exceeds_limit_150.0"
+  ],
+  [
+    "2026-09-04 10:54:58",
+    "LOG:ERROR",
+    "nifty_algo               | UNHANDLED ERROR in main loop: name 'ipft' is not defined"
+  ],
+  [
+    "2026-09-04 10:54:58",
+    "LOG:ERROR",
+    "nifty_algo               | Traceback (most recent call last):"
+  ],
+  [
+    "2026-09-04 10:55:29",
+    "LOG:ERROR",
+    "nifty_algo               | UNHANDLED ERROR in main loop: name 'ipft' is not defined"
+  ],
+  [
+    "2026-09-04 10:55:29",
+    "LOG:ERROR",
+    "nifty_algo               | Traceback (most recent call last):"
+  ],
+  [
+    "2026-09-04T10:56:25.958827+05:30",
+    "CYCLE",
+    "spot=23961.55 vix=10.84 vrp=3.4621765580371298 vol=RICH trend=TRENDING dir=NEUTRAL adx=0.0 pcr=1.206876379899232 skew=1.0143149284253579 action=STRATEGY_SELECTED:IRON_CONDOR no_trade_reason=None open_pos=0 daily_pnl=0.0"
+  ],
+  [
+    "2026-09-04T10:56:25.994580+05:30",
+    "DECISION",
+    "STRATEGY_SELECTED IRON_CONDOR \u2014 trending_neutral_condor_half_size+RICH_vrp"
+  ],
+  [
+    "2026-09-04T10:56:25.999994+05:30",
+    "ENTRY",
+    "IRON_CONDOR lots=1 credit/debit=44.46949251809231 vrp=3.4621765580371298 vix=10.84 vol_cond=RICH trend=TRENDING dir=NEUTRAL reason=trending_neutral_condor_half_size+RICH_vrp"
+  ]
+]

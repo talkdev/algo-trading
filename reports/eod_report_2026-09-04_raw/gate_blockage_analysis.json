@@ -1,0 +1,17 @@
+{
+  "total_cycles": 1,
+  "total_decisions": 1,
+  "no_trade_count": 0,
+  "enter_count": 1,
+  "no_trade_rate_pct": 0.0,
+  "gate_category_counts": {
+    "risk_gates": 0,
+    "data_gates": 0,
+    "market_condition_gates": 0,
+    "timing_gates": 0,
+    "strategy_gates": 0,
+    "event_gates": 0,
+    "other": 0
+  },
+  "top_10_reasons": {}
+}

@@ -251,7 +251,7 @@ class MarketDataEngine:
             self.logger.warning(f"Spot {spot} outside valid range [10000,50000] — "
                                  f"discarding, using last known value")
             spot = self.state.get("prev_spot")
-        if vix is not None and not (5.0 < vix < 90.0):
+        if vix is not None and not (7.0 < vix < 60.0):
             self.logger.warning(f"VIX {vix} outside valid range [5,90] — "
                                  f"discarding, using last known value")
             vix = self.state.get("prev_vix")
@@ -643,8 +643,8 @@ class MarketDataEngine:
         if total_call_oi <= 0:
             return None
         pcr = total_put_oi / total_call_oi
-        if pcr < 0.2 or pcr > 6.0:
-            self.logger.warning(f"PCR {pcr:.3f} outside valid range [0.2,6.0] — discarding")
+        if pcr < 0.3 or pcr > 4.0:
+            self.logger.warning(f"PCR {pcr:.3f} outside valid range [0.3,4.0] — discarding")
             return None
         return pcr
 
@@ -711,7 +711,7 @@ class MarketDataEngine:
     # MODULE 1: PRE-SESSION ASSESSMENT (re-run every 30 minutes)
     # ─────────────────────────────────────────────────────────────────
     def _compute_base_regime(self, vix: float) -> str:
-        if vix < 11.0: return "SUPPRESSED"
+        if vix < 10.0: return "SUPPRESSED"
         if vix < 14.0: return "LOW"
         if vix < 18.0: return "NORMAL"
         if vix < 24.0: return "ELEVATED"
@@ -719,7 +719,7 @@ class MarketDataEngine:
 
     def _compute_regime_with_hysteresis(self, vix: float, prev_regime: str) -> str:
         bands = {
-            "SUPPRESSED": (None, 11.5), "LOW": (10.5, 14.5), "NORMAL": (13.5, 18.5),
+            "SUPPRESSED": (None, 10.5), "LOW": (9.5, 13.5), "NORMAL": (12.5, 18.5),
             "ELEVATED": (17.5, 24.5), "HIGH": (23.5, None),
         }
         if prev_regime in bands:
@@ -895,10 +895,10 @@ class MarketDataEngine:
 
         _or_mid = (or_high + or_low) / 2.0 if or_high and or_low else 24000.0
         _or_width_pct = (or_width / _or_mid) * 100.0
-        if _or_width_pct < 0.18: or_condition, or_score = "VERY_NARROW", 2
-        elif _or_width_pct < 0.32: or_condition, or_score = "NARROW", 1
-        elif _or_width_pct < 0.50: or_condition, or_score = "MODERATE", 0
-        elif _or_width_pct < 0.70: or_condition, or_score = "WIDE", -1
+        if _or_width_pct < 0.20: or_condition, or_score = "VERY_NARROW", 2
+        elif _or_width_pct < 0.35: or_condition, or_score = "NARROW", 1
+        elif _or_width_pct < 0.55: or_condition, or_score = "MODERATE", 0
+        elif _or_width_pct < 0.75: or_condition, or_score = "WIDE", -1
         else: or_condition, or_score = "VERY_WIDE", -2
 
         return {"or_high": or_high, "or_low": or_low, "or_width": or_width,
@@ -909,7 +909,7 @@ class MarketDataEngine:
     # MODULE 5: TREND CONDITION (ADX)
     # ─────────────────────────────────────────────────────────────────
     def _compute_adx(self, bars: list, period: int = 14) -> tuple[float, float, float, str]:
-        if len(bars) < 2:
+        if len(bars) < 3:
             return 0.0, 0.0, 0.0, "UNKNOWN"
         trs, pdms, ndms = [], [], []
         for i in range(1, len(bars)):
@@ -919,7 +919,7 @@ class MarketDataEngine:
             pdms.append(up if (up > down and up > 0) else 0.0)
             ndms.append(down if (down > up and down > 0) else 0.0)
 
-        if len(trs) < period:
+        if len(trs) < max(period, 5):
             return 0.0, 0.0, 0.0, "UNKNOWN"
 
         def wilder_smooth(values, p):
@@ -958,10 +958,10 @@ class MarketDataEngine:
         return adx_value, pdi_last, ndi_last, direction
 
     def _classify_adx(self, adx_value: float) -> tuple[str, int]:
-        if adx_value < 22: return "FLAT", 2
-        if adx_value < 28: return "WEAK", 1
-        if adx_value < 35: return "MODERATE", 0
-        if adx_value < 42: return "STRONG", -1
+        if adx_value < 20: return "FLAT", 2
+        if adx_value < 25: return "WEAK", 1
+        if adx_value < 32: return "MODERATE", 0
+        if adx_value < 40: return "STRONG", -1
         return "VERY_STRONG", -2
 
     def _spot_vs_or(self, spot, or_high, or_low) -> tuple[str, int]:
@@ -979,15 +979,13 @@ class MarketDataEngine:
 
     def assess_trend_condition(self, candles_today: list, spot: Optional[float]) -> dict:
         n_bars = len(candles_today)
-        if n_bars < 6:
+        if n_bars < 4:
             adx_value, pdi, ndi, adx_dir = 0.0, 0.0, 0.0, "UNKNOWN"
             adx_condition, reliability = "INSUFFICIENT_DATA", "LOW"
         else:
-            reliability = "LOW" if n_bars < 15 else ("MEDIUM" if n_bars < 30 else "HIGH")
+            reliability = "LOW" if n_bars < 12 else ("MEDIUM" if n_bars < 24 else "HIGH")
             adx_value, pdi, ndi, adx_dir = self._compute_adx(candles_today, period=14)
-            if reliability == "LOW":
-                # Explicit fix vs. naive implementation: do NOT trust directional
-                # conviction from a very small, noisy bar sample.
+            if reliability == "LOW" and n_bars < 10:
                 adx_condition = "EARLY_SESSION"
                 adx_dir = "UNKNOWN"
             else:
@@ -1001,6 +999,10 @@ class MarketDataEngine:
             trend_condition, trend_score = "OR_PENDING", 0
         else:
             trend_condition, trend_score = TREND_LOOKUP.get((or_cond, adx_condition), ("UNCERTAIN", 0))
+            if adx_condition in ("EARLY_SESSION", "INSUFFICIENT_DATA") and or_cond in ("VERY_NARROW", "NARROW"):
+                trend_condition, trend_score = "RANGE_ASSUMED", 1
+            elif adx_condition in ("EARLY_SESSION", "INSUFFICIENT_DATA") and or_cond == "MODERATE":
+                trend_condition, trend_score = "UNCERTAIN", 0
             if spot_vs_or.startswith("ABOVE_OR") or spot_vs_or.startswith("BELOW_OR"):
                 try:
                     breakout_pts = float(spot_vs_or.split("_")[-1].replace("pts", ""))
@@ -1035,25 +1037,32 @@ class MarketDataEngine:
                     "high_quality_sell_day": False}
 
         sell_ok, buy_ok, sell_reduction = False, False, 1.0
-        if vrp > 5.0: vol_cond, vol_score, sell_ok = "VERY_RICH", 2, True
-        elif vrp > 3.0: vol_cond, vol_score, sell_ok = "RICH", 1, True
-        elif vrp > 1.5: vol_cond, vol_score, sell_ok, sell_reduction = "FAIR", 0, True, 0.5
+        if vrp > 4.0: vol_cond, vol_score, sell_ok = "VERY_RICH", 2, True
+        elif vrp > 2.0: vol_cond, vol_score, sell_ok = "RICH", 1, True
+        elif vrp > 0.8: vol_cond, vol_score, sell_ok, sell_reduction = "FAIR", 0, True, 0.75
         elif vrp > 0.0: vol_cond, vol_score = "THIN", -1
         elif vrp > -2.0: vol_cond, vol_score, buy_ok = "CHEAP", -2, True
         else: vol_cond, vol_score, buy_ok = "INVERTED", -3, True
 
         if vix_regime == "SUPPRESSED":
-            sell_ok = False
-            buy_ok = True
-            vol_score = min(vol_score, -1)
+            if vrp > 1.5:
+                sell_ok = True
+                sell_reduction = 0.5
+                vol_score = min(vol_score, 0)
+            else:
+                sell_ok = False
+                buy_ok = True
+                vol_score = min(vol_score, -1)
+        if vix_regime == "LOW" and vrp > 1.5:
+            sell_ok = True
 
         iv_behavior, iv_change_pct, iv_mod = "UNKNOWN", 0.0, 0.0
         if n_candles >= 6 and opening_iv and opening_iv > 0 and atm_iv and atm_iv > 0:
             iv_change_pct = (atm_iv - opening_iv) / opening_iv * 100.0
-            if iv_change_pct < -15.0: iv_behavior, iv_mod = "CRUSHING", 0.3
-            elif iv_change_pct < -5.0: iv_behavior, iv_mod = "DECLINING", 0.1
-            elif iv_change_pct <= 5.0: iv_behavior, iv_mod = "STABLE", 0.0
-            elif iv_change_pct <= 15.0:
+            if iv_change_pct < -12.0: iv_behavior, iv_mod = "CRUSHING", 0.3
+            elif iv_change_pct < -4.0: iv_behavior, iv_mod = "DECLINING", 0.1
+            elif iv_change_pct <= 4.0: iv_behavior, iv_mod = "STABLE", 0.0
+            elif iv_change_pct <= 12.0:
                 iv_behavior, iv_mod = "EXPANDING", -0.2
                 sell_reduction = min(sell_reduction, 0.75)
             else:

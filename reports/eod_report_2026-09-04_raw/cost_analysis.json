@@ -1,0 +1,23 @@
+[
+  {
+    "position_id": "87054612-717e-481c-b269-4e1c76a06832",
+    "strategy": "IRON_CONDOR",
+    "recomputed_entry_costs": {
+      "stt": 8.26,
+      "exchange": 2.68,
+      "brokerage": 80.0,
+      "sebi": 0.0075,
+      "stamp": 0.0612,
+      "gst": 14.88,
+      "total": 105.89
+    },
+    "recorded_entry_costs_rupees": 104.357986324,
+    "recorded_exit_costs_rupees": null,
+    "cost_discrepancy_rupees": null,
+    "net_pnl_rupees": null,
+    "gross_pnl_rupees": null,
+    "result": "STILL_OPEN_OR_MISSING_EXIT",
+    "hold_minutes": null,
+    "exit_reason": null
+  }
+]

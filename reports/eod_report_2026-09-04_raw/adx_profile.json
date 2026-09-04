@@ -1,0 +1,13 @@
+{
+  "adx_open": 0.0,
+  "adx_close": 0.0,
+  "adx_mean": 0.0,
+  "adx_max": 0.0,
+  "adx_min": 0.0,
+  "adx_condition_distribution": {
+    "FLAT": 1
+  },
+  "trending_cycles": 0,
+  "strong_trend_cycles": 0,
+  "flat_cycles": 1
+}
