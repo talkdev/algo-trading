@@ -693,7 +693,9 @@ class ExecutionEngine:
                     pass
 
         if strategy_type == "SELL" and position.get("entry_credit") and position["entry_credit"] > 0:
-            _credit_stop_limit = position["entry_credit"] * 2.0
+            _is_directional = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
+            _stop_multiplier = 2.5 if _is_directional else 2.0
+            _credit_stop_limit = position["entry_credit"] * _stop_multiplier
             _actual_stop = min(
                 effective_stop if effective_stop is not None else _credit_stop_limit,
                 _credit_stop_limit
@@ -740,6 +742,7 @@ class ExecutionEngine:
                 and current_premium >= position["target_value"]:
             return "CLOSE_TARGET", {"current_premium": current_premium}
 
+        _is_directional_for_lock = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
         if strategy_type == "SELL" and position.get("entry_credit"):
             entry_credit = position["entry_credit"]
             gross_credit_for_profit_pct = position.get("gross_credit") or entry_credit
@@ -748,16 +751,18 @@ class ExecutionEngine:
             lots_lock = position.get("final_lots", 1)
             entry_costs_pts = (position.get("entry_costs_rupees") or 0.0) / max(C02_lock * lots_lock, 1)
             true_breakeven_premium = entry_credit - entry_costs_pts
-            if profit_pct >= 0.20 and not position.get("stop_at_breakeven"):
+            _lock_threshold = 0.25 if _is_directional_for_lock else 0.20
+            _move_threshold = 0.55 if _is_directional_for_lock else 0.50
+            if profit_pct >= _lock_threshold and not position.get("stop_at_breakeven"):
                 lock_stop = max(true_breakeven_premium, current_premium * 1.05)
                 self.db.update("positions", {"stop_premium": lock_stop, "stop_at_breakeven": 1},
                                 {"position_id": position["position_id"]})
-                self.logger.info(f"PROFIT LOCK: {strategy_name} -> current_premium lock (profit={profit_pct*100:.0f}%)")
+                self.logger.info(f"PROFIT LOCK: {strategy_name} -> breakeven lock (profit={profit_pct*100:.0f}%)")
                 return "TIGHTEN_STOP", {}
-            if profit_pct >= 0.50 and not position.get("stop_moved_to_25pct"):
+            if profit_pct >= _move_threshold and not position.get("stop_moved_to_25pct"):
                 self.db.update("positions", {"stop_premium": entry_credit * 0.75, "stop_moved_to_25pct": 1},
                                 {"position_id": position["position_id"]})
-                self.logger.info(f"PROFIT LOCK: {strategy_name} -> 25% profit (profit={profit_pct*100:.0f}%)")
+                self.logger.info(f"PROFIT LOCK: {strategy_name} -> 25% profit lock (profit={profit_pct*100:.0f}%)")
                 return "TIGHTEN_STOP", {}
 
         vwap_dist = signals.get("vwap_dist_pct")
@@ -765,9 +770,9 @@ class ExecutionEngine:
         _now_time = now_ist().time()
         _vwap_exits_active = _now_time < _dtime(14, 30)
         if vwap_dist is not None and _vwap_exits_active:
-            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.15:
+            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.30:
                 return "CLOSE_VWAP", {"vwap_dist": vwap_dist}
-            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.15:
+            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.30:
                 return "CLOSE_VWAP", {"vwap_dist": vwap_dist}
             if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY"):
                 if vwap_dist > 0.25:
@@ -776,8 +781,10 @@ class ExecutionEngine:
                     return "CLOSE_PUT_SIDE", {"vwap_dist": vwap_dist}
 
         _now_time_cheap = now_ist().time()
-        if strategy_type == "SELL" and _now_time_cheap >= dtime(14, 30):
-            _cheap_threshold = 3.00
+        _is_directional_cheap = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
+        _cheap_time_threshold = dtime(14, 45) if _is_directional_cheap else dtime(14, 30)
+        if strategy_type == "SELL" and _now_time_cheap >= _cheap_time_threshold:
+            _cheap_threshold = 5.00 if _is_directional_cheap else 3.00
             _all_cheap = True
             for _leg_cheap in legs:
                 if _leg_cheap["leg_status"] != "OPEN" or _leg_cheap["action"] != "SELL":
@@ -790,11 +797,11 @@ class ExecutionEngine:
                     _all_cheap = False
                     break
             if _all_cheap:
-                return "CLOSE_TARGET", {"reason_detail": "all_short_legs_below_2pt_cheap_buyback"}
+                return "CLOSE_TARGET", {"reason_detail": "all_short_legs_below_threshold_cheap_buyback"}
 
         adx_value = signals.get("adx")
         if (adx_value is not None and adx_value > 30 and strategy_type == "SELL"
-                and strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")):
+                and strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY")):
             return "CLOSE_ADX", {"adx": adx_value}
 
         portfolio_delta = self._compute_portfolio_delta()
@@ -811,13 +818,16 @@ class ExecutionEngine:
             return "CLOSE_TIME", {}
 
         if strategy_type == "SELL":
+            _is_directional_delta = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
+            _delta_close_limit = 0.50 if _is_directional_delta else 0.40
+            _delta_tighten_limit = 0.42 if _is_directional_delta else 0.32
             for leg in legs:
                 if leg["action"] == "SELL" and leg["leg_status"] == "OPEN":
                     opt = chain.get(leg["strike"], {}).get(leg["option_type"], {}) if chain else {}
                     current_delta = abs(opt.get("delta", leg["entry_delta"]) or 0)
-                    if current_delta > 0.40:
+                    if current_delta > _delta_close_limit:
                         return "CLOSE_STOP", {"reason_detail": f"short_leg_delta_breach_{current_delta:.3f}"}
-                    if current_delta > 0.32 and not position.get("stop_tightened_for_delta"):
+                    if current_delta > _delta_tighten_limit and not position.get("stop_tightened_for_delta"):
                         self.db.update(
                             "positions",
                             {"stop_premium": position["stop_premium"] * 0.80, "stop_tightened_for_delta": 1},
@@ -1036,10 +1046,11 @@ class ExecutionEngine:
         state["daily_pnl"] = state.get("daily_pnl", 0.0) + net_pnl_rupees
         state["current_capital"] = state.get("current_capital", self.config.starting_capital) + net_pnl_rupees
 
-        if reason == "CLOSE_STOP":
-            state["last_stop_time"] = now_ist().isoformat()
-            state["last_stop_reason"] = reason
-            state["consecutive_stops"] = state.get("consecutive_stops", 0) + 1
+        if reason in ("CLOSE_STOP", "SHUTDOWN_CLOSE", "EOD_CLOSE", "HARD_EXIT_15:00"):
+            if reason == "CLOSE_STOP":
+                state["last_stop_time"] = now_ist().isoformat()
+                state["last_stop_reason"] = reason
+                state["consecutive_stops"] = state.get("consecutive_stops", 0) + 1
             _open_pos_list = self._get_open_positions()
             if not _open_pos_list:
                 from market_data_engine import MarketDataEngine as _MDE
@@ -1052,7 +1063,10 @@ class ExecutionEngine:
         elif reason in ("CLOSE_ADX", "CLOSE_VWAP", "CLOSE_DELTA"):
             state["last_stop_time"] = now_ist().isoformat()
             state["last_stop_reason"] = reason
-            CLOSE_DELTA_cooldown = True
+        elif reason in ("SHUTDOWN_CLOSE", "EOD_CLOSE", "HARD_EXIT_15:00", "SELF_TEST_CLEANUP"):
+            state["consecutive_stops"] = 0
+            current_entry_count = state.get("entry_count", 1)
+            state["entry_count"] = max(0, current_entry_count - 1)
         else:
             state["consecutive_stops"] = 0
             if reason == "CLOSE_TARGET":
@@ -1065,6 +1079,9 @@ class ExecutionEngine:
                 state["daily_halted"] = True
                 self.logger.warning(f"DAILY LOSS LIMIT: {daily_loss_pct*100:.2f}% — halting trading")
 
+        self.db.update("session_state",
+            {"daily_pnl": state["daily_pnl"], "current_capital": state["current_capital"]},
+            {"trading_date": today_ist().isoformat()})
         self.market_engine._save_session_state()
 
     def close_all_positions(self, reason: str) -> None:

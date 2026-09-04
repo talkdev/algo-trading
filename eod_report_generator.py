@@ -174,6 +174,90 @@ def fetch_chain_atm_history(conn, d):
     return q(conn, "SELECT capture_time, strike, option_type, bid, ask, ltp, iv, delta, oi, volume FROM option_chain_snapshot WHERE trading_date=? AND ABS(delta) BETWEEN 0.35 AND 0.65 ORDER BY capture_time, strike", (d,))
 
 
+def fetch_intraday_candles(conn, d):
+    if not table_exists(conn, "intraday_candles"):
+        return []
+    return q(conn, "SELECT candle_time, open, high, low, close, volume FROM intraday_candles WHERE trading_date=? AND interval_min=1 ORDER BY candle_time", (d,))
+
+
+def compute_candle_statistics(candles):
+    if not candles:
+        return {}
+    closes = [c["close"] for c in candles if c.get("close")]
+    highs = [c["high"] for c in candles if c.get("high")]
+    lows = [c["low"] for c in candles if c.get("low")]
+    volumes = [c["volume"] for c in candles if c.get("volume")]
+    if not closes:
+        return {}
+    ranges = [c["high"] - c["low"] for c in candles if c.get("high") and c.get("low")]
+    result = {
+        "total_1min_bars": len(candles),
+        "first_bar_time": candles[0]["candle_time"] if candles else None,
+        "last_bar_time": candles[-1]["candle_time"] if candles else None,
+        "open": closes[0] if closes else None,
+        "close": closes[-1] if closes else None,
+        "high": max(highs) if highs else None,
+        "low": min(lows) if lows else None,
+        "total_volume": sum(volumes) if volumes else 0,
+        "avg_bar_range_pts": round(statistics.mean(ranges), 3) if ranges else None,
+        "max_bar_range_pts": round(max(ranges), 3) if ranges else None,
+        "zero_volume_bars": sum(1 for v in volumes if v == 0),
+    }
+    if len(closes) >= 2:
+        result["net_change_pts"] = round(closes[-1] - closes[0], 2)
+        result["net_change_pct"] = round((closes[-1] - closes[0]) / closes[0] * 100, 3)
+    return result
+
+
+def fetch_cumulative_performance(conn, d, lookback_days=90):
+    if not table_exists(conn, "daily_summary"):
+        return []
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    except Exception:
+        return []
+    return q(conn, "SELECT * FROM daily_summary WHERE trading_date >= ? AND trading_date <= ? ORDER BY trading_date", (cutoff, d))
+
+
+def compute_equity_curve(cumulative_days):
+    if not cumulative_days:
+        return {}
+    pnls = [d.get("net_pnl_rupees") or 0 for d in cumulative_days]
+    capital = [d.get("capital_end") for d in cumulative_days if d.get("capital_end")]
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p < 0)
+    total_pnl = sum(pnls)
+    gross_wins = sum(p for p in pnls if p > 0)
+    gross_losses = abs(sum(p for p in pnls if p < 0))
+    max_dd = 0.0
+    if len(capital) >= 2:
+        peak = capital[0]
+        for c in capital:
+            if c > peak:
+                peak = c
+            dd = peak - c
+            if dd > max_dd:
+                max_dd = dd
+    return {
+        "total_trading_days": len(cumulative_days),
+        "profitable_days": wins,
+        "loss_days": losses,
+        "flat_days": len(cumulative_days) - wins - losses,
+        "day_win_rate_pct": round(wins / len(cumulative_days) * 100, 1) if cumulative_days else 0,
+        "total_pnl_rupees": round(total_pnl, 2),
+        "avg_daily_pnl_rupees": round(total_pnl / len(cumulative_days), 2) if cumulative_days else 0,
+        "gross_wins_rupees": round(gross_wins, 2),
+        "gross_losses_rupees": round(gross_losses, 2),
+        "profit_factor": round(gross_wins / gross_losses, 3) if gross_losses > 0 else None,
+        "max_drawdown_rupees": round(max_dd, 2),
+        "capital_start": capital[0] if capital else None,
+        "capital_end": capital[-1] if capital else None,
+        "total_return_pct": round((capital[-1] - capital[0]) / capital[0] * 100, 3) if len(capital) >= 2 else 0,
+        "daily_pnl_series": [{"date": d.get("trading_date"), "pnl": d.get("net_pnl_rupees"), "capital": d.get("capital_end")} for d in cumulative_days],
+    }
+
+
 def fetch_chain_wing_history(conn, d):
     if not table_exists(conn, "option_chain_snapshot"):
         return []
@@ -254,7 +338,7 @@ def analyze_trade_costs(trade_entries, trade_exits):
             "recomputed_entry_costs": breakdown,
             "recorded_entry_costs_rupees": t.get("entry_costs_rupees"),
             "recorded_exit_costs_rupees": exit_row.get("exit_costs_rupees") if exit_row else None,
-            "cost_discrepancy_rupees": cost_discrepancy,
+            "cost_discrepancy_entry_only_rupees": cost_discrepancy,
             "net_pnl_rupees": exit_row.get("net_pnl_rupees") if exit_row else None,
             "gross_pnl_rupees": exit_row.get("gross_pnl_rupees") if exit_row else None,
             "result": exit_row.get("result") if exit_row else "STILL_OPEN_OR_MISSING_EXIT",
@@ -746,6 +830,8 @@ def generate_report(target_date):
     prior_exits = fetch_all_exits_for_strategy_analysis(conn, target_date, lookback_days=30)
     chain_atm_history = fetch_chain_atm_history(conn, target_date)
     chain_wing_history = fetch_chain_wing_history(conn, target_date)
+    intraday_candles = fetch_intraday_candles(conn, target_date)
+    cumulative_days = fetch_cumulative_performance(conn, target_date, lookback_days=90)
 
     conn.close()
 
@@ -766,6 +852,8 @@ def generate_report(target_date):
     pnl_curve = compute_pnl_curve(cycle_rows)
     gate_analysis = compute_gate_blockage_analysis(decisions, cycle_rows)
     nifty_benchmarks = compute_nifty_intraday_benchmarks(cycle_rows, trade_exits)
+    candle_stats = compute_candle_statistics(intraday_candles)
+    equity_curve = compute_equity_curve(cumulative_days)
     anomalies = detect_anomalies(session_state, cycle_rows, api_summary, gaps, daily_summary, decisions, trade_exits, vrp_stats, spot_profile)
     timeline = build_master_timeline(cycle_rows, decisions, trade_entries, trade_exits, audit_file_lines)
     warning_error_lines = filter_log_lines_by_level(audit_file_lines, {"WARNING", "ERROR", "CRITICAL"})
@@ -948,7 +1036,7 @@ def generate_report(target_date):
             md.append("\n**Recomputed cost breakdown (independent cross-check):**\n")
             md.append(md_kv(cost_row["recomputed_entry_costs"]))
             md.append(f"- Recorded entry costs (Rs): {cost_row['recorded_entry_costs_rupees']}\n")
-            md.append(f"- Cost discrepancy (Rs): {cost_row['cost_discrepancy_rupees']}\n")
+            md.append(f"- Cost discrepancy entry-only (Rs): {cost_row.get('cost_discrepancy_entry_only_rupees', cost_row.get('cost_discrepancy_rupees', 'N/A'))}\n")
 
     md.append("## 14. Exit Reason Analysis\n")
     if exit_reason_analysis:
@@ -977,6 +1065,10 @@ def generate_report(target_date):
     md.append("## 18. Option Chain Statistics\n")
     md.append(md_kv(chain_summary))
     md.append(f"\n_Full chain ({len(chain_rows)} rows) in raw JSON export._\n")
+
+    md.append("## 18b. Intraday 1-Minute Candle Statistics\n")
+    md.append(md_kv(candle_stats) if candle_stats else "_No intraday candle data stored for this date._\n")
+    md.append(f"\n_Total 1-min bars in DB: {len(intraday_candles)}. Used for ADX, VWAP, Parkinson RV, OR. Stored permanently._\n")
 
     md.append("## 19. ATM IV Intraday History\n")
     if chain_atm_history:
@@ -1007,9 +1099,18 @@ def generate_report(target_date):
         "Timing gaps (>10min) in cycle_log": len(gaps),
         "Trades with no matching exit row": sum(1 for t in trade_entries if t["position_id"] not in exits_by_position),
         "Positions still OPEN at report time": sum(1 for p in positions if p.get("status") == "OPEN"),
-        "Cost discrepancies detected": sum(1 for c in cost_analysis if c.get("cost_discrepancy_rupees") and abs(c["cost_discrepancy_rupees"]) > 10),
+        "Cost discrepancies detected (entry only, >Rs2)": sum(1 for c in cost_analysis if c.get("cost_discrepancy_entry_only_rupees") and c["cost_discrepancy_entry_only_rupees"] > 2.0),
     }
     md.append(md_kv(dq))
+
+    md.append("## 21b. Cumulative Engine Performance (90-day equity curve)\n")
+    if equity_curve:
+        md.append(md_kv({k: v for k, v in equity_curve.items() if k != "daily_pnl_series"}))
+        if equity_curve.get("daily_pnl_series"):
+            md.append("\n**Daily P&L Series:**\n")
+            md.append(md_table(equity_curve["daily_pnl_series"], ["date", "pnl", "capital"], max_rows=90))
+    else:
+        md.append("_No cumulative data yet — needs at least 1 completed day with daily_summary._\n")
 
     md.append("## 22. Historical Performance (30-day lookback)\n")
     if historical_perf:
@@ -1105,6 +1206,9 @@ def generate_report(target_date):
         "nifty_benchmarks": nifty_benchmarks,
         "chain_atm_history": chain_atm_history,
         "chain_wing_history": chain_wing_history,
+        "intraday_candles_1min": intraday_candles,
+        "candle_statistics": candle_stats,
+        "cumulative_performance_90d": equity_curve,
         "api_summary": {k: v for k, v in api_summary.items() if k != "errors_sample"},
     }
     for name, data in raw_exports.items():
