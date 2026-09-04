@@ -119,6 +119,29 @@ class MainEngine:
             return earliest["capital_at_entry"]
         return self.market_engine.state.get("current_capital", self.config.starting_capital)
 
+    def _reconcile_open_positions_on_startup(self) -> None:
+        today_str = today_ist().isoformat()
+        open_positions = self.execution_engine._get_open_positions()
+        if not open_positions:
+            return
+        self.logger.info(
+            f"STARTUP RECONCILIATION: {len(open_positions)} open position(s) found"
+        )
+        for pos in open_positions:
+            if pos["trading_date"] != today_str:
+                self.logger.warning(
+                    f"Closing stale prior-day position: "
+                    f"{pos['strategy_name']} from {pos['trading_date']}"
+                )
+                self.execution_engine.execute_close(
+                    pos, "STALE_PRIOR_DAY_CLOSE"
+                )
+            else:
+                self.logger.info(
+                    f"Resuming today's open position: "
+                    f"{pos['strategy_name']} {pos['position_id'][:16]}..."
+                )
+
     def _carry_forward_capital(self) -> None:
         """
         File 2 initializes a brand-new day's session_state row with
@@ -412,9 +435,17 @@ class MainEngine:
         self.logger.info("Graceful shutdown initiated")
         open_positions = self.execution_engine._get_open_positions()
         if open_positions:
-            self.logger.info(f"Shutdown: closing {len(open_positions)} open position(s)")
-            self.execution_engine.close_all_positions("SHUTDOWN_CLOSE")
+            self.logger.info(
+                f"Shutdown: {len(open_positions)} open position(s) will remain open. "
+                f"Engine will resume monitoring them on next start."
+            )
         self.market_engine._save_session_state()
+        self.logger.info(
+            f"Session state saved. entry_count={self.market_engine.state.get('entry_count', 0)}, "
+            f"daily_pnl={self.market_engine.state.get('daily_pnl', 0)}, "
+            f"open_positions={len(open_positions) if open_positions else 0}. "
+            f"Restart engine to resume."
+        )
         self.logger.info("Shutdown complete.")
         self.db.close()
 
@@ -449,6 +480,7 @@ class MainEngine:
             return
 
         self._verify_lot_size()
+        self._reconcile_open_positions_on_startup()
         self._carry_forward_capital()
 
         while self.running:

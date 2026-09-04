@@ -162,6 +162,7 @@ class MarketDataEngine:
         self.logger = logger
         self.holidays = load_nse_holidays()
 
+        self._ensure_intraday_candles_table()
         for col, coltype in SESSION_STATE_EXTRA_COLUMNS:
             ensure_column(self.db, "session_state", col, coltype)
 
@@ -172,10 +173,131 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     # SESSION STATE (persisted)
     # ─────────────────────────────────────────────────────────────────
+    def _ensure_intraday_candles_table(self) -> None:
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS intraday_candles "
+            "(candle_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "trading_date TEXT, candle_time TEXT, interval_min INTEGER DEFAULT 1, "
+            "open REAL, high REAL, low REAL, close REAL, volume INTEGER, source TEXT)"
+        )
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_intraday_candles_unique "
+            "ON intraday_candles(trading_date, candle_time, interval_min)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_intraday_candles_date "
+            "ON intraday_candles(trading_date)"
+        )
+
+    def _persist_candles_to_db(self, bars_1m: list, trading_date: str) -> None:
+        if not bars_1m:
+            return
+        rows = []
+        for b in bars_1m:
+            if b.get("timestamp") is None:
+                continue
+            rows.append((
+                trading_date,
+                b["timestamp"].isoformat(),
+                1,
+                b["open"], b["high"], b["low"], b["close"],
+                b.get("volume", 0),
+                "upstox_intraday",
+            ))
+        if rows:
+            try:
+                self.db.executemany(
+                    "INSERT OR IGNORE INTO intraday_candles "
+                    "(trading_date, candle_time, interval_min, open, high, low, close, volume, source) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    rows,
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not persist intraday candles: {e}")
+
+    def _load_candles_from_db_today(self, trading_date: str) -> list:
+        try:
+            rows = self.db.query(
+                "SELECT candle_time, open, high, low, close, volume FROM intraday_candles "
+                "WHERE trading_date=? AND interval_min=1 ORDER BY candle_time",
+                (trading_date,),
+            )
+            bars = []
+            for r in rows:
+                ts = parse_ist_timestamp(r["candle_time"])
+                if ts is None:
+                    continue
+                bars.append({
+                    "timestamp": ts,
+                    "open": r["open"], "high": r["high"],
+                    "low": r["low"], "close": r["close"],
+                    "volume": r["volume"] or 0,
+                })
+            return bars
+        except Exception as e:
+            self.logger.warning(f"Could not load candles from DB: {e}")
+            return []
+
+    def _load_historical_candles_from_db(self, n: int = 5) -> dict:
+        today = today_ist()
+        try:
+            date_rows = self.db.query(
+                "SELECT DISTINCT trading_date FROM intraday_candles "
+                "WHERE trading_date < ? AND interval_min=1 "
+                "ORDER BY trading_date DESC LIMIT ?",
+                (today.isoformat(), n),
+            )
+            result = {}
+            for dr in date_rows:
+                date_str = dr["trading_date"]
+                candle_rows = self.db.query(
+                    "SELECT candle_time, open, high, low, close, volume "
+                    "FROM intraday_candles WHERE trading_date=? AND interval_min=1 "
+                    "ORDER BY candle_time",
+                    (date_str,),
+                )
+                bars = []
+                for cr in candle_rows:
+                    ts = parse_ist_timestamp(cr["candle_time"])
+                    if ts is None:
+                        continue
+                    bars.append({
+                        "timestamp": ts,
+                        "open": cr["open"], "high": cr["high"],
+                        "low": cr["low"], "close": cr["close"],
+                        "volume": cr["volume"] or 0,
+                    })
+                if bars:
+                    from datetime import date as _date
+                    result[_date.fromisoformat(date_str)] = bars
+            return result
+        except Exception as e:
+            self.logger.warning(f"Could not load historical candles from DB: {e}")
+            return {}
+
     def _load_or_init_session_state(self) -> dict:
         today_str = today_ist().isoformat()
         row = self.db.query_one("SELECT * FROM session_state WHERE trading_date=?", (today_str,))
-        if row:
+        if row is not None:
+            actual_entries = self.db.query_one(
+                "SELECT COUNT(*) as cnt FROM positions WHERE trading_date=? "
+                "AND status IN ('OPEN', 'CLOSED')",
+                (today_str,),
+            )
+            if actual_entries:
+                db_count = actual_entries["cnt"]
+                if row.get("entry_count", 0) != db_count:
+                    self.logger.info(
+                        f"Correcting entry_count on load: "
+                        f"{row.get('entry_count', 0)} -> {db_count} "
+                        f"(based on actual OPEN+CLOSED positions in DB)"
+                    )
+                    row["entry_count"] = db_count
+                    self.db.update(
+                        "session_state",
+                        {"entry_count": db_count},
+                        {"trading_date": today_str},
+                    )
             for boolcol in ("daily_halted", "circuit_breaker_suspected", "vix_spike_detected",
                              "event_announced", "or_computed", "session_initialized", "vwap_valid",
                              "paper_trade_mode", "stop_at_breakeven", "stop_moved_to_25pct"):
@@ -223,7 +345,12 @@ class MarketDataEngine:
     def reset_if_new_day(self) -> None:
         today_str = today_ist().isoformat()
         if self.state.get("trading_date") != today_str:
-            self.logger.info(f"New trading day detected: {today_str} — resetting session state.")
+            self.logger.info(
+                f"New trading day detected: {today_str} — "
+                f"previous day was {self.state.get('trading_date')}. "
+                f"Initializing fresh session state for new day."
+            )
+            self._close_any_stale_prior_day_positions(self.state.get("trading_date"))
             self.state = self._load_or_init_session_state()
             self.last_chain: dict = {}
             self.last_chain_expiry = None
@@ -344,7 +471,21 @@ class MarketDataEngine:
                 continue
             bars_1m.append(b)
         bars_1m.sort(key=lambda x: x["timestamp"])
-        return self._resample_to_5min(bars_1m)
+        trading_date = today_ist().isoformat()
+        self._persist_candles_to_db(bars_1m, trading_date)
+        db_bars = self._load_candles_from_db_today(trading_date)
+        merged = {}
+        for b in db_bars:
+            if b["timestamp"] is not None:
+                merged[b["timestamp"]] = b
+        for b in bars_1m:
+            if b["timestamp"] is not None:
+                merged[b["timestamp"]] = b
+        session_bars = [
+            b for b in sorted(merged.values(), key=lambda x: x["timestamp"])
+            if dtime(9, 15) <= b["timestamp"].time() <= dtime(15, 29)
+        ]
+        return self._resample_to_5min(session_bars)
 
     def _get_prev_close(self) -> Optional[float]:
         today = today_ist()
@@ -425,9 +566,12 @@ class MarketDataEngine:
     def _compute_parkinson_rv_fresh(self, vix: Optional[float]) -> tuple[float, str]:
         try:
             session_bars = self._fetch_last_n_complete_sessions_5min(n=5)
+            if not session_bars:
+                self.logger.info("Parkinson RV: API returned no bars, trying DB cache")
+                session_bars = self._load_historical_candles_from_db(n=5)
         except Exception as e:
-            self.logger.warning(f"Parkinson RV: historical fetch failed ({e}), using VIX proxy")
-            session_bars = {}
+            self.logger.warning(f"Parkinson RV: historical fetch failed ({e}), trying DB cache")
+            session_bars = self._load_historical_candles_from_db(n=5)
 
         all_bars = [b for bars in session_bars.values() for b in bars]
         valid_bars = [b for b in all_bars
@@ -711,7 +855,7 @@ class MarketDataEngine:
     # MODULE 1: PRE-SESSION ASSESSMENT (re-run every 30 minutes)
     # ─────────────────────────────────────────────────────────────────
     def _compute_base_regime(self, vix: float) -> str:
-        if vix < 10.0: return "SUPPRESSED"
+        if vix < 10.5: return "SUPPRESSED"
         if vix < 14.0: return "LOW"
         if vix < 18.0: return "NORMAL"
         if vix < 24.0: return "ELEVATED"
@@ -719,7 +863,7 @@ class MarketDataEngine:
 
     def _compute_regime_with_hysteresis(self, vix: float, prev_regime: str) -> str:
         bands = {
-            "SUPPRESSED": (None, 10.5), "LOW": (9.5, 13.5), "NORMAL": (12.5, 18.5),
+            "SUPPRESSED": (None, 11.0), "LOW": (10.0, 14.5), "NORMAL": (13.5, 18.5),
             "ELEVATED": (17.5, 24.5), "HIGH": (23.5, None),
         }
         if prev_regime in bands:
@@ -1045,7 +1189,7 @@ class MarketDataEngine:
         else: vol_cond, vol_score, buy_ok = "INVERTED", -3, True
 
         if vix_regime == "SUPPRESSED":
-            if vrp > 1.5:
+            if vrp > 2.0:
                 sell_ok = True
                 sell_reduction = 0.5
                 vol_score = min(vol_score, 0)
@@ -1053,8 +1197,6 @@ class MarketDataEngine:
                 sell_ok = False
                 buy_ok = True
                 vol_score = min(vol_score, -1)
-        if vix_regime == "LOW" and vrp > 1.5:
-            sell_ok = True
 
         iv_behavior, iv_change_pct, iv_mod = "UNKNOWN", 0.0, 0.0
         if n_candles >= 6 and opening_iv and opening_iv > 0 and atm_iv and atm_iv > 0:

@@ -1,40 +1,19 @@
 [
   {
-    "position_id": "87054612-717e-481c-b269-4e1c76a06832",
-    "strategy": "IRON_CONDOR",
+    "position_id": "52c64b75-3ded-4313-a5fd-2b5dc118bdcb",
+    "strategy": "BULL_PUT_SPREAD",
     "recomputed_entry_costs": {
-      "stt": 8.26,
-      "exchange": 2.68,
-      "brokerage": 80.0,
-      "sebi": 0.0075,
-      "stamp": 0.0612,
-      "gst": 14.88,
-      "total": 105.89
+      "stt": 9.16,
+      "exchange": 3.11,
+      "brokerage": 40.0,
+      "sebi": 0.0088,
+      "stamp": 0.0796,
+      "gst": 7.76,
+      "total": 60.12
     },
-    "recorded_entry_costs_rupees": 104.357986324,
+    "recorded_entry_costs_rupees": 58.153184736,
     "recorded_exit_costs_rupees": null,
-    "cost_discrepancy_rupees": null,
-    "net_pnl_rupees": null,
-    "gross_pnl_rupees": null,
-    "result": "STILL_OPEN_OR_MISSING_EXIT",
-    "hold_minutes": null,
-    "exit_reason": null
-  },
-  {
-    "position_id": "df87a016-3093-429c-949d-089f4905918b",
-    "strategy": "IRON_CONDOR",
-    "recomputed_entry_costs": {
-      "stt": 8.29,
-      "exchange": 2.69,
-      "brokerage": 80.0,
-      "sebi": 0.0076,
-      "stamp": 0.0613,
-      "gst": 14.89,
-      "total": 105.93
-    },
-    "recorded_entry_costs_rupees": 104.39689601299999,
-    "recorded_exit_costs_rupees": null,
-    "cost_discrepancy_rupees": null,
+    "cost_discrepancy_entry_only_rupees": null,
     "net_pnl_rupees": null,
     "gross_pnl_rupees": null,
     "result": "STILL_OPEN_OR_MISSING_EXIT",
