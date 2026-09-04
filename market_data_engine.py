@@ -173,6 +173,28 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     # SESSION STATE (persisted)
     # ─────────────────────────────────────────────────────────────────
+    def compute_max_pain(self, chain: dict) -> float:
+        if not chain:
+            return 0.0
+        strikes = sorted(chain.keys())
+        if len(strikes) < 5:
+            return 0.0
+        min_pain_strike = strikes[0]
+        min_pain_value = float("inf")
+        for test_strike in strikes:
+            total_pain = 0.0
+            for strike, legs in chain.items():
+                call_oi = legs.get("call", {}).get("oi", 0) or 0
+                put_oi = legs.get("put", {}).get("oi", 0) or 0
+                if test_strike > strike:
+                    total_pain += call_oi * (test_strike - strike)
+                if test_strike < strike:
+                    total_pain += put_oi * (strike - test_strike)
+            if total_pain < min_pain_value:
+                min_pain_value = total_pain
+                min_pain_strike = test_strike
+        return min_pain_strike
+
     def _ensure_intraday_candles_table(self) -> None:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS intraday_candles "
@@ -1313,10 +1335,23 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     # PERSISTENCE
     # ─────────────────────────────────────────────────────────────────
-    def _persist_option_chain_snapshot(self, chain: dict, expiry: Optional[date]) -> None:
+    def _persist_option_chain_snapshot(self, chain: dict, expiry: Optional[date], signals: Optional[dict] = None) -> None:
         if not chain or not expiry:
             return
         capture_time, trading_date = now_ist().isoformat(), today_ist().isoformat()
+        latest_cycle = self.db.query_one(
+            "SELECT cycle_id FROM cycle_log WHERE trading_date=? ORDER BY cycle_id DESC LIMIT 1",
+            (trading_date,),
+        )
+        cycle_id_val = latest_cycle["cycle_id"] if latest_cycle else None
+        _spot = signals.get("spot") if signals else self.state.get("prev_spot")
+        _vix = signals.get("vix") if signals else self.state.get("prev_vix")
+        _vrp = signals.get("vrp") if signals else None
+        _adx = signals.get("adx") if signals else None
+        _vwap_dist = signals.get("vwap_dist_pct") if signals else None
+        _trend = signals.get("trend_condition") if signals else None
+        _vol_cond = signals.get("volatility_condition") if signals else None
+        _direction = signals.get("direction") if signals else None
         rows = []
         for strike, legs in chain.items():
             for opt_type in ("call", "put"):
@@ -1328,18 +1363,41 @@ class MarketDataEngine:
                     leg.get("bid", 0), leg.get("ask", 0), leg.get("ltp", 0),
                     leg.get("oi", 0), leg.get("volume", 0), leg.get("iv", 0), leg.get("delta", 0),
                     leg.get("gamma", 0), leg.get("theta", 0), leg.get("vega", 0), leg.get("timestamp"),
+                    cycle_id_val, _spot, _vix, _vrp, _adx, _vwap_dist, _trend, _vol_cond, _direction,
                 ))
         if rows:
             self.db.executemany(
                 """INSERT INTO option_chain_snapshot
                    (capture_time, trading_date, expiry, strike, option_type, bid, ask, ltp,
-                    oi, volume, iv, delta, gamma, theta, vega, data_timestamp)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    oi, volume, iv, delta, gamma, theta, vega, data_timestamp,
+                    cycle_id, spot_at_capture, vix_at_capture, vrp_at_capture,
+                    adx_at_capture, vwap_dist_at_capture, trend_condition_at_capture,
+                    volatility_condition_at_capture, direction_at_capture)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 rows,
             )
             self.logger.debug(f"Persisted {len(rows)} option_chain_snapshot rows for {expiry}")
 
     def _persist_cycle_log(self, s: dict) -> None:
+        _open_pos = self.db.query(
+            "SELECT position_id FROM positions WHERE trading_date=? AND status='OPEN'",
+            (s["trading_date"],),
+        )
+        _open_pos_ids = json.dumps([r["position_id"] for r in _open_pos])
+        _atm_straddle = None
+        _chain = self.last_chain
+        _spot = s.get("spot")
+        if _chain and _spot:
+            _step = 50
+            _atm = round(_spot / _step) * _step
+            if _atm not in _chain:
+                _atm = min(_chain.keys(), key=lambda k: abs(k - _spot))
+            _c = _chain.get(_atm, {}).get("call", {})
+            _p = _chain.get(_atm, {}).get("put", {})
+            _c_mid = (_c.get("bid", 0) + _c.get("ask", 0)) / 2.0 if (_c.get("bid", 0) > 0 and _c.get("ask", 0) > 0) else _c.get("ltp", 0)
+            _p_mid = (_p.get("bid", 0) + _p.get("ask", 0)) / 2.0 if (_p.get("bid", 0) > 0 and _p.get("ask", 0) > 0) else _p.get("ltp", 0)
+            if _c_mid > 0 and _p_mid > 0:
+                _atm_straddle = round(_c_mid + _p_mid, 2)
         self.db.insert("cycle_log", {
             "cycle_time": now_ist().isoformat(), "trading_date": s["trading_date"],
             "spot": s["spot"], "vix": s["vix"], "vrp": s["vrp"],
@@ -1357,6 +1415,10 @@ class MarketDataEngine:
             "conditions_not_met_json": json.dumps(s.get("conditions_not_met", {})),
             "open_positions": 0, "daily_pnl_net": s.get("daily_pnl", 0.0),
             "vix_regime": s["vix_regime"], "day_mode": s["day_mode"],
+            "open_position_ids": _open_pos_ids,
+            "vrp_percentile": s.get("vrp_percentile"),
+            "max_pain": s.get("max_pain"),
+            "atm_straddle_price": _atm_straddle,
             "raw_json": json.dumps({k: v for k, v in s.items() if k != "atm_greeks"}, default=str),
         })
 
@@ -1490,18 +1552,26 @@ class MarketDataEngine:
         skew = self.compute_skew_ratio(put_iv, call_iv)
 
         if atm_iv is not None and dte is not None and spot is not None:
-            dte_wing_map = {0: 50, 1: 75, 2: 100, 3: 100, 4: 150, 5: 150, 6: 200, 7: 200, 8: 250}
-            vix_wing_mult = {"SUPPRESSED": 0.8, "LOW": 1.0, "NORMAL": 1.0,
-                             "ELEVATED": 1.3, "HIGH": 1.6}.get(self.state.get("vix_regime", "NORMAL"), 1.0)
-            wing_dte_vix_combined = True
-            if dte in dte_wing_map:
-                base_wing = dte_wing_map[dte]
-                step = self.config.nifty_strike_step
-                adjusted = int(round((base_wing * vix_wing_mult) / step) * step)
-                self.state["wing_width"] = max(50, min(adjusted, 500))
+            step = self.config.nifty_strike_step
+            atm_strike = round(spot / step) * step
+            if atm_strike not in chain:
+                atm_strike = min(chain.keys(), key=lambda k: abs(k - spot)) if chain else atm_strike
+            _atm_call = chain.get(atm_strike, {}).get("call", {}) if chain else {}
+            _atm_put = chain.get(atm_strike, {}).get("put", {}) if chain else {}
+            _call_mid = (_atm_call.get("bid", 0) + _atm_call.get("ask", 0)) / 2.0 if (_atm_call.get("bid", 0) > 0 and _atm_call.get("ask", 0) > 0) else _atm_call.get("ltp", 0)
+            _put_mid = (_atm_put.get("bid", 0) + _atm_put.get("ask", 0)) / 2.0 if (_atm_put.get("bid", 0) > 0 and _atm_put.get("ask", 0) > 0) else _atm_put.get("ltp", 0)
+            _straddle_price = _call_mid + _put_mid
+            if _straddle_price > 20:
+                _raw_wing = _straddle_price * 0.85
+                _computed_wing = int(round(_raw_wing / step) * step)
+                self.state["wing_width"] = max(100, min(_computed_wing, 400))
+                self.logger.debug(
+                    f"Wing width from straddle: straddle={_straddle_price:.1f} "
+                    f"raw_wing={_raw_wing:.1f} final={self.state['wing_width']}"
+                )
             else:
                 expected_move = spot * atm_iv * ((max(dte, 1) / 365.0) ** 0.5)
-                computed_wing = int(round((expected_move * 0.60) / self.config.nifty_strike_step) * self.config.nifty_strike_step)
+                computed_wing = int(round((expected_move * 0.70) / step) * step)
                 self.state["wing_width"] = max(100, min(computed_wing, 400))
 
         current_time = now_ist().time()
@@ -1562,6 +1632,7 @@ class MarketDataEngine:
 
         atm_greeks = self._get_atm_greeks(chain, spot)
 
+        max_pain = self.compute_max_pain(chain) if chain else 0.0
         signals = {
             "trading_date": trading_date, "spot": spot, "vix": vix,
             "intraday_rv_selling_veto": intraday_rv_selling_veto,
@@ -1585,6 +1656,7 @@ class MarketDataEngine:
             "entry_start": self.state.get("entry_start"), "entry_end": self.state.get("entry_end"),
             "hard_exit_time": self.state.get("hard_exit_time"), "atm_greeks": atm_greeks,
             "chain_size": len(chain), "active_expiry": expiry.isoformat() if expiry else None,
+            "max_pain": max_pain,
             "actual_dte": dte, "daily_pnl": self.state.get("daily_pnl", 0.0),
             "current_capital": self.state.get("current_capital", self.config.starting_capital),
         }
@@ -1593,8 +1665,8 @@ class MarketDataEngine:
         signals["conditions_met"], signals["conditions_not_met"] = met, not_met
 
         self._save_session_state()
-        self._persist_option_chain_snapshot(chain, expiry)
         self._persist_cycle_log(signals)
+        self._persist_option_chain_snapshot(chain, expiry, signals)
         self._display_cycle_console(signals)
 
         return signals

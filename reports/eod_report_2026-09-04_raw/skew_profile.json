@@ -1,8 +1,8 @@
 {
   "skew_open": 1.021,
-  "skew_close": 1.029,
-  "skew_mean": 1.038,
-  "skew_min": 1.021,
+  "skew_close": 1.038,
+  "skew_mean": 1.032,
+  "skew_min": 1.015,
   "skew_max": 1.066,
   "fear_skew_cycles": 0,
   "complacent_skew_cycles": 0
