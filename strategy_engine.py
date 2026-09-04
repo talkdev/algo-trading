@@ -260,8 +260,19 @@ class StrategyEngine:
         if state.get("entry_count", 0) >= self.config.max_entries_per_day:
             return "NO_TRADE", "max_entries_per_day_reached"
 
-        if self._count_open_positions() >= self.config.max_concurrent_positions:
+        open_count = self._count_open_positions()
+        if open_count >= self.config.max_concurrent_positions:
             return "NO_TRADE", "max_concurrent_positions_reached"
+        if open_count >= 1:
+            existing = self.db.query(
+                "SELECT strategy_name FROM positions WHERE trading_date=? AND status='OPEN'",
+                (today_ist().isoformat(),),
+            )
+            existing_strategies = [r["strategy_name"] for r in existing]
+            if existing_strategies.count("IRON_CONDOR") >= 1:
+                return "NO_TRADE", "iron_condor_already_open_no_duplicate"
+            if existing_strategies.count("IRON_BUTTERFLY") >= 1:
+                return "NO_TRADE", "iron_butterfly_already_open_no_duplicate"
 
         if state.get("consecutive_stops", 0) >= 3:
             return "NO_TRADE", "3_consecutive_stops_today_halt"
@@ -285,6 +296,14 @@ class StrategyEngine:
                 minutes_since = required_cooldown
             if minutes_since < required_cooldown:
                 return "NO_TRADE", f"stop_cooldown_{required_cooldown - minutes_since:.0f}min_remaining"
+        last_entry_time = state.get("last_entry_time")
+        if last_entry_time and self._count_open_positions() == 0:
+            try:
+                mins_since_entry = (now_ist() - datetime.fromisoformat(last_entry_time)).total_seconds() / 60.0
+                if mins_since_entry < 15:
+                    return "NO_TRADE", f"entry_cooldown_{15 - mins_since_entry:.0f}min_remaining_after_last_entry"
+            except Exception:
+                pass
 
         if s["volatility_condition"] == "UNKNOWN":
             return "NO_TRADE", "vrp_unknown_insufficient_data"

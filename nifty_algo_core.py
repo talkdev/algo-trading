@@ -433,7 +433,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 0)),
 
         max_concurrent_positions=_get_int(env, "MAX_CONCURRENT_POSITIONS", 2),
-        max_entries_per_day=_get_int(env, "MAX_ENTRIES_PER_DAY", 2),
+        max_entries_per_day=_get_int(env, "MAX_ENTRIES_PER_DAY", 3),
 
         high_impact_events=load_high_impact_events(),
 
@@ -532,6 +532,7 @@ CREATE TABLE IF NOT EXISTS session_state (
     consecutive_stops        INTEGER DEFAULT 0,
     last_stop_time           TEXT,
     last_stop_reason         TEXT,
+    last_entry_time          TEXT,
     actual_expiry            TEXT,
     actual_dte               INTEGER,
     opening_iv                REAL,

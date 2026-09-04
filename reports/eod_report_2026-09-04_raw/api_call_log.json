@@ -53,5 +53,38 @@
     "response_time_ms": 59.21269999817014,
     "rate_limited": 0,
     "error_message": null
+  },
+  {
+    "call_id": 211,
+    "call_time": "2026-09-04T11:01:25.775718+05:30",
+    "category": "quote",
+    "endpoint": "ltp",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 43.157699983567,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 212,
+    "call_time": "2026-09-04T11:01:25.794194+05:30",
+    "category": "historical",
+    "endpoint": "intraday_candle",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 17.261000000871718,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 213,
+    "call_time": "2026-09-04T11:01:25.860049+05:30",
+    "category": "chain",
+    "endpoint": "option_chain",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 61.565799987874925,
+    "rate_limited": 0,
+    "error_message": null
   }
 ]
