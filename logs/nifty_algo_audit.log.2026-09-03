@@ -1,0 +1,269 @@
+2026-09-03 11:02:31 | INFO     | nifty_algo               | Core infrastructure self-test starting
+2026-09-03 11:02:31 | INFO     | nifty_algo               | Database schema initialized with 12 tables at C:\Users\Administrator\Desktop\algo-trading\data\nifty_algo.db
+2026-09-03 11:02:32 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 11:02:32 | INFO     | nifty_algo               | Core infrastructure self-test complete.
+2026-09-03 11:05:18 | INFO     | nifty_algo               | Core infrastructure self-test starting
+2026-09-03 11:05:18 | INFO     | nifty_algo               | Database schema initialized with 12 tables at C:\Users\Administrator\Desktop\algo-trading\data\nifty_algo.db
+2026-09-03 11:05:18 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 11:05:18 | INFO     | nifty_algo               | Core infrastructure self-test complete.
+2026-09-03 11:11:44 | INFO     | nifty_algo               | Initialized fresh session_state for 2026-09-03.
+2026-09-03 11:11:45 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 11:11:45 | INFO     | nifty_algo               | Active expiry: 2026-09-08 (DTE=5)
+2026-09-03 11:11:45 | INFO     | nifty_algo               | OPENING RANGE COMPUTED: H=24025 L=23955 W=70 [MODERATE]
+2026-09-03 11:11:45 | INFO     | nifty_algo               | Session initialized: opening_iv=10.05% opening_pcr=0.765
+2026-09-03 11:16:56 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 11:16:57 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 11:17:42 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 11:17:43 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 11:24:54 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 11:24:54 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 11:24:54 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 11:24:54 | INFO     | nifty_algo               | NO_TRADE: fair_vrp_neutral_direction_insufficient_edge
+2026-09-03 11:29:37 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 11:29:37 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 11:29:37 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 11:29:37 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 11:29:37 | INFO     | nifty_algo               | NO_TRADE: fair_vrp_neutral_direction_insufficient_edge
+2026-09-03 11:34:20 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 11:34:20 | INFO     | nifty_algo               | Shutdown signal received — shutting down gracefully.
+2026-09-03 11:34:20 | INFO     | nifty_algo               | Graceful shutdown initiated
+2026-09-03 11:34:20 | INFO     | nifty_algo               | Shutdown complete.
+2026-09-03 14:03:33 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:03:33 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:03:34 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:03:34 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:03:34 | INFO     | nifty_algo               | Active expiry: 2026-09-08 (DTE=5)
+2026-09-03 14:03:34 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:08:34 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:11:01 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:11:01 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:11:02 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:11:02 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:11:02 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:16:02 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:21:02 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:26:02 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:31:02 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:31:33 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 14:31:33 | INFO     | nifty_algo               | Shutdown signal received — shutting down gracefully.
+2026-09-03 14:31:33 | INFO     | nifty_algo               | Graceful shutdown initiated
+2026-09-03 14:31:33 | INFO     | nifty_algo               | Shutdown complete.
+2026-09-03 14:31:36 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:31:36 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:31:36 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:31:36 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:31:37 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:31:37 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: no such column: total_pnl_with_unrealized
+2026-09-03 14:31:37 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 463, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 246, in run_one_cycle
+    self.market_engine._save_session_state()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 221, in _save_session_state
+    self.db.update("session_state", data, {"trading_date": trading_date})
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\algo-trading\nifty_algo_core.py", line 896, in update
+    cur = self._conn.execute(sql, params)
+sqlite3.OperationalError: no such column: total_pnl_with_unrealized
+
+2026-09-03 14:32:07 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: no such column: total_pnl_with_unrealized
+2026-09-03 14:32:07 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 463, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 226, in run_one_cycle
+    signals = self.market_engine.run_cycle()
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1329, in run_cycle
+    self._save_session_state()
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 221, in _save_session_state
+    self.db.update("session_state", data, {"trading_date": trading_date})
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\algo-trading\nifty_algo_core.py", line 896, in update
+    cur = self._conn.execute(sql, params)
+sqlite3.OperationalError: no such column: total_pnl_with_unrealized
+
+2026-09-03 14:32:34 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 14:32:40 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:32:40 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:32:41 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:32:41 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:32:41 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:33:34 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 14:33:34 | INFO     | nifty_algo               | Shutdown signal received — shutting down gracefully.
+2026-09-03 14:33:34 | INFO     | nifty_algo               | Graceful shutdown initiated
+2026-09-03 14:33:34 | INFO     | nifty_algo               | Shutdown complete.
+2026-09-03 14:33:42 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:33:42 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:33:43 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:33:43 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:33:43 | INFO     | nifty_algo               | Active expiry: 2026-09-08 (DTE=5)
+2026-09-03 14:33:43 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:35:46 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 14:35:46 | INFO     | nifty_algo               | Shutdown signal received — shutting down gracefully.
+2026-09-03 14:35:46 | INFO     | nifty_algo               | Graceful shutdown initiated
+2026-09-03 14:35:46 | INFO     | nifty_algo               | Shutdown complete.
+2026-09-03 14:35:54 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:35:54 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:35:54 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:35:54 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:35:54 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:40:54 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:42:25 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 14:42:25 | INFO     | nifty_algo               | Shutdown signal received — shutting down gracefully.
+2026-09-03 14:42:25 | INFO     | nifty_algo               | Graceful shutdown initiated
+2026-09-03 14:42:25 | INFO     | nifty_algo               | Shutdown complete.
+2026-09-03 14:42:28 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:42:28 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:42:29 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:42:29 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:42:29 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:47:29 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:48:47 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 14:48:47 | INFO     | nifty_algo               | Shutdown signal received — shutting down gracefully.
+2026-09-03 14:48:47 | INFO     | nifty_algo               | Graceful shutdown initiated
+2026-09-03 14:48:47 | INFO     | nifty_algo               | Shutdown complete.
+2026-09-03 14:48:50 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 14:48:50 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 14:48:50 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 14:48:50 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 14:48:50 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:53:50 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 14:58:50 | WARNING  | nifty_algo               | PCR 5.000 outside valid range [0.3,3.0] — discarding
+2026-09-03 14:58:50 | INFO     | nifty_algo               | NO_TRADE: past_entry_window_end_14:00:00
+2026-09-03 15:03:50 | INFO     | nifty_algo               | Active expiry: 2026-09-08 (DTE=5)
+2026-09-03 15:03:50 | WARNING  | nifty_algo               | PCR 4.877 outside valid range [0.3,3.0] — discarding
+2026-09-03 15:08:50 | WARNING  | nifty_algo               | PCR 4.769 outside valid range [0.3,3.0] — discarding
+2026-09-03 15:12:49 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 15:12:49 | INFO     | nifty_algo               | Shutdown signal received — shutting down gracefully.
+2026-09-03 15:12:49 | INFO     | nifty_algo               | Graceful shutdown initiated
+2026-09-03 15:12:49 | INFO     | nifty_algo               | Shutdown complete.
+2026-09-03 15:12:51 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 15:12:51 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 15:12:52 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 15:12:52 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 15:12:52 | WARNING  | nifty_algo               | PCR 4.744 outside valid range [0.3,3.0] — discarding
+2026-09-03 15:12:52 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: name 'candles_today' is not defined
+2026-09-03 15:12:52 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 460, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 226, in run_one_cycle
+    signals = self.market_engine.run_cycle()
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1359, in run_cycle
+    vol_result = self.assess_volatility_condition(
+        vrp, atm_iv, self.state.get("opening_iv"), self.state.get("vix_regime"), vix_spike
+    )
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1032, in assess_volatility_condition
+    iv_behavior_min_bars = len(candles_today) >= 6
+                               ^^^^^^^^^^^^^
+NameError: name 'candles_today' is not defined
+
+2026-09-03 15:13:22 | WARNING  | nifty_algo               | PCR 4.745 outside valid range [0.3,3.0] — discarding
+2026-09-03 15:13:22 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: name 'candles_today' is not defined
+2026-09-03 15:13:22 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 460, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 226, in run_one_cycle
+    signals = self.market_engine.run_cycle()
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1359, in run_cycle
+    vol_result = self.assess_volatility_condition(
+        vrp, atm_iv, self.state.get("opening_iv"), self.state.get("vix_regime"), vix_spike
+    )
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1032, in assess_volatility_condition
+    iv_behavior_min_bars = len(candles_today) >= 6
+                               ^^^^^^^^^^^^^
+NameError: name 'candles_today' is not defined
+
+2026-09-03 15:13:39 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 15:13:41 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 15:13:41 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 15:13:42 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 15:13:42 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 15:13:42 | INFO     | nifty_algo               | PCR baseline set at 10:00: opening_pcr=1.621
+2026-09-03 15:13:42 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: name 'candles_today' is not defined
+2026-09-03 15:13:42 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 460, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 226, in run_one_cycle
+    signals = self.market_engine.run_cycle()
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1366, in run_cycle
+    dir_result = self.assess_directional_bias(
+        vwap_dist_pct, pcr, self.state.get("opening_pcr"), put_iv, call_iv, skew,
+        trend_result.get("adx_direction"), self.state.get("gap_direction"),
+    )
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1072, in assess_directional_bias
+    last_candle_close = candles_today[-1]["close"] if candles_today else spot_val
+                                                      ^^^^^^^^^^^^^
+NameError: name 'candles_today' is not defined
+
+2026-09-03 15:14:12 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: name 'candles_today' is not defined
+2026-09-03 15:14:12 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 460, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 226, in run_one_cycle
+    signals = self.market_engine.run_cycle()
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1366, in run_cycle
+    dir_result = self.assess_directional_bias(
+        vwap_dist_pct, pcr, self.state.get("opening_pcr"), put_iv, call_iv, skew,
+        trend_result.get("adx_direction"), self.state.get("gap_direction"),
+    )
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1072, in assess_directional_bias
+    last_candle_close = candles_today[-1]["close"] if candles_today else spot_val
+                                                      ^^^^^^^^^^^^^
+NameError: name 'candles_today' is not defined
+
+2026-09-03 15:14:24 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 15:14:27 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 15:14:27 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 15:14:27 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 15:14:27 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 15:14:27 | INFO     | nifty_algo               | PCR baseline set at 10:00: opening_pcr=1.634
+2026-09-03 15:14:27 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: no such column: pcr_baseline_set_at_10am
+2026-09-03 15:14:27 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 460, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 226, in run_one_cycle
+    signals = self.market_engine.run_cycle()
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1405, in run_cycle
+    self._save_session_state()
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 221, in _save_session_state
+    self.db.update("session_state", data, {"trading_date": trading_date})
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\algo-trading\nifty_algo_core.py", line 908, in update
+    cur = self._conn.execute(sql, params)
+sqlite3.OperationalError: no such column: pcr_baseline_set_at_10am
+
+2026-09-03 15:14:57 | ERROR    | nifty_algo               | UNHANDLED ERROR in main loop: no such column: pcr_baseline_set_at_10am
+2026-09-03 15:14:57 | ERROR    | nifty_algo               | Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 460, in run
+    self.run_one_cycle()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\main.py", line 226, in run_one_cycle
+    signals = self.market_engine.run_cycle()
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 1405, in run_cycle
+    self._save_session_state()
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\market_data_engine.py", line 221, in _save_session_state
+    self.db.update("session_state", data, {"trading_date": trading_date})
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\algo-trading\nifty_algo_core.py", line 908, in update
+    cur = self._conn.execute(sql, params)
+sqlite3.OperationalError: no such column: pcr_baseline_set_at_10am
+
+2026-09-03 15:15:05 | INFO     | nifty_algo               | Received signal 2 — will shut down gracefully.
+2026-09-03 15:15:07 | INFO     | nifty_algo               | Loaded existing session_state for 2026-09-03 from DB (mid-day restart recovery).
+2026-09-03 15:15:07 | INFO     | nifty_algo               | ExecutionEngine initialized in PAPER TRADE mode.
+2026-09-03 15:15:08 | INFO     | nifty_algo               | Upstox token validated. User: Deoraj Anand
+2026-09-03 15:15:08 | INFO     | nifty_algo               | Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live — lot sizes have changed before and can change again.
+2026-09-03 15:15:08 | INFO     | nifty_algo               | PCR baseline set at 10:00: opening_pcr=1.635
+2026-09-03 15:30:08 | INFO     | nifty_algo               | Post-market — performing EOD tasks and stopping.
+2026-09-03 15:30:08 | INFO     | nifty_algo               | Performing end-of-day tasks
+2026-09-03 15:30:08 | INFO     | nifty_algo               | EOD SUMMARY: net_pnl=Rs0.00 win_rate=0.0% trades=0
