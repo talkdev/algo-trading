@@ -1,10 +1,15 @@
-# Python
+# ─────────────────────────────────────────────────────────────────────────
+# NIFTY INTRADAY OPTIONS ALGO ENGINE — .gitignore
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyo
+*.pyd
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────────────────────
 .venv/
 venv/
 env/
@@ -12,42 +17,109 @@ ENV/
 env.bak/
 venv.bak/
 
-# Environment / secrets
+# ── Credentials / secrets (NEVER commit these) ────────────────────────────
 .env
 .env.*
 env.txt
+*.token
+*.secret
+upstox_token.txt
+access_token.txt
 
-# IDEs
+# ── Engine database (contains live trade data, P&L, positions) ────────────
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ── Engine log files ──────────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+nifty_algo_audit.log*
+
+# ── EOD reports (generated output, not source) ────────────────────────────
+reports/
+eod_report_*/
+
+# ── NSE holiday / event calendar (user-populated, may contain future dates) 
+nse_holidays.json
+high_impact_events.json
+
+# ── IDEs ──────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# OS files
+# ── OS files ──────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+eHiDX
 Thumbs.db
+desktop.ini
 
-# Logs
-*.log
-
-# Testing / coverage
+# ── Testing / coverage ────────────────────────────────────────────────────
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
+pytest.ini
+test_results/
 
-# Build / distribution
+# ── Build / distribution ──────────────────────────────────────────────────
 build/
 dist/
 *.egg-info/
+*.egg
+MANIFEST
+site/
 
-# Jupyter
+# ── Jupyter ───────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+*.ipynb
 
-# Temporary files
+# ── Temporary / scratch files ─────────────────────────────────────────────
 *.tmp
 *.temp
 *.bak
+*.orig
+*.rej
+scratch/
+sandbox/
+debug_*.py
+test_*.py
+tmp_*.py
 
-# Environment / secrets
-.env
-.env.*
-env.txt
+# ── Patch files (applied and done, no need to track) ─────────────────────
+patch_*.py
+clear_session.py
+check_db.py
+
+# ── Backtest / simulation output ─────────────────────────────────────────
+backtest_results/
+simulation_output/
+*.csv
+*.xlsx
+*.parquet
+
+# ── Raw JSON exports from EOD report generator ───────────────────────────
+*_raw/
+raw_exports/
+
+# ── Upstox / broker specific ─────────────────────────────────────────────
+instrument_master*.json
+instrument_master*.csv
+*.instruments
+upstox_instruments/
+
+# ── stdout redirect logs (if using cron) ─────────────────────────────────
+stdout.log
+stderr.log
+cron_*.log
