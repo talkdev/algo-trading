@@ -757,5 +757,93 @@
     "response_time_ms": 73.71659995988011,
     "rate_limited": 0,
     "error_message": null
+  },
+  {
+    "call_id": 70,
+    "call_time": "2026-09-04T12:51:12.825574+05:30",
+    "category": "default",
+    "endpoint": "profile",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 565.3077000752091,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 71,
+    "call_time": "2026-09-04T12:51:12.889578+05:30",
+    "category": "quote",
+    "endpoint": "ltp",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 60.881200013682246,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 72,
+    "call_time": "2026-09-04T12:51:12.915929+05:30",
+    "category": "historical",
+    "endpoint": "intraday_candle",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 25.280400062911212,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 73,
+    "call_time": "2026-09-04T12:51:13.006458+05:30",
+    "category": "chain",
+    "endpoint": "option_chain",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 75.67609997931868,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 74,
+    "call_time": "2026-09-04T12:53:48.816119+05:30",
+    "category": "default",
+    "endpoint": "profile",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 439.7703999420628,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 75,
+    "call_time": "2026-09-04T12:53:48.868676+05:30",
+    "category": "quote",
+    "endpoint": "ltp",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 38.38510008063167,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 76,
+    "call_time": "2026-09-04T12:53:48.891787+05:30",
+    "category": "historical",
+    "endpoint": "intraday_candle",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 22.019000025466084,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 77,
+    "call_time": "2026-09-04T12:53:48.982718+05:30",
+    "category": "chain",
+    "endpoint": "option_chain",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 73.03749991115183,
+    "rate_limited": 0,
+    "error_message": null
   }
 ]
