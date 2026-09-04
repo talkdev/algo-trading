@@ -1,6 +1,6 @@
 {
-  "total_rows": 174,
-  "unique_capture_times": 1,
+  "total_rows": 1566,
+  "unique_capture_times": 9,
   "unique_strikes": 87,
   "strike_range": [
     22100.0,
@@ -8,16 +8,16 @@
   ],
   "zero_bid_ask_count": 0,
   "zero_bid_ask_pct": 0.0,
-  "avg_spread": 42.42,
-  "max_spread": 332.9,
-  "avg_iv_pct": 19.24,
+  "avg_spread": 42.284,
+  "max_spread": 334.0,
+  "avg_iv_pct": 19.15,
   "iv_range_pct": [
-    6.59,
-    71.27
+    5.37,
+    71.58
   ],
-  "total_call_oi": 215478445,
-  "total_put_oi": 249135380,
-  "chain_pcr": 1.156,
+  "total_call_oi": 1951329575,
+  "total_put_oi": 2262456040,
+  "chain_pcr": 1.159,
   "first_capture": "2026-09-04T11:43:21.442314+05:30",
-  "last_capture": "2026-09-04T11:43:21.442314+05:30"
+  "last_capture": "2026-09-04T12:09:13.339678+05:30"
 }

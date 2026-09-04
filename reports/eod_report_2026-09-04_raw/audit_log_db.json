@@ -94,5 +94,589 @@
     "logger_name": "nifty_algo",
     "message": "ENTRY EXECUTED: BULL_PUT_SPREAD position_id=52c64b75-3ded-4313-a5fd-2b5dc118bdcb lots=2 paper_trade=True",
     "context_json": null
+  },
+  {
+    "log_id": 13,
+    "log_time": "2026-09-04T11:48:21.391250+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 14,
+    "log_time": "2026-09-04T11:53:21.486880+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 15,
+    "log_time": "2026-09-04T11:55:33.057561+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Received signal 2 \u2014 will shut down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 16,
+    "log_time": "2026-09-04T11:55:33.062795+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown signal received \u2014 shutting down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 17,
+    "log_time": "2026-09-04T11:55:33.067886+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Graceful shutdown initiated",
+    "context_json": null
+  },
+  {
+    "log_id": 18,
+    "log_time": "2026-09-04T11:55:33.069214+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown: 1 open position(s) will remain open. Engine will resume monitoring them on next start.",
+    "context_json": null
+  },
+  {
+    "log_id": 19,
+    "log_time": "2026-09-04T11:55:33.070663+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Session state saved. entry_count=1, daily_pnl=0.0, open_positions=1. Restart engine to resume.",
+    "context_json": null
+  },
+  {
+    "log_id": 20,
+    "log_time": "2026-09-04T11:55:33.076825+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown complete.",
+    "context_json": null
+  },
+  {
+    "log_id": 21,
+    "log_time": "2026-09-04T11:55:35.979787+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Loaded existing session_state for 2026-09-04 from DB (mid-day restart recovery).",
+    "context_json": null
+  },
+  {
+    "log_id": 22,
+    "log_time": "2026-09-04T11:55:35.988616+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ExecutionEngine initialized in PAPER TRADE mode.",
+    "context_json": null
+  },
+  {
+    "log_id": 23,
+    "log_time": "2026-09-04T11:55:36.638519+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Upstox token validated. User: Deoraj Anand",
+    "context_json": null
+  },
+  {
+    "log_id": 24,
+    "log_time": "2026-09-04T11:55:36.644943+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live \u2014 lot sizes have changed before and can change again.",
+    "context_json": null
+  },
+  {
+    "log_id": 25,
+    "log_time": "2026-09-04T11:55:36.646105+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "STARTUP RECONCILIATION: 1 open position(s) found",
+    "context_json": null
+  },
+  {
+    "log_id": 26,
+    "log_time": "2026-09-04T11:55:36.646627+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Resuming today's open position: BULL_PUT_SPREAD 52c64b75-3ded-43...",
+    "context_json": null
+  },
+  {
+    "log_id": 27,
+    "log_time": "2026-09-04T11:55:36.782524+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "PCR baseline set at 10:00: opening_pcr=1.920",
+    "context_json": null
+  },
+  {
+    "log_id": 28,
+    "log_time": "2026-09-04T11:55:36.850008+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 29,
+    "log_time": "2026-09-04T11:59:15.232202+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Received signal 2 \u2014 will shut down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 30,
+    "log_time": "2026-09-04T11:59:15.234437+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown signal received \u2014 shutting down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 31,
+    "log_time": "2026-09-04T11:59:15.235688+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Graceful shutdown initiated",
+    "context_json": null
+  },
+  {
+    "log_id": 32,
+    "log_time": "2026-09-04T11:59:15.240912+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown: 1 open position(s) will remain open. Engine will resume monitoring them on next start.",
+    "context_json": null
+  },
+  {
+    "log_id": 33,
+    "log_time": "2026-09-04T11:59:15.243049+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Session state saved. entry_count=1, daily_pnl=0.0, open_positions=1. Restart engine to resume.",
+    "context_json": null
+  },
+  {
+    "log_id": 34,
+    "log_time": "2026-09-04T11:59:15.244121+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown complete.",
+    "context_json": null
+  },
+  {
+    "log_id": 35,
+    "log_time": "2026-09-04T11:59:18.627469+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Loaded existing session_state for 2026-09-04 from DB (mid-day restart recovery).",
+    "context_json": null
+  },
+  {
+    "log_id": 36,
+    "log_time": "2026-09-04T11:59:18.631982+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ExecutionEngine initialized in PAPER TRADE mode.",
+    "context_json": null
+  },
+  {
+    "log_id": 37,
+    "log_time": "2026-09-04T11:59:19.208070+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Upstox token validated. User: Deoraj Anand",
+    "context_json": null
+  },
+  {
+    "log_id": 38,
+    "log_time": "2026-09-04T11:59:19.216055+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live \u2014 lot sizes have changed before and can change again.",
+    "context_json": null
+  },
+  {
+    "log_id": 39,
+    "log_time": "2026-09-04T11:59:19.217339+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "STARTUP RECONCILIATION: 1 open position(s) found",
+    "context_json": null
+  },
+  {
+    "log_id": 40,
+    "log_time": "2026-09-04T11:59:19.221206+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Resuming today's open position: BULL_PUT_SPREAD 52c64b75-3ded-43...",
+    "context_json": null
+  },
+  {
+    "log_id": 41,
+    "log_time": "2026-09-04T11:59:19.353607+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "PCR baseline set at 10:00: opening_pcr=1.948",
+    "context_json": null
+  },
+  {
+    "log_id": 42,
+    "log_time": "2026-09-04T11:59:19.423062+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 43,
+    "log_time": "2026-09-04T12:01:11.779851+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Received signal 2 \u2014 will shut down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 44,
+    "log_time": "2026-09-04T12:01:11.789559+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown signal received \u2014 shutting down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 45,
+    "log_time": "2026-09-04T12:01:11.790847+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Graceful shutdown initiated",
+    "context_json": null
+  },
+  {
+    "log_id": 46,
+    "log_time": "2026-09-04T12:01:11.791768+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown: 1 open position(s) will remain open. Engine will resume monitoring them on next start.",
+    "context_json": null
+  },
+  {
+    "log_id": 47,
+    "log_time": "2026-09-04T12:01:11.793155+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Session state saved. entry_count=1, daily_pnl=0.0, open_positions=1. Restart engine to resume.",
+    "context_json": null
+  },
+  {
+    "log_id": 48,
+    "log_time": "2026-09-04T12:01:11.794564+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown complete.",
+    "context_json": null
+  },
+  {
+    "log_id": 49,
+    "log_time": "2026-09-04T12:01:18.332095+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Loaded existing session_state for 2026-09-04 from DB (mid-day restart recovery).",
+    "context_json": null
+  },
+  {
+    "log_id": 50,
+    "log_time": "2026-09-04T12:01:18.335394+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ExecutionEngine initialized in PAPER TRADE mode.",
+    "context_json": null
+  },
+  {
+    "log_id": 51,
+    "log_time": "2026-09-04T12:01:18.702870+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Upstox token validated. User: Deoraj Anand",
+    "context_json": null
+  },
+  {
+    "log_id": 52,
+    "log_time": "2026-09-04T12:01:18.703578+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live \u2014 lot sizes have changed before and can change again.",
+    "context_json": null
+  },
+  {
+    "log_id": 53,
+    "log_time": "2026-09-04T12:01:18.704270+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "STARTUP RECONCILIATION: 1 open position(s) found",
+    "context_json": null
+  },
+  {
+    "log_id": 54,
+    "log_time": "2026-09-04T12:01:18.704596+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Resuming today's open position: BULL_PUT_SPREAD 52c64b75-3ded-43...",
+    "context_json": null
+  },
+  {
+    "log_id": 55,
+    "log_time": "2026-09-04T12:01:18.850105+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "PCR baseline set at 10:00: opening_pcr=1.974",
+    "context_json": null
+  },
+  {
+    "log_id": 56,
+    "log_time": "2026-09-04T12:01:18.884447+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 57,
+    "log_time": "2026-09-04T12:03:30.970194+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Received signal 2 \u2014 will shut down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 58,
+    "log_time": "2026-09-04T12:03:30.974906+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown signal received \u2014 shutting down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 59,
+    "log_time": "2026-09-04T12:03:30.975705+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Graceful shutdown initiated",
+    "context_json": null
+  },
+  {
+    "log_id": 60,
+    "log_time": "2026-09-04T12:03:30.976247+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown: 1 open position(s) will remain open. Engine will resume monitoring them on next start.",
+    "context_json": null
+  },
+  {
+    "log_id": 61,
+    "log_time": "2026-09-04T12:03:30.976986+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Session state saved. entry_count=1, daily_pnl=0.0, open_positions=1. Restart engine to resume.",
+    "context_json": null
+  },
+  {
+    "log_id": 62,
+    "log_time": "2026-09-04T12:03:30.977531+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown complete.",
+    "context_json": null
+  },
+  {
+    "log_id": 63,
+    "log_time": "2026-09-04T12:03:36.463407+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Loaded existing session_state for 2026-09-04 from DB (mid-day restart recovery).",
+    "context_json": null
+  },
+  {
+    "log_id": 64,
+    "log_time": "2026-09-04T12:03:36.467920+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ExecutionEngine initialized in PAPER TRADE mode.",
+    "context_json": null
+  },
+  {
+    "log_id": 65,
+    "log_time": "2026-09-04T12:03:37.048518+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Upstox token validated. User: Deoraj Anand",
+    "context_json": null
+  },
+  {
+    "log_id": 66,
+    "log_time": "2026-09-04T12:03:37.064424+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live \u2014 lot sizes have changed before and can change again.",
+    "context_json": null
+  },
+  {
+    "log_id": 67,
+    "log_time": "2026-09-04T12:03:37.067244+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "STARTUP RECONCILIATION: 1 open position(s) found",
+    "context_json": null
+  },
+  {
+    "log_id": 68,
+    "log_time": "2026-09-04T12:03:37.069041+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Resuming today's open position: BULL_PUT_SPREAD 52c64b75-3ded-43...",
+    "context_json": null
+  },
+  {
+    "log_id": 69,
+    "log_time": "2026-09-04T12:03:37.238638+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "PCR baseline set at 10:00: opening_pcr=1.943",
+    "context_json": null
+  },
+  {
+    "log_id": 70,
+    "log_time": "2026-09-04T12:03:37.283279+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 71,
+    "log_time": "2026-09-04T12:08:37.295574+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 72,
+    "log_time": "2026-09-04T12:09:05.605690+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Received signal 2 \u2014 will shut down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 73,
+    "log_time": "2026-09-04T12:09:05.610952+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown signal received \u2014 shutting down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 74,
+    "log_time": "2026-09-04T12:09:05.612536+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Graceful shutdown initiated",
+    "context_json": null
+  },
+  {
+    "log_id": 75,
+    "log_time": "2026-09-04T12:09:05.613604+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown: 1 open position(s) will remain open. Engine will resume monitoring them on next start.",
+    "context_json": null
+  },
+  {
+    "log_id": 76,
+    "log_time": "2026-09-04T12:09:05.615608+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Session state saved. entry_count=1, daily_pnl=0.0, open_positions=1. Restart engine to resume.",
+    "context_json": null
+  },
+  {
+    "log_id": 77,
+    "log_time": "2026-09-04T12:09:05.616623+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown complete.",
+    "context_json": null
+  },
+  {
+    "log_id": 78,
+    "log_time": "2026-09-04T12:09:12.647984+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Loaded existing session_state for 2026-09-04 from DB (mid-day restart recovery).",
+    "context_json": null
+  },
+  {
+    "log_id": 79,
+    "log_time": "2026-09-04T12:09:12.651425+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ExecutionEngine initialized in PAPER TRADE mode.",
+    "context_json": null
+  },
+  {
+    "log_id": 80,
+    "log_time": "2026-09-04T12:09:13.184191+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Upstox token validated. User: Deoraj Anand",
+    "context_json": null
+  },
+  {
+    "log_id": 81,
+    "log_time": "2026-09-04T12:09:13.186805+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live \u2014 lot sizes have changed before and can change again.",
+    "context_json": null
+  },
+  {
+    "log_id": 82,
+    "log_time": "2026-09-04T12:09:13.189455+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "STARTUP RECONCILIATION: 1 open position(s) found",
+    "context_json": null
+  },
+  {
+    "log_id": 83,
+    "log_time": "2026-09-04T12:09:13.191740+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Resuming today's open position: BULL_PUT_SPREAD 52c64b75-3ded-43...",
+    "context_json": null
+  },
+  {
+    "log_id": 84,
+    "log_time": "2026-09-04T12:09:13.338109+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "PCR baseline set at 10:00: opening_pcr=1.790",
+    "context_json": null
+  },
+  {
+    "log_id": 85,
+    "log_time": "2026-09-04T12:09:13.385673+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
   }
 ]

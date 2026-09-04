@@ -8,5 +8,85 @@
     "reason": "bullish_strong_trend_put_credit_safe_side+RICH_vrp",
     "params_json": "{\"valid\": true, \"total_fixed_costs_rupees\": 47.443384336, \"strategy_name\": \"BULL_PUT_SPREAD\", \"strategy_type\": \"SELL\", \"selection_reason\": \"bullish_strong_trend_put_credit_safe_side+RICH_vrp\", \"target_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"legs\": [{\"strike\": 23850.0, \"option_type\": \"put\", \"action\": \"SELL\", \"exec_price\": 40.7, \"bid\": 40.7, \"ask\": 40.8, \"ltp\": 40.8, \"delta\": -0.2648, \"gamma\": 0.0013, \"vega\": 8.3884, \"theta\": -9.9136, \"iv\": 0.0983, \"oi\": 10287095}, {\"strike\": 23700.0, \"option_type\": \"put\", \"action\": \"BUY\", \"exec_price\": 17.7, \"bid\": 17.65, \"ask\": 17.7, \"ltp\": 17.65, \"delta\": -0.1287, \"gamma\": 0.0008, \"vega\": 5.3814, \"theta\": -6.9129, \"iv\": 0.10679999999999999, \"oi\": 10115105}], \"num_legs\": 2, \"gross_credit\": 23.000000000000004, \"gross_debit\": null, \"total_slippage\": 0.07499999999999751, \"total_costs_pts\": 0.8122813005538462, \"total_costs_rupees_per_lot\": 5.354900200000001, \"entry_credit\": 22.11271869944616, \"entry_debit\": null, \"stop_premium\": 28.74653430928001, \"target_premium\": 15.036648715623386, \"stop_value\": null, \"target_value\": null, \"price_stop_pts\": 80, \"tightening_schedule\": [[\"13:00\", 0.8], [\"14:00\", 0.65]], \"final_lots\": 2, \"max_loss_per_lot\": 538.9975182990003, \"total_max_risk\": 1077.9950365980005, \"estimated_margin\": 22425.0, \"hard_exit_time\": \"15:00\", \"target_pct\": 0.32, \"entry_spot\": 23984.05, \"entry_vix\": 10.75, \"entry_vrp\": 3.7457485147422505, \"entry_time\": \"2026-09-04T11:43:21.470702+05:30\", \"wing_width\": 150.0, \"stop_at_breakeven\": false, \"stop_moved_to_25pct\": false, \"last_known_premium\": 22.11271869944616}",
     "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23984.05, \"vix\": 10.75, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09630337547510759, \"parkinson_rv\": 0.05884589032768509, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.7457485147422505, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 49.0275836633565, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_68pts\", \"vwap\": 23952.17166666667, \"vwap_dist_pct\": 0.13309162015440232, \"pcr\": 1.8878511111843346, \"pcr_change\": 0.0, \"skew_ratio\": 1.0207684319833852, \"direction\": \"BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 2,
+    "decision_time": "2026-09-04T11:48:21.392145+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23982.7, \"vix\": 10.75, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09617675117168771, \"parkinson_rv\": 0.0515116067396385, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.77425489523469, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 48.99162189295276, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_66pts\", \"vwap\": 23953.075268817207, \"vwap_dist_pct\": 0.1236781951808922, \"pcr\": 1.8889067142008318, \"pcr_change\": 0.0010556030164972086, \"skew_ratio\": 1.0365726227795191, \"direction\": \"BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 3,
+    "decision_time": "2026-09-04T11:53:21.487355+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23984.0, \"vix\": 10.76, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.0969436139127915, \"parkinson_rv\": 0.05023543053916896, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.902789135433869, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 48.970343001270734, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_68pts\", \"vwap\": 23954.171875, \"vwap_dist_pct\": 0.12452162886553557, \"pcr\": 1.9051007497102854, \"pcr_change\": 0.01724963852595085, \"skew_ratio\": 1.0417536534446765, \"direction\": \"BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 4,
+    "decision_time": "2026-09-04T11:55:36.850515+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23985.9, \"vix\": 10.77, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09702853541690977, \"parkinson_rv\": 0.050376802218975045, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.8997805132864514, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 48.970343001270734, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_70pts\", \"vwap\": 23954.138020833332, \"vwap_dist_pct\": 0.13259495766053192, \"pcr\": 1.91999598563092, \"pcr_change\": 0.0, \"skew_ratio\": 1.0514705882352942, \"direction\": \"MILD_BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 5,
+    "decision_time": "2026-09-04T11:59:19.423357+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23980.9, \"vix\": 10.74, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09660467797998917, \"parkinson_rv\": 0.048459864603092546, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.9243926622635383, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 48.94931481066527, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_65pts\", \"vwap\": 23955.028787878786, \"vwap_dist_pct\": 0.10799908591346151, \"pcr\": 1.9477414900268775, \"pcr_change\": 0.0, \"skew_ratio\": 1.032258064516129, \"direction\": \"MILD_BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 6,
+    "decision_time": "2026-09-04T12:01:18.885232+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23974.85, \"vix\": 10.74, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09688396406058222, \"parkinson_rv\": 0.04749795234574856, \"rv_source\": \"rolling_intraday\", \"vrp\": 4.007762919939564, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 47.539819484475785, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_59pts\", \"vwap\": 23955.576960784314, \"vwap_dist_pct\": 0.08045324580257383, \"pcr\": 1.9741156143229535, \"pcr_change\": 0.0, \"skew_ratio\": 1.0657620041753655, \"direction\": \"MILD_BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 7,
+    "decision_time": "2026-09-04T12:03:37.283938+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23966.7, \"vix\": 10.8, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09587812472391159, \"parkinson_rv\": 0.0479110342391252, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.8766525799733094, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 46.833293270145155, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_50pts\", \"vwap\": 23955.47303921569, \"vwap_dist_pct\": 0.04686595320381696, \"pcr\": 1.943483561733892, \"pcr_change\": 0.0, \"skew_ratio\": 1.039460020768432, \"direction\": \"MILD_BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 8,
+    "decision_time": "2026-09-04T12:08:37.295996+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23959.95, \"vix\": 10.97, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09502116897427297, \"parkinson_rv\": 0.04857453619399929, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.77331526374424, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 43.246885573301725, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_44pts\", \"vwap\": 23955.40380952381, \"vwap_dist_pct\": 0.018977724242674337, \"pcr\": 1.8035238799969702, \"pcr_change\": -0.13995968173692175, \"skew_ratio\": 1.0259067357512954, \"direction\": \"MILD_BULLISH\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"EXTREME_FEAR_CONTRARIAN\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"PUTS\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
+  },
+  {
+    "decision_id": 9,
+    "decision_time": "2026-09-04T12:09:13.387996+05:30",
+    "trading_date": "2026-09-04",
+    "action": "NO_TRADE",
+    "strategy_name": "NONE",
+    "reason": "position_already_open_single_position_engine",
+    "params_json": null,
+    "signals_json": "{\"trading_date\": \"2026-09-04\", \"spot\": 23965.35, \"vix\": 10.96, \"intraday_rv_selling_veto\": false, \"vix_regime\": \"LOW\", \"day_mode\": \"NORMAL\", \"day_label\": \"FRIDAY\", \"circuit_breaker_suspected\": false, \"vix_spike_detected\": false, \"atm_iv\": 0.09486307742417564, \"parkinson_rv\": 0.04864801950630847, \"rv_source\": \"rolling_intraday\", \"vrp\": 3.7521639997368705, \"volatility_condition\": \"RICH\", \"iv_behavior\": \"STABLE\", \"sell_ok\": true, \"buy_ok\": false, \"sell_size_reduction\": 1.0, \"high_quality_sell_day\": true, \"or_condition\": \"VERY_NARROW\", \"or_width\": 20.450000000000728, \"adx\": 43.246885573301725, \"adx_condition\": \"VERY_STRONG\", \"adx_direction\": \"BULLISH\", \"trend_condition\": \"STRONG_TREND\", \"spot_vs_or\": \"ABOVE_OR_49pts\", \"vwap\": 23955.469047619048, \"vwap_dist_pct\": 0.0412471672389673, \"pcr\": 1.789725750719988, \"pcr_change\": 0.0, \"skew_ratio\": 1.029136316337149, \"direction\": \"NEUTRAL\", \"vwap_signal\": \"NEUTRAL\", \"pcr_signal\": \"STABLE\", \"skew_signal\": \"BALANCED\", \"preferred_sell_side\": \"BOTH\", \"entry_start\": \"10:00\", \"entry_end\": \"14:00\", \"hard_exit_time\": \"15:00\", \"chain_size\": 87, \"active_expiry\": \"2026-09-08\", \"actual_dte\": 4, \"daily_pnl\": 0.0, \"current_capital\": 1000000.0}"
   }
 ]

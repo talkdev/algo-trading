@@ -398,10 +398,10 @@ class MarketDataEngine:
                                      f"{pct*100:.2f}% in one cycle")
         if prev_vix and prev_vix > 0 and vix:
             chg = (vix - prev_vix) / prev_vix * 100.0
-            if chg > 15.0:
+            if chg > 25.0:
                 vix_spike = True
                 self.logger.warning(f"VIX SPIKE: {prev_vix:.1f} -> {vix:.1f} ({chg:.1f}%)")
-            elif chg < -10.0:
+            elif chg < -15.0:
                 vix_spike = False
 
         self.state["prev_spot"] = spot
@@ -545,6 +545,21 @@ class MarketDataEngine:
             return None
         return rv
 
+    def _compute_vrp_percentile(self, current_vrp: float) -> float:
+        try:
+            rows = self.db.query(
+                "SELECT vrp FROM cycle_log WHERE trading_date < ? AND vrp IS NOT NULL "
+                "ORDER BY trading_date DESC, cycle_id DESC LIMIT 400",
+                (today_ist().isoformat(),),
+            )
+            if len(rows) < 20:
+                return 50.0
+            historical_vrps = sorted([r["vrp"] for r in rows])
+            rank = sum(1 for v in historical_vrps if v <= current_vrp)
+            return round(rank / len(historical_vrps) * 100.0, 1)
+        except Exception:
+            return 50.0
+
     def compute_parkinson_rv(self, vix: Optional[float], candles_today: Optional[list] = None) -> tuple[Optional[float], str]:
         today_str = today_ist().isoformat()
         if candles_today and len(candles_today) >= 12:
@@ -565,13 +580,13 @@ class MarketDataEngine:
 
     def _compute_parkinson_rv_fresh(self, vix: Optional[float]) -> tuple[float, str]:
         try:
-            session_bars = self._fetch_last_n_complete_sessions_5min(n=5)
+            session_bars = self._fetch_last_n_complete_sessions_5min(n=10)
             if not session_bars:
                 self.logger.info("Parkinson RV: API returned no bars, trying DB cache")
-                session_bars = self._load_historical_candles_from_db(n=5)
+                session_bars = self._load_historical_candles_from_db(n=10)
         except Exception as e:
             self.logger.warning(f"Parkinson RV: historical fetch failed ({e}), trying DB cache")
-            session_bars = self._load_historical_candles_from_db(n=5)
+            session_bars = self._load_historical_candles_from_db(n=10)
 
         all_bars = [b for bars in session_bars.values() for b in bars]
         valid_bars = [b for b in all_bars
@@ -855,16 +870,16 @@ class MarketDataEngine:
     # MODULE 1: PRE-SESSION ASSESSMENT (re-run every 30 minutes)
     # ─────────────────────────────────────────────────────────────────
     def _compute_base_regime(self, vix: float) -> str:
-        if vix < 10.5: return "SUPPRESSED"
-        if vix < 14.0: return "LOW"
-        if vix < 18.0: return "NORMAL"
-        if vix < 24.0: return "ELEVATED"
+        if vix < 11.0: return "SUPPRESSED"
+        if vix < 15.0: return "LOW"
+        if vix < 20.0: return "NORMAL"
+        if vix < 26.0: return "ELEVATED"
         return "HIGH"
 
     def _compute_regime_with_hysteresis(self, vix: float, prev_regime: str) -> str:
         bands = {
-            "SUPPRESSED": (None, 11.0), "LOW": (10.0, 14.5), "NORMAL": (13.5, 18.5),
-            "ELEVATED": (17.5, 24.5), "HIGH": (23.5, None),
+            "SUPPRESSED": (None, 11.5), "LOW": (10.5, 15.5), "NORMAL": (14.5, 20.5),
+            "ELEVATED": (19.5, 26.5), "HIGH": (25.5, None),
         }
         if prev_regime in bands:
             lo, hi = bands[prev_regime]
@@ -944,8 +959,8 @@ class MarketDataEngine:
         wing_map = {"SUPPRESSED": 150, "LOW": 150, "NORMAL": 150, "ELEVATED": 200, "HIGH": 250}
         self.state["wing_width"] = wing_map.get(vix_regime, 150)
 
-        dow_stop = {"MONDAY": 1.4, "TUESDAY": 1.2, "WEDNESDAY": 1.3, "THURSDAY": 1.4, "FRIDAY": 1.3}
-        dow_size = {"MONDAY": 0.50, "TUESDAY": 0.60, "WEDNESDAY": 1.0, "THURSDAY": 1.0, "FRIDAY": 0.90}
+        dow_stop = {"MONDAY": 1.5, "TUESDAY": 1.3, "WEDNESDAY": 1.5, "THURSDAY": 1.5, "FRIDAY": 1.4}
+        dow_size = {"MONDAY": 0.50, "TUESDAY": 0.50, "WEDNESDAY": 1.0, "THURSDAY": 1.0, "FRIDAY": 0.80}
         self.state["stop_multiplier"] = dow_stop.get(day_label, 2.0)
 
         vix_size = {"SUPPRESSED": 0.0, "LOW": 0.75, "NORMAL": 1.0,
@@ -961,12 +976,11 @@ class MarketDataEngine:
         hard_exit = self.config.hard_exit_time
 
         if day_label == "TUESDAY" and TUESDAY_EARLY_EXIT_ENABLED:
-            last_entry = min(last_entry, dtime(14, 0))
-            hard_exit = min(hard_exit, dtime(15, 0))
+            last_entry = min(last_entry, dtime(13, 0))
+            hard_exit = min(hard_exit, dtime(15, 25))
             self.logger.info(
-                f"TUESDAY (0DTE) RISK OVERRIDE: last_entry={last_entry}, "
-                f"hard_exit={hard_exit}. Morning entries use next-week contract. "
-                f"0DTE entries only 12:30-14:00. "
+                f"TUESDAY (0DTE NIFTY EXPIRY) RISK OVERRIDE: last_entry={last_entry}, "
+                f"hard_exit={hard_exit}. No new entries after 13:00 on expiry day. "
                 f"Set TUESDAY_EARLY_EXIT_ENABLED=false in env.txt to disable."
             )
 
@@ -1016,21 +1030,20 @@ class MarketDataEngine:
     # MODULE 2: OPENING RANGE
     # ─────────────────────────────────────────────────────────────────
     def compute_opening_range(self, candles_today: list) -> Optional[dict]:
-        opening_bars = [b for b in candles_today if dtime(9, 30) <= b["timestamp"].time() <= dtime(9, 44)]
+        opening_bars = [b for b in candles_today if dtime(9, 15) <= b["timestamp"].time() <= dtime(10, 14)]
         opening_bars = [b for b in opening_bars if b["high"] > b["low"]]
         opening_bars = [b for b in opening_bars if (b["high"] - b["low"]) <= 1000]
         or_volume_filter_removed = True
 
-        if len(opening_bars) < 2:
-            or_flat_open_fallback = True
+        if len(opening_bars) < 6:
             spot_now = self.state.get("prev_spot")
             if spot_now and spot_now > 0:
-                return {"or_high": spot_now + 10, "or_low": spot_now - 10,
-                        "or_width": 20, "or_condition": "VERY_NARROW",
-                        "or_score": 2, "partial": True}
+                return {"or_high": spot_now + 25, "or_low": spot_now - 25,
+                        "or_width": 50, "or_condition": "NARROW",
+                        "or_score": 1, "partial": True}
             return None
 
-        opening_bars = sorted(opening_bars, key=lambda b: b["timestamp"])[:6]
+        opening_bars = sorted(opening_bars, key=lambda b: b["timestamp"])[:12]
         or_high = max(b["high"] for b in opening_bars)
         or_low = min(b["low"] for b in opening_bars)
         or_width = or_high - or_low
@@ -1181,15 +1194,15 @@ class MarketDataEngine:
                     "high_quality_sell_day": False}
 
         sell_ok, buy_ok, sell_reduction = False, False, 1.0
-        if vrp > 4.0: vol_cond, vol_score, sell_ok = "VERY_RICH", 2, True
-        elif vrp > 2.0: vol_cond, vol_score, sell_ok = "RICH", 1, True
-        elif vrp > 0.8: vol_cond, vol_score, sell_ok, sell_reduction = "FAIR", 0, True, 0.75
+        if vrp > 5.0: vol_cond, vol_score, sell_ok = "VERY_RICH", 2, True
+        elif vrp > 3.0: vol_cond, vol_score, sell_ok = "RICH", 1, True
+        elif vrp > 1.5: vol_cond, vol_score, sell_ok, sell_reduction = "FAIR", 0, True, 0.75
         elif vrp > 0.0: vol_cond, vol_score = "THIN", -1
         elif vrp > -2.0: vol_cond, vol_score, buy_ok = "CHEAP", -2, True
         else: vol_cond, vol_score, buy_ok = "INVERTED", -3, True
 
         if vix_regime == "SUPPRESSED":
-            if vrp > 2.0:
+            if vrp > 3.0:
                 sell_ok = True
                 sell_reduction = 0.5
                 vol_score = min(vol_score, 0)
@@ -1268,7 +1281,7 @@ class MarketDataEngine:
         elif skew > 0.95: skew_signal, skew_score, preferred_side = "BALANCED", 0, "BOTH"
         else: skew_signal, skew_score, preferred_side = "COMPLACENT", 1, "PUTS"
 
-        direction_score = float(vwap_score + pcr_score + skew_score)
+        direction_score = float((vwap_score * 2.0) + (pcr_score * 0.5) + (skew_score * 1.0))
 
         current_time = now_ist().time()
         if current_time < dtime(11, 0) and gap_direction not in (None, "FLAT") and direction_score == 0:
@@ -1277,10 +1290,10 @@ class MarketDataEngine:
         if adx_direction == "BULLISH" and direction_score > 0: direction_score += 0.3
         elif adx_direction == "BEARISH" and direction_score < 0: direction_score -= 0.3
 
-        if direction_score >= 1.2: direction = "BULLISH"
-        elif direction_score >= 0.5: direction = "MILD_BULLISH"
-        elif direction_score <= -1.2: direction = "BEARISH"
-        elif direction_score <= -0.5: direction = "MILD_BEARISH"
+        if direction_score >= 2.0: direction = "BULLISH"
+        elif direction_score >= 0.8: direction = "MILD_BULLISH"
+        elif direction_score <= -2.0: direction = "BEARISH"
+        elif direction_score <= -0.8: direction = "MILD_BEARISH"
         else: direction = "NEUTRAL"
 
         if skew_signal in ("FEAR", "EXTREME_FEAR"): preferred_side = "CALLS"
@@ -1492,7 +1505,7 @@ class MarketDataEngine:
                 self.state["wing_width"] = max(100, min(computed_wing, 400))
 
         current_time = now_ist().time()
-        if current_time >= dtime(9, 45) and not self.state.get("or_computed"):
+        if current_time >= dtime(10, 15) and not self.state.get("or_computed"):
             or_result = self.compute_opening_range(candles_today)
             if or_result:
                 self.state["or_high"] = or_result["or_high"]
@@ -1504,7 +1517,7 @@ class MarketDataEngine:
                                   f"L={or_result['or_low']:.0f} W={or_result['or_width']:.0f} "
                                   f"[{or_result['or_condition']}]")
 
-        if current_time >= dtime(9, 45) and not self.state.get("session_initialized"):
+        if current_time >= dtime(10, 15) and not self.state.get("session_initialized"):
             if atm_iv:
                 self.state["opening_iv"] = atm_iv
             if self.state.get("opening_iv") is not None:

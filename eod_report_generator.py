@@ -744,8 +744,28 @@ def detect_anomalies(session_state, cycle_rows, api_summary, gaps, daily_summary
     if no_trade_reasons:
         top_reason, top_count = next(iter(no_trade_reasons.items()))
         total_decisions = len(decisions)
+    _ok_reasons = {
+        "position_already_open_single_position_engine",
+        "max_concurrent_positions_reached",
+        "iron_condor_already_open_no_duplicate",
+        "iron_butterfly_already_open_no_duplicate",
+    }
+    if no_trade_reasons:
+        top_reason, top_count = next(iter(no_trade_reasons.items()))
+        total_decisions = len(decisions)
         if total_decisions and top_count > total_decisions * 0.5:
-            flags.append(f"[FLAG] Single no-trade reason dominates: '{top_reason}' fired {top_count}/{total_decisions} times ({top_count/total_decisions*100:.0f}%) — gate may be miscalibrated.")
+            if top_reason not in _ok_reasons:
+                flags.append(
+                    f"[FLAG] Single no-trade reason dominates: '{top_reason}' "
+                    f"fired {top_count}/{total_decisions} times "
+                    f"({top_count/total_decisions*100:.0f}%) — gate may be miscalibrated."
+                )
+            else:
+                flags.append(
+                    f"[OK] Single position engine working correctly: '{top_reason}' "
+                    f"fired {top_count}/{total_decisions} times — "
+                    f"expected behavior while a position is open."
+                )
     stop_exits = [e for e in trade_exits if e.get("exit_reason") == "CLOSE_STOP"]
     if len(stop_exits) >= 2:
         flags.append(f"[FLAG] {len(stop_exits)} positions hit stop-loss today — review stop multiplier and entry conditions.")
