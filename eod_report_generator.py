@@ -32,7 +32,7 @@ LOG_DIR = Path(_ENV.get("LOG_DIR", "logs"))
 if not LOG_DIR.is_absolute():
     LOG_DIR = BASE_DIR / LOG_DIR
 
-LOT_SIZE = int(_ENV.get("NIFTY_LOT_SIZE", "75") or 75)
+LOT_SIZE = int(_ENV.get("NIFTY_LOT_SIZE", "65") or 65)
 STT_RATE = float(_ENV.get("STT_RATE", "0.0015") or 0.0015)
 EXCHANGE_TXN_RATE = float(_ENV.get("EXCHANGE_TXN_RATE", "0.0003552") or 0.0003552)
 BROKERAGE_PER_ORDER = float(_ENV.get("BROKERAGE_PER_ORDER", "20.0") or 20.0)

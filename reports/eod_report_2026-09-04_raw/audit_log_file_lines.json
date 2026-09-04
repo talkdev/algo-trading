@@ -133,5 +133,7 @@
   "2026-09-04 12:42:26 | INFO     | nifty_algo               | STARTUP RECONCILIATION: 1 open position(s) found",
   "2026-09-04 12:42:26 | INFO     | nifty_algo               | Resuming today's open position: BULL_PUT_SPREAD 52c64b75-3ded-43...",
   "2026-09-04 12:42:26 | INFO     | nifty_algo               | PCR baseline set at 10:00: opening_pcr=2.970",
-  "2026-09-04 12:42:26 | INFO     | nifty_algo               | NO_TRADE: position_already_open_single_position_engine"
+  "2026-09-04 12:42:26 | INFO     | nifty_algo               | NO_TRADE: position_already_open_single_position_engine",
+  "2026-09-04 12:47:26 | INFO     | nifty_algo               | Active expiry: 2026-09-08 (DTE=4)",
+  "2026-09-04 12:47:26 | INFO     | nifty_algo               | NO_TRADE: position_already_open_single_position_engine"
 ]

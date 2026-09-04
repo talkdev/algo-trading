@@ -1,5 +1,5 @@
 # NIFTY Intraday Options Engine — EOD Forensic Report
-**Target Date:** 2026-09-04  |  **Report Generated:** 2026-09-04T12:42:34.048962
+**Target Date:** 2026-09-04  |  **Report Generated:** 2026-09-04T12:51:05.472148
 
 ## 0. How to Read This Report
 
@@ -42,7 +42,7 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **Day mode**: NORMAL
 - **VIX regime (final)**: LOW
 - **OR condition / width**: VERY_NARROW / 20.450000000000728
-- **Trades attempted (decisions)**: 18
+- **Trades attempted (decisions)**: 19
 - **Trades executed**: 1
 - **Trades closed**: 0
 - **Wins / Losses**: 0 / 0
@@ -54,19 +54,19 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **Current capital (session_state)**: 1000000.0
 - **Daily halted**: 0
 - **Consecutive stops**: 0
-- **Cycles logged**: 18
-- **NIFTY open / close / range**: 23984.05 / 23942.45 / 46.7pts (0.195%)
-- **VRP mean today (pp)**: 3.787
-- **ATM IV open / close (pct)**: 9.63 / 9.382
-- **IV crush today (pp)**: 0.248
-- **Option chain snapshot rows**: 3132
-- **API calls made**: 65
-- **Audit log lines (file)**: 135
+- **Cycles logged**: 19
+- **NIFTY open / close / range**: 23984.05 / 23936.15 / 49.75pts (0.207%)
+- **VRP mean today (pp)**: 3.79
+- **ATM IV open / close (pct)**: 9.63 / 9.31
+- **IV crush today (pp)**: 0.32
+- **Option chain snapshot rows**: 3306
+- **API calls made**: 69
+- **Audit log lines (file)**: 137
 
 ## 3. Auto-Detected Anomalies / Flags
 
-- [FLAG] NIFTY moved only 0.20% intraday — very low move day, premium may have been thin.
-- [OK] Single position engine working correctly: 'position_already_open_single_position_engine' fired 17/18 times — expected behavior while a position is open.
+- [FLAG] NIFTY moved only 0.21% intraday — very low move day, premium may have been thin.
+- [OK] Single position engine working correctly: 'position_already_open_single_position_engine' fired 18/19 times — expected behavior while a position is open.
 
 ## 4. Session Configuration Snapshot
 
@@ -103,16 +103,16 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **event_announced**: 0
 - **paper_trade_mode**: 1
 - **created_at**: 2026-09-04T11:43:20.636601+05:30
-- **updated_at**: 2026-09-04T12:42:26.405253+05:30
+- **updated_at**: 2026-09-04T12:47:26.514257+05:30
 - **or_computed**: 1
 - **session_initialized**: 1
-- **vix_regime_last_checked**: 2026-09-04T12:14:13.229729+05:30
-- **prev_spot**: 23942.45
+- **vix_regime_last_checked**: 2026-09-04T12:47:26.288635+05:30
+- **prev_spot**: 23936.15
 - **prev_vix**: 10.78
-- **parkinson_rv_pct**: 0.045728604129936436
+- **parkinson_rv_pct**: 0.044991850393676994
 - **parkinson_rv_computed_date**: 2026-09-04
 - **vwap_valid**: 1
-- **expiry_last_checked**: 2026-09-04T12:14:13.374090+05:30
+- **expiry_last_checked**: 2026-09-04T12:47:26.416880+05:30
 - **pre_event_spot**: None
 - **pre_event_iv**: None
 - **event_announcement_time**: None
@@ -125,46 +125,46 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 ## 5. NIFTY Intraday Profile
 
 - **open**: 23984.05
-- **close**: 23942.45
+- **close**: 23936.15
 - **high**: 23985.9
-- **low**: 23939.2
-- **range_pts**: 46.7
-- **range_pct**: 0.195
-- **net_change_pts**: -41.6
-- **net_change_pct**: -0.173
+- **low**: 23936.15
+- **range_pts**: 49.75
+- **range_pct**: 0.207
+- **net_change_pts**: -47.9
+- **net_change_pct**: -0.2
 - **direction**: DOWN
 - **first_half_range_pts**: 25.95
-- **second_half_range_pts**: 12.1
+- **second_half_range_pts**: 15.15
 - **volatility_expansion_second_half**: False
 
-- **actual_day_range_pts**: 46.7
-- **actual_day_range_pct**: 0.195
+- **actual_day_range_pts**: 49.75
+- **actual_day_range_pct**: 0.207
 - **expected_daily_range_pct_from_vix**: 0.68
-- **range_vs_expected_ratio**: 0.29
+- **range_vs_expected_ratio**: 0.3
 - **day_classification**: LOW_MOVE
 - **avg_hold_minutes_today**: None
 - **nifty_intraday_note**: NIFTY 50 weekly expiry is Tuesday. 0DTE gamma risk highest on Tuesday afternoon. Normal daily range for NIFTY in 2026 is 0.5-1.2% based on VIX 12-18 regime.
 
 ## 6. VRP / Volatility Deep Dive
 
-- **vrp_mean**: 3.787
+- **vrp_mean**: 3.79
 - **vrp_min**: 3.594
 - **vrp_max**: 4.008
-- **vrp_stdev**: 0.108
-- **vrp_positive_cycles**: 18
+- **vrp_stdev**: 0.106
+- **vrp_positive_cycles**: 19
 - **vrp_negative_cycles**: 0
-- **vrp_rich_cycles**: 18
+- **vrp_rich_cycles**: 19
 - **vrp_very_rich_cycles**: 0
 - **vrp_cheap_cycles**: 0
-- **total_vrp_cycles**: 18
+- **total_vrp_cycles**: 19
 - **atm_iv_open_pct**: 9.63
-- **atm_iv_close_pct**: 9.382
-- **atm_iv_mean_pct**: 9.498
-- **atm_iv_min_pct**: 9.342
+- **atm_iv_close_pct**: 9.31
+- **atm_iv_mean_pct**: 9.488
+- **atm_iv_min_pct**: 9.31
 - **atm_iv_max_pct**: 9.703
-- **iv_crush_pct**: 0.248
-- **parkinson_rv_mean_pct**: 4.891
-- **parkinson_rv_min_pct**: 4.573
+- **iv_crush_pct**: 0.32
+- **parkinson_rv_mean_pct**: 4.87
+- **parkinson_rv_min_pct**: 4.499
 - **parkinson_rv_max_pct**: 5.885
 
 
@@ -173,12 +173,12 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 ## 7. ADX / Trend Profile
 
 - **adx_open**: 49.03
-- **adx_close**: 31.46
-- **adx_mean**: 41.47
+- **adx_close**: 30.92
+- **adx_mean**: 40.91
 - **adx_max**: 49.03
-- **adx_min**: 31.46
-- **adx_condition_distribution**: {'VERY_STRONG': 10, 'STRONG': 7, 'MODERATE': 1}
-- **trending_cycles**: 18
+- **adx_min**: 30.92
+- **adx_condition_distribution**: {'VERY_STRONG': 10, 'STRONG': 7, 'MODERATE': 2}
+- **trending_cycles**: 19
 - **strong_trend_cycles**: 17
 - **flat_cycles**: 0
 
@@ -188,17 +188,17 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 ## 8. PCR / Skew / Directional Profile
 
 - **pcr_open**: 1.888
-- **pcr_close**: 2.97
-- **pcr_mean**: 2.451
+- **pcr_close**: 2.928
+- **pcr_mean**: 2.477
 - **pcr_min**: 1.551
 - **pcr_max**: 3.742
-- **pcr_change_open_to_close**: 1.082
-- **extreme_fear_cycles**: 17
+- **pcr_change_open_to_close**: 1.04
+- **extreme_fear_cycles**: 18
 - **extreme_greed_cycles**: 0
 - **neutral_cycles**: 0
 
 - **skew_open**: 1.021
-- **skew_close**: 1.038
+- **skew_close**: 1.017
 - **skew_mean**: 1.032
 - **skew_min**: 1.015
 - **skew_max**: 1.066
@@ -210,7 +210,7 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 
 ## 9. Market Data Timeline (cycle_log)
 
-Total cycles: 18. Gaps detected: 0.
+Total cycles: 19. Gaps detected: 0.
 
 | cycle_time | spot | vix | vrp | atm_iv_pct | parkinson_rv_pct | adx | adx_condition | vwap_dist_pct | pcr | skew_ratio | or_condition | volatility_condition | trend_condition | direction | action_taken | no_trade_reason | open_positions | daily_pnl_net |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -232,16 +232,17 @@ Total cycles: 18. Gaps detected: 0.
 | 2026-09-04T12:35:12.467133+05:30 | 23946.9000 | 10.8000 | 3.7443 | 9.3451 | 4.6891 | 33.2093 | STRONG | -0.0318 | 3.1494 | 1.0233 | VERY_NARROW | RICH | STRONG_TREND | NEUTRAL | NO_TRADE | position_already_open_single_position_engine | 1 | -836.8466 |
 | 2026-09-04T12:40:12.474815+05:30 | 23944.4000 | 10.7900 | 3.8091 | 9.3691 | 4.6299 | 32.3038 | STRONG | -0.0410 | 3.0423 | 1.0254 | VERY_NARROW | RICH | STRONG_TREND | NEUTRAL | NO_TRADE | position_already_open_single_position_engine | 1 | -947.3466 |
 | 2026-09-04T12:42:26.405997+05:30 | 23942.4500 | 10.7800 | 3.8828 | 9.3820 | 4.5729 | 31.4629 | MODERATE | -0.0481 | 2.9697 | 1.0384 | VERY_NARROW | RICH | STRONG_TREND | NEUTRAL | NO_TRADE | position_already_open_single_position_engine | 1 | -1038.3466 |
+| 2026-09-04T12:47:26.514562+05:30 | 23936.1500 | 10.7800 | 3.8507 | 9.3099 | 4.4992 | 30.9201 | MODERATE | -0.0726 | 2.9279 | 1.0169 | VERY_NARROW | RICH | MILD_TREND | NEUTRAL | NO_TRADE | position_already_open_single_position_engine | 1 | -1064.3466 |
 
 ## 10. Gate Blockage Analysis
 
-- **total_cycles**: 18
-- **total_decisions**: 18
-- **no_trade_count**: 17
+- **total_cycles**: 19
+- **total_decisions**: 19
+- **no_trade_count**: 18
 - **enter_count**: 1
-- **no_trade_rate_pct**: 94.4
-- **gate_category_counts**: {'risk_gates': 0, 'data_gates': 0, 'market_condition_gates': 0, 'timing_gates': 0, 'strategy_gates': 0, 'event_gates': 0, 'other': 17}
-- **top_10_reasons**: {'position_already_open_single_position_engine': 17}
+- **no_trade_rate_pct**: 94.7
+- **gate_category_counts**: {'risk_gates': 0, 'data_gates': 0, 'market_condition_gates': 0, 'timing_gates': 0, 'strategy_gates': 0, 'event_gates': 0, 'other': 18}
+- **top_10_reasons**: {'position_already_open_single_position_engine': 18}
 
 
 **Gate analysis interpretation:** If risk_gates dominate, the engine is being too conservative on capital/loss limits. If timing_gates dominate, the trading window may be too narrow. If strategy_gates dominate, credit floors or ratio checks are blocking trades — review MIN_CREDITS and credit/width ratio thresholds. If data_gates dominate, there are API or data quality issues.
@@ -268,6 +269,7 @@ Total cycles: 18. Gaps detected: 0.
 | 2026-09-04T12:35:12.543057+05:30 | NO_TRADE | NONE | position_already_open_single_position_engine |
 | 2026-09-04T12:40:12.497982+05:30 | NO_TRADE | NONE | position_already_open_single_position_engine |
 | 2026-09-04T12:42:26.472626+05:30 | NO_TRADE | NONE | position_already_open_single_position_engine |
+| 2026-09-04T12:47:26.584122+05:30 | NO_TRADE | NONE | position_already_open_single_position_engine |
 
 
 ### 11a. Full Parameters for Selected Strategies
@@ -358,7 +360,7 @@ Total cycles: 18. Gaps detected: 0.
 
 ## 12. No-Trade Reason Frequency
 
-- [17x] position_already_open_single_position_engine
+- [18x] position_already_open_single_position_engine
 
 ## 13. Trade-by-Trade Deep Dive
 
@@ -415,13 +417,13 @@ Total cycles: 18. Gaps detected: 0.
 
 **Recomputed cost breakdown (independent cross-check):**
 
-- **stt**: 9.16
-- **exchange**: 3.11
+- **stt**: 7.94
+- **exchange**: 2.7
 - **brokerage**: 40.0
-- **sebi**: 0.0088
-- **stamp**: 0.0796
-- **gst**: 7.76
-- **total**: 60.12
+- **sebi**: 0.0076
+- **stamp**: 0.069
+- **gst**: 7.69
+- **total**: 58.4
 
 - Recorded entry costs (Rs): 58.153184736
 
@@ -482,46 +484,47 @@ _No exits recorded today._
 | 2026-09-04T12:35:12.467133+05:30 | -836.8466 | 23946.9000 | 3.7443 | 33.2093 |
 | 2026-09-04T12:40:12.474815+05:30 | -947.3466 | 23944.4000 | 3.8091 | 32.3038 |
 | 2026-09-04T12:42:26.405997+05:30 | -1038.3466 | 23942.4500 | 3.8828 | 31.4629 |
+| 2026-09-04T12:47:26.514562+05:30 | -1064.3466 | 23936.1500 | 3.8507 | 30.9201 |
 
 ## 18. Option Chain Statistics
 
-- **total_rows**: 3132
-- **unique_capture_times**: 18
+- **total_rows**: 3306
+- **unique_capture_times**: 19
 - **unique_strikes**: 87
 - **strike_range**: [22100.0, 26400.0]
 - **zero_bid_ask_count**: 0
 - **zero_bid_ask_pct**: 0.0
-- **avg_spread**: 41.845
+- **avg_spread**: 41.66
 - **max_spread**: 334.0
-- **avg_iv_pct**: 19.07
+- **avg_iv_pct**: 19.05
 - **iv_range_pct**: [5.37, 71.58]
-- **total_call_oi**: 4002743810
-- **total_put_oi**: 4418344840
-- **chain_pcr**: 1.104
+- **total_call_oi**: 4238110045
+- **total_put_oi**: 4652644425
+- **chain_pcr**: 1.098
 - **first_capture**: 2026-09-04T11:43:21.442314+05:30
-- **last_capture**: 2026-09-04T12:42:26.406442+05:30
+- **last_capture**: 2026-09-04T12:47:26.514935+05:30
 
 
-_Full chain (3132 rows) in raw JSON export._
+_Full chain (3306 rows) in raw JSON export._
 
 ## 18b. Intraday 1-Minute Candle Statistics
 
-- **total_1min_bars**: 207
+- **total_1min_bars**: 212
 - **first_bar_time**: 2026-09-04T09:15:00+05:30
-- **last_bar_time**: 2026-09-04T12:41:00+05:30
+- **last_bar_time**: 2026-09-04T12:46:00+05:30
 - **open**: 23906.8
-- **close**: 23942.4
+- **close**: 23936.15
 - **high**: 24005.75
 - **low**: 23895.85
 - **total_volume**: 0
-- **avg_bar_range_pts**: 6.236
+- **avg_bar_range_pts**: 6.191
 - **max_bar_range_pts**: 46.95
 - **zero_volume_bars**: 0
-- **net_change_pts**: 35.6
-- **net_change_pct**: 0.149
+- **net_change_pts**: 29.35
+- **net_change_pct**: 0.123
 
 
-_Total 1-min bars in DB: 207. Used for ADX, VWAP, Parkinson RV, OR. Stored permanently._
+_Total 1-min bars in DB: 212. Used for ADX, VWAP, Parkinson RV, OR. Stored permanently._
 
 ## 19. ATM IV Intraday History
 
@@ -588,7 +591,7 @@ _Total 1-min bars in DB: 207. Used for ADX, VWAP, Parkinson RV, OR. Stored perma
 | 2026-09-04T12:09:13.339678+05:30 | 23900.0000 | call | 156.3500 | 156.7500 | 156.7500 | 0.1067 | 0.6269 | 7259200 |
 | 2026-09-04T12:09:13.339678+05:30 | 23900.0000 | put | 58.4500 | 58.6000 | 58.6000 | 0.0938 | -0.3569 | 25561250 |
 
-_... 76 more row(s) omitted — see raw JSON export._
+_... 83 more row(s) omitted — see raw JSON export._
 
 
 ### Wing IV History (25-delta strikes)
@@ -656,15 +659,15 @@ _... 76 more row(s) omitted — see raw JSON export._
 | 2026-09-04T12:09:13.339678+05:30 | 24100.0000 | call | 52.7000 | 52.8000 | 52.8500 | 0.0974 | 0.3263 | 14046955 |
 | 2026-09-04T12:09:13.339678+05:30 | 24150.0000 | call | 37.1500 | 37.2000 | 37.1500 | 0.0961 | 0.2551 | 7137650 |
 
-_... 59 more row(s) omitted — see raw JSON export._
+_... 66 more row(s) omitted — see raw JSON export._
 
 ## 20. API Call Health
 
-- **total_calls**: 65
-- **by_category**: {'default': 9, 'quote': 18, 'historical': 18, 'chain': 20}
+- **total_calls**: 69
+- **by_category**: {'default': 9, 'quote': 19, 'historical': 19, 'chain': 22}
 - **error_count**: 0
 - **rate_limited_count**: 0
-- **avg_response_ms**: 114.0
+- **avg_response_ms**: 110.7
 - **p95_response_ms**: 556.4
 - **max_response_ms**: 635.3
 - **slow_calls_over_2s**: 0
@@ -700,17 +703,17 @@ _No prior days summary data available._
 
 ## 24. NIFTY Intraday Benchmarks
 
-- **actual_day_range_pts**: 46.7
-- **actual_day_range_pct**: 0.195
+- **actual_day_range_pts**: 49.75
+- **actual_day_range_pct**: 0.207
 - **expected_daily_range_pct_from_vix**: 0.68
-- **range_vs_expected_ratio**: 0.29
+- **range_vs_expected_ratio**: 0.3
 - **day_classification**: LOW_MOVE
 - **avg_hold_minutes_today**: None
 - **nifty_intraday_note**: NIFTY 50 weekly expiry is Tuesday. 0DTE gamma risk highest on Tuesday afternoon. Normal daily range for NIFTY in 2026 is 0.5-1.2% based on VIX 12-18 regime.
 
 ## 25. Audit Log — Warnings and Errors
 
-Total WARNING/ERROR/CRITICAL lines: 1 of 135 total (135 in DB table)
+Total WARNING/ERROR/CRITICAL lines: 1 of 137 total (137 in DB table)
 
 
 ```
@@ -759,6 +762,8 @@ Total WARNING/ERROR/CRITICAL lines: 1 of 135 total (135 in DB table)
 | 2026-09-04T12:40:12.497982+05:30 | DECISION | NO_TRADE NONE — position_already_open_single_position_engine |
 | 2026-09-04T12:42:26.405997+05:30 | CYCLE | spot=23942.45 vix=10.78 vrp=3.882757321820818 vol=RICH trend=STRONG_TREND dir=NEUTRAL adx=31.46292154872564 pcr=2.969708 |
 | 2026-09-04T12:42:26.472626+05:30 | DECISION | NO_TRADE NONE — position_already_open_single_position_engine |
+| 2026-09-04T12:47:26.514562+05:30 | CYCLE | spot=23936.15 vix=10.78 vrp=3.8507418037030483 vol=RICH trend=MILD_TREND dir=NEUTRAL adx=30.920073120036733 pcr=2.927851 |
+| 2026-09-04T12:47:26.584122+05:30 | DECISION | NO_TRADE NONE — position_already_open_single_position_engine |
 
 ## 27. Daily Summary (engine EOD)
 

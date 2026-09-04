@@ -1078,5 +1078,21 @@
     "logger_name": "nifty_algo",
     "message": "NO_TRADE: position_already_open_single_position_engine",
     "context_json": null
+  },
+  {
+    "log_id": 136,
+    "log_time": "2026-09-04T12:47:26.429001+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Active expiry: 2026-09-08 (DTE=4)",
+    "context_json": null
+  },
+  {
+    "log_id": 137,
+    "log_time": "2026-09-04T12:47:26.583254+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
   }
 ]

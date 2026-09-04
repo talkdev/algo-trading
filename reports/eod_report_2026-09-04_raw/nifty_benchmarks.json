@@ -1,8 +1,8 @@
 {
-  "actual_day_range_pts": 46.7,
-  "actual_day_range_pct": 0.195,
+  "actual_day_range_pts": 49.75,
+  "actual_day_range_pct": 0.207,
   "expected_daily_range_pct_from_vix": 0.68,
-  "range_vs_expected_ratio": 0.29,
+  "range_vs_expected_ratio": 0.3,
   "day_classification": "LOW_MOVE",
   "avg_hold_minutes_today": null,
   "nifty_intraday_note": "NIFTY 50 weekly expiry is Tuesday. 0DTE gamma risk highest on Tuesday afternoon. Normal daily range for NIFTY in 2026 is 0.5-1.2% based on VIX 12-18 regime."

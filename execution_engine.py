@@ -860,6 +860,33 @@ class ExecutionEngine:
                                           f"tightening stop for {strategy_name}")
                         return "TIGHTEN_STOP", {}
 
+        if strategy_type == "SELL" and position.get("entry_credit") and position.get("entry_time"):
+            try:
+                _entry_dt = datetime.fromisoformat(position["entry_time"])
+                _hold_min = (now_ist() - _entry_dt).total_seconds() / 60.0
+                if _hold_min >= 60:
+                    _entry_credit = position["entry_credit"]
+                    _expected_theta_decay = abs(
+                        sum(l.get("entry_theta", 0) or 0 for l in legs if l.get("leg_status") == "OPEN")
+                    ) * (_hold_min / 390.0)
+                    _actual_decay = _entry_credit - current_premium
+                    if _expected_theta_decay > 0 and _actual_decay < (_expected_theta_decay * 0.15):
+                        _tightened_stop = _entry_credit * 1.5
+                        if current_premium > _tightened_stop and not position.get("stop_tightened_for_delta"):
+                            self.db.update(
+                                "positions",
+                                {"stop_premium": _tightened_stop, "stop_tightened_for_delta": 1},
+                                {"position_id": position["position_id"]},
+                            )
+                            self.logger.info(
+                                f"THETA UNDERPERFORMANCE: {strategy_name} held {_hold_min:.0f}min "
+                                f"expected_decay={_expected_theta_decay:.2f}pts actual={_actual_decay:.2f}pts "
+                                f"tightening stop to {_tightened_stop:.2f}pts"
+                            )
+                            return "TIGHTEN_STOP", {}
+            except Exception:
+                pass
+
         return "HOLD", {"current_premium": current_premium}
 
     def monitor_all_positions(self, signals: dict) -> None:
