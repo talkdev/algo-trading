@@ -1,0 +1,122 @@
+[
+  {
+    "log_id": 262,
+    "log_time": "2026-09-04T10:56:25.339255+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Initialized fresh session_state for 2026-09-04.",
+    "context_json": null
+  },
+  {
+    "log_id": 263,
+    "log_time": "2026-09-04T10:56:25.340344+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ExecutionEngine initialized in PAPER TRADE mode.",
+    "context_json": null
+  },
+  {
+    "log_id": 264,
+    "log_time": "2026-09-04T10:56:25.736701+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Upstox token validated. User: Deoraj Anand",
+    "context_json": null
+  },
+  {
+    "log_id": 265,
+    "log_time": "2026-09-04T10:56:25.737351+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live \u2014 lot sizes have changed before and can change again.",
+    "context_json": null
+  },
+  {
+    "log_id": 266,
+    "log_time": "2026-09-04T10:56:25.890911+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Active expiry: 2026-09-08 (DTE=4)",
+    "context_json": null
+  },
+  {
+    "log_id": 267,
+    "log_time": "2026-09-04T10:56:25.953668+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "OPENING RANGE COMPUTED: H=23916 L=23896 W=20 [VERY_NARROW]",
+    "context_json": null
+  },
+  {
+    "log_id": 268,
+    "log_time": "2026-09-04T10:56:25.954050+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Session initialized: opening_iv=9.70%",
+    "context_json": null
+  },
+  {
+    "log_id": 269,
+    "log_time": "2026-09-04T10:56:25.954345+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "PCR baseline set at 10:00: opening_pcr=1.207",
+    "context_json": null
+  },
+  {
+    "log_id": 270,
+    "log_time": "2026-09-04T10:56:25.980599+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Half-size applied due to: trending_neutral_condor_half_size+RICH_vrp",
+    "context_json": null
+  },
+  {
+    "log_id": 271,
+    "log_time": "2026-09-04T10:56:25.994247+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "STRATEGY DECISION: STRATEGY_SELECTED IRON_CONDOR \u2014 trending_neutral_condor_half_size+RICH_vrp",
+    "context_json": null
+  },
+  {
+    "log_id": 272,
+    "log_time": "2026-09-04T10:56:25.997168+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "[PAPER] ENTRY FILL: BUY CALL 24300 x1 @ 12.50 (order_id=PAPER-2026-09-04-0001)",
+    "context_json": null
+  },
+  {
+    "log_id": 273,
+    "log_time": "2026-09-04T10:56:25.997597+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "[PAPER] ENTRY FILL: BUY PUT 23650 x1 @ 14.70 (order_id=PAPER-2026-09-04-0002)",
+    "context_json": null
+  },
+  {
+    "log_id": 274,
+    "log_time": "2026-09-04T10:56:25.998139+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "[PAPER] ENTRY FILL: SELL CALL 24150 x1 @ 38.90 (order_id=PAPER-2026-09-04-0003)",
+    "context_json": null
+  },
+  {
+    "log_id": 275,
+    "log_time": "2026-09-04T10:56:25.998560+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "[PAPER] ENTRY FILL: SELL PUT 23800 x1 @ 34.50 (order_id=PAPER-2026-09-04-0004)",
+    "context_json": null
+  },
+  {
+    "log_id": 276,
+    "log_time": "2026-09-04T10:56:26.010591+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ENTRY EXECUTED: IRON_CONDOR position_id=87054612-717e-481c-b269-4e1c76a06832 lots=1 paper_trade=True",
+    "context_json": null
+  }
+]

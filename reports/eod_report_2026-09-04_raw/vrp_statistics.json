@@ -1,0 +1,21 @@
+{
+  "vrp_mean": 3.462,
+  "vrp_min": 3.462,
+  "vrp_max": 3.462,
+  "vrp_stdev": 0,
+  "vrp_positive_cycles": 1,
+  "vrp_negative_cycles": 0,
+  "vrp_rich_cycles": 1,
+  "vrp_very_rich_cycles": 0,
+  "vrp_cheap_cycles": 0,
+  "total_vrp_cycles": 1,
+  "atm_iv_open_pct": 9.7,
+  "atm_iv_close_pct": 9.7,
+  "atm_iv_mean_pct": 9.7,
+  "atm_iv_min_pct": 9.7,
+  "atm_iv_max_pct": 9.7,
+  "iv_crush_pct": 0,
+  "parkinson_rv_mean_pct": 6.238,
+  "parkinson_rv_min_pct": 6.238,
+  "parkinson_rv_max_pct": 6.238
+}

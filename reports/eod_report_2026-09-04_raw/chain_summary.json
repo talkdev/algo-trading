@@ -1,0 +1,23 @@
+{
+  "total_rows": 174,
+  "unique_capture_times": 1,
+  "unique_strikes": 87,
+  "strike_range": [
+    22100.0,
+    26400.0
+  ],
+  "zero_bid_ask_count": 0,
+  "zero_bid_ask_pct": 0.0,
+  "avg_spread": 41.174,
+  "max_spread": 329.3,
+  "avg_iv_pct": 19.07,
+  "iv_range_pct": [
+    5.98,
+    67.5
+  ],
+  "total_call_oi": 230650680,
+  "total_put_oi": 228596615,
+  "chain_pcr": 0.991,
+  "first_capture": "2026-09-04T10:56:25.955280+05:30",
+  "last_capture": "2026-09-04T10:56:25.955280+05:30"
+}
