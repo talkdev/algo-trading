@@ -1,8 +1,8 @@
 {
-  "total_cycles": 1,
-  "total_decisions": 1,
+  "total_cycles": 2,
+  "total_decisions": 2,
   "no_trade_count": 0,
-  "enter_count": 1,
+  "enter_count": 2,
   "no_trade_rate_pct": 0.0,
   "gate_category_counts": {
     "risk_gates": 0,

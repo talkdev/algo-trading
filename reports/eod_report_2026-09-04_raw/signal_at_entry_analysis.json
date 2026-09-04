@@ -1,29 +1,32 @@
 {
   "vrp_at_entry": {
     "values": [
-      3.4621765580371298
+      3.4621765580371298,
+      3.611731816011787
     ],
-    "mean": 3.462
+    "mean": 3.537
   },
   "vix_at_entry": {
     "values": [
-      10.84
+      10.84,
+      10.79
     ],
-    "mean": 10.84
+    "mean": 10.815
   },
   "adx_at_entry": {
     "values": [
+      0.0,
       0.0
     ],
     "mean": 0.0
   },
   "volatility_condition_at_entry": {
-    "RICH": 1
+    "RICH": 2
   },
   "trend_condition_at_entry": {
-    "TRENDING": 1
+    "TRENDING": 2
   },
   "direction_at_entry": {
-    "NEUTRAL": 1
+    "NEUTRAL": 2
   }
 }

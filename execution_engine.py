@@ -555,7 +555,7 @@ class ExecutionEngine:
         state = self.market_engine.state
         state["entry_count"] = state.get("entry_count", 0) + 1
         state["consecutive_stops"] = 0
-        entry_count_only_on_loss = True
+        state["last_entry_time"] = now_ist().isoformat()
         self.market_engine._save_session_state()
 
         print_section(f"POSITION OPENED: {params['strategy_name']}")
@@ -693,7 +693,7 @@ class ExecutionEngine:
                     pass
 
         if strategy_type == "SELL" and position.get("entry_credit") and position["entry_credit"] > 0:
-            _credit_stop_limit = position["entry_credit"] * 1.5
+            _credit_stop_limit = position["entry_credit"] * 2.0
             _actual_stop = min(
                 effective_stop if effective_stop is not None else _credit_stop_limit,
                 _credit_stop_limit

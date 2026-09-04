@@ -1,11 +1,11 @@
 {
   "open": 23961.55,
-  "close": 23961.55,
-  "high": 23961.55,
+  "close": 23970.35,
+  "high": 23970.35,
   "low": 23961.55,
-  "range_pts": 0.0,
-  "range_pct": 0.0,
-  "net_change_pts": 0.0,
-  "net_change_pct": 0.0,
-  "direction": "FLAT"
+  "range_pts": 8.8,
+  "range_pct": 0.037,
+  "net_change_pts": 8.8,
+  "net_change_pct": 0.037,
+  "direction": "UP"
 }

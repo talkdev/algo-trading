@@ -194,7 +194,7 @@ class MarketDataEngine:
             "hard_exit_time": self.config.hard_exit_time.strftime("%H:%M"),
             "stop_multiplier": 2.0, "size_multiplier": 1.0, "wing_width": 150,
             "entry_count": 0, "reentry_count": 0, "daily_halted": False, "consecutive_stops": 0,
-            "last_stop_time": None, "last_stop_reason": None,
+            "last_stop_time": None, "last_stop_reason": None, "last_entry_time": None,
             "actual_expiry": None, "actual_dte": None,
             "opening_iv": None, "opening_pcr": None,
             "current_capital": self.config.starting_capital, "daily_pnl": 0.0,
