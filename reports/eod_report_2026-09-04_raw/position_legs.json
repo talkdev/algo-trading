@@ -7,7 +7,7 @@
     "action": "BUY",
     "qty": 130,
     "entry_price": 17.7,
-    "exit_price": null,
+    "exit_price": 16.9,
     "entry_bid": 17.65,
     "entry_ask": 17.7,
     "entry_delta": -0.1287,
@@ -18,8 +18,8 @@
     "entry_oi": 10115105,
     "exit_delta": null,
     "broker_order_id_entry": "PAPER-2026-09-04-0001",
-    "broker_order_id_exit": null,
-    "leg_status": "OPEN"
+    "broker_order_id_exit": "PAPER-2026-09-04-0001",
+    "leg_status": "CLOSED"
   },
   {
     "leg_id": 2,
@@ -29,7 +29,7 @@
     "action": "SELL",
     "qty": 130,
     "entry_price": 40.7,
-    "exit_price": null,
+    "exit_price": 44.05,
     "entry_bid": 40.7,
     "entry_ask": 40.8,
     "entry_delta": -0.2648,
@@ -40,7 +40,7 @@
     "entry_oi": 10287095,
     "exit_delta": null,
     "broker_order_id_entry": "PAPER-2026-09-04-0002",
-    "broker_order_id_exit": null,
-    "leg_status": "OPEN"
+    "broker_order_id_exit": "PAPER-2026-09-04-0002",
+    "leg_status": "CLOSED"
   }
 ]

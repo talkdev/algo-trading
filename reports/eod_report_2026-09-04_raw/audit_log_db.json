@@ -1318,5 +1318,381 @@
     "logger_name": "nifty_algo",
     "message": "NO_TRADE: position_already_open_single_position_engine",
     "context_json": null
+  },
+  {
+    "log_id": 166,
+    "log_time": "2026-09-04T12:58:49.065005+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: position_already_open_single_position_engine",
+    "context_json": null
+  },
+  {
+    "log_id": 167,
+    "log_time": "2026-09-04T13:03:49.001821+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 168,
+    "log_time": "2026-09-04T13:08:49.030490+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 169,
+    "log_time": "2026-09-04T13:13:49.016114+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 170,
+    "log_time": "2026-09-04T13:18:49.010371+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Active expiry: 2026-09-08 (DTE=4)",
+    "context_json": null
+  },
+  {
+    "log_id": 171,
+    "log_time": "2026-09-04T13:18:49.124376+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 172,
+    "log_time": "2026-09-04T13:23:48.977677+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 173,
+    "log_time": "2026-09-04T13:28:49.050285+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 174,
+    "log_time": "2026-09-04T13:33:49.027185+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 175,
+    "log_time": "2026-09-04T13:38:48.974070+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 176,
+    "log_time": "2026-09-04T13:43:48.949548+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 177,
+    "log_time": "2026-09-04T13:48:48.976929+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 178,
+    "log_time": "2026-09-04T13:53:48.944418+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Active expiry: 2026-09-08 (DTE=4)",
+    "context_json": null
+  },
+  {
+    "log_id": 179,
+    "log_time": "2026-09-04T13:53:49.041000+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 180,
+    "log_time": "2026-09-04T13:58:48.979473+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 181,
+    "log_time": "2026-09-04T14:03:48.955988+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 182,
+    "log_time": "2026-09-04T14:08:48.955155+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 183,
+    "log_time": "2026-09-04T14:13:48.931454+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 184,
+    "log_time": "2026-09-04T14:18:48.925426+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 185,
+    "log_time": "2026-09-04T14:23:48.933703+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 186,
+    "log_time": "2026-09-04T14:28:48.900350+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Active expiry: 2026-09-08 (DTE=4)",
+    "context_json": null
+  },
+  {
+    "log_id": 187,
+    "log_time": "2026-09-04T14:28:49.003568+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 188,
+    "log_time": "2026-09-04T14:33:48.943597+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 189,
+    "log_time": "2026-09-04T14:38:48.969136+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 190,
+    "log_time": "2026-09-04T14:43:48.897520+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 191,
+    "log_time": "2026-09-04T14:48:48.898830+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 192,
+    "log_time": "2026-09-04T14:53:48.922537+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 193,
+    "log_time": "2026-09-04T14:58:48.905607+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "NO_TRADE: past_entry_window_end_13:00:00",
+    "context_json": null
+  },
+  {
+    "log_id": 194,
+    "log_time": "2026-09-04T15:03:48.880014+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Active expiry: 2026-09-08 (DTE=4)",
+    "context_json": null
+  },
+  {
+    "log_id": 195,
+    "log_time": "2026-09-04T15:03:48.985249+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "[PAPER] EXIT FILL: close BUY PUT 23700 x2 @ 16.90 (order_id=PAPER-2026-09-04-0001)",
+    "context_json": null
+  },
+  {
+    "log_id": 196,
+    "log_time": "2026-09-04T15:03:48.986393+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "[PAPER] EXIT FILL: close SELL PUT 23850 x2 @ 44.05 (order_id=PAPER-2026-09-04-0002)",
+    "context_json": null
+  },
+  {
+    "log_id": 197,
+    "log_time": "2026-09-04T15:03:48.991055+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "POSITION CLOSED: BULL_PUT_SPREAD reason=CLOSE_TIME net_pnl=Rs-772.44 result=LOSS",
+    "context_json": null
+  },
+  {
+    "log_id": 198,
+    "log_time": "2026-09-04T15:28:48.861033+05:30",
+    "level": "WARNING",
+    "logger_name": "nifty_algo",
+    "message": "PCR 8.068 outside valid range [0.3,4.0] \u2014 discarding",
+    "context_json": null
+  },
+  {
+    "log_id": 199,
+    "log_time": "2026-09-04T15:33:47.796486+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Received signal 2 \u2014 will shut down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 200,
+    "log_time": "2026-09-04T15:33:47.797421+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown signal received \u2014 shutting down gracefully.",
+    "context_json": null
+  },
+  {
+    "log_id": 201,
+    "log_time": "2026-09-04T15:33:47.798220+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Graceful shutdown initiated",
+    "context_json": null
+  },
+  {
+    "log_id": 202,
+    "log_time": "2026-09-04T15:33:47.799054+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Session state saved. entry_count=1, daily_pnl=-772.4365690719992, open_positions=0. Restart engine to resume.",
+    "context_json": null
+  },
+  {
+    "log_id": 203,
+    "log_time": "2026-09-04T15:33:47.799679+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Shutdown complete.",
+    "context_json": null
+  },
+  {
+    "log_id": 204,
+    "log_time": "2026-09-04T15:33:49.698567+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Loaded existing session_state for 2026-09-04 from DB (mid-day restart recovery).",
+    "context_json": null
+  },
+  {
+    "log_id": 205,
+    "log_time": "2026-09-04T15:33:49.703523+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "ExecutionEngine initialized in PAPER TRADE mode.",
+    "context_json": null
+  },
+  {
+    "log_id": 206,
+    "log_time": "2026-09-04T15:33:50.270429+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Upstox token validated. User: Deoraj Anand",
+    "context_json": null
+  },
+  {
+    "log_id": 207,
+    "log_time": "2026-09-04T15:33:50.278168+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Lot size configured as 65 shares/lot. MANUALLY VERIFY this matches the current NSE NIFTY contract specification and your broker's instrument master before trading live \u2014 lot sizes have changed before and can change again.",
+    "context_json": null
+  },
+  {
+    "log_id": 208,
+    "log_time": "2026-09-04T15:33:50.459516+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Active expiry: 2026-09-08 (DTE=4)",
+    "context_json": null
+  },
+  {
+    "log_id": 209,
+    "log_time": "2026-09-04T15:33:50.530549+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "PCR baseline set at 10:00: opening_pcr=0.612",
+    "context_json": null
+  },
+  {
+    "log_id": 210,
+    "log_time": "2026-09-04T15:43:50.276420+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Post-market \u2014 performing EOD tasks and stopping.",
+    "context_json": null
+  },
+  {
+    "log_id": 211,
+    "log_time": "2026-09-04T15:43:50.284689+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "Performing end-of-day tasks",
+    "context_json": null
+  },
+  {
+    "log_id": 212,
+    "log_time": "2026-09-04T15:43:50.335183+05:30",
+    "level": "INFO",
+    "logger_name": "nifty_algo",
+    "message": "EOD SUMMARY: net_pnl=Rs-772.44 win_rate=0.0% trades=1",
+    "context_json": null
   }
 ]

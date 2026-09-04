@@ -503,14 +503,11 @@ class MainEngine:
                 loop_duration = (now_ist() - loop_start).total_seconds()
                 if loop_duration > 60:
                     self.logger.warning(f"Cycle took {loop_duration:.0f}s (longer than the 300s target)")
-                _is_tuesday_0dte = (
-                    now_ist().weekday() == 1
-                    and now_ist().time() >= dtime(13, 30)
-                    and len(self.execution_engine._get_open_positions()) > 0
-                )
-                _cycle_interval = 120 if _is_tuesday_0dte else 300
-                if _is_tuesday_0dte:
-                    self.logger.debug("Tuesday 0DTE after 13:30 with open position — 2-min monitoring cycle")
+                _has_open = len(self.execution_engine._get_open_positions()) > 0
+                if _has_open:
+                    _cycle_interval = 60
+                else:
+                    _cycle_interval = 300
                 self._sleep(max(5, _cycle_interval - loop_duration))
 
             except KeyboardInterrupt:
