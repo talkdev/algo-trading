@@ -121,5 +121,12 @@
   "2026-09-04 10:56:25 | INFO     | nifty_algo               | [PAPER] ENTRY FILL: BUY PUT 23650 x1 @ 14.70 (order_id=PAPER-2026-09-04-0002)",
   "2026-09-04 10:56:25 | INFO     | nifty_algo               | [PAPER] ENTRY FILL: SELL CALL 24150 x1 @ 38.90 (order_id=PAPER-2026-09-04-0003)",
   "2026-09-04 10:56:25 | INFO     | nifty_algo               | [PAPER] ENTRY FILL: SELL PUT 23800 x1 @ 34.50 (order_id=PAPER-2026-09-04-0004)",
-  "2026-09-04 10:56:26 | INFO     | nifty_algo               | ENTRY EXECUTED: IRON_CONDOR position_id=87054612-717e-481c-b269-4e1c76a06832 lots=1 paper_trade=True"
+  "2026-09-04 10:56:26 | INFO     | nifty_algo               | ENTRY EXECUTED: IRON_CONDOR position_id=87054612-717e-481c-b269-4e1c76a06832 lots=1 paper_trade=True",
+  "2026-09-04 11:01:25 | INFO     | nifty_algo               | Half-size applied due to: trending_neutral_condor_half_size+RICH_vrp",
+  "2026-09-04 11:01:25 | INFO     | nifty_algo               | STRATEGY DECISION: STRATEGY_SELECTED IRON_CONDOR \u2014 trending_neutral_condor_half_size+RICH_vrp",
+  "2026-09-04 11:01:25 | INFO     | nifty_algo               | [PAPER] ENTRY FILL: BUY CALL 24300 x1 @ 12.95 (order_id=PAPER-2026-09-04-0005)",
+  "2026-09-04 11:01:25 | INFO     | nifty_algo               | [PAPER] ENTRY FILL: BUY PUT 23650 x1 @ 14.30 (order_id=PAPER-2026-09-04-0006)",
+  "2026-09-04 11:01:25 | INFO     | nifty_algo               | [PAPER] ENTRY FILL: SELL CALL 24150 x1 @ 40.05 (order_id=PAPER-2026-09-04-0007)",
+  "2026-09-04 11:01:25 | INFO     | nifty_algo               | [PAPER] ENTRY FILL: SELL PUT 23800 x1 @ 33.65 (order_id=PAPER-2026-09-04-0008)",
+  "2026-09-04 11:01:25 | INFO     | nifty_algo               | ENTRY EXECUTED: IRON_CONDOR position_id=df87a016-3093-429c-949d-089f4905918b lots=1 paper_trade=True"
 ]

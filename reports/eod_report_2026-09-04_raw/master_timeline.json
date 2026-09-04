@@ -38,5 +38,20 @@
     "2026-09-04T10:56:25.999994+05:30",
     "ENTRY",
     "IRON_CONDOR lots=1 credit/debit=44.46949251809231 vrp=3.4621765580371298 vix=10.84 vol_cond=RICH trend=TRENDING dir=NEUTRAL reason=trending_neutral_condor_half_size+RICH_vrp"
+  ],
+  [
+    "2026-09-04T11:01:25.866980+05:30",
+    "CYCLE",
+    "spot=23970.35 vix=10.79 vrp=3.611731816011787 vol=RICH trend=TRENDING dir=NEUTRAL adx=0.0 pcr=1.2206783517297 skew=1.031958762886598 action=STRATEGY_SELECTED:IRON_CONDOR no_trade_reason=None open_pos=1 daily_pnl=-140.10798632400036"
+  ],
+  [
+    "2026-09-04T11:01:25.911224+05:30",
+    "DECISION",
+    "STRATEGY_SELECTED IRON_CONDOR \u2014 trending_neutral_condor_half_size+RICH_vrp"
+  ],
+  [
+    "2026-09-04T11:01:25.926159+05:30",
+    "ENTRY",
+    "IRON_CONDOR lots=1 credit/debit=44.66889390749229 vrp=3.611731816011787 vix=10.79 vol_cond=RICH trend=TRENDING dir=NEUTRAL reason=trending_neutral_condor_half_size+RICH_vrp"
   ]
 ]

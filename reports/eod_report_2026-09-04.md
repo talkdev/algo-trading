@@ -1,5 +1,5 @@
 # NIFTY Intraday Options Engine — EOD Forensic Report
-**Target Date:** 2026-09-04  |  **Report Generated:** 2026-09-04T10:57:39.402173
+**Target Date:** 2026-09-04  |  **Report Generated:** 2026-09-04T11:01:53.897904
 
 ## 0. How to Read This Report
 
@@ -42,8 +42,8 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **Day mode**: NORMAL
 - **VIX regime (final)**: LOW
 - **OR condition / width**: VERY_NARROW / 20.450000000000728
-- **Trades attempted (decisions)**: 1
-- **Trades executed**: 1
+- **Trades attempted (decisions)**: 2
+- **Trades executed**: 2
 - **Trades closed**: 0
 - **Wins / Losses**: 0 / 0
 - **Gross P&L (Rs)**: 0
@@ -54,18 +54,18 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **Current capital (session_state)**: 1000000.0
 - **Daily halted**: 0
 - **Consecutive stops**: 0
-- **Cycles logged**: 1
-- **NIFTY open / close / range**: 23961.55 / 23961.55 / 0.0pts (0.0%)
-- **VRP mean today (pp)**: 3.462
-- **ATM IV open / close (pct)**: 9.7 / 9.7
-- **IV crush today (pp)**: 0
-- **Option chain snapshot rows**: 174
-- **API calls made**: 5
-- **Audit log lines (file)**: 123
+- **Cycles logged**: 2
+- **NIFTY open / close / range**: 23961.55 / 23970.35 / 8.8pts (0.037%)
+- **VRP mean today (pp)**: 3.537
+- **ATM IV open / close (pct)**: 9.7 / 9.724
+- **IV crush today (pp)**: -0.025
+- **Option chain snapshot rows**: 348
+- **API calls made**: 8
+- **Audit log lines (file)**: 130
 
 ## 3. Auto-Detected Anomalies / Flags
 
-- [FLAG] NIFTY moved only 0.00% intraday — very low move day, premium may have been thin.
+- [FLAG] NIFTY moved only 0.04% intraday — very low move day, premium may have been thin.
 
 ## 4. Session Configuration Snapshot
 
@@ -85,7 +85,7 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **stop_multiplier**: 1.3
 - **size_multiplier**: 0.675
 - **wing_width**: 150
-- **entry_count**: 1
+- **entry_count**: 2
 - **reentry_count**: 0
 - **daily_halted**: 0
 - **consecutive_stops**: 0
@@ -102,13 +102,13 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **event_announced**: 0
 - **paper_trade_mode**: 1
 - **created_at**: 2026-09-04T10:56:25.337273+05:30
-- **updated_at**: 2026-09-04T10:56:26.000242+05:30
+- **updated_at**: 2026-09-04T11:01:25.926324+05:30
 - **or_computed**: 1
 - **session_initialized**: 1
 - **vix_regime_last_checked**: 2026-09-04T10:56:25.774622+05:30
-- **prev_spot**: 23961.55
-- **prev_vix**: 10.84
-- **parkinson_rv_pct**: 0.06237523607273729
+- **prev_spot**: 23970.35
+- **prev_vix**: 10.79
+- **parkinson_rv_pct**: 0.06112572430927868
 - **parkinson_rv_computed_date**: 2026-09-04
 - **vwap_valid**: 1
 - **expiry_last_checked**: 2026-09-04T10:56:25.890558+05:30
@@ -119,43 +119,43 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 ## 5. NIFTY Intraday Profile
 
 - **open**: 23961.55
-- **close**: 23961.55
-- **high**: 23961.55
+- **close**: 23970.35
+- **high**: 23970.35
 - **low**: 23961.55
-- **range_pts**: 0.0
-- **range_pct**: 0.0
-- **net_change_pts**: 0.0
-- **net_change_pct**: 0.0
-- **direction**: FLAT
+- **range_pts**: 8.8
+- **range_pct**: 0.037
+- **net_change_pts**: 8.8
+- **net_change_pct**: 0.037
+- **direction**: UP
 
-- **actual_day_range_pts**: 0.0
-- **actual_day_range_pct**: 0.0
-- **expected_daily_range_pct_from_vix**: 0.683
-- **range_vs_expected_ratio**: 0.0
+- **actual_day_range_pts**: 8.8
+- **actual_day_range_pct**: 0.037
+- **expected_daily_range_pct_from_vix**: 0.681
+- **range_vs_expected_ratio**: 0.05
 - **day_classification**: LOW_MOVE
 - **avg_hold_minutes_today**: None
 - **nifty_intraday_note**: NIFTY 50 weekly expiry is Tuesday. 0DTE gamma risk highest on Tuesday afternoon. Normal daily range for NIFTY in 2026 is 0.5-1.2% based on VIX 12-18 regime.
 
 ## 6. VRP / Volatility Deep Dive
 
-- **vrp_mean**: 3.462
+- **vrp_mean**: 3.537
 - **vrp_min**: 3.462
-- **vrp_max**: 3.462
-- **vrp_stdev**: 0
-- **vrp_positive_cycles**: 1
+- **vrp_max**: 3.612
+- **vrp_stdev**: 0.106
+- **vrp_positive_cycles**: 2
 - **vrp_negative_cycles**: 0
-- **vrp_rich_cycles**: 1
+- **vrp_rich_cycles**: 2
 - **vrp_very_rich_cycles**: 0
 - **vrp_cheap_cycles**: 0
-- **total_vrp_cycles**: 1
+- **total_vrp_cycles**: 2
 - **atm_iv_open_pct**: 9.7
-- **atm_iv_close_pct**: 9.7
-- **atm_iv_mean_pct**: 9.7
+- **atm_iv_close_pct**: 9.724
+- **atm_iv_mean_pct**: 9.712
 - **atm_iv_min_pct**: 9.7
-- **atm_iv_max_pct**: 9.7
-- **iv_crush_pct**: 0
-- **parkinson_rv_mean_pct**: 6.238
-- **parkinson_rv_min_pct**: 6.238
+- **atm_iv_max_pct**: 9.724
+- **iv_crush_pct**: -0.025
+- **parkinson_rv_mean_pct**: 6.175
+- **parkinson_rv_min_pct**: 6.113
 - **parkinson_rv_max_pct**: 6.238
 
 
@@ -168,10 +168,10 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 - **adx_mean**: 0.0
 - **adx_max**: 0.0
 - **adx_min**: 0.0
-- **adx_condition_distribution**: {'FLAT': 1}
+- **adx_condition_distribution**: {'FLAT': 2}
 - **trending_cycles**: 0
 - **strong_trend_cycles**: 0
-- **flat_cycles**: 1
+- **flat_cycles**: 2
 
 
 **ADX interpretation for NIFTY intraday:** ADX < 20 = flat/range (ideal for condors). ADX 20-25 = weak trend (spreads ok). ADX 25-32 = moderate trend (directional spreads only). ADX > 32 = strong trend (exit condors, avoid new sells). ADX > 40 = very strong trend (no premium selling at all).
@@ -179,20 +179,20 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 ## 8. PCR / Skew / Directional Profile
 
 - **pcr_open**: 1.207
-- **pcr_close**: 1.207
-- **pcr_mean**: 1.207
+- **pcr_close**: 1.221
+- **pcr_mean**: 1.214
 - **pcr_min**: 1.207
-- **pcr_max**: 1.207
-- **pcr_change_open_to_close**: 0.0
+- **pcr_max**: 1.221
+- **pcr_change_open_to_close**: 0.014
 - **extreme_fear_cycles**: 0
 - **extreme_greed_cycles**: 0
-- **neutral_cycles**: 1
+- **neutral_cycles**: 2
 
 - **skew_open**: 1.014
-- **skew_close**: 1.014
-- **skew_mean**: 1.014
+- **skew_close**: 1.032
+- **skew_mean**: 1.023
 - **skew_min**: 1.014
-- **skew_max**: 1.014
+- **skew_max**: 1.032
 - **fear_skew_cycles**: 0
 - **complacent_skew_cycles**: 0
 
@@ -201,18 +201,19 @@ This report describes one trading day of a NIFTY-50 intraday options-selling/buy
 
 ## 9. Market Data Timeline (cycle_log)
 
-Total cycles: 1. Gaps detected: 0.
+Total cycles: 2. Gaps detected: 0.
 
 | cycle_time | spot | vix | vrp | atm_iv_pct | parkinson_rv_pct | adx | adx_condition | vwap_dist_pct | pcr | skew_ratio | or_condition | volatility_condition | trend_condition | direction | action_taken | no_trade_reason | open_positions | daily_pnl_net |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 2026-09-04T10:56:25.958827+05:30 | 23961.5500 | 10.8400 | 3.4622 | 9.6997 | 6.2375 | 0.0000 | FLAT | 0.0922 | 1.2069 | 1.0143 | VERY_NARROW | RICH | TRENDING | NEUTRAL | STRATEGY_SELECTED:IRON_CONDOR |  | 0 | 0.0000 |
+| 2026-09-04T11:01:25.866980+05:30 | 23970.3500 | 10.7900 | 3.6117 | 9.7243 | 6.1126 | 0.0000 | FLAT | 0.1239 | 1.2207 | 1.0320 | VERY_NARROW | RICH | TRENDING | NEUTRAL | STRATEGY_SELECTED:IRON_CONDOR |  | 1 | -140.1080 |
 
 ## 10. Gate Blockage Analysis
 
-- **total_cycles**: 1
-- **total_decisions**: 1
+- **total_cycles**: 2
+- **total_decisions**: 2
 - **no_trade_count**: 0
-- **enter_count**: 1
+- **enter_count**: 2
 - **no_trade_rate_pct**: 0.0
 - **gate_category_counts**: {'risk_gates': 0, 'data_gates': 0, 'market_condition_gates': 0, 'timing_gates': 0, 'strategy_gates': 0, 'event_gates': 0, 'other': 0}
 - **top_10_reasons**: {}
@@ -225,6 +226,7 @@ Total cycles: 1. Gaps detected: 0.
 | decision_time | action | strategy_name | reason |
 |---|---|---|---|
 | 2026-09-04T10:56:25.994580+05:30 | STRATEGY_SELECTED | IRON_CONDOR | trending_neutral_condor_half_size+RICH_vrp |
+| 2026-09-04T11:01:25.911224+05:30 | STRATEGY_SELECTED | IRON_CONDOR | trending_neutral_condor_half_size+RICH_vrp |
 
 
 ### 11a. Full Parameters for Selected Strategies
@@ -343,6 +345,120 @@ Total cycles: 1. Gaps detected: 0.
 }
 ```
 
+
+**2026-09-04T11:01:25.911224+05:30 — IRON_CONDOR**
+
+```json
+{
+  "valid": true,
+  "total_fixed_costs_rupees": 94.820713163,
+  "strategy_name": "IRON_CONDOR",
+  "strategy_type": "SELL",
+  "selection_reason": "trending_neutral_condor_half_size+RICH_vrp",
+  "target_expiry": "2026-09-08",
+  "actual_dte": 4,
+  "legs": [
+    {
+      "strike": 24150.0,
+      "option_type": "call",
+      "action": "SELL",
+      "exec_price": 40.05,
+      "bid": 40.05,
+      "ask": 40.15,
+      "ltp": 40.15,
+      "delta": 0.2648,
+      "gamma": 0.0013,
+      "vega": 8.4121,
+      "theta": -9.7498,
+      "iv": 0.09699999999999999,
+      "oi": 7488650
+    },
+    {
+      "strike": 23800.0,
+      "option_type": "put",
+      "action": "SELL",
+      "exec_price": 33.65,
+      "bid": 33.65,
+      "ask": 33.75,
+      "ltp": 33.7,
+      "delta": -0.2259,
+      "gamma": 0.0012,
+      "vega": 7.7228,
+      "theta": -9.2323,
+      "iv": 0.1001,
+      "oi": 15880150
+    },
+    {
+      "strike": 24300.0,
+      "option_type": "call",
+      "action": "BUY",
+      "exec_price": 12.95,
+      "bid": 12.85,
+      "ask": 12.95,
+      "ltp": 12.95,
+      "delta": 0.1082,
+      "gamma": 0.0008,
+      "vega": 4.7739,
+      "theta": -5.4809,
+      "iv": 0.09609999999999999,
+      "oi": 12267125
+    },
+    {
+      "strike": 23650.0,
+      "option_type": "put",
+      "action": "BUY",
+      "exec_price": 14.3,
+      "bid": 14.25,
+      "ask": 14.3,
+      "ltp": 14.3,
+      "delta": -0.1067,
+      "gamma": 0.0007,
+      "vega": 4.7251,
+      "theta": -6.0965,
+      "iv": 0.10800000000000001,
+      "oi": 4399135
+    }
+  ],
+  "num_legs": 4,
+  "gross_credit": 46.449999999999996,
+  "gross_debit": null,
+  "total_slippage": 0.1750000000000016,
+  "total_costs_pts": 1.6061060925076922,
+  "total_costs_rupees_per_lot": 9.576182849999999,
+  "entry_credit": 44.6688939074923,
+  "entry_debit": null,
+  "stop_premium": 58.06956207973999,
+  "target_premium": 30.37484785709476,
+  "stop_value": null,
+  "target_value": null,
+  "price_stop_pts": 80,
+  "tightening_schedule": [
+    [
+      "13:00",
+      0.8
+    ],
+    [
+      "14:00",
+      0.65
+    ]
+  ],
+  "final_lots": 1,
+  "max_loss_per_lot": 1088.804288995125,
+  "total_max_risk": 1088.804288995125,
+  "estimated_margin": 11212.5,
+  "hard_exit_time": "15:00",
+  "target_pct": 0.32,
+  "entry_spot": 23970.35,
+  "entry_vix": 10.79,
+  "entry_vrp": 3.611731816011787,
+  "entry_time": "2026-09-04T11:01:25.906463+05:30",
+  "wing_width": 150.0,
+  "stop_at_breakeven": false,
+  "stop_moved_to_25pct": false,
+  "last_known_premium": 44.6688939074923
+}
+```
+
 ## 12. No-Trade Reason Frequency
 
 _No NO_TRADE decisions recorded._
@@ -416,6 +532,73 @@ _No NO_TRADE decisions recorded._
 
 - Cost discrepancy (Rs): None
 
+
+### Position `df87a016-3093-429c-949d-089f4905918b` — IRON_CONDOR
+
+- **Entry time**: 2026-09-04T11:01:25.926159+05:30
+- **Day label**: FRIDAY
+- **Selection reason**: trending_neutral_condor_half_size+RICH_vrp
+- **Entry spot / VIX / VRP**: 23970.35 / 10.79 / 3.611731816011787
+- **ATM IV at entry**: 0.09724304246939655
+- **Parkinson RV at entry**: 0.06112572430927868
+- **ADX at entry**: 0.0
+- **VWAP dist at entry**: 0.12390078045390687
+- **PCR at entry**: 1.2206783517297
+- **PCR change at entry**: 0.013801971830468052
+- **Skew at entry**: 1.031958762886598
+- **Volatility condition**: RICH
+- **IV behavior**: STABLE
+- **Trend condition**: TRENDING
+- **ADX condition**: FLAT
+- **Direction**: NEUTRAL
+- **VWAP signal**: NEUTRAL
+- **PCR signal**: STABLE
+- **Skew signal**: BALANCED
+- **Preferred sell side**: BOTH
+- **OR condition / width**: VERY_NARROW / 20.450000000000728
+- **Target expiry / DTE**: 2026-09-08 / 4
+- **Entry credit/debit (pts)**: 44.66889390749229
+- **Gross credit (pts)**: 46.449999999999996
+- **Slippage (pts)**: 0.1750000000000016
+- **Entry costs (Rs)**: 104.39689601299999
+- **Stop premium (pts)**: 58.06956207973998
+- **Target premium (pts)**: 30.374847857094753
+- **Price stop (pts)**: 80
+- **Final lots**: 1
+- **Max loss/lot (Rs)**: 1088.804288995125
+- **Total max risk (Rs)**: 1088.804288995125
+- **Capital at entry**: 1000000.0
+- **Daily P&L at entry**: 0.0
+- **Paper trade**: 1
+
+
+**Legs at entry:**
+
+| action | option_type | strike | exec_price | delta | gamma | vega | theta | iv | oi |
+|---|---|---|---|---|---|---|---|---|---|
+| SELL | call | 24150.0000 | 40.0500 | 0.2648 | 0.0013 | 8.4121 | -9.7498 | 0.0970 | 7488650 |
+| SELL | put | 23800.0000 | 33.6500 | -0.2259 | 0.0012 | 7.7228 | -9.2323 | 0.1001 | 15880150 |
+| BUY | call | 24300.0000 | 12.9500 | 0.1082 | 0.0008 | 4.7739 | -5.4809 | 0.0961 | 12267125 |
+| BUY | put | 23650.0000 | 14.3000 | -0.1067 | 0.0007 | 4.7251 | -6.0965 | 0.1080 | 4399135 |
+
+
+**Exit:** _No matching exit row — position may still be open or exit failed to record. Check positions.status for df87a016-3093-429c-949d-089f4905918b._
+
+
+**Recomputed cost breakdown (independent cross-check):**
+
+- **stt**: 8.29
+- **exchange**: 2.69
+- **brokerage**: 80.0
+- **sebi**: 0.0076
+- **stamp**: 0.0613
+- **gst**: 14.89
+- **total**: 105.93
+
+- Recorded entry costs (Rs): 104.39689601299999
+
+- Cost discrepancy (Rs): None
+
 ## 14. Exit Reason Analysis
 
 _No exits recorded today._
@@ -425,12 +608,12 @@ _No exits recorded today._
 
 ## 15. Signal Conditions at Entry
 
-- **vrp_at_entry**: {'values': [3.4621765580371298], 'mean': 3.462}
-- **vix_at_entry**: {'values': [10.84], 'mean': 10.84}
-- **adx_at_entry**: {'values': [0.0], 'mean': 0.0}
-- **volatility_condition_at_entry**: {'RICH': 1}
-- **trend_condition_at_entry**: {'TRENDING': 1}
-- **direction_at_entry**: {'NEUTRAL': 1}
+- **vrp_at_entry**: {'values': [3.4621765580371298, 3.611731816011787], 'mean': 3.537}
+- **vix_at_entry**: {'values': [10.84, 10.79], 'mean': 10.815}
+- **adx_at_entry**: {'values': [0.0, 0.0], 'mean': 0.0}
+- **volatility_condition_at_entry**: {'RICH': 2}
+- **trend_condition_at_entry**: {'TRENDING': 2}
+- **direction_at_entry**: {'NEUTRAL': 2}
 
 
 **Optimal entry conditions for NIFTY intraday premium selling:** VRP > 3pp, VIX 13-20, ADX < 25, OR condition NARROW or VERY_NARROW, volatility_condition RICH or VERY_RICH, iv_behavior STABLE or DECLINING, direction NEUTRAL or aligned with spread side, time 10:30-13:00 IST.
@@ -440,6 +623,7 @@ _No exits recorded today._
 | position_id | strategy_name | entry_time | final_lots | entry_credit | entry_debit | status | exit_time | exit_reason | net_pnl_rupees | paper_trade |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 87054612-717e-481c-b269-4e1c76a06832 | IRON_CONDOR | 2026-09-04T10:56:25.998669+05:30 | 1 | 44.4695 |  | OPEN |  |  |  | 1 |
+| df87a016-3093-429c-949d-089f4905918b | IRON_CONDOR | 2026-09-04T11:01:25.925341+05:30 | 1 | 44.6689 |  | OPEN |  |  |  | 1 |
 
 
 ### All Legs
@@ -450,33 +634,38 @@ _No exits recorded today._
 | 87054612-717e-481c-b269-4e1c76a06832 | 23650.0000 | put | BUY | 65 | 14.7000 |  | -0.1094 | 0.0007 | 4.8123 | 0.1074 | OPEN |
 | 87054612-717e-481c-b269-4e1c76a06832 | 24150.0000 | call | SELL | 65 | 38.9000 |  | 0.2589 | 0.0013 | 8.3177 | 0.0978 | OPEN |
 | 87054612-717e-481c-b269-4e1c76a06832 | 23800.0000 | put | SELL | 65 | 34.5000 |  | -0.2308 | 0.0012 | 7.8187 | 0.0992 | OPEN |
+| df87a016-3093-429c-949d-089f4905918b | 24300.0000 | call | BUY | 65 | 12.9500 |  | 0.1082 | 0.0008 | 4.7739 | 0.0961 | OPEN |
+| df87a016-3093-429c-949d-089f4905918b | 23650.0000 | put | BUY | 65 | 14.3000 |  | -0.1067 | 0.0007 | 4.7251 | 0.1080 | OPEN |
+| df87a016-3093-429c-949d-089f4905918b | 24150.0000 | call | SELL | 65 | 40.0500 |  | 0.2648 | 0.0013 | 8.4121 | 0.0970 | OPEN |
+| df87a016-3093-429c-949d-089f4905918b | 23800.0000 | put | SELL | 65 | 33.6500 |  | -0.2259 | 0.0012 | 7.7228 | 0.1001 | OPEN |
 
 ## 17. P&L Curve (intraday)
 
 | time | pnl | spot | vrp | adx |
 |---|---|---|---|---|
 | 2026-09-04T10:56:25.958827+05:30 | 0.0000 | 23961.5500 | 3.4622 | 0.0000 |
+| 2026-09-04T11:01:25.866980+05:30 | -140.1080 | 23970.3500 | 3.6117 | 0.0000 |
 
 ## 18. Option Chain Statistics
 
-- **total_rows**: 174
-- **unique_capture_times**: 1
+- **total_rows**: 348
+- **unique_capture_times**: 2
 - **unique_strikes**: 87
 - **strike_range**: [22100.0, 26400.0]
 - **zero_bid_ask_count**: 0
 - **zero_bid_ask_pct**: 0.0
-- **avg_spread**: 41.174
+- **avg_spread**: 44.321
 - **max_spread**: 329.3
-- **avg_iv_pct**: 19.07
-- **iv_range_pct**: [5.98, 67.5]
-- **total_call_oi**: 230650680
-- **total_put_oi**: 228596615
-- **chain_pcr**: 0.991
+- **avg_iv_pct**: 18.99
+- **iv_range_pct**: [5.68, 68.08]
+- **total_call_oi**: 461318455
+- **total_put_oi**: 457767570
+- **chain_pcr**: 0.992
 - **first_capture**: 2026-09-04T10:56:25.955280+05:30
-- **last_capture**: 2026-09-04T10:56:25.955280+05:30
+- **last_capture**: 2026-09-04T11:01:25.863105+05:30
 
 
-_Full chain (174 rows) in raw JSON export._
+_Full chain (348 rows) in raw JSON export._
 
 ## 19. ATM IV Intraday History
 
@@ -490,6 +679,14 @@ _Full chain (174 rows) in raw JSON export._
 | 2026-09-04T10:56:25.955280+05:30 | 24000.0000 | put | 98.3000 | 98.4000 | 98.4000 | 0.0884 | -0.5234 | 15266615 |
 | 2026-09-04T10:56:25.955280+05:30 | 24050.0000 | call | 74.6000 | 74.8000 | 74.6000 | 0.1010 | 0.4042 | 9786335 |
 | 2026-09-04T10:56:25.955280+05:30 | 24050.0000 | put | 123.8500 | 124.0000 | 124.0000 | 0.0858 | -0.6131 | 3719755 |
+| 2026-09-04T11:01:25.863105+05:30 | 23900.0000 | call | 162.0000 | 162.3000 | 162.0000 | 0.1080 | 0.6315 | 9165390 |
+| 2026-09-04T11:01:25.863105+05:30 | 23900.0000 | put | 58.0000 | 58.1000 | 58.1000 | 0.0948 | -0.3515 | 24505780 |
+| 2026-09-04T11:01:25.863105+05:30 | 23950.0000 | call | 129.2000 | 129.5000 | 129.2000 | 0.1047 | 0.5634 | 10433150 |
+| 2026-09-04T11:01:25.863105+05:30 | 23950.0000 | put | 75.2000 | 75.2500 | 75.1500 | 0.0925 | -0.4288 | 16402880 |
+| 2026-09-04T11:01:25.863105+05:30 | 24000.0000 | call | 100.6500 | 100.9000 | 100.6500 | 0.1020 | 0.4891 | 21624720 |
+| 2026-09-04T11:01:25.863105+05:30 | 24000.0000 | put | 96.5000 | 96.6500 | 96.6500 | 0.0903 | -0.5128 | 15419755 |
+| 2026-09-04T11:01:25.863105+05:30 | 24050.0000 | call | 76.1500 | 76.3500 | 76.1500 | 0.1003 | 0.4122 | 9726275 |
+| 2026-09-04T11:01:25.863105+05:30 | 24050.0000 | put | 122.0000 | 122.2500 | 121.9500 | 0.0880 | -0.6003 | 3819075 |
 
 
 ### Wing IV History (25-delta strikes)
@@ -502,15 +699,22 @@ _Full chain (174 rows) in raw JSON export._
 | 2026-09-04T10:56:25.955280+05:30 | 24100.0000 | call | 54.5000 | 54.6500 | 54.5500 | 0.0992 | 0.3290 | 14162135 |
 | 2026-09-04T10:56:25.955280+05:30 | 24150.0000 | call | 38.9000 | 39.0000 | 38.9000 | 0.0978 | 0.2589 | 7483970 |
 | 2026-09-04T10:56:25.955280+05:30 | 24200.0000 | call | 27.3000 | 27.3500 | 27.3000 | 0.0972 | 0.1978 | 14992315 |
+| 2026-09-04T11:01:25.863105+05:30 | 23750.0000 | put | 25.0000 | 25.0500 | 25.0500 | 0.1022 | -0.1764 | 6692010 |
+| 2026-09-04T11:01:25.863105+05:30 | 23800.0000 | put | 33.6500 | 33.7500 | 33.7000 | 0.1001 | -0.2259 | 15880150 |
+| 2026-09-04T11:01:25.863105+05:30 | 23850.0000 | put | 44.1500 | 44.3000 | 44.3000 | 0.0974 | -0.2836 | 9976915 |
+| 2026-09-04T11:01:25.863105+05:30 | 24100.0000 | call | 56.2000 | 56.3000 | 56.3000 | 0.0984 | 0.3361 | 14296035 |
+| 2026-09-04T11:01:25.863105+05:30 | 24150.0000 | call | 40.0500 | 40.1500 | 40.1500 | 0.0970 | 0.2648 | 7488650 |
+| 2026-09-04T11:01:25.863105+05:30 | 24200.0000 | call | 28.0000 | 28.0500 | 28.0500 | 0.0964 | 0.2024 | 15047110 |
+| 2026-09-04T11:01:25.863105+05:30 | 24250.0000 | call | 19.1000 | 19.2000 | 19.2000 | 0.0961 | 0.1501 | 6503965 |
 
 ## 20. API Call Health
 
-- **total_calls**: 5
-- **by_category**: {'default': 1, 'quote': 1, 'historical': 1, 'chain': 2}
+- **total_calls**: 8
+- **by_category**: {'default': 1, 'quote': 2, 'historical': 2, 'chain': 3}
 - **error_count**: 0
 - **rate_limited_count**: 0
-- **avg_response_ms**: 118.0
-- **p95_response_ms**: None
+- **avg_response_ms**: 89.0
+- **p95_response_ms**: 394.9
 - **max_response_ms**: 394.9
 - **slow_calls_over_2s**: 0
 
@@ -527,8 +731,8 @@ _Full chain (174 rows) in raw JSON export._
 - **Cycles with adx_condition=INSUFFICIENT_DATA**: 0
 - **Option chain rows with zero bid/ask**: 0
 - **Timing gaps (>10min) in cycle_log**: 0
-- **Trades with no matching exit row**: 1
-- **Positions still OPEN at report time**: 1
+- **Trades with no matching exit row**: 2
+- **Positions still OPEN at report time**: 2
 - **Cost discrepancies detected**: 0
 
 ## 22. Historical Performance (30-day lookback)
@@ -550,17 +754,17 @@ _No historical exit data available in 30-day lookback window._
 
 ## 24. NIFTY Intraday Benchmarks
 
-- **actual_day_range_pts**: 0.0
-- **actual_day_range_pct**: 0.0
-- **expected_daily_range_pct_from_vix**: 0.683
-- **range_vs_expected_ratio**: 0.0
+- **actual_day_range_pts**: 8.8
+- **actual_day_range_pct**: 0.037
+- **expected_daily_range_pct_from_vix**: 0.681
+- **range_vs_expected_ratio**: 0.05
 - **day_classification**: LOW_MOVE
 - **avg_hold_minutes_today**: None
 - **nifty_intraday_note**: NIFTY 50 weekly expiry is Tuesday. 0DTE gamma risk highest on Tuesday afternoon. Normal daily range for NIFTY in 2026 is 0.5-1.2% based on VIX 12-18 regime.
 
 ## 25. Audit Log — Warnings and Errors
 
-Total WARNING/ERROR/CRITICAL lines: 5 of 123 total (15 in DB table)
+Total WARNING/ERROR/CRITICAL lines: 5 of 130 total (22 in DB table)
 
 
 ```
@@ -583,6 +787,9 @@ Total WARNING/ERROR/CRITICAL lines: 5 of 123 total (15 in DB table)
 | 2026-09-04T10:56:25.958827+05:30 | CYCLE | spot=23961.55 vix=10.84 vrp=3.4621765580371298 vol=RICH trend=TRENDING dir=NEUTRAL adx=0.0 pcr=1.206876379899232 skew=1. |
 | 2026-09-04T10:56:25.994580+05:30 | DECISION | STRATEGY_SELECTED IRON_CONDOR — trending_neutral_condor_half_size+RICH_vrp |
 | 2026-09-04T10:56:25.999994+05:30 | ENTRY | IRON_CONDOR lots=1 credit/debit=44.46949251809231 vrp=3.4621765580371298 vix=10.84 vol_cond=RICH trend=TRENDING dir=NEUT |
+| 2026-09-04T11:01:25.866980+05:30 | CYCLE | spot=23970.35 vix=10.79 vrp=3.611731816011787 vol=RICH trend=TRENDING dir=NEUTRAL adx=0.0 pcr=1.2206783517297 skew=1.031 |
+| 2026-09-04T11:01:25.911224+05:30 | DECISION | STRATEGY_SELECTED IRON_CONDOR — trending_neutral_condor_half_size+RICH_vrp |
+| 2026-09-04T11:01:25.926159+05:30 | ENTRY | IRON_CONDOR lots=1 credit/debit=44.66889390749229 vrp=3.611731816011787 vix=10.79 vol_cond=RICH trend=TRENDING dir=NEUTR |
 
 ## 27. Daily Summary (engine EOD)
 

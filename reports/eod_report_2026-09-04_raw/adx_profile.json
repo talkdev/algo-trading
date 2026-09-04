@@ -5,9 +5,9 @@
   "adx_max": 0.0,
   "adx_min": 0.0,
   "adx_condition_distribution": {
-    "FLAT": 1
+    "FLAT": 2
   },
   "trending_cycles": 0,
   "strong_trend_cycles": 0,
-  "flat_cycles": 1
+  "flat_cycles": 2
 }
