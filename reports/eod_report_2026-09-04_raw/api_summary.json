@@ -1,15 +1,15 @@
 {
-  "total_calls": 77,
+  "total_calls": 182,
   "by_category": {
-    "default": 11,
-    "quote": 21,
-    "historical": 21,
-    "chain": 24
+    "default": 12,
+    "quote": 54,
+    "historical": 54,
+    "chain": 62
   },
   "error_count": 0,
   "rate_limited_count": 0,
-  "avg_response_ms": 116.1,
-  "p95_response_ms": 558.6,
+  "avg_response_ms": 79.2,
+  "p95_response_ms": 516.8,
   "max_response_ms": 635.3,
   "slow_calls_over_2s": 0
 }

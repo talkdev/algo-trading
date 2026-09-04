@@ -1,1 +1,13 @@
-{}
+{
+  "CLOSE_TIME": {
+    "count": 1,
+    "wins": 0,
+    "losses": 1,
+    "total_pnl_rupees": -772.44,
+    "avg_pnl_rupees": -772.44,
+    "avg_hold_minutes": 200.5,
+    "strategies_involved": {
+      "BULL_PUT_SPREAD": 1
+    }
+  }
+}

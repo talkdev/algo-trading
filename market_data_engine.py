@@ -612,7 +612,7 @@ class MarketDataEngine:
 
         all_bars = [b for bars in session_bars.values() for b in bars]
         valid_bars = [b for b in all_bars
-                      if b["high"] > 0 and b["low"] > 0 and b["high"] >= b["low"] and b["volume"] > 0]
+                      if b["high"] > 0 and b["low"] > 0 and b["high"] >= b["low"]]
 
         if len(valid_bars) < 30:
             return self._parkinson_fallback(vix), "vix_proxy_insufficient_bars"
@@ -645,7 +645,7 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     # OPTION CHAIN: expiry discovery + fetch + normalization
     # ─────────────────────────────────────────────────────────────────
-    def discover_active_expiry(self, prefer_dte_min: int = 4) -> tuple[Optional[date], Optional[int]]:
+    def discover_active_expiry(self, prefer_dte_min: int = 1) -> tuple[Optional[date], Optional[int]]:
         try:
             contracts = self.client.get_option_contracts(INSTRUMENT_KEY_NIFTY_SPOT)
         except Exception as e:
@@ -706,7 +706,7 @@ class MarketDataEngine:
                 should_refresh = True
 
         if should_refresh:
-            expiry, dte = self.discover_active_expiry()
+            expiry, dte = self.discover_active_expiry(prefer_dte_min=1)
             if expiry:
                 self.state["actual_expiry"] = expiry.isoformat()
                 self.state["actual_dte"] = dte
@@ -810,13 +810,14 @@ class MarketDataEngine:
 
     def compute_pcr(self, chain: dict, spot: Optional[float] = None) -> Optional[float]:
         if spot is not None and spot > 0:
+            _pcr_band = spot * 0.03
             total_put_oi = sum(
                 legs.get("put", {}).get("oi", 0)
-                for strike, legs in chain.items() if strike > spot
+                for strike, legs in chain.items() if (spot - _pcr_band) <= strike < spot
             )
             total_call_oi = sum(
                 legs.get("call", {}).get("oi", 0)
-                for strike, legs in chain.items() if strike < spot
+                for strike, legs in chain.items() if spot < strike <= (spot + _pcr_band)
             )
         else:
             total_put_oi = sum(legs.get("put", {}).get("oi", 0) for legs in chain.values())
@@ -843,7 +844,7 @@ class MarketDataEngine:
         if total_bars < 3:
             return None, False
         equal_pv = sum((b["high"] + b["low"] + b["close"]) / 3.0 for b in candles_today)
-        return equal_pv / total_bars, True
+        return equal_pv / total_bars, False
 
     def _find_by_delta(self, chain: dict, opt_type: str, target: float, tolerance: float = 0.05) -> Optional[float]:
         best_iv, best_diff = None, float("inf")
@@ -981,17 +982,16 @@ class MarketDataEngine:
         wing_map = {"SUPPRESSED": 150, "LOW": 150, "NORMAL": 150, "ELEVATED": 200, "HIGH": 250}
         self.state["wing_width"] = wing_map.get(vix_regime, 150)
 
-        dow_stop = {"MONDAY": 1.5, "TUESDAY": 1.3, "WEDNESDAY": 1.5, "THURSDAY": 1.5, "FRIDAY": 1.4}
-        dow_size = {"MONDAY": 0.50, "TUESDAY": 0.50, "WEDNESDAY": 1.0, "THURSDAY": 1.0, "FRIDAY": 0.80}
+        dow_stop = {"MONDAY": 2.0, "TUESDAY": 1.5, "WEDNESDAY": 2.5, "THURSDAY": 2.5, "FRIDAY": 2.5}
+        dow_size = {"MONDAY": 1.00, "TUESDAY": 0.75, "WEDNESDAY": 0.25, "THURSDAY": 0.25, "FRIDAY": 0.25}
         self.state["stop_multiplier"] = dow_stop.get(day_label, 2.0)
 
         vix_size = {"SUPPRESSED": 0.0, "LOW": 0.75, "NORMAL": 1.0,
                     "ELEVATED": 0.75, "HIGH": 0.50}.get(vix_regime, 1.0)
         combined_size = vix_size * dow_size.get(day_label, 1.0)
         if vix_regime == "ELEVATED":
-            combined_size = max(combined_size, 0.50)
-            elevated_vix_size_floor = True
-        self.state["size_multiplier"] = max(combined_size, 0.25)
+            combined_size = max(combined_size, 0.25)
+        self.state["size_multiplier"] = max(combined_size, 0.10)
 
         entry_start = self.config.trading_window_start
         last_entry = self.config.trading_window_last_entry
@@ -1162,11 +1162,12 @@ class MarketDataEngine:
             adx_value, pdi, ndi, adx_dir = 0.0, 0.0, 0.0, "UNKNOWN"
             adx_condition, reliability = "INSUFFICIENT_DATA", "LOW"
         else:
-            reliability = "LOW" if n_bars < 12 else ("MEDIUM" if n_bars < 24 else "HIGH")
+            reliability = "LOW" if n_bars < 35 else ("MEDIUM" if n_bars < 50 else "HIGH")
             adx_value, pdi, ndi, adx_dir = self._compute_adx(candles_today, period=14)
-            if reliability == "LOW" and n_bars < 10:
+            if n_bars < 35:
                 adx_condition = "EARLY_SESSION"
                 adx_dir = "UNKNOWN"
+                adx_value = 0.0
             else:
                 adx_condition, _ = self._classify_adx(adx_value)
 
@@ -1259,7 +1260,8 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────
     def assess_directional_bias(self, vwap_dist_pct, pcr, opening_pcr, put_iv, call_iv, skew,
                                   adx_direction, gap_direction, last_candle_close_val: float = 0.0) -> dict:
-        if vwap_dist_pct is None:
+        _vwap_valid_flag = self.state.get("vwap_valid", False)
+        if vwap_dist_pct is None or not _vwap_valid_flag:
             vwap_signal, vwap_score = "UNKNOWN", 0
         elif vwap_dist_pct > 0.50: vwap_signal, vwap_score = "BULLISH_EXTENDED", 1
         elif vwap_dist_pct > 0.15: vwap_signal, vwap_score = "BULLISH", 1
@@ -1576,16 +1578,28 @@ class MarketDataEngine:
 
         current_time = now_ist().time()
         if current_time >= dtime(10, 15) and not self.state.get("or_computed"):
-            or_result = self.compute_opening_range(candles_today)
-            if or_result:
-                self.state["or_high"] = or_result["or_high"]
-                self.state["or_low"] = or_result["or_low"]
-                self.state["or_width"] = or_result["or_width"]
-                self.state["or_condition"] = or_result["or_condition"]
-                self.state["or_computed"] = True
-                self.logger.info(f"OPENING RANGE COMPUTED: H={or_result['or_high']:.0f} "
-                                  f"L={or_result['or_low']:.0f} W={or_result['or_width']:.0f} "
-                                  f"[{or_result['or_condition']}]")
+            _or_bars_available = [b for b in candles_today if dtime(9, 15) <= b["timestamp"].time() <= dtime(10, 14)]
+            _or_coverage_ok = len(_or_bars_available) >= 45
+            if not _or_coverage_ok and current_time < dtime(10, 45):
+                self.logger.info(f"OR coverage insufficient ({len(_or_bars_available)} bars) — retrying next cycle")
+            else:
+                or_result = self.compute_opening_range(candles_today)
+                if or_result and not or_result.get("partial", False):
+                    self.state["or_high"] = or_result["or_high"]
+                    self.state["or_low"] = or_result["or_low"]
+                    self.state["or_width"] = or_result["or_width"]
+                    self.state["or_condition"] = or_result["or_condition"]
+                    self.state["or_computed"] = True
+                    self.logger.info(f"OPENING RANGE COMPUTED: H={or_result['or_high']:.0f} "
+                                      f"L={or_result['or_low']:.0f} W={or_result['or_width']:.0f} "
+                                      f"[{or_result['or_condition']}] bars={len(_or_bars_available)}")
+                elif or_result and or_result.get("partial", False) and current_time >= dtime(10, 45):
+                    self.state["or_high"] = or_result["or_high"]
+                    self.state["or_low"] = or_result["or_low"]
+                    self.state["or_width"] = or_result["or_width"]
+                    self.state["or_condition"] = or_result["or_condition"]
+                    self.state["or_computed"] = True
+                    self.logger.warning(f"OR accepted with partial coverage ({len(_or_bars_available)} bars) after 10:45")
 
         if current_time >= dtime(10, 15) and not self.state.get("session_initialized"):
             if atm_iv:

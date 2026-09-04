@@ -1,1 +1,26 @@
-{}
+{
+  "by_strategy": {
+    "BULL_PUT_SPREAD": {
+      "total_trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "win_rate_pct": 0.0,
+      "total_pnl_rupees": -772.44,
+      "avg_pnl_per_trade": -772.44,
+      "avg_hold_minutes": 200.5,
+      "exit_reason_distribution": {
+        "CLOSE_TIME": 1
+      }
+    }
+  },
+  "overall_30d": {
+    "total_trades": 1,
+    "total_wins": 0,
+    "total_losses": 1,
+    "total_pnl_rupees": -772.44,
+    "avg_win_rupees": 0,
+    "avg_loss_rupees": 772.44,
+    "profit_factor": 0.0,
+    "win_rate_pct": 0.0
+  }
+}
