@@ -335,7 +335,7 @@ class MarketDataEngine:
             "or_high": None, "or_low": None, "or_width": None, "or_condition": None,
             "entry_start": max(self.config.trading_window_start, dtime(10, 30)).strftime("%H:%M"),
             "entry_end": min(self.config.trading_window_last_entry, dtime(13, 0)).strftime("%H:%M"),
-            "hard_exit_time": self.config.hard_exit_time.strftime("%H:%M"),
+            "hard_exit_time": max(self.config.hard_exit_time, dtime(15, 25)).strftime("%H:%M"),
             "stop_multiplier": 2.0, "size_multiplier": 1.0, "wing_width": 150,
             "entry_count": 0, "reentry_count": 0, "daily_halted": False, "consecutive_stops": 0,
             "last_stop_time": None, "last_stop_reason": None, "last_entry_time": None,

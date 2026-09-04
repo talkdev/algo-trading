@@ -198,5 +198,25 @@
     "2026-09-04T12:47:26.584122+05:30",
     "DECISION",
     "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:51:13.017325+05:30",
+    "CYCLE",
+    "spot=23939.65 vix=10.8 vrp=3.9100313807263722 vol=RICH trend=TRENDING dir=NEUTRAL adx=30.43091465996519 pcr=2.860044173894306 skew=1.011640211640212 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-947.3465690720001"
+  ],
+  [
+    "2026-09-04T12:51:13.069237+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
+  ],
+  [
+    "2026-09-04T12:53:48.998688+05:30",
+    "CYCLE",
+    "spot=23945.3 vix=10.78 vrp=3.8247174583950585 vol=RICH trend=STRONG_TREND dir=NEUTRAL adx=30.142781847874232 pcr=2.804221908073205 skew=0.9936575052854122 action=NO_TRADE no_trade_reason=position_already_open_single_position_engine open_pos=1 daily_pnl=-719.8465690719992"
+  ],
+  [
+    "2026-09-04T12:53:49.093569+05:30",
+    "DECISION",
+    "NO_TRADE NONE \u2014 position_already_open_single_position_engine"
   ]
 ]
