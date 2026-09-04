@@ -66,11 +66,11 @@ DTE_REQUIREMENTS = {
 }
 
 MIN_CREDITS = {
-    "IRON_BUTTERFLY": 20, "IRON_CONDOR": 18,
-    "BULL_PUT_SPREAD": 15, "BEAR_CALL_SPREAD": 14, "POST_EVENT_STRADDLE": 25,
+    "IRON_BUTTERFLY": 15, "IRON_CONDOR": 12,
+    "BULL_PUT_SPREAD": 10, "BEAR_CALL_SPREAD": 10, "POST_EVENT_STRADDLE": 20,
 }
 MIN_CREDITS_TUESDAY = {
-    "IRON_BUTTERFLY": 25, "IRON_CONDOR": 18, "BULL_PUT_SPREAD": 16, "BEAR_CALL_SPREAD": 15,
+    "IRON_BUTTERFLY": 18, "IRON_CONDOR": 14, "BULL_PUT_SPREAD": 12, "BEAR_CALL_SPREAD": 12,
 }
 
 PRICE_STOPS = {
@@ -141,7 +141,7 @@ class StrategyEngine:
     def _straddle_allowed(self, s: dict) -> bool:
         if s["vix_regime"] == "HIGH":
             return False
-        if s["vix_regime"] == "SUPPRESSED":
+        if s["vix_regime"] == "SUPPRESSED" and (s.get("vrp") or 0) < 2.0:
             return False
         if s["vix_regime"] == "ELEVATED":
             if s.get("or_condition") in ("VERY_NARROW", "NARROW") and (s.get("vrp") or 0) > 3.0:
@@ -241,8 +241,8 @@ class StrategyEngine:
             return "NO_TRADE", "vix_spike_detected_no_new_sells"
         if s.get("intraday_rv_selling_veto"):
             return "NO_TRADE", "intraday_rv_exceeds_atm_iv_no_premium_selling"
-        if s.get("iv_behavior") == "EXPANDING" and s.get("sell_ok"):
-            return "NO_TRADE", "iv_expanding_no_new_sells_wait_for_stable_or_declining"
+        if s.get("iv_behavior") == "EXPANDING" and s.get("sell_ok") and (s.get("vrp") or 0) < 4.0:
+            return "NO_TRADE", "iv_expanding_vrp_below_4_no_new_sells"
         if s.get("iv_behavior") == "SPIKING":
             return "NO_TRADE", "iv_spiking_no_new_sells"
 
@@ -294,8 +294,8 @@ class StrategyEngine:
             return "NO_TRADE", "opening_range_pending"
         if s["day_mode"] == "EVENT" and not state.get("event_announced"):
             return "NO_TRADE", "event_day_awaiting_announcement"
-        if s["vix_regime"] == "SUPPRESSED":
-            return "NO_TRADE", "vix_suppressed_no_edge"
+        if s["vix_regime"] == "SUPPRESSED" and (s.get("vrp") or 0) < 1.0:
+            return "NO_TRADE", "vix_suppressed_vrp_below_1.0_no_edge"
         gap_fade = self.market_engine.state.get("gap_fade_opportunity", False)
         if s["or_condition"] == "VERY_WIDE" and s["volatility_condition"] in ("RICH", "VERY_RICH"):
             if not gap_fade:
@@ -312,7 +312,7 @@ class StrategyEngine:
         except Exception:
             hard_exit = self.config.hard_exit_time
         minutes_to_exit = self._time_diff_minutes(current_time, hard_exit)
-        if minutes_to_exit < 60:
+        if minutes_to_exit < 45:
             return "NO_TRADE", f"only_{minutes_to_exit:.0f}min_before_hard_exit_insufficient"
 
         return None
@@ -360,30 +360,31 @@ class StrategyEngine:
                 return "NO_TRADE", "uncertain_trend_neutral_direction_no_edge"
 
             elif trend in ("MILD_TREND", "TRENDING"):
-                if adx_dir == "BULLISH" and dirn in ("BULLISH", "MILD_BULLISH") \
+                if adx_dir in ("BULLISH", "UNKNOWN") and dirn in ("BULLISH", "MILD_BULLISH") \
                         and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
                     return "BULL_PUT_SPREAD", f"bullish_trend_sell_puts_aligned+{vol}_vrp"
-                if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH") \
+                if adx_dir in ("BEARISH", "UNKNOWN") and dirn in ("BEARISH", "MILD_BEARISH") \
                         and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
                     return "BEAR_CALL_SPREAD", f"bearish_trend_sell_calls_aligned+{vol}_vrp"
-                if adx_dir == "BULLISH":
-                    return "BULL_PUT_SPREAD", f"trending_neutral_adx_safe_side_bullish+{vol}_vrp"
-                if adx_dir == "BEARISH":
-                    return "BEAR_CALL_SPREAD", f"trending_neutral_adx_safe_side_bearish+{vol}_vrp"
-                trending_neutral_adx_safe_side = True
+                if dirn in ("BULLISH", "MILD_BULLISH") and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
+                    return "BULL_PUT_SPREAD", f"trending_bullish_direction_safe_side+{vol}_vrp"
+                if dirn in ("BEARISH", "MILD_BEARISH") and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
+                    return "BEAR_CALL_SPREAD", f"trending_bearish_direction_safe_side+{vol}_vrp"
+                if dirn == "NEUTRAL" and straddle_allowed:
+                    return "IRON_CONDOR", f"trending_neutral_condor_half_size+{vol}_vrp"
                 return "NO_TRADE", f"trending_no_aligned_side_adx_dir={adx_dir}_direction={dirn}"
 
             elif trend == "STRONG_TREND":
-                if adx_dir == "BULLISH" and dirn in ("BULLISH", "MILD_BULLISH") \
+                if dirn in ("BULLISH", "MILD_BULLISH") \
                         and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
                     return "BULL_PUT_SPREAD", f"bullish_strong_trend_put_credit_safe_side+{vol}_vrp"
-                if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH") \
+                if dirn in ("BEARISH", "MILD_BEARISH") \
                         and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
                     return "BEAR_CALL_SPREAD", f"bearish_strong_trend_call_credit_safe_side+{vol}_vrp"
                 return "NO_TRADE", "strong_trend_no_aligned_direction_for_credit_spread"
 
         elif vol == "FAIR" and sell_ok:
-            if trend in ("RANGE_BOUND", "MILD_RANGE", "RANGE_ASSUMED"):
+            if trend in ("RANGE_BOUND", "MILD_RANGE", "RANGE_ASSUMED", "UNCERTAIN"):
                 if dirn in ("BULLISH", "MILD_BULLISH"):
                     if vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
                         return "BULL_PUT_SPREAD", "bullish+fair_vrp+range_half_size"
@@ -395,15 +396,17 @@ class StrategyEngine:
                 if dirn == "NEUTRAL" and straddle_allowed:
                     return "IRON_CONDOR", "neutral+fair_vrp+range_quarter_size"
                 return "NO_TRADE", "fair_vrp_neutral_direction_insufficient_edge"
-            elif trend == "MILD_TREND":
-                if adx_dir == "BULLISH" and dirn in ("BULLISH", "MILD_BULLISH") \
+            elif trend in ("MILD_TREND", "TRENDING"):
+                if adx_dir in ("BULLISH", "UNKNOWN") and dirn in ("BULLISH", "MILD_BULLISH") \
                         and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
-                    return "BULL_PUT_SPREAD", "bullish+fair_vrp+mild_trend_aligned_half_size"
-                if adx_dir == "BEARISH" and dirn in ("BEARISH", "MILD_BEARISH") \
+                    return "BULL_PUT_SPREAD", "bullish+fair_vrp+trend_aligned_half_size"
+                if adx_dir in ("BEARISH", "UNKNOWN") and dirn in ("BEARISH", "MILD_BEARISH") \
                         and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
-                    return "BEAR_CALL_SPREAD", "bearish+fair_vrp+mild_trend_aligned_half_size"
-                return "NO_TRADE", "fair_vrp_mild_trend_no_aligned_side"
-            return "NO_TRADE", "fair_vrp_trending_no_trade"
+                    return "BEAR_CALL_SPREAD", "bearish+fair_vrp+trend_aligned_half_size"
+                if dirn == "NEUTRAL" and straddle_allowed:
+                    return "IRON_CONDOR", "neutral+fair_vrp+trending_condor_quarter_size"
+                return "NO_TRADE", "fair_vrp_trending_no_aligned_direction"
+            return "NO_TRADE", "fair_vrp_strong_trend_no_trade"
 
         elif vol in ("THIN", "CHEAP", "INVERTED") and buy_ok:
             if trend in ("TRENDING", "STRONG_TREND"):
@@ -539,11 +542,11 @@ class StrategyEngine:
             mins_to_exit = self._time_diff_minutes(current_time, hard_exit)
             actual_dte_condor = state.get("actual_dte")
             if actual_dte_condor == 0:
-                if mins_to_exit < 90:
-                    return False, f"iron_condor_0dte_needs_90min_before_exit_only_{mins_to_exit:.0f}min"
+                if mins_to_exit < 75:
+                    return False, f"iron_condor_0dte_needs_75min_before_exit_only_{mins_to_exit:.0f}min"
             else:
-                if mins_to_exit < 120:
-                    return False, f"iron_condor_needs_2hr_before_exit_only_{mins_to_exit:.0f}min"
+                if mins_to_exit < 90:
+                    return False, f"iron_condor_needs_90min_before_exit_only_{mins_to_exit:.0f}min"
             if s["adx_condition"] in ("STRONG", "VERY_STRONG"):
                 return False, "iron_condor_blocked_adx_trending"
 

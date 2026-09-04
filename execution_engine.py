@@ -226,6 +226,7 @@ class ExecutionEngine:
     def _compute_portfolio_delta(self) -> float:
         chain = self.market_engine.last_chain
         total_delta = 0.0
+        C02 = self.config.lot_size
         for pos in self._get_open_positions():
             for leg in self._get_position_legs(pos["position_id"]):
                 if leg["leg_status"] != "OPEN":
@@ -234,17 +235,18 @@ class ExecutionEngine:
                 if opt:
                     live_delta = opt.get("delta", leg["entry_delta"])
                 else:
-                    delta_conservative_fallback = True
                     _ed = leg["entry_delta"] or 0
                     live_delta = _ed * 1.5 if abs(_ed) < 0.5 else _ed
+                lots = leg["qty"] // C02 if C02 > 0 else 1
                 sign = -1 if leg["action"] == "SELL" else 1
-                total_delta += sign * live_delta * leg["qty"]
+                total_delta += sign * live_delta * lots
         return total_delta
 
     def _compute_portfolio_vega_gamma(self) -> tuple[float, float]:
         chain = self.market_engine.last_chain
         total_vega = 0.0
         total_gamma = 0.0
+        C02 = self.config.lot_size
         for pos in self._get_open_positions():
             for leg in self._get_position_legs(pos["position_id"]):
                 if leg["leg_status"] != "OPEN":
@@ -256,12 +258,12 @@ class ExecutionEngine:
                     live_vega = opt.get("vega") or _entry_vega
                     live_gamma = opt.get("gamma") or _entry_gamma
                 else:
-                    vega_dte_scaled_fallback = True
                     live_vega = _entry_vega * 0.5
                     live_gamma = _entry_gamma * 2.0
+                lots = leg["qty"] // C02 if C02 > 0 else 1
                 sign = -1 if leg["action"] == "SELL" else 1
-                total_vega += sign * live_vega * leg["qty"]
-                total_gamma += sign * live_gamma * leg["qty"]
+                total_vega += sign * live_vega * lots
+                total_gamma += sign * live_gamma * lots
         return total_vega, total_gamma
 
     def _compute_transaction_costs(self, legs: list, lots: int, action: str) -> dict:
@@ -270,8 +272,12 @@ class ExecutionEngine:
         C02 = self.config.lot_size
 
         for leg in legs:
-            price = leg.get("exit_price") if leg.get("exit_price") is not None else leg.get("entry_price", 0)
-            price = price or 0
+            if action == "ENTRY":
+                price = leg.get("entry_price", 0) or 0
+            else:
+                price = leg.get("exit_price", 0) or 0
+            if price <= 0:
+                price = leg.get("entry_price", 0) or 0
             qty = lots * C02
             if price <= 0:
                 continue
@@ -296,7 +302,7 @@ class ExecutionEngine:
         self.logger.debug(f"Transaction costs ({action}): STT={stt:.2f} Brokerage={brokerage:.2f} "
                            f"GST={gst:.2f} Total={total_costs:.2f}")
         return {"total_rupees": round(total_costs, 2), "breakdown": {
-            "stt": round(stt, 2), "exchange": round(exchange, 2), "ipft": round(ipft, 6),
+            "stt": round(stt, 2), "exchange": round(exchange, 2),
             "sebi": round(sebi, 4), "stamp": round(stamp, 4), "brokerage": round(brokerage, 2),
             "gst": round(gst, 2), "total": round(total_costs, 2),
         }}
@@ -318,7 +324,7 @@ class ExecutionEngine:
             return "NO_GO", {"reason": f"daily_loss_{daily_loss_pct*100:.2f}pct_exceeds_limit"}
 
         size_adj = 1.0
-        if daily_loss_pct >= self.config.max_daily_loss_pct * 0.75:
+        if daily_loss_pct >= self.config.max_daily_loss_pct * 0.80:
             size_adj = 0.50
             self.logger.info(f"Soft limit: daily loss {daily_loss_pct*100:.1f}%, reducing size 50%")
 
@@ -341,7 +347,7 @@ class ExecutionEngine:
         # Portfolio delta check
         C02 = self.config.lot_size
         new_delta = sum(
-            (-1 if leg["action"] == "SELL" else 1) * leg["delta"] * final_lots * C02
+            (-1 if leg["action"] == "SELL" else 1) * leg["delta"] * final_lots
             for leg in params["legs"]
         )
         current_portfolio_delta = self._compute_portfolio_delta()
@@ -349,33 +355,32 @@ class ExecutionEngine:
         total_open_lots_for_delta = sum(
             p["final_lots"] for p in self._get_open_positions()
         ) + final_lots
-        delta_limit = 0.20 * total_open_lots_for_delta * C02
+        delta_limit = 0.20 * total_open_lots_for_delta
 
         if abs(post_trade_delta) > delta_limit:
             reduced_lots, found = final_lots - 1, False
             while reduced_lots >= 1:
                 new_delta_r = sum(
-                    (-1 if leg["action"] == "SELL" else 1) * leg["delta"] * reduced_lots * C02
+                    (-1 if leg["action"] == "SELL" else 1) * leg["delta"] * reduced_lots
                     for leg in params["legs"]
                 )
                 _total_lots_reduced = sum(
                     p["final_lots"] for p in self._get_open_positions()
                 ) + reduced_lots
-                delta_reduction_total_lots = True
-                if abs(current_portfolio_delta + new_delta_r) <= (0.20 * _total_lots_reduced * C02):
+                if abs(current_portfolio_delta + new_delta_r) <= (0.20 * _total_lots_reduced):
                     final_lots, found = reduced_lots, True
                     break
                 reduced_lots -= 1
             if not found:
                 return "NO_GO", {"reason": "portfolio_delta_exceeds_limit_cannot_reduce_further"}
 
-        new_vega = sum((-1 if leg["action"] == "SELL" else 1) * (leg.get("vega") or 0) * final_lots * C02 for leg in params["legs"])
-        new_gamma = sum((-1 if leg["action"] == "SELL" else 1) * (leg.get("gamma") or 0) * final_lots * C02 for leg in params["legs"])
+        new_vega = sum((-1 if leg["action"] == "SELL" else 1) * (leg.get("vega") or 0) * final_lots for leg in params["legs"])
+        new_gamma = sum((-1 if leg["action"] == "SELL" else 1) * (leg.get("gamma") or 0) * final_lots for leg in params["legs"])
         current_vega, current_gamma = self._compute_portfolio_vega_gamma()
         post_trade_vega = current_vega + new_vega
         post_trade_gamma = current_gamma + new_gamma
-        vega_limit = 50.0 * final_lots
-        gamma_limit = 0.05 * final_lots
+        vega_limit = 200.0 * final_lots
+        gamma_limit = 0.50 * final_lots
         if abs(post_trade_vega) > vega_limit:
             return "NO_GO", {"reason": f"portfolio_vega_{post_trade_vega:.1f}_exceeds_limit_{vega_limit:.1f}"}
         if abs(post_trade_gamma) > gamma_limit:
@@ -393,9 +398,9 @@ class ExecutionEngine:
             bid, ask, oi = opt.get("bid", 0), opt.get("ask", 0), opt.get("oi", 0)
             if bid <= 0 and ask <= 0:
                 return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_no_bid_ask_at_execution"}
-            if oi < 100:
-                return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_oi_below_100_at_execution"}
-            if bid > 0 and ask > 0 and (ask - bid) / ask > 0.35:
+            if oi < 50:
+                return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_oi_below_50_at_execution"}
+            if bid > 0 and ask > 0 and (ask - bid) / ask > 0.50:
                 return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_spread_too_wide_at_execution"}
 
             current_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0
@@ -420,7 +425,7 @@ class ExecutionEngine:
             original_net_credit = params["entry_credit"]
             if original_net_credit and original_net_credit > 0:
                 decay = (original_net_credit - current_net_credit) / original_net_credit
-                if decay > 0.15:
+                if decay > 0.25:
                     return "NO_GO", {"reason": f"credit_decayed_{decay*100:.0f}pct_since_computed"}
                 if current_net_credit < original_net_credit:
                     params["entry_credit"] = current_net_credit
@@ -446,8 +451,7 @@ class ExecutionEngine:
         except Exception:
             hard_exit = self.config.hard_exit_time
         _actual_dte_buffer = self.market_engine.state.get("actual_dte")
-        _min_buffer = 90 if _actual_dte_buffer == 0 else 45
-        hard_exit_buffer_45min = True
+        _min_buffer = 75 if _actual_dte_buffer == 0 else 30
         if self._time_diff_minutes(current_time, hard_exit) < _min_buffer:
             return "NO_GO", {"reason": f"only_{self._time_diff_minutes(current_time, hard_exit):.0f}min_before_hard_exit_need_{_min_buffer}"}
 
@@ -609,7 +613,7 @@ class ExecutionEngine:
             reason = result.get("reason", "unknown")
             print_section("PRE-TRADE VALIDATION: NO_GO")
             print(f"  Reason: {reason}")
-            self.logger.info(f"PRE_TRADE_NO_GO: {reason}")
+            self.logger.warning(f"PRE_TRADE_NO_GO: {reason}")
             return None
 
         print_section("PRE-TRADE VALIDATION: GO")
@@ -761,19 +765,19 @@ class ExecutionEngine:
         _now_time = now_ist().time()
         _vwap_exits_active = _now_time < _dtime(14, 30)
         if vwap_dist is not None and _vwap_exits_active:
-            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.20:
+            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.15:
                 return "CLOSE_VWAP", {"vwap_dist": vwap_dist}
-            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.20:
+            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.15:
                 return "CLOSE_VWAP", {"vwap_dist": vwap_dist}
             if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY"):
-                if vwap_dist > 0.30:
+                if vwap_dist > 0.25:
                     return "CLOSE_CALL_SIDE", {"vwap_dist": vwap_dist}
-                if vwap_dist < -0.30:
+                if vwap_dist < -0.25:
                     return "CLOSE_PUT_SIDE", {"vwap_dist": vwap_dist}
 
         _now_time_cheap = now_ist().time()
         if strategy_type == "SELL" and _now_time_cheap >= dtime(14, 30):
-            _cheap_threshold = 2.00
+            _cheap_threshold = 3.00
             _all_cheap = True
             for _leg_cheap in legs:
                 if _leg_cheap["leg_status"] != "OPEN" or _leg_cheap["action"] != "SELL":
@@ -789,7 +793,7 @@ class ExecutionEngine:
                 return "CLOSE_TARGET", {"reason_detail": "all_short_legs_below_2pt_cheap_buyback"}
 
         adx_value = signals.get("adx")
-        if (adx_value is not None and adx_value > 35 and strategy_type == "SELL"
+        if (adx_value is not None and adx_value > 30 and strategy_type == "SELL"
                 and strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")):
             return "CLOSE_ADX", {"adx": adx_value}
 
@@ -811,9 +815,9 @@ class ExecutionEngine:
                 if leg["action"] == "SELL" and leg["leg_status"] == "OPEN":
                     opt = chain.get(leg["strike"], {}).get(leg["option_type"], {}) if chain else {}
                     current_delta = abs(opt.get("delta", leg["entry_delta"]) or 0)
-                    if current_delta > 0.45:
+                    if current_delta > 0.40:
                         return "CLOSE_STOP", {"reason_detail": f"short_leg_delta_breach_{current_delta:.3f}"}
-                    if current_delta > 0.38 and not position.get("stop_tightened_for_delta"):
+                    if current_delta > 0.32 and not position.get("stop_tightened_for_delta"):
                         self.db.update(
                             "positions",
                             {"stop_premium": position["stop_premium"] * 0.80, "stop_tightened_for_delta": 1},
@@ -1042,9 +1046,9 @@ class ExecutionEngine:
                 _sig = self.market_engine.state
                 _combo = f"{_sig.get('volatility_condition', '')}_{_sig.get('trend_condition', '')}_{_sig.get('direction', '')}"
                 state["last_stop_signal_combo"] = _combo
-            if state["consecutive_stops"] >= 3:
+            if state["consecutive_stops"] >= 2:
                 state["daily_halted"] = True
-                self.logger.warning("3 consecutive stops — halting trading for the day")
+                self.logger.warning("2 consecutive stops — halting trading for the day")
         elif reason in ("CLOSE_ADX", "CLOSE_VWAP", "CLOSE_DELTA"):
             state["last_stop_time"] = now_ist().isoformat()
             state["last_stop_reason"] = reason
