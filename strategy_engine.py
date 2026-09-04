@@ -260,19 +260,30 @@ class StrategyEngine:
         if state.get("entry_count", 0) >= self.config.max_entries_per_day:
             return "NO_TRADE", "max_entries_per_day_reached"
 
+        today_str = today_ist().isoformat()
         open_count = self._count_open_positions()
+        actual_entries_today = self.db.query_one(
+            "SELECT COUNT(*) as cnt FROM positions WHERE trading_date=? "
+            "AND status IN ('OPEN', 'CLOSED')",
+            (today_str,),
+        )
+        db_entry_count = actual_entries_today["cnt"] if actual_entries_today else 0
+        if db_entry_count != state.get("entry_count", 0):
+            state["entry_count"] = db_entry_count
         if open_count >= self.config.max_concurrent_positions:
             return "NO_TRADE", "max_concurrent_positions_reached"
+        if db_entry_count >= self.config.max_entries_per_day:
+            return "NO_TRADE", f"max_entries_per_day_{db_entry_count}_reached"
         if open_count >= 1:
-            existing = self.db.query(
-                "SELECT strategy_name FROM positions WHERE trading_date=? AND status='OPEN'",
-                (today_ist().isoformat(),),
-            )
-            existing_strategies = [r["strategy_name"] for r in existing]
-            if existing_strategies.count("IRON_CONDOR") >= 1:
-                return "NO_TRADE", "iron_condor_already_open_no_duplicate"
-            if existing_strategies.count("IRON_BUTTERFLY") >= 1:
-                return "NO_TRADE", "iron_butterfly_already_open_no_duplicate"
+            return "NO_TRADE", "position_already_open_single_position_engine"
+        last_entry_time = state.get("last_entry_time")
+        if last_entry_time and open_count == 0 and db_entry_count > 0:
+            try:
+                mins_since_entry = (now_ist() - datetime.fromisoformat(last_entry_time)).total_seconds() / 60.0
+                if mins_since_entry < 15:
+                    return "NO_TRADE", f"entry_cooldown_{15 - mins_since_entry:.0f}min_remaining_after_last_entry"
+            except Exception:
+                pass
 
         if state.get("consecutive_stops", 0) >= 3:
             return "NO_TRADE", "3_consecutive_stops_today_halt"
@@ -591,14 +602,16 @@ class StrategyEngine:
                     return False, f"bull_put_spread_spot_below_or_by_{breakdown:.0f}pts"
 
         elif strategy_name == "BEAR_CALL_SPREAD":
-            if s["vwap"] and spot and spot > s["vwap"]:
-                return False, f"bear_call_spread_requires_spot_below_vwap_spot={spot:.0f}_vwap={s['vwap']:.0f}"
+            _adx_strong_bear = s.get("adx", 0) and s["adx"] > 25
+            if not _adx_strong_bear:
+                if s["vwap"] and spot and spot > s["vwap"]:
+                    return False, f"bear_call_spread_requires_spot_below_vwap_spot={spot:.0f}_vwap={s['vwap']:.0f}"
             if (s["spot_vs_or"] or "").startswith("ABOVE_OR"):
                 try:
                     breakout = float(s["spot_vs_or"].split("_")[-1].replace("pts", ""))
                 except ValueError:
                     breakout = 0.0
-                if breakout > 30:
+                if breakout > 50:
                     return False, f"bear_call_spread_spot_above_or_by_{breakout:.0f}pts"
 
         elif strategy_name == "BULL_CALL_SPREAD":
@@ -975,10 +988,18 @@ class StrategyEngine:
             net_profit_at_target = net_credit - target_premium_at_target - exit_costs_pts
             if net_profit_at_target <= 0:
                 return {"valid": False, "reason": f"net_profit_at_target_{net_profit_at_target:.2f}pts_non_positive"}
-            _min_rupee_profit = 500.0
+            _vix_regime = s.get("vix_regime", "NORMAL")
+            _min_rupee_profit_map = {
+                "SUPPRESSED": 200.0,
+                "LOW": 250.0,
+                "NORMAL": 350.0,
+                "ELEVATED": 400.0,
+                "HIGH": 500.0,
+            }
+            _min_rupee_profit = _min_rupee_profit_map.get(_vix_regime, 300.0)
             _projected_rupee_profit = net_profit_at_target * C02
             if _projected_rupee_profit < _min_rupee_profit:
-                return {"valid": False, "reason": f"projected_profit_Rs{_projected_rupee_profit:.0f}_below_minimum_Rs{_min_rupee_profit:.0f}"}
+                return {"valid": False, "reason": f"projected_profit_Rs{_projected_rupee_profit:.0f}_below_minimum_Rs{_min_rupee_profit:.0f}_for_{_vix_regime}_regime"}
 
         current_capital = state.get("current_capital", self.config.starting_capital)
         risk_pct = self.config.max_risk_per_trade_pct
