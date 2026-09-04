@@ -713,5 +713,49 @@
     "response_time_ms": 67.63639999553561,
     "rate_limited": 0,
     "error_message": null
+  },
+  {
+    "call_id": 66,
+    "call_time": "2026-09-04T12:47:26.287554+05:30",
+    "category": "quote",
+    "endpoint": "ltp",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 49.34020002838224,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 67,
+    "call_time": "2026-09-04T12:47:26.314697+05:30",
+    "category": "historical",
+    "endpoint": "intraday_candle",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 25.328599964268506,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 68,
+    "call_time": "2026-09-04T12:47:26.414289+05:30",
+    "category": "chain",
+    "endpoint": "option_contracts",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 78.32739991135895,
+    "rate_limited": 0,
+    "error_message": null
+  },
+  {
+    "call_id": 69,
+    "call_time": "2026-09-04T12:47:26.505933+05:30",
+    "category": "chain",
+    "endpoint": "option_chain",
+    "method": "GET",
+    "status_code": 200,
+    "response_time_ms": 73.71659995988011,
+    "rate_limited": 0,
+    "error_message": null
   }
 ]

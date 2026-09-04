@@ -244,9 +244,14 @@ def select_strategy(cycle):
     sell_ok = vol in ("RICH", "VERY_RICH") or (vol == "FAIR" and vrp > 1.5)
     buy_ok = vol in ("CHEAP", "INVERTED")
 
+    _adx_val = cycle.get("adx") or 0
+    _adx_cond = cycle.get("adx_condition") or "UNKNOWN"
+
     if vol in ("VERY_RICH", "RICH") and sell_ok:
         if trend in ("RANGE_BOUND", "MILD_RANGE", "RANGE_ASSUMED", "UNCERTAIN"):
             if dirn == "NEUTRAL":
+                if _adx_val > 25:
+                    return "NO_TRADE", f"iron_condor_blocked_adx_{_adx_val:.0f}_above_exit_threshold"
                 return "IRON_CONDOR", f"neutral+{vol}+{trend}"
             elif dirn in ("BULLISH", "MILD_BULLISH") and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
                 return "BULL_PUT_SPREAD", f"bullish+{vol}+{trend}"
@@ -258,6 +263,8 @@ def select_strategy(cycle):
             elif dirn in ("BEARISH", "MILD_BEARISH") and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
                 return "BEAR_CALL_SPREAD", f"bearish_trend+{vol}+{trend}"
             elif dirn == "NEUTRAL":
+                if _adx_val > 25:
+                    return "NO_TRADE", f"iron_condor_blocked_adx_{_adx_val:.0f}_trending_neutral"
                 return "IRON_CONDOR", f"neutral_trend+{vol}+{trend}"
 
     elif vol == "FAIR" and sell_ok:
@@ -620,6 +627,10 @@ def run_backtest(start_date=None, end_date=None, stop_mult=2.5, target_pct=0.50,
             if session_position_open:
                 continue
 
+            session_traded = False
+            if session_traded:
+                continue
+
             strategy, reason = select_strategy(cyc)
             if strategy == "NO_TRADE":
                 continue
@@ -713,6 +724,7 @@ def run_backtest(start_date=None, end_date=None, stop_mult=2.5, target_pct=0.50,
             day_pnl += result["net_pnl_rs"]
             day_trades += 1
             total_sim += 1
+            session_traded = True
             session_position_open = True
             session_entry_cycle_idx = i
 

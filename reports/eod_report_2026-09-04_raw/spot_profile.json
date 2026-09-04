@@ -1,14 +1,14 @@
 {
   "open": 23984.05,
-  "close": 23942.45,
+  "close": 23936.15,
   "high": 23985.9,
-  "low": 23939.2,
-  "range_pts": 46.7,
-  "range_pct": 0.195,
-  "net_change_pts": -41.6,
-  "net_change_pct": -0.173,
+  "low": 23936.15,
+  "range_pts": 49.75,
+  "range_pct": 0.207,
+  "net_change_pts": -47.9,
+  "net_change_pct": -0.2,
   "direction": "DOWN",
   "first_half_range_pts": 25.95,
-  "second_half_range_pts": 12.1,
+  "second_half_range_pts": 15.15,
   "volatility_expansion_second_half": false
 }

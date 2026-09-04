@@ -585,6 +585,9 @@ class StrategyEngine:
                 return False, "iron_butterfly_monday_requires_narrow_or"
             _adx_val_bf = s.get("adx") or 0
             if _adx_val_bf > 20:
+                return False, f"iron_butterfly_blocked_adx_{_adx_val_bf:.0f}_needs_flat_market"
+            _adx_val_bf = s.get("adx") or 0
+            if _adx_val_bf > 20:
                 return False, f"iron_butterfly_blocked_adx_{_adx_val_bf:.0f}_too_high_for_butterfly"
 
         elif strategy_name == "IRON_CONDOR":

@@ -333,8 +333,8 @@ class MarketDataEngine:
             "trading_date": today_str, "day_mode": "NORMAL", "vix_regime": "UNKNOWN",
             "gap_size": "SMALL", "gap_direction": "FLAT", "day_label": None,
             "or_high": None, "or_low": None, "or_width": None, "or_condition": None,
-            "entry_start": self.config.trading_window_start.strftime("%H:%M"),
-            "entry_end": self.config.trading_window_last_entry.strftime("%H:%M"),
+            "entry_start": max(self.config.trading_window_start, dtime(10, 30)).strftime("%H:%M"),
+            "entry_end": min(self.config.trading_window_last_entry, dtime(13, 0)).strftime("%H:%M"),
             "hard_exit_time": self.config.hard_exit_time.strftime("%H:%M"),
             "stop_multiplier": 2.0, "size_multiplier": 1.0, "wing_width": 150,
             "entry_count": 0, "reentry_count": 0, "daily_halted": False, "consecutive_stops": 0,
@@ -892,15 +892,15 @@ class MarketDataEngine:
     # MODULE 1: PRE-SESSION ASSESSMENT (re-run every 30 minutes)
     # ─────────────────────────────────────────────────────────────────
     def _compute_base_regime(self, vix: float) -> str:
-        if vix < 11.0: return "SUPPRESSED"
-        if vix < 15.0: return "LOW"
+        if vix < 10.0: return "SUPPRESSED"
+        if vix < 14.0: return "LOW"
         if vix < 20.0: return "NORMAL"
         if vix < 26.0: return "ELEVATED"
         return "HIGH"
 
     def _compute_regime_with_hysteresis(self, vix: float, prev_regime: str) -> str:
         bands = {
-            "SUPPRESSED": (None, 11.5), "LOW": (10.5, 15.5), "NORMAL": (14.5, 20.5),
+            "SUPPRESSED": (None, 10.5), "LOW": (9.5, 14.5), "NORMAL": (13.5, 20.5),
             "ELEVATED": (19.5, 26.5), "HIGH": (25.5, None),
         }
         if prev_regime in bands:
