@@ -137,14 +137,20 @@ class LiveOrderExecutor:
         opt = chain.get(strike, {}).get(opt_type, {}) if chain else {}
         bid, ask = opt.get("bid", 0) or 0, opt.get("ask", 0) or 0
         tick = 0.05
-        if bid > 0 and ask > 0:
-            mid = (bid + ask) / 2.0
-        else:
-            mid = fallback
         if transaction_type == "BUY":
-            price = mid + tick
+            if ask > 0:
+                price = ask + (2 * tick)
+            elif bid > 0:
+                price = bid + (4 * tick)
+            else:
+                price = fallback + (2 * tick)
         else:
-            price = mid - tick
+            if bid > 0:
+                price = bid - (2 * tick)
+            elif ask > 0:
+                price = ask - (4 * tick)
+            else:
+                price = fallback - (2 * tick)
             price = max(price, tick)
         return round(round(price / tick) * tick, 2)
 
@@ -258,8 +264,8 @@ class ExecutionEngine:
                     live_vega = opt.get("vega") or _entry_vega
                     live_gamma = opt.get("gamma") or _entry_gamma
                 else:
-                    live_vega = _entry_vega * 0.5
-                    live_gamma = _entry_gamma * 2.0
+                    live_vega = _entry_vega
+                    live_gamma = _entry_gamma
                 lots = leg["qty"] // C02 if C02 > 0 else 1
                 sign = -1 if leg["action"] == "SELL" else 1
                 total_vega += sign * live_vega * lots
@@ -379,8 +385,9 @@ class ExecutionEngine:
         current_vega, current_gamma = self._compute_portfolio_vega_gamma()
         post_trade_vega = current_vega + new_vega
         post_trade_gamma = current_gamma + new_gamma
-        vega_limit = 200.0 * final_lots
-        gamma_limit = 0.50 * final_lots
+        total_lots_in_portfolio = sum(p["final_lots"] for p in self._get_open_positions()) + final_lots
+        vega_limit = 120.0 * total_lots_in_portfolio
+        gamma_limit = 0.30 * total_lots_in_portfolio
         if abs(post_trade_vega) > vega_limit:
             return "NO_GO", {"reason": f"portfolio_vega_{post_trade_vega:.1f}_exceeds_limit_{vega_limit:.1f}"}
         if abs(post_trade_gamma) > gamma_limit:
@@ -398,9 +405,9 @@ class ExecutionEngine:
             bid, ask, oi = opt.get("bid", 0), opt.get("ask", 0), opt.get("oi", 0)
             if bid <= 0 and ask <= 0:
                 return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_no_bid_ask_at_execution"}
-            if oi < 50:
-                return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_oi_below_50_at_execution"}
-            if bid > 0 and ask > 0 and (ask - bid) / ask > 0.50:
+            if oi < 500:
+                return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_oi_below_500_at_execution"}
+            if bid > 0 and ask > 0 and (ask - bid) / ask > 0.08:
                 return "NO_GO", {"reason": f"leg_{strike}_{opt_type}_spread_too_wide_at_execution"}
 
             current_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0
@@ -425,7 +432,7 @@ class ExecutionEngine:
             original_net_credit = params["entry_credit"]
             if original_net_credit and original_net_credit > 0:
                 decay = (original_net_credit - current_net_credit) / original_net_credit
-                if decay > 0.25:
+                if decay > 0.20:
                     return "NO_GO", {"reason": f"credit_decayed_{decay*100:.0f}pct_since_computed"}
                 if current_net_credit < original_net_credit:
                     params["entry_credit"] = current_net_credit
@@ -451,7 +458,7 @@ class ExecutionEngine:
         except Exception:
             hard_exit = self.config.hard_exit_time
         _actual_dte_buffer = self.market_engine.state.get("actual_dte")
-        _min_buffer = 75 if _actual_dte_buffer == 0 else 30
+        _min_buffer = 90 if _actual_dte_buffer == 0 else 60
         if self._time_diff_minutes(current_time, hard_exit) < _min_buffer:
             return "NO_GO", {"reason": f"only_{self._time_diff_minutes(current_time, hard_exit):.0f}min_before_hard_exit_need_{_min_buffer}"}
 
@@ -694,14 +701,19 @@ class ExecutionEngine:
 
         if strategy_type == "SELL" and position.get("entry_credit") and position["entry_credit"] > 0:
             _is_directional = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
-            _stop_multiplier = 2.5 if _is_directional else 2.0
-            _credit_stop_limit = position["entry_credit"] * _stop_multiplier
-            _actual_stop = min(
-                effective_stop if effective_stop is not None else _credit_stop_limit,
-                _credit_stop_limit
-            )
-            if current_premium >= _actual_stop:
-                return "CLOSE_STOP", {"current_premium": current_premium, "effective_stop": _actual_stop}
+            if _is_directional:
+                _gross_credit = position.get("gross_credit") or position["entry_credit"]
+                _credit_stop_limit = _gross_credit * 2.5
+                if current_premium >= _credit_stop_limit:
+                    return "CLOSE_STOP", {"current_premium": current_premium, "effective_stop": _credit_stop_limit}
+            else:
+                _credit_stop_limit = position["entry_credit"] * 1.8
+                _actual_stop = min(
+                    effective_stop if effective_stop is not None else _credit_stop_limit,
+                    _credit_stop_limit
+                )
+                if current_premium >= _actual_stop:
+                    return "CLOSE_STOP", {"current_premium": current_premium, "effective_stop": _actual_stop}
         elif strategy_type == "SELL" and effective_stop is not None and current_premium >= effective_stop:
             return "CLOSE_STOP", {"current_premium": current_premium, "effective_stop": effective_stop}
         if strategy_type == "BUY" and position.get("stop_value") is not None \
@@ -717,14 +729,25 @@ class ExecutionEngine:
         if strategy_type == "SELL" and position.get("entry_credit"):
             _entry_credit_td = position["entry_credit"]
             _now_time_td = now_ist().time()
-            if _now_time_td >= dtime(13, 30):
-                _time_target_pct = 0.25
-            elif _now_time_td >= dtime(13, 0):
-                _time_target_pct = 0.30
-            elif _now_time_td >= dtime(12, 0):
-                _time_target_pct = 0.32
+            _is_directional_time = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
+            if _is_directional_time:
+                if _now_time_td >= dtime(15, 0):
+                    _time_target_pct = 0.30
+                elif _now_time_td >= dtime(14, 30):
+                    _time_target_pct = 0.38
+                elif _now_time_td >= dtime(14, 0):
+                    _time_target_pct = 0.45
+                else:
+                    _time_target_pct = None
             else:
-                _time_target_pct = None
+                if _now_time_td >= dtime(14, 30):
+                    _time_target_pct = 0.35
+                elif _now_time_td >= dtime(14, 0):
+                    _time_target_pct = 0.40
+                elif _now_time_td >= dtime(13, 0):
+                    _time_target_pct = 0.45
+                else:
+                    _time_target_pct = None
             if _time_target_pct is not None:
                 _time_target_premium = _entry_credit_td * (1.0 - _time_target_pct)
                 _effective_target = min(
@@ -800,7 +823,7 @@ class ExecutionEngine:
                 return "CLOSE_TARGET", {"reason_detail": "all_short_legs_below_threshold_cheap_buyback"}
 
         adx_value = signals.get("adx")
-        if (adx_value is not None and adx_value > 30 and strategy_type == "SELL"
+        if (adx_value is not None and adx_value > 28 and strategy_type == "SELL"
                 and strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY")):
             return "CLOSE_ADX", {"adx": adx_value}
 
@@ -819,8 +842,8 @@ class ExecutionEngine:
 
         if strategy_type == "SELL":
             _is_directional_delta = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
-            _delta_close_limit = 0.50 if _is_directional_delta else 0.40
-            _delta_tighten_limit = 0.42 if _is_directional_delta else 0.32
+            _delta_close_limit = 0.42 if _is_directional_delta else 0.40
+            _delta_tighten_limit = 0.35 if _is_directional_delta else 0.32
             for leg in legs:
                 if leg["action"] == "SELL" and leg["leg_status"] == "OPEN":
                     opt = chain.get(leg["strike"], {}).get(leg["option_type"], {}) if chain else {}
@@ -840,6 +863,27 @@ class ExecutionEngine:
         return "HOLD", {"current_premium": current_premium}
 
     def monitor_all_positions(self, signals: dict) -> None:
+        if signals.get("vix_spike_detected"):
+            open_positions = self._get_open_positions()
+            if open_positions:
+                legs_by_pos = {}
+                for pos in open_positions:
+                    pos_legs = self._get_position_legs(pos["position_id"])
+                    net_vega = sum(
+                        (-1 if l["action"] == "SELL" else 1) * (l["entry_vega"] or 0)
+                        for l in pos_legs if l["leg_status"] == "OPEN"
+                    )
+                    legs_by_pos[pos["position_id"]] = net_vega
+                most_short_vega_id = min(legs_by_pos, key=lambda k: legs_by_pos[k])
+                for pos in open_positions:
+                    if pos["position_id"] == most_short_vega_id:
+                        self.logger.warning(
+                            f"VIX SPIKE DETECTED: force-closing most short-vega position "
+                            f"{pos['strategy_name']} {pos['position_id'][:16]} "
+                            f"net_vega={legs_by_pos[most_short_vega_id]:.2f}"
+                        )
+                        self.execute_close(pos, "CLOSE_VIX_SPIKE", {})
+                        break
         for position in self._get_open_positions():
             action, context = self.monitor_position(position, signals)
             if action == "HOLD":

@@ -493,7 +493,7 @@ class MainEngine:
                     self._sleep_until(dtime(9, 15))
                     continue
 
-                if current_time > dtime(15, 30):
+                if current_time > dtime(15, 40):
                     self.logger.info("Post-market — performing EOD tasks and stopping.")
                     self.perform_end_of_day_tasks()
                     break

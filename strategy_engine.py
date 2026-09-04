@@ -78,13 +78,13 @@ PRICE_STOPS = {
     "BEAR_CALL_SPREAD": 80, "POST_EVENT_STRADDLE": 120,
 }
 
-TARGET_PCT_BY_DAY = {"MONDAY": 0.32, "TUESDAY": 0.30, "WEDNESDAY": 0.35,
-                      "THURSDAY": 0.35, "FRIDAY": 0.32}
+TARGET_PCT_BY_DAY = {"MONDAY": 0.50, "TUESDAY": 0.45, "WEDNESDAY": 0.50,
+                      "THURSDAY": 0.50, "FRIDAY": 0.45}
 
 MIN_CREDIT_MULTIPLIER_BY_REGIME = {"SUPPRESSED": 1.0, "LOW": 1.1, "NORMAL": 1.0,
                                     "ELEVATED": 1.15, "HIGH": 1.3}
 
-LOT_CAPS_BY_DAY = {"TUESDAY": 2, "MONDAY": 1, "FRIDAY": 2}
+LOT_CAPS_BY_DAY = {"TUESDAY": 1, "MONDAY": 1, "FRIDAY": 2}
 
 STRATEGY_STATE_EXTRA_COLUMNS = [
     ("pre_event_spot", "REAL"),
@@ -141,7 +141,7 @@ class StrategyEngine:
     def _straddle_allowed(self, s: dict) -> bool:
         if s["vix_regime"] == "HIGH":
             return False
-        if s["vix_regime"] == "SUPPRESSED" and (s.get("vrp") or 0) < 2.0:
+        if s["vix_regime"] in ("SUPPRESSED", "HIGH"):
             return False
         if s["vix_regime"] == "ELEVATED":
             if s.get("or_condition") in ("VERY_NARROW", "NARROW") and (s.get("vrp") or 0) > 3.0:
@@ -165,8 +165,8 @@ class StrategyEngine:
         state = self.market_engine.state
         dte = state.get("actual_dte")
 
-        if dtime(9, 15) <= current_time < dtime(9, 30):
-            return "WAIT", ["first_15min_spread_too_wide_avoid_entry"]
+        if dtime(9, 15) <= current_time < dtime(10, 30):
+            return "WAIT", ["first_75min_iv_settling_avoid_entry"]
 
         if dte == 0 and dtime(12, 0) <= current_time < dtime(12, 30):
             return "WAIT", ["0dte_avoid_12pm_eu_open_transition"]
@@ -202,10 +202,12 @@ class StrategyEngine:
             if timing == "GOOD":
                 timing = "CAUTION"
             notes.append("Early in trading window — opening volatility may not have settled")
-        if current_time > dtime(13, 0):
+        if current_time > dtime(12, 30):
             if timing == "GOOD":
                 timing = "CAUTION"
-            notes.append("Late in trading window — reduced time for IV compression before hard exit")
+            notes.append("Approaching end of entry window — reduced theta decay time")
+        if current_time > dtime(13, 0):
+            return "WAIT", ["past_13:00_no_new_entries_insufficient_theta_time"]
         return timing, notes
 
     def _update_event_detection(self, s: dict) -> None:
@@ -241,8 +243,8 @@ class StrategyEngine:
             return "NO_TRADE", "vix_spike_detected_no_new_sells"
         if s.get("intraday_rv_selling_veto"):
             return "NO_TRADE", "intraday_rv_exceeds_atm_iv_no_premium_selling"
-        if s.get("iv_behavior") == "EXPANDING" and s.get("sell_ok") and (s.get("vrp") or 0) < 4.0:
-            return "NO_TRADE", "iv_expanding_vrp_below_4_no_new_sells"
+        if s.get("iv_behavior") == "EXPANDING" and s.get("sell_ok"):
+            return "NO_TRADE", "iv_expanding_never_sell_into_rising_iv"
         if s.get("iv_behavior") == "SPIKING":
             return "NO_TRADE", "iv_spiking_no_new_sells"
 
@@ -324,13 +326,16 @@ class StrategyEngine:
             return "NO_TRADE", "opening_range_pending"
         if s["day_mode"] == "EVENT" and not state.get("event_announced"):
             return "NO_TRADE", "event_day_awaiting_announcement"
-        if s["vix_regime"] == "SUPPRESSED" and (s.get("vrp") or 0) < 1.0:
-            return "NO_TRADE", "vix_suppressed_vrp_below_1.0_no_edge"
+        if s["vix_regime"] == "SUPPRESSED" and (s.get("vrp") or 0) < 3.0:
+            return "NO_TRADE", "vix_suppressed_vrp_below_3.0_no_edge"
+        _vrp_pct = s.get("vrp_percentile", 50.0)
+        if _vrp_pct < 35.0 and s.get("sell_ok"):
+            return "NO_TRADE", f"vrp_percentile_{_vrp_pct:.0f}_below_35th_pct_insufficient_relative_edge"
         gap_fade = self.market_engine.state.get("gap_fade_opportunity", False)
-        if s["or_condition"] == "VERY_WIDE" and s["volatility_condition"] in ("RICH", "VERY_RICH"):
+        if s["or_condition"] in ("WIDE", "VERY_WIDE") and s["volatility_condition"] in ("RICH", "VERY_RICH"):
             if not gap_fade:
-                return "NO_TRADE", "very_wide_or_dangerous_to_sell_premium"
-            self.logger.info("VERY_WIDE OR but gap_fade_opportunity active — allowing condor")
+                return "NO_TRADE", "wide_or_dangerous_to_sell_premium"
+            self.logger.info("WIDE/VERY_WIDE OR but gap_fade_opportunity active — allowing condor")
 
         entry_timing, timing_notes = self._compute_entry_timing(s)
         if entry_timing == "WAIT":
@@ -342,7 +347,7 @@ class StrategyEngine:
         except Exception:
             hard_exit = self.config.hard_exit_time
         minutes_to_exit = self._time_diff_minutes(current_time, hard_exit)
-        if minutes_to_exit < 45:
+        if minutes_to_exit < 90:
             return "NO_TRADE", f"only_{minutes_to_exit:.0f}min_before_hard_exit_insufficient"
 
         return None
@@ -843,9 +848,8 @@ class StrategyEngine:
 
     def _build_tightening_schedule(self, day_label: Optional[str]) -> list:
         if day_label == "TUESDAY":
-            return [("11:00", 0.80), ("12:00", 0.65), ("13:00", 0.50)]
-        return [("13:00", 0.80), ("14:00", 0.65)]
-        tightening_profit_gated = True
+            return [("11:00", 0.80), ("12:00", 0.65), ("12:30", 0.50), ("13:00", 0.35)]
+        return [("13:00", 0.85), ("14:00", 0.70), ("14:30", 0.55)]
 
     # ─────────────────────────────────────────────────────────────────
     # MODULE 8: FULL PARAMETER COMPUTATION
@@ -990,11 +994,11 @@ class StrategyEngine:
                 return {"valid": False, "reason": f"net_profit_at_target_{net_profit_at_target:.2f}pts_non_positive"}
             _vix_regime = s.get("vix_regime", "NORMAL")
             _min_rupee_profit_map = {
-                "SUPPRESSED": 200.0,
-                "LOW": 250.0,
-                "NORMAL": 350.0,
-                "ELEVATED": 400.0,
-                "HIGH": 500.0,
+                "SUPPRESSED": 350.0,
+                "LOW": 400.0,
+                "NORMAL": 500.0,
+                "ELEVATED": 600.0,
+                "HIGH": 700.0,
             }
             _min_rupee_profit = _min_rupee_profit_map.get(_vix_regime, 300.0)
             _projected_rupee_profit = net_profit_at_target * C02
@@ -1010,8 +1014,14 @@ class StrategyEngine:
         _size_mult_check = size_mult
 
         if strategy_type == "SELL":
-            stop_premium = net_credit * stop_multiplier
-            stop_based_loss = (stop_premium - net_credit) * C02 * 1.25
+            _is_directional_sizing = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
+            if _is_directional_sizing:
+                _gross_credit_for_stop = gross_credit if gross_credit and gross_credit > 0 else net_credit
+                stop_premium = _gross_credit_for_stop * 2.5
+                stop_based_loss = (_gross_credit_for_stop * 1.5) * C02 * 1.25
+            else:
+                stop_premium = net_credit * stop_multiplier
+                stop_based_loss = (stop_premium - net_credit) * C02 * 1.25
             if actual_wing_pts is not None and actual_wing_pts > 0 and net_credit > 0:
                 contractual_max_loss = (actual_wing_pts - net_credit) * C02
                 max_loss_per_lot = min(stop_based_loss, contractual_max_loss) if contractual_max_loss > 0 else stop_based_loss
@@ -1084,6 +1094,7 @@ class StrategyEngine:
             "total_costs_rupees_per_lot": total_costs_rupees_per_lot,
             "entry_credit": net_credit, "entry_debit": net_debit,
             "stop_premium": stop_premium if strategy_type == "SELL" else None,
+            "stop_basis": "gross_credit_2.5x" if strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD") else "net_credit_multiplier",
             "target_premium": (net_credit * (1.0 - target_pct_final)) if strategy_type == "SELL" else None,
             "stop_value": (net_debit * 0.50) if strategy_type == "BUY" else None,
             "target_value": (net_debit * 1.50) if strategy_type == "BUY" else None,
