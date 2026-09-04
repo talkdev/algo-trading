@@ -681,6 +681,13 @@ class MarketDataEngine:
     def compute_25d_ivs(self, chain: dict) -> tuple[Optional[float], Optional[float]]:
         put_iv = self._find_by_delta(chain, "put", 0.25, tolerance=0.05)
         call_iv = self._find_by_delta(chain, "call", 0.25, tolerance=0.05)
+        skew_tolerance_fallback = False
+        if put_iv is None:
+            put_iv = self._find_by_delta(chain, "put", 0.25, tolerance=0.08)
+            skew_tolerance_fallback = True
+        if call_iv is None:
+            call_iv = self._find_by_delta(chain, "call", 0.25, tolerance=0.08)
+            skew_tolerance_fallback = True
         return put_iv, call_iv
 
     def compute_skew_ratio(self, put_iv: Optional[float], call_iv: Optional[float]) -> Optional[float]:
@@ -1321,8 +1328,14 @@ class MarketDataEngine:
 
         if atm_iv is not None and dte is not None and spot is not None:
             dte_wing_map = {0: 50, 1: 75, 2: 100, 3: 100, 4: 150, 5: 150, 6: 200, 7: 200, 8: 250}
+            vix_wing_mult = {"SUPPRESSED": 0.8, "LOW": 1.0, "NORMAL": 1.0,
+                             "ELEVATED": 1.3, "HIGH": 1.6}.get(self.state.get("vix_regime", "NORMAL"), 1.0)
+            wing_dte_vix_combined = True
             if dte in dte_wing_map:
-                self.state["wing_width"] = dte_wing_map[dte]
+                base_wing = dte_wing_map[dte]
+                step = self.config.nifty_strike_step
+                adjusted = int(round((base_wing * vix_wing_mult) / step) * step)
+                self.state["wing_width"] = max(50, min(adjusted, 500))
             else:
                 expected_move = spot * atm_iv * ((max(dte, 1) / 365.0) ** 0.5)
                 computed_wing = int(round((expected_move * 0.60) / self.config.nifty_strike_step) * self.config.nifty_strike_step)

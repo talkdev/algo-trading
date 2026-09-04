@@ -548,8 +548,18 @@ class StrategyEngine:
                 return False, "iron_condor_blocked_adx_trending"
 
         elif strategy_name == "BULL_PUT_SPREAD":
-            if s["vwap"] and spot and spot < s["vwap"]:
+            _or_mid = None
+            _or_h = self.market_engine.state.get("or_high")
+            _or_l = self.market_engine.state.get("or_low")
+            if _or_h and _or_l:
+                _or_mid = (_or_h + _or_l) / 2.0
+            bull_put_or_midpoint_check = True
+            _candle_count = len(self.market_engine.last_chain) if self.market_engine.last_chain else 0
+            _use_or_mid = _or_mid is not None and self.market_engine.state.get("or_computed")
+            if s["vwap"] and spot and spot < s["vwap"] and not _use_or_mid:
                 return False, f"bull_put_spread_requires_spot_above_vwap_spot={spot:.0f}_vwap={s['vwap']:.0f}"
+            if _use_or_mid and spot and spot < _or_mid:
+                return False, f"bull_put_spread_spot_below_or_midpoint_{spot:.0f}_vs_{_or_mid:.0f}"
             if (s["spot_vs_or"] or "").startswith("BELOW_OR"):
                 try:
                     breakdown = float(s["spot_vs_or"].split("_")[-1].replace("pts", ""))

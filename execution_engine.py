@@ -231,10 +231,13 @@ class ExecutionEngine:
                 if leg["leg_status"] != "OPEN":
                     continue
                 opt = chain.get(leg["strike"], {}).get(leg["option_type"], {}) if chain else {}
-                live_delta = opt.get("delta", leg["entry_delta"])
+                if opt:
+                    live_delta = opt.get("delta", leg["entry_delta"])
+                else:
+                    delta_conservative_fallback = True
+                    _ed = leg["entry_delta"] or 0
+                    live_delta = _ed * 1.5 if abs(_ed) < 0.5 else _ed
                 sign = -1 if leg["action"] == "SELL" else 1
-                # NOTE: leg["qty"] is already total shares (lots * lot_size) —
-                # do NOT multiply by lot_size again here.
                 total_delta += sign * live_delta * leg["qty"]
         return total_delta
 
@@ -548,6 +551,7 @@ class ExecutionEngine:
         state = self.market_engine.state
         state["entry_count"] = state.get("entry_count", 0) + 1
         state["consecutive_stops"] = 0
+        entry_count_only_on_loss = True
         self.market_engine._save_session_state()
 
         print_section(f"POSITION OPENED: {params['strategy_name']}")
@@ -948,8 +952,15 @@ class ExecutionEngine:
         if remaining_open:
             new_credit = sum(l["entry_price"] for l in remaining_open if l["action"] == "SELL") \
                 - sum(l["entry_price"] for l in remaining_open if l["action"] == "BUY")
-            self.db.update("positions", {"entry_credit": new_credit, "updated_at": now_ist().isoformat()},
-                            {"position_id": position["position_id"]})
+            close_one_side_stop_update = True
+            raw_p = json.loads(position.get("raw_params_json") or "{}")
+            _stop_mult = self.market_engine.state.get("stop_multiplier", 1.5)
+            new_stop = new_credit * _stop_mult if new_credit > 0 else position.get("stop_premium")
+            self.db.update("positions", {
+                "entry_credit": new_credit,
+                "stop_premium": new_stop,
+                "updated_at": now_ist().isoformat()
+            }, {"position_id": position["position_id"]})
         else:
             self._finalize_position_from_partial_closes(position, reason)
 
@@ -1040,6 +1051,9 @@ class ExecutionEngine:
             CLOSE_DELTA_cooldown = True
         else:
             state["consecutive_stops"] = 0
+            if reason == "CLOSE_TARGET":
+                current_count = state.get("entry_count", 1)
+                state["entry_count"] = max(0, current_count - 1)
 
         if state["current_capital"]:
             daily_loss_pct = max(0.0, -state["daily_pnl"]) / state["current_capital"]
