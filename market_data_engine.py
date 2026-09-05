@@ -519,13 +519,13 @@ class MarketDataEngine:
         or_mid = (or_high + or_low) / 2.0
         or_width_pct = (or_width / or_mid) * 100.0 if or_mid > 0 else 0.0
 
-        if or_width_pct < 0.20:
+        if or_width < 40:
             or_condition, or_score = "VERY_NARROW", 2
-        elif or_width_pct < 0.35:
+        elif or_width < 75:
             or_condition, or_score = "NARROW", 1
-        elif or_width_pct < 0.55:
+        elif or_width < 120:
             or_condition, or_score = "MODERATE", 0
-        elif or_width_pct < 0.75:
+        elif or_width < 180:
             or_condition, or_score = "WIDE", -1
         else:
             or_condition, or_score = "VERY_WIDE", -2
@@ -549,12 +549,6 @@ class MarketDataEngine:
             return "OBSERVING"
 
         last_close = float(post["close"].iloc[-1])
-        avg_vol = float(post["volume"].mean()) if len(post) > 3 else 0
-        recent_vol = float(
-            post["volume"].iloc[-min(3, len(post)):].mean()
-        ) if len(post) > 0 else 0
-        vol_ok = (recent_vol > avg_vol * self.config.orb_volume_multiplier
-                  if avg_vol > 0 else False)
 
         in_choppy_window = now <= dtime(10, 15)
         if in_choppy_window:
@@ -566,17 +560,18 @@ class MarketDataEngine:
             if (check_df["low"] < orb_low).any() and not (check_df["close"] < orb_low).any():
                 return "CHOPPY"
         else:
-            if last_close > orb_high:
-                return "UPTREND" if vol_ok else "RANGE"
-            if last_close < orb_low:
-                return "DOWNTREND" if vol_ok else "RANGE"
+            if last_close > orb_high + 20:
+                return "UPTREND"
+            if last_close < orb_low - 20:
+                return "DOWNTREND"
             return "RANGE"
 
-        if last_close > orb_high and vol_ok:
+        if last_close > orb_high + 20:
             return "UPTREND"
-        if last_close < orb_low and vol_ok:
+        if last_close < orb_low - 20:
             return "DOWNTREND"
         return "RANGE"
+
 
     def compute_parkinson_rv(
         self, vix: Optional[float], bars: Optional[pd.DataFrame] = None
@@ -1093,9 +1088,9 @@ class MarketDataEngine:
         self.state["day_label"] = day_label
 
         vix_size = {
-            "SUPPRESSED": 0.0, "LOW": 0.75, "NORMAL": 1.0,
-            "ELEVATED": 0.75, "HIGH": 0.50,
-        }.get(new_regime, 1.0)
+            "SUPPRESSED": 1.0, "LOW": 1.0, "NORMAL": 0.75,
+            "ELEVATED": 0.50, "HIGH": 0.25,
+        }
         dow_size = {
             "MONDAY": 1.00, "TUESDAY": 0.75, "WEDNESDAY": 0.25,
             "THURSDAY": 0.25, "FRIDAY": 0.25,
@@ -1535,17 +1530,31 @@ class MarketDataEngine:
             self._pcr_baseline_set = True
             self.logger.info(f"PCR baseline: opening_pcr={pcr:.3f}")
 
+        _day_move_used_pct = 0.0
+        _opening_straddle_ref = self.state.get("_straddle_open_for_regime", 0)
+        if _opening_straddle_ref > 0 and spot is not None:
+            _first_bar_close = None
+            if not bars.empty:
+                _morning_bars = bars[bars["time"] >= "09:15:00"]
+                if not _morning_bars.empty:
+                    _first_bar_close = float(_morning_bars["close"].iloc[0])
+            if _first_bar_close is None:
+                _first_bar_close = spot
+            _day_move_used_pct = abs(spot - _first_bar_close) / _opening_straddle_ref * 100.0
+
         _day_label = self.state.get("day_label")
         _actual_dte = dte if dte is not None else self.state.get("actual_dte")
         if _day_label == "TUESDAY" and _actual_dte == 0:
             _tue_entry_start = "11:00"
             _tue_entry_end = "12:30"
+            _tue_hard_exit = "14:30"
             if self.state.get("entry_start") != _tue_entry_start:
                 self.state["entry_start"] = _tue_entry_start
                 self.state["entry_end"] = _tue_entry_end
+                self.state["hard_exit_time"] = _tue_hard_exit
                 self.logger.info(
-                    f"Tuesday 0DTE: entry window tightened to "
-                    f"{_tue_entry_start}-{_tue_entry_end} for gamma risk management"
+                    f"Tuesday 0DTE: entry window {_tue_entry_start}-{_tue_entry_end} "
+                    f"hard exit {_tue_hard_exit} for gamma risk management"
                 )
 
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, bars)
@@ -1815,6 +1824,7 @@ class MarketDataEngine:
             "entry_end": self.state.get("entry_end"),
             "hard_exit_time": self.state.get("hard_exit_time"),
             "chain_size": len(chain),
+            "day_move_used_pct": _day_move_used_pct,
             "chain_stale": chain_stale,
             "active_expiry": expiry.isoformat() if expiry else None,
             "actual_dte": dte,

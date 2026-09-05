@@ -91,7 +91,7 @@ class LiveOrderExecutor:
         opt = chain.get(strike, {}).get(opt_type, {}) if chain else {}
         bid = opt.get("bid", 0) or 0
         ask = opt.get("ask", 0) or 0
-        tick = 0.05
+        tick = 0.10
         if transaction_type == "BUY":
             price = ask + (2 * tick) if ask > 0 else (bid + (4 * tick) if bid > 0 else fallback + (2 * tick))
         else:

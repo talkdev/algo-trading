@@ -188,6 +188,10 @@ class AutoCalibrator:
             result.update(self._calibrate_straddle_ratio())
         except Exception as e:
             self.logger.debug(f"AutoCalibrator straddle ratio calibration error: {e}")
+        try:
+            result.update(self._calibrate_dte_performance())
+        except Exception as e:
+            self.logger.debug(f"AutoCalibrator DTE performance calibration error: {e}")
         self.logger.info("AutoCalibrator: completed. Keys calibrated: %s" % list(result.keys()))
         for _h in self.logger.handlers:
             if hasattr(_h, 'stream') and hasattr(_h.stream, 'flush'):
@@ -195,7 +199,7 @@ class AutoCalibrator:
         return result
 
     def _calibrate_vix_thresholds(self):
-        vix_df = self.db.get_vix_history(days=730)
+        vix_df = self.db.get_vix_history(days=730, from_date='2025-09-01')
         if vix_df.empty or len(vix_df) < 20:
             self.logger.info("AutoCalibrator VIX: insufficient data, using NIFTY 2026 defaults")
             return {
@@ -325,6 +329,46 @@ class AutoCalibrator:
         except Exception:
             return {}
 
+    def _calibrate_dte_performance(self):
+        try:
+            rows = self.db.query(
+                "SELECT te.actual_dte, te.strategy_name, "
+                "tx.net_pnl_rupees, tx.result "
+                "FROM trade_entries te "
+                "JOIN trade_exits tx ON te.position_id = tx.position_id "
+                "WHERE te.trading_date >= '2025-09-01' "
+                "ORDER BY te.entry_time"
+            )
+            if len(rows) < 5:
+                return {}
+            dte_buckets = {0: [], 1: [], 2: []}
+            for r in rows:
+                dte = r.get("actual_dte")
+                pnl = r.get("net_pnl_rupees", 0) or 0
+                if dte == 0:
+                    dte_buckets[0].append(pnl)
+                elif dte == 1:
+                    dte_buckets[1].append(pnl)
+                elif dte is not None and dte >= 2:
+                    dte_buckets[2].append(pnl)
+            result = {}
+            for dte_key, pnls in dte_buckets.items():
+                if len(pnls) >= 3:
+                    wins = sum(1 for p in pnls if p > 0)
+                    wr = wins / len(pnls)
+                    avg_pnl = sum(pnls) / len(pnls)
+                    result[f"dte_{dte_key}_win_rate"] = round(wr, 3)
+                    result[f"dte_{dte_key}_avg_pnl"] = round(avg_pnl, 2)
+                    result[f"dte_{dte_key}_n_trades"] = len(pnls)
+                    self.logger.info(
+                        f"AutoCalibrator DTE={dte_key}: "
+                        f"n={len(pnls)} wr={wr:.1%} avg_pnl=Rs{avg_pnl:.0f}"
+                    )
+            return result
+        except Exception as e:
+            self.logger.debug(f"AutoCalibrator DTE performance error: {e}")
+            return {}
+
     def _calibrate_straddle_ratio(self):
         try:
             df = self.db.get_daily_summary(days=730)
@@ -381,7 +425,7 @@ class CalibrationEngine:
                 is_calibrated=bool(d["is_valid"]),
                 vrp_sell_threshold=float(d.get("vrp_sell_threshold") or 3.0),
                 vrp_fair_threshold=float(d.get("vrp_fair_threshold") or 1.5),
-                day_size_monday=float(d.get("day_size_monday") or 0.75),
+                day_size_monday=float(d.get("day_size_monday") or 1.0),
                 day_size_tuesday=float(d.get("day_size_tuesday") or 0.60),
                 day_size_wednesday=float(d.get("day_size_wednesday") or 0.75),
                 day_size_thursday=float(d.get("day_size_thursday") or 0.75),
@@ -400,8 +444,22 @@ class CalibrationEngine:
 
     def run(self) -> Optional[CalibrationState]:
         self.logger.info("Calibration run starting...")
+        _tuesday_regime_start = "2025-09-01"
         n_exp  = self.db.count_tuesday_expiries()
         n_days = self.db.count_trading_days()
+        try:
+            _pre_change_vix = self.db.query_one(
+                "SELECT COUNT(*) as cnt FROM vix_history WHERE date < ?",
+                (_tuesday_regime_start,)
+            )
+            if _pre_change_vix and _pre_change_vix.get("cnt", 0) > 0:
+                self.logger.warning(
+                    f"Calibration: {_pre_change_vix['cnt']} pre-Tuesday-regime rows "
+                    f"(before {_tuesday_regime_start}) detected in vix_history. "
+                    f"These are Thursday-expiry regime data and will be excluded."
+                )
+        except Exception:
+            pass
         self.logger.info(f"  Data: {n_exp} Tuesday expiries, {n_days} trading days")
 
         vix_df = self.db.get_vix_history(days=365)
@@ -537,7 +595,7 @@ class CalibrationEngine:
             is_calibrated=valid,
             vrp_sell_threshold=3.0,
             vrp_fair_threshold=1.5,
-            day_size_monday=0.75,
+            day_size_monday=1.0,
             day_size_tuesday=0.60,
             day_size_wednesday=0.75,
             day_size_thursday=0.75,
@@ -569,7 +627,7 @@ class CalibrationEngine:
                 "notes": f"tier={cal_tier} days={n_days}",
                 "vrp_sell_threshold": 3.0,
                 "vrp_fair_threshold": 1.5,
-                "day_size_monday": 0.75,
+                "day_size_monday": 1.0,
                 "day_size_tuesday": 0.60,
                 "day_size_wednesday": 0.75,
                 "day_size_thursday": 0.75,
@@ -609,6 +667,26 @@ class CalibrationEngine:
             cal.day_size_thursday = auto_results["day_size_thursday"]
         if auto_results.get("day_size_friday"):
             cal.day_size_friday = auto_results["day_size_friday"]
+        if auto_results.get("dte_0_win_rate") is not None:
+            _dte0_wr = auto_results["dte_0_win_rate"]
+            _dte0_n = auto_results.get("dte_0_n_trades", 0)
+            if _dte0_n >= 5:
+                if _dte0_wr < 0.40:
+                    cal.day_size_tuesday = max(cal.day_size_tuesday * 0.80, 0.25)
+                    self.logger.info(f"AutoCalibrator: 0DTE win rate {_dte0_wr:.1%} low, reducing Tuesday size to {cal.day_size_tuesday:.2f}")
+                elif _dte0_wr >= 0.65:
+                    cal.day_size_tuesday = min(cal.day_size_tuesday * 1.10, 0.80)
+                    self.logger.info(f"AutoCalibrator: 0DTE win rate {_dte0_wr:.1%} high, increasing Tuesday size to {cal.day_size_tuesday:.2f}")
+        if auto_results.get("dte_1_win_rate") is not None:
+            _dte1_wr = auto_results["dte_1_win_rate"]
+            _dte1_n = auto_results.get("dte_1_n_trades", 0)
+            if _dte1_n >= 5:
+                if _dte1_wr < 0.40:
+                    cal.day_size_monday = max(cal.day_size_monday * 0.85, 0.50)
+                    self.logger.info(f"AutoCalibrator: 1DTE win rate {_dte1_wr:.1%} low, reducing Monday size to {cal.day_size_monday:.2f}")
+                elif _dte1_wr >= 0.65:
+                    cal.day_size_monday = min(cal.day_size_monday * 1.10, 1.25)
+                    self.logger.info(f"AutoCalibrator: 1DTE win rate {_dte1_wr:.1%} high, increasing Monday size to {cal.day_size_monday:.2f}")
         self._state = cal
         self.logger.info(f"Calibration complete. Valid={valid} Tier={cal_tier}.")
         return cal
@@ -745,7 +823,9 @@ class RegimeClassifier:
         except Exception:
             return 1.0
 
-    def _calculate_straddle_ratio(self, straddle: float, weekday: int) -> float:
+    def _calculate_straddle_ratio(
+        self, straddle: float, weekday: int, dte: Optional[int] = None
+    ) -> float:
         try:
             df = self.db.get_daily_summary(days=120)
             if df.empty or "realized_move" not in df.columns:
@@ -757,12 +837,28 @@ class RegimeClassifier:
                     if len(same_r) >= 5:
                         avg_r = same_r.mean()
                         avg = avg_r / 1.6 if avg_r > 0 else 0
+                        if dte == 0 and avg > 0:
+                            from datetime import datetime as _dt
+                            _now = now_ist()
+                            _session_start = _dt.combine(_now.date(), time(9, 15))
+                            _remaining_min = max(0, (_dt.combine(_now.date(), time(15, 30)) - _now).total_seconds() / 60.0)
+                            _remaining_frac = _remaining_min / 375.0
+                            import math as _math
+                            avg = avg * _math.sqrt(max(_remaining_frac, 0.05))
                         return straddle / avg if avg > 0 else 1.0
                 return 1.0
             avg = same.mean()
+            if dte == 0 and avg > 0:
+                from datetime import datetime as _dt
+                import math as _math
+                _now = now_ist()
+                _remaining_min = max(0, (_dt.combine(_now.date(), time(15, 30)) - _now).total_seconds() / 60.0)
+                _remaining_frac = _remaining_min / 375.0
+                avg = avg * _math.sqrt(max(_remaining_frac, 0.05))
             return straddle / avg if avg > 0 else 1.0
         except Exception:
             return 1.0
+
 
     def classify_positioning(self, signals: dict) -> PositioningRegime:
         _cal = self.cal
@@ -868,25 +964,6 @@ class RegimeClassifier:
         max_pain = signals.get("max_pain", 0) or 0
         vix = signals.get("vix") or 15.0
 
-        if (day_type == "EXPIRY_DAY" and now >= time(13, 0) and
-                max_pain > 0 and vix < self.config.vix_high):
-            dist = abs(spot - max_pain)
-            if dist > 100:
-                notes.append(f"MaxPain={max_pain} dist={dist:.0f}")
-                labels = {0: "MONDAY", 1: "TUESDAY", 2: "WEDNESDAY", 3: "THURSDAY", 4: "FRIDAY"}
-                day_label = labels.get(now_ist().weekday(), "MONDAY")
-                _cal_st2 = self.cal
-                _dsm2 = {
-                    0: getattr(_cal_st2, "day_size_monday",    0.75) if _cal_st2 else 0.75,
-                    1: getattr(_cal_st2, "day_size_tuesday",   0.60) if _cal_st2 else 0.60,
-                    2: getattr(_cal_st2, "day_size_wednesday", 0.75) if _cal_st2 else 0.75,
-                    3: getattr(_cal_st2, "day_size_thursday",  0.75) if _cal_st2 else 0.75,
-                    4: getattr(_cal_st2, "day_size_friday",    0.50) if _cal_st2 else 0.50,
-                }
-                day_m = _dsm2.get(now_ist().weekday(), 0.5)
-                raw_size = day_m * 0.5
-                final_size = raw_size * self.config.event_size_multiplier if event_day else raw_size
-                return FinalRegime.EXPIRY_MAX_PAIN, ConfidenceLevel.MEDIUM, final_size, raw_size, event_day, " | ".join(notes)
 
         votes = []
         agreements = 0
