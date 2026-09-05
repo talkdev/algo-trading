@@ -1,101 +1,119 @@
-from pathlib import Path
+import os
+import sys
+import ast
 
-BASE_DIR = Path(__file__).resolve().parent
+TARGET = "regime_engine.py"
 
-print("=" * 60)
-print("PATCH V5 FINAL CHECK AND ADX FIX")
-print("=" * 60)
+if not os.path.exists(TARGET):
+    print(f"ERROR: {TARGET} not found.")
+    sys.exit(1)
 
-mde_path = BASE_DIR / "market_data_engine.py"
-c = mde_path.read_text(encoding="utf-8")
+with open(TARGET, "r", encoding="utf-8") as fh:
+    src = fh.read()
 
-print("\n--- ADX block current state ---")
-adx_idx = c.find("reliability = \"LOW\" if n_bars < 35")
-if adx_idx >= 0:
-    print(repr(c[adx_idx:adx_idx+400]))
-else:
-    print("  ADX block not found")
+original_src = src
+patches_applied = []
+patches_failed = []
 
-changed = False
 
-old_adx_or = (
-    "            reliability = \"LOW\" if n_bars < 35 else (\"MEDIUM\" if n_bars < 50 else \"HIGH\")\n"
-    "            adx_value, pdi, ndi, adx_dir = self._compute_adx(candles_today, period=14)\n"
-    "            if reliability == \"LOW\" or n_bars < 35:\n"
-    "                adx_condition = \"EARLY_SESSION\"\n"
-    "                adx_dir = \"UNKNOWN\"\n"
-    "                adx_value = 0.0\n"
-    "            else:\n"
-    "                adx_condition, _ = self._classify_adx(adx_value)"
+def apply(label, old, new):
+    global src
+    old = old.lstrip("\n")
+    new = new.lstrip("\n")
+    if old in src:
+        src = src.replace(old, new, 1)
+        patches_applied.append(label)
+    else:
+        patches_failed.append(label)
+
+
+apply(
+    "PATCH-1: Fix variable ordering in classify_positioning - move _cal and derived vars to top",
+    (
+        "    def classify_positioning(self, snap: MarketSnapshot) -> PositioningRegime:\n"
+        "        strikes_half = max(Config.TOTAL_STRIKES // 2, 1)\n"
+        "        avg_ce = max(snap.total_ce_oi / strikes_half, 1) if snap.total_ce_oi > 0 else 1.0\n"
+        "        avg_pe = max(snap.total_pe_oi / strikes_half, 1) if snap.total_pe_oi > 0 else 1.0\n"
+        "        r_str  = snap.resistance_oi / avg_ce if snap.total_ce_oi > 0 else 0.0\n"
+        "        s_str  = snap.support_oi    / avg_pe if snap.total_pe_oi > 0 else 0.0\n"
+        "        rng_pct = (abs(snap.resistance_strike - snap.support_strike) / snap.nifty_spot * 100\n"
+        "                   if snap.resistance_strike and snap.support_strike else 0.0)\n"
+        "        pcr = snap.pcr\n"
+        "        oi_change = snap.oi_change_pct\n"
+        "        skew      = snap.skew\n"
+        "        strong = self._t(\"oi_wall_strong_threshold\", \"OI_WALL_STRONG\")\n"
+        "        mod    = (_cal.oi_wall_moderate_cal if (_cal and _cal.is_calibrated) else Config.OI_WALL_MODERATE)\n"
+        "        wall_range        = r_str >= mod and s_str >= mod and rng_pct < 4.0\n"
+        "        wall_strong_range = r_str >= strong and s_str >= strong and 0 < rng_pct < 3.0\n"
+        "        oi_building  = oi_change > _oi_build\n"
+        "        oi_unwinding = oi_change < _oi_unwind\n"
+        "        pcr_extreme_bull = pcr < Config.PCR_EXTREME_BULL\n"
+        "        pcr_extreme_bear = pcr > Config.PCR_EXTREME_BEAR\n"
+        "        pcr_bullish      = pcr < Config.PCR_BULLISH_THRESHOLD\n"
+        "        pcr_bearish      = pcr > Config.PCR_BEARISH_THRESHOLD\n"
+        "        _cal = self.cal\n"
+        "        _skew_bear = _cal.skew_bearish_threshold if (_cal and _cal.is_calibrated) else Config.SKEW_BEARISH_THRESHOLD\n"
+        "        _skew_bull = _cal.skew_bullish_threshold if (_cal and _cal.is_calibrated) else Config.SKEW_BULLISH_THRESHOLD\n"
+        "        _oi_build  = _cal.oi_buildup_threshold   if (_cal and _cal.is_calibrated) else Config.OI_BUILDUP_THRESHOLD\n"
+        "        _oi_unwind = _cal.oi_unwind_threshold    if (_cal and _cal.is_calibrated) else Config.OI_UNWIND_THRESHOLD\n"
+        "        skew_bearish     = skew > _skew_bear\n"
+        "        skew_bullish     = skew < _skew_bull"
+    ),
+    (
+        "    def classify_positioning(self, snap: MarketSnapshot) -> PositioningRegime:\n"
+        "        _cal = self.cal\n"
+        "        _skew_bear = _cal.skew_bearish_threshold if (_cal and _cal.is_calibrated) else Config.SKEW_BEARISH_THRESHOLD\n"
+        "        _skew_bull = _cal.skew_bullish_threshold if (_cal and _cal.is_calibrated) else Config.SKEW_BULLISH_THRESHOLD\n"
+        "        _oi_build  = _cal.oi_buildup_threshold   if (_cal and _cal.is_calibrated) else Config.OI_BUILDUP_THRESHOLD\n"
+        "        _oi_unwind = _cal.oi_unwind_threshold    if (_cal and _cal.is_calibrated) else Config.OI_UNWIND_THRESHOLD\n"
+        "        strikes_half = max(Config.TOTAL_STRIKES // 2, 1)\n"
+        "        avg_ce = max(snap.total_ce_oi / strikes_half, 1) if snap.total_ce_oi > 0 else 1.0\n"
+        "        avg_pe = max(snap.total_pe_oi / strikes_half, 1) if snap.total_pe_oi > 0 else 1.0\n"
+        "        r_str  = snap.resistance_oi / avg_ce if snap.total_ce_oi > 0 else 0.0\n"
+        "        s_str  = snap.support_oi    / avg_pe if snap.total_pe_oi > 0 else 0.0\n"
+        "        rng_pct = (abs(snap.resistance_strike - snap.support_strike) / snap.nifty_spot * 100\n"
+        "                   if snap.resistance_strike and snap.support_strike else 0.0)\n"
+        "        pcr = snap.pcr\n"
+        "        oi_change = snap.oi_change_pct\n"
+        "        skew      = snap.skew\n"
+        "        strong = self._t(\"oi_wall_strong_threshold\", \"OI_WALL_STRONG\")\n"
+        "        mod    = (_cal.oi_wall_moderate_cal if (_cal and _cal.is_calibrated) else Config.OI_WALL_MODERATE)\n"
+        "        wall_range        = r_str >= mod and s_str >= mod and rng_pct < 4.0\n"
+        "        wall_strong_range = r_str >= strong and s_str >= strong and 0 < rng_pct < 3.0\n"
+        "        oi_building  = oi_change > _oi_build\n"
+        "        oi_unwinding = oi_change < _oi_unwind\n"
+        "        pcr_extreme_bull = pcr < Config.PCR_EXTREME_BULL\n"
+        "        pcr_extreme_bear = pcr > Config.PCR_EXTREME_BEAR\n"
+        "        pcr_bullish      = pcr < Config.PCR_BULLISH_THRESHOLD\n"
+        "        pcr_bearish      = pcr > Config.PCR_BEARISH_THRESHOLD\n"
+        "        skew_bearish     = skew > _skew_bear\n"
+        "        skew_bullish     = skew < _skew_bull"
+    )
 )
-new_adx_clean = (
-    "            reliability = \"LOW\" if n_bars < 35 else (\"MEDIUM\" if n_bars < 50 else \"HIGH\")\n"
-    "            adx_value, pdi, ndi, adx_dir = self._compute_adx(candles_today, period=14)\n"
-    "            if n_bars < 35:\n"
-    "                adx_condition = \"EARLY_SESSION\"\n"
-    "                adx_dir = \"UNKNOWN\"\n"
-    "                adx_value = 0.0\n"
-    "            else:\n"
-    "                adx_condition, _ = self._classify_adx(adx_value)"
-)
 
-if old_adx_or in c:
-    c = c.replace(old_adx_or, new_adx_clean, 1)
-    print("  PATCHED: ADX condition simplified to if n_bars < 35")
-    changed = True
-elif new_adx_clean in c:
-    print("  ALREADY CORRECT: ADX uses if n_bars < 35")
-else:
-    print("  NOT FOUND: ADX block in either form")
+if src == original_src:
+    print("WARNING: No changes made. Marker failed.")
+    for p in patches_failed:
+        print(f"  FAILED: {p}")
+    sys.exit(1)
 
-if changed:
-    mde_path.write_text(c, encoding="utf-8")
-    print("  SAVED: market_data_engine.py")
+try:
+    ast.parse(src)
+except SyntaxError as e:
+    print(f"SYNTAX ERROR after patching: {e}")
+    print("File NOT written. Original preserved.")
+    sys.exit(1)
 
-print("\n--- Final verification of ALL patches ---")
-checks = [
-    (BASE_DIR / "market_data_engine.py", [
-        ("prefer_dte_min=1", "prefer_dte_min: int = 1"),
-        ("Parkinson no volume filter", "b[\"high\"] >= b[\"low\"]]"),
-        ("VWAP fallback False", "return equal_pv / total_bars, False"),
-        ("PCR OTM", "_pcr_band = spot * 0.03"),
-        ("ADX 35-bar gate", "if n_bars < 35:\n                adx_condition = \"EARLY_SESSION\""),
-        ("OR coverage gate", "_or_bars_available"),
-        ("DOW tables inverted", "\"MONDAY\": 1.00"),
-        ("VWAP signal flag", "_vwap_valid_flag"),
-        ("discover_active_expiry call", "discover_active_expiry(prefer_dte_min=1)"),
-    ]),
-    (BASE_DIR / "strategy_engine.py", [
-        ("LOT_CAPS inverted", "\"MONDAY\": 3"),
-        ("structural cap", "_structural_max"),
-        ("theta budget gate", "_theta_capture_pts"),
-    ]),
-    (BASE_DIR / "execution_engine.py", [
-        ("exit leg SELL first", "key=lambda l: 0 if l[\"action\"] == \"SELL\" else 1"),
-        ("price stop directional", "_sname_ps = position.get(\"strategy_name\""),
-        ("profit lock 70pct", "entry_credit * 0.70"),
-    ]),
-    (BASE_DIR / "main.py", [
-        ("monitoring 60s", "_has_open = len(self.execution_engine._get_open_positions()) > 0"),
-    ]),
-    (BASE_DIR / "backtest.py", [
-        ("double-cost fix", "net_credit = gross_credit - slip"),
-        ("gross_pnl gross_credit", "gross_pnl_pts = gross_credit - exit_prem"),
-        ("ADX condor exit 25", "and adx > 25:"),
-    ]),
-]
+with open(TARGET, "w", encoding="utf-8") as fh:
+    fh.write(src)
 
-all_ok = True
-for fpath, items in checks:
-    fc = fpath.read_text(encoding="utf-8")
-    for label, check_str in items:
-        status = "OK" if check_str in fc else "MISSING"
-        if status == "MISSING":
-            all_ok = False
-        print(f"  {status}: [{fpath.name}] {label}")
-
-print()
-if all_ok:
-    print("ALL 19 PATCHES CONFIRMED APPLIED — ENGINE READY")
-else:
-    print("SOME PATCHES STILL MISSING")
+print(f"\npatch.py complete. File written: {TARGET}")
+print(f"\nApplied ({len(patches_applied)}):")
+for p in patches_applied:
+    print(f"  OK: {p}")
+if patches_failed:
+    print(f"\nFailed ({len(patches_failed)}):")
+    for p in patches_failed:
+        print(f"  SKIP: {p}")
+print("\nSyntax verified OK before write.")
+print("Verification: python -m py_compile regime_engine.py && echo SYNTAX OK")
