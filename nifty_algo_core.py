@@ -98,8 +98,8 @@ MAX_DAILY_LOSS_PCT=0.02
 MAX_RISK_PER_TRADE_PCT=0.006
 NIFTY_LOT_SIZE=65
 NIFTY_STRIKE_STEP=50
-STT_RATE=0.0015
-STT_OPTIONS_SELL=0.0015
+STT_RATE=0.000625
+STT_OPTIONS_SELL=0.000625
 STT_OPTIONS_EXERCISE=0.0015
 BROKERAGE_PER_ORDER=20.0
 EXCHANGE_TXN_RATE=0.0003552
@@ -540,8 +540,8 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         max_risk_per_trade_pct=max_risk_per_trade_pct,
         lot_size=_get_int(env, "NIFTY_LOT_SIZE", 65),
         nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),
-        stt_rate=_get_float(env, "STT_RATE", 0.0015),
-        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),
+        stt_rate=_get_float(env, "STT_RATE", 0.000625),
+        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.000625),
         stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
         exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003552),
@@ -1215,11 +1215,13 @@ class Database:
         )
         return row["cnt"] if row else 0
 
-    def get_vix_history(self, days=365):
+    def get_vix_history(self, days=365, from_date=None):
         try:
             import pandas as pd
             from datetime import date, timedelta
             cutoff = (date.today() - timedelta(days=days)).isoformat()
+            if from_date and from_date > cutoff:
+                cutoff = from_date
             rows = self.query(
                 "SELECT * FROM vix_history WHERE date >= ? ORDER BY timestamp",
                 (cutoff,),
@@ -1285,11 +1287,13 @@ class Database:
         )
         return row["cnt"] if row else 0
 
-    def get_vix_history(self, days=365):
+    def get_vix_history(self, days=365, from_date=None):
         try:
             import pandas as pd
             from datetime import date, timedelta
             cutoff = (date.today() - timedelta(days=days)).isoformat()
+            if from_date and from_date > cutoff:
+                cutoff = from_date
             rows = self.query(
                 "SELECT * FROM vix_history WHERE date >= ? ORDER BY timestamp",
                 (cutoff,),

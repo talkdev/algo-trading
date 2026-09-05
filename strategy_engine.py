@@ -25,8 +25,8 @@ FINAL_REGIME_TO_STRATEGY = {
 }
 
 DTE_REQUIREMENTS = {
-    "IRON_BUTTERFLY":  (0, 7),
-    "IRON_CONDOR":     (1, 8),
+    "IRON_BUTTERFLY":  (0, 1),
+    "IRON_CONDOR":     (0, 2),
     "BULL_PUT_SPREAD": (0, 8),
     "BEAR_CALL_SPREAD":(0, 8),
     "BULL_CALL_SPREAD":(1, 5),
@@ -143,12 +143,19 @@ class StrategyEngine:
         return True
 
     def _resolve_premium_sell_range(self, s: dict) -> str:
+        actual_dte = s.get("actual_dte")
+        if actual_dte == 0:
+            return "IRON_CONDOR"
         or_condition = s.get("or_condition", "MODERATE")
         adx_15 = s.get("adx_15") or 0
+        adx_15_mature = s.get("adx_15_mature", False)
         if (or_condition in ("VERY_NARROW", "NARROW") and
-                adx_15 < 20 and self._straddle_allowed(s)):
+                adx_15_mature and adx_15 < 20 and
+                actual_dte == 1 and
+                self._straddle_allowed(s)):
             return "IRON_BUTTERFLY"
         return "IRON_CONDOR"
+
 
     def _resolve_expiry_max_pain(self, s: dict) -> str:
         direction = s.get("direction", "NEUTRAL")
@@ -372,6 +379,60 @@ class StrategyEngine:
 
         if s.get("volatility_condition") == "UNKNOWN":
             return "NO_TRADE", "vrp_unknown_insufficient_data"
+
+        _conf_gate = s.get("confidence")
+        if _conf_gate in ("LOW", "NONE"):
+            return "NO_TRADE", f"confidence_{_conf_gate}_insufficient_edge_after_costs"
+
+        _actual_dte_gate = s.get("actual_dte")
+        _vol_cond_gate = s.get("volatility_condition", "UNKNOWN")
+        if _actual_dte_gate is not None and _actual_dte_gate >= 2:
+            if _vol_cond_gate not in ("RICH", "VERY_RICH"):
+                return "NO_TRADE", f"dte_{_actual_dte_gate}_requires_rich_vrp_not_{_vol_cond_gate}"
+            if _conf_gate != "HIGH":
+                return "NO_TRADE", f"dte_{_actual_dte_gate}_requires_high_confidence_not_{_conf_gate}"
+
+        _day_move_used = s.get("day_move_used_pct", 0.0) or 0.0
+        if _day_move_used >= 70.0 and s.get("sell_ok"):
+            return "NO_TRADE", f"day_move_used_{_day_move_used:.0f}pct_of_opening_straddle_no_edge"
+
+        _strategy_for_buy_check = None
+        if final_regime and final_regime not in ("NO_TRADE", "EMERGENCY_EXIT"):
+            try:
+                from regime_bridge import final_regime_to_strategy_name as _frts
+                _strategy_for_buy_check = _frts(final_regime, s)
+            except Exception:
+                pass
+        _buy_side = {"LONG_STRADDLE", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD"}
+        if _strategy_for_buy_check in _buy_side:
+            return "NO_TRADE", "buy_side_requires_pre_1030_entry_window"
+
+        _strategy_for_buy_check = None
+        if final_regime and final_regime not in ("NO_TRADE", "EMERGENCY_EXIT"):
+            from regime_bridge import final_regime_to_strategy_name
+            try:
+                _strategy_for_buy_check = final_regime_to_strategy_name(final_regime, s)
+            except Exception:
+                pass
+        _buy_side_strategies = {"LONG_STRADDLE", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD"}
+        if _strategy_for_buy_check in _buy_side_strategies:
+            return "NO_TRADE", "buy_side_requires_pre_1030_entry_window"
+
+        _confidence_check = s.get("confidence")
+        if _confidence_check in ("LOW", "NONE"):
+            return "NO_TRADE", f"confidence_{_confidence_check}_insufficient_edge_after_costs"
+
+        _actual_dte_gate = s.get("actual_dte")
+        _vol_cond_gate = s.get("volatility_condition", "UNKNOWN")
+        if _actual_dte_gate is not None and _actual_dte_gate >= 2:
+            if _vol_cond_gate not in ("RICH", "VERY_RICH"):
+                return "NO_TRADE", f"dte_{_actual_dte_gate}_requires_rich_vrp_not_{_vol_cond_gate}"
+            if _confidence_check != "HIGH":
+                return "NO_TRADE", f"dte_{_actual_dte_gate}_requires_high_confidence_not_{_confidence_check}"
+
+        _day_move_used = s.get("day_move_used_pct", 0.0) or 0.0
+        if _day_move_used >= 70.0 and s.get("sell_ok"):
+            return "NO_TRADE", f"day_move_used_{_day_move_used:.0f}pct_of_opening_straddle_no_edge"
         if not state.get("or_computed"):
             return "NO_TRADE", "opening_range_not_yet_computed"
         if s.get("trend_condition") in ("OR_PENDING", "OBSERVING"):
@@ -413,6 +474,12 @@ class StrategyEngine:
                 size_mult *= 0.50
             elif confidence == "LOW":
                 size_mult *= 0.25
+
+        _dte_for_cap = s.get("actual_dte")
+        if _dte_for_cap is not None and _dte_for_cap >= 2:
+            dte_midweek_size_cap = 0.25
+            if size_mult > dte_midweek_size_cap:
+                size_mult = dte_midweek_size_cap
 
         if not self._straddle_allowed(s) and strategy_name in ("IRON_BUTTERFLY", "POST_EVENT_STRADDLE"):
             dte = s.get("actual_dte")
@@ -616,7 +683,7 @@ class StrategyEngine:
         return ltp
 
     def _build_legs_spec(
-        self, strategy: str, chain: dict, spot: float, wing: float, dte: Optional[int]
+        self, strategy: str, chain: dict, spot: float, wing: float, dte: Optional[int], s: Optional[dict] = None
     ) -> Tuple[Optional[list], Optional[str]]:
         step = self.config.nifty_strike_step
         td = self._dte_adjusted_delta(0.25, dte)
@@ -640,16 +707,39 @@ class StrategyEngine:
             ], None
 
         if strategy == "IRON_CONDOR":
-            sc = self._find_strike_by_delta(chain, "call", td)
-            sp = self._find_strike_by_delta(chain, "put",  td)
-            if sc is None or sp is None:
-                return None, "cannot_find_0.25_delta_strikes_for_condor"
-            lc = sc + wing
-            lp = sp - wing
+            if dte == 0:
+                _atm_straddle_ref = s.get("atm_straddle_price", 0) if s else 0
+                if _atm_straddle_ref and _atm_straddle_ref > 20:
+                    _short_dist = round(_atm_straddle_ref * 0.85 / step) * step
+                    _short_dist = max(_short_dist, step)
+                    _wing_dist = round(_atm_straddle_ref * 0.55 / step) * step
+                    _wing_dist = max(_wing_dist, step)
+                    sc = round((spot + _short_dist) / step) * step
+                    sp = round((spot - _short_dist) / step) * step
+                    lc = sc + _wing_dist
+                    lp = sp - _wing_dist
+                else:
+                    sc = self._find_strike_by_delta(chain, "call", td)
+                    sp = self._find_strike_by_delta(chain, "put",  td)
+                    if sc is None or sp is None:
+                        return None, "cannot_find_strikes_for_0dte_condor"
+                    lc = sc + wing
+                    lp = sp - wing
+            else:
+                sc = self._find_strike_by_delta(chain, "call", td)
+                sp = self._find_strike_by_delta(chain, "put",  td)
+                if sc is None or sp is None:
+                    return None, "cannot_find_0.25_delta_strikes_for_condor"
+                lc = sc + wing
+                lp = sp - wing
             if lc not in chain:
-                lc = min(chain.keys(), key=lambda k: abs(k - (sc + wing)))
+                lc = min(chain.keys(), key=lambda k: abs(k - lc))
             if lp not in chain:
-                lp = min(chain.keys(), key=lambda k: abs(k - (sp - wing)))
+                lp = min(chain.keys(), key=lambda k: abs(k - lp))
+            if sc not in chain:
+                sc = min(chain.keys(), key=lambda k: abs(k - sc))
+            if sp not in chain:
+                sp = min(chain.keys(), key=lambda k: abs(k - sp))
             if lc <= sc or lp >= sp:
                 return None, "condor_long_strikes_not_further_otm"
             if sc <= sp + step:
@@ -772,7 +862,7 @@ class StrategyEngine:
             return {"valid": False, "reason": "spot_unavailable"}
 
         wing = state.get("wing_width", 150)
-        legs_spec, err = self._build_legs_spec(strategy_name, chain, spot, wing, actual_dte)
+        legs_spec, err = self._build_legs_spec(strategy_name, chain, spot, wing, actual_dte, s)
         if legs_spec is None:
             return {"valid": False, "reason": err}
 

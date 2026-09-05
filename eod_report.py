@@ -1205,6 +1205,8 @@ def generate_report(target_date):
     md.append("## 29. Data Quality Checks\n")
     dq = {
         "Cycles missing spot":           sum(1 for c in cycle_rows if c.get("spot") is None),
+        "Cycles with day_move_used>=70pct": sum(1 for c in cycle_rows if (c.get("day_move_used_pct") or 0) >= 70.0),
+        "Max day_move_used_pct today":   round(max((c.get("day_move_used_pct") or 0 for c in cycle_rows), default=0), 1),
         "Cycles with stale chain":        sum(1 for c in cycle_rows if c.get("chain_stale")),
         "Stale chain pct":               round(sum(1 for c in cycle_rows if c.get("chain_stale")) / len(cycle_rows) * 100, 1) if cycle_rows else 0,
         "Cycles missing VIX":            sum(1 for c in cycle_rows if c.get("vix") is None),
@@ -1339,6 +1341,15 @@ Key questions for LLM:
         "or_analysis":                or_analysis,
         "vix_intraday_profile":       vix_profile,
         "api_summary":                {k: v for k, v in api_summary.items() if k != "errors_sample"},
+        "dte_performance_raw": {
+            str(dte): {
+                "trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == dte),
+                "wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == dte and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
+                "losses": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == dte and exits_by_pos.get(t.get("position_id"), {}).get("result") == "LOSS"),
+                "net_pnl": round(sum(exits_by_pos.get(t.get("position_id"), {}).get("net_pnl_rupees", 0) or 0 for t in trade_entries if (t.get("actual_dte") or 99) == dte), 2),
+            }
+            for dte in [0, 1, 2, 3, 4, 5, 6]
+        },
         "llm_analysis_context": {
             "target_date":         target_date,
             "net_pnl_rupees":      net_pnl,
@@ -1360,6 +1371,18 @@ Key questions for LLM:
                 "avg_vrp": round(statistics.mean(v["vrp"] for v in vrp_curve), 3) if vrp_curve else None,
             },
             "anomaly_count":       len([f for f in anomalies if "[FLAG]" in f]),
+            "dte_breakdown": {
+                "dte_0_trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 0),
+                "dte_1_trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 1),
+                "dte_2plus_trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 0) >= 2),
+                "dte_0_wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 0 and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
+                "dte_1_wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 1 and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
+                "dte_2plus_wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 0) >= 2 and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
+            },
+            "day_move_used_at_entries": [
+                {"time": t.get("entry_time"), "day_move_used_pct": None}
+                for t in trade_entries
+            ],
             "chain_stale_cycles":  sum(1 for c in cycle_rows if c.get("chain_stale")),
             "chain_stale_pct":     round(sum(1 for c in cycle_rows if c.get("chain_stale")) / len(cycle_rows) * 100, 1) if cycle_rows else 0,
             "iv_crush_summary":    {k: v for k, v in iv_crush_by_pos.items() if v},
