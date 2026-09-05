@@ -88,6 +88,7 @@ def replay_day(conn, trading_date):
         "vrp_mean": round(statistics.mean(vrp_vals), 3) if vrp_vals else None,
         "or_condition": or_cond,
         "trade_details": [],
+        "dte_performance": {0: {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}, 1: {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}, 2: {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}},
     }
 
     hold_mins = []
@@ -141,6 +142,13 @@ def replay_day(conn, trading_date):
         if ex:
             net_pnl   = ex.get("net_pnl_rupees", 0) or 0
             gross_pnl = ex.get("gross_pnl_rupees", 0) or 0
+            _n_legs = len(json.loads(t.get("legs_json", "[]"))) if t.get("legs_json") else 2
+            _vix_at_entry = t.get("entry_vix") or 14.0
+            _dte_slip = t.get("actual_dte") or 1
+            _slip_per_leg = 0.30 + max(0, (_vix_at_entry - 14.0) * 0.05) + (0.15 if _dte_slip == 0 else 0.0)
+            slippage_pts = _slip_per_leg * _n_legs
+            slippage_rs = slippage_pts * LOT_SIZE * (t.get("final_lots") or 1)
+            gross_pnl = gross_pnl - slippage_rs
             tot_costs = ex.get("total_costs_rupees", 0) or 0
             result    = ex.get("result", "UNKNOWN")
             hold_min  = ex.get("hold_minutes", 0) or 0
@@ -196,6 +204,15 @@ def replay_day(conn, trading_date):
             _cal_rows = q(conn, "SELECT calibration_tier FROM calibration_state WHERE calibrated_at <= ? ORDER BY calibrated_at DESC LIMIT 1", (t.get("entry_time", "9999"),))
             _cal_tier = _cal_rows[0]["calibration_tier"] if _cal_rows else 0
             detail["calibration_tier_at_trade"] = _cal_tier
+            _dte_bucket = min(t.get("actual_dte") or 1, 2)
+            if _dte_bucket not in day["dte_performance"]:
+                day["dte_performance"][_dte_bucket] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+            day["dte_performance"][_dte_bucket]["count"] += 1
+            day["dte_performance"][_dte_bucket]["net_pnl"] += net_pnl
+            if result == "WIN":
+                day["dte_performance"][_dte_bucket]["wins"] += 1
+            elif result == "LOSS":
+                day["dte_performance"][_dte_bucket]["losses"] += 1
             detail.update({
                 "exit_time": ex.get("exit_time"),
                 "exit_reason": exit_rsn,
@@ -322,6 +339,7 @@ def run_walkforward_backtest(from_date=None, to_date=None):
     regime_agg   = {}
     strategy_agg = {}
     vrp_agg      = {}
+    dte_agg      = {0: {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}, 1: {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}, 2: {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}}
 
     for day in all_days:
         for k, v in day.get("regime_performance", {}).items():
@@ -342,6 +360,12 @@ def run_walkforward_backtest(from_date=None, to_date=None):
             for f in ["count", "wins", "losses"]:
                 vrp_agg[k][f] += v.get(f, 0)
             vrp_agg[k]["net_pnl"] += v.get("net_pnl", 0.0)
+        for dte_k, dte_v in day.get("dte_performance", {}).items():
+            if dte_k not in dte_agg:
+                dte_agg[dte_k] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+            for f in ["count", "wins", "losses"]:
+                dte_agg[dte_k][f] += dte_v.get(f, 0)
+            dte_agg[dte_k]["net_pnl"] += dte_v.get("net_pnl", 0.0)
 
     def add_win_rate(d):
         result_d = {}
@@ -394,6 +418,15 @@ def run_walkforward_backtest(from_date=None, to_date=None):
         "regime_performance": add_win_rate(regime_agg),
         "strategy_performance": add_win_rate(strategy_agg),
         "vrp_condition_performance": add_win_rate(vrp_agg),
+        "dte_performance_breakdown": {
+            str(k): {
+                **v,
+                "win_rate_pct": round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0,
+                "avg_pnl": round(v["net_pnl"] / v["count"], 2) if v["count"] else 0,
+                "label": {0: "0DTE_Tuesday", 1: "1DTE_Monday", 2: "2plus_DTE_MidWeek"}.get(k, f"DTE_{k}"),
+            }
+            for k, v in sorted(dte_agg.items())
+        },
         "iv_crush_by_strategy": {
             k: {
                 "crush_count": v.get("crush_count", 0),
@@ -470,6 +503,15 @@ def run_walkforward_backtest(from_date=None, to_date=None):
         for strat, vals in sorted(iv_crush_by_strategy.items()):
             rate = round(vals.get("crush_count", 0) / vals.get("total", 1) * 100, 1) if vals.get("total", 0) > 0 else 0
             print(f"    {strat:<25} crush={vals.get('crush_count',0)}/{vals.get('total',0)} ({rate}%)")
+    print()
+    if dte_agg:
+        print("  DTE Performance Breakdown:")
+        dte_labels = {0: "0DTE (Tuesday)", 1: "1DTE (Monday)", 2: "2+DTE (Wed-Fri)"}
+        for dte_k in sorted(dte_agg.keys()):
+            dv = dte_agg[dte_k]
+            wr = round(dv["wins"] / dv["count"] * 100, 1) if dv["count"] else 0
+            label = dte_labels.get(dte_k, f"DTE={dte_k}")
+            print(f"    {label:<20} n={dv['count']:3d} wr={wr:5.1f}% pnl=Rs{dv['net_pnl']:8.0f}")
     print()
     print(f"  Full report: {report_path}")
 
