@@ -262,8 +262,8 @@ class MarketDataEngine:
             "day_mode": "NORMAL", "vix_regime": "UNKNOWN",
             "gap_size": "SMALL", "gap_direction": "FLAT", "day_label": None,
             "or_high": None, "or_low": None, "or_width": None, "or_condition": None,
-            "entry_start": max(self.config.trading_window_start, dtime(10, 30)).strftime("%H:%M"),
-            "entry_end": min(self.config.trading_window_last_entry, dtime(13, 0)).strftime("%H:%M"),
+            "entry_start": max(self.config.trading_window_start, dtime(9, 45)).strftime("%H:%M"),
+            "entry_end": min(self.config.trading_window_last_entry, dtime(14, 0)).strftime("%H:%M"),
             "hard_exit_time": self.config.hard_exit_time.strftime("%H:%M"),
             "stop_multiplier": 2.0, "size_multiplier": 1.0, "wing_width": 150,
             "entry_count": 0, "reentry_count": 0,
@@ -602,12 +602,6 @@ class MarketDataEngine:
                 self.state.get("parkinson_rv_pct") is not None and
                 today_str == today_ist().isoformat()):
             return self.state["parkinson_rv_pct"], "cached"
-
-        if vix and vix > 0:
-            rv = (vix / 100.0) * 0.65
-            self.state["parkinson_rv_pct"] = rv
-            self.state["parkinson_rv_computed_date"] = today_str
-            return rv, "vix_proxy"
 
         return None, "unavailable"
 
@@ -1571,9 +1565,9 @@ class MarketDataEngine:
                 iv_behavior = "CRUSHING"
             elif iv_change_pct < -4.0:
                 iv_behavior = "DECLINING"
-            elif iv_change_pct <= 4.0:
+            elif iv_change_pct <= 8.0:
                 iv_behavior = "STABLE"
-            elif iv_change_pct <= 12.0:
+            elif iv_change_pct <= 15.0:
                 iv_behavior = "EXPANDING"
             else:
                 iv_behavior = "SPIKING"

@@ -149,6 +149,19 @@ def replay_day(conn, trading_date):
             slippage_pts = _slip_per_leg * _n_legs
             slippage_rs = slippage_pts * LOT_SIZE * (t.get("final_lots") or 1)
             gross_pnl = gross_pnl - slippage_rs
+            _pid_legs = q(conn, "SELECT quoted_mid_at_entry, quoted_mid_at_exit, entry_price, exit_price, action FROM position_legs WHERE position_id=?", (pid,))
+            _actual_slippage_pts = 0.0
+            for _leg in _pid_legs:
+                _qme = _leg.get("quoted_mid_at_entry") or 0
+                _ep = _leg.get("entry_price") or 0
+                _qmx = _leg.get("quoted_mid_at_exit") or 0
+                _xp = _leg.get("exit_price") or 0
+                if _qme > 0 and _ep > 0:
+                    _actual_slippage_pts += abs(_ep - _qme)
+                if _qmx > 0 and _xp > 0:
+                    _actual_slippage_pts += abs(_xp - _qmx)
+            detail["actual_slippage_pts"] = round(_actual_slippage_pts, 3)
+            detail["modeled_slippage_pts"] = round(slippage_pts, 3)
             tot_costs = ex.get("total_costs_rupees", 0) or 0
             result    = ex.get("result", "UNKNOWN")
             hold_min  = ex.get("hold_minutes", 0) or 0
@@ -440,6 +453,34 @@ def run_walkforward_backtest(from_date=None, to_date=None):
             {"date": d["trading_date"], "capital": d["capital_end"], "pnl": d["net_pnl_rupees"], "cumulative_pnl": d["cumulative_pnl"]}
             for d in all_days
         ],
+        "payoff_geometry_analysis": {
+            "avg_win_pts": round(
+                sum(td.get("net_pnl_rupees", 0) or 0 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) > 0) /
+                max(sum(1 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) > 0), 1) / LOT_SIZE, 3
+            ),
+            "avg_loss_pts": round(
+                abs(sum(td.get("net_pnl_rupees", 0) or 0 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) < 0)) /
+                max(sum(1 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) < 0), 1) / LOT_SIZE, 3
+            ),
+            "reward_to_risk": round(
+                (sum(td.get("net_pnl_rupees", 0) or 0 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) > 0) /
+                 max(sum(1 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) > 0), 1)) /
+                max(abs(sum(td.get("net_pnl_rupees", 0) or 0 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) < 0)) /
+                    max(sum(1 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) < 0), 1), 1), 3
+            ),
+            "break_even_win_rate_required": round(
+                1 / (1 + (
+                    (sum(td.get("net_pnl_rupees", 0) or 0 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) > 0) /
+                     max(sum(1 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) > 0), 1)) /
+                    max(abs(sum(td.get("net_pnl_rupees", 0) or 0 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) < 0)) /
+                        max(sum(1 for d in all_days for td in d.get("trade_details", []) if (td.get("net_pnl_rupees") or 0) < 0), 1), 0.01)
+                )) * 100, 1
+            ),
+            "avg_actual_slippage_pts": round(
+                sum(td.get("actual_slippage_pts") or 0 for d in all_days for td in d.get("trade_details", []) if td.get("actual_slippage_pts") is not None) /
+                max(sum(1 for d in all_days for td in d.get("trade_details", []) if td.get("actual_slippage_pts") is not None), 1), 3
+            ),
+        },
         "llm_analysis_context": {
             "summary": f"Walk-forward backtest of NIFTY intraday options engine v2.0 over {total_days} trading days.",
             "key_findings": {

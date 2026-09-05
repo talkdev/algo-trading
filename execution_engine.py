@@ -343,7 +343,7 @@ class ExecutionEngine:
         current_portfolio_delta = self._compute_portfolio_delta()
         post_trade_delta = current_portfolio_delta + new_delta
         total_open_lots = sum(p["final_lots"] for p in self._get_open_positions()) + final_lots
-        delta_limit = 0.20 * total_open_lots
+        delta_limit = 0.20 * total_open_lots * self.config.lot_size
 
         if abs(post_trade_delta) > delta_limit:
             reduced = final_lots - 1
@@ -558,6 +558,8 @@ class ExecutionEngine:
                 "exit_delta": None,
                 "broker_order_id_entry": leg["fill"]["order_id"],
                 "broker_order_id_exit": None,
+                "quoted_mid_at_entry": (leg.get("bid", 0) + leg.get("ask", 0)) / 2.0 if (leg.get("bid", 0) > 0 and leg.get("ask", 0) > 0) else leg.get("exec_price", 0),
+                "quoted_mid_at_exit": None,
                 "leg_status": "OPEN",
             })
 
@@ -785,7 +787,7 @@ class ExecutionEngine:
             move_thresh = 0.55 if is_dir_lock else 0.50
 
             if profit_pct >= lock_thresh and not position.get("stop_at_breakeven"):
-                lock_stop = max(true_breakeven, entry_credit * 0.70)
+                lock_stop = max(true_breakeven, entry_credit * 0.80)
                 self.db.update("positions",
                                {"stop_premium": lock_stop, "stop_at_breakeven": 1},
                                {"position_id": position["position_id"]})
@@ -793,7 +795,7 @@ class ExecutionEngine:
                 return "TIGHTEN_STOP", {}
             if profit_pct >= move_thresh and not position.get("stop_moved_to_25pct"):
                 self.db.update("positions",
-                               {"stop_premium": entry_credit * 0.75, "stop_moved_to_25pct": 1},
+                               {"stop_premium": entry_credit * 0.85, "stop_moved_to_25pct": 1},
                                {"position_id": position["position_id"]})
                 self.logger.info(f"PROFIT LOCK: {strategy_name} -> 25% lock (profit={profit_pct*100:.0f}%)")
                 return "TIGHTEN_STOP", {}
