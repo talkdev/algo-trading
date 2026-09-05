@@ -158,6 +158,22 @@ MIN_TRADING_DAYS_FOR_CALIBRATION=20
 EVENT_SIZE_MULTIPLIER=0.25
 TUESDAY_EARLY_EXIT_ENABLED=true
 GIFT_NIFTY_INSTRUMENT_KEY=
+VIX_LOW=12.5
+VIX_NORMAL=16.0
+VIX_HIGH=22.0
+VIX_EXTREME_HIGH=28.0
+DEFINED_RISK_ONLY_ON_EVENT=true
+HV_LOOKBACK_DAYS=20
+STRADDLE_ROC_WINDOW_MIN=15
+STRADDLE_ROC_ALERT_PCT=12.0
+VIX_LOW=12.5
+VIX_NORMAL=16.0
+VIX_HIGH=22.0
+VIX_EXTREME_HIGH=28.0
+DEFINED_RISK_ONLY_ON_EVENT=true
+HV_LOOKBACK_DAYS=20
+STRADDLE_ROC_WINDOW_MIN=15
+STRADDLE_ROC_ALERT_PCT=12.0
 """
 
 
@@ -447,6 +463,22 @@ class Config:
     event_size_multiplier: float
     tuesday_early_exit_enabled: bool
     gift_nifty_instrument_key: str
+    vix_low: float
+    vix_normal: float
+    vix_high: float
+    vix_extreme_high: float
+    defined_risk_only_on_event: bool
+    hv_lookback_days: int
+    straddle_roc_window_min: int
+    straddle_roc_alert_pct: float
+    vix_low: float
+    vix_normal: float
+    vix_high: float
+    vix_extreme_high: float
+    defined_risk_only_on_event: bool
+    hv_lookback_days: int
+    straddle_roc_window_min: int
+    straddle_roc_alert_pct: float
 
     def __repr__(self) -> str:
         def mask(s: str) -> str:
@@ -569,6 +601,14 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         event_size_multiplier=_get_float(env, "EVENT_SIZE_MULTIPLIER", 0.25),
         tuesday_early_exit_enabled=_get_bool(env, "TUESDAY_EARLY_EXIT_ENABLED", True),
         gift_nifty_instrument_key=env.get("GIFT_NIFTY_INSTRUMENT_KEY", "").strip(),
+        vix_low=_get_float(env, "VIX_LOW", 12.5),
+        vix_normal=_get_float(env, "VIX_NORMAL", 16.0),
+        vix_high=_get_float(env, "VIX_HIGH", 22.0),
+        vix_extreme_high=_get_float(env, "VIX_EXTREME_HIGH", 28.0),
+        defined_risk_only_on_event=_get_bool(env, "DEFINED_RISK_ONLY_ON_EVENT", True),
+        hv_lookback_days=_get_int(env, "HV_LOOKBACK_DAYS", 20),
+        straddle_roc_window_min=_get_int(env, "STRADDLE_ROC_WINDOW_MIN", 15),
+        straddle_roc_alert_pct=_get_float(env, "STRADDLE_ROC_ALERT_PCT", 12.0),
     )
 
 
@@ -734,6 +774,7 @@ CREATE TABLE IF NOT EXISTS cycle_log (
     open_positions INTEGER, daily_pnl_net REAL,
     vix_regime TEXT, day_mode TEXT, open_position_ids TEXT,
     vrp_percentile REAL, max_pain REAL, atm_straddle_price REAL,
+    chain_stale INTEGER DEFAULT 0,
     raw_json TEXT
 );
 
@@ -918,6 +959,29 @@ CREATE TABLE IF NOT EXISTS backtest_calibration (
 
 CREATE INDEX IF NOT EXISTS idx_backtest_cal_cell
     ON backtest_calibration(cell_key);
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    date TEXT NOT NULL,
+    time TEXT NOT NULL,
+    spot REAL,
+    vix REAL,
+    atm_iv REAL,
+    skew REAL,
+    oi_change_pct REAL,
+    resistance_oi INTEGER,
+    support_oi INTEGER,
+    total_ce_oi INTEGER,
+    total_pe_oi INTEGER,
+    pcr REAL,
+    adx_15 REAL,
+    vwap_dist_pct REAL,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ms_ts ON market_snapshots(timestamp);
+CREATE INDEX IF NOT EXISTS idx_ms_date ON market_snapshots(date);
 """
 
 MIGRATION_SQL = [
@@ -971,6 +1035,19 @@ MIGRATION_SQL = [
     "ALTER TABLE calibration_state ADD COLUMN oi_wall_moderate_cal REAL DEFAULT 1.7",
     "ALTER TABLE calibration_state ADD COLUMN calibration_tier INTEGER DEFAULT 0",
     "ALTER TABLE regime_decisions ADD COLUMN calibration_tier INTEGER DEFAULT 0",
+    "ALTER TABLE market_snapshots ADD COLUMN vrp REAL",
+    "ALTER TABLE market_snapshots ADD COLUMN parkinson_rv REAL",
+    "ALTER TABLE market_snapshots ADD COLUMN volatility_condition TEXT",
+    "ALTER TABLE market_snapshots ADD COLUMN trend_condition TEXT",
+    "ALTER TABLE market_snapshots ADD COLUMN direction TEXT",
+    "ALTER TABLE cycle_log ADD COLUMN chain_stale INTEGER DEFAULT 0",
+    "ALTER TABLE calibration_state ADD COLUMN vrp_sell_threshold REAL DEFAULT 3.0",
+    "ALTER TABLE calibration_state ADD COLUMN vrp_fair_threshold REAL DEFAULT 1.5",
+    "ALTER TABLE calibration_state ADD COLUMN day_size_monday REAL DEFAULT 0.75",
+    "ALTER TABLE calibration_state ADD COLUMN day_size_tuesday REAL DEFAULT 0.60",
+    "ALTER TABLE calibration_state ADD COLUMN day_size_wednesday REAL DEFAULT 0.75",
+    "ALTER TABLE calibration_state ADD COLUMN day_size_thursday REAL DEFAULT 0.75",
+    "ALTER TABLE calibration_state ADD COLUMN day_size_friday REAL DEFAULT 0.50",
 ]
 
 
@@ -1117,6 +1194,163 @@ class Database:
             })
         except Exception:
             pass
+
+    def get_connection(self):
+        return self._conn
+
+    def get_latest_calibration(self):
+        return self.query_one(
+            "SELECT * FROM calibration_state WHERE is_valid=1 ORDER BY calibrated_at DESC LIMIT 1"
+        )
+
+    def count_tuesday_expiries(self):
+        row = self.query_one(
+            "SELECT COUNT(*) as cnt FROM daily_summary WHERE day_label='TUESDAY'"
+        )
+        return row["cnt"] if row else 0
+
+    def count_trading_days(self):
+        row = self.query_one(
+            "SELECT COUNT(DISTINCT trading_date) as cnt FROM daily_summary"
+        )
+        return row["cnt"] if row else 0
+
+    def get_vix_history(self, days=365):
+        try:
+            import pandas as pd
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = self.query(
+                "SELECT * FROM vix_history WHERE date >= ? ORDER BY timestamp",
+                (cutoff,),
+            )
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            import pandas as pd
+            return pd.DataFrame()
+
+    def get_daily_summary(self, days=365):
+        try:
+            import pandas as pd
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = self.query(
+                "SELECT *, strftime('%w', trading_date) as weekday "
+                "FROM daily_summary WHERE trading_date >= ? ORDER BY trading_date",
+                (cutoff,),
+            )
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            df["weekday"] = pd.to_numeric(df["weekday"], errors="coerce")
+            return df
+        except Exception:
+            import pandas as pd
+            return pd.DataFrame()
+
+    def get_spot_history(self, days=30):
+        try:
+            import pandas as pd
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = self.query(
+                "SELECT trading_date as date, candle_time as time, "
+                "open, high, low, close, volume "
+                "FROM intraday_candles WHERE trading_date >= ? "
+                "ORDER BY trading_date, candle_time",
+                (cutoff,),
+            )
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            import pandas as pd
+            return pd.DataFrame()
+
+    def get_connection(self):
+        return self._conn
+
+    def get_latest_calibration(self):
+        return self.query_one(
+            "SELECT * FROM calibration_state WHERE is_valid=1 ORDER BY calibrated_at DESC LIMIT 1"
+        )
+
+    def count_tuesday_expiries(self):
+        row = self.query_one(
+            "SELECT COUNT(*) as cnt FROM daily_summary WHERE day_label='TUESDAY'"
+        )
+        return row["cnt"] if row else 0
+
+    def count_trading_days(self):
+        row = self.query_one(
+            "SELECT COUNT(DISTINCT trading_date) as cnt FROM daily_summary"
+        )
+        return row["cnt"] if row else 0
+
+    def get_vix_history(self, days=365):
+        try:
+            import pandas as pd
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = self.query(
+                "SELECT * FROM vix_history WHERE date >= ? ORDER BY timestamp",
+                (cutoff,),
+            )
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            import pandas as pd
+            return pd.DataFrame()
+
+    def get_daily_summary(self, days=365):
+        try:
+            import pandas as pd
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = self.query(
+                "SELECT *, CAST(strftime('%w', trading_date) AS INTEGER) as weekday_sql "
+                "FROM daily_summary WHERE trading_date >= ? ORDER BY trading_date",
+                (cutoff,),
+            )
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            df["weekday_sql"] = pd.to_numeric(df["weekday_sql"], errors="coerce")
+            df["weekday"] = df["weekday_sql"].apply(
+                lambda w: (int(w) - 1) % 7 if pd.notna(w) else float("nan")
+            )
+            return df
+        except Exception:
+            import pandas as pd
+            return pd.DataFrame()
+
+    def get_spot_history(self, days=30):
+        try:
+            import pandas as pd
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = self.query(
+                "SELECT trading_date as date, candle_time as time, "
+                "open, high, low, close, volume "
+                "FROM intraday_candles WHERE trading_date >= ? "
+                "ORDER BY trading_date, candle_time",
+                (cutoff,),
+            )
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            import pandas as pd
+            return pd.DataFrame()
+
+    def get_market_snapshots(self, days=365):
+        try:
+            import pandas as pd
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            rows = self.query(
+                "SELECT * FROM market_snapshots WHERE date >= ? ORDER BY timestamp",
+                (cutoff,),
+            )
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            import pandas as pd
+            return pd.DataFrame()
 
     def close(self) -> None:
         with self._lock:

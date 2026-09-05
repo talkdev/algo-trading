@@ -1,15 +1,11 @@
-import sqlite3
 import json
-import math
+import sqlite3
 import statistics
-import csv
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Optional
-
+from datetime import datetime
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "backtest_results"
+OUTPUT_DIR = BASE_DIR / "reports"
 
 
 def load_env_simple(path):
@@ -30,39 +26,21 @@ DB_PATH = Path(_ENV.get("DB_PATH", "data/nifty_algo.db"))
 if not DB_PATH.is_absolute():
     DB_PATH = BASE_DIR / DB_PATH
 
-LOT_SIZE            = int(_ENV.get("NIFTY_LOT_SIZE", "65") or 65)
-STT_RATE            = float(_ENV.get("STT_RATE", "0.0015") or 0.0015)
-EXCHANGE_TXN_RATE   = float(_ENV.get("EXCHANGE_TXN_RATE", "0.0003552") or 0.0003552)
-BROKERAGE_PER_ORDER = float(_ENV.get("BROKERAGE_PER_ORDER", "20.0") or 20.0)
-SEBI_RATE           = float(_ENV.get("SEBI_RATE", "0.000001") or 0.000001)
-STAMP_DUTY          = float(_ENV.get("STAMP_DUTY_BUY_OPTIONS", "0.00003") or 0.00003)
-STARTING_CAPITAL    = float(_ENV.get("STARTING_CAPITAL", "1000000") or 1000000)
-NIFTY_STRIKE_STEP   = int(_ENV.get("NIFTY_STRIKE_STEP", "50") or 50)
-
-MIN_SAMPLES_SIGNIFICANCE = 10
-MIN_SAMPLES_RELIABLE     = 30
-RISK_FREE_ANNUAL         = 0.065
-TRADING_DAYS_YEAR        = 252
-
-FINAL_REGIME_TO_STRATEGY = {
-    "PREMIUM_SELL_RANGE":   None,
-    "PREMIUM_SELL_BULL":    "BULL_PUT_SPREAD",
-    "PREMIUM_SELL_BEAR":    "BEAR_CALL_SPREAD",
-    "BUY_STRADDLE":         "LONG_STRADDLE",
-    "BUY_DIRECTIONAL_BULL": "BULL_CALL_SPREAD",
-    "BUY_DIRECTIONAL_BEAR": "BEAR_PUT_SPREAD",
-    "EXPIRY_MAX_PAIN":      None,
-    "NO_TRADE":             None,
-    "EMERGENCY_EXIT":       None,
-}
+LOT_SIZE         = int(_ENV.get("NIFTY_LOT_SIZE", "65") or 65)
+STARTING_CAPITAL = float(_ENV.get("STARTING_CAPITAL", "1000000") or 1000000)
 
 
-def get_conn():
+def get_connection():
     if not DB_PATH.exists():
         raise FileNotFoundError(f"Database not found: {DB_PATH}")
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def table_exists(conn, name):
+    row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+    return row is not None
 
 
 def q(conn, sql, params=()):
@@ -72,1115 +50,439 @@ def q(conn, sql, params=()):
         return []
 
 
-def table_exists(conn, name):
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone()
-    return row is not None
+def replay_day(conn, trading_date):
+    cycle_rows    = q(conn, "SELECT * FROM cycle_log WHERE trading_date=? ORDER BY cycle_id", (trading_date,))
+    trade_entries = q(conn, "SELECT * FROM trade_entries WHERE trading_date=? ORDER BY entry_time", (trading_date,))
+    trade_exits   = q(conn, "SELECT te.* FROM trade_exits te JOIN positions p ON te.position_id=p.position_id WHERE p.trading_date=? ORDER BY te.exit_time", (trading_date,)) if table_exists(conn, "trade_exits") else []
+    regime_decs   = q(conn, "SELECT * FROM regime_decisions WHERE date=? ORDER BY timestamp", (trading_date,)) if table_exists(conn, "regime_decisions") else []
+    vix_rows      = q(conn, "SELECT * FROM vix_history WHERE date=? ORDER BY timestamp", (trading_date,)) if table_exists(conn, "vix_history") else []
+    mkt_snaps     = q(conn, "SELECT * FROM market_snapshots WHERE date=? ORDER BY timestamp", (trading_date,)) if table_exists(conn, "market_snapshots") else []
 
+    exits_by_pos = {e["position_id"]: e for e in trade_exits}
 
-def column_exists(conn, table, column):
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r[1] == column for r in rows)
+    vrp_vals = [c["vrp"] for c in cycle_rows if c.get("vrp") is not None]
+    vix_vals = [r["vix_value"] for r in vix_rows if r.get("vix_value")]
+    or_cond  = next((c["or_condition"] for c in cycle_rows if c.get("or_condition")), "UNKNOWN")
 
-
-def compute_costs(legs, lots):
-    sell_prem = sum(l.get("exec_price", 0) for l in legs if l.get("action") == "SELL")
-    buy_prem  = sum(l.get("exec_price", 0) for l in legs if l.get("action") == "BUY")
-    turnover  = sell_prem + buy_prem
-    n_orders  = len(legs)
-    stt      = sell_prem * LOT_SIZE * lots * STT_RATE
-    exchange = turnover  * LOT_SIZE * lots * EXCHANGE_TXN_RATE
-    sebi     = turnover  * LOT_SIZE * lots * SEBI_RATE
-    stamp    = buy_prem  * LOT_SIZE * lots * STAMP_DUTY
-    brokerage = BROKERAGE_PER_ORDER * n_orders
-    gst      = (brokerage + exchange + sebi) * 0.18
-    return round(stt + exchange + sebi + stamp + brokerage + gst, 2)
-
-
-def find_delta_strike(chain, opt_type, target_delta, tolerance=0.10):
-    best = None
-    best_diff = float("inf")
-    for strike, legs in chain.items():
-        leg = legs.get(opt_type, {})
-        delta = leg.get("delta")
-        if delta is None:
-            continue
-        diff = abs(abs(delta) - target_delta)
-        if diff < best_diff:
-            best_diff = diff
-            best = strike
-    return best if best_diff <= tolerance else None
-
-
-def exec_price(chain, strike, opt_type, action):
-    leg = chain.get(strike, {}).get(opt_type, {})
-    bid = leg.get("bid", 0) or 0
-    ask = leg.get("ask", 0) or 0
-    ltp = leg.get("ltp", 0) or 0
-    if bid > 0 and ask > 0:
-        return bid if action == "SELL" else ask
-    return ltp
-
-
-def mark_price(chain, strike, opt_type):
-    leg = chain.get(strike, {}).get(opt_type, {})
-    bid = leg.get("bid", 0) or 0
-    ask = leg.get("ask", 0) or 0
-    ltp = leg.get("ltp", 0) or 0
-    if bid > 0 and ask > 0:
-        return (bid + ask) / 2.0
-    return ltp
-
-
-def load_chain(conn, cycle_id, capture_time, trading_date, expiry):
-    chain = {}
-    if cycle_id and table_exists(conn, "option_chain_snapshot"):
-        try:
-            rows = q(
-                conn,
-                "SELECT strike, option_type, bid, ask, ltp, iv, delta, gamma, vega, theta, oi "
-                "FROM option_chain_snapshot WHERE cycle_id=? AND expiry=?",
-                (cycle_id, expiry),
-            )
-            for r in rows:
-                s = r["strike"]
-                if s not in chain:
-                    chain[s] = {}
-                chain[s][r["option_type"]] = {
-                    k: r[k] for k in ("bid", "ask", "ltp", "iv", "delta", "gamma", "vega", "theta", "oi")
-                }
-        except Exception:
-            chain = {}
-
-    if not chain and capture_time and table_exists(conn, "option_chain_snapshot"):
-        try:
-            rows = q(
-                conn,
-                "SELECT strike, option_type, bid, ask, ltp, iv, delta, gamma, vega, theta, oi "
-                "FROM option_chain_snapshot "
-                "WHERE trading_date=? AND expiry=? AND capture_time >= ? "
-                "ORDER BY capture_time ASC LIMIT 174",
-                (trading_date, expiry, capture_time),
-            )
-            for r in rows:
-                s = r["strike"]
-                if s not in chain:
-                    chain[s] = {}
-                chain[s][r["option_type"]] = {
-                    k: r[k] for k in ("bid", "ask", "ltp", "iv", "delta", "gamma", "vega", "theta", "oi")
-                }
-        except Exception:
-            chain = {}
-
-    return chain
-
-
-def dte_adjusted_delta(base, dte):
-    if dte is None:
-        return base
-    if dte <= 0:
-        return max(0.10, base - 0.12)
-    if dte == 1:
-        return max(0.12, base - 0.10)
-    if dte == 2:
-        return max(0.15, base - 0.07)
-    if dte == 3:
-        return max(0.18, base - 0.05)
-    return base
-
-
-def resolve_strategy_from_final_regime(final_regime, cycle):
-    if not final_regime or final_regime in ("NO_TRADE", "EMERGENCY_EXIT"):
-        return "NO_TRADE", "regime_engine_no_trade"
-
-    if final_regime == "PREMIUM_SELL_RANGE":
-        or_condition = cycle.get("or_condition", "MODERATE")
-        adx_15 = cycle.get("adx_15") or cycle.get("adx") or 0
-        if or_condition in ("VERY_NARROW", "NARROW") and adx_15 < 20:
-            return "IRON_BUTTERFLY", f"regime:{final_regime}:butterfly_narrow_or"
-        return "IRON_CONDOR", f"regime:{final_regime}:condor"
-
-    if final_regime == "EXPIRY_MAX_PAIN":
-        direction = cycle.get("direction", "NEUTRAL")
-        if direction in ("BULLISH", "MILD_BULLISH"):
-            return "BULL_PUT_SPREAD", f"regime:{final_regime}:bull_put"
-        return "BEAR_CALL_SPREAD", f"regime:{final_regime}:bear_call"
-
-    mapped = FINAL_REGIME_TO_STRATEGY.get(final_regime)
-    if mapped:
-        return mapped, f"regime:{final_regime}"
-    return "NO_TRADE", f"regime:{final_regime}:no_map"
-
-
-def select_strategy_fallback(cycle):
-    vol   = cycle.get("volatility_condition") or "UNKNOWN"
-    trend = cycle.get("trend_condition") or "OR_PENDING"
-    dirn  = cycle.get("direction") or "NEUTRAL"
-    vrp   = cycle.get("vrp") or 0
-    vix_reg = cycle.get("vix_regime") or "NORMAL"
-    adx_15  = cycle.get("adx_15") or cycle.get("adx") or 0
-
-    if vol == "UNKNOWN" or trend in ("OR_PENDING", "OBSERVING", "UNKNOWN"):
-        return "NO_TRADE", "insufficient_data"
-    if vix_reg == "SUPPRESSED" and vrp < 3.0:
-        return "NO_TRADE", "vix_suppressed_low_vrp"
-
-    vwap_dist = cycle.get("vwap_dist_pct") or 0
-    if vwap_dist > 0.35:
-        vwap_sig = "BULLISH_EXTENDED"
-    elif vwap_dist > 0.10:
-        vwap_sig = "BULLISH"
-    elif vwap_dist < -0.35:
-        vwap_sig = "BEARISH_EXTENDED"
-    elif vwap_dist < -0.10:
-        vwap_sig = "BEARISH"
-    else:
-        vwap_sig = "NEUTRAL"
-
-    sell_ok = vol in ("RICH", "VERY_RICH") or (vol == "FAIR" and vrp > 1.5)
-    buy_ok  = vol in ("CHEAP", "INVERTED")
-
-    if vol in ("VERY_RICH", "RICH") and sell_ok:
-        if trend in ("RANGE_BOUND", "MILD_RANGE", "RANGE_ASSUMED", "UNCERTAIN", "RANGE", "CHOPPY"):
-            if dirn == "NEUTRAL":
-                if adx_15 > 25:
-                    return "NO_TRADE", f"condor_blocked_adx_{adx_15:.0f}"
-                return "IRON_CONDOR", f"neutral+{vol}+{trend}"
-            elif dirn in ("BULLISH", "MILD_BULLISH") and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
-                return "BULL_PUT_SPREAD", f"bullish+{vol}+{trend}"
-            elif dirn in ("BEARISH", "MILD_BEARISH") and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
-                return "BEAR_CALL_SPREAD", f"bearish+{vol}+{trend}"
-        elif trend in ("TRENDING", "STRONG_TREND", "MILD_TREND", "UPTREND", "STRONG_UPTREND", "DOWNTREND", "STRONG_DOWNTREND"):
-            if dirn in ("BULLISH", "MILD_BULLISH") and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
-                return "BULL_PUT_SPREAD", f"bullish_trend+{vol}"
-            elif dirn in ("BEARISH", "MILD_BEARISH") and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
-                return "BEAR_CALL_SPREAD", f"bearish_trend+{vol}"
-            elif dirn == "NEUTRAL":
-                if adx_15 > 25:
-                    return "NO_TRADE", f"condor_blocked_adx_{adx_15:.0f}_trending"
-                return "IRON_CONDOR", f"neutral_trend+{vol}"
-
-    elif vol == "FAIR" and sell_ok:
-        if trend in ("RANGE_BOUND", "MILD_RANGE", "RANGE_ASSUMED", "UNCERTAIN", "RANGE"):
-            if dirn in ("BULLISH", "MILD_BULLISH") and vwap_sig not in ("BEARISH", "BEARISH_EXTENDED"):
-                return "BULL_PUT_SPREAD", "bullish+fair+range"
-            elif dirn in ("BEARISH", "MILD_BEARISH") and vwap_sig not in ("BULLISH", "BULLISH_EXTENDED"):
-                return "BEAR_CALL_SPREAD", "bearish+fair+range"
-            elif dirn == "NEUTRAL":
-                return "IRON_CONDOR", "neutral+fair+range"
-
-    elif vol in ("CHEAP", "INVERTED") and buy_ok:
-        if trend in ("TRENDING", "STRONG_TREND", "UPTREND", "STRONG_UPTREND"):
-            if dirn in ("BULLISH", "MILD_BULLISH"):
-                return "BULL_CALL_SPREAD", f"bullish+{vol}+trend"
-            elif dirn in ("BEARISH", "MILD_BEARISH"):
-                return "BEAR_PUT_SPREAD", f"bearish+{vol}+trend"
-        elif trend in ("DOWNTREND", "STRONG_DOWNTREND"):
-            if dirn in ("BEARISH", "MILD_BEARISH"):
-                return "BEAR_PUT_SPREAD", f"bearish+{vol}+downtrend"
-
-    return "NO_TRADE", f"no_match:{vol}+{trend}+{dirn}"
-
-
-def build_legs(strategy, chain, spot, wing, dte):
-    if not chain or spot is None:
-        return None
-    td = dte_adjusted_delta(0.25, dte)
-
-    if strategy == "IRON_CONDOR":
-        sc = find_delta_strike(chain, "call", td)
-        sp = find_delta_strike(chain, "put",  td)
-        if sc is None or sp is None:
-            return None
-        lc = sc + wing
-        lp = sp - wing
-        if lc not in chain:
-            lc = min(chain.keys(), key=lambda k: abs(k - (sc + wing)))
-        if lp not in chain:
-            lp = min(chain.keys(), key=lambda k: abs(k - (sp - wing)))
-        if lc <= sc or lp >= sp:
-            return None
-        return [
-            {"strike": sc, "option_type": "call", "action": "SELL"},
-            {"strike": sp, "option_type": "put",  "action": "SELL"},
-            {"strike": lc, "option_type": "call", "action": "BUY"},
-            {"strike": lp, "option_type": "put",  "action": "BUY"},
-        ]
-
-    if strategy == "IRON_BUTTERFLY":
-        step = NIFTY_STRIKE_STEP
-        atm = round(spot / step) * step
-        if atm not in chain:
-            atm = min(chain.keys(), key=lambda k: abs(k - spot))
-        bw = max(wing, 50)
-        lc = atm + bw
-        lp = atm - bw
-        if lc not in chain:
-            lc = min(chain.keys(), key=lambda k: abs(k - (atm + bw)))
-        if lp not in chain:
-            lp = min(chain.keys(), key=lambda k: abs(k - (atm - bw)))
-        return [
-            {"strike": atm, "option_type": "call", "action": "SELL"},
-            {"strike": atm, "option_type": "put",  "action": "SELL"},
-            {"strike": lc,  "option_type": "call", "action": "BUY"},
-            {"strike": lp,  "option_type": "put",  "action": "BUY"},
-        ]
-
-    if strategy == "BULL_PUT_SPREAD":
-        sp = find_delta_strike(chain, "put", td)
-        if sp is None:
-            return None
-        lp = sp - wing
-        if lp not in chain:
-            lp = min(chain.keys(), key=lambda k: abs(k - (sp - wing)))
-        if lp >= sp:
-            return None
-        return [
-            {"strike": sp, "option_type": "put", "action": "SELL"},
-            {"strike": lp, "option_type": "put", "action": "BUY"},
-        ]
-
-    if strategy == "BEAR_CALL_SPREAD":
-        sc = find_delta_strike(chain, "call", td)
-        if sc is None:
-            return None
-        lc = sc + wing
-        if lc not in chain:
-            lc = min(chain.keys(), key=lambda k: abs(k - (sc + wing)))
-        if lc <= sc:
-            return None
-        return [
-            {"strike": sc, "option_type": "call", "action": "SELL"},
-            {"strike": lc, "option_type": "call", "action": "BUY"},
-        ]
-
-    if strategy == "BULL_CALL_SPREAD":
-        lc = find_delta_strike(chain, "call", 0.40)
-        sc = find_delta_strike(chain, "call", 0.20)
-        if lc is None or sc is None or lc >= sc:
-            return None
-        return [
-            {"strike": lc, "option_type": "call", "action": "BUY"},
-            {"strike": sc, "option_type": "call", "action": "SELL"},
-        ]
-
-    if strategy == "BEAR_PUT_SPREAD":
-        lp = find_delta_strike(chain, "put", 0.40)
-        sp = find_delta_strike(chain, "put", 0.20)
-        if lp is None or sp is None or lp <= sp:
-            return None
-        return [
-            {"strike": lp, "option_type": "put", "action": "BUY"},
-            {"strike": sp, "option_type": "put", "action": "SELL"},
-        ]
-
-    if strategy == "LONG_STRADDLE":
-        step = NIFTY_STRIKE_STEP
-        atm = round(spot / step) * step
-        if atm not in chain:
-            atm = min(chain.keys(), key=lambda k: abs(k - spot))
-        return [
-            {"strike": atm, "option_type": "call", "action": "BUY"},
-            {"strike": atm, "option_type": "put",  "action": "BUY"},
-        ]
-
-    return None
-
-
-def simulate_trade(
-    entry_cycle, subsequent, strategy, legs_spec,
-    gross_credit, net_credit, stop_mult, target_pct, lots,
-    calibration_state=None
-):
-    entry_costs = compute_costs(
-        [{"exec_price": l.get("exec_price", 0), "action": l["action"]} for l in legs_spec],
-        lots,
-    )
-    stop_prem   = gross_credit * stop_mult
-    target_prem = net_credit * (1.0 - target_pct)
-    price_stop  = 80
-    entry_spot  = entry_cycle.get("spot")
-    max_adverse = 0.0
-    exit_reason = "HARD_EXIT"
-    exit_prem   = net_credit
-
-    oi_buildup  = 0.08
-    oi_unwind   = -0.08
-    skew_bear   = 3.0
-    if calibration_state:
-        oi_buildup = calibration_state.get("oi_buildup_threshold", 0.08) or 0.08
-        oi_unwind  = calibration_state.get("oi_unwind_threshold", -0.08) or -0.08
-        skew_bear  = calibration_state.get("skew_bearish_threshold", 3.0) or 3.0
-
-    for cyc_data in subsequent:
-        chain = cyc_data.get("chain", {})
-        if not chain:
-            continue
-        meta = cyc_data.get("meta", {})
-
-        cur_prem = 0.0
-        for leg in legs_spec:
-            mp = mark_price(chain, leg["strike"], leg["option_type"])
-            if mp <= 0:
-                mp = leg.get("exec_price", 0) or 0
-            cur_prem += mp if leg["action"] == "SELL" else -mp
-
-        if cur_prem > max_adverse:
-            max_adverse = cur_prem
-
-        if cur_prem >= stop_prem:
-            exit_reason = "CLOSE_STOP"
-            exit_prem   = cur_prem
-            break
-
-        if cur_prem <= target_prem:
-            exit_reason = "CLOSE_TARGET"
-            exit_prem   = cur_prem
-            break
-
-        adx = meta.get("adx_15") or meta.get("adx") or 0
-        if strategy in ("IRON_CONDOR", "IRON_BUTTERFLY") and adx > 25:
-            exit_reason = "CLOSE_ADX"
-            exit_prem   = cur_prem
-            break
-
-        vwap_dist = meta.get("vwap_dist") or 0
-        if strategy == "BULL_PUT_SPREAD" and vwap_dist < -0.25:
-            exit_reason = "CLOSE_VWAP"
-            exit_prem   = cur_prem
-            break
-        if strategy == "BEAR_CALL_SPREAD" and vwap_dist > 0.25:
-            exit_reason = "CLOSE_VWAP"
-            exit_prem   = cur_prem
-            break
-
-        spot = meta.get("spot")
-        if entry_spot and spot and abs(spot - entry_spot) >= price_stop:
-            exit_reason = "CLOSE_PRICE_STOP"
-            exit_prem   = cur_prem
-            break
-
-        skew = meta.get("skew") or meta.get("skew_ratio") or 0
-        oi_change = meta.get("oi_change_pct") or 0
-        if strategy in ("IRON_CONDOR", "IRON_BUTTERFLY"):
-            if skew > skew_bear:
-                exit_reason = "CLOSE_SKEW_SPIKE"
-                exit_prem   = cur_prem
-                break
-            if oi_change < oi_unwind:
-                exit_reason = "CLOSE_OI_UNWIND"
-                exit_prem   = cur_prem
-                break
-
-        for leg in legs_spec:
-            if leg["action"] == "SELL":
-                leg_data = chain.get(leg["strike"], {}).get(leg["option_type"], {})
-                cur_delta = abs(leg_data.get("delta", 0) or 0)
-                if cur_delta > 0.42:
-                    exit_reason = "CLOSE_DELTA"
-                    exit_prem   = cur_prem
-                    break
-
-    _sell_legs = [l for l in legs_spec if l["action"] == "SELL"]
-    _n_sell    = max(len(_sell_legs), 1)
-    _exit_sell = exit_prem / _n_sell if _n_sell > 0 else exit_prem
-    exit_costs = compute_costs(
-        [{"exec_price": _exit_sell, "action": "BUY" if l["action"] == "SELL" else "SELL"}
-         for l in legs_spec],
-        lots,
-    )
-
-    gross_pnl_pts = gross_credit - exit_prem
-    gross_pnl_rs  = gross_pnl_pts * LOT_SIZE * lots
-    total_costs   = entry_costs + exit_costs
-    net_pnl_rs    = gross_pnl_rs - total_costs
-    result        = "WIN" if net_pnl_rs > 0 else ("LOSS" if net_pnl_rs < 0 else "BREAKEVEN")
-
-    return {
-        "exit_reason":       exit_reason,
-        "exit_premium":      round(exit_prem, 3),
-        "gross_pnl_pts":     round(gross_pnl_pts, 3),
-        "gross_pnl_rs":      round(gross_pnl_rs, 2),
-        "entry_costs_rs":    round(entry_costs, 2),
-        "exit_costs_rs":     round(exit_costs, 2),
-        "total_costs_rs":    round(total_costs, 2),
-        "net_pnl_rs":        round(net_pnl_rs, 2),
-        "result":            result,
-        "max_adverse_premium": round(max_adverse, 3),
-        "adverse_move_pts":  round(max_adverse - net_credit, 3),
+    day = {
+        "trading_date": trading_date,
+        "cycles": len(cycle_rows),
+        "regime_decisions": len(regime_decs),
+        "trades_entered": len(trade_entries),
+        "trades_closed": len(trade_exits),
+        "wins": 0, "losses": 0, "breakevens": 0,
+        "gross_pnl_rupees": 0.0,
+        "total_costs_rupees": 0.0,
+        "net_pnl_rupees": 0.0,
+        "net_pnl_pct": 0.0,
+        "avg_hold_minutes": 0.0,
+        "stops_fired": 0,
+        "target_exits": 0,
+        "time_exits": 0,
+        "iv_crush_trades": 0,
+        "strategies_used": {},
+        "regime_performance": {},
+        "vrp_condition_performance": {},
+        "vix_open": vix_vals[0] if vix_vals else None,
+        "vix_close": vix_vals[-1] if vix_vals else None,
+        "vrp_mean": round(statistics.mean(vrp_vals), 3) if vrp_vals else None,
+        "or_condition": or_cond,
+        "trade_details": [],
     }
 
+    hold_mins = []
+    entry_vrps = []
+    day_iv_crush_by_strategy = {}
 
-def cell_stats(trades):
-    if not trades:
-        return {}
-    pnls   = [t["net_pnl_rs"] for t in trades]
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p < 0]
-    n      = len(pnls)
-    win_rate  = len(wins) / n if n > 0 else 0
-    avg_pnl   = statistics.mean(pnls) if pnls else 0
-    avg_win   = statistics.mean(wins)   if wins   else 0
-    avg_loss  = statistics.mean(losses) if losses else 0
-    pf = sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else None
+    for t in trade_entries:
+        pid      = t.get("position_id")
+        ex       = exits_by_pos.get(pid)
+        strat    = str(t.get("strategy_name") or "UNKNOWN")
+        regime   = str(t.get("final_regime_at_entry") or "UNKNOWN")
+        vol_cond = str(t.get("volatility_condition") or "UNKNOWN")
+        entry_vrp = t.get("entry_vrp")
 
-    sharpe = None
-    if n >= MIN_SAMPLES_SIGNIFICANCE:
-        rf     = RISK_FREE_ANNUAL / TRADING_DAYS_YEAR
-        excess = [p / STARTING_CAPITAL - rf for p in pnls]
-        if len(excess) >= 2:
-            std = statistics.stdev(excess)
-            if std > 0:
-                raw = statistics.mean(excess) / std * math.sqrt(TRADING_DAYS_YEAR)
-                sharpe = round(max(-10.0, min(10.0, raw)), 3)
+        if strat not in day["strategies_used"]:
+            day["strategies_used"][strat] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        day["strategies_used"][strat]["count"] += 1
 
-    adverse        = [t["adverse_move_pts"] for t in trades]
-    adverse_sorted = sorted(adverse)
-    p75 = adverse_sorted[int(len(adverse_sorted) * 0.75)] if adverse_sorted else 0
-    p90 = adverse_sorted[int(len(adverse_sorted) * 0.90)] if adverse_sorted else 0
-    p95 = adverse_sorted[int(len(adverse_sorted) * 0.95)] if adverse_sorted else 0
+        if regime not in day["regime_performance"]:
+            day["regime_performance"][regime] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        day["regime_performance"][regime]["count"] += 1
 
-    credits      = [t.get("gross_credit", 0) for t in trades if t.get("gross_credit")]
-    avg_credit   = statistics.mean(credits) if credits else 0
-    costs        = [t["total_costs_rs"] for t in trades]
-    avg_costs_rs = statistics.mean(costs) if costs else 0
-    avg_costs_pts = avg_costs_rs / (LOT_SIZE * statistics.mean([t.get("lots", 1) for t in trades])) if trades else 0
+        if vol_cond not in day["vrp_condition_performance"]:
+            day["vrp_condition_performance"][vol_cond] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        day["vrp_condition_performance"][vol_cond]["count"] += 1
 
-    exit_dist = {}
-    for t in trades:
-        r = t.get("exit_reason", "UNKNOWN")
-        exit_dist[r] = exit_dist.get(r, 0) + 1
+        if entry_vrp:
+            entry_vrps.append(entry_vrp)
 
-    stop_mult_rec = None
-    if p90 > 0 and avg_credit > 0 and n >= 3:
-        stop_mult_rec = round((p90 + avg_credit) / avg_credit * 1.1, 2)
-        stop_mult_rec = max(1.5, min(stop_mult_rec, 4.0))
+        detail = {
+            "position_id": pid,
+            "strategy_name": strat,
+            "entry_time": t.get("entry_time"),
+            "entry_spot": t.get("entry_spot"),
+            "entry_vix": t.get("entry_vix"),
+            "entry_vrp": entry_vrp,
+            "entry_credit": t.get("entry_credit") or t.get("entry_debit"),
+            "final_lots": t.get("final_lots"),
+            "actual_dte": t.get("actual_dte"),
+            "final_regime": regime,
+            "confidence": t.get("confidence_at_entry"),
+            "volatility_condition": vol_cond,
+            "trend_condition": t.get("trend_condition"),
+            "direction": t.get("direction"),
+            "exit_time": None, "exit_reason": None, "hold_minutes": None,
+            "gross_pnl_rupees": None, "total_costs_rupees": None,
+            "net_pnl_rupees": None, "result": None,
+            "calibration_tier_at_trade": None,
+        }
 
-    _cost_floor   = round(avg_costs_pts * 4.0, 1) if avg_costs_pts > 0 else None
-    _profit_floor = round(avg_costs_pts * 8.0, 1) if avg_costs_pts > 0 else None
+        if ex:
+            net_pnl   = ex.get("net_pnl_rupees", 0) or 0
+            gross_pnl = ex.get("gross_pnl_rupees", 0) or 0
+            tot_costs = ex.get("total_costs_rupees", 0) or 0
+            result    = ex.get("result", "UNKNOWN")
+            hold_min  = ex.get("hold_minutes", 0) or 0
+            exit_rsn  = ex.get("exit_reason", "")
 
-    kelly = None
-    if avg_win > 0 and avg_loss < 0 and n >= MIN_SAMPLES_SIGNIFICANCE:
-        wlr   = avg_win / abs(avg_loss)
-        kelly = round(max(0, min(win_rate - (1 - win_rate) / wlr, 0.25)), 4)
+            day["gross_pnl_rupees"]   += gross_pnl
+            day["total_costs_rupees"] += tot_costs
+            day["net_pnl_rupees"]     += net_pnl
 
-    size_mult = None
-    if n >= MIN_SAMPLES_SIGNIFICANCE:
-        if sharpe is not None and sharpe >= 1.5:
-            size_mult = round(min(sharpe / 1.5, 2.0), 2)
-        elif sharpe is not None and sharpe >= 0.5:
-            size_mult = 1.0
-        elif sharpe is not None and sharpe >= 0:
-            size_mult = 0.75
-        elif sharpe is not None:
-            size_mult = 0.0
+            if result == "WIN":
+                day["wins"] += 1
+                day["strategies_used"][strat]["wins"] += 1
+                day["regime_performance"][regime]["wins"] += 1
+                day["vrp_condition_performance"][vol_cond]["wins"] += 1
+            elif result == "LOSS":
+                day["losses"] += 1
+                day["strategies_used"][strat]["losses"] += 1
+                day["regime_performance"][regime]["losses"] += 1
+                day["vrp_condition_performance"][vol_cond]["losses"] += 1
+            else:
+                day["breakevens"] += 1
 
-    has_edge = (
-        n >= MIN_SAMPLES_SIGNIFICANCE and
-        avg_pnl > 0 and
-        win_rate > 0.45 and
-        (pf is None or pf > 1.0)
-    )
+            day["strategies_used"][strat]["net_pnl"]             += net_pnl
+            day["regime_performance"][regime]["net_pnl"]          += net_pnl
+            day["vrp_condition_performance"][vol_cond]["net_pnl"] += net_pnl
 
-    if n < MIN_SAMPLES_SIGNIFICANCE:
-        quality = "INSUFFICIENT"
-        action  = "WATCH"
-    elif n < MIN_SAMPLES_RELIABLE:
-        quality = "INDICATIVE"
-        action  = "KEEP" if has_edge else "KILL"
-    else:
-        quality = "RELIABLE"
-        action  = "KEEP" if has_edge else "KILL"
+            if exit_rsn == "CLOSE_STOP":
+                day["stops_fired"] += 1
+            elif exit_rsn == "CLOSE_TARGET":
+                day["target_exits"] += 1
+            elif exit_rsn in ("CLOSE_TIME", "HARD_EXIT_15:00", "EOD_CLOSE"):
+                day["time_exits"] += 1
 
-    regime_dist = {}
-    for t in trades:
-        fr = t.get("final_regime") or "UNKNOWN"
-        regime_dist[fr] = regime_dist.get(fr, 0) + 1
+            hold_mins.append(hold_min)
 
-    cal_tier_dist = {}
-    for t in trades:
-        tier = t.get("calibration_tier")
-        if tier is not None:
-            key = f"tier_{tier}"
-            cal_tier_dist[key] = cal_tier_dist.get(key, 0) + 1
+            entry_iv = t.get("entry_atm_iv")
+            if entry_iv and entry_iv > 0:
+                exit_cycles = [c for c in cycle_rows if str(c.get("cycle_time", "")) >= str(ex.get("exit_time", ""))]
+                if exit_cycles:
+                    exit_iv_pct = exit_cycles[0].get("atm_iv_pct")
+                    if exit_iv_pct and (exit_iv_pct / 100.0) < entry_iv:
+                        day["iv_crush_trades"] += 1
+                        if strat not in day_iv_crush_by_strategy:
+                            day_iv_crush_by_strategy[strat] = {"crush_count": 0, "total": 0}
+                        day_iv_crush_by_strategy[strat]["crush_count"] += 1
 
-    return {
-        "n_trades":                      n,
-        "win_rate_pct":                  round(win_rate * 100, 1),
-        "avg_pnl_rs":                    round(avg_pnl, 2),
-        "avg_win_rs":                    round(avg_win, 2),
-        "avg_loss_rs":                   round(avg_loss, 2),
-        "profit_factor":                 round(pf, 3) if pf else None,
-        "sharpe":                        sharpe,
-        "total_pnl_rs":                  round(sum(pnls), 2),
-        "avg_credit_pts":                round(avg_credit, 2),
-        "avg_costs_rs":                  round(avg_costs_rs, 2),
-        "avg_costs_pts":                 round(avg_costs_pts, 3),
-        "p75_adverse_pts":               round(p75, 2),
-        "p90_adverse_pts":               round(p90, 2),
-        "p95_adverse_pts":               round(p95, 2),
-        "exit_reason_distribution":      exit_dist,
-        "regime_distribution":           regime_dist,
-        "calibration_tier_distribution": cal_tier_dist,
-        "has_edge":                      has_edge,
-        "data_quality":                  quality,
-        "recommended_stop_multiplier":   stop_mult_rec,
-        "recommended_min_credit_pts":    _profit_floor,
-        "cost_coverage_floor_pts":       _cost_floor,
-        "kelly_fraction":                kelly,
-        "recommended_size_multiplier":   size_mult,
-        "action":                        action,
-    }
+            if strat not in day_iv_crush_by_strategy:
+                day_iv_crush_by_strategy[strat] = {"crush_count": 0, "total": 0}
+            day_iv_crush_by_strategy[strat]["total"] += 1
 
-
-def overall_summary(all_trades, daily_pnls):
-    if not all_trades:
-        return {"total_trades": 0, "message": "No trades simulated"}
-    pnls   = [t["net_pnl_rs"] for t in all_trades]
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p < 0]
-    daily_returns = list(daily_pnls.values())
-    sharpe = None
-    if len(daily_returns) >= 5:
-        rf     = RISK_FREE_ANNUAL / TRADING_DAYS_YEAR
-        excess = [r / STARTING_CAPITAL - rf for r in daily_returns]
-        if statistics.stdev(excess) > 0:
-            sharpe = round(
-                statistics.mean(excess) / statistics.stdev(excess) * math.sqrt(TRADING_DAYS_YEAR),
-                3,
-            )
-    equity = []
-    capital = STARTING_CAPITAL
-    for d in sorted(daily_pnls.keys()):
-        capital += daily_pnls[d]
-        equity.append({"date": d, "capital": round(capital, 2), "daily_pnl": round(daily_pnls[d], 2)})
-    peak   = STARTING_CAPITAL
-    max_dd = 0.0
-    for e in equity:
-        if e["capital"] > peak:
-            peak = e["capital"]
-        dd = peak - e["capital"]
-        if dd > max_dd:
-            max_dd = dd
-
-    regime_dist = {}
-    for t in all_trades:
-        fr = t.get("final_regime") or "UNKNOWN"
-        regime_dist[fr] = regime_dist.get(fr, 0) + 1
-
-    tier_dist = {}
-    for t in all_trades:
-        tier = t.get("calibration_tier")
-        if tier is not None:
-            key = f"tier_{tier}"
-            tier_dist[key] = tier_dist.get(key, 0) + 1
-
-    return {
-        "total_trades":           len(all_trades),
-        "total_days":             len(daily_pnls),
-        "win_rate_pct":           round(len(wins) / len(pnls) * 100, 1) if pnls else 0,
-        "total_pnl_rs":           round(sum(pnls), 2),
-        "avg_pnl_per_trade_rs":   round(statistics.mean(pnls), 2) if pnls else 0,
-        "avg_win_rs":             round(statistics.mean(wins), 2)   if wins   else 0,
-        "avg_loss_rs":            round(statistics.mean(losses), 2) if losses else 0,
-        "profit_factor":          round(sum(wins) / abs(sum(losses)), 3) if losses and sum(losses) != 0 else None,
-        "overall_sharpe":         sharpe,
-        "max_drawdown_rs":        round(max_dd, 2),
-        "final_capital_rs":       round(capital, 2) if equity else STARTING_CAPITAL,
-        "total_return_pct":       round((capital - STARTING_CAPITAL) / STARTING_CAPITAL * 100, 3) if equity else 0,
-        "regime_distribution":    regime_dist,
-        "calibration_tier_distribution": tier_dist,
-        "equity_curve":           equity,
-    }
-
-
-def save_calibration_to_db(conn, cell_stats_map):
-    if not table_exists(conn, "backtest_calibration"):
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS backtest_calibration (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    generated_at TEXT NOT NULL,
-                    cell_key TEXT, n_trades INTEGER,
-                    win_rate_pct REAL, avg_pnl_rs REAL, sharpe REAL,
-                    recommended_stop_multiplier REAL,
-                    recommended_min_credit_pts REAL,
-                    cost_coverage_floor_pts REAL,
-                    recommended_size_multiplier REAL,
-                    kelly_fraction REAL,
-                    data_quality TEXT, action TEXT, has_edge INTEGER,
-                    created_at TEXT DEFAULT (datetime('now','localtime'))
-                )
-            """)
-            conn.commit()
-        except Exception as e:
-            print(f"Could not create backtest_calibration table: {e}")
-            return
-
-    generated_at = datetime.now().isoformat()
-    rows = []
-    for cell_key, st in cell_stats_map.items():
-        rows.append((
-            generated_at, cell_key,
-            st.get("n_trades"), st.get("win_rate_pct"), st.get("avg_pnl_rs"),
-            st.get("sharpe"), st.get("recommended_stop_multiplier"),
-            st.get("recommended_min_credit_pts"), st.get("cost_coverage_floor_pts"),
-            st.get("recommended_size_multiplier"), st.get("kelly_fraction"),
-            st.get("data_quality"), st.get("action"), int(st.get("has_edge", False)),
-        ))
-    try:
-        conn.executemany(
-            "INSERT INTO backtest_calibration "
-            "(generated_at, cell_key, n_trades, win_rate_pct, avg_pnl_rs, sharpe, "
-            "recommended_stop_multiplier, recommended_min_credit_pts, "
-            "cost_coverage_floor_pts, recommended_size_multiplier, kelly_fraction, "
-            "data_quality, action, has_edge) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            rows,
-        )
-        conn.commit()
-        print(f"Saved {len(rows)} calibration recommendations to backtest_calibration table.")
-    except Exception as e:
-        print(f"Could not save calibration to DB: {e}")
-
-
-def run_backtest(
-    start_date=None, end_date=None,
-    stop_mult=2.5, target_pct=0.50, lots=2, wing_width=None,
-    verbose=True, save_calibration=True,
-):
-    conn = get_conn()
-
-    if start_date is None:
-        row = conn.execute("SELECT MIN(trading_date) FROM cycle_log").fetchone()
-        start_date = row[0] if row and row[0] else "2026-01-01"
-    if end_date is None:
-        end_date = datetime.now().strftime("%Y-%m-%d")
-
-    if verbose:
-        print(f"Backtesting from {start_date} to {end_date}")
-        print(f"Parameters: stop={stop_mult}x, target={target_pct*100:.0f}%, lots={lots}")
-        print()
-
-    has_final_regime = (
-        table_exists(conn, "cycle_log") and
-        column_exists(conn, "cycle_log", "final_regime")
-    )
-    has_regime_decisions = table_exists(conn, "regime_decisions")
-    has_calibration = table_exists(conn, "calibration_state")
-
-    calibration_state = None
-    if has_calibration:
-        cal_row = conn.execute(
-            "SELECT * FROM calibration_state WHERE is_valid=1 ORDER BY calibrated_at DESC LIMIT 1"
-        ).fetchone()
-        if cal_row:
-            calibration_state = dict(cal_row)
-            if verbose:
-                print(
-                    f"Using calibration: tier={calibration_state.get('calibration_tier', 0)}, "
-                    f"days={calibration_state.get('n_trading_days')}"
-                )
-
-    trading_dates = q(
-        conn,
-        "SELECT DISTINCT trading_date FROM cycle_log "
-        "WHERE trading_date >= ? AND trading_date <= ? ORDER BY trading_date",
-        (start_date, end_date),
-    )
-    if verbose:
-        print(f"Found {len(trading_dates)} trading days")
-
-    all_trades      = []
-    cell_trades_map = {}
-    daily_pnls      = {}
-    total_sim       = 0
-
-    for day_row in trading_dates:
-        td = day_row["trading_date"]
-        cycles = q(conn, "SELECT * FROM cycle_log WHERE trading_date=? ORDER BY cycle_id", (td,))
-
-        expiry_row = conn.execute(
-            "SELECT DISTINCT expiry FROM option_chain_snapshot "
-            "WHERE trading_date=? ORDER BY expiry ASC LIMIT 1",
-            (td,),
-        ).fetchone()
-        if not expiry_row:
-            continue
-        expiry = expiry_row[0]
-
-        regime_decisions_today = {}
-        if has_regime_decisions:
-            rd_rows = q(conn, "SELECT * FROM regime_decisions WHERE date=? ORDER BY timestamp", (td,))
-            for rd in rd_rows:
-                ts = rd.get("timestamp", "")
-                regime_decisions_today[ts[:16]] = rd
-
-        all_cyc = []
-        for cyc in cycles:
-            chain = load_chain(conn, cyc.get("cycle_id"), cyc.get("cycle_time"), td, expiry)
-            all_cyc.append({
-                "cycle": cyc,
-                "chain": chain,
-                "meta": {
-                    "spot":         cyc.get("spot"),
-                    "vix":          cyc.get("vix"),
-                    "vrp":          cyc.get("vrp"),
-                    "adx_15":       cyc.get("adx_15") or cyc.get("adx"),
-                    "adx":          cyc.get("adx"),
-                    "vwap_dist":    cyc.get("vwap_dist_pct"),
-                    "trend":        cyc.get("trend_condition"),
-                    "direction":    cyc.get("direction"),
-                    "skew":         cyc.get("skew") or cyc.get("skew_ratio"),
-                    "oi_change_pct":cyc.get("oi_change_pct"),
-                },
+            entry_credit = t.get("entry_credit") or t.get("entry_debit") or 0
+            net_pnl_pts  = ex.get("net_pnl_pts", 0) or 0
+            _cal_rows = q(conn, "SELECT calibration_tier FROM calibration_state WHERE calibrated_at <= ? ORDER BY calibrated_at DESC LIMIT 1", (t.get("entry_time", "9999"),))
+            _cal_tier = _cal_rows[0]["calibration_tier"] if _cal_rows else 0
+            detail["calibration_tier_at_trade"] = _cal_tier
+            detail.update({
+                "exit_time": ex.get("exit_time"),
+                "exit_reason": exit_rsn,
+                "hold_minutes": hold_min,
+                "gross_pnl_rupees": gross_pnl,
+                "total_costs_rupees": tot_costs,
+                "net_pnl_rupees": net_pnl,
+                "net_pnl_pct_credit": round(net_pnl_pts / entry_credit * 100, 1) if entry_credit > 0 else None,
+                "result": result,
             })
 
-        day_pnl = 0.0
-        day_trades = 0
-        session_position_open = False
+        day["trade_details"].append(detail)
 
-        for i, cyc_data in enumerate(all_cyc):
-            cyc   = cyc_data["cycle"]
-            chain = cyc_data["chain"]
-            if not chain:
-                continue
+    if hold_mins:
+        day["avg_hold_minutes"] = round(statistics.mean(hold_mins), 1)
+    if entry_vrps:
+        day["avg_entry_vrp"] = round(statistics.mean(entry_vrps), 3)
 
-            ct_str = cyc.get("cycle_time", "")
-            try:
-                ct = datetime.fromisoformat(ct_str)
-                if ct.hour < 10 or ct.hour >= 14:
-                    continue
-            except Exception:
-                continue
+    total_t = day["wins"] + day["losses"] + day["breakevens"]
+    day["win_rate_pct"] = round(day["wins"] / total_t * 100, 1) if total_t else 0.0
+    day["net_pnl_pct"]  = round(day["net_pnl_rupees"] / STARTING_CAPITAL * 100, 3)
 
-            if session_position_open:
-                continue
+    gw = sum(e.get("net_pnl_rupees", 0) or 0 for e in trade_exits if (e.get("net_pnl_rupees") or 0) > 0)
+    gl = abs(sum(e.get("net_pnl_rupees", 0) or 0 for e in trade_exits if (e.get("net_pnl_rupees") or 0) < 0))
+    day["profit_factor"] = round(gw / gl, 3) if gl > 0 else None
 
-            final_regime     = cyc.get("final_regime") if has_final_regime else None
-            confidence       = cyc.get("confidence")
-            calibration_tier = cyc.get("calibration_tier") if column_exists(conn, "cycle_log", "calibration_tier") else None
+    if day["gross_pnl_rupees"] > 0:
+        day["cost_efficiency_pct"] = round(day["total_costs_rupees"] / day["gross_pnl_rupees"] * 100, 1)
+    else:
+        day["cost_efficiency_pct"] = None
 
-            if calibration_tier is None and has_regime_decisions:
-                ts_key = ct_str[:16]
-                rd = regime_decisions_today.get(ts_key)
-                if rd:
-                    if not final_regime:
-                        final_regime = rd.get("final_regime")
-                    if not confidence:
-                        confidence = rd.get("confidence")
-                    if calibration_tier is None:
-                        calibration_tier = rd.get("calibration_tier")
+    return day, day_iv_crush_by_strategy
 
-            if final_regime and final_regime not in ("NO_TRADE", "EMERGENCY_EXIT", None):
-                strategy, reason = resolve_strategy_from_final_regime(final_regime, cyc)
-            else:
-                strategy, reason = select_strategy_fallback(cyc)
 
-            if strategy == "NO_TRADE":
-                continue
+def run_walkforward_backtest(from_date=None, to_date=None):
+    conn = get_connection()
 
-            spot = cyc.get("spot")
-            if not spot:
-                continue
+    if not table_exists(conn, "trade_entries"):
+        print("No trade_entries table. Run engine first.")
+        conn.close()
+        return None
 
-            actual_dte = None
-            try:
-                exp_d = datetime.strptime(expiry, "%Y-%m-%d").date()
-                trd_d = datetime.strptime(td, "%Y-%m-%d").date()
-                actual_dte = (exp_d - trd_d).days
-            except Exception:
-                pass
+    all_dates = [r["trading_date"] for r in q(conn, "SELECT DISTINCT trading_date FROM trade_entries ORDER BY trading_date")]
+    if from_date:
+        all_dates = [d for d in all_dates if d >= from_date]
+    if to_date:
+        all_dates = [d for d in all_dates if d <= to_date]
 
-            eff_wing = wing_width
-            if eff_wing is None:
-                atm_straddle = cyc.get("atm_straddle_price")
-                if atm_straddle and atm_straddle > 20:
-                    raw = atm_straddle * 0.85
-                    eff_wing = int(round(raw / NIFTY_STRIKE_STEP) * NIFTY_STRIKE_STEP)
-                    eff_wing = max(100, min(eff_wing, 400))
-                else:
-                    eff_wing = 150
+    if not all_dates:
+        print("No trading dates found.")
+        conn.close()
+        return None
 
-            legs = build_legs(strategy, chain, spot, eff_wing, actual_dte)
-            if not legs:
-                continue
+    print(f"Walk-forward backtest: {len(all_dates)} trading days ({all_dates[0]} to {all_dates[-1]})")
+    print()
 
-            for leg in legs:
-                leg["exec_price"] = exec_price(chain, leg["strike"], leg["option_type"], leg["action"])
+    all_days = []
+    capital = STARTING_CAPITAL
+    peak_capital = STARTING_CAPITAL
+    max_drawdown = 0.0
+    cum_pnl = 0.0
+    consec_losses = 0
+    max_consec_losses = 0
+    iv_crush_by_strategy = {}
 
-            gross_credit = (
-                sum(l["exec_price"] for l in legs if l["action"] == "SELL") -
-                sum(l["exec_price"] for l in legs if l["action"] == "BUY")
-            )
-            if gross_credit <= 0:
-                continue
+    for d in all_dates:
+        day, day_iv_crush = replay_day(conn, d)
+        day["capital_start"] = capital
+        capital += day["net_pnl_rupees"]
+        day["capital_end"] = capital
+        cum_pnl += day["net_pnl_rupees"]
+        day["cumulative_pnl"] = round(cum_pnl, 2)
 
-            slip = sum(
-                min(
-                    (chain.get(l["strike"], {}).get(l["option_type"], {}).get("ask", 0) -
-                     chain.get(l["strike"], {}).get(l["option_type"], {}).get("bid", 0)) / 2.0,
-                    3.0,
-                )
-                for l in legs
-            )
-            net_credit = gross_credit - slip
-            if net_credit <= 0:
-                continue
+        if capital > peak_capital:
+            peak_capital = capital
+        dd = peak_capital - capital
+        if dd > max_drawdown:
+            max_drawdown = dd
 
-            subsequent = [s for s in all_cyc[i + 1:] if s["chain"]]
-            if not subsequent:
-                continue
+        if day["losses"] > 0 and day["wins"] == 0:
+            consec_losses += 1
+            max_consec_losses = max(max_consec_losses, consec_losses)
+        else:
+            consec_losses = 0
 
-            result = simulate_trade(
-                entry_cycle=cyc,
-                subsequent=subsequent,
-                strategy=strategy,
-                legs_spec=legs,
-                gross_credit=gross_credit,
-                net_credit=net_credit,
-                stop_mult=stop_mult,
-                target_pct=target_pct,
-                lots=lots,
-                calibration_state=calibration_state,
-            )
+        for strat, vals in day_iv_crush.items():
+            if strat not in iv_crush_by_strategy:
+                iv_crush_by_strategy[strat] = {"crush_count": 0, "total": 0}
+            iv_crush_by_strategy[strat]["crush_count"] += vals.get("crush_count", 0)
+            iv_crush_by_strategy[strat]["total"]       += vals.get("total", 0)
 
-            cell_key = (
-                f"{final_regime or cyc.get('volatility_condition')}|"
-                f"{cyc.get('trend_condition')}|"
-                f"{cyc.get('direction')}|"
-                f"{strategy}"
-            )
-
-            trade_rec = {
-                "trading_date":      td,
-                "cycle_time":        ct_str,
-                "strategy_name":     strategy,
-                "selection_reason":  reason,
-                "cell_key":          cell_key,
-                "final_regime":      final_regime,
-                "confidence":        confidence,
-                "calibration_tier":  calibration_tier,
-                "volatility_condition": cyc.get("volatility_condition"),
-                "trend_condition":   cyc.get("trend_condition"),
-                "direction":         cyc.get("direction"),
-                "vix_regime":        cyc.get("vix_regime"),
-                "actual_dte":        actual_dte,
-                "spot":              spot,
-                "vrp":               cyc.get("vrp"),
-                "adx":               cyc.get("adx_15") or cyc.get("adx"),
-                "gross_credit":      round(gross_credit, 3),
-                "net_credit":        round(net_credit, 3),
-                "wing_width":        eff_wing,
-                "lots":              lots,
-                **result,
-            }
-
-            all_trades.append(trade_rec)
-            cell_trades_map.setdefault(cell_key, []).append(trade_rec)
-            day_pnl    += result["net_pnl_rs"]
-            day_trades += 1
-            total_sim  += 1
-            session_position_open = True
-
-        if day_trades > 0:
-            daily_pnls[td] = day_pnl
-
-    cs      = {k: cell_stats(v) for k, v in cell_trades_map.items()}
-    summary = overall_summary(all_trades, daily_pnls)
-
-    if save_calibration and cs:
-        save_calibration_to_db(conn, cs)
+        all_days.append(day)
+        status = "WIN" if day["net_pnl_rupees"] > 0 else ("LOSS" if day["net_pnl_rupees"] < 0 else "FLAT")
+        _or_str  = str(day.get("or_condition") or "?")[:12]
+        _vix_str = str(day.get("vix_open") or "?")[:5]
+        _vrp_str = str(day.get("vrp_mean") or "?")[:6]
+        print(f"  {d} [{_or_str:<12}] VIX={_vix_str:<5} "
+              f"VRP={_vrp_str:<6} "
+              f"T={day['trades_entered']:2d} "
+              f"P&L=Rs{day['net_pnl_rupees']:8.0f} [{status}] "
+              f"Cap=Rs{capital:,.0f}")
 
     conn.close()
 
-    if verbose:
-        print(f"\nBacktest complete:")
-        print(f"  Total simulated trades: {total_sim}")
-        print(f"  Unique cells tested: {len(cs)}")
-        print(f"  Regime engine output used: {has_final_regime}")
-        print(f"  Calibration tier applied: {calibration_state.get('calibration_tier', 'N/A') if calibration_state else 'N/A'}")
+    total_days   = len(all_days)
+    prof_days    = sum(1 for d in all_days if d["net_pnl_rupees"] > 0)
+    loss_days    = sum(1 for d in all_days if d["net_pnl_rupees"] < 0)
+    total_trades = sum(d["trades_entered"] for d in all_days)
+    total_wins   = sum(d["wins"] for d in all_days)
+    total_losses = sum(d["losses"] for d in all_days)
+    total_gross  = sum(d["gross_pnl_rupees"] for d in all_days)
+    total_costs  = sum(d["total_costs_rupees"] for d in all_days)
+    total_net    = sum(d["net_pnl_rupees"] for d in all_days)
+    total_stops  = sum(d["stops_fired"] for d in all_days)
+    total_tgts   = sum(d["target_exits"] for d in all_days)
+    total_time   = sum(d["time_exits"] for d in all_days)
+    total_iv_crush = sum(d["iv_crush_trades"] for d in all_days)
 
-    return {"all_trades": all_trades, "cell_stats": cs, "daily_pnls": daily_pnls, "summary": summary}
+    gw_total = sum(d["net_pnl_rupees"] for d in all_days if d["net_pnl_rupees"] > 0)
+    gl_total = abs(sum(d["net_pnl_rupees"] for d in all_days if d["net_pnl_rupees"] < 0))
+    overall_pf = round(gw_total / gl_total, 3) if gl_total > 0 else None
+    trade_wr   = round(total_wins / (total_wins + total_losses) * 100, 1) if (total_wins + total_losses) > 0 else 0
 
+    regime_agg   = {}
+    strategy_agg = {}
+    vrp_agg      = {}
 
-def print_summary(s):
-    print("\n" + "=" * 60)
-    print("OVERALL BACKTEST SUMMARY")
-    print("=" * 60)
-    for k, v in s.items():
-        if k not in ("equity_curve", "regime_distribution", "calibration_tier_distribution"):
-            print(f"  {k:<35}: {v}")
-    if s.get("regime_distribution"):
-        print("\n  Regime distribution:")
-        for k, v in sorted(s["regime_distribution"].items(), key=lambda x: -x[1]):
-            print(f"    {k}: {v}")
-    if s.get("calibration_tier_distribution"):
-        print("\n  Calibration tier distribution:")
-        for k, v in sorted(s["calibration_tier_distribution"].items()):
-            print(f"    {k}: {v}")
-    n = s.get("total_trades", 0)
-    if n < MIN_SAMPLES_SIGNIFICANCE:
-        print(f"\n  WARNING: Only {n} trades — need {MIN_SAMPLES_SIGNIFICANCE}+ for significance")
-    elif n < MIN_SAMPLES_RELIABLE:
-        print(f"\n  NOTE: {n} trades — indicative, need {MIN_SAMPLES_RELIABLE}+ for reliable Sharpe")
-    else:
-        print(f"\n  Data quality: RELIABLE ({n} trades)")
+    for day in all_days:
+        for k, v in day.get("regime_performance", {}).items():
+            if k not in regime_agg:
+                regime_agg[k] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+            for f in ["count", "wins", "losses"]:
+                regime_agg[k][f] += v.get(f, 0)
+            regime_agg[k]["net_pnl"] += v.get("net_pnl", 0.0)
+        for k, v in day.get("strategies_used", {}).items():
+            if k not in strategy_agg:
+                strategy_agg[k] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+            for f in ["count", "wins", "losses"]:
+                strategy_agg[k][f] += v.get(f, 0)
+            strategy_agg[k]["net_pnl"] += v.get("net_pnl", 0.0)
+        for k, v in day.get("vrp_condition_performance", {}).items():
+            if k not in vrp_agg:
+                vrp_agg[k] = {"count": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+            for f in ["count", "wins", "losses"]:
+                vrp_agg[k][f] += v.get(f, 0)
+            vrp_agg[k]["net_pnl"] += v.get("net_pnl", 0.0)
 
+    def add_win_rate(d):
+        result_d = {}
+        for k, v in sorted(d.items(), key=lambda x: -x[1]["net_pnl"]):
+            enriched = dict(v)
+            enriched["win_rate_pct"] = round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0
+            enriched["avg_pnl"] = round(v["net_pnl"] / v["count"], 2) if v["count"] else 0
+            result_d[k] = enriched
+        return result_d
 
-def print_calibration(cs):
-    W = 175
-    print("\n" + "=" * W)
-    print("CALIBRATION TABLE — Per-Cell Analysis (v2.0)")
-    print(f"  Min samples for significance: {MIN_SAMPLES_SIGNIFICANCE} | For reliable Sharpe: {MIN_SAMPLES_RELIABLE}")
-    print(f"  Cell key format: final_regime|trend_condition|direction|strategy")
-    print(f"  Calibration recommendations saved to backtest_calibration DB table")
-    print("=" * W)
-    hdr = (
-        f"{'Cell Key':<60} {'N':>4} {'WR%':>5} {'AvgPnL':>8} {'Sharpe':>7} "
-        f"{'PF':>5} {'Stop':>6} {'MinCr':>7} {'CostFlr':>7} {'Size':>6} "
-        f"{'Quality':<12} {'Action':<6}"
-    )
-    print(hdr)
-    print("-" * W)
+    summary = {
+        "backtest_metadata": {
+            "generated_at": datetime.now().isoformat(),
+            "from_date": all_dates[0],
+            "to_date": all_dates[-1],
+            "total_trading_days": total_days,
+            "starting_capital": STARTING_CAPITAL,
+            "lot_size": LOT_SIZE,
+            "engine_version": "v2.0_patched",
+        },
+        "overall_performance": {
+            "profitable_days": prof_days,
+            "loss_days": loss_days,
+            "flat_days": total_days - prof_days - loss_days,
+            "day_win_rate_pct": round(prof_days / total_days * 100, 1) if total_days else 0,
+            "total_trades": total_trades,
+            "total_wins": total_wins,
+            "total_losses": total_losses,
+            "trade_win_rate_pct": trade_wr,
+            "total_gross_pnl_rupees": round(total_gross, 2),
+            "total_costs_rupees": round(total_costs, 2),
+            "total_net_pnl_rupees": round(total_net, 2),
+            "total_return_pct": round(total_net / STARTING_CAPITAL * 100, 3),
+            "profit_factor": overall_pf,
+            "max_drawdown_rupees": round(max_drawdown, 2),
+            "max_drawdown_pct": round(max_drawdown / STARTING_CAPITAL * 100, 3),
+            "max_consecutive_losses": max_consec_losses,
+            "capital_final": round(capital, 2),
+            "total_stops_fired": total_stops,
+            "total_target_exits": total_tgts,
+            "total_time_exits": total_time,
+            "iv_crush_trades": total_iv_crush,
+            "iv_crush_rate_pct": round(total_iv_crush / total_trades * 100, 1) if total_trades else 0,
+            "cost_as_pct_gross": round(total_costs / total_gross * 100, 1) if total_gross > 0 else None,
+            "avg_daily_pnl_rupees": round(total_net / total_days, 2) if total_days else 0,
+            "avg_trades_per_day": round(total_trades / total_days, 2) if total_days else 0,
+            "stop_rate_pct": round(total_stops / total_trades * 100, 1) if total_trades else 0,
+            "target_rate_pct": round(total_tgts / total_trades * 100, 1) if total_trades else 0,
+        },
+        "regime_performance": add_win_rate(regime_agg),
+        "strategy_performance": add_win_rate(strategy_agg),
+        "vrp_condition_performance": add_win_rate(vrp_agg),
+        "iv_crush_by_strategy": {
+            k: {
+                "crush_count": v.get("crush_count", 0),
+                "total": v.get("total", 0),
+                "crush_rate_pct": round(v.get("crush_count", 0) / v.get("total", 1) * 100, 1) if v.get("total", 0) > 0 else 0,
+            }
+            for k, v in iv_crush_by_strategy.items()
+        },
+        "daily_results": all_days,
+        "equity_curve": [
+            {"date": d["trading_date"], "capital": d["capital_end"], "pnl": d["net_pnl_rupees"], "cumulative_pnl": d["cumulative_pnl"]}
+            for d in all_days
+        ],
+        "llm_analysis_context": {
+            "summary": f"Walk-forward backtest of NIFTY intraday options engine v2.0 over {total_days} trading days.",
+            "key_findings": {
+                "best_regime": max(regime_agg, key=lambda k: regime_agg[k]["net_pnl"]) if regime_agg else None,
+                "worst_regime": min(regime_agg, key=lambda k: regime_agg[k]["net_pnl"]) if regime_agg else None,
+                "best_strategy": max(strategy_agg, key=lambda k: strategy_agg[k]["net_pnl"]) if strategy_agg else None,
+                "best_vrp_condition": max(vrp_agg, key=lambda k: vrp_agg[k].get("net_pnl", 0)) if vrp_agg else None,
+                "stop_rate_pct": round(total_stops / total_trades * 100, 1) if total_trades else 0,
+                "target_rate_pct": round(total_tgts / total_trades * 100, 1) if total_trades else 0,
+                "cost_drag_pct": round(total_costs / STARTING_CAPITAL * 100, 3),
+                "iv_crush_rate_pct": round(total_iv_crush / total_trades * 100, 1) if total_trades else 0,
+            },
+            "questions_for_llm": [
+                "Which regime produced the best risk-adjusted returns?",
+                "Is the profit factor sustainable given the sample size?",
+                "Are transaction costs proportionate to gross P&L?",
+                "Which VRP condition had the best win rate?",
+                "What is the optimal stop loss multiplier based on actual stop outcomes?",
+                "Are there patterns in losing days (VIX level, OR condition, day of week)?",
+                "Does IV crush consistently occur in winning trades?",
+                "What is the optimal entry window based on actual trade timing data?",
+                "Is the Tuesday 0DTE entry window (11:00-12:30) producing better results?",
+                "Are calibrated day sizes improving performance vs hardcoded sizes?",
+            ],
+        },
+    }
 
-    for ck, st in sorted(cs.items(), key=lambda x: x[1].get("sharpe") or -999, reverse=True):
-        n   = st.get("n_trades", 0)
-        wr  = st.get("win_rate_pct", 0)
-        ap  = st.get("avg_pnl_rs", 0)
-        sh  = st.get("sharpe")
-        pf  = st.get("profit_factor")
-        sm  = st.get("recommended_stop_multiplier")
-        mc  = st.get("recommended_min_credit_pts")
-        cf  = st.get("cost_coverage_floor_pts")
-        sz  = st.get("recommended_size_multiplier")
-        ql  = st.get("data_quality", "UNKNOWN")
-        ac  = st.get("action", "WATCH")
-
-        sh_s = f"{sh:.2f}" if sh is not None else "N/A"
-        pf_s = f"{pf:.2f}" if pf is not None else "N/A"
-        sm_s = f"{sm:.2f}" if sm is not None else "N/A"
-        mc_s = f"{mc:.1f}" if mc is not None else "N/A"
-        cf_s = f"{cf:.1f}" if cf is not None else "N/A"
-        sz_s = f"{sz:.2f}" if sz is not None else "N/A"
-
-        print(
-            f"{ck[:60]:<60} {n:>4} {wr:>5.1f} {ap:>8.0f} {sh_s:>7} "
-            f"{pf_s:>5} {sm_s:>6} {mc_s:>7} {cf_s:>7} {sz_s:>6} "
-            f"{ql:<12} {ac:<6}"
-        )
-
-    print("=" * W)
-    keep  = [k for k, v in cs.items() if v.get("action") == "KEEP"]
-    kill  = [k for k, v in cs.items() if v.get("action") == "KILL"]
-    watch = [k for k, v in cs.items() if v.get("action") == "WATCH"]
-    print(f"\nSummary: {len(keep)} KEEP  {len(kill)} KILL  {len(watch)} WATCH")
-
-    if kill:
-        print("\nCells to KILL (negative expectancy with sufficient data):")
-        for c in kill:
-            print(f"  {c}")
-    if keep:
-        print("\nTop cells to KEEP (positive expectancy):")
-        for c in sorted(keep, key=lambda x: cs[x].get("sharpe") or 0, reverse=True)[:5]:
-            st = cs[c]
-            print(f"  {c}")
-            print(
-                f"    Sharpe={st.get('sharpe')} WR={st.get('win_rate_pct')}% "
-                f"AvgPnL=Rs{st.get('avg_pnl_rs'):.0f} "
-                f"Stop={st.get('recommended_stop_multiplier')} "
-                f"MinCr={st.get('recommended_min_credit_pts')} "
-                f"Size={st.get('recommended_size_multiplier')}"
-            )
-            if st.get("regime_distribution"):
-                print(f"    Regimes: {st['regime_distribution']}")
-
-
-def save_results(results):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = OUTPUT_DIR / f"backtest_{all_dates[0]}_to_{all_dates[-1]}.json"
+    report_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
 
-    for name, data in [
-        (f"backtest_trades_{ts}.json",     results["all_trades"]),
-        (f"backtest_cell_stats_{ts}.json", results["cell_stats"]),
-    ]:
-        p = OUTPUT_DIR / name
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-        print(f"Saved: {p}")
+    print()
+    print("=" * 65)
+    print("WALK-FORWARD BACKTEST RESULTS")
+    print("=" * 65)
+    print(f"  Period    : {all_dates[0]} to {all_dates[-1]} ({total_days} days)")
+    print(f"  Trades    : {total_trades} | Win Rate: {trade_wr}% | Day Win: {round(prof_days/total_days*100,1) if total_days else 0}%")
+    print(f"  Net P&L   : Rs{total_net:,.2f} ({total_net/STARTING_CAPITAL*100:.3f}%)")
+    print(f"  Profit Factor: {overall_pf}")
+    print(f"  Max Drawdown : Rs{max_drawdown:,.2f} ({max_drawdown/STARTING_CAPITAL*100:.3f}%)")
+    print(f"  Total Costs  : Rs{total_costs:,.2f}")
+    print(f"  Stops/Targets/Time: {total_stops}/{total_tgts}/{total_time}")
+    print(f"  IV Crush Trades: {total_iv_crush}/{total_trades} ({round(total_iv_crush/total_trades*100,1) if total_trades else 0}%)")
+    print()
+    if regime_agg:
+        print("  Regime Performance:")
+        for regime, perf in sorted(regime_agg.items(), key=lambda x: -x[1]["net_pnl"]):
+            wr = round(perf["wins"] / perf["count"] * 100, 1) if perf["count"] else 0
+            regime_str = str(regime) if regime is not None else "UNKNOWN"
+            print(f"    {regime_str:<30} n={perf['count']:3d} wr={wr:5.1f}% pnl=Rs{perf['net_pnl']:8.0f}")
+    print()
+    if strategy_agg:
+        print("  Strategy Performance:")
+        for strat, perf in sorted(strategy_agg.items(), key=lambda x: -x[1]["net_pnl"]):
+            wr = round(perf["wins"] / perf["count"] * 100, 1) if perf["count"] else 0
+            strat_str = str(strat) if strat is not None else "UNKNOWN"
+            print(f"    {strat_str:<25} n={perf['count']:3d} wr={wr:5.1f}% pnl=Rs{perf['net_pnl']:8.0f}")
+    print()
+    if iv_crush_by_strategy:
+        print("  IV Crush by Strategy:")
+        for strat, vals in sorted(iv_crush_by_strategy.items()):
+            rate = round(vals.get("crush_count", 0) / vals.get("total", 1) * 100, 1) if vals.get("total", 0) > 0 else 0
+            print(f"    {strat:<25} crush={vals.get('crush_count',0)}/{vals.get('total',0)} ({rate}%)")
+    print()
+    print(f"  Full report: {report_path}")
 
-    summary_out = {k: v for k, v in results["summary"].items() if k != "equity_curve"}
-    p = OUTPUT_DIR / f"backtest_summary_{ts}.json"
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(summary_out, f, indent=2, default=str)
-    print(f"Saved: {p}")
-
-    if results["cell_stats"]:
-        p = OUTPUT_DIR / f"calibration_table_{ts}.csv"
-        fields = [
-            "cell_key", "n_trades", "win_rate_pct", "avg_pnl_rs", "total_pnl_rs",
-            "avg_win_rs", "avg_loss_rs", "profit_factor", "sharpe",
-            "avg_credit_pts", "avg_costs_rs", "avg_costs_pts",
-            "p75_adverse_pts", "p90_adverse_pts", "p95_adverse_pts",
-            "recommended_stop_multiplier", "recommended_min_credit_pts",
-            "cost_coverage_floor_pts", "kelly_fraction",
-            "recommended_size_multiplier", "data_quality", "action", "has_edge",
-        ]
-        with open(p, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            w.writeheader()
-            for ck, st in sorted(
-                results["cell_stats"].items(),
-                key=lambda x: x[1].get("sharpe") or -999,
-                reverse=True,
-            ):
-                row = {"cell_key": ck}
-                row.update(st)
-                row.pop("exit_reason_distribution", None)
-                row.pop("regime_distribution", None)
-                row.pop("calibration_tier_distribution", None)
-                w.writerow(row)
-        print(f"Saved: {p}")
+    return summary
 
 
 if __name__ == "__main__":
     import sys
     args = sys.argv[1:]
-    start_date = end_date = None
-    stop_mult  = 2.5
-    target_pct = 0.50
-    lots       = 2
-
+    from_d = to_d = None
     for i, a in enumerate(args):
-        if a == "--start"       and i + 1 < len(args): start_date = args[i + 1]
-        elif a == "--end"       and i + 1 < len(args): end_date   = args[i + 1]
-        elif a == "--stop-mult" and i + 1 < len(args): stop_mult  = float(args[i + 1])
-        elif a == "--target-pct"and i + 1 < len(args): target_pct = float(args[i + 1])
-        elif a == "--lots"      and i + 1 < len(args): lots       = int(args[i + 1])
-
-    print("NIFTY Options Intraday Algo v2.0 — Backtesting Module")
-    print("=" * 60)
-    print("Uses stored final_regime from cycle_log/regime_decisions when available.")
-    print("Falls back to signal-based selection when regime engine output is absent.")
-    print("Calibration recommendations saved to backtest_calibration DB table.")
-    print("=" * 60)
-
-    results = run_backtest(
-        start_date=start_date,
-        end_date=end_date,
-        stop_mult=stop_mult,
-        target_pct=target_pct,
-        lots=lots,
-        verbose=True,
-        save_calibration=True,
-    )
-
-    print_summary(results["summary"])
-    print_calibration(results["cell_stats"])
-    save_results(results)
-
-    print("\nUsage:")
-    print("  python backtest.py")
-    print("  python backtest.py --start 2026-09-01 --end 2026-09-30")
-    print("  python backtest.py --stop-mult 2.0 --target-pct 0.45 --lots 1")
+        if a == "--from" and i + 1 < len(args):
+            from_d = args[i + 1]
+        if a == "--to" and i + 1 < len(args):
+            to_d = args[i + 1]
+    run_walkforward_backtest(from_date=from_d, to_date=to_d)

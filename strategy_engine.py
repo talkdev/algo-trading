@@ -68,8 +68,8 @@ MIN_CREDIT_MULT_BY_REGIME = {
 }
 
 LOT_CAPS_BY_DAY = {
-    "MONDAY": 3, "TUESDAY": 2, "WEDNESDAY": 1,
-    "THURSDAY": 1, "FRIDAY": 1,
+    "MONDAY": 3, "TUESDAY": 2, "WEDNESDAY": 2,
+    "THURSDAY": 2, "FRIDAY": 1,
 }
 
 
@@ -190,7 +190,8 @@ class StrategyEngine:
             if trend in ("RANGE", "CHOPPY", "RANGE_BOUND", "MILD_RANGE",
                          "RANGE_ASSUMED", "UNCERTAIN"):
                 if dirn == "NEUTRAL":
-                    if adx_15 > 25:
+                    adx_15_mature = s.get("adx_15_mature", True)
+                    if adx_15_mature and adx_15 > 25:
                         return "NO_TRADE", f"condor_blocked_adx_{adx_15:.0f}"
                     if (vol in ("VERY_RICH", "RICH") and
                             s.get("or_condition") in ("VERY_NARROW", "NARROW") and
@@ -383,11 +384,6 @@ class StrategyEngine:
             if not self.market_engine.state.get("gap_fade_opportunity"):
                 return "NO_TRADE", "wide_or_dangerous_to_sell_premium"
 
-        if current_time < dtime(10, 30):
-            return "NO_TRADE", "first_75min_iv_settling_avoid_entry"
-        if current_time > dtime(13, 0):
-            return "NO_TRADE", "past_13:00_no_new_entries"
-
         try:
             hard_exit = datetime.strptime(
                 state.get("hard_exit_time", "15:25"), "%H:%M"
@@ -412,10 +408,11 @@ class StrategyEngine:
         else:
             size_mult = state.get("size_multiplier", 1.0)
 
-        if confidence == "MEDIUM":
-            size_mult *= 0.50
-        elif confidence == "LOW":
-            size_mult *= 0.25
+        if not (final_regime and final_regime not in ("NO_TRADE", "EMERGENCY_EXIT", None)):
+            if confidence == "MEDIUM":
+                size_mult *= 0.50
+            elif confidence == "LOW":
+                size_mult *= 0.25
 
         if not self._straddle_allowed(s) and strategy_name in ("IRON_BUTTERFLY", "POST_EVENT_STRADDLE"):
             dte = s.get("actual_dte")
@@ -460,6 +457,7 @@ class StrategyEngine:
             size_mult *= sell_size_reduction
 
         return strategy_name, reason, max(size_mult, 0.10)
+
 
     def _validate_strategy_entry_rules(
         self, strategy_name: str, s: dict

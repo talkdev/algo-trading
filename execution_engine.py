@@ -276,21 +276,14 @@ class ExecutionEngine:
         bid = opt.get("bid", 0) or 0
         ask = opt.get("ask", 0) or 0
         ltp = opt.get("ltp", 0) or 0
-        ts_str = opt.get("timestamp")
-        age = float("inf")
-        if ts_str:
-            from nifty_algo_core import parse_ist_timestamp
-            ts = parse_ist_timestamp(ts_str)
-            if ts:
-                age = (now_ist() - ts).total_seconds()
-        if bid > 0 and ask > 0 and age < 30:
+        if bid > 0 and ask > 0:
             return (bid + ask) / 2.0
-        if ltp > 0 and age < 60:
+        if ltp > 0:
             return ltp
-        if bid > 0 and ask > 0 and age < 120:
-            return (bid + ask) / 2.0
-        if ltp > 0 and age < 300:
-            return ltp
+        if bid > 0:
+            return bid
+        if ask > 0:
+            return ask
         return leg.get("entry_price", 0) or 0
 
     def _compute_current_premium(self, legs: list, chain: dict) -> float:
@@ -690,13 +683,15 @@ class ExecutionEngine:
         effective_stop = position.get("stop_premium")
 
         if effective_stop is not None and orig_stop:
+            best_factor = 1.0
             for tighten_time_str, factor in tightening:
                 try:
                     tighten_time = datetime.strptime(tighten_time_str, "%H:%M").time()
                 except Exception:
                     continue
                 if current_time >= tighten_time:
-                    effective_stop = orig_stop * factor
+                    best_factor = min(best_factor, factor)
+            effective_stop = orig_stop * best_factor
             if strategy_type == "SELL" and position.get("entry_time"):
                 try:
                     entry_dt = datetime.fromisoformat(position["entry_time"])
@@ -1183,8 +1178,6 @@ class ExecutionEngine:
                          "EOD_CLOSE", "SHUTDOWN_CLOSE", "STALE_PRIOR_DAY_CLOSE",
                          "SELF_TEST_CLEANUP"):
             state["consecutive_stops"] = 0
-            current_count = state.get("entry_count", 1)
-            state["entry_count"] = max(0, current_count - 1)
 
         if state.get("current_capital"):
             daily_loss_pct = max(0.0, -state["daily_pnl"]) / state["current_capital"]
