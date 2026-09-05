@@ -207,6 +207,9 @@ class MarketDataEngine:
         self.last_chain: dict = {}
         self.last_chain_expiry: Optional[date] = None
         self._pcr_baseline_set: bool = False
+        self._chain_fetch_time: Optional[datetime] = None
+        self._cached_calibration: Optional[dict] = None
+        self._calibration_cache_time: Optional[datetime] = None
 
     def _ensure_tables(self) -> None:
         extra_cols = [
@@ -594,14 +597,15 @@ class MarketDataEngine:
                 if log_hl_sq:
                     park_const = 1.0 / (4.0 * math.log(2.0))
                     variance = park_const * (sum(log_hl_sq) / len(log_hl_sq))
-                    rv = math.sqrt(variance * 75.0 * 252.0)
+                    rv = math.sqrt(variance * 375.0 * 252.0)
                     if 0.02 < rv < 0.80:
                         self.state["parkinson_rv_pct"] = rv
                         self.state["parkinson_rv_computed_date"] = today_str
                         return rv, "rolling_intraday"
 
         if (self.state.get("parkinson_rv_computed_date") == today_str and
-                self.state.get("parkinson_rv_pct") is not None):
+                self.state.get("parkinson_rv_pct") is not None and
+                today_str == today_ist().isoformat()):
             return self.state["parkinson_rv_pct"], "cached"
 
         if vix and vix > 0:
@@ -643,6 +647,19 @@ class MarketDataEngine:
 
         if atm_iv < 0.05 or atm_iv > 0.80:
             return None
+        try:
+            _vix_state = self.state.get("prev_vix")
+            if _vix_state and _vix_state > 0:
+                vix_decimal = _vix_state / 100.0
+                if atm_iv < vix_decimal * 0.60 or atm_iv > vix_decimal * 2.0:
+                    self.logger.warning(
+                        f"ATM IV {atm_iv*100:.2f}% vs VIX {_vix_state:.2f} — "
+                        f"ratio {atm_iv/vix_decimal:.2f} outside 0.60-2.00 range. "
+                        f"Chain data may be stale. Treating ATM IV as unavailable."
+                    )
+                    return None
+        except Exception:
+            pass
         return atm_iv
 
     def compute_pcr(
@@ -680,7 +697,7 @@ class MarketDataEngine:
     def compute_vwap(
         self, bars: pd.DataFrame
     ) -> Tuple[Optional[float], bool]:
-        if len(bars) < 3:
+        if len(bars) < 30:
             return None, False
         cum_pv, cum_vol = 0.0, 0.0
         for _, row in bars.iterrows():
@@ -725,6 +742,41 @@ class MarketDataEngine:
         if skew < 0.5 or skew > 3.0:
             return None
         return skew
+
+    def _check_chain_staleness(self, chain: dict, spot: Optional[float]) -> bool:
+        if not chain or spot is None:
+            return True
+        now = now_ist()
+        current_time = now.time()
+        market_open = dtime(9, 15) <= current_time <= dtime(15, 30)
+        if not market_open:
+            return True
+        if self._chain_fetch_time is not None:
+            fetch_age = (now - self._chain_fetch_time).total_seconds()
+            if fetch_age > 480:
+                self.logger.warning(
+                    f"Chain staleness: chain fetched {fetch_age:.0f}s ago. Treating as stale."
+                )
+                return True
+        step = self.config.nifty_strike_step
+        atm = round(spot / step) * step
+        if atm not in chain:
+            strikes = list(chain.keys())
+            if not strikes:
+                return True
+            atm = min(strikes, key=lambda k: abs(k - spot))
+        atm_legs = chain.get(atm, {})
+        for opt_type in ("call", "put"):
+            leg = atm_legs.get(opt_type, {})
+            bid = leg.get("bid", 0) or 0
+            ask = leg.get("ask", 0) or 0
+            ltp = leg.get("ltp", 0) or 0
+            if bid <= 0 and ask <= 0 and ltp <= 0:
+                self.logger.warning(
+                    f"Chain staleness: ATM {opt_type} has zero bid, ask and ltp."
+                )
+                return True
+        return False
 
     def compute_otm_skew(
         self, chain: dict, atm_strike: int
@@ -936,10 +988,11 @@ class MarketDataEngine:
                         preferred = [f for f in future if f[0] >= 1]
                         expiry, dte = (preferred[0][1], preferred[0][0]) if preferred else (future[0][1], future[0][0])
 
+                    trading_dte = ExpiryCalendar.get_dte(today_ist())
                     self.state["actual_expiry"] = expiry.isoformat()
-                    self.state["actual_dte"] = dte
+                    self.state["actual_dte"] = trading_dte
                     self.state["expiry_last_checked"] = now_ist().isoformat()
-                    self.logger.info(f"Active expiry: {expiry} (DTE={dte})")
+                    self.logger.info(f"Active expiry: {expiry} (DTE={trading_dte} trading days)")
             except Exception as e:
                 self.logger.error(f"Failed to discover active expiry: {e}")
 
@@ -948,7 +1001,7 @@ class MarketDataEngine:
             return None, None
         try:
             expiry_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-            dte = (expiry_date - today_ist()).days
+            dte = ExpiryCalendar.get_dte(today_ist())
             self.state["actual_dte"] = dte
             return expiry_date, dte
         except Exception:
@@ -970,20 +1023,32 @@ class MarketDataEngine:
             return {}
 
     def _compute_vix_regime(self, vix: float) -> str:
-        if vix < 10.0:
+        suppressed_thresh = getattr(self.config, "vix_low", 12.5)
+        normal_thresh     = getattr(self.config, "vix_normal", 16.0)
+        high_thresh       = getattr(self.config, "vix_high", 22.0)
+        extreme_thresh    = getattr(self.config, "vix_extreme_high", 28.0)
+        if vix < suppressed_thresh:
             return "SUPPRESSED"
-        if vix < 14.0:
+        if vix < normal_thresh:
             return "LOW"
-        if vix < 20.0:
+        if vix < high_thresh:
             return "NORMAL"
-        if vix < 26.0:
+        if vix < extreme_thresh:
             return "ELEVATED"
         return "HIGH"
 
     def _compute_regime_with_hysteresis(self, vix: float, prev_regime: str) -> str:
+        _sup  = getattr(self.config, "vix_low", 12.5)
+        _norm = getattr(self.config, "vix_normal", 16.0)
+        _high = getattr(self.config, "vix_high", 22.0)
+        _ext  = getattr(self.config, "vix_extreme_high", 28.0)
+        _buf  = 0.5
         bands = {
-            "SUPPRESSED": (None, 10.5), "LOW": (9.5, 14.5),
-            "NORMAL": (13.5, 20.5), "ELEVATED": (19.5, 26.5), "HIGH": (25.5, None),
+            "SUPPRESSED": (None, _sup + _buf),
+            "LOW":        (_sup - _buf, _norm + _buf),
+            "NORMAL":     (_norm - _buf, _high + _buf),
+            "ELEVATED":   (_high - _buf, _ext + _buf),
+            "HIGH":       (_ext - _buf, None),
         }
         if prev_regime in bands:
             lo, hi = bands[prev_regime]
@@ -1070,6 +1135,8 @@ class MarketDataEngine:
         return self.state.get("wing_width", 150)
 
     def _persist_cycle_log(self, s: dict) -> None:
+        if ExpiryCalendar.is_holiday(today_ist()):
+            return
         open_pos = self.db.query(
             "SELECT position_id FROM positions WHERE trading_date=? AND status='OPEN'",
             (s["trading_date"],),
@@ -1121,6 +1188,7 @@ class MarketDataEngine:
             "vrp_percentile": s.get("vrp_percentile"),
             "max_pain": s.get("max_pain"),
             "atm_straddle_price": atm_straddle,
+            "chain_stale": int(s.get("chain_stale", False)),
             "raw_json": json.dumps(
                 {k: v for k, v in s.items() if k not in ("atm_greeks", "conditions_met", "conditions_not_met")},
                 default=str
@@ -1131,6 +1199,8 @@ class MarketDataEngine:
         self, chain: dict, expiry: Optional[date], signals: Optional[dict] = None
     ) -> None:
         if not chain or not expiry:
+            return
+        if ExpiryCalendar.is_holiday(today_ist()):
             return
         capture_time = now_ist().isoformat()
         trading_date = today_ist().isoformat()
@@ -1202,6 +1272,62 @@ class MarketDataEngine:
             })
         except Exception as e:
             self.logger.debug(f"ATM options_chain insert error: {e}")
+
+    def _persist_vix_history(self, s: dict) -> None:
+        if ExpiryCalendar.is_holiday(today_ist()):
+            return
+        _ct = now_ist().time()
+        if not (dtime(9, 15) <= _ct <= dtime(15, 30)):
+            return
+        vix = s.get("vix")
+        if vix is None or vix <= 0:
+            return
+        try:
+            now = now_ist()
+            dte = s.get("actual_dte")
+            self.db.insert("vix_history", {
+                "timestamp": now.isoformat(),
+                "date": today_ist().isoformat(),
+                "time": now.strftime("%H:%M:%S"),
+                "weekday": today_ist().weekday(),
+                "vix_value": vix,
+                "dte": dte,
+            })
+        except Exception as e:
+            self.logger.debug(f"vix_history insert error: {e}")
+
+    def _persist_market_snapshot(self, s: dict) -> None:
+        if ExpiryCalendar.is_holiday(today_ist()):
+            return
+        _ct = now_ist().time()
+        if not (dtime(9, 15) <= _ct <= dtime(15, 30)):
+            return
+        try:
+            now = now_ist()
+            self.db.insert("market_snapshots", {
+                "timestamp": now.isoformat(),
+                "date": today_ist().isoformat(),
+                "time": now.strftime("%H:%M:%S"),
+                "spot": s.get("spot"),
+                "vix": s.get("vix"),
+                "atm_iv": s.get("atm_iv"),
+                "skew": s.get("skew"),
+                "oi_change_pct": s.get("oi_change_pct"),
+                "resistance_oi": s.get("resistance_oi", 0),
+                "support_oi": s.get("support_oi", 0),
+                "total_ce_oi": s.get("total_ce_oi", 0),
+                "total_pe_oi": s.get("total_pe_oi", 0),
+                "pcr": s.get("pcr"),
+                "adx_15": s.get("adx_15"),
+                "vwap_dist_pct": s.get("vwap_dist_pct"),
+                "vrp": s.get("vrp"),
+                "parkinson_rv": s.get("parkinson_rv"),
+                "volatility_condition": s.get("volatility_condition"),
+                "trend_condition": s.get("trend_condition"),
+                "direction": s.get("direction"),
+            })
+        except Exception as e:
+            self.logger.debug(f"market_snapshot insert error: {e}")
 
     def finalize_cycle_log(
         self, action_taken: str, no_trade_reason: Optional[str], open_positions: int
@@ -1318,6 +1444,7 @@ class MarketDataEngine:
         chain = self.fetch_option_chain(expiry) if expiry else {}
         self.last_chain = chain
         self.last_chain_expiry = expiry
+        self._chain_fetch_time = now_ist()
 
         atm_iv = self.compute_atm_iv(chain, spot)
         pcr = self.compute_pcr(chain, spot)
@@ -1361,7 +1488,12 @@ class MarketDataEngine:
                 atm_pe, atm_pe_iv, atm_pe_oi, pe_leg.get("volume", 0) or 0,
             )
 
-            otm_ce_iv, otm_pe_iv, skew = self.compute_otm_skew(chain, atm_strike)
+            chain_stale = self._check_chain_staleness(chain, spot)
+        if chain_stale:
+            if dtime(9, 15) <= now_ist().time() <= dtime(15, 30):
+                self.logger.warning("Chain is stale during market hours. Skipping IV/VRP computation.")
+            atm_iv = None
+        otm_ce_iv, otm_pe_iv, skew = self.compute_otm_skew(chain, atm_strike)
 
         oi_change = self.compute_oi_change(
             atm_strike, expiry.isoformat() if expiry else "",
@@ -1393,7 +1525,7 @@ class MarketDataEngine:
                         )
 
         if current_time >= dtime(10, 15) and not self.state.get("session_initialized"):
-            if atm_iv:
+            if atm_iv and not chain_stale:
                 self.state["opening_iv"] = atm_iv
                 self.state["session_initialized"] = True
                 self.logger.info(f"Session initialized: opening_iv={atm_iv*100:.2f}%")
@@ -1402,6 +1534,19 @@ class MarketDataEngine:
             self.state["opening_pcr"] = pcr
             self._pcr_baseline_set = True
             self.logger.info(f"PCR baseline: opening_pcr={pcr:.3f}")
+
+        _day_label = self.state.get("day_label")
+        _actual_dte = dte if dte is not None else self.state.get("actual_dte")
+        if _day_label == "TUESDAY" and _actual_dte == 0:
+            _tue_entry_start = "11:00"
+            _tue_entry_end = "12:30"
+            if self.state.get("entry_start") != _tue_entry_start:
+                self.state["entry_start"] = _tue_entry_start
+                self.state["entry_end"] = _tue_entry_end
+                self.logger.info(
+                    f"Tuesday 0DTE: entry window tightened to "
+                    f"{_tue_entry_start}-{_tue_entry_end} for gamma risk management"
+                )
 
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, bars)
         vrp = None
@@ -1432,12 +1577,16 @@ class MarketDataEngine:
         df60 = TechnicalEngine.resample_bars(bars, self.config.mtf_resample_60)
 
         adx_15 = 0.0
+        adx_15_mature = False
         if not df15.empty and len(df15) >= self.config.min_bars_for_adx:
             adx_15 = TechnicalEngine.calculate_adx(df15, self.config.adx_period)
+            adx_15_mature = len(df15) >= self.config.adx_period * 2
 
         adx_60 = 0.0
+        adx_60_mature = False
         if not df60.empty and len(df60) >= self.config.min_bars_for_adx:
             adx_60 = TechnicalEngine.calculate_adx(df60, self.config.adx_period)
+            adx_60_mature = len(df60) >= self.config.adx_period * 2
 
         ema_structure = TechnicalEngine.classify_ema_structure(
             df15, self.config.ema_fast, self.config.ema_slow
@@ -1508,6 +1657,13 @@ class MarketDataEngine:
             else:
                 pcr_signal = "STRONG_GREED"
 
+        if skew is not None and skew < -1.5:
+            self.logger.warning(
+                f"OTM skew={skew:.2f} is negative beyond -1.5 — "
+                f"NIFTY structural skew violation. Treating skew as UNKNOWN."
+            )
+            skew = None
+            skew_ratio = None
         if skew_ratio is None:
             skew_signal = "UNKNOWN"
             preferred_side = "BOTH"
@@ -1561,14 +1717,29 @@ class MarketDataEngine:
         buy_ok = False
         volatility_condition = "UNKNOWN"
 
+        _cal_vrp_sell = 3.0
+        _cal_vrp_fair = 1.5
+        try:
+            _now = now_ist()
+            if (self._cached_calibration is None or
+                    self._calibration_cache_time is None or
+                    (_now - self._calibration_cache_time).total_seconds() > 3600):
+                self._cached_calibration = self.db.get_latest_calibration()
+                self._calibration_cache_time = _now
+            if self._cached_calibration:
+                _cal_vrp_sell = float(self._cached_calibration.get("vrp_sell_threshold") or 3.0)
+                _cal_vrp_fair = float(self._cached_calibration.get("vrp_fair_threshold") or 1.5)
+        except Exception:
+            pass
+        _vrp_very_rich = _cal_vrp_sell * 1.25
         if vrp is not None and not vix_spike:
-            if vrp > 5.0:
+            if vrp > _vrp_very_rich:
                 volatility_condition = "VERY_RICH"
                 sell_ok = True
-            elif vrp > 3.0:
+            elif vrp > _cal_vrp_sell:
                 volatility_condition = "RICH"
                 sell_ok = True
-            elif vrp > 1.5:
+            elif vrp > _cal_vrp_fair:
                 volatility_condition = "FAIR"
                 sell_ok = True
             elif vrp > 0.0:
@@ -1619,6 +1790,8 @@ class MarketDataEngine:
             "or_low": self.state.get("or_low"),
             "adx": adx_15, "adx_condition": adx_condition,
             "adx_15": adx_15, "adx_60": adx_60,
+            "adx_15_mature": adx_15_mature, "adx_60_mature": adx_60_mature,
+            "adx_15_mature": adx_15_mature, "adx_60_mature": adx_60_mature,
             "ema_structure": ema_structure,
             "price_regime_15": price_regime_15,
             "price_regime_60": price_regime_60,
@@ -1642,6 +1815,7 @@ class MarketDataEngine:
             "entry_end": self.state.get("entry_end"),
             "hard_exit_time": self.state.get("hard_exit_time"),
             "chain_size": len(chain),
+            "chain_stale": chain_stale,
             "active_expiry": expiry.isoformat() if expiry else None,
             "actual_dte": dte,
             "max_pain": max_pain,
@@ -1671,6 +1845,8 @@ class MarketDataEngine:
         self._save_session_state()
         self._persist_cycle_log(signals)
         self._persist_option_chain_snapshot(chain, expiry, signals)
+        self._persist_market_snapshot(signals)
+        self._persist_vix_history(signals)
         self._print_cycle_dashboard(signals)
 
         return signals

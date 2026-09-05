@@ -37,6 +37,15 @@ class MainEngine:
             self.config, self.db, self.market_engine, self.client, self.logger
         )
 
+        try:
+            from regime_engine import RegimeEngine
+            self._regime_engine = RegimeEngine(
+                self.config, self.db, self.market_engine, self.logger
+            )
+        except Exception as _re:
+            self.logger.warning(f"RegimeEngine init failed: {_re}")
+            self._regime_engine = None
+
         self.loop_count = 0
         self.running = True
         self._last_status_print_time = 0.0
@@ -92,20 +101,28 @@ class MainEngine:
             return
         today_str = today_ist().isoformat()
         last_summary = self.db.query_one(
-            "SELECT capital_end FROM daily_summary "
+            "SELECT capital_end, net_pnl_rupees, trading_date FROM daily_summary "
             "WHERE trading_date < ? AND capital_end IS NOT NULL "
             "ORDER BY trading_date DESC LIMIT 1",
             (today_str,),
         )
         if last_summary and last_summary.get("capital_end") is not None:
             prior_capital = last_summary["capital_end"]
+            prior_pnl = last_summary.get("net_pnl_rupees", 0) or 0
+            prior_date = last_summary.get("trading_date", "unknown")
             current = state.get("current_capital", 0)
             if abs(prior_capital - current) > 0.01:
                 state["current_capital"] = prior_capital
                 self.market_engine._save_session_state()
                 self.logger.info(
-                    f"Capital carried forward: Rs{prior_capital:,.2f} "
-                    f"(was Rs{current:,.2f})"
+                    f"Capital carried forward from {prior_date}: "
+                    f"Rs{prior_capital:,.2f} (session had Rs{current:,.2f}). "
+                    f"Prior session P&L: Rs{prior_pnl:,.2f}"
+                )
+            else:
+                self.logger.info(
+                    f"Capital reconciled: Rs{prior_capital:,.2f} from {prior_date}. "
+                    f"Prior session P&L: Rs{prior_pnl:,.2f}"
                 )
 
     def _reconcile_open_positions_on_startup(self) -> None:
@@ -243,55 +260,12 @@ class MainEngine:
         if not force and not self._market_open():
             return
         try:
-            from regime_bridge import merge_regime_into_signals
-            cal = self._calibration_engine_run()
-            if cal:
-                self.strategy_engine.market_engine._save_session_state()
-        except ImportError:
-            pass
+            from regime_engine import RegimeEngine
+            if hasattr(self, "_regime_engine") and self._regime_engine is not None:
+                self._regime_engine.run_calibration(force=force)
+                self.market_engine._save_session_state()
         except Exception as e:
             self.logger.error(f"Calibration error: {e}", exc_info=True)
-
-    def _calibration_engine_run(self):
-        try:
-            import numpy as np
-            import pandas as pd
-            db = self.db
-            today_str = today_ist().isoformat()
-            n_days = db.query_one(
-                "SELECT COUNT(DISTINCT date) as cnt FROM daily_summary"
-            )
-            n_days_count = n_days["cnt"] if n_days else 0
-            vix_df = pd.read_sql_query(
-                "SELECT vix_value FROM vix_history WHERE date >= ? ORDER BY timestamp",
-                db._conn(),
-                params=((date.today() - timedelta(days=365)).isoformat(),),
-            )
-            if len(vix_df) >= 50:
-                v = vix_df["vix_value"].dropna().values
-                p25 = float(np.percentile(v, 25))
-                p50 = float(np.percentile(v, 50))
-                p75 = float(np.percentile(v, 75))
-                p90 = float(np.percentile(v, 90))
-                tier1 = len(vix_df) >= 50 and n_days_count >= 5
-                tier2 = n_days_count >= self.config.min_trading_days_for_calibration and len(vix_df) >= 50
-                tier3 = n_days_count >= 60 and len(vix_df) >= 100
-                cal_tier = 3 if tier3 else (2 if tier2 else (1 if tier1 else 0))
-                valid = tier2
-                if valid:
-                    self.logger.info(f"Calibration tier={cal_tier} VALID.")
-                else:
-                    self.logger.warning(
-                        f"Calibration tier={cal_tier}. "
-                        f"Need {self.config.min_trading_days_for_calibration} days "
-                        f"(have {n_days_count})."
-                    )
-                return {"tier": cal_tier, "valid": valid,
-                        "vix_p25": p25, "vix_p50": p50,
-                        "vix_p75": p75, "vix_p90": p90}
-        except Exception as e:
-            self.logger.debug(f"Calibration run error: {e}")
-        return None
 
     def _market_open(self) -> bool:
         if ExpiryCalendar.is_holiday(today_ist()):
@@ -328,7 +302,11 @@ class MainEngine:
 
         try:
             from regime_bridge import merge_regime_into_signals
-            signals = merge_regime_into_signals(signals, self.market_engine)
+            if hasattr(self, "_regime_engine") and self._regime_engine is not None:
+                regime_snap = self._regime_engine.process_signals(signals)
+                signals = merge_regime_into_signals(signals, regime_snap)
+            else:
+                signals = merge_regime_into_signals(signals, self.market_engine)
         except ImportError:
             pass
         except Exception as e:
@@ -666,6 +644,15 @@ class MainEngine:
             while self.running:
                 loop_start = now_ist()
                 current_time = loop_start.time()
+
+                if ExpiryCalendar.is_holiday(today_ist()):
+                    next_day = ExpiryCalendar.get_next_trading_day(today_ist())
+                    self.logger.info(
+                        f"Non-trading day ({today_ist().strftime("%A %Y-%m-%d")}). "
+                        f"Next trading day: {next_day}. Sleeping 300s."
+                    )
+                    self._sleep(300)
+                    continue
 
                 if current_time < dtime(9, 15):
                     self._sleep(30)
