@@ -111,20 +111,15 @@ class StrategyEngine:
         return row["cnt"] if row else 0
 
     def _get_target_pct(self, s: dict) -> float:
-        day_label = self.market_engine.state.get("day_label")
-        base = TARGET_PCT_BY_DAY.get(day_label, 0.50)
         dte = s.get("actual_dte")
         if dte is None:
-            return base
+            return 0.50
         if dte == 0:
-            return min(base, 0.35)
+            return 0.50
         if dte == 1:
-            return min(base, 0.40)
-        if dte == 2:
-            return min(base, 0.45)
-        if dte == 3:
-            return min(base, 0.48)
-        return base
+            return 0.50
+        return 0.50
+
 
     def _get_min_credit_mult(self, s: dict) -> float:
         return MIN_CREDIT_MULT_BY_REGIME.get(s.get("vix_regime", "NORMAL"), 1.0)
@@ -710,10 +705,11 @@ class StrategyEngine:
             if dte == 0:
                 _atm_straddle_ref = s.get("atm_straddle_price", 0) if s else 0
                 if _atm_straddle_ref and _atm_straddle_ref > 20:
-                    _short_dist = round(_atm_straddle_ref * 0.85 / step) * step
-                    _short_dist = max(_short_dist, step)
-                    _wing_dist = round(_atm_straddle_ref * 0.55 / step) * step
-                    _wing_dist = max(_wing_dist, step)
+                    _short_dist = round(_atm_straddle_ref * 0.50 / step) * step
+                    _short_dist = max(_short_dist, step * 2)
+                    _target_credit = _atm_straddle_ref * 0.20
+                    _min_wing_for_ratio = round(_target_credit / 0.25 / step) * step
+                    _wing_dist = max(round(_atm_straddle_ref * 0.60 / step) * step, _min_wing_for_ratio, step * 2)
                     sc = round((spot + _short_dist) / step) * step
                     sp = round((spot - _short_dist) / step) * step
                     lc = sc + _wing_dist
@@ -829,10 +825,8 @@ class StrategyEngine:
         return None, f"unknown_strategy_{strategy}"
 
     def _build_tightening_schedule(self) -> list:
-        day_label = self.market_engine.state.get("day_label")
-        if day_label == "TUESDAY":
-            return [("11:00", 0.80), ("12:00", 0.65), ("12:30", 0.50), ("13:00", 0.35)]
-        return [("13:00", 0.85), ("14:00", 0.70), ("14:30", 0.55)]
+        return []
+
 
     def compute_strategy_params(
         self, strategy_name: str, selection_reason: str,
@@ -907,10 +901,15 @@ class StrategyEngine:
                 "oi": opt.get("oi", 0),
             })
 
-        gross_value = sum(
-            l["exec_price"] if l["action"] == "SELL" else -l["exec_price"]
-            for l in validated_legs
-        )
+        gross_value = 0.0
+        for _gv_leg in validated_legs:
+            _gv_bid = _gv_leg.get("bid", 0) or 0
+            _gv_ask = _gv_leg.get("ask", 0) or 0
+            _gv_mid = (_gv_bid + _gv_ask) / 2.0 if (_gv_bid > 0 and _gv_ask > 0) else _gv_leg.get("exec_price", 0) or 0
+            if _gv_leg["action"] == "SELL":
+                gross_value += _gv_mid
+            else:
+                gross_value -= _gv_mid
         num_legs = len(validated_legs)
 
         gross_credit = gross_debit = None
@@ -928,8 +927,10 @@ class StrategyEngine:
             bid = leg["bid"]
             ask = leg["ask"]
             leg_delta = abs(leg.get("delta", 0.25) or 0.25)
-            slip_cap = 1.5 if leg_delta > 0.35 else (2.0 if leg_delta > 0.20 else 3.0)
-            total_slippage += min((ask - bid) / 2.0, slip_cap) if (bid > 0 and ask > 0) else slip_cap
+            if bid > 0 and ask > 0:
+                total_slippage += 0.30
+            else:
+                total_slippage += 0.50
 
         C02 = self.config.lot_size
         sell_pts = sum(l["exec_price"] for l in validated_legs if l["action"] == "SELL")
@@ -996,7 +997,7 @@ class StrategyEngine:
         if actual_dte == 0:
             risk_pct = min(risk_pct, 0.003)
         max_risk = current_capital * risk_pct
-        stop_mult = state.get("stop_multiplier", 2.0)
+        stop_mult = min(state.get("stop_multiplier", 1.5), 1.5)
 
         if strategy_type == "SELL":
             is_dir = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
@@ -1046,7 +1047,7 @@ class StrategyEngine:
             total_margin = margin_per_lot * final_lots
 
         if strategy_type == "SELL" and net_credit and net_credit > 0:
-            credit_stop_mult = 2.5 if actual_dte == 0 else 3.0
+            credit_stop_mult = 1.5 if actual_dte == 0 else 1.5
             credit_stop = net_credit * credit_stop_mult
             static_stop = PRICE_STOPS.get(strategy_name, 80)
             if actual_dte == 0:
@@ -1077,13 +1078,15 @@ class StrategyEngine:
         entry_dt = datetime.combine(today_ist(), now_t)
         exit_dt  = datetime.combine(today_ist(), hard_exit_t)
         hold_hrs = max(0.5, (exit_dt - entry_dt).total_seconds() / 3600.0)
-        theta_capture = net_theta * (hold_hrs / 24.0)
-        round_trip_cost = total_costs_pts * 2.0
-        if strategy_type == "SELL" and round_trip_cost > 0 and theta_capture < (2.0 * round_trip_cost):
-            return {
-                "valid": False,
-                "reason": f"theta_capture_{theta_capture:.3f}pts_below_2x_round_trip_{round_trip_cost:.3f}pts"
-            }
+        round_trip_cost_pts = total_costs_pts * 2.0
+        if strategy_type == "SELL" and net_credit and net_credit > 0:
+            expected_edge_pts = (net_credit * target_pct_final) - round_trip_cost_pts
+            min_viable_edge = round_trip_cost_pts * 1.5
+            if expected_edge_pts < min_viable_edge:
+                return {
+                    "valid": False,
+                    "reason": f"expected_edge_{expected_edge_pts:.2f}pts_below_min_{min_viable_edge:.2f}pts"
+                }
 
         return {
             "valid": True,

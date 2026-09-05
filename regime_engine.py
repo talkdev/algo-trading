@@ -189,6 +189,10 @@ class AutoCalibrator:
         except Exception as e:
             self.logger.debug(f"AutoCalibrator straddle ratio calibration error: {e}")
         try:
+            result.update(self._bootstrap_realized_move())
+        except Exception as e:
+            self.logger.debug(f"AutoCalibrator bootstrap realized_move error: {e}")
+        try:
             result.update(self._calibrate_dte_performance())
         except Exception as e:
             self.logger.debug(f"AutoCalibrator DTE performance calibration error: {e}")
@@ -223,23 +227,65 @@ class AutoCalibrator:
     def _calibrate_vrp_thresholds(self):
         try:
             rows = self.db.query(
-                "SELECT vrp, volatility_condition FROM market_snapshots "
-                "WHERE vrp IS NOT NULL AND vrp != 0 ORDER BY timestamp"
+                "SELECT ms.vrp, tx.net_pnl_rupees "
+                "FROM market_snapshots ms "
+                "JOIN trade_entries te ON ms.date = te.trading_date "
+                "JOIN trade_exits tx ON te.position_id = tx.position_id "
+                "WHERE ms.vrp IS NOT NULL AND ms.vrp > 0 "
+                "AND ms.date >= '2025-09-01' "
+                "ORDER BY ms.timestamp"
             )
             if len(rows) < 30:
-                return {"vrp_sell_threshold": self.NIFTY_VRP_SELL_DEFAULT, "vrp_fair_threshold": self.NIFTY_VRP_FAIR_DEFAULT}
-            vrps = [r["vrp"] for r in rows if r["vrp"] is not None]
-            positive_vrps = [v for v in vrps if v > 0]
-            if len(positive_vrps) < 10:
-                return {"vrp_sell_threshold": self.NIFTY_VRP_SELL_DEFAULT, "vrp_fair_threshold": self.NIFTY_VRP_FAIR_DEFAULT}
-            sell_thresh = float(np.percentile(positive_vrps, 40))
-            fair_thresh = float(np.percentile(positive_vrps, 20))
+                vrp_rows = self.db.query(
+                    "SELECT vrp FROM market_snapshots "
+                    "WHERE vrp IS NOT NULL AND vrp > 0 AND date >= '2025-09-01' "
+                    "ORDER BY timestamp"
+                )
+                if len(vrp_rows) < 30:
+                    return {"vrp_sell_threshold": self.NIFTY_VRP_SELL_DEFAULT, "vrp_fair_threshold": self.NIFTY_VRP_FAIR_DEFAULT}
+                vrps = [r["vrp"] for r in vrp_rows]
+                sell_thresh = float(max(self.NIFTY_VRP_SELL_DEFAULT, sum(vrps) / len(vrps)))
+                fair_thresh = float(max(self.NIFTY_VRP_FAIR_DEFAULT, sell_thresh * 0.50))
+                self.logger.info(f"AutoCalibrator VRP (distribution-based, n={len(vrps)}): sell={sell_thresh:.2f} fair={fair_thresh:.2f}")
+                return {"vrp_sell_threshold": sell_thresh, "vrp_fair_threshold": fair_thresh}
+            vrp_buckets = {}
+            for r in rows:
+                vrp = r["vrp"]
+                pnl = r.get("net_pnl_rupees", 0) or 0
+                bucket = round(vrp * 2) / 2.0
+                if bucket not in vrp_buckets:
+                    vrp_buckets[bucket] = []
+                vrp_buckets[bucket].append(pnl)
+            prior_sell = self.NIFTY_VRP_SELL_DEFAULT
+            prior_fair = self.NIFTY_VRP_FAIR_DEFAULT
+            sell_thresh = prior_sell
+            fair_thresh = prior_fair
+            for vrp_level in sorted(vrp_buckets.keys()):
+                pnls = vrp_buckets[vrp_level]
+                n = len(pnls)
+                shrinkage = n / (n + 30)
+                avg_pnl = sum(pnls) / n if n > 0 else 0
+                shrunk_pnl = shrinkage * avg_pnl + (1 - shrinkage) * 0
+                if shrunk_pnl > 0 and n >= 5:
+                    sell_thresh = min(sell_thresh, vrp_level)
+                    break
+            for vrp_level in sorted(vrp_buckets.keys()):
+                pnls = vrp_buckets[vrp_level]
+                n = len(pnls)
+                shrinkage = n / (n + 30)
+                avg_pnl = sum(pnls) / n if n > 0 else 0
+                shrunk_pnl = shrinkage * avg_pnl + (1 - shrinkage) * 0
+                if shrunk_pnl > -500 and n >= 5:
+                    fair_thresh = min(fair_thresh, vrp_level)
+                    break
             sell_thresh = max(sell_thresh, 2.0)
             fair_thresh = max(fair_thresh, 1.0)
-            self.logger.info(f"AutoCalibrator VRP: sell={sell_thresh:.2f} fair={fair_thresh:.2f} (n={len(positive_vrps)})")
+            self.logger.info(f"AutoCalibrator VRP (outcome-based, n={len(rows)}): sell={sell_thresh:.2f} fair={fair_thresh:.2f}")
             return {"vrp_sell_threshold": sell_thresh, "vrp_fair_threshold": fair_thresh}
-        except Exception:
+        except Exception as e:
+            self.logger.debug(f"AutoCalibrator VRP calibration error: {e}")
             return {"vrp_sell_threshold": self.NIFTY_VRP_SELL_DEFAULT, "vrp_fair_threshold": self.NIFTY_VRP_FAIR_DEFAULT}
+
 
     def _calibrate_skew_thresholds(self):
         try:
@@ -367,6 +413,85 @@ class AutoCalibrator:
             return result
         except Exception as e:
             self.logger.debug(f"AutoCalibrator DTE performance error: {e}")
+            return {}
+
+    def _bootstrap_realized_move(self):
+        try:
+            existing = self.db.query_one(
+                "SELECT COUNT(*) as cnt FROM daily_summary WHERE realized_move IS NOT NULL AND realized_move > 0"
+            )
+            if existing and existing.get("cnt", 0) >= 20:
+                self.logger.info("AutoCalibrator: realized_move already populated, skipping bootstrap")
+                return {}
+            self.logger.info("AutoCalibrator: bootstrapping realized_move from NIFTY historical OHLC...")
+            from datetime import date, timedelta
+            from nifty_algo_core import INSTRUMENT_KEY_NIFTY_SPOT
+            try:
+                from nifty_algo_core import load_config, RateLimiter, UpstoxClient
+                _cfg = load_config()
+                if not _cfg.upstox_access_token:
+                    self.logger.info("AutoCalibrator: no token for bootstrap, skipping")
+                    return {}
+                _rl = RateLimiter(_cfg.rate_limits)
+                _client = UpstoxClient(_cfg, _rl, self.db, self.logger)
+                to_date = (date.today() - timedelta(days=1)).isoformat()
+                from_date = (date.today() - timedelta(days=365)).isoformat()
+                candles = _client.get_historical_candles(
+                    INSTRUMENT_KEY_NIFTY_SPOT, "day", from_date, to_date
+                )
+                if not candles or len(candles) < 20:
+                    self.logger.info(f"AutoCalibrator: only {len(candles) if candles else 0} daily candles available")
+                    return {}
+                from datetime import datetime as _dt
+                updated = 0
+                for c in candles:
+                    try:
+                        if isinstance(c, (list, tuple)) and len(c) >= 5:
+                            ts_raw = str(c[0]).replace("Z", "").replace("+05:30", "").replace("+0530", "")
+                            ts = _dt.fromisoformat(ts_raw)
+                            day_date = ts.date().isoformat()
+                            o = float(c[1])
+                            h = float(c[2])
+                            l = float(c[3])
+                            cl = float(c[4])
+                            realized_move = abs(cl - o)
+                            day_range = h - l
+                            existing_row = self.db.query_one(
+                                "SELECT trading_date FROM daily_summary WHERE trading_date=?",
+                                (day_date,)
+                            )
+                            if existing_row:
+                                self.db.update(
+                                    "daily_summary",
+                                    {"realized_move": round(realized_move, 2), "day_range_points": round(day_range, 2)},
+                                    {"trading_date": day_date}
+                                )
+                            else:
+                                weekday = ts.weekday()
+                                day_labels = {0: "MONDAY", 1: "TUESDAY", 2: "WEDNESDAY", 3: "THURSDAY", 4: "FRIDAY"}
+                                self.db.insert("daily_summary", {
+                                    "trading_date": day_date,
+                                    "day_label": day_labels.get(weekday, "UNKNOWN"),
+                                    "realized_move": round(realized_move, 2),
+                                    "day_range_points": round(day_range, 2),
+                                    "trades_attempted": 0, "trades_executed": 0,
+                                    "trades_won": 0, "trades_lost": 0,
+                                    "win_rate_pct": 0, "gross_pnl_rupees": 0,
+                                    "total_costs_rupees": 0, "net_pnl_rupees": 0,
+                                    "net_pnl_pct_capital": 0,
+                                    "created_at": _dt.now().isoformat(),
+                                })
+                            updated += 1
+                    except Exception as _e:
+                        self.logger.debug(f"Bootstrap candle parse error: {_e}")
+                        continue
+                self.logger.info(f"AutoCalibrator: bootstrapped realized_move for {updated} sessions")
+                return {"realized_move_bootstrapped": updated}
+            except Exception as e:
+                self.logger.debug(f"AutoCalibrator bootstrap error: {e}")
+                return {}
+        except Exception as e:
+            self.logger.debug(f"AutoCalibrator bootstrap outer error: {e}")
             return {}
 
     def _calibrate_straddle_ratio(self):
@@ -995,10 +1120,22 @@ class RegimeClassifier:
 
         notes.append(f"votes={votes}")
 
+        _bull_count = votes.count("BULL")
+        _bear_count = votes.count("BEAR")
+        if _bull_count >= 1 and _bear_count >= 1:
+            return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: BULL_BEAR_conflict_contradictory_signals"
+
+        _sell_votes = votes.count("SELL")
+        _buy_votes = votes.count("BUY")
+        _range_votes = votes.count("RANGE")
+        _bull_votes = votes.count("BULL")
+        _bear_votes = votes.count("BEAR")
+        _directional = _sell_votes + _buy_votes + _range_votes + _bull_votes + _bear_votes
+
         conf = (
-            ConfidenceLevel.HIGH   if agreements == 3 else
-            ConfidenceLevel.MEDIUM if agreements == 2 else
-            ConfidenceLevel.LOW    if agreements == 1 else
+            ConfidenceLevel.HIGH   if _directional >= 3 else
+            ConfidenceLevel.MEDIUM if _directional == 2 else
+            ConfidenceLevel.LOW    if _directional == 1 else
             ConfidenceLevel.NONE
         )
         if conf == ConfidenceLevel.NONE:

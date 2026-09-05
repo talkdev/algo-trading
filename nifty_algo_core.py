@@ -105,8 +105,8 @@ BROKERAGE_PER_ORDER=20.0
 EXCHANGE_TXN_RATE=0.0003552
 SEBI_RATE=0.000001
 STAMP_DUTY_BUY_OPTIONS=0.00003
-TRADING_WINDOW_START=10:30
-TRADING_WINDOW_LAST_ENTRY=13:00
+TRADING_WINDOW_START=09:45
+TRADING_WINDOW_LAST_ENTRY=14:00
 HARD_EXIT_TIME=15:25
 MAX_CONCURRENT_POSITIONS=2
 MAX_ENTRIES_PER_DAY=3
@@ -547,8 +547,8 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003552),
         sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
         stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00003),
-        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(10, 30)),
-        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(13, 0)),
+        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 45)),
+        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),
         hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 25)),
         max_concurrent_positions=_get_int(env, "MAX_CONCURRENT_POSITIONS", 2),
         max_entries_per_day=_get_int(env, "MAX_ENTRIES_PER_DAY", 3),
@@ -703,6 +703,7 @@ CREATE TABLE IF NOT EXISTS position_legs (
     entry_bid REAL, entry_ask REAL, entry_delta REAL, entry_gamma REAL,
     entry_vega REAL, entry_theta REAL, entry_iv REAL, entry_oi INTEGER,
     exit_delta REAL, broker_order_id_entry TEXT, broker_order_id_exit TEXT,
+    quoted_mid_at_entry REAL, quoted_mid_at_exit REAL,
     leg_status TEXT DEFAULT 'OPEN',
     FOREIGN KEY (position_id) REFERENCES positions(position_id)
 );
@@ -1041,6 +1042,8 @@ MIGRATION_SQL = [
     "ALTER TABLE market_snapshots ADD COLUMN trend_condition TEXT",
     "ALTER TABLE market_snapshots ADD COLUMN direction TEXT",
     "ALTER TABLE cycle_log ADD COLUMN chain_stale INTEGER DEFAULT 0",
+    "ALTER TABLE position_legs ADD COLUMN quoted_mid_at_entry REAL",
+    "ALTER TABLE position_legs ADD COLUMN quoted_mid_at_exit REAL",
     "ALTER TABLE calibration_state ADD COLUMN vrp_sell_threshold REAL DEFAULT 3.0",
     "ALTER TABLE calibration_state ADD COLUMN vrp_fair_threshold REAL DEFAULT 1.5",
     "ALTER TABLE calibration_state ADD COLUMN day_size_monday REAL DEFAULT 0.75",
