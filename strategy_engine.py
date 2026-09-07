@@ -409,7 +409,7 @@ class StrategyEngine:
 
         try:
             hard_exit = datetime.strptime(
-                state.get("hard_exit_time", "15:25"), "%H:%M"
+                state.get("hard_exit_time", "15:15"), "%H:%M"
             ).time()
         except Exception:
             hard_exit = self.config.hard_exit_time
@@ -513,7 +513,7 @@ class StrategyEngine:
         elif strategy_name == "IRON_CONDOR":
             try:
                 hard_exit = datetime.strptime(
-                    state.get("hard_exit_time", "15:25"), "%H:%M"
+                    state.get("hard_exit_time", "15:15"), "%H:%M"
                 ).time()
             except Exception:
                 hard_exit = self.config.hard_exit_time

@@ -522,6 +522,7 @@ class MainEngine:
             "day_range_pct": round(day_range_pct, 3),
             "vix_close_val": vixs[-1] if vixs else None,
             "opening_straddle": self.market_engine.state.get("_straddle_open_for_summary", 0),
+            "opening_iv_pct": round((self.market_engine.state.get("opening_iv") or 0) * 100.0, 3),
             "realized_move": round(realized_move, 2),
             "straddle_ratio": round(straddle_ratio, 3),
             "dominant_regime": self._get_dominant_regime(cycle_rows),
@@ -713,10 +714,7 @@ class MainEngine:
                         self._sleep(30)
                         continue
 
-                _cal_interval = max(int(getattr(self.config, "calibration_interval_sec", 3600)), 3600)
-                if (now_mono - self._last_calibration_time) >= _cal_interval:
-                    self._last_calibration_time = now_mono
-                    self._run_calibration_cycle()
+                pass
 
                 status_interval = self.config.STATUS_PRINT_INTERVAL_MIN * 60 if hasattr(self.config, 'STATUS_PRINT_INTERVAL_MIN') else 300
                 if (now_mono - self._last_status_print_time) >= status_interval:
