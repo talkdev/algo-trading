@@ -1017,6 +1017,7 @@ MIGRATION_SQL = [
     "ALTER TABLE daily_summary ADD COLUMN realized_move REAL",
     "ALTER TABLE daily_summary ADD COLUMN straddle_ratio REAL",
     "ALTER TABLE daily_summary ADD COLUMN dominant_regime TEXT",
+    "ALTER TABLE daily_summary ADD COLUMN opening_iv_pct REAL",
     "ALTER TABLE positions ADD COLUMN stop_tightened_for_delta INTEGER DEFAULT 0",
     "ALTER TABLE session_state ADD COLUMN or_computed INTEGER DEFAULT 0",
     "ALTER TABLE session_state ADD COLUMN session_initialized INTEGER DEFAULT 0",

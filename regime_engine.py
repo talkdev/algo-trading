@@ -1044,11 +1044,14 @@ class RegimeClassifier:
     def _calculate_ivr(self, current_iv_pct: float) -> float:
         try:
             df = self.db.get_vix_history(days=365)
-            if df.empty or len(df) < 20:
+            if df.empty:
+                return 50.0
+            n_dates = df["date"].nunique() if "date" in df.columns else 0
+            if n_dates < 30:
                 return 50.0
             vals = df["vix_value"].dropna().values
             vals = vals[(vals > 8.0) & (vals < 90.0)]
-            if len(vals) < 20:
+            if len(vals) < 50:
                 return 50.0
             _adj_iv = current_iv_pct / 1.15
             lo = np.percentile(vals, 5)
@@ -1112,12 +1115,13 @@ class RegimeClassifier:
                         return straddle / avg if avg > 0 else 1.0
                 return 1.0
             avg = same.mean()
-            if dte == 0 and avg > 0:
+            if dte is not None and dte <= 1 and avg > 0:
                 from datetime import datetime as _dt
+                import math as _math
                 _now = now_ist()
                 _remaining_min = max(0, (_dt.combine(_now.date(), time(15, 30)) - _now).total_seconds() / 60.0)
                 _remaining_frac = _remaining_min / 375.0
-                avg = avg * _math.sqrt(max(_remaining_frac, 0.05))
+                avg = avg * _math.sqrt(max(_remaining_frac, 0.10))
             return straddle / avg if avg > 0 else 1.0
         except Exception:
             return 1.0
