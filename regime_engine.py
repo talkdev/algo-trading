@@ -931,10 +931,12 @@ class RegimeClassifier:
 
         ivr     = self._calculate_ivr(cur_iv_pct)
         iv_hv   = self._calculate_iv_hv_ratio(cur_iv_pct)
+        _dte_vol = signals.get("actual_dte")
         s_ratio = self._calculate_straddle_ratio(
             signals.get("atm_straddle_price", 0),
             signals.get("timestamp", datetime.now()).weekday()
-            if hasattr(signals.get("timestamp", None), "weekday") else 0
+            if hasattr(signals.get("timestamp", None), "weekday") else 0,
+            dte=_dte_vol,
         )
 
         details = {
@@ -1089,7 +1091,7 @@ class RegimeClassifier:
             if same_r is not None and len(same_r) >= 5:
                 avg_r = same_r.mean()
                 avg = avg_r * 0.70 if avg_r > 0 else 0
-                if dte == 0 and avg > 0:
+                if dte is not None and dte <= 1 and avg > 0:
                     from datetime import datetime as _dt
                     _now = now_ist()
                     _remaining_min = max(0, (_dt.combine(_now.date(), time(15, 30)) - _now).total_seconds() / 60.0)
@@ -1597,9 +1599,11 @@ class RegimeEngine:
         iv_hv   = self.classifier._calculate_iv_hv_ratio(cur_iv_pct)
         if iv_hv is None:
             iv_hv = 0.0
+        _dte_for_ratio = signals.get("actual_dte")
         s_ratio = self.classifier._calculate_straddle_ratio(
             signals.get("atm_straddle_price", 0) or 0,
-            ts.weekday() if hasattr(ts, "weekday") else 0
+            ts.weekday() if hasattr(ts, "weekday") else 0,
+            dte=_dte_for_ratio,
         )
 
         _sh   = max((signals.get("chain_size") or 71) // 2, 1)

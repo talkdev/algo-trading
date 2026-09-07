@@ -1043,7 +1043,10 @@ class StrategyEngine:
             final_lots = min(final_lots, max(1, int(margin_avail / margin_per_lot)))
             total_margin = margin_per_lot * final_lots
 
-        _opening_straddle_ref = s.get("atm_straddle_price") or 0
+        _opening_straddle_ref = (
+            self.market_engine.state.get("_straddle_open_for_regime") or
+            s.get("atm_straddle_price") or 0
+        )
         if strategy_type == "SELL" and net_credit and net_credit > 0:
             _is_ic_ib = strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY")
             if _is_ic_ib and _opening_straddle_ref > 20:
