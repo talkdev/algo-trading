@@ -710,35 +710,26 @@ class MarketDataEngine:
         atm = round(spot / step) * step
         if atm not in chain:
             atm = min(chain.keys(), key=lambda k: abs(k - spot))
-        iv_samples = []
-        for s_strike in [atm - step, atm, atm + step]:
-            leg = chain.get(s_strike, {})
-            if not leg:
-                continue
-            c_leg = leg.get("call", {})
-            p_leg = leg.get("put", {})
-            c_iv = c_leg.get("iv", 0.0) or 0.0
-            p_iv = p_leg.get("iv", 0.0) or 0.0
-            c_oi = c_leg.get("oi", 0) or 0
-            p_oi = p_leg.get("oi", 0) or 0
-            if c_iv <= 0 and p_iv <= 0:
-                continue
-            t_oi = c_oi + p_oi
-            if t_oi > 0:
-                s_iv = (c_iv * c_oi + p_iv * p_oi) / t_oi
-            elif c_iv > 0 and p_iv > 0:
-                s_iv = (c_iv + p_iv) / 2.0
-            elif c_iv > 0:
-                s_iv = c_iv
-            else:
-                s_iv = p_iv
-            if 0.05 <= s_iv <= 0.80:
-                w = 2.0 if s_strike == atm else 1.0
-                iv_samples.append((s_iv, w))
-        if not iv_samples:
+        leg = chain.get(atm, {})
+        call, put = leg.get("call", {}), leg.get("put", {})
+        call_iv = call.get("iv", 0.0) or 0.0
+        put_iv = put.get("iv", 0.0) or 0.0
+        call_oi = call.get("oi", 0) or 0
+        put_oi = put.get("oi", 0) or 0
+
+        if call_iv <= 0 and put_iv <= 0:
             return None
-        total_w = sum(w for _, w in iv_samples)
-        atm_iv = sum(iv * w for iv, w in iv_samples) / total_w
+
+        total_oi = call_oi + put_oi
+        if total_oi > 0:
+            atm_iv = (call_iv * call_oi + put_iv * put_oi) / total_oi
+        elif call_iv > 0 and put_iv > 0:
+            atm_iv = (call_iv + put_iv) / 2.0
+        elif call_iv > 0:
+            atm_iv = call_iv
+        else:
+            atm_iv = put_iv
+
         if atm_iv < 0.05 or atm_iv > 0.80:
             return None
         try:
@@ -762,7 +753,7 @@ class MarketDataEngine:
         if not chain:
             return None
         if spot is not None and spot > 0:
-            band = spot * 0.05
+            band = spot * 0.03
             total_put = sum(
                 legs.get("put", {}).get("oi", 0) or 0
                 for strike, legs in chain.items()
@@ -898,7 +889,6 @@ class MarketDataEngine:
 
         skew = round(otm_pe_iv - otm_ce_iv, 2)
         if skew < -1.5:
-            self.logger.debug(f"OTM skew={skew:.2f} negative calls>puts treating as neutral")
             return otm_ce_iv, otm_pe_iv, 0.0
         return otm_ce_iv, otm_pe_iv, skew
 
@@ -982,40 +972,18 @@ class MarketDataEngine:
         if current_total <= 0:
             return 0.0
         lookback = self.config.oi_change_lookback_min
-        today_str = today_ist().isoformat()
-        cutoff_ts = (now_ist() - timedelta(minutes=lookback + 5)).isoformat()
+        cutoff = (now_ist() - timedelta(minutes=lookback + 5)).isoformat()
         limit_ts = (now_ist() - timedelta(minutes=lookback)).isoformat()
         row = self.db.query_one(
-            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
-            "WHERE trading_date=? AND strike=? AND expiry=? "
-            "AND capture_time >= ? AND capture_time <= ? "
-            "LIMIT 1",
-            (today_str, atm_strike, expiry_str, cutoff_ts, limit_ts),
-        )
-        if row and row.get("total_oi"):
-            prior = row["total_oi"]
-            if prior > 0:
-                return (current_total - prior) / prior
-        row2 = self.db.query_one(
             "SELECT ce_oi, pe_oi FROM options_chain "
             "WHERE strike=? AND expiry_date=? AND timestamp>=? AND timestamp<=? "
             "ORDER BY timestamp ASC LIMIT 1",
-            (atm_strike, expiry_str, cutoff_ts, limit_ts),
+            (atm_strike, expiry_str, cutoff, limit_ts),
         )
-        if row2:
-            prior2 = (row2.get("ce_oi") or 0) + (row2.get("pe_oi") or 0)
-            if prior2 > 0:
-                return (current_total - prior2) / prior2
-        row3 = self.db.query_one(
-            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
-            "WHERE trading_date=? AND strike=? AND expiry=? "
-            "ORDER BY capture_time ASC LIMIT 1",
-            (today_str, atm_strike, expiry_str),
-        )
-        if row3 and row3.get("total_oi"):
-            prior3 = row3["total_oi"]
-            if prior3 > 0 and prior3 != current_total:
-                return (current_total - prior3) / prior3
+        if row:
+            prior = (row.get("ce_oi") or 0) + (row.get("pe_oi") or 0)
+            if prior > 0:
+                return (current_total - prior) / prior
         return 0.0
 
     def _normalize_option_leg(self, raw: dict) -> dict:
@@ -1827,8 +1795,15 @@ class MarketDataEngine:
                 pcr_signal = "STRONG_GREED"
 
         if skew is not None and skew < -1.5:
-            self.logger.debug(f"OTM skew={skew:.2f} negative treating as neutral 0.0")
-            skew = 0.0
+            _now_t = now_ist().time()
+            from datetime import time as _dtime
+            if _now_t >= _dtime(10, 0):
+                self.logger.warning(
+                    f"OTM skew={skew:.2f} is negative beyond -1.5 — "
+                    f"NIFTY structural skew violation. Treating skew as UNKNOWN."
+                )
+            skew = None
+            skew_ratio = None
         if skew_ratio is None:
             skew_signal = "UNKNOWN"
             preferred_side = "BOTH"

@@ -212,7 +212,7 @@ def compute_candle_statistics(candles):
     closes  = [c["close"] for c in candles if c.get("close")]
     highs   = [c["high"]  for c in candles if c.get("high")]
     lows    = [c["low"]   for c in candles if c.get("low")]
-    volumes = [c["volume"] for c in candles if c.get("volume") is not None]
+    volumes = [c["volume"] for c in candles if c.get("volume")]
     if not closes:
         return {}
     ranges = [c["high"] - c["low"] for c in candles if c.get("high") and c.get("low")]
@@ -227,8 +227,7 @@ def compute_candle_statistics(candles):
         "total_volume":      sum(volumes) if volumes else 0,
         "avg_bar_range_pts": round(statistics.mean(ranges), 3) if ranges else None,
         "max_bar_range_pts": round(max(ranges), 3) if ranges else None,
-        "zero_volume_bars":  sum(1 for v in volumes if (v or 0) == 0),
-        "volume_note":       "NSE index volume always 0 via Upstox API confirmed",
+        "zero_volume_bars":  sum(1 for v in volumes if v == 0),
     }
     if len(closes) >= 2:
         result["net_change_pts"] = round(closes[-1] - closes[0], 2)

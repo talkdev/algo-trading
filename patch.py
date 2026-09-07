@@ -1,4 +1,4 @@
-# patch4.py — only 2 real fixes needed now
+# patch6.py
 from __future__ import annotations
 import ast
 import shutil
@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime
 
 BASE = Path(__file__).resolve().parent
-BACKUP_DIR = BASE / f"_patch4_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+BACKUP_DIR = BASE / f"_patch6_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 _errors = []
 _applied = []
 _skipped = []
@@ -45,84 +45,82 @@ def rb(src, old, new, label):
     print(f"  [OK] {label}")
     return result
 
-def show_lines(fp, pattern, ctx=4):
-    lines = Path(fp).read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
-        if pattern in line:
-            s = max(0, i - ctx)
-            e = min(len(lines), i + ctx + 1)
-            print(f"  Found at line {i+1}:")
-            for j in range(s, e):
-                m = ">>>" if j == i else "   "
-                print(f"  {m} L{j+1}: {repr(lines[j])}")
-
 print("=" * 68)
-print("NIFTY OPTIONS ALGO ENGINE PATCH 4")
-print("Only real issues confirmed in patched code")
-print(f"Base dir: {BASE}")
+print("PATCH 6 - NIFTY OPTIONS SIGNAL QUALITY FIXES")
+print(f"Base: {BASE}")
 print("=" * 68)
 
-re_path = BASE / "regime_engine.py"
+mde_path = BASE / "market_data_engine.py"
+eod_path = BASE / "eod_report.py"
 
-print("\n[DIAGNOSE] Finding exact patterns...")
-print("\n--- pd.read_sql_query in CalibrationEngine.run ---")
-show_lines(re_path, "pd.read_sql_query", 5)
-print("\n--- snap_df = pd.read_sql_query ---")
-show_lines(re_path, "snap_df = pd.read_sql_query", 5)
-print("\n--- _pd2 usage ---")
-show_lines(re_path, "_pd2", 3)
-print("\n--- vix bootstrap from daily_summary ---")
-show_lines(re_path, "bootstrap from daily_summary", 3)
-show_lines(re_path, "_vix_bootstrapped", 3)
-print("\n--- VIX p25 floor in CalibrationEngine.run ---")
-show_lines(re_path, "p25 = max", 3)
-show_lines(re_path, "p25 = float", 3)
+print("\n[1/2] market_data_engine.py")
+src = read(mde_path)
+
+src = rb(src,
+'        if spot is not None and spot > 0:\n            band = spot * 0.03\n            total_put = sum(\n                legs.get("put", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if (spot - band) <= strike < spot\n            )\n            total_call = sum(\n                legs.get("call", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if spot < strike <= (spot + band)\n            )',
+'        if spot is not None and spot > 0:\n            band = spot * 0.05\n            total_put = sum(\n                legs.get("put", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if (spot - band) <= strike < spot\n            )\n            total_call = sum(\n                legs.get("call", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if spot < strike <= (spot + band)\n            )',
+"FIX-1: PCR band 3pct to 5pct for NIFTY meaningful OI range")
+
+src = rb(src,
+'    def compute_atm_iv(\n        self, chain: dict, spot: Optional[float]\n    ) -> Optional[float]:\n        if not chain or spot is None:\n            return None\n        step = self.config.nifty_strike_step\n        atm = round(spot / step) * step\n        if atm not in chain:\n            atm = min(chain.keys(), key=lambda k: abs(k - spot))\n        leg = chain.get(atm, {})\n        call, put = leg.get("call", {}), leg.get("put", {})\n        call_iv = call.get("iv", 0.0) or 0.0\n        put_iv = put.get("iv", 0.0) or 0.0\n        call_oi = call.get("oi", 0) or 0\n        put_oi = put.get("oi", 0) or 0\n\n        if call_iv <= 0 and put_iv <= 0:\n            return None\n\n        total_oi = call_oi + put_oi\n        if total_oi > 0:\n            atm_iv = (call_iv * call_oi + put_iv * put_oi) / total_oi\n        elif call_iv > 0 and put_iv > 0:\n            atm_iv = (call_iv + put_iv) / 2.0\n        elif call_iv > 0:\n            atm_iv = call_iv\n        else:\n            atm_iv = put_iv\n\n        if atm_iv < 0.05 or atm_iv > 0.80:\n            return None\n        try:\n            _vix_state = self.state.get("prev_vix")\n            if _vix_state and _vix_state > 0:\n                vix_decimal = _vix_state / 100.0\n                if atm_iv < vix_decimal * 0.60 or atm_iv > vix_decimal * 2.0:\n                    self.logger.warning(\n                        f"ATM IV {atm_iv*100:.2f}% vs VIX {_vix_state:.2f} — "\n                        f"ratio {atm_iv/vix_decimal:.2f} outside 0.60-2.00 range. "\n                        f"Chain data may be stale. Treating ATM IV as unavailable."\n                    )\n                    return None\n        except Exception:\n            pass\n        return atm_iv',
+'    def compute_atm_iv(\n        self, chain: dict, spot: Optional[float]\n    ) -> Optional[float]:\n        if not chain or spot is None:\n            return None\n        step = self.config.nifty_strike_step\n        atm = round(spot / step) * step\n        if atm not in chain:\n            atm = min(chain.keys(), key=lambda k: abs(k - spot))\n        iv_samples = []\n        for s_strike in [atm - step, atm, atm + step]:\n            leg = chain.get(s_strike, {})\n            if not leg:\n                continue\n            c_leg = leg.get("call", {})\n            p_leg = leg.get("put", {})\n            c_iv = c_leg.get("iv", 0.0) or 0.0\n            p_iv = p_leg.get("iv", 0.0) or 0.0\n            c_oi = c_leg.get("oi", 0) or 0\n            p_oi = p_leg.get("oi", 0) or 0\n            if c_iv <= 0 and p_iv <= 0:\n                continue\n            t_oi = c_oi + p_oi\n            if t_oi > 0:\n                s_iv = (c_iv * c_oi + p_iv * p_oi) / t_oi\n            elif c_iv > 0 and p_iv > 0:\n                s_iv = (c_iv + p_iv) / 2.0\n            elif c_iv > 0:\n                s_iv = c_iv\n            else:\n                s_iv = p_iv\n            if 0.05 <= s_iv <= 0.80:\n                w = 2.0 if s_strike == atm else 1.0\n                iv_samples.append((s_iv, w))\n        if not iv_samples:\n            return None\n        total_w = sum(w for _, w in iv_samples)\n        atm_iv = sum(iv * w for iv, w in iv_samples) / total_w\n        if atm_iv < 0.05 or atm_iv > 0.80:\n            return None\n        try:\n            _vix_state = self.state.get("prev_vix")\n            if _vix_state and _vix_state > 0:\n                vix_decimal = _vix_state / 100.0\n                if atm_iv < vix_decimal * 0.60 or atm_iv > vix_decimal * 2.0:\n                    self.logger.warning(\n                        f"ATM IV {atm_iv*100:.2f}% vs VIX {_vix_state:.2f} — "\n                        f"ratio {atm_iv/vix_decimal:.2f} outside 0.60-2.00 range. "\n                        f"Chain data may be stale. Treating ATM IV as unavailable."\n                    )\n                    return None\n        except Exception:\n            pass\n        return atm_iv',
+"FIX-2: ATM IV weighted average ATM-50 ATM ATM+50 reduces single-strike quote noise")
+
+src = rb(src,
+'    def compute_oi_change(\n        self, atm_strike: int, expiry_str: str,\n        current_ce_oi: int, current_pe_oi: int\n    ) -> float:\n        current_total = current_ce_oi + current_pe_oi\n        if current_total <= 0:\n            return 0.0\n        lookback = self.config.oi_change_lookback_min\n        cutoff = (now_ist() - timedelta(minutes=lookback + 5)).isoformat()\n        limit_ts = (now_ist() - timedelta(minutes=lookback)).isoformat()\n        row = self.db.query_one(\n            "SELECT ce_oi, pe_oi FROM options_chain "\n            "WHERE strike=? AND expiry_date=? AND timestamp>=? AND timestamp<=? "\n            "ORDER BY timestamp ASC LIMIT 1",\n            (atm_strike, expiry_str, cutoff, limit_ts),\n        )\n        if row:\n            prior = (row.get("ce_oi") or 0) + (row.get("pe_oi") or 0)\n            if prior > 0:\n                return (current_total - prior) / prior\n        return 0.0',
+'    def compute_oi_change(\n        self, atm_strike: int, expiry_str: str,\n        current_ce_oi: int, current_pe_oi: int\n    ) -> float:\n        current_total = current_ce_oi + current_pe_oi\n        if current_total <= 0:\n            return 0.0\n        lookback = self.config.oi_change_lookback_min\n        today_str = today_ist().isoformat()\n        cutoff_ts = (now_ist() - timedelta(minutes=lookback + 5)).isoformat()\n        limit_ts = (now_ist() - timedelta(minutes=lookback)).isoformat()\n        row = self.db.query_one(\n            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "\n            "WHERE trading_date=? AND strike=? AND expiry=? "\n            "AND capture_time >= ? AND capture_time <= ? "\n            "LIMIT 1",\n            (today_str, atm_strike, expiry_str, cutoff_ts, limit_ts),\n        )\n        if row and row.get("total_oi"):\n            prior = row["total_oi"]\n            if prior > 0:\n                return (current_total - prior) / prior\n        row2 = self.db.query_one(\n            "SELECT ce_oi, pe_oi FROM options_chain "\n            "WHERE strike=? AND expiry_date=? AND timestamp>=? AND timestamp<=? "\n            "ORDER BY timestamp ASC LIMIT 1",\n            (atm_strike, expiry_str, cutoff_ts, limit_ts),\n        )\n        if row2:\n            prior2 = (row2.get("ce_oi") or 0) + (row2.get("pe_oi") or 0)\n            if prior2 > 0:\n                return (current_total - prior2) / prior2\n        row3 = self.db.query_one(\n            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "\n            "WHERE trading_date=? AND strike=? AND expiry=? "\n            "ORDER BY capture_time ASC LIMIT 1",\n            (today_str, atm_strike, expiry_str),\n        )\n        if row3 and row3.get("total_oi"):\n            prior3 = row3["total_oi"]\n            if prior3 > 0 and prior3 != current_total:\n                return (current_total - prior3) / prior3\n        return 0.0',
+"FIX-3: OI change uses option_chain_snapshot every cycle with fallback to options_chain")
+
+src = rb(src,
+'        if skew < -1.5:\n            return otm_ce_iv, otm_pe_iv, 0.0\n        return otm_ce_iv, otm_pe_iv, skew',
+'        if skew < -1.5:\n            self.logger.debug(f"OTM skew={skew:.2f} negative calls>puts treating as neutral")\n            return otm_ce_iv, otm_pe_iv, 0.0\n        return otm_ce_iv, otm_pe_iv, skew',
+"FIX-4a: negative OTM skew debug log only not warning")
+
+src = rb(src,
+'        if skew is not None and skew < -1.5:\n            _now_t = now_ist().time()\n            from datetime import time as _dtime\n            if _now_t >= _dtime(10, 0):\n                self.logger.warning(\n                    f"OTM skew={skew:.2f} is negative beyond -1.5 — "\n                    f"NIFTY structural skew violation. Treating skew as UNKNOWN."\n                )\n            skew = None\n            skew_ratio = None',
+'        if skew is not None and skew < -1.5:\n            self.logger.debug(f"OTM skew={skew:.2f} negative treating as neutral 0.0")\n            skew = 0.0',
+"FIX-4b: negative skew in run_cycle set to 0.0 neutral eliminates UNKNOWN volatility cycles")
+
+write(mde_path, src)
+ok1 = check_syntax(mde_path)
+if ok1:
+    print("  market_data_engine.py syntax OK")
+
+print("\n[2/2] eod_report.py")
+src = read(eod_path)
+
+src = rb(src,
+'    volumes = [c["volume"] for c in candles if c.get("volume")]',
+'    volumes = [c["volume"] for c in candles if c.get("volume") is not None]',
+"FIX-5a: zero_volume_bars use is not None to include zero values in list")
+
+src = rb(src,
+'        "zero_volume_bars":  sum(1 for v in volumes if v == 0),',
+'        "zero_volume_bars":  sum(1 for v in volumes if (v or 0) == 0),\n        "volume_note":       "NSE index volume always 0 via Upstox API confirmed",',
+"FIX-5b: add volume_note to candle stats for LLM context")
+
+write(eod_path, src)
+ok2 = check_syntax(eod_path)
+if ok2:
+    print("  eod_report.py syntax OK")
 
 print("\n" + "=" * 68)
-print("APPLYING PATCH 4")
+print("PATCH 6 SUMMARY")
 print("=" * 68)
-
-print("\n[RE-FIX-1] Fix pd not defined in CalibrationEngine.run")
-src = read(re_path)
-
-src = rb(src,
-'            snap_df = pd.read_sql_query(\n                "SELECT skew, oi_change_pct, resistance_oi, support_oi, "\n                "total_ce_oi, total_pe_oi FROM market_snapshots "\n                "WHERE skew != 0 AND date >= ? ORDER BY timestamp",\n                self.db.get_connection(),\n                params=((date.today() - timedelta(days=365)).isoformat(),),\n            )',
-'            import pandas as _pd_cal\n            snap_df = _pd_cal.read_sql_query(\n                "SELECT skew, oi_change_pct, resistance_oi, support_oi, "\n                "total_ce_oi, total_pe_oi FROM market_snapshots "\n                "WHERE skew != 0 AND date >= ? ORDER BY timestamp",\n                self.db.get_connection(),\n                params=((date.today() - timedelta(days=365)).isoformat(),),\n            )',
-"RE-FIX-1: fix pd not defined in CalibrationEngine.run snap_df query")
-
-print("\n[RE-FIX-2] Fix VIX bootstrap in CalibrationEngine.run to use daily_summary vix columns")
-src = rb(src,
-'        if len(vix_df) >= 50:\n            v   = vix_df["vix_value"].dropna().values\n            p25 = float(np.percentile(v, 25))\n            p50 = float(np.percentile(v, 50))\n            p75 = float(np.percentile(v, 75))\n            p90 = float(np.percentile(v, 90))\n            _n_vix = len(v)\n            if _n_vix < 500:\n                p90 = max(p90, 24.0)\n            if _n_vix < 200:\n                p75 = max(p75, 18.0)\n            if _n_vix < 100:\n                p50 = max(p50, 14.0)\n            self.logger.info(\n                f"  VIX: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={_n_vix})"\n            )',
-'        if len(vix_df) >= 50:\n            v   = vix_df["vix_value"].dropna().values\n            v   = v[(v > 8.0) & (v < 90.0)]\n            p25 = float(np.percentile(v, 25))\n            p50 = float(np.percentile(v, 50))\n            p75 = float(np.percentile(v, 75))\n            p90 = float(np.percentile(v, 90))\n            _n_vix = len(v)\n            if _n_vix < 500:\n                p90 = max(p90, 24.0)\n            if _n_vix < 200:\n                p75 = max(p75, 18.0)\n            if _n_vix < 100:\n                p50 = max(p50, 14.0)\n            p25 = max(p25, 10.5)\n            p50 = max(p50, 13.0)\n            p75 = max(p75, 17.0)\n            self.logger.info(\n                f"  VIX: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={_n_vix})"\n            )',
-"RE-FIX-2: add floor to calibration VIX percentiles (p25>=10.5, p50>=13.0, p75>=17.0)")
-
-src = rb(src,
-'        else:\n            self.logger.info(f"  VIX rows={len(vix_df)} < 50. Attempting bootstrap from daily_summary.")\n            _vix_bootstrapped = False\n            try:\n                _daily = self.db.get_daily_summary(days=730)\n                _vcols = [c for c in ["vix_open", "vix_close", "vix_high", "vix_low"] if c in _daily.columns]\n                if not _daily.empty and _vcols:\n                    _vvals = _pd.concat([_daily[c].dropna() for c in _vcols]).values\n                    _vvals = _vvals[(_vvals > 8.0) & (_vvals < 90.0)]\n                    if len(_vvals) >= 20:\n                        p25 = float(max(np.percentile(_vvals, 25), 11.0))\n                        p50 = float(max(np.percentile(_vvals, 50), 14.0))\n                        p75 = float(max(np.percentile(_vvals, 75), 18.0))\n                        p90 = float(max(np.percentile(_vvals, 90), 24.0))\n                        self.logger.info(f"  VIX bootstrap from daily_summary: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(_vvals)})")\n                        _vix_bootstrapped = True\n            except Exception as _ve:\n                self.logger.debug(f"  VIX bootstrap error: {_ve}")',
-'        else:\n            self.logger.info(f"  VIX rows={len(vix_df)} < 50. Attempting bootstrap from daily_summary.")\n            _vix_bootstrapped = False\n            try:\n                import pandas as _pd_boot\n                _daily = self.db.get_daily_summary(days=730)\n                _vcols = [c for c in ["vix_open", "vix_close", "vix_high", "vix_low", "vix_close_val"] if c in _daily.columns]\n                if not _daily.empty and _vcols:\n                    _vvals = _pd_boot.concat([_daily[c].dropna() for c in _vcols]).values\n                    _vvals = _vvals[(_vvals > 8.0) & (_vvals < 90.0)]\n                    if len(_vvals) >= 10:\n                        p25 = float(max(np.percentile(_vvals, 25), 10.5))\n                        p50 = float(max(np.percentile(_vvals, 50), 13.0))\n                        p75 = float(max(np.percentile(_vvals, 75), 17.0))\n                        p90 = float(max(np.percentile(_vvals, 90), 24.0))\n                        self.logger.info(f"  VIX bootstrap from daily_summary: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(_vvals)})")\n                        _vix_bootstrapped = True\n            except Exception as _ve:\n                self.logger.debug(f"  VIX bootstrap error: {_ve}")',
-"RE-FIX-3: fix pd not defined in VIX bootstrap, add vix_close_val column, lower min to 10 rows")
-
-write(re_path, src)
-ok = check_syntax(re_path)
-
-print("\n" + "=" * 68)
-print("PATCH 4 SUMMARY")
-print("=" * 68)
-print(f"Applied: {len(_applied)}")
+print(f"Applied : {len(_applied)}")
 for a in _applied:
     print(f"  [OK] {a}")
-print(f"Skipped: {len(_skipped)}")
+print(f"Skipped : {len(_skipped)}")
 for s in _skipped:
     print(f"  [SKIP] {s}")
-print(f"Errors:  {len(_errors)}")
+print(f"Errors  : {len(_errors)}")
 for e in _errors:
     print(f"  [ERR] {e}")
-print(f"\nBackups: {BACKUP_DIR}")
-print("\nNOTE: Issues 1,4,9,10,11,12,13 need fresh trading day run to verify.")
-print("      Issues 2,5,6,7 are self-fixing on next run.")
-print("      Issues 3,8 fixed by this patch.")
+print(f"Backups : {BACKUP_DIR}")
 
 if _errors:
+    print("\n[FAIL]")
     sys.exit(1)
 else:
-    print("\n[SUCCESS] Patch 4 complete.")
+    print("\n[SUCCESS] Patch 6 complete.")
     sys.exit(0)
