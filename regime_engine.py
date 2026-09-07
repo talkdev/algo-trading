@@ -945,15 +945,27 @@ class RegimeClassifier:
         _prev_vix_close = 0.0
         try:
             _prev_row = self.db.query_one(
-                "SELECT vix_close FROM daily_summary WHERE trading_date < ? "
-                "AND vix_close IS NOT NULL AND vix_close > 0 "
+                "SELECT vix_close_val FROM daily_summary WHERE trading_date < ? "
+                "AND vix_close_val IS NOT NULL AND vix_close_val > 0 "
                 "ORDER BY trading_date DESC LIMIT 1",
                 (str(datetime.now().date()),)
             )
-            if _prev_row and _prev_row.get("vix_close"):
-                _prev_vix_close = float(_prev_row["vix_close"])
+            if _prev_row and _prev_row.get("vix_close_val"):
+                _prev_vix_close = float(_prev_row["vix_close_val"])
         except Exception:
             pass
+        if _prev_vix_close <= 0:
+            try:
+                _vix_rows = self.db.query(
+                    "SELECT vix_value FROM vix_history "
+                    "WHERE date < ? AND vix_value > 0 "
+                    "ORDER BY timestamp DESC LIMIT 5",
+                    (str(datetime.now().date()),)
+                )
+                if _vix_rows:
+                    _prev_vix_close = float(_vix_rows[0]["vix_value"])
+            except Exception:
+                pass
         _vix_pct_from_close = ((vix - _prev_vix_close) / _prev_vix_close * 100.0) if _prev_vix_close > 0 else 0.0
         if _vix_pct_from_close >= 15.0 and vix >= 14.0:
             details["trigger"] = "VIX_SPIKE_REAL"
@@ -986,7 +998,8 @@ class RegimeClassifier:
         vix_md = max(self._t("vix_p50", "vix_normal"), 13.0)
         vix_hi = max(self._t("vix_p75", "vix_high"), 17.0)
         scores.append(-1 if vix < vix_lo else -0.5 if vix < vix_md else 0 if vix < vix_hi else 1)
-        scores.append(-1 if vix_roc < -2 else -0.5 if vix_roc < 0 else 0 if vix_roc < emg * 0.6 else 1)
+        _emg_score_thresh = 3.0
+        scores.append(-1 if vix_roc < -2 else -0.5 if vix_roc < 0 else 0 if vix_roc < _emg_score_thresh else 1)
 
         ivr_s = self._t("ivr_sell_threshold", "ivr_sell")
         ivr_b = self._t("ivr_buy_threshold",  "ivr_buy")
