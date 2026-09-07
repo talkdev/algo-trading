@@ -1,4 +1,7 @@
+# file name is market_data_engine.py
+
 from __future__ import annotations
+import re
 
 import json
 import math
@@ -29,8 +32,12 @@ class TechnicalEngine:
         try:
             df = bars_1min.copy()
             if "datetime" not in df.columns:
-                df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"])
+                df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"], errors="coerce")
+                if hasattr(df["datetime"].dtype, "tz") and df["datetime"].dtype.tz is not None:
+                    df["datetime"] = df["datetime"].dt.tz_localize(None)
             df = df.set_index("datetime").sort_index()
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
             resampled = df[["open", "high", "low", "close", "volume"]].resample(
                 interval, label="left", closed="left"
             ).agg({
@@ -210,6 +217,9 @@ class MarketDataEngine:
         self._chain_fetch_time: Optional[datetime] = None
         self._cached_calibration: Optional[dict] = None
         self._calibration_cache_time: Optional[datetime] = None
+        self._last_vrp: Optional[float] = None
+        self._first_bar_close_today: Optional[float] = None
+        self._first_bar_date: Optional[str] = None
 
     def _ensure_tables(self) -> None:
         extra_cols = [
@@ -283,6 +293,7 @@ class MarketDataEngine:
             "pre_event_spot": None, "pre_event_iv": None,
             "event_announcement_time": None,
             "last_stop_signal_combo": None, "gap_fade_opportunity": False,
+            "_straddle_open_for_regime": 0.0, "_straddle_open_for_summary": 0.0,
             "created_at": now_ist().isoformat(), "updated_at": now_ist().isoformat(),
         }
         insert_row = {k: (int(v) if isinstance(v, bool) else v) for k, v in defaults.items()}
@@ -298,6 +309,12 @@ class MarketDataEngine:
         for k, v in list(data.items()):
             if isinstance(v, bool):
                 data[k] = int(v)
+        try:
+            import sqlite3 as _sq
+            _cols = {r[1] for r in self.db.get_connection().execute("PRAGMA table_info(session_state)").fetchall()}
+            data = {k: v for k, v in data.items() if k in _cols}
+        except Exception:
+            pass
         self.db.update("session_state", data, {"trading_date": trading_date})
 
     def reset_if_new_day(self) -> None:
@@ -311,6 +328,9 @@ class MarketDataEngine:
             self.last_chain = {}
             self.last_chain_expiry = None
             self._pcr_baseline_set = False
+            self._last_vrp = None
+            self._first_bar_close_today = None
+            self._first_bar_date = None
 
     def _close_stale_prior_day_positions(self, prior_date: Optional[str]) -> None:
         if not prior_date:
@@ -431,23 +451,44 @@ class MarketDataEngine:
         if bars_1m:
             rows = []
             for b in bars_1m:
+                ts = b["timestamp"]
+                if hasattr(ts, "strftime"):
+                    ts_clean = ts.strftime("%H:%M:%S")
+                else:
+                    s = str(ts).strip()
+                    for sep in ["T", " "]:
+                        if sep in s:
+                            s = s.split(sep)[1]
+                            break
+                    s = s.replace("+05:30", "").replace("+0530", "").replace("Z", "").strip()
+                    ts_clean = s[:8]
+                if not ts_clean or len(ts_clean) != 8:
+                    continue
+                try:
+                    _h, _m, _s = ts_clean.split(":")
+                    if not (0 <= int(_h) <= 23 and 0 <= int(_m) <= 59 and 0 <= int(_s) <= 59):
+                        continue
+                except Exception:
+                    continue
                 rows.append((
                     trading_date,
-                    b["timestamp"].isoformat(),
+                    ts_clean,
                     1,
                     b["open"], b["high"], b["low"], b["close"],
                     b.get("volume", 0),
                     "upstox_intraday",
                 ))
-            try:
-                self.db.executemany(
-                    "INSERT OR IGNORE INTO intraday_candles "
-                    "(trading_date, candle_time, interval_min, open, high, low, close, volume, source) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    rows,
-                )
-            except Exception as e:
-                self.logger.warning(f"Could not persist intraday candles: {e}")
+            if rows:
+                try:
+                    self.db.executemany(
+                        "INSERT OR REPLACE INTO intraday_candles "
+                        "(trading_date, candle_time, interval_min, open, high, low, close, volume, source) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        rows,
+                    )
+                    self.logger.debug(f"Stored {len(rows)} candle bars for {trading_date}")
+                except Exception as e:
+                    self.logger.warning(f"Could not persist intraday candles: {e}")
 
         return self._load_candles_from_db(trading_date)
 
@@ -463,7 +504,15 @@ class MarketDataEngine:
                 return pd.DataFrame()
             df = pd.DataFrame(rows)
             df["date"] = trading_date
-            df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"])
+            df["datetime"] = pd.to_datetime(
+                df["date"] + " " + df["time"],
+                format="%Y-%m-%d %H:%M:%S",
+                errors="coerce",
+            )
+            if hasattr(df["datetime"].dtype, "tz") and df["datetime"].dtype.tz is not None:
+                df["datetime"] = df["datetime"].dt.tz_localize(None)
+            df = df.dropna(subset=["datetime"])
+            df = df[df["open"] > 0].copy()
             return df
         except Exception as e:
             self.logger.warning(f"Could not load candles from DB: {e}")
@@ -471,6 +520,13 @@ class MarketDataEngine:
 
     def get_today_spot_bars(self) -> pd.DataFrame:
         return self._load_candles_from_db(today_ist().isoformat())
+
+    def _snap_available(self) -> bool:
+        return (
+            self.state.get("prev_spot") is not None
+            and self.last_chain is not None
+            and len(self.last_chain) > 0
+        )
 
     def _get_prev_close(self) -> Optional[float]:
         today = today_ist()
@@ -578,30 +634,70 @@ class MarketDataEngine:
     ) -> Tuple[Optional[float], str]:
         today_str = today_ist().isoformat()
 
-        if bars is not None and not bars.empty and len(bars) >= 12:
-            rolling = bars.tail(30)
+        if bars is not None and not bars.empty and len(bars) >= 20:
+            rolling = bars.tail(60)
             valid = rolling[
                 (rolling["high"] > rolling["low"]) & (rolling["high"] > 0)
             ]
-            if len(valid) >= 6:
+            if len(valid) >= 15:
                 log_hl_sq = [
                     math.log(r["high"] / r["low"]) ** 2
                     for _, r in valid.iterrows()
-                    if r["low"] > 0
+                    if r["low"] > 0 and r["high"] / r["low"] > 1.0001
                 ]
-                if log_hl_sq:
+                if len(log_hl_sq) >= 10:
                     park_const = 1.0 / (4.0 * math.log(2.0))
                     variance = park_const * (sum(log_hl_sq) / len(log_hl_sq))
                     rv = math.sqrt(variance * 375.0 * 252.0)
-                    if 0.02 < rv < 0.80:
+                    _cached_rv = self.state.get("parkinson_rv_pct")
+                    _rv_floor = 0.06
+                    if rv < _rv_floor:
+                        if _cached_rv and _cached_rv >= _rv_floor:
+                            self.logger.debug(
+                                f"Parkinson RV {rv*100:.2f}% below floor {_rv_floor*100:.0f}% — "
+                                f"using cached {_cached_rv*100:.2f}%"
+                            )
+                            return _cached_rv, "cached"
+                        _vix_now2 = self.state.get("prev_vix") or 15.0
+                        _vix_implied = (_vix_now2 / 100.0) * 0.75
+                        self.logger.debug(
+                            f"Parkinson RV {rv*100:.2f}% below floor — "
+                            f"using VIX-implied {_vix_implied*100:.2f}%"
+                        )
+                        return _vix_implied, "vix_implied"
+                    if 0.06 <= rv < 0.60:
+                        if _cached_rv and _cached_rv >= _rv_floor:
+                            if rv < _cached_rv * 0.50:
+                                self.logger.debug(
+                                    f"Parkinson RV {rv*100:.2f}% dropped >50% from cached "
+                                    f"{_cached_rv*100:.2f}% — using cached"
+                                )
+                                return _cached_rv, "cached"
                         self.state["parkinson_rv_pct"] = rv
                         self.state["parkinson_rv_computed_date"] = today_str
                         return rv, "rolling_intraday"
+                    elif _cached_rv and _cached_rv >= _rv_floor:
+                        self.logger.debug(
+                            f"Parkinson RV {rv*100:.2f}% outside valid range — using cached {_cached_rv*100:.2f}%"
+                        )
+                        return _cached_rv, "cached"
 
         if (self.state.get("parkinson_rv_computed_date") == today_str and
                 self.state.get("parkinson_rv_pct") is not None and
                 today_str == today_ist().isoformat()):
-            return self.state["parkinson_rv_pct"], "cached"
+            _cached = self.state["parkinson_rv_pct"]
+            if _cached >= 0.06:
+                return _cached, "cached"
+
+        _vix_now = self.state.get("prev_vix") or vix or 15.0
+        if _vix_now and _vix_now > 0:
+            _vix_implied_rv = (_vix_now / 100.0) * 0.75
+            if 0.04 < _vix_implied_rv < 0.60:
+                self.logger.debug(
+                    f"Parkinson RV unavailable — using VIX-implied RV: "
+                    f"{_vix_implied_rv*100:.2f}% (VIX={_vix_now:.2f})"
+                )
+                return _vix_implied_rv, "vix_implied"
 
         return None, "unavailable"
 
@@ -686,7 +782,7 @@ class MarketDataEngine:
     def compute_vwap(
         self, bars: pd.DataFrame
     ) -> Tuple[Optional[float], bool]:
-        if len(bars) < 30:
+        if len(bars) < 10:
             return None, False
         cum_pv, cum_vol = 0.0, 0.0
         for _, row in bars.iterrows():
@@ -700,7 +796,7 @@ class MarketDataEngine:
             return None, False
         avg = sum((r["high"] + r["low"] + r["close"]) / 3.0
                   for _, r in bars.iterrows()) / total
-        return avg, False
+        return avg, True
 
     def compute_25d_ivs(
         self, chain: dict
@@ -771,21 +867,29 @@ class MarketDataEngine:
         self, chain: dict, atm_strike: int
     ) -> Tuple[float, float, float]:
         step = self.config.nifty_strike_step
-        otm_ce_strike = atm_strike + step
-        otm_pe_strike = atm_strike - step
+        spot = self.state.get("prev_spot") or atm_strike
 
-        otm_ce_iv = 0.0
-        otm_pe_iv = 0.0
+        def _best_otm_iv(opt_type, direction):
+            for multiplier in [1, 2, 3]:
+                strike = atm_strike + (step * multiplier * direction)
+                if strike in chain:
+                    raw = chain[strike].get(opt_type, {}).get("iv", 0) or 0
+                    iv = raw * 100.0 if raw < 2.0 else raw
+                    bid = chain[strike].get(opt_type, {}).get("bid", 0) or 0
+                    ask = chain[strike].get(opt_type, {}).get("ask", 0) or 0
+                    if iv > 0.5 and (bid > 0 or ask > 0):
+                        return iv
+            return 0.0
 
-        if otm_ce_strike in chain:
-            raw = chain[otm_ce_strike].get("call", {}).get("iv", 0) or 0
-            otm_ce_iv = raw * 100.0 if raw < 2.0 else raw
+        otm_ce_iv = _best_otm_iv("call", 1)
+        otm_pe_iv = _best_otm_iv("put", -1)
 
-        if otm_pe_strike in chain:
-            raw = chain[otm_pe_strike].get("put", {}).get("iv", 0) or 0
-            otm_pe_iv = raw * 100.0 if raw < 2.0 else raw
+        if otm_pe_iv <= 0 or otm_ce_iv <= 0:
+            return otm_ce_iv, otm_pe_iv, 0.0
 
-        skew = round(otm_pe_iv - otm_ce_iv, 2) if (otm_pe_iv > 0 and otm_ce_iv > 0) else 0.0
+        skew = round(otm_pe_iv - otm_ce_iv, 2)
+        if skew < -1.5:
+            return otm_ce_iv, otm_pe_iv, 0.0
         return otm_ce_iv, otm_pe_iv, skew
 
     def compute_max_pain(self, chain: dict) -> int:
@@ -1081,10 +1185,11 @@ class MarketDataEngine:
         day_label = labels.get(today.weekday(), "WEEKEND")
         self.state["day_label"] = day_label
 
-        vix_size = {
+        vix_size_map = {
             "SUPPRESSED": 1.0, "LOW": 1.0, "NORMAL": 0.75,
             "ELEVATED": 0.50, "HIGH": 0.25,
         }
+        vix_size = vix_size_map.get(new_regime, 0.75)
         dow_size = {
             "MONDAY": 1.00, "TUESDAY": 0.75, "WEDNESDAY": 0.25,
             "THURSDAY": 0.25, "FRIDAY": 0.25,
@@ -1165,8 +1270,8 @@ class MarketDataEngine:
             "ema_structure": s.get("ema_structure"),
             "oi_change_pct": s.get("oi_change_pct"),
             "skew": s.get("skew"),
-            "action_taken": "SIGNAL_ONLY",
-            "no_trade_reason": None,
+            "action_taken": s.get("final_regime") or "SIGNAL_ONLY",
+            "no_trade_reason": s.get("notes") if s.get("final_regime") in ("NO_TRADE", "EMERGENCY_EXIT") else None,
             "conditions_met_json": json.dumps(s.get("conditions_met", {})),
             "conditions_not_met_json": json.dumps(s.get("conditions_not_met", {})),
             "open_positions": 0,
@@ -1347,13 +1452,12 @@ class MarketDataEngine:
         checks = {
             "or_computed": bool(self.state.get("or_computed")),
             "session_initialized": bool(self.state.get("session_initialized")),
-            "vwap_valid": bool(self.state.get("vwap_valid")),
             "atm_iv_available": s.get("atm_iv") is not None,
             "vrp_available": s.get("vrp") is not None,
             "chain_has_min_strikes": (s.get("chain_size") or 0) >= 10,
             "not_circuit_breaker": not s.get("circuit_breaker_suspected"),
             "not_vix_spike": not s.get("vix_spike_detected"),
-            "vix_regime_not_suppressed": s.get("vix_regime") != "SUPPRESSED",
+            "vix_regime_not_suppressed": s.get("vix_regime") not in ("SUPPRESSED", "HIGH"),
             "within_trading_window": self._is_within_trading_window(),
             "daily_not_halted": not bool(self.state.get("daily_halted")),
         }
@@ -1526,15 +1630,16 @@ class MarketDataEngine:
 
         _day_move_used_pct = 0.0
         _opening_straddle_ref = self.state.get("_straddle_open_for_regime", 0)
-        if _opening_straddle_ref > 0 and spot is not None:
-            _first_bar_close = None
-            if not bars.empty:
-                _morning_bars = bars[bars["time"] >= "09:15:00"]
-                if not _morning_bars.empty:
-                    _first_bar_close = float(_morning_bars["close"].iloc[0])
-            if _first_bar_close is None:
-                _first_bar_close = spot
-            _day_move_used_pct = abs(spot - _first_bar_close) / _opening_straddle_ref * 100.0
+        _today_dmu = today_ist().isoformat()
+        if self._first_bar_date != _today_dmu:
+            self._first_bar_close_today = None
+            self._first_bar_date = _today_dmu
+        if self._first_bar_close_today is None and not bars.empty:
+            _mb = bars[bars["time"] >= "09:15:00"]
+            if not _mb.empty:
+                self._first_bar_close_today = float(_mb["close"].iloc[0])
+        if _opening_straddle_ref > 0 and spot is not None and self._first_bar_close_today is not None:
+            _day_move_used_pct = abs(spot - self._first_bar_close_today) / _opening_straddle_ref * 100.0
 
         _day_label = self.state.get("day_label")
         _actual_dte = dte if dte is not None else self.state.get("actual_dte")
@@ -1554,7 +1659,32 @@ class MarketDataEngine:
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, bars)
         vrp = None
         if atm_iv is not None and parkinson_rv is not None:
-            vrp = atm_iv * 100.0 - parkinson_rv * 100.0
+            _raw_vrp = atm_iv * 100.0 - parkinson_rv * 100.0
+            _prev_vrp = self._last_vrp
+            if _prev_vrp is None:
+                try:
+                    _prev_cycle = self.db.query_one(
+                        "SELECT vrp FROM cycle_log WHERE trading_date=? AND vrp IS NOT NULL "
+                        "ORDER BY cycle_id DESC LIMIT 1",
+                        (today_ist().isoformat(),),
+                    )
+                    if _prev_cycle:
+                        _prev_vrp = _prev_cycle["vrp"]
+                except Exception:
+                    pass
+            if _prev_vrp is not None and _prev_vrp > 0 and _raw_vrp > _prev_vrp * 2.0:
+                self.logger.warning(
+                    f"VRP spike: {_raw_vrp:.2f}pp vs prev {_prev_vrp:.2f}pp — "
+                    f"capping at prev VRP (likely bad Parkinson RV)"
+                )
+                vrp = _prev_vrp
+            elif -5.0 < _raw_vrp < 15.0:
+                vrp = _raw_vrp
+                self._last_vrp = vrp
+            else:
+                self.logger.debug(f"VRP {_raw_vrp:.2f}pp outside -5 to 15 range — discarding")
+                if _prev_vrp is not None:
+                    vrp = _prev_vrp
 
         iv_behavior = "UNKNOWN"
         iv_change_pct = 0.0
@@ -1579,16 +1709,20 @@ class MarketDataEngine:
         df15 = TechnicalEngine.resample_bars(bars, self.config.mtf_resample_15)
         df60 = TechnicalEngine.resample_bars(bars, self.config.mtf_resample_60)
 
+        _adx_min_15 = max(8, min(self.config.min_bars_for_adx, 10))
+        _adx_min_60 = max(4, _adx_min_15 // 2)
         adx_15 = 0.0
         adx_15_mature = False
-        if not df15.empty and len(df15) >= self.config.min_bars_for_adx:
-            adx_15 = TechnicalEngine.calculate_adx(df15, self.config.adx_period)
+        if not df15.empty and len(df15) >= _adx_min_15:
+            _adx_period_15 = min(self.config.adx_period, max(5, len(df15) - 2))
+            adx_15 = TechnicalEngine.calculate_adx(df15, _adx_period_15)
             adx_15_mature = len(df15) >= self.config.adx_period * 2
 
         adx_60 = 0.0
         adx_60_mature = False
-        if not df60.empty and len(df60) >= self.config.min_bars_for_adx:
-            adx_60 = TechnicalEngine.calculate_adx(df60, self.config.adx_period)
+        if not df60.empty and len(df60) >= _adx_min_60:
+            _adx_period_60 = min(self.config.adx_period, max(3, len(df60) - 2))
+            adx_60 = TechnicalEngine.calculate_adx(df60, _adx_period_60)
             adx_60_mature = len(df60) >= self.config.adx_period * 2
 
         ema_structure = TechnicalEngine.classify_ema_structure(
@@ -1661,10 +1795,13 @@ class MarketDataEngine:
                 pcr_signal = "STRONG_GREED"
 
         if skew is not None and skew < -1.5:
-            self.logger.warning(
-                f"OTM skew={skew:.2f} is negative beyond -1.5 — "
-                f"NIFTY structural skew violation. Treating skew as UNKNOWN."
-            )
+            _now_t = now_ist().time()
+            from datetime import time as _dtime
+            if _now_t >= _dtime(10, 0):
+                self.logger.warning(
+                    f"OTM skew={skew:.2f} is negative beyond -1.5 — "
+                    f"NIFTY structural skew violation. Treating skew as UNKNOWN."
+                )
             skew = None
             skew_ratio = None
         if skew_ratio is None:
@@ -1756,11 +1893,18 @@ class MarketDataEngine:
 
             vix_regime = self.state.get("vix_regime", "NORMAL")
             if vix_regime == "SUPPRESSED":
-                if vrp > 3.0:
+                _sup_vrp_thresh = 2.5
+                try:
+                    _cal = self.db.get_latest_calibration()
+                    if _cal and _cal.get("vrp_sell_threshold"):
+                        _sup_vrp_thresh = float(_cal["vrp_sell_threshold"]) * 0.85
+                except Exception:
+                    pass
+                if vrp is not None and vrp > _sup_vrp_thresh:
                     sell_ok = True
                 else:
                     sell_ok = False
-                    buy_ok = True
+                    buy_ok = False
         elif vix_spike:
             volatility_condition = "SPIKING"
             sell_ok = False

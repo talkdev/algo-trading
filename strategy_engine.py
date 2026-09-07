@@ -1,3 +1,5 @@
+# file name is strategy_engine.py
+
 from __future__ import annotations
 
 import json
@@ -26,27 +28,27 @@ FINAL_REGIME_TO_STRATEGY = {
 
 DTE_REQUIREMENTS = {
     "IRON_BUTTERFLY":  (0, 1),
-    "IRON_CONDOR":     (0, 2),
-    "BULL_PUT_SPREAD": (0, 8),
-    "BEAR_CALL_SPREAD":(0, 8),
-    "BULL_CALL_SPREAD":(1, 5),
-    "BEAR_PUT_SPREAD": (1, 5),
-    "LONG_STRADDLE":   (1, 5),
+    "IRON_CONDOR":     (0, 3),
+    "BULL_PUT_SPREAD": (0, 5),
+    "BEAR_CALL_SPREAD":(0, 5),
+    "BULL_CALL_SPREAD":(1, 3),
+    "BEAR_PUT_SPREAD": (1, 3),
+    "LONG_STRADDLE":   (1, 3),
     "POST_EVENT_STRADDLE": (0, 3),
 }
 
 MIN_CREDITS = {
+    "IRON_BUTTERFLY":  12,
+    "IRON_CONDOR":     10,
+    "BULL_PUT_SPREAD": 8,
+    "BEAR_CALL_SPREAD":8,
+    "POST_EVENT_STRADDLE": 20,
+}
+MIN_CREDITS_TUESDAY = {
     "IRON_BUTTERFLY":  15,
     "IRON_CONDOR":     12,
     "BULL_PUT_SPREAD": 10,
     "BEAR_CALL_SPREAD":10,
-    "POST_EVENT_STRADDLE": 20,
-}
-MIN_CREDITS_TUESDAY = {
-    "IRON_BUTTERFLY":  18,
-    "IRON_CONDOR":     14,
-    "BULL_PUT_SPREAD": 12,
-    "BEAR_CALL_SPREAD":12,
 }
 
 PRICE_STOPS = {
@@ -112,13 +114,16 @@ class StrategyEngine:
 
     def _get_target_pct(self, s: dict) -> float:
         dte = s.get("actual_dte")
+        vix = s.get("vix") or 15.0
         if dte is None:
-            return 0.50
+            return 0.45
         if dte == 0:
-            return 0.50
+            return 0.50 if vix < 12.0 else (0.45 if vix < 14.0 else 0.50)
         if dte == 1:
-            return 0.50
-        return 0.50
+            return 0.45 if vix < 12.0 else (0.40 if vix < 14.0 else 0.45)
+        if dte == 2:
+            return 0.40
+        return 0.38
 
 
     def _get_min_credit_mult(self, s: dict) -> float:
@@ -342,13 +347,13 @@ class StrategyEngine:
         if last_entry_time and open_count == 0 and db_count > 0:
             try:
                 mins = (now_ist() - datetime.fromisoformat(last_entry_time)).total_seconds() / 60.0
-                if mins < 15:
-                    return "NO_TRADE", f"entry_cooldown_{15-mins:.0f}min_remaining"
+                if mins < 10:
+                    return "NO_TRADE", f"entry_cooldown_{10-mins:.0f}min_remaining"
             except Exception:
                 pass
 
-        if state.get("consecutive_stops", 0) >= 3:
-            return "NO_TRADE", "3_consecutive_stops_halt"
+        if state.get("consecutive_stops", 0) >= 2:
+            return "NO_TRADE", "2_consecutive_stops_halt"
 
         last_stop_reason = state.get("last_stop_reason", "")
         last_stop_signal = state.get("last_stop_signal_combo", "")
@@ -388,45 +393,7 @@ class StrategyEngine:
                 return "NO_TRADE", f"dte_{_actual_dte_gate}_requires_high_confidence_not_{_conf_gate}"
 
         _day_move_used = s.get("day_move_used_pct", 0.0) or 0.0
-        if _day_move_used >= 70.0 and s.get("sell_ok"):
-            return "NO_TRADE", f"day_move_used_{_day_move_used:.0f}pct_of_opening_straddle_no_edge"
-
-        _strategy_for_buy_check = None
-        if final_regime and final_regime not in ("NO_TRADE", "EMERGENCY_EXIT"):
-            try:
-                from regime_bridge import final_regime_to_strategy_name as _frts
-                _strategy_for_buy_check = _frts(final_regime, s)
-            except Exception:
-                pass
-        _buy_side = {"LONG_STRADDLE", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD"}
-        if _strategy_for_buy_check in _buy_side:
-            return "NO_TRADE", "buy_side_requires_pre_1030_entry_window"
-
-        _strategy_for_buy_check = None
-        if final_regime and final_regime not in ("NO_TRADE", "EMERGENCY_EXIT"):
-            from regime_bridge import final_regime_to_strategy_name
-            try:
-                _strategy_for_buy_check = final_regime_to_strategy_name(final_regime, s)
-            except Exception:
-                pass
-        _buy_side_strategies = {"LONG_STRADDLE", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD"}
-        if _strategy_for_buy_check in _buy_side_strategies:
-            return "NO_TRADE", "buy_side_requires_pre_1030_entry_window"
-
-        _confidence_check = s.get("confidence")
-        if _confidence_check in ("LOW", "NONE"):
-            return "NO_TRADE", f"confidence_{_confidence_check}_insufficient_edge_after_costs"
-
-        _actual_dte_gate = s.get("actual_dte")
-        _vol_cond_gate = s.get("volatility_condition", "UNKNOWN")
-        if _actual_dte_gate is not None and _actual_dte_gate >= 2:
-            if _vol_cond_gate not in ("RICH", "VERY_RICH"):
-                return "NO_TRADE", f"dte_{_actual_dte_gate}_requires_rich_vrp_not_{_vol_cond_gate}"
-            if _confidence_check != "HIGH":
-                return "NO_TRADE", f"dte_{_actual_dte_gate}_requires_high_confidence_not_{_confidence_check}"
-
-        _day_move_used = s.get("day_move_used_pct", 0.0) or 0.0
-        if _day_move_used >= 70.0 and s.get("sell_ok"):
+        if _day_move_used >= 75.0 and s.get("sell_ok"):
             return "NO_TRADE", f"day_move_used_{_day_move_used:.0f}pct_of_opening_straddle_no_edge"
         if not state.get("or_computed"):
             return "NO_TRADE", "opening_range_not_yet_computed"
@@ -494,7 +461,10 @@ class StrategyEngine:
         if strategy_name in ("IRON_BUTTERFLY", "IRON_CONDOR"):
             dirn = s.get("direction", "NEUTRAL")
             side = s.get("preferred_sell_side", "BOTH")
-            if dirn in ("BULLISH", "MILD_BULLISH", "BEARISH", "MILD_BEARISH"):
+            final_regime = s.get("final_regime", "")
+            is_range_regime = final_regime in ("PREMIUM_SELL_RANGE", "EXPIRY_MAX_PAIN")
+            strong_direction = dirn in ("BULLISH", "BEARISH")
+            if not is_range_regime and strong_direction:
                 if side == "PUTS":
                     strategy_name = "BULL_PUT_SPREAD"
                     reason += "_downgraded_direction_shifted_to_bull_put"
@@ -560,15 +530,20 @@ class StrategyEngine:
             or_low = state.get("or_low")
             or_mid = (or_high + or_low) / 2.0 if (or_high and or_low) else None
             vwap = s.get("vwap")
-            if or_mid and spot and spot < or_mid:
+            actual_dte_bp = s.get("actual_dte")
+            trend_cond = s.get("trend_condition", "RANGE")
+            or_buffer = 30 if actual_dte_bp == 0 else 15
+            if trend_cond in ("DOWNTREND", "STRONG_DOWNTREND"):
+                or_buffer = or_buffer + 60
+            if or_mid and spot and spot < (or_mid - or_buffer):
                 return False, f"bull_put_spot_below_or_midpoint_{spot:.0f}_vs_{or_mid:.0f}"
-            if not or_mid and vwap and spot and spot < vwap:
+            if not or_mid and vwap and spot and spot < (vwap - 20):
                 return False, f"bull_put_spot_below_vwap_{spot:.0f}_vs_{vwap:.0f}"
             spot_vs_or = s.get("spot_vs_or", "") or ""
             if spot_vs_or.startswith("BELOW_OR"):
                 try:
                     pts = float(spot_vs_or.split("_")[-1].replace("pts", ""))
-                    if pts > 30:
+                    if pts > 60:
                         return False, f"bull_put_spot_below_or_by_{pts:.0f}pts"
                 except ValueError:
                     pass
@@ -624,17 +599,23 @@ class StrategyEngine:
                 best_diff, best = diff, strike
         return best if best_diff <= tol else None
 
-    def _dte_adjusted_delta(self, base: float, dte: Optional[int]) -> float:
+    def _dte_adjusted_delta(self, base: float, dte: Optional[int], vix: float = 15.0) -> float:
         if dte is None:
             return base
+        if vix < 12.0:
+            _vix_delta_adj = -0.02
+        elif vix < 14.0:
+            _vix_delta_adj = -0.01
+        else:
+            _vix_delta_adj = 0.0
         if dte <= 0:
-            return max(0.10, base - 0.12)
+            return max(0.18, base - 0.08 + _vix_delta_adj)
         if dte == 1:
-            return max(0.12, base - 0.10)
+            return max(0.20, base - 0.05 + _vix_delta_adj)
         if dte == 2:
-            return max(0.15, base - 0.07)
+            return max(0.20, base - 0.03 + _vix_delta_adj)
         if dte == 3:
-            return max(0.18, base - 0.05)
+            return max(0.22, base - 0.02 + _vix_delta_adj)
         return base
 
     def _validate_strike(
@@ -702,6 +683,8 @@ class StrategyEngine:
             ], None
 
         if strategy == "IRON_CONDOR":
+            _vix_condor = s.get("vix", 15.0) if s else 15.0
+            td = self._dte_adjusted_delta(0.25, dte, _vix_condor)
             if dte == 0:
                 _atm_straddle_ref = s.get("atm_straddle_price", 0) if s else 0
                 if _atm_straddle_ref and _atm_straddle_ref > 20:
@@ -966,29 +949,50 @@ class StrategyEngine:
             cost_floor   = total_costs_pts * 3.0
             min_credit   = max(static_floor, cost_floor)
 
+            _vix_min_scale = 0.65 if (s.get("vix") or 15.0) < 12.0 else (0.75 if (s.get("vix") or 15.0) < 14.0 else 1.0)
+            min_credit = min_credit * _vix_min_scale
             if net_credit < min_credit:
                 return {"valid": False, "reason": f"net_credit_{net_credit:.2f}_below_min_{min_credit:.2f}"}
 
-            min_ratio = 0.20 if actual_dte == 0 else (0.12 if actual_dte <= 1 else 0.10)
+            _vix_for_ratio = s.get("vix") or 15.0
+            if _vix_for_ratio < 12.0:
+                _ratio_scale = 0.65
+            elif _vix_for_ratio < 14.0:
+                _ratio_scale = 0.75
+            elif _vix_for_ratio < 16.0:
+                _ratio_scale = 0.85
+            else:
+                _ratio_scale = 1.00
+            min_ratio = (0.20 if actual_dte == 0 else (0.12 if actual_dte <= 1 else 0.10)) * _ratio_scale
+            min_ratio = round(min_ratio, 4)
             if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "POST_EVENT_STRADDLE"):
                 actual_wing_pts = abs(validated_legs[2]["strike"] - validated_legs[0]["strike"])
                 if actual_wing_pts > 0 and (net_credit / actual_wing_pts) < min_ratio:
-                    return {"valid": False, "reason": f"credit_ratio_below_{min_ratio}"}
+                    return {"valid": False, "reason": f"credit_ratio_below_{min_ratio:.3f}"}
             elif strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"):
                 actual_wing_pts = abs(validated_legs[0]["strike"] - validated_legs[1]["strike"])
-                if actual_wing_pts > 0 and (net_credit / actual_wing_pts) < 0.10:
-                    return {"valid": False, "reason": "credit_ratio_below_0.10"}
+                _dir_ratio = 0.10 * _ratio_scale
+                if actual_wing_pts > 0 and (net_credit / actual_wing_pts) < _dir_ratio:
+                    return {"valid": False, "reason": f"credit_ratio_below_{_dir_ratio:.3f}"}
 
             target_pct = self._get_target_pct(s)
             target_at_target = net_credit * (1.0 - target_pct)
             exit_costs = total_costs_pts + total_slippage
             net_profit_at_target = net_credit - target_at_target - exit_costs
-            if net_profit_at_target <= 0:
+            if net_profit_at_target <= 0.5:
                 return {"valid": False, "reason": f"net_profit_at_target_{net_profit_at_target:.2f}_non_positive"}
 
             vix_regime = s.get("vix_regime", "NORMAL")
-            min_rupee = {"SUPPRESSED": 350, "LOW": 400, "NORMAL": 500,
-                         "ELEVATED": 600, "HIGH": 700}.get(vix_regime, 300)
+            _vix_val_rp = s.get("vix") or 15.0
+            if _vix_val_rp < 11.5:
+                min_rupee = 100
+            elif _vix_val_rp < 13.0:
+                min_rupee = 150
+            elif _vix_val_rp < 15.0:
+                min_rupee = 175
+            else:
+                min_rupee = {"SUPPRESSED": 200, "LOW": 250, "NORMAL": 350,
+                             "ELEVATED": 450, "HIGH": 550}.get(vix_regime, 200)
             if net_profit_at_target * C02 < min_rupee:
                 return {"valid": False, "reason": f"projected_profit_below_Rs{min_rupee}"}
 
@@ -1037,7 +1041,7 @@ class StrategyEngine:
             final_lots = max(1, int(max_risk / max_loss_per_lot))
 
         if strategy_type == "SELL":
-            margin_per_lot = (actual_wing_pts or wing) * C02 * 1.15
+            margin_per_lot = (actual_wing_pts or wing) * C02 * 1.10
         else:
             margin_per_lot = (net_debit or 0) * C02
         total_margin = margin_per_lot * final_lots
@@ -1047,7 +1051,7 @@ class StrategyEngine:
             total_margin = margin_per_lot * final_lots
 
         if strategy_type == "SELL" and net_credit and net_credit > 0:
-            credit_stop_mult = 1.5 if actual_dte == 0 else 1.5
+            credit_stop_mult = 1.8 if actual_dte == 0 else (1.6 if actual_dte == 1 else 1.5)
             credit_stop = net_credit * credit_stop_mult
             static_stop = PRICE_STOPS.get(strategy_name, 80)
             if actual_dte == 0:
@@ -1080,8 +1084,19 @@ class StrategyEngine:
         hold_hrs = max(0.5, (exit_dt - entry_dt).total_seconds() / 3600.0)
         round_trip_cost_pts = total_costs_pts * 2.0
         if strategy_type == "SELL" and net_credit and net_credit > 0:
-            expected_edge_pts = (net_credit * target_pct_final) - round_trip_cost_pts
-            min_viable_edge = round_trip_cost_pts * 1.5
+            _vix_edge = s.get("vix") or 15.0
+            _profit_at_target = net_credit * target_pct_final
+            _exit_cost_pts = total_costs_pts + total_slippage
+            expected_edge_pts = _profit_at_target - _exit_cost_pts
+            if _vix_edge < 11.5:
+                _min_edge_pts = _exit_cost_pts * 0.60
+            elif _vix_edge < 13.0:
+                _min_edge_pts = _exit_cost_pts * 0.70
+            elif _vix_edge < 15.0:
+                _min_edge_pts = _exit_cost_pts * 0.85
+            else:
+                _min_edge_pts = _exit_cost_pts * 1.00
+            min_viable_edge = _min_edge_pts
             if expected_edge_pts < min_viable_edge:
                 return {
                     "valid": False,

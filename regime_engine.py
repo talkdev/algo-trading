@@ -1,3 +1,5 @@
+# file name is regime_engine.py
+
 from __future__ import annotations
 
 import json
@@ -142,19 +144,19 @@ class CalibrationState:
 
 class AutoCalibrator:
 
-    NIFTY_VIX_LOW_DEFAULT = 12.5
-    NIFTY_VIX_NORMAL_DEFAULT = 16.0
-    NIFTY_VIX_HIGH_DEFAULT = 22.0
-    NIFTY_VIX_EXTREME_DEFAULT = 28.0
+    NIFTY_VIX_LOW_DEFAULT = 11.5
+    NIFTY_VIX_NORMAL_DEFAULT = 14.5
+    NIFTY_VIX_HIGH_DEFAULT = 20.0
+    NIFTY_VIX_EXTREME_DEFAULT = 26.0
     NIFTY_SKEW_BEAR_DEFAULT = 3.0
     NIFTY_SKEW_BULL_DEFAULT = -1.0
     NIFTY_OI_BUILD_DEFAULT = 0.08
     NIFTY_OI_UNWIND_DEFAULT = -0.08
     NIFTY_OI_WALL_STRONG_DEFAULT = 2.8
     NIFTY_OI_WALL_MOD_DEFAULT = 1.7
-    NIFTY_STRADDLE_RATIO_SELL_DEFAULT = 1.18
-    NIFTY_VRP_SELL_DEFAULT = 3.0
-    NIFTY_VRP_FAIR_DEFAULT = 1.5
+    NIFTY_STRADDLE_RATIO_SELL_DEFAULT = 1.10
+    NIFTY_VRP_SELL_DEFAULT = 2.5
+    NIFTY_VRP_FAIR_DEFAULT = 1.2
 
     def __init__(self, db, config, logger):
         self.db = db
@@ -203,9 +205,29 @@ class AutoCalibrator:
         return result
 
     def _calibrate_vix_thresholds(self):
-        vix_df = self.db.get_vix_history(days=730, from_date='2025-09-01')
+        _earliest = self.db.query_one("SELECT MIN(date) as d FROM vix_history")
+        _from_vix = _earliest["d"] if _earliest and _earliest.get("d") else "2025-09-01"
+        vix_df = self.db.get_vix_history(days=730, from_date=_from_vix)
         if vix_df.empty or len(vix_df) < 20:
-            self.logger.info("AutoCalibrator VIX: insufficient data, using NIFTY 2026 defaults")
+            self.logger.info("AutoCalibrator VIX: no vix_history rows - attempting bootstrap from daily_summary")
+            try:
+                daily_df = self.db.get_daily_summary(days=730)
+                vix_cols = [c for c in ["vix_open", "vix_close", "vix_high", "vix_low"] if c in daily_df.columns]
+                if not daily_df.empty and vix_cols:
+                    import pandas as _pd
+                    import numpy as _np
+                    vix_vals = _pd.concat([daily_df[c].dropna() for c in vix_cols]).values
+                    vix_vals = vix_vals[(vix_vals > 8.0) & (vix_vals < 90.0)]
+                    if len(vix_vals) >= 20:
+                        p25 = float(max(_np.percentile(vix_vals, 25), 11.0))
+                        p50 = float(max(_np.percentile(vix_vals, 50), 14.0))
+                        p75 = float(max(_np.percentile(vix_vals, 75), 18.0))
+                        p90 = float(max(_np.percentile(vix_vals, 90), 24.0))
+                        self.logger.info(f"AutoCalibrator VIX bootstrap from daily_summary: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(vix_vals)})")
+                        return {"vix_p25": p25, "vix_p50": p50, "vix_p75": p75, "vix_p90": p90}
+            except Exception as _e:
+                self.logger.debug(f"VIX bootstrap from daily_summary failed: {_e}")
+            self.logger.info("AutoCalibrator VIX: using NIFTY 2026 defaults")
             return {
                 "vix_p25": getattr(self.config, "vix_low", self.NIFTY_VIX_LOW_DEFAULT),
                 "vix_p50": getattr(self.config, "vix_normal", self.NIFTY_VIX_NORMAL_DEFAULT),
@@ -221,6 +243,8 @@ class AutoCalibrator:
         p50 = max(p50, 14.0)
         p75 = max(p75, 18.0)
         p90 = max(p90, 24.0)
+        if len(v) < 200:
+            p90 = max(p90, 24.0)
         self.logger.info(f"AutoCalibrator VIX: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(v)})")
         return {"vix_p25": p25, "vix_p50": p50, "vix_p75": p75, "vix_p90": p90}
 
@@ -232,7 +256,6 @@ class AutoCalibrator:
                 "JOIN trade_entries te ON ms.date = te.trading_date "
                 "JOIN trade_exits tx ON te.position_id = tx.position_id "
                 "WHERE ms.vrp IS NOT NULL AND ms.vrp > 0 "
-                "AND ms.date >= '2025-09-01' "
                 "ORDER BY ms.timestamp"
             )
             if len(rows) < 30:
@@ -347,22 +370,34 @@ class AutoCalibrator:
             }
 
     def _calibrate_day_size_multipliers(self):
+        nifty_2026_defaults = {
+            "day_size_monday": 0.75,
+            "day_size_tuesday": 0.55,
+            "day_size_wednesday": 0.65,
+            "day_size_thursday": 0.65,
+            "day_size_friday": 0.45,
+        }
         try:
             df = self.db.get_daily_summary(days=730)
             if df.empty or "net_pnl_rupees" not in df.columns or len(df) < 20:
-                return {}
+                return nifty_2026_defaults
             result = {}
             day_map = {1: "monday", 2: "tuesday", 3: "wednesday", 4: "thursday", 5: "friday"}
-            base_sizes = {1: 0.75, 2: 0.60, 3: 0.75, 4: 0.75, 5: 0.50}
+            base_sizes = {1: 0.75, 2: 0.55, 3: 0.65, 4: 0.65, 5: 0.45}
             for wd, name in day_map.items():
-                sub = df[df["weekday"] == wd]
+                sub = df[df["weekday"] == wd].copy()
                 if len(sub) < 5:
                     result[f"day_size_{name}"] = base_sizes[wd]
                     continue
-                wins = (sub["net_pnl_rupees"] > 0).sum()
-                total = len(sub)
+                traded = sub[sub["trades_executed"] > 0].copy() if "trades_executed" in sub.columns else sub.copy()
+                if len(traded) < 3:
+                    result[f"day_size_{name}"] = base_sizes[wd]
+                    self.logger.info(f"AutoCalibrator DaySize: {name} no trade data, using NIFTY 2026 default={base_sizes[wd]:.2f}")
+                    continue
+                wins = (traded["net_pnl_rupees"] > 0).sum()
+                total = len(traded)
                 win_rate = wins / total
-                avg_pnl = sub["net_pnl_rupees"].mean()
+                avg_pnl = traded["net_pnl_rupees"].mean()
                 if win_rate >= 0.60 and avg_pnl > 0:
                     size = min(base_sizes[wd] * 1.10, 1.00)
                 elif win_rate < 0.40 or avg_pnl < 0:
@@ -370,10 +405,13 @@ class AutoCalibrator:
                 else:
                     size = base_sizes[wd]
                 result[f"day_size_{name}"] = round(size, 2)
-                self.logger.info(f"AutoCalibrator DaySize: {name} win_rate={win_rate:.1%} size={size:.2f} (n={total})")
+                self.logger.info(f"AutoCalibrator DaySize: {name} win_rate={win_rate:.1%} size={size:.2f} (n={total} traded_days={len(traded)})")
+            for k, v in nifty_2026_defaults.items():
+                if k not in result:
+                    result[k] = v
             return result
         except Exception:
-            return {}
+            return nifty_2026_defaults
 
     def _calibrate_dte_performance(self):
         try:
@@ -382,7 +420,6 @@ class AutoCalibrator:
                 "tx.net_pnl_rupees, tx.result "
                 "FROM trade_entries te "
                 "JOIN trade_exits tx ON te.position_id = tx.position_id "
-                "WHERE te.trading_date >= '2025-09-01' "
                 "ORDER BY te.entry_time"
             )
             if len(rows) < 5:
@@ -590,19 +627,73 @@ class CalibrationEngine:
         vix_df = self.db.get_vix_history(days=365)
         if len(vix_df) >= 50:
             v   = vix_df["vix_value"].dropna().values
+            v   = v[(v > 8.0) & (v < 90.0)]
             p25 = float(np.percentile(v, 25))
             p50 = float(np.percentile(v, 50))
             p75 = float(np.percentile(v, 75))
             p90 = float(np.percentile(v, 90))
+            _n_vix = len(v)
+            if _n_vix < 500:
+                p90 = max(p90, 24.0)
+            if _n_vix < 200:
+                p75 = max(p75, 18.0)
+            if _n_vix < 100:
+                p50 = max(p50, 14.0)
+            p25 = max(p25, 10.5)
+            p50 = max(p50, 13.0)
+            p75 = max(p75, 17.0)
             self.logger.info(
-                f"  VIX: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f}"
+                f"  VIX: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={_n_vix})"
             )
         else:
-            self.logger.warning(f"  VIX rows={len(vix_df)} < 50. Using estimates.")
-            p25 = getattr(self.config, "vix_low", 13.0)
-            p50 = getattr(self.config, "vix_normal", 16.0)
-            p75 = getattr(self.config, "vix_high", 22.0)
-            p90 = getattr(self.config, "vix_extreme_high", 28.0)
+            self.logger.info(f"  VIX rows={len(vix_df)} < 50. Attempting bootstrap from daily_summary.")
+            _vix_bootstrapped = False
+            try:
+                import pandas as _pd_boot
+                _daily = self.db.get_daily_summary(days=730)
+                _vcols = [c for c in ["vix_open", "vix_close", "vix_high", "vix_low", "vix_close_val"] if c in _daily.columns]
+                if not _daily.empty and _vcols:
+                    _vvals = _pd_boot.concat([_daily[c].dropna() for c in _vcols]).values
+                    _vvals = _vvals[(_vvals > 8.0) & (_vvals < 90.0)]
+                    if len(_vvals) >= 10:
+                        p25 = float(max(np.percentile(_vvals, 25), 10.5))
+                        p50 = float(max(np.percentile(_vvals, 50), 13.0))
+                        p75 = float(max(np.percentile(_vvals, 75), 17.0))
+                        p90 = float(max(np.percentile(_vvals, 90), 24.0))
+                        self.logger.info(f"  VIX bootstrap from daily_summary: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(_vvals)})")
+                        _vix_bootstrapped = True
+            except Exception as _ve:
+                self.logger.debug(f"  VIX bootstrap error: {_ve}")
+            if not _vix_bootstrapped:
+                try:
+                    import pandas as _pd2
+                    import sqlite3 as _sq2
+                    _conn2 = _sq2.connect(str(self.db.db_path))
+                    _vix_query = """
+                        SELECT vix_value FROM vix_history
+                        WHERE vix_value > 8 AND vix_value < 90
+                        ORDER BY timestamp
+                    """
+                    _vdf2 = _pd2.read_sql_query(_vix_query, _conn2)
+                    _conn2.close()
+                    if len(_vdf2) >= 10:
+                        _vvals2 = _vdf2["vix_value"].values
+                        p25 = float(max(np.percentile(_vvals2, 25), 11.0))
+                        p50 = float(max(np.percentile(_vvals2, 50), 14.0))
+                        p75 = float(max(np.percentile(_vvals2, 75), 18.0))
+                        p90 = float(max(np.percentile(_vvals2, 90), 24.0))
+                        self.logger.info(f"  VIX direct bootstrap OK: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(_vvals2)})")
+                        _vix_bootstrapped = True
+                    else:
+                        self.logger.info(f"  VIX direct query: {len(_vdf2)} rows - need 10")
+                except Exception as _ve2:
+                    self.logger.info(f"  VIX bootstrap retry error: {_ve2}")
+            if not _vix_bootstrapped:
+                self.logger.warning(f"  VIX rows={len(vix_df)} < 50 and bootstrap failed. Using NIFTY 2026 estimates.")
+                p25 = getattr(self.config, "vix_low", 13.0)
+                p50 = getattr(self.config, "vix_normal", 16.0)
+                p75 = getattr(self.config, "vix_high", 22.0)
+                p90 = getattr(self.config, "vix_extreme_high", 28.0)
 
         vix_roc_emg = self.config.vix_roc_emergency_pct
         if len(vix_df) >= 200:
@@ -642,7 +733,8 @@ class CalibrationEngine:
         oi_mod    = self.config.oi_wall_moderate
 
         try:
-            snap_df = pd.read_sql_query(
+            import pandas as _pd_cal
+            snap_df = _pd_cal.read_sql_query(
                 "SELECT skew, oi_change_pct, resistance_oi, support_oi, "
                 "total_ce_oi, total_pe_oi FROM market_snapshots "
                 "WHERE skew != 0 AND date >= ? ORDER BY timestamp",
@@ -682,9 +774,9 @@ class CalibrationEngine:
         except Exception as e:
             self.logger.debug(f"  Extended calibration skipped: {e}")
 
-        tier1 = len(vix_df) >= 50 and n_days >= 5
-        tier2 = n_days >= self.config.min_trading_days_for_calibration and len(vix_df) >= 50
-        tier3 = n_days >= 60 and len(vix_df) >= 100
+        tier1 = n_days >= 5
+        tier2 = n_days >= self.config.min_trading_days_for_calibration
+        tier3 = n_days >= 60 and len(vix_df) >= 50
         cal_tier = 3 if tier3 else (2 if tier2 else (1 if tier1 else 0))
         valid = tier2
 
@@ -692,7 +784,7 @@ class CalibrationEngine:
             self.logger.warning(
                 f"  Calibration tier={cal_tier}. "
                 f"Need {self.config.min_trading_days_for_calibration} days "
-                f"(have {n_days}) and 50 VIX rows (have {len(vix_df)})."
+                f"(have {n_days}). VIX rows={len(vix_df)} (informational only)."
             )
         else:
             self.logger.info(f"  Calibration tier={cal_tier} VALID.")
@@ -720,13 +812,23 @@ class CalibrationEngine:
             is_calibrated=valid,
             vrp_sell_threshold=3.0,
             vrp_fair_threshold=1.5,
-            day_size_monday=1.0,
-            day_size_tuesday=0.60,
-            day_size_wednesday=0.75,
-            day_size_thursday=0.75,
-            day_size_friday=0.50,
+            day_size_monday=0.75,
+            day_size_tuesday=0.55,
+            day_size_wednesday=0.65,
+            day_size_thursday=0.65,
+            day_size_friday=0.45,
         )
 
+        auto_cal = AutoCalibrator(self.db, self.config, self.logger)
+        auto_results = auto_cal.run()
+        _vrp_sell_final = float(auto_results.get("vrp_sell_threshold") or 2.5)
+        _vrp_fair_final = float(auto_results.get("vrp_fair_threshold") or 1.2)
+        _ds_mon = float(auto_results.get("day_size_monday") or 0.75)
+        _ds_tue = float(auto_results.get("day_size_tuesday") or 0.55)
+        _ds_wed = float(auto_results.get("day_size_wednesday") or 0.65)
+        _ds_thu = float(auto_results.get("day_size_thursday") or 0.65)
+        _ds_fri = float(auto_results.get("day_size_friday") or 0.45)
+        _sr_sell = float(auto_results.get("straddle_ratio_sell") or sr_sell)
         try:
             self.db.insert("calibration_state", {
                 "calibrated_at": datetime.now().isoformat(),
@@ -736,7 +838,7 @@ class CalibrationEngine:
                 "ivr_sell_threshold": self.config.ivr_sell,
                 "ivr_buy_threshold": self.config.ivr_buy,
                 "iv_hv_sell_threshold": self.config.iv_hv_sell,
-                "straddle_ratio_sell": sr_sell,
+                "straddle_ratio_sell": _sr_sell,
                 "oi_wall_strong": oi_strong,
                 "tuesday_avg_range": ranges[1], "monday_avg_range": ranges[0],
                 "thursday_avg_range": ranges[3], "friday_avg_range": ranges[4],
@@ -750,20 +852,17 @@ class CalibrationEngine:
                 "calibration_tier": cal_tier,
                 "is_valid": int(valid),
                 "notes": f"tier={cal_tier} days={n_days}",
-                "vrp_sell_threshold": 3.0,
-                "vrp_fair_threshold": 1.5,
-                "day_size_monday": 1.0,
-                "day_size_tuesday": 0.60,
-                "day_size_wednesday": 0.75,
-                "day_size_thursday": 0.75,
-                "day_size_friday": 0.50,
+                "vrp_sell_threshold": _vrp_sell_final,
+                "vrp_fair_threshold": _vrp_fair_final,
+                "day_size_monday": _ds_mon,
+                "day_size_tuesday": _ds_tue,
+                "day_size_wednesday": _ds_wed,
+                "day_size_thursday": _ds_thu,
+                "day_size_friday": _ds_fri,
             })
         except Exception as e:
             self.logger.warning(f"Could not save calibration: {e}")
-
-        auto_cal = AutoCalibrator(self.db, self.config, self.logger)
-        auto_results = auto_cal.run()
-        if auto_results.get("vix_p25") and not valid:
+        if auto_results.get("vix_p25"):
             cal.vix_p25 = auto_results.get("vix_p25", cal.vix_p25)
             cal.vix_p50 = auto_results.get("vix_p50", cal.vix_p50)
             cal.vix_p75 = auto_results.get("vix_p75", cal.vix_p75)
@@ -776,22 +875,14 @@ class CalibrationEngine:
             cal.oi_buildup_threshold = auto_results["oi_buildup_threshold"]
         if auto_results.get("oi_unwind_threshold"):
             cal.oi_unwind_threshold = auto_results["oi_unwind_threshold"]
-        if auto_results.get("straddle_ratio_sell"):
-            cal.straddle_ratio_sell = auto_results["straddle_ratio_sell"]
-        if auto_results.get("vrp_sell_threshold"):
-            cal.vrp_sell_threshold = auto_results["vrp_sell_threshold"]
-        if auto_results.get("vrp_fair_threshold"):
-            cal.vrp_fair_threshold = auto_results["vrp_fair_threshold"]
-        if auto_results.get("day_size_monday"):
-            cal.day_size_monday = auto_results["day_size_monday"]
-        if auto_results.get("day_size_tuesday"):
-            cal.day_size_tuesday = auto_results["day_size_tuesday"]
-        if auto_results.get("day_size_wednesday"):
-            cal.day_size_wednesday = auto_results["day_size_wednesday"]
-        if auto_results.get("day_size_thursday"):
-            cal.day_size_thursday = auto_results["day_size_thursday"]
-        if auto_results.get("day_size_friday"):
-            cal.day_size_friday = auto_results["day_size_friday"]
+        cal.straddle_ratio_sell = _sr_sell
+        cal.vrp_sell_threshold = _vrp_sell_final
+        cal.vrp_fair_threshold = _vrp_fair_final
+        cal.day_size_monday = _ds_mon
+        cal.day_size_tuesday = _ds_tue
+        cal.day_size_wednesday = _ds_wed
+        cal.day_size_thursday = _ds_thu
+        cal.day_size_friday = _ds_fri
         if auto_results.get("dte_0_win_rate") is not None:
             _dte0_wr = auto_results["dte_0_win_rate"]
             _dte0_n = auto_results.get("dte_0_n_trades", 0)
@@ -861,14 +952,27 @@ class RegimeClassifier:
         }
 
         emg = self._t("vix_roc_emergency", "vix_roc_emergency_pct")
-        if vix_roc >= emg:
+        _vix_regime_now = self._engine_ref.market_engine.state.get("vix_regime", "NORMAL") if self._engine_ref else "NORMAL"
+        _emg_adjusted = emg * 1.5 if _vix_regime_now == "SUPPRESSED" else emg
+        if vix_roc >= _emg_adjusted:
             details["trigger"] = "VIX_SPIKE"
             return VolatilityRegime.ABORT, details
 
         vix_ceil = self._t("vix_p90", "vix_extreme_high")
+        _vix_ceil_floor = getattr(self.config, "vix_extreme_high", 28.0)
+        vix_ceil = max(vix_ceil, _vix_ceil_floor * 0.80)
         if vix >= vix_ceil:
             details["trigger"] = "VIX_EXTREME"
             return VolatilityRegime.ABORT, details
+
+        _vrp_for_abort = signals.get("vrp")
+        if _vrp_for_abort is not None and _vrp_for_abort > 8.0:
+            details["trigger"] = "VRP_SPIKE_LIKELY_DATA_ERROR"
+            self.logger.warning(
+                f"VRP={_vrp_for_abort:.2f}pp exceeds 8.0pp — likely Parkinson RV data error. "
+                f"Treating as SELL_PREMIUM not ABORT to allow trading."
+            )
+            return VolatilityRegime.SELL_PREMIUM, details
 
         vix_fail = getattr(self._engine_ref, "_vix_fail_count", 0)
         if vix_fail >= self.config.vix_fail_limit:
@@ -876,9 +980,9 @@ class RegimeClassifier:
             return VolatilityRegime.ABORT, details
 
         scores = []
-        vix_lo = self._t("vix_p25", "vix_low")
-        vix_md = self._t("vix_p50", "vix_normal")
-        vix_hi = self._t("vix_p75", "vix_high")
+        vix_lo = max(self._t("vix_p25", "vix_low"), 10.5)
+        vix_md = max(self._t("vix_p50", "vix_normal"), 13.0)
+        vix_hi = max(self._t("vix_p75", "vix_high"), 17.0)
         scores.append(-1 if vix < vix_lo else -0.5 if vix < vix_md else 0 if vix < vix_hi else 1)
         scores.append(-1 if vix_roc < -2 else -0.5 if vix_roc < 0 else 0 if vix_roc < emg * 0.6 else 1)
 
@@ -975,7 +1079,6 @@ class RegimeClassifier:
             avg = same.mean()
             if dte == 0 and avg > 0:
                 from datetime import datetime as _dt
-                import math as _math
                 _now = now_ist()
                 _remaining_min = max(0, (_dt.combine(_now.date(), time(15, 30)) - _now).total_seconds() / 60.0)
                 _remaining_frac = _remaining_min / 375.0
@@ -1077,8 +1180,8 @@ class RegimeClassifier:
             return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: Price regime OBSERVING — OR not established"
         if price == PriceRegime.CHOPPY:
             return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: Choppy"
-        if now >= time(14, 45):
-            return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: Past 14:45"
+        if now >= time(14, 30):
+            return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: Past 14:30"
         if now < time(9, 45):
             return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: Before 09:45"
 
@@ -1122,8 +1225,13 @@ class RegimeClassifier:
 
         _bull_count = votes.count("BULL")
         _bear_count = votes.count("BEAR")
+        _sell_count = votes.count("SELL")
+        _range_count = votes.count("RANGE")
         if _bull_count >= 1 and _bear_count >= 1:
-            return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: BULL_BEAR_conflict_contradictory_signals"
+            if _sell_count >= 1:
+                pass
+            else:
+                return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: BULL_BEAR_conflict_contradictory_signals"
 
         _sell_votes = votes.count("SELL")
         _buy_votes = votes.count("BUY")
@@ -1174,6 +1282,8 @@ class RegimeClassifier:
 
         if sell >= 1 and range_ >= 1:
             _candidate = FinalRegime.PREMIUM_SELL_RANGE
+        elif sell >= 1 and bull >= 1 and bear >= 1:
+            _candidate = FinalRegime.PREMIUM_SELL_RANGE
         elif sell >= 1 and bull >= 1:
             _candidate = FinalRegime.PREMIUM_SELL_BULL
         elif sell >= 1 and bear >= 1:
@@ -1185,6 +1295,8 @@ class RegimeClassifier:
         elif buy >= 1 and bear >= 1:
             _candidate = FinalRegime.BUY_DIRECTIONAL_BEAR
         elif range_ >= 2:
+            _candidate = FinalRegime.PREMIUM_SELL_RANGE
+        elif sell >= 1:
             _candidate = FinalRegime.PREMIUM_SELL_RANGE
         else:
             return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: No regime map"
@@ -1286,6 +1398,7 @@ class RegimeEngine:
                 state.get("_straddle_open_for_regime", 0) == 0 and
                 now_ist().time() >= time(9, 30)):
             state["_straddle_open_for_regime"] = straddle
+            state["_straddle_open_for_summary"] = straddle
             self.logger.info(f"Regime opening straddle recorded: {straddle:.2f}")
 
     def _apply_persistence_filter(self, new_regime: RegimeSnapshot) -> RegimeSnapshot:
