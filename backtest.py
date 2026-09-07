@@ -149,8 +149,6 @@ def replay_day(conn, trading_date):
             _dte_slip = t.get("actual_dte") or 1
             _slip_per_leg = 0.30 + max(0, (_vix_at_entry - 14.0) * 0.05) + (0.15 if _dte_slip == 0 else 0.0)
             slippage_pts = _slip_per_leg * _n_legs
-            slippage_rs = slippage_pts * LOT_SIZE * (t.get("final_lots") or 1)
-            gross_pnl = gross_pnl - slippage_rs
             _pid_legs = q(conn, "SELECT quoted_mid_at_entry, quoted_mid_at_exit, entry_price, exit_price, action FROM position_legs WHERE position_id=?", (pid,))
             _actual_slippage_pts = 0.0
             for _leg in _pid_legs:

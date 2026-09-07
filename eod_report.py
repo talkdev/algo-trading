@@ -507,6 +507,69 @@ def compute_cost_by_strategy(trade_entries, trade_exits):
     return result
 
 
+def compute_exit_quality(trade_entries, trade_exits, chain_rows):
+    exits_by_position = {e["position_id"]: e for e in trade_exits}
+    result = []
+    for t in trade_entries:
+        pid = t.get("position_id")
+        ex = exits_by_position.get(pid)
+        if not ex:
+            continue
+        exit_time = ex.get("exit_time", "")
+        exit_reason = ex.get("exit_reason", "")
+        exit_premium = ex.get("exit_premium") or 0
+        entry_credit = t.get("entry_credit") or t.get("entry_debit") or 0
+        lots = t.get("final_lots", 1) or 1
+        C02 = 65
+        _mark_at_15 = None
+        _pnl_if_held = None
+        _override_cost_rs = None
+        _is_override = exit_reason in ("EMERGENCY_EXIT", "CLOSE_VIX_SPIKE", "ABORT")
+        _eod_chain = [c for c in chain_rows if c.get("capture_time", "") >= "15:00:00"[:len(c.get("capture_time", ""))]]
+        if _eod_chain and entry_credit > 0:
+            _eod_premium = 0.0
+            _legs_info = []
+            try:
+                import json as _j
+                _legs_info = _j.loads(t.get("legs_json", "[]")) if t.get("legs_json") else []
+            except Exception:
+                pass
+            for _leg in _legs_info:
+                _strike = _leg.get("strike")
+                _opt = _leg.get("option_type")
+                _action = _leg.get("action")
+                _eod_rows = [c for c in _eod_chain if abs((c.get("strike") or 0) - (_strike or 0)) < 1 and c.get("option_type") == _opt]
+                if _eod_rows:
+                    _bid = _eod_rows[-1].get("bid", 0) or 0
+                    _ask = _eod_rows[-1].get("ask", 0) or 0
+                    _mark = (_bid + _ask) / 2.0 if (_bid > 0 and _ask > 0) else (_bid or _ask)
+                    if _action == "SELL":
+                        _eod_premium += _mark
+                    else:
+                        _eod_premium -= _mark
+            if _eod_premium >= 0:
+                _mark_at_15 = round(_eod_premium, 3)
+                _pnl_if_held_pts = entry_credit - _eod_premium
+                _pnl_if_held = round(_pnl_if_held_pts * C02 * lots, 2)
+                _actual_pnl = ex.get("net_pnl_rupees") or 0
+                if _is_override:
+                    _override_cost_rs = round(_pnl_if_held - _actual_pnl, 2)
+        result.append({
+            "position_id": pid,
+            "strategy_name": t.get("strategy_name"),
+            "exit_reason": exit_reason,
+            "is_override_exit": _is_override,
+            "actual_net_pnl_rs": ex.get("net_pnl_rupees"),
+            "mark_at_15:00": _mark_at_15,
+            "pnl_if_held_to_15:00": _pnl_if_held,
+            "override_cost_rs": _override_cost_rs,
+            "hold_minutes": ex.get("hold_minutes"),
+            "exit_premium": exit_premium,
+            "entry_credit": entry_credit,
+        })
+    return result
+
+
 def compute_greeks_attribution(trade_entries, trade_exits, cycle_rows):
     exits_by_position = {e["position_id"]: e for e in trade_exits}
     result = []
@@ -944,6 +1007,7 @@ def generate_report(target_date):
     cost_by_strat       = compute_cost_by_strategy(trade_entries, trade_exits)
     regime_accuracy     = compute_regime_accuracy(regime_decisions, trade_exits)
     greeks_attr         = compute_greeks_attribution(trade_entries, trade_exits, cycle_rows)
+    exit_quality        = compute_exit_quality(trade_entries, trade_exits, chain_rows)
 
     iv_crush_by_pos = {}
     for t in trade_entries:
@@ -1159,6 +1223,14 @@ def generate_report(target_date):
                 md.append(md_kv({"IV crush": f"entry={crush.get('entry_atm_iv_pct')}% exit={crush.get('exit_atm_iv_pct')}% crush={crush.get('iv_crush_pct')}% [{crush.get('direction')}]"}))
         else:
             md.append("\n**Exit:** _No matching exit row — position may still be open._\n")
+    md.append("## 20b. Exit Quality Attribution\n")
+    if exit_quality:
+        _override_exits = [e for e in exit_quality if e.get("is_override_exit")]
+        _total_override_cost = sum(e.get("override_cost_rs") or 0 for e in _override_exits)
+        md.append(f"Override exits today: {len(_override_exits)} | Total override cost: Rs{_total_override_cost:.0f}\n")
+        md.append(md_table(exit_quality, ["position_id", "strategy_name", "exit_reason", "is_override_exit", "actual_net_pnl_rs", "mark_at_15:00", "pnl_if_held_to_15:00", "override_cost_rs", "hold_minutes"]))
+    else:
+        md.append("_No closed trades._\n")
     md.append("## 21. Greeks P&L Attribution\n")
     if greeks_attr:
         md.append(md_table(greeks_attr, ["position_id", "strategy_name", "net_pnl_rupees", "hold_minutes", "entry_vrp", "exit_vrp", "vrp_change", "estimated_theta_pts", "result", "exit_reason"]))
@@ -1333,6 +1405,8 @@ Key questions for LLM:
         "vwap_valid_cycles":   sum(1 for c in cycle_rows if c.get("vwap_dist_pct") is not None),
         "cost_by_strategy":           cost_by_strat,
         "greeks_pnl_attribution":     greeks_attr,
+        "exit_quality_attribution":   exit_quality,
+        "override_exit_cost_rs":      sum(e.get("override_cost_rs") or 0 for e in exit_quality if e.get("is_override_exit")),
         "or_analysis":                or_analysis,
         "vix_intraday_profile":       vix_profile,
         "api_summary":                {k: v for k, v in api_summary.items() if k != "errors_sample"},

@@ -983,7 +983,7 @@ class StrategyEngine:
 
             _one_way_costs_rs = (total_costs_pts + total_slippage) * C02
             _rtrip_costs_rs = _one_way_costs_rs * 2.0
-            min_rupee = max(int(_rtrip_costs_rs * 2.0), 150)
+            min_rupee = max(int(_rtrip_costs_rs * 3.0), 200)
             _gross_profit_at_target = gross_credit * self._get_target_pct(s) if gross_credit else net_credit * self._get_target_pct(s)
             _gross_profit_rs = _gross_profit_at_target * C02
             if _gross_profit_rs < min_rupee:
@@ -1023,8 +1023,10 @@ class StrategyEngine:
         raw_lots = max_risk / max_loss_per_lot
         base_lots = max(1, int(raw_lots))
         intended = raw_lots * size_mult
-        if intended < 0.5:
-            return {"valid": False, "reason": f"intended_lots_{intended:.2f}_below_minimum"}
+        _is_4leg = strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY", "POST_EVENT_STRADDLE")
+        _min_lots_4leg = 2 if _is_4leg else 1
+        if intended < 0.5 or (intended < _min_lots_4leg and _is_4leg):
+            return {"valid": False, "reason": f"intended_lots_{intended:.2f}_below_minimum_{_min_lots_4leg}lot_floor"}
 
         final_lots = max(1, int(base_lots * size_mult))
         capital_scale = max(1, int(current_capital / self.config.starting_capital))
