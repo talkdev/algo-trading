@@ -485,12 +485,7 @@ give me each file wise issue name and its severity,impact apart from the below d
 keep your focus on making this engine highly profitable.
 
 below are the public repository links of the nifty options algo trade engine python files
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/full-system/config.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/full-system/data_manager.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/full-system/decision_journal.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/full-system/main.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/full-system/regime_engine.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/full-system/strategy_engine.py
+
 
 
 
@@ -501,15 +496,15 @@ do not hallucinate.
 Use approach of how professional and established nifty options intraday algo trader use.
 It is year 2026 so use NIFTY options rules and NIFTY intraday options behaviour accordingly.
 below are the public repository links of the nifty intraday options algo trade engine python files
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/backtest.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/eod_report.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/execution_engine.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/main.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/market_data_engine.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/nifty_algo_core.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/regime_bridge.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/regime_engine.py
 https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/strategy_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/regime_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/main.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/execution_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/eod_report.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/data_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/core.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/calibration_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/backtest.py
 go deeper and analyze again all the files only regarding proftability and accuracy not for errors or bugs.
 
 
