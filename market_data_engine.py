@@ -1630,7 +1630,7 @@ class MarketDataEngine:
 
         current_time = now_ist().time()
 
-        if current_time >= dtime(10, 15) and not self.state.get("or_computed"):
+        if current_time >= dtime(9, 30) and not self.state.get("or_computed"):
             orb_bars = bars[
                 (bars["time"] >= "09:15:00") & (bars["time"] < "09:30:00")
             ] if not bars.empty else pd.DataFrame()
@@ -1649,7 +1649,7 @@ class MarketDataEngine:
                             f"W={or_result['or_width']:.0f} [{or_result['or_condition']}]"
                         )
 
-        if current_time >= dtime(10, 15) and not self.state.get("session_initialized"):
+        if current_time >= dtime(9, 30) and not self.state.get("session_initialized"):
             if atm_iv and not chain_stale:
                 self.state["opening_iv"] = atm_iv
                 self.state["session_initialized"] = True

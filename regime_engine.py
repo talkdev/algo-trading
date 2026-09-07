@@ -1006,7 +1006,10 @@ class RegimeClassifier:
         scores.append(-1 if ivr > ivr_s else -0.5 if ivr > self.config.ivr_neutral_low else 0 if ivr > ivr_b else 1)
 
         iv_hv_s = self._t("iv_hv_sell_threshold", "iv_hv_sell")
-        scores.append(-1 if iv_hv > iv_hv_s else -0.5 if iv_hv > self.config.iv_hv_neutral else 0 if iv_hv > self.config.iv_hv_buy else 1)
+        if iv_hv is None or iv_hv <= 0:
+            scores.append(0)
+        else:
+            scores.append(-1 if iv_hv > iv_hv_s else -0.5 if iv_hv > self.config.iv_hv_neutral else 0 if iv_hv > self.config.iv_hv_buy else 1)
 
         sr_s = self._t("straddle_ratio_sell", "straddle_ratio_sell")
         scores.append(-1 if s_ratio > sr_s else -0.5 if s_ratio > self.config.straddle_ratio_neutral_h else 0 if s_ratio > self.config.straddle_ratio_neutral_l else 1)
@@ -1043,11 +1046,15 @@ class RegimeClassifier:
             if df.empty or len(df) < 20:
                 return 50.0
             vals = df["vix_value"].dropna().values
+            vals = vals[(vals > 8.0) & (vals < 90.0)]
+            if len(vals) < 20:
+                return 50.0
+            _adj_iv = current_iv_pct / 1.15
             lo = np.percentile(vals, 5)
             hi = np.percentile(vals, 95)
             if hi <= lo:
                 return 50.0
-            return float(np.clip((current_iv_pct - lo) / (hi - lo) * 100.0, 0, 100))
+            return float(np.clip((_adj_iv - lo) / (hi - lo) * 100.0, 0, 100))
         except Exception:
             return 50.0
 
@@ -1055,17 +1062,17 @@ class RegimeClassifier:
         try:
             df = self.db.get_spot_history(days=self.config.hv_lookback_days + 10)
             if df.empty or "close" not in df.columns:
-                return 1.0
+                return None
             daily_closes = df.groupby("date")["close"].last().sort_index().values[-self.config.hv_lookback_days:]
             if len(daily_closes) < 5:
-                return 1.0
+                return None
             valid = daily_closes[daily_closes > 0]
             if len(valid) < 5:
-                return 1.0
+                return None
             hv = float(np.std(np.diff(np.log(valid))) * np.sqrt(252) * 100)
-            return current_iv_pct / hv if hv > 0 else 1.0
+            return current_iv_pct / hv if hv > 0 else None
         except Exception:
-            return 1.0
+            return None
 
     def _calculate_straddle_ratio(
         self, straddle: float, weekday: int, dte: Optional[int] = None
@@ -1074,12 +1081,24 @@ class RegimeClassifier:
             df = self.db.get_daily_summary(days=120)
             if df.empty or "realized_move" not in df.columns:
                 return 1.0
+            same_r = df[df["weekday"] == weekday]["day_range_points"].dropna() if "day_range_points" in df.columns else None
+            if same_r is not None and len(same_r) >= 5:
+                avg_r = same_r.mean()
+                avg = avg_r * 0.70 if avg_r > 0 else 0
+                if dte == 0 and avg > 0:
+                    from datetime import datetime as _dt
+                    _now = now_ist()
+                    _remaining_min = max(0, (_dt.combine(_now.date(), time(15, 30)) - _now).total_seconds() / 60.0)
+                    _remaining_frac = _remaining_min / 375.0
+                    import math as _math
+                    avg = avg * _math.sqrt(max(_remaining_frac, 0.05))
+                return straddle / avg if avg > 0 else 1.0
             same = df[df["weekday"] == weekday]["realized_move"].dropna()
             if len(same) < 5:
                 if "day_range_points" in df.columns:
-                    same_r = df[df["weekday"] == weekday]["day_range_points"].dropna()
-                    if len(same_r) >= 5:
-                        avg_r = same_r.mean()
+                    same_r2 = df[df["weekday"] == weekday]["day_range_points"].dropna()
+                    if len(same_r2) >= 5:
+                        avg_r = same_r2.mean()
                         avg = avg_r / 1.6 if avg_r > 0 else 0
                         if dte == 0 and avg > 0:
                             from datetime import datetime as _dt

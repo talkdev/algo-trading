@@ -716,7 +716,7 @@ class ExecutionEngine:
                 credit_stop_limit = gc * 2.2
                 if current_premium >= credit_stop_limit:
                     return "CLOSE_STOP", {"current_premium": current_premium}
-            else:
+            elif strategy_name not in ("IRON_CONDOR", "IRON_BUTTERFLY"):
                 credit_stop_limit = position["entry_credit"] * 1.6
                 actual_stop = min(
                     effective_stop if effective_stop is not None else credit_stop_limit,
@@ -1172,8 +1172,7 @@ class ExecutionEngine:
                 state["daily_halted"] = True
                 self.logger.warning("2 consecutive stops — halting trading for the day")
         elif reason in ("CLOSE_ADX", "CLOSE_VWAP", "CLOSE_DELTA"):
-            state["last_stop_time"]   = now_ist().isoformat()
-            state["last_stop_reason"] = reason
+            pass
         elif reason in ("CLOSE_TARGET", "CLOSE_TIME", "HARD_EXIT_15:00",
                          "EOD_CLOSE", "SHUTDOWN_CLOSE", "STALE_PRIOR_DAY_CLOSE",
                          "SELF_TEST_CLEANUP"):
