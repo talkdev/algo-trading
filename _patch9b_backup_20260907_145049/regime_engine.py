@@ -1006,11 +1006,10 @@ class RegimeClassifier:
         scores.append(-1 if ivr > ivr_s else -0.5 if ivr > self.config.ivr_neutral_low else 0 if ivr > ivr_b else 1)
 
         iv_hv_s = self._t("iv_hv_sell_threshold", "iv_hv_sell")
-        _iv_hv_safe = iv_hv if (iv_hv is not None and iv_hv > 0) else None
-        if _iv_hv_safe is None:
+        if iv_hv is None or iv_hv <= 0:
             scores.append(0)
         else:
-            scores.append(-1 if _iv_hv_safe > iv_hv_s else -0.5 if _iv_hv_safe > self.config.iv_hv_neutral else 0 if _iv_hv_safe > self.config.iv_hv_buy else 1)
+            scores.append(-1 if iv_hv > iv_hv_s else -0.5 if iv_hv > self.config.iv_hv_neutral else 0 if iv_hv > self.config.iv_hv_buy else 1)
 
         sr_s = self._t("straddle_ratio_sell", "straddle_ratio_sell")
         scores.append(-1 if s_ratio > sr_s else -0.5 if s_ratio > self.config.straddle_ratio_neutral_h else 0 if s_ratio > self.config.straddle_ratio_neutral_l else 1)
@@ -1591,8 +1590,6 @@ class RegimeEngine:
         cur_iv_pct = cur_iv_raw * 100.0 if cur_iv_raw < 2.0 else cur_iv_raw
         ivr     = self.classifier._calculate_ivr(cur_iv_pct)
         iv_hv   = self.classifier._calculate_iv_hv_ratio(cur_iv_pct)
-        if iv_hv is None:
-            iv_hv = 0.0
         s_ratio = self.classifier._calculate_straddle_ratio(
             signals.get("atm_straddle_price", 0) or 0,
             ts.weekday() if hasattr(ts, "weekday") else 0
@@ -1656,19 +1653,6 @@ class RegimeEngine:
         self, old: Optional[RegimeSnapshot], new: RegimeSnapshot
     ) -> None:
         if old is None or old.final_regime != new.final_regime:
-            _ivhv_str = f"{new.iv_hv_ratio:.2f}" if new.iv_hv_ratio is not None else "N/A"
-            _ivr_str = f"{new.ivr:.1f}" if new.ivr is not None else "N/A"
-            _vix_str = f"{new.vix_level:.2f}" if new.vix_level is not None else "N/A"
-            _roc_str = f"{new.vix_roc:.2f}" if new.vix_roc is not None else "N/A"
-            _adx15_str = f"{new.adx_15:.1f}" if new.adx_15 is not None else "N/A"
-            _adx60_str = f"{new.adx_60:.1f}" if new.adx_60 is not None else "N/A"
-            _oi_str = f"{new.oi_change_pct:.2%}" if new.oi_change_pct is not None else "N/A"
-            _skew_str = f"{new.skew:.2f}" if new.skew is not None else "N/A"
-            _raw_str = f"{new.raw_size_multiplier:.2f}" if new.raw_size_multiplier is not None else "N/A"
-            _fin_str = f"{new.size_multiplier:.2f}" if new.size_multiplier is not None else "N/A"
-            _wall_str = f"{new.oi_wall_strength:.2f}" if new.oi_wall_strength is not None else "N/A"
-            _mp_str = f"{new.max_pain_distance:.0f}" if new.max_pain_distance is not None else "N/A"
-            _pcr_str = f"{new.pcr:.3f}" if new.pcr is not None else "N/A"
             self.logger.info("-" * 55)
             self.logger.info(f"  REGIME -> {new.final_regime}")
             if new.event_day:
@@ -1683,24 +1667,24 @@ class RegimeEngine:
                 f"MTF={new.mtf_aligned}"
             )
             self.logger.info(
-                f"  ADX15={_adx15_str} ADX60={_adx60_str} "
+                f"  ADX15={new.adx_15:.1f} ADX60={new.adx_60:.1f} "
                 f"EMA={new.ema_structure}"
             )
             self.logger.info(
                 f"  Pos={new.positioning_regime} "
-                f"OIChg={_oi_str} Skew={_skew_str}"
+                f"OIChg={new.oi_change_pct:.2%} Skew={new.skew:.2f}"
             )
             self.logger.info(
-                f"  Conf={new.confidence} RawSize={_raw_str} "
-                f"FinalSize={_fin_str}"
+                f"  Conf={new.confidence} RawSize={new.raw_size_multiplier:.2f} "
+                f"FinalSize={new.size_multiplier:.2f}"
             )
             self.logger.info(
-                f"  VIX={_vix_str} ROC={_roc_str}% "
-                f"IVR={_ivr_str} IV/HV={_ivhv_str}"
+                f"  VIX={new.vix_level:.2f} ROC={new.vix_roc:.2f}% "
+                f"IVR={new.ivr:.1f} IV/HV={new.iv_hv_ratio:.2f}"
             )
             self.logger.info(
-                f"  OIWall={_wall_str} "
-                f"MaxPainDist={_mp_str}pts PCR={_pcr_str}"
+                f"  OIWall={new.oi_wall_strength:.2f} "
+                f"MaxPainDist={new.max_pain_distance:.0f}pts PCR={new.pcr:.3f}"
             )
             self.logger.info(
                 f"  Calibrated={new.is_calibrated} Tier={new.calibration_tier}"
