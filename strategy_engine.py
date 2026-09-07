@@ -38,17 +38,17 @@ DTE_REQUIREMENTS = {
 }
 
 MIN_CREDITS = {
-    "IRON_BUTTERFLY":  12,
-    "IRON_CONDOR":     10,
-    "BULL_PUT_SPREAD": 8,
-    "BEAR_CALL_SPREAD":8,
-    "POST_EVENT_STRADDLE": 20,
+    "IRON_BUTTERFLY":  25,
+    "IRON_CONDOR":     22,
+    "BULL_PUT_SPREAD": 18,
+    "BEAR_CALL_SPREAD":18,
+    "POST_EVENT_STRADDLE": 25,
 }
 MIN_CREDITS_TUESDAY = {
-    "IRON_BUTTERFLY":  15,
-    "IRON_CONDOR":     12,
-    "BULL_PUT_SPREAD": 10,
-    "BEAR_CALL_SPREAD":10,
+    "IRON_BUTTERFLY":  28,
+    "IRON_CONDOR":     25,
+    "BULL_PUT_SPREAD": 20,
+    "BEAR_CALL_SPREAD":20,
 }
 
 PRICE_STOPS = {
@@ -70,8 +70,8 @@ MIN_CREDIT_MULT_BY_REGIME = {
 }
 
 LOT_CAPS_BY_DAY = {
-    "MONDAY": 3, "TUESDAY": 2, "WEDNESDAY": 2,
-    "THURSDAY": 2, "FRIDAY": 1,
+    "MONDAY": 4, "TUESDAY": 3, "WEDNESDAY": 3,
+    "THURSDAY": 3, "FRIDAY": 3,
 }
 
 
@@ -949,8 +949,7 @@ class StrategyEngine:
             cost_floor   = total_costs_pts * 3.0
             min_credit   = max(static_floor, cost_floor)
 
-            _vix_min_scale = 0.65 if (s.get("vix") or 15.0) < 12.0 else (0.75 if (s.get("vix") or 15.0) < 14.0 else 1.0)
-            min_credit = min_credit * _vix_min_scale
+            _vix_min_scale = 1.0
             if net_credit < min_credit:
                 return {"valid": False, "reason": f"net_credit_{net_credit:.2f}_below_min_{min_credit:.2f}"}
 
@@ -982,17 +981,8 @@ class StrategyEngine:
             if net_profit_at_target <= 0.5:
                 return {"valid": False, "reason": f"net_profit_at_target_{net_profit_at_target:.2f}_non_positive"}
 
-            vix_regime = s.get("vix_regime", "NORMAL")
-            _vix_val_rp = s.get("vix") or 15.0
-            if _vix_val_rp < 11.5:
-                min_rupee = 100
-            elif _vix_val_rp < 13.0:
-                min_rupee = 150
-            elif _vix_val_rp < 15.0:
-                min_rupee = 175
-            else:
-                min_rupee = {"SUPPRESSED": 200, "LOW": 250, "NORMAL": 350,
-                             "ELEVATED": 450, "HIGH": 550}.get(vix_regime, 200)
+            _rtrip_costs_rs = (total_costs_pts + total_slippage) * 2.0 * C02
+            min_rupee = max(int(_rtrip_costs_rs * 3.0), 150)
             if net_profit_at_target * C02 < min_rupee:
                 return {"valid": False, "reason": f"projected_profit_below_Rs{min_rupee}"}
 

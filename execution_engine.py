@@ -219,7 +219,10 @@ class ExecutionEngine:
         if turnover <= 0:
             return {"total_rupees": 0.0, "breakdown": {}}
 
-        stt      = sell_pts * self.config.stt_options_sell
+        if action == "EXIT":
+            stt = buy_pts * self.config.stt_options_sell
+        else:
+            stt = sell_pts * self.config.stt_options_sell
         exchange = turnover * self.config.exchange_txn_rate
         sebi     = turnover * self.config.sebi_rate
         stamp    = buy_pts  * self.config.stamp_duty_buy_options
@@ -804,18 +807,13 @@ class ExecutionEngine:
 
         vwap_dist = signals.get("vwap_dist_pct")
         if vwap_dist is not None and current_time < dtime(14, 30):
-            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.30:
+            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.40:
                 return "CLOSE_VWAP", {"vwap_dist": vwap_dist}
-            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.30:
+            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.40:
                 return "CLOSE_VWAP", {"vwap_dist": vwap_dist}
-            if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY"):
-                if vwap_dist > 0.25:
-                    return "CLOSE_CALL_SIDE", {"vwap_dist": vwap_dist}
-                if vwap_dist < -0.25:
-                    return "CLOSE_PUT_SIDE", {"vwap_dist": vwap_dist}
 
-        if strategy_type == "SELL" and current_time >= dtime(14, 30):
-            cheap_thresh = 5.00 if strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD") else 3.00
+        if strategy_type == "SELL" and current_time >= dtime(13, 0):
+            cheap_thresh = 3.00 if strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD") else 2.00
             all_cheap = True
             for leg in legs:
                 if leg["leg_status"] != "OPEN" or leg["action"] != "SELL":
@@ -878,13 +876,7 @@ class ExecutionEngine:
     def monitor_all_positions(self, signals: dict) -> None:
         final_regime = signals.get("final_regime")
         if final_regime == "EMERGENCY_EXIT":
-            open_positions = self._get_open_positions()
-            if open_positions:
-                self.logger.warning(
-                    f"REGIME ENGINE EMERGENCY_EXIT — force-closing "
-                    f"{len(open_positions)} position(s)"
-                )
-                self.close_all_positions("EMERGENCY_EXIT")
+            self.logger.info("REGIME EMERGENCY_EXIT — blocking new entries only, positions managed by own rules")
             return
 
         if signals.get("vix_spike_detected"):
