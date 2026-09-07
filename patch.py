@@ -1,237 +1,128 @@
+# patch4.py — only 2 real fixes needed now
+from __future__ import annotations
 import ast
+import shutil
 import sys
 from pathlib import Path
+from datetime import datetime
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parent
+BACKUP_DIR = BASE / f"_patch4_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+_errors = []
+_applied = []
+_skipped = []
 
+def backup(fp):
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(fp, BACKUP_DIR / Path(fp).name)
 
-def read_file(p):
-    return p.read_text(encoding="utf-8")
+def read(fp):
+    return Path(fp).read_text(encoding="utf-8")
 
+def write(fp, content):
+    backup(Path(fp))
+    Path(fp).write_text(content, encoding="utf-8")
 
-def write_file(p, content):
-    p.write_text(content, encoding="utf-8")
-
-
-def verify_syntax(path):
-    src = read_file(path)
+def check_syntax(fp):
+    src = Path(fp).read_text(encoding="utf-8")
     try:
         ast.parse(src)
-        print(f"  SYNTAX OK: {path.name}")
         return True
     except SyntaxError as e:
-        print(f"  SYNTAX ERROR in {path.name}: line {e.lineno}: {e.msg}")
-        lines = src.split("\n")
-        start = max(0, e.lineno - 5)
-        end = min(len(lines), e.lineno + 5)
-        for i, line in enumerate(lines[start:end], start=start + 1):
-            marker = ">>>" if i == e.lineno else "   "
-            print(f"    {marker} {i:4d}: {repr(line)}")
+        msg = f"SYNTAX ERROR in {Path(fp).name} line {e.lineno}: {e.msg}"
+        _errors.append(msg)
+        print(f"  [FAIL] {msg}")
+        shutil.copy2(BACKUP_DIR / Path(fp).name, fp)
         return False
 
+def rb(src, old, new, label):
+    if old not in src:
+        _skipped.append(label)
+        print(f"  [SKIP] Not found: {label}")
+        return src
+    result = src.replace(old, new, 1)
+    _applied.append(label)
+    print(f"  [OK] {label}")
+    return result
 
-def diagnose_ee():
-    path = BASE_DIR / "execution_engine.py"
-    src = read_file(path)
-    lines = src.split("\n")
-
-    print("--- execution_engine.py: delta_limit all occurrences ---")
-    for i, line in enumerate(lines, 1):
-        if "delta_limit" in line:
-            print(f"  {i:4d}: {repr(line)}")
-
-    print()
-    print("--- execution_engine.py: profit lock all occurrences ---")
-    for i, line in enumerate(lines, 1):
-        if "lock_stop" in line or "stop_at_breakeven" in line or "stop_moved_to_25pct" in line:
-            print(f"  {i:4d}: {repr(line)}")
-
-    print()
-    print("--- execution_engine.py: entry_credit * 0. occurrences ---")
-    for i, line in enumerate(lines, 1):
-        if "entry_credit * 0." in line:
-            print(f"  {i:4d}: {repr(line)}")
-
-    print()
-    print("--- execution_engine.py: lock_thresh and move_thresh context ---")
-    for i, line in enumerate(lines, 1):
-        if "lock_thresh" in line or "move_thresh" in line:
-            start = max(0, i - 2)
-            end = min(len(lines), i + 8)
-            for j in range(start - 1, end):
-                print(f"  {j+1:4d}: {repr(lines[j])}")
-            print()
-            break
-
-
-def fix_delta_limit_in_ee():
-    path = BASE_DIR / "execution_engine.py"
-    src = read_file(path)
-    lines = src.split("\n")
-    print("Fixing delta_limit in execution_engine.py...")
-
-    changed = False
+def show_lines(fp, pattern, ctx=4):
+    lines = Path(fp).read_text(encoding="utf-8").splitlines()
     for i, line in enumerate(lines):
-        if "delta_limit = 0.20 * total_open_lots" in line and "lot_size" not in line:
-            indent = ""
-            for ch in line:
-                if ch in (" ", "\t"):
-                    indent += ch
-                else:
-                    break
-            lines[i] = f"{indent}delta_limit = 0.20 * total_open_lots * self.config.lot_size"
-            print(f"  APPLIED: ee: delta_limit unified to index-point units at line {i+1}")
-            changed = True
+        if pattern in line:
+            s = max(0, i - ctx)
+            e = min(len(lines), i + ctx + 1)
+            print(f"  Found at line {i+1}:")
+            for j in range(s, e):
+                m = ">>>" if j == i else "   "
+                print(f"  {m} L{j+1}: {repr(lines[j])}")
 
-    if not changed:
-        print("  delta_limit lines in execution_engine.py:")
-        for i, line in enumerate(lines, 1):
-            if "delta_limit" in line:
-                print(f"    {i:4d}: {repr(line)}")
+print("=" * 68)
+print("NIFTY OPTIONS ALGO ENGINE PATCH 4")
+print("Only real issues confirmed in patched code")
+print(f"Base dir: {BASE}")
+print("=" * 68)
 
-    src = "\n".join(lines)
-    write_file(path, src)
-    return changed
+re_path = BASE / "regime_engine.py"
 
+print("\n[DIAGNOSE] Finding exact patterns...")
+print("\n--- pd.read_sql_query in CalibrationEngine.run ---")
+show_lines(re_path, "pd.read_sql_query", 5)
+print("\n--- snap_df = pd.read_sql_query ---")
+show_lines(re_path, "snap_df = pd.read_sql_query", 5)
+print("\n--- _pd2 usage ---")
+show_lines(re_path, "_pd2", 3)
+print("\n--- vix bootstrap from daily_summary ---")
+show_lines(re_path, "bootstrap from daily_summary", 3)
+show_lines(re_path, "_vix_bootstrapped", 3)
+print("\n--- VIX p25 floor in CalibrationEngine.run ---")
+show_lines(re_path, "p25 = max", 3)
+show_lines(re_path, "p25 = float", 3)
 
-def fix_profit_lock_in_ee():
-    path = BASE_DIR / "execution_engine.py"
-    src = read_file(path)
-    lines = src.split("\n")
-    print("Fixing profit lock stops in execution_engine.py...")
+print("\n" + "=" * 68)
+print("APPLYING PATCH 4")
+print("=" * 68)
 
-    changed = False
-    for i, line in enumerate(lines):
-        if "lock_stop = max(" in line and "entry_credit" in line:
-            print(f"  Found lock_stop at line {i+1}: {repr(line)}")
-            if "0.70" in line:
-                lines[i] = line.replace("entry_credit * 0.70", "entry_credit * 0.80")
-                print(f"  APPLIED: ee: profit lock 0.70 -> 0.80")
-                changed = True
-            elif "0.80" in line:
-                print(f"  CONFIRMED: ee: profit lock already 0.80")
+print("\n[RE-FIX-1] Fix pd not defined in CalibrationEngine.run")
+src = read(re_path)
 
-        if '"stop_premium": entry_credit * 0.75' in line:
-            lines[i] = line.replace('"stop_premium": entry_credit * 0.75', '"stop_premium": entry_credit * 0.85')
-            print(f"  APPLIED: ee: stop_premium 0.75 -> 0.85 at line {i+1}")
-            changed = True
+src = rb(src,
+'            snap_df = pd.read_sql_query(\n                "SELECT skew, oi_change_pct, resistance_oi, support_oi, "\n                "total_ce_oi, total_pe_oi FROM market_snapshots "\n                "WHERE skew != 0 AND date >= ? ORDER BY timestamp",\n                self.db.get_connection(),\n                params=((date.today() - timedelta(days=365)).isoformat(),),\n            )',
+'            import pandas as _pd_cal\n            snap_df = _pd_cal.read_sql_query(\n                "SELECT skew, oi_change_pct, resistance_oi, support_oi, "\n                "total_ce_oi, total_pe_oi FROM market_snapshots "\n                "WHERE skew != 0 AND date >= ? ORDER BY timestamp",\n                self.db.get_connection(),\n                params=((date.today() - timedelta(days=365)).isoformat(),),\n            )',
+"RE-FIX-1: fix pd not defined in CalibrationEngine.run snap_df query")
 
-        if '"stop_premium": entry_credit * 0.85' in line:
-            print(f"  CONFIRMED: ee: stop_premium already 0.85 at line {i+1}")
+print("\n[RE-FIX-2] Fix VIX bootstrap in CalibrationEngine.run to use daily_summary vix columns")
+src = rb(src,
+'        if len(vix_df) >= 50:\n            v   = vix_df["vix_value"].dropna().values\n            p25 = float(np.percentile(v, 25))\n            p50 = float(np.percentile(v, 50))\n            p75 = float(np.percentile(v, 75))\n            p90 = float(np.percentile(v, 90))\n            _n_vix = len(v)\n            if _n_vix < 500:\n                p90 = max(p90, 24.0)\n            if _n_vix < 200:\n                p75 = max(p75, 18.0)\n            if _n_vix < 100:\n                p50 = max(p50, 14.0)\n            self.logger.info(\n                f"  VIX: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={_n_vix})"\n            )',
+'        if len(vix_df) >= 50:\n            v   = vix_df["vix_value"].dropna().values\n            v   = v[(v > 8.0) & (v < 90.0)]\n            p25 = float(np.percentile(v, 25))\n            p50 = float(np.percentile(v, 50))\n            p75 = float(np.percentile(v, 75))\n            p90 = float(np.percentile(v, 90))\n            _n_vix = len(v)\n            if _n_vix < 500:\n                p90 = max(p90, 24.0)\n            if _n_vix < 200:\n                p75 = max(p75, 18.0)\n            if _n_vix < 100:\n                p50 = max(p50, 14.0)\n            p25 = max(p25, 10.5)\n            p50 = max(p50, 13.0)\n            p75 = max(p75, 17.0)\n            self.logger.info(\n                f"  VIX: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={_n_vix})"\n            )',
+"RE-FIX-2: add floor to calibration VIX percentiles (p25>=10.5, p50>=13.0, p75>=17.0)")
 
-    if not changed:
-        print("  Profit lock lines in execution_engine.py:")
-        for i, line in enumerate(lines, 1):
-            if "lock_stop" in line or ("entry_credit" in line and "0.7" in line):
-                print(f"    {i:4d}: {repr(line)}")
+src = rb(src,
+'        else:\n            self.logger.info(f"  VIX rows={len(vix_df)} < 50. Attempting bootstrap from daily_summary.")\n            _vix_bootstrapped = False\n            try:\n                _daily = self.db.get_daily_summary(days=730)\n                _vcols = [c for c in ["vix_open", "vix_close", "vix_high", "vix_low"] if c in _daily.columns]\n                if not _daily.empty and _vcols:\n                    _vvals = _pd.concat([_daily[c].dropna() for c in _vcols]).values\n                    _vvals = _vvals[(_vvals > 8.0) & (_vvals < 90.0)]\n                    if len(_vvals) >= 20:\n                        p25 = float(max(np.percentile(_vvals, 25), 11.0))\n                        p50 = float(max(np.percentile(_vvals, 50), 14.0))\n                        p75 = float(max(np.percentile(_vvals, 75), 18.0))\n                        p90 = float(max(np.percentile(_vvals, 90), 24.0))\n                        self.logger.info(f"  VIX bootstrap from daily_summary: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(_vvals)})")\n                        _vix_bootstrapped = True\n            except Exception as _ve:\n                self.logger.debug(f"  VIX bootstrap error: {_ve}")',
+'        else:\n            self.logger.info(f"  VIX rows={len(vix_df)} < 50. Attempting bootstrap from daily_summary.")\n            _vix_bootstrapped = False\n            try:\n                import pandas as _pd_boot\n                _daily = self.db.get_daily_summary(days=730)\n                _vcols = [c for c in ["vix_open", "vix_close", "vix_high", "vix_low", "vix_close_val"] if c in _daily.columns]\n                if not _daily.empty and _vcols:\n                    _vvals = _pd_boot.concat([_daily[c].dropna() for c in _vcols]).values\n                    _vvals = _vvals[(_vvals > 8.0) & (_vvals < 90.0)]\n                    if len(_vvals) >= 10:\n                        p25 = float(max(np.percentile(_vvals, 25), 10.5))\n                        p50 = float(max(np.percentile(_vvals, 50), 13.0))\n                        p75 = float(max(np.percentile(_vvals, 75), 17.0))\n                        p90 = float(max(np.percentile(_vvals, 90), 24.0))\n                        self.logger.info(f"  VIX bootstrap from daily_summary: p25={p25:.1f} p50={p50:.1f} p75={p75:.1f} p90={p90:.1f} (n={len(_vvals)})")\n                        _vix_bootstrapped = True\n            except Exception as _ve:\n                self.logger.debug(f"  VIX bootstrap error: {_ve}")',
+"RE-FIX-3: fix pd not defined in VIX bootstrap, add vix_close_val column, lower min to 10 rows")
 
-    src = "\n".join(lines)
-    write_file(path, src)
-    return changed
+write(re_path, src)
+ok = check_syntax(re_path)
 
+print("\n" + "=" * 68)
+print("PATCH 4 SUMMARY")
+print("=" * 68)
+print(f"Applied: {len(_applied)}")
+for a in _applied:
+    print(f"  [OK] {a}")
+print(f"Skipped: {len(_skipped)}")
+for s in _skipped:
+    print(f"  [SKIP] {s}")
+print(f"Errors:  {len(_errors)}")
+for e in _errors:
+    print(f"  [ERR] {e}")
+print(f"\nBackups: {BACKUP_DIR}")
+print("\nNOTE: Issues 1,4,9,10,11,12,13 need fresh trading day run to verify.")
+print("      Issues 2,5,6,7 are self-fixing on next run.")
+print("      Issues 3,8 fixed by this patch.")
 
-def final_verify():
-    results = {}
-
-    se = read_file(BASE_DIR / "strategy_engine.py")
-    results["SE-01 theta gate expected_edge"] = "expected_edge_pts" in se
-    results["SE-02 target 0.50"] = "return 0.50" in se
-    results["SE-03 credit stop 1.5x in se"] = "credit_stop_mult = 1.5" in se
-    results["SE-04 tightening cleared"] = "return []" in se and "_build_tightening_schedule" in se
-    results["SE-05 slippage 0.30"] = "total_slippage += 0.30" in se
-    results["SE-06 gross_value mid-price"] = "gross_value = 0.0" in se and "_gv_mid" in se
-    results["SE-08 0DTE strike 0.50x"] = "0.50 / step" in se
-
-    ee = read_file(BASE_DIR / "execution_engine.py")
-    results["EE-01 delta_limit index units"] = "total_open_lots * self.config.lot_size" in ee
-    results["EE-02 profit lock 0.80"] = "entry_credit * 0.80" in ee
-    results["EE-03 quoted_mid_at_entry stored"] = "quoted_mid_at_entry" in ee
-
-    mde = read_file(BASE_DIR / "market_data_engine.py")
-    results["MDE-01 VIX proxy removed"] = "(vix / 100.0) * 0.65" not in mde
-    results["MDE-02 IV EXPANDING 8pct"] = "iv_change_pct <= 8.0" in mde
-    results["MDE-03 entry window 09:45"] = "9, 45" in mde or "09:45" in mde
-
-    re_src = read_file(BASE_DIR / "regime_engine.py")
-    results["RE-01 BULL+BEAR veto"] = "BULL_BEAR_conflict" in re_src
-    results["RE-02 confidence concordance"] = "_bull_count" in re_src
-    results["RE-03 VRP outcome-based"] = "shrinkage" in re_src
-    results["RE-04 bootstrap realized_move"] = "_bootstrap_realized_move" in re_src
-
-    core = read_file(BASE_DIR / "nifty_algo_core.py")
-    results["CORE-01 quoted_mid in schema"] = "quoted_mid_at_entry" in core
-    results["CORE-02 entry window 09:45"] = "09:45" in core or "9, 45" in core
-
-    bt = read_file(BASE_DIR / "backtest.py")
-    results["BT-01 actual slippage"] = "actual_slippage_pts" in bt
-    results["BT-02 payoff_geometry"] = "payoff_geometry_analysis" in bt
-
-    passed = sum(1 for v in results.values() if v)
-    failed = sum(1 for v in results.values() if not v)
-    print(f"\n  Verification: {passed}/{len(results)} confirmed")
-    if failed:
-        print("  MISSING:")
-        for k, v in results.items():
-            if not v:
-                print(f"    MISSING: {k}")
-    else:
-        print("  ALL confirmed")
-    return failed == 0
-
-
-def main():
-    print("Step 1: Diagnosing execution_engine.py for delta_limit and profit lock...")
-    diagnose_ee()
-    print()
-
-    print("Step 2: Fix delta_limit in execution_engine.py...")
-    fix_delta_limit_in_ee()
-    print()
-
-    print("Step 3: Fix profit lock stops in execution_engine.py...")
-    fix_profit_lock_in_ee()
-    print()
-
-    print("Step 4: Syntax verification...")
-    all_ok = True
-    for fname in ["nifty_algo_core.py", "market_data_engine.py", "regime_engine.py",
-                  "strategy_engine.py", "execution_engine.py", "main.py",
-                  "eod_report.py", "backtest.py"]:
-        fpath = BASE_DIR / fname
-        if fpath.exists():
-            ok = verify_syntax(fpath)
-            if not ok:
-                all_ok = False
-    print()
-
-    print("Step 5: Final verification...")
-    all_present = final_verify()
-    print()
-
-    if all_ok and all_present:
-        print("=" * 65)
-        print("ALL PATCHES VERIFIED — ENGINE READY")
-        print("=" * 65)
-        print()
-        print("All 15 critical fixes confirmed across all files.")
-        print()
-        print("Engine is now structurally capable of profitable trading:")
-        print("  Theta gate removed — engine can enter SELL trades")
-        print("  Payoff geometry fixed — 1:2 R:R, 66% break-even")
-        print("  0DTE strikes at 0.50x straddle — credit passes floors")
-        print("  VIX proxy RV removed — no synthetic RICH signal")
-        print("  Confidence = concordance — BULL+BEAR conflict = NO_TRADE")
-        print("  Mid-price fills — no double friction on entry")
-        print("  Entry window 09:45 — captures morning IV richness")
-        print("  Delta limit unified — consistent risk monitoring")
-        print("  Profit locks wider — positions have room to work")
-    elif not all_ok:
-        print("SYNTAX ERRORS remain — review above")
-        sys.exit(1)
-    else:
-        print("SOME PATCHES MISSING — review above")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+if _errors:
+    sys.exit(1)
+else:
+    print("\n[SUCCESS] Patch 4 complete.")
+    sys.exit(0)

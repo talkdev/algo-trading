@@ -1,12 +1,17 @@
+# file name is eod_report.py
+
 import glob
 import json
 import statistics
 import sqlite3
 import csv
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, date as _date_cls, timedelta
 
-TARGET_DATE = "2026-09-08"
+from datetime import date as _d
+_today_d = _d.today()
+TARGET_DATE = _today_d.isoformat()
+
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "reports"
 
@@ -478,12 +483,12 @@ def compute_slippage_analysis(trade_entries, trade_exits):
 
 
 def compute_cost_by_strategy(trade_entries, trade_exits):
-    exits_by_pos = {e["position_id"]: e for e in trade_exits}
+    exits_by_position = {e["position_id"]: e for e in trade_exits}
     result = {}
     for t in trade_entries:
         strat = t.get("strategy_name", "UNKNOWN")
         pid   = t.get("position_id")
-        ex    = exits_by_pos.get(pid)
+        ex    = exits_by_position.get(pid)
         if strat not in result:
             result[strat] = {"trades": 0, "wins": 0, "losses": 0, "total_costs": 0.0, "total_net_pnl": 0.0}
         result[strat]["trades"] += 1
@@ -496,17 +501,17 @@ def compute_cost_by_strategy(trade_entries, trade_exits):
                 result[strat]["losses"] += 1
     for s in result:
         t = result[s]["trades"]
-        result[s]["win_rate_pct"]      = round(result[s]["wins"] / t * 100, 1) if t else 0
+        result[s]["win_rate_pct"]       = round(result[s]["wins"] / t * 100, 1) if t else 0
         result[s]["avg_cost_per_trade"] = round(result[s]["total_costs"] / t, 2) if t else 0
     return result
 
 
 def compute_greeks_attribution(trade_entries, trade_exits, cycle_rows):
-    exits_by_pos = {e["position_id"]: e for e in trade_exits}
+    exits_by_position = {e["position_id"]: e for e in trade_exits}
     result = []
     for t in trade_entries:
         pid       = t.get("position_id")
-        ex        = exits_by_pos.get(pid)
+        ex        = exits_by_position.get(pid)
         entry_vrp = t.get("entry_vrp")
         exit_vrp  = None
         if ex:
@@ -906,6 +911,16 @@ def generate_report(target_date):
     for leg in legs:
         legs_by_position.setdefault(leg["position_id"], []).append(leg)
 
+    _dte_perf_raw = {}
+    for _dte_k in [0, 1, 2, 3, 4, 5, 6]:
+        _dte_trades = [t for t in trade_entries if (t.get("actual_dte") or 99) == _dte_k]
+        _dte_perf_raw[str(_dte_k)] = {
+            "trades": len(_dte_trades),
+            "wins": sum(1 for t in _dte_trades if exits_by_position.get(t.get("position_id"), {}).get("result") == "WIN"),
+            "losses": sum(1 for t in _dte_trades if exits_by_position.get(t.get("position_id"), {}).get("result") == "LOSS"),
+            "net_pnl": round(sum(exits_by_position.get(t.get("position_id"), {}).get("net_pnl_rupees", 0) or 0 for t in _dte_trades), 2),
+        }
+
     no_trade_reasons    = aggregate_no_trade_reasons(decisions)
     strategies_used     = aggregate_strategies(trade_entries)
     chain_summary       = summarize_option_chain(chain_rows)
@@ -956,7 +971,6 @@ def generate_report(target_date):
     md.append(f"**Target Date:** {target_date}  |  **Generated:** {datetime.now().isoformat()}\n")
     md.append("## 0. Engine Architecture Note\n")
     md.append("Integrated v2.0 engine. Regime engine classifies volatility, price, positioning using ADX, EMA, HH/HL, ORB, OI change, skew, PCR. Calibration tiered 0-3, auto-improves. All positions intraday only.\n")
-
     md.append("## 1. Table of Contents\n")
     md.append("2. Executive Summary | 3. Anomalies | 4. Calibration | 5. Session Config | 6. NIFTY Profile | 7. VRP Deep Dive | 8. VRP Curve | 9. ADX Profile | 10. PCR/Skew | 11. OR Analysis | 12. VIX Profile | 13. Regime Timeline | 14. Regime Distribution | 15. Regime Accuracy | 16. Market Data Timeline | 17. Gate Analysis | 18. Strategy Decisions | 19. No-Trade Reasons | 20. Trade Deep Dive | 21. Greeks Attribution | 22. IV Crush | 23. Slippage | 24. Cost by Strategy | 25. P&L Curve | 26. Option Chain | 27. Candle Stats | 28. API Health | 29. Data Quality | 30. Calibration Drift | 31. Cumulative Performance | 32. Prior Days | 33. Audit Warnings | 34. Master Timeline | 35. Daily Summary | 36. LLM Context | 37. Raw Export\n")
 
@@ -992,63 +1006,48 @@ def generate_report(target_date):
         "Audit log lines":             len(audit_file_lines),
     }
     md.append(md_kv(exec_summary))
-
     md.append("## 3. Auto-Detected Anomalies\n")
     md.append("\n".join(f"- {f}" for f in anomalies) + "\n")
-
     md.append("## 4. Calibration Status\n")
     md.append(md_kv(calibration_summary))
-
     md.append("## 5. Session Configuration\n")
     md.append(md_kv(session_state) if session_state else "_No session_state row found._\n")
-
     md.append("## 6. NIFTY Intraday Profile\n")
     md.append(md_kv(spot_profile))
-
     md.append("## 7. VRP / Volatility Deep Dive\n")
     md.append(md_kv(vrp_stats))
     md.append("\n**VRP thresholds (NIFTY 2026 calibrated):** VERY_RICH > 3.75pp. RICH 3.0-3.75pp. FAIR 1.5-3.0pp. THIN 0-1.5pp. CHEAP < 0. Parkinson RV uses 375 bars/day annualization.\n")
-
     md.append("## 8. Intraday VRP Curve\n")
     if vrp_curve:
         md.append(md_table(vrp_curve, ["time", "vrp", "atm_iv_pct", "parkinson_rv_pct", "volatility_condition"], max_rows=100))
     else:
         md.append("_No VRP curve data._\n")
-
     md.append("## 9. ADX / Trend Profile\n")
     md.append(md_kv(adx_profile))
-
     md.append("## 10. PCR / Skew / Directional Profile\n")
     md.append(md_kv(pcr_profile))
     md.append(md_kv(skew_profile))
-
     md.append("## 11. Opening Range Analysis\n")
     md.append(md_kv(or_analysis))
-
     md.append("## 12. VIX Intraday Profile\n")
     md.append(md_kv(vix_profile))
-
     md.append("## 13. Regime Engine Timeline\n")
     if regime_timeline:
         md.append(md_table(regime_timeline, ["time", "source", "final_regime", "confidence", "size_multiplier", "vol_regime", "price_regime_15", "positioning", "adx_15", "ema_structure", "calibration_tier", "notes"], max_rows=100))
     else:
         md.append("_No regime_decisions rows found._\n")
-
     md.append("## 14. Regime Distribution Today\n")
     for regime, count in regime_dist.items():
         md.append(f"- **{regime}**: {count} decisions\n")
-
     md.append("## 15. Regime Accuracy Scoring\n")
     if regime_accuracy:
         for regime, acc in regime_accuracy.items():
             md.append(f"- **{regime}**: {acc.get('WIN',0)}/{acc['total']} wins ({acc['win_rate_pct']}%)\n")
     else:
         md.append("_No regime accuracy data — need trades to score._\n")
-
     md.append("## 16. Market Data Timeline (cycle_log)\n")
     md.append(f"Total cycles: {len(cycle_rows)}.\n")
     md.append(md_table(cycle_rows, ["cycle_time", "spot", "vix", "vrp", "atm_iv_pct", "parkinson_rv_pct", "adx", "adx_condition", "vwap_dist_pct", "pcr", "skew_ratio", "or_condition", "volatility_condition", "trend_condition", "direction", "final_regime", "confidence", "action_taken", "no_trade_reason", "open_positions", "daily_pnl_net"], max_rows=100))
-
     md.append("## 17. Gate Blockage Analysis\n")
     gate_categories = {
         "risk_gates":       ["daily_loss_limit", "max_entries", "max_concurrent", "consecutive_stops", "stop_cooldown"],
@@ -1083,17 +1082,14 @@ def generate_report(target_date):
     md.append("\n**Top 10 no-trade reasons:**\n")
     for reason, count in list(no_trade_reasons.items())[:10]:
         md.append(f"- [{count}x] {reason}\n")
-
     md.append("## 18. Strategy Decisions\n")
     md.append(md_table(decisions, ["decision_time", "action", "strategy_name", "reason"], max_rows=100))
-
     md.append("## 19. No-Trade Reason Frequency\n")
     if no_trade_reasons:
         for reason, count in no_trade_reasons.items():
             md.append(f"- [{count}x] {reason}\n")
     else:
         md.append("_No NO_TRADE decisions recorded._\n")
-
     md.append("## 20. Trade Deep Dive\n")
     if not trade_entries:
         md.append("_No trades entered._\n")
@@ -1162,76 +1158,65 @@ def generate_report(target_date):
                 md.append(md_kv({"IV crush": f"entry={crush.get('entry_atm_iv_pct')}% exit={crush.get('exit_atm_iv_pct')}% crush={crush.get('iv_crush_pct')}% [{crush.get('direction')}]"}))
         else:
             md.append("\n**Exit:** _No matching exit row — position may still be open._\n")
-
     md.append("## 21. Greeks P&L Attribution\n")
     if greeks_attr:
         md.append(md_table(greeks_attr, ["position_id", "strategy_name", "net_pnl_rupees", "hold_minutes", "entry_vrp", "exit_vrp", "vrp_change", "estimated_theta_pts", "result", "exit_reason"]))
     else:
         md.append("_No trades._\n")
-
     md.append("## 22. IV Crush Per Trade\n")
     for pid, crush in iv_crush_by_pos.items():
         if crush:
             md.append(f"- **{str(pid)[:16]}**: entry={crush.get('entry_atm_iv_pct')}% exit={crush.get('exit_atm_iv_pct')}% crush={crush.get('iv_crush_pct')}% [{crush.get('direction')}]\n")
-
     md.append("## 23. Slippage Analysis\n")
     md.append(md_kv(slippage_analysis))
-
     md.append("## 24. Cost Breakdown by Strategy\n")
     for strat, cb in cost_by_strat.items():
         md.append(f"\n### {strat}\n")
         md.append(md_kv(cb))
-
     md.append("## 25. P&L Curve (intraday)\n")
     if pnl_curve:
         md.append(md_table(pnl_curve, ["time", "pnl", "spot", "vrp", "adx", "regime"], max_rows=100))
     else:
         md.append("_No P&L curve data._\n")
-
     md.append("## 26. Option Chain Statistics\n")
     md.append(md_kv(chain_summary))
     md.append(f"\n_Full chain ({len(chain_rows)} rows) in raw JSON export._\n")
-
     md.append("## 27. Intraday 1-Minute Candle Statistics\n")
     md.append(md_kv(candle_stats) if candle_stats else "_No intraday candle data._\n")
     md.append(f"\n_Total 1-min bars: {len(intraday_candles)}._\n")
-
     md.append("## 28. API Call Health\n")
     md.append(md_kv({k: v for k, v in api_summary.items() if k != "errors_sample"}))
     if api_summary.get("errors_sample"):
         md.append("\n**Sample API errors:**\n")
         md.append(md_table(api_summary["errors_sample"], ["call_time", "category", "endpoint", "status_code", "error_message"]))
-
     md.append("## 29. Data Quality Checks\n")
     dq = {
-        "Cycles missing spot":           sum(1 for c in cycle_rows if c.get("spot") is None),
+        "Cycles missing spot":             sum(1 for c in cycle_rows if c.get("spot") is None),
         "Cycles with day_move_used>=70pct": sum(1 for c in cycle_rows if (c.get("day_move_used_pct") or 0) >= 70.0),
-        "Max day_move_used_pct today":   round(max((c.get("day_move_used_pct") or 0 for c in cycle_rows), default=0), 1),
-        "Cycles with stale chain":        sum(1 for c in cycle_rows if c.get("chain_stale")),
-        "Stale chain pct":               round(sum(1 for c in cycle_rows if c.get("chain_stale")) / len(cycle_rows) * 100, 1) if cycle_rows else 0,
-        "Cycles missing VIX":            sum(1 for c in cycle_rows if c.get("vix") is None),
-        "Cycles missing VRP":            sum(1 for c in cycle_rows if c.get("vrp") is None),
-        "Cycles missing PCR":            sum(1 for c in cycle_rows if c.get("pcr") is None),
-        "Cycles no final_regime":        sum(1 for c in cycle_rows if not c.get("final_regime")),
-        "Cycles vol_condition=UNKNOWN":  sum(1 for c in cycle_rows if c.get("volatility_condition") == "UNKNOWN"),
-        "Cycles trend=OR_PENDING":       sum(1 for c in cycle_rows if c.get("trend_condition") == "OR_PENDING"),
-        "Regime decisions logged":       len(regime_decisions),
-        "Chain rows zero bid/ask":       chain_summary.get("zero_bid_ask_count", 0),
-        "Trades no exit row":            sum(1 for t in trade_entries if t["position_id"] not in exits_by_position),
-        "Positions still OPEN":          sum(1 for p in positions if p.get("status") == "OPEN"),
-        "VIX history rows today":        len(vix_history_today),
-        "Market snapshots today":        len(market_snaps_today),
-        "Calibration tier":              calibration_summary.get("calibration_tier"),
-        "Calibration valid":             calibration_summary.get("is_valid"),
+        "Max day_move_used_pct today":     round(max((c.get("day_move_used_pct") or 0 for c in cycle_rows), default=0), 1),
+        "Cycles with stale chain":          sum(1 for c in cycle_rows if c.get("chain_stale")),
+        "Stale chain pct":                 round(sum(1 for c in cycle_rows if c.get("chain_stale")) / len(cycle_rows) * 100, 1) if cycle_rows else 0,
+        "Cycles missing VIX":              sum(1 for c in cycle_rows if c.get("vix") is None),
+        "Cycles missing VRP":              sum(1 for c in cycle_rows if c.get("vrp") is None),
+        "Cycles missing PCR":              sum(1 for c in cycle_rows if c.get("pcr") is None),
+        "Cycles no final_regime":          sum(1 for c in cycle_rows if not c.get("final_regime")),
+        "Cycles vol_condition=UNKNOWN":    sum(1 for c in cycle_rows if c.get("volatility_condition") == "UNKNOWN"),
+        "Cycles trend=OR_PENDING":         sum(1 for c in cycle_rows if c.get("trend_condition") == "OR_PENDING"),
+        "Regime decisions logged":         len(regime_decisions),
+        "Chain rows zero bid/ask":         chain_summary.get("zero_bid_ask_count", 0),
+        "Trades no exit row":              sum(1 for t in trade_entries if t["position_id"] not in exits_by_position),
+        "Positions still OPEN":            sum(1 for p in positions if p.get("status") == "OPEN"),
+        "VIX history rows today":          len(vix_history_today),
+        "Market snapshots today":          len(market_snaps_today),
+        "Calibration tier":                calibration_summary.get("calibration_tier"),
+        "Calibration valid":               calibration_summary.get("is_valid"),
     }
     md.append(md_kv(dq))
-
     md.append("## 30. Calibration Drift Tracking\n")
     if calibration_drift:
         md.append(md_table(calibration_drift, ["calibrated_at", "calibration_tier", "is_valid", "vix_p50", "vix_p75", "skew_bearish_threshold", "oi_buildup_threshold", "straddle_ratio_sell", "vrp_sell_threshold", "day_size_tuesday"], max_rows=20))
     else:
         md.append("_No calibration history._\n")
-
     md.append("## 31. Cumulative Performance (90-day)\n")
     if equity_curve:
         md.append(md_kv({k: v for k, v in equity_curve.items() if k != "daily_pnl_series"}))
@@ -1240,13 +1225,11 @@ def generate_report(target_date):
             md.append(md_table(equity_curve["daily_pnl_series"], ["date", "pnl", "capital"], max_rows=90))
     else:
         md.append("_No cumulative data yet._\n")
-
     md.append("## 32. Prior Days Comparison\n")
     if prior_days_summary:
         md.append(md_table(prior_days_summary, ["trading_date", "day_label", "trades_executed", "win_rate_pct", "net_pnl_rupees", "net_pnl_pct_capital", "vrp_mean", "or_condition", "stops_fired", "profit_factor", "capital_end"], max_rows=10))
     else:
         md.append("_No prior days data._\n")
-
     md.append("## 33. Audit Log — Warnings and Errors\n")
     md.append(f"WARNING/ERROR/CRITICAL: {len(warning_error_lines)} of {len(audit_file_lines)} total ({len(audit_db_rows)} in DB)\n\n")
     if warning_error_lines:
@@ -1255,13 +1238,10 @@ def generate_report(target_date):
             md.append(f"_... {len(warning_error_lines) - 200} more lines in raw export._\n")
     else:
         md.append("_No warnings or errors logged today._\n")
-
     md.append("## 34. Unified Master Timeline\n")
     md.append(md_table([{"time": e[0], "type": e[1], "detail": e[2]} for e in timeline], ["time", "type", "detail"], max_rows=200))
-
     md.append("## 35. Daily Summary (engine EOD)\n")
     md.append(md_kv(daily_summary) if daily_summary else "_No daily_summary row found._\n")
-
     md.append("## 36. LLM Analysis Context\n")
     md.append(f"""
 **For AI/LLM analysis — NIFTY intraday options engine v2.0 — {target_date}:**
@@ -1285,8 +1265,15 @@ Key questions for LLM:
 10. Did VIX regime correctly size positions?
 11. What does the VRP curve suggest about premium richness timing?
 12. Were the calibrated VRP thresholds appropriate for today's market?
+13. Was the straddle ratio (opening_straddle vs realized_move) predictive of the day type?
+14. Were ADX signals available during the primary entry window (10:45-13:00)?
+15. Did the positioning regime (PCR/skew/OI) correctly predict directional bias?
+16. Was the Parkinson RV computation stable or did it show anomalies?
+17. Were there false EMERGENCY_EXIT signals due to data quality issues?
+18. Did the engine take all valid trades or were good setups blocked by gates?
+19. What was the optimal entry time based on VRP curve richness today?
+20. Were transaction costs below 15pct of gross credit collected?
 """)
-
     md.append("## 37. Raw Data Export Manifest\n")
     md.append(f"All tables exported to: `eod_report_{target_date}_raw/`\n")
 
@@ -1322,6 +1309,7 @@ Key questions for LLM:
         "chain_summary":              chain_summary,
         "vrp_statistics":             vrp_stats,
         "vrp_curve":                  vrp_curve,
+        "vrp_curve_full":             vrp_curve,
         "spot_profile":               spot_profile,
         "adx_profile":                adx_profile,
         "pcr_profile":                pcr_profile,
@@ -1336,20 +1324,18 @@ Key questions for LLM:
         "cumulative_performance_90d": equity_curve,
         "iv_crush_per_trade":         iv_crush_by_pos,
         "slippage_analysis":          slippage_analysis,
+        "straddle_ratio_today": daily_summary.get("straddle_ratio") if daily_summary else None,
+        "opening_straddle":    daily_summary.get("opening_straddle") if daily_summary else None,
+        "realized_move":       daily_summary.get("realized_move") if daily_summary else None,
+        "adx_available_cycles": sum(1 for c in cycle_rows if (c.get("adx_15") or 0) > 0),
+        "adx_unavailable_cycles": sum(1 for c in cycle_rows if (c.get("adx_15") or 0) == 0),
+        "vwap_valid_cycles":   sum(1 for c in cycle_rows if c.get("vwap_dist_pct") is not None),
         "cost_by_strategy":           cost_by_strat,
         "greeks_pnl_attribution":     greeks_attr,
         "or_analysis":                or_analysis,
         "vix_intraday_profile":       vix_profile,
         "api_summary":                {k: v for k, v in api_summary.items() if k != "errors_sample"},
-        "dte_performance_raw": {
-            str(dte): {
-                "trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == dte),
-                "wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == dte and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
-                "losses": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == dte and exits_by_pos.get(t.get("position_id"), {}).get("result") == "LOSS"),
-                "net_pnl": round(sum(exits_by_pos.get(t.get("position_id"), {}).get("net_pnl_rupees", 0) or 0 for t in trade_entries if (t.get("actual_dte") or 99) == dte), 2),
-            }
-            for dte in [0, 1, 2, 3, 4, 5, 6]
-        },
+        "dte_performance_raw":        _dte_perf_raw,
         "llm_analysis_context": {
             "target_date":         target_date,
             "net_pnl_rupees":      net_pnl,
@@ -1372,12 +1358,12 @@ Key questions for LLM:
             },
             "anomaly_count":       len([f for f in anomalies if "[FLAG]" in f]),
             "dte_breakdown": {
-                "dte_0_trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 0),
-                "dte_1_trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 1),
+                "dte_0_trades":     sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 0),
+                "dte_1_trades":     sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 1),
                 "dte_2plus_trades": sum(1 for t in trade_entries if (t.get("actual_dte") or 0) >= 2),
-                "dte_0_wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 0 and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
-                "dte_1_wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 1 and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
-                "dte_2plus_wins": sum(1 for t in trade_entries if (t.get("actual_dte") or 0) >= 2 and exits_by_pos.get(t.get("position_id"), {}).get("result") == "WIN"),
+                "dte_0_wins":       sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 0 and exits_by_position.get(t.get("position_id"), {}).get("result") == "WIN"),
+                "dte_1_wins":       sum(1 for t in trade_entries if (t.get("actual_dte") or 99) == 1 and exits_by_position.get(t.get("position_id"), {}).get("result") == "WIN"),
+                "dte_2plus_wins":   sum(1 for t in trade_entries if (t.get("actual_dte") or 0) >= 2 and exits_by_position.get(t.get("position_id"), {}).get("result") == "WIN"),
             },
             "day_move_used_at_entries": [
                 {"time": t.get("entry_time"), "day_move_used_pct": None}
@@ -1407,9 +1393,14 @@ Key questions for LLM:
 
 if __name__ == "__main__":
     import sys
-    td = TARGET_DATE
+    from datetime import date as _d2
+    td = _d2.today().isoformat()
     args = sys.argv[1:]
     for i, a in enumerate(args):
         if a == "--date" and i + 1 < len(args):
             td = args[i + 1]
+        elif a == "--yesterday":
+            from datetime import timedelta as _td2
+            td = (_d2.today() - _td2(days=1)).isoformat()
+    print(f"Generating EOD report for: {td}")
     generate_report(td)

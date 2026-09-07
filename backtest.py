@@ -1,3 +1,5 @@
+# file name is backtest.py
+
 import json
 import sqlite3
 import statistics
@@ -398,6 +400,7 @@ def run_walkforward_backtest(from_date=None, to_date=None):
             "starting_capital": STARTING_CAPITAL,
             "lot_size": LOT_SIZE,
             "engine_version": "v2.0_patched",
+            "nifty_options_context": "NIFTY weekly Tuesday expiry, suppressed VIX 2026 regime",
         },
         "overall_performance": {
             "profitable_days": prof_days,
@@ -504,6 +507,13 @@ def run_walkforward_backtest(from_date=None, to_date=None):
                 "What is the optimal entry window based on actual trade timing data?",
                 "Is the Tuesday 0DTE entry window (11:00-12:30) producing better results?",
                 "Are calibrated day sizes improving performance vs hardcoded sizes?",
+                "What is the win rate breakdown by VIX regime (SUPPRESSED/LOW/NORMAL/ELEVATED)?",
+                "Is IRON_CONDOR outperforming directional spreads in suppressed VIX?",
+                "What percentage of trades were exited via stop vs target vs time?",
+                "Is the straddle ratio at entry predictive of trade outcome?",
+                "Are false EMERGENCY_EXIT events detectable from the Parkinson RV data?",
+                "What is the average hold time by strategy and is it optimal for NIFTY intraday?",
+                "Are there specific OR conditions (NARROW/MODERATE) that produce better outcomes?",
             ],
         },
     }
