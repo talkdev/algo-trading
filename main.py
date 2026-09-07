@@ -1,4 +1,7 @@
-# file name is main.py
+# main.py
+# NIFTY Intraday Options Engine v3.0
+# Main orchestration loop: startup, intraday cycle, EOD tasks, shutdown.
+# Regime-based architecture — clean separation of concerns.
 
 from __future__ import annotations
 
@@ -7,83 +10,158 @@ import signal
 import time as time_module
 import traceback
 from datetime import datetime, date, time as dtime, timedelta
+from pathlib import Path
 
-from nifty_algo_core import (
+from core import (
     Config, Database, RateLimiter, UpstoxClient,
     ExpiryCalendar, now_ist, today_ist,
     print_section, print_kv_table,
     load_config, setup_logging,
 )
-from market_data_engine import MarketDataEngine
+from data_engine import MarketDataEngine
+from regime_engine import RegimeEngine, merge_regime_into_signals
+from calibration_engine import CalibrationEngine
 from strategy_engine import StrategyEngine
 from execution_engine import ExecutionEngine
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
 class MainEngine:
+    """
+    Main orchestration engine for NIFTY intraday options trading.
+
+    Architecture:
+    ┌─────────────────────────────────────────────────────────┐
+    │  MainEngine                                             │
+    │  ├── MarketDataEngine   (spot, VIX, chain, signals)     │
+    │  ├── CalibrationEngine  (self-calibrating thresholds)   │
+    │  ├── RegimeEngine       (4-dimensional regime class.)   │
+    │  ├── StrategyEngine     (strategy selection + params)   │
+    │  └── ExecutionEngine    (order execution + monitoring)  │
+    └─────────────────────────────────────────────────────────┘
+
+    Main loop (every regime_calc_interval_sec = 45s):
+    1. Reset if new day
+    2. Run market data cycle (fetch spot, VIX, chain, compute signals)
+    3. Run regime engine (classify vol/price/positioning, compute size)
+    4. Merge regime into signals
+    5. Monitor open positions (7-priority exit system)
+    6. Perform hard exit sweep at 15:00
+    7. Check daily loss halt
+    8. If entry possible: run strategy engine → execute entry
+    9. Update cycle log with P&L
+    10. Print cycle summary
+
+    Separate timers:
+    - Spot bar collection: every spot_bar_interval_sec (60s)
+    - Calibration: every calibration_interval_sec (3600s) + at startup + EOD
+    """
 
     def __init__(self):
+        # ── Load configuration ────────────────────────────────────────────
         self.config = load_config()
+
+        # ── Initialise database ───────────────────────────────────────────
         self.db = Database(self.config.db_path)
-        self.logger = setup_logging(self.db, self.config.log_dir)
+
+        # ── Initialise logging ────────────────────────────────────────────
+        import logging
+        log_level = getattr(logging, self.config.log_level.upper(), logging.INFO)
+        self.logger = setup_logging(self.db, self.config.log_dir, level=log_level)
+
+        # ── Initialise API client ─────────────────────────────────────────
         self.rate_limiter = RateLimiter(self.config.rate_limits)
         self.client = UpstoxClient(
             self.config, self.rate_limiter, self.db, self.logger
         )
+
+        # ── Initialise sub-engines ────────────────────────────────────────
         self.market_engine = MarketDataEngine(
             self.config, self.db, self.client, self.rate_limiter, self.logger
         )
-        self.strategy_engine = StrategyEngine(
+        self.cal_engine = CalibrationEngine(
+            self.db, self.config, self.logger
+        )
+        self.regime_engine = RegimeEngine(
             self.config, self.db, self.market_engine, self.logger
         )
+        self.strategy_engine = StrategyEngine(
+            self.config, self.db, self.market_engine, self.cal_engine, self.logger
+        )
         self.execution_engine = ExecutionEngine(
-            self.config, self.db, self.market_engine, self.client, self.logger
+            self.config, self.db, self.market_engine, self.cal_engine,
+            self.client, self.logger
         )
 
-        try:
-            from regime_engine import RegimeEngine
-            self._regime_engine = RegimeEngine(
-                self.config, self.db, self.market_engine, self.logger
-            )
-        except Exception as _re:
-            self.logger.warning(f"RegimeEngine init failed: {_re}")
-            self._regime_engine = None
-
-        self.loop_count = 0
-        self.running = True
+        # ── Loop state ────────────────────────────────────────────────────
+        self.loop_count              = 0
+        self.running                 = True
+        self._last_cycle_time        = 0.0
+        self._last_spot_time         = 0.0
+        self._last_calibration_time  = 0.0
         self._last_status_print_time = 0.0
-        self._last_cycle_time = 0.0
-        self._last_spot_time = 0.0
-        self._last_calibration_time = 0.0
-        self._eod_done = False
+        self._eod_done               = False
 
+        # ── Signal handlers ───────────────────────────────────────────────
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
-    def _handle_signal(self, signum, frame):
-        self.logger.info(f"Received signal {signum} — shutting down gracefully.")
+    # ─────────────────────────────────────────────────────────────────────
+    # SIGNAL HANDLING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _handle_signal(self, signum, frame) -> None:
+        """Handle OS signals (Ctrl+C, SIGTERM) for graceful shutdown."""
+        self.logger.info(f"Received signal {signum} — initiating graceful shutdown.")
         self.running = False
         raise KeyboardInterrupt()
 
+    # ─────────────────────────────────────────────────────────────────────
+    # STARTUP
+    # ─────────────────────────────────────────────────────────────────────
+
     def _print_startup_banner(self) -> None:
-        print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v2.0", char="#")
+        """Print startup configuration banner."""
+        print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
-            "Mode": "PAPER TRADE" if self.config.paper_trade_mode else "*** LIVE TRADING ***",
-            "Starting Capital": self.config.starting_capital,
-            "Max Daily Loss": f"{self.config.max_daily_loss_pct*100:.1f}%",
-            "Max Risk Per Trade": f"{self.config.max_risk_per_trade_pct*100:.2f}%",
-            "Trading Window": (
+            "Mode":                  "PAPER TRADE" if self.config.paper_trade_mode
+                                     else "*** LIVE TRADING ***",
+            "Starting Capital":      f"Rs{self.config.starting_capital:,.0f}",
+            "Max Daily Loss":        f"{self.config.max_daily_loss_pct*100:.1f}%",
+            "Max Risk Per Trade":    f"{self.config.max_risk_per_trade_pct*100:.3f}%",
+            "Trading Window":        (
                 f"{self.config.trading_window_start} - "
                 f"{self.config.trading_window_last_entry} "
                 f"(hard exit {self.config.hard_exit_time})"
             ),
-            "Lot Size": self.config.lot_size,
-            "ADX Trend Threshold": self.config.adx_trend_threshold,
-            "ADX Strong Threshold": self.config.adx_strong_threshold,
-            "EMA Fast / Slow": f"{self.config.ema_fast} / {self.config.ema_slow}",
-            "Event Size Multiplier": self.config.event_size_multiplier,
-            "Tuesday Early Exit": self.config.tuesday_early_exit_enabled,
-            "DB Path": str(self.config.db_path),
+            "Tuesday Window":        (
+                f"10:30 - {self.config.tuesday_last_entry} "
+                f"(hard exit {self.config.tuesday_hard_exit})"
+            ),
+            "Lot Size":              self.config.lot_size,
+            "Strike Step":           self.config.nifty_strike_step,
+            "ADX Trend Threshold":   self.config.adx_trend_threshold,
+            "ADX Strong Threshold":  self.config.adx_strong_threshold,
+            "VRP Sell Threshold":    f"{self.config.vrp_sell_threshold_default:.2f}pp (default)",
+            "ABORT VIX Spike":       f"{self.config.abort_vix_spike_pct:.0f}% from prev close",
+            "ABORT VIX Absolute":    f"{self.config.abort_vix_absolute:.0f}",
+            "Day Move Block":        f"{self.config.day_move_used_block_pct:.0f}%",
+            "Delta Close Threshold": self.config.delta_close_threshold,
+            "Spot Proximity":        f"{self.config.spot_proximity_pts}pts",
+            "Price Stop Mult":       f"{self.config.price_stop_straddle_mult:.2f}× straddle",
+            "Profit Lock DTE0":      f"{self.config.profit_lock_pct_dte0*100:.0f}%",
+            "Profit Lock DTE1+":     f"{self.config.profit_lock_pct_dte1plus*100:.0f}%",
+            "Cheap Buyback":         f"≤{self.config.cheap_buyback_pts}pts after "
+                                     f"{self.config.cheap_buyback_after_time}",
+            "Phantom Tracking":      self.config.phantom_trade_tracking,
+            "Calibration Min Days":  self.config.min_trading_days_for_calibration,
+            "DB Path":               str(self.config.db_path),
+            "Log Dir":               str(self.config.log_dir),
         }, title="STARTUP CONFIGURATION")
+
         if not self.config.paper_trade_mode:
             print("\n  " + "!" * 70)
             print("  !!! WARNING: LIVE TRADING MODE — REAL ORDERS WILL BE PLACED !!!")
@@ -91,34 +169,47 @@ class MainEngine:
         print()
 
     def _verify_lot_size(self) -> None:
+        """Log lot size verification reminder."""
         self.logger.info(
             f"Lot size configured as {self.config.lot_size} units/lot. "
             f"MANUALLY VERIFY against current NSE NIFTY contract spec "
-            f"and broker instrument master before live trading."
+            f"and broker instrument master before live trading. "
+            f"As of 2026, NIFTY lot size = 75 units (verify current spec)."
         )
 
     def _carry_forward_capital(self) -> None:
-        state = self.market_engine.state
+        """
+        Carry forward capital from the previous trading session.
+        Called at startup to ensure capital is correctly initialised.
+        """
+        state     = self.market_engine.state
+        today_str = today_ist().isoformat()
+
+        # Only carry forward if no trades have been taken today yet
         if state.get("entry_count", 0) != 0:
             return
-        today_str = today_ist().isoformat()
+
         last_summary = self.db.query_one(
-            "SELECT capital_end, net_pnl_rupees, trading_date FROM daily_summary "
+            "SELECT capital_end, net_pnl_rupees, trading_date "
+            "FROM daily_summary "
             "WHERE trading_date < ? AND capital_end IS NOT NULL "
             "ORDER BY trading_date DESC LIMIT 1",
             (today_str,),
         )
+
         if last_summary and last_summary.get("capital_end") is not None:
-            prior_capital = last_summary["capital_end"]
-            prior_pnl = last_summary.get("net_pnl_rupees", 0) or 0
-            prior_date = last_summary.get("trading_date", "unknown")
-            current = state.get("current_capital", 0)
+            prior_capital = float(last_summary["capital_end"])
+            prior_pnl     = float(last_summary.get("net_pnl_rupees", 0) or 0)
+            prior_date    = last_summary.get("trading_date", "unknown")
+            current       = float(state.get("current_capital", 0) or 0)
+
             if abs(prior_capital - current) > 0.01:
                 state["current_capital"] = prior_capital
                 self.market_engine._save_session_state()
                 self.logger.info(
                     f"Capital carried forward from {prior_date}: "
-                    f"Rs{prior_capital:,.2f} (session had Rs{current:,.2f}). "
+                    f"Rs{prior_capital:,.2f} "
+                    f"(session had Rs{current:,.2f}). "
                     f"Prior session P&L: Rs{prior_pnl:,.2f}"
                 )
             else:
@@ -128,71 +219,92 @@ class MainEngine:
                 )
 
     def _reconcile_open_positions_on_startup(self) -> None:
-        today_str = today_ist().isoformat()
+        """
+        Reconcile open positions on startup.
+        - Close stale prior-day positions
+        - Resume monitoring of today's open positions
+        """
+        today_str      = today_ist().isoformat()
         open_positions = self.execution_engine._get_open_positions()
+
         if not open_positions:
+            self.logger.info("Startup reconciliation: no open positions found.")
             return
+
         self.logger.info(
-            f"STARTUP RECONCILIATION: {len(open_positions)} open position(s) found"
+            f"Startup reconciliation: {len(open_positions)} open position(s) found."
         )
+
         for pos in open_positions:
             if pos["trading_date"] != today_str:
                 self.logger.warning(
                     f"Closing stale prior-day position: "
                     f"{pos['strategy_name']} from {pos['trading_date']}"
                 )
-                self.execution_engine.execute_close(pos, "STALE_PRIOR_DAY_CLOSE")
+                self.execution_engine.execute_close(
+                    pos, "STALE_PRIOR_DAY_CLOSE", 0, {}
+                )
             else:
                 self.logger.info(
                     f"Resuming today's open position: "
-                    f"{pos['strategy_name']} {pos['position_id'][:16]}..."
+                    f"{pos['strategy_name']} "
+                    f"{pos['position_id'][:16]}..."
                 )
 
-    def _get_capital_at_day_start(self) -> float:
-        today_str = today_ist().isoformat()
-        earliest = self.db.query_one(
-            "SELECT capital_at_entry FROM trade_entries "
-            "WHERE trading_date=? ORDER BY entry_time ASC LIMIT 1",
-            (today_str,),
-        )
-        if earliest and earliest.get("capital_at_entry") is not None:
-            return earliest["capital_at_entry"]
-        return self.market_engine.state.get(
-            "current_capital", self.config.starting_capital
-        )
+    # ─────────────────────────────────────────────────────────────────────
+    # INTRADAY HELPERS
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _market_open(self) -> bool:
+        """Return True if NSE market is currently open."""
+        if ExpiryCalendar.is_holiday(today_ist()):
+            return False
+        now = now_ist().time()
+        return dtime(9, 15) <= now <= dtime(15, 30)
 
     def compute_unrealized_pnl(self) -> float:
-        C02 = self.config.lot_size
+        """
+        Compute total unrealized P&L across all open positions.
+        Uses last_known_premium from positions table.
+        """
+        C02        = self.config.lot_size
         unrealized = 0.0
+
         for pos in self.execution_engine._get_open_positions():
             current_prem = pos.get("last_known_premium")
             if current_prem is None:
                 continue
-            if pos["strategy_type"] == "SELL":
-                unrealized += (
-                    (pos.get("entry_credit") or 0.0) - current_prem
-                ) * pos["final_lots"] * C02
-            else:
-                unrealized += (
-                    current_prem - (pos.get("entry_debit") or 0.0)
-                ) * pos["final_lots"] * C02
+            entry_credit = float(pos.get("entry_credit") or 0)
+            lots         = int(pos.get("final_lots", 1) or 1)
+            # P&L = (entry_credit - current_premium) × lot_size × lots
+            unrealized += (entry_credit - current_prem) * C02 * lots
+
         return unrealized
 
     def compute_total_daily_pnl(self) -> float:
-        realized = self.market_engine.state.get("daily_pnl", 0.0)
+        """Return realized + unrealized P&L for today."""
+        realized = float(self.market_engine.state.get("daily_pnl", 0.0) or 0.0)
         return realized + self.compute_unrealized_pnl()
 
     def check_daily_loss_halt(self) -> None:
-        state = self.market_engine.state
-        current_cap = state.get("current_capital", self.config.starting_capital)
+        """
+        Check if total daily P&L (realized + unrealized) exceeds daily loss limit.
+        Halts trading if limit is exceeded.
+        """
+        state       = self.market_engine.state
+        current_cap = float(state.get("current_capital", self.config.starting_capital) or 0)
+
         if not current_cap or current_cap <= 0:
             return
-        realized_pnl = state.get("daily_pnl", 0.0)
+
+        realized_pnl = float(state.get("daily_pnl", 0.0) or 0.0)
         day_start_cap = current_cap - realized_pnl
         if day_start_cap <= 0:
             day_start_cap = current_cap
+
         total_pnl = self.compute_total_daily_pnl()
-        loss_pct = max(0.0, -total_pnl) / day_start_cap
+        loss_pct  = max(0.0, -total_pnl) / day_start_cap
+
         if loss_pct >= self.config.max_daily_loss_pct and not state.get("daily_halted"):
             state["daily_halted"] = True
             self.logger.warning(
@@ -201,202 +313,261 @@ class MainEngine:
             )
             self.market_engine._save_session_state()
 
-    def perform_hard_exit_sweep(self) -> None:
-        current_time = now_ist().time()
-        _is_tuesday = today_ist().weekday() == 1
-        _hard_sweep_time = dtime(15, 0) if _is_tuesday else dtime(15, 0)
-        if current_time >= _hard_sweep_time:
-            open_positions = self.execution_engine._get_open_positions()
-            if open_positions:
-                self.logger.info(
-                    f"HARD EXIT SWEEP @ 15:00 — "
-                    f"closing {len(open_positions)} position(s)"
-                )
-                self.execution_engine.close_all_positions("HARD_EXIT_15:00")
+    def _get_capital_at_day_start(self) -> float:
+        """Return capital at the start of today's session."""
+        today_str = today_ist().isoformat()
+        earliest  = self.db.query_one(
+            "SELECT capital_at_entry FROM trade_entries "
+            "WHERE trading_date=? ORDER BY entry_time ASC LIMIT 1",
+            (today_str,),
+        )
+        if earliest and earliest.get("capital_at_entry") is not None:
+            return float(earliest["capital_at_entry"])
+        return float(self.market_engine.state.get(
+            "current_capital", self.config.starting_capital
+        ) or self.config.starting_capital)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SPOT BAR COLLECTION
+    # ─────────────────────────────────────────────────────────────────────
 
     def _run_spot_cycle(self) -> None:
+        """
+        Fetch and store today's 1-minute NIFTY candles.
+        Called every spot_bar_interval_sec (60s) independently of the main cycle.
+        """
         if not self._market_open():
             return
         try:
             candles = self.client.get_intraday_candles(
                 "NSE_INDEX|Nifty 50", "1minute"
             )
-            if candles:
-                trading_date = today_ist().isoformat()
-                rows = []
-                for c in candles:
-                    if len(c) >= 6:
-                        try:
-                            from nifty_algo_core import parse_ist_timestamp
-                            ts_raw = (str(c[0])
-                                      .replace("Z", "")
-                                      .replace("+05:30", "")
-                                      .replace("+0530", ""))
-                            ts = datetime.fromisoformat(ts_raw)
-                            ts_clean = ts.strftime("%H:%M:%S")
-                            from datetime import time as _dtime
-                            if not (_dtime(9, 15) <= ts.time() <= _dtime(15, 29)):
-                                continue
-                            rows.append((
-                                trading_date,
-                                ts_clean,
-                                1,
-                                float(c[1]), float(c[2]),
-                                float(c[3]), float(c[4]),
-                                int(c[5]),
-                                "upstox_intraday",
-                            ))
-                        except Exception as _te:
-                            self.logger.debug(
-                                f"Spot bar parse failed: {_te} raw={c[0]}"
-                            )
-                if rows:
-                    try:
-                        self.db.executemany(
-                            "INSERT OR REPLACE INTO intraday_candles "
-                            "(trading_date, candle_time, interval_min, "
-                            "open, high, low, close, volume, source) "
-                            "VALUES (?,?,?,?,?,?,?,?,?)",
-                            rows,
-                        )
-                        self.logger.debug(f"Spot cycle stored {len(rows)} bars for {trading_date}")
-                    except Exception as e:
-                        self.logger.warning(f"Spot bar insert error: {e}")
+            if not candles:
+                return
+
+            trading_date = today_ist().isoformat()
+            rows = []
+
+            for c in candles:
+                if len(c) < 5:
+                    continue
+                try:
+                    from core import parse_ist_timestamp
+                    ts_raw = (
+                        str(c[0])
+                        .replace("Z", "")
+                        .replace("+05:30", "")
+                        .replace("+0530", "")
+                    )
+                    ts = datetime.fromisoformat(ts_raw)
+                    if not (dtime(9, 15) <= ts.time() <= dtime(15, 29)):
+                        continue
+                    ts_clean = ts.strftime("%H:%M:%S")
+                    rows.append((
+                        trading_date, ts_clean, 1,
+                        float(c[1]), float(c[2]),
+                        float(c[3]), float(c[4]),
+                        int(c[5]) if len(c) > 5 else 0,
+                        "upstox_intraday",
+                    ))
+                except Exception as _te:
+                    self.logger.debug(f"Spot bar parse error: {_te} raw={c[0]}")
+
+            if rows:
+                try:
+                    self.db.executemany(
+                        "INSERT OR REPLACE INTO intraday_candles "
+                        "(trading_date, candle_time, interval_min, "
+                        "open, high, low, close, volume, source) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        rows,
+                    )
+                    self.logger.debug(
+                        f"Spot cycle stored {len(rows)} bars for {trading_date}"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Spot bar insert error: {e}")
+
         except Exception as e:
             self.logger.warning(f"Spot cycle error: {e}")
 
-    def _run_calibration_cycle(self, force: bool = False) -> None:
+    # ─────────────────────────────────────────────────────────────────────
+    # CALIBRATION
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _run_calibration_cycle(
+        self, force: bool = False, schedule: str = "daily"
+    ) -> None:
+        """
+        Run calibration cycle.
+        force=True: run regardless of market hours (startup, EOD).
+        """
         if not force and not self._market_open():
             return
         try:
-            from regime_engine import RegimeEngine
-            if hasattr(self, "_regime_engine") and self._regime_engine is not None:
-                self._regime_engine.run_calibration(force=force)
-                self.market_engine._save_session_state()
+            cal = self.cal_engine.run(schedule=schedule)
+            if cal:
+                # Update regime engine with new calibration
+                self.regime_engine.calibrator._state = cal
+                self.regime_engine.classifier.cal    = cal
+                self.logger.info(
+                    f"Calibration updated: tier={cal.calibration_tier} "
+                    f"vrp_sell={cal.vrp_sell_threshold:.2f}pp"
+                )
         except Exception as e:
-            self.logger.error(f"Calibration error: {e}", exc_info=True)
+            self.logger.error(f"Calibration cycle error: {e}", exc_info=True)
 
-    def _market_open(self) -> bool:
-        if ExpiryCalendar.is_holiday(today_ist()):
-            return False
-        now = now_ist().time()
-        return dtime(9, 15) <= now <= dtime(15, 30)
-
-    def _print_cycle_footer(self) -> None:
-        total_pnl = self.compute_total_daily_pnl()
-        open_positions = self.execution_engine._get_open_positions()
-        print_section("CYCLE SUMMARY")
-        print_kv_table({
-            "Cycle #": self.loop_count,
-            "Open Positions": len(open_positions),
-            "Realized P&L Today (Rs)": round(
-                self.market_engine.state.get("daily_pnl", 0.0), 2
-            ),
-            "Unrealized P&L (Rs)": round(self.compute_unrealized_pnl(), 2),
-            "Total P&L Today (Rs)": round(total_pnl, 2),
-            "Current Capital (Rs)": self.market_engine.state.get("current_capital"),
-            "Daily Halted": bool(self.market_engine.state.get("daily_halted")),
-            "Entries Today": self.market_engine.state.get("entry_count", 0),
-            "Consecutive Stops": self.market_engine.state.get("consecutive_stops", 0),
-            "VIX Regime": self.market_engine.state.get("vix_regime"),
-            "Day Label": self.market_engine.state.get("day_label"),
-        })
-        print()
+    # ─────────────────────────────────────────────────────────────────────
+    # MAIN CYCLE
+    # ─────────────────────────────────────────────────────────────────────
 
     def run_one_cycle(self) -> None:
+        """
+        Execute one complete trading cycle.
+        Called every regime_calc_interval_sec (default 45s).
+        """
         current_time = now_ist().time()
+
+        # ── Step 1: Reset if new day ──────────────────────────────────────
         self.market_engine.reset_if_new_day()
 
+        # ── Step 2: Market data cycle ─────────────────────────────────────
         signals = self.market_engine.run_cycle()
 
+        # ── Step 3: Regime classification ────────────────────────────────
         try:
-            from regime_bridge import merge_regime_into_signals
-            if hasattr(self, "_regime_engine") and self._regime_engine is not None:
-                regime_snap = self._regime_engine.process_signals(signals)
-                signals = merge_regime_into_signals(signals, regime_snap)
-            else:
-                self.logger.warning("RegimeEngine not available — signals will lack final_regime")
-        except ImportError:
-            self.logger.warning("regime_bridge import failed")
+            regime_snapshot = self.regime_engine.process_signals(signals)
+            signals = merge_regime_into_signals(signals, regime_snapshot)
         except Exception as e:
-            self.logger.error(f"Regime bridge error: {e}", exc_info=True)
+            self.logger.error(f"Regime engine error: {e}", exc_info=True)
+            # Continue without regime — signals will have None for regime fields
 
+        # ── Step 4: Update cycle log with regime outputs ──────────────────
         try:
             latest_cycle = self.db.query_one(
-                "SELECT cycle_id FROM cycle_log WHERE trading_date=? "
-                "ORDER BY cycle_id DESC LIMIT 1",
+                "SELECT cycle_id FROM cycle_log "
+                "WHERE trading_date=? ORDER BY cycle_id DESC LIMIT 1",
                 (today_ist().isoformat(),),
             )
             if latest_cycle and signals.get("final_regime"):
                 self.db.update(
                     "cycle_log",
                     {
-                        "final_regime": signals.get("final_regime"),
-                        "confidence": signals.get("confidence"),
-                        "price_regime_15": signals.get("price_regime_15"),
-                        "price_regime_60": signals.get("price_regime_60"),
-                        "mtf_aligned": int(signals.get("mtf_aligned", False)),
-                        "adx_15": signals.get("adx_15"),
-                        "adx_60": signals.get("adx_60"),
-                        "ema_structure": signals.get("ema_structure"),
-                        "no_trade_reason": signals.get("notes") if signals.get("final_regime") in ("NO_TRADE", "EMERGENCY_EXIT") else None,
+                        "vol_regime":        signals.get("vol_regime"),
+                        "price_regime":      signals.get("price_regime"),
+                        "positioning_regime":signals.get("positioning_regime"),
+                        "confidence_level":  signals.get("confidence_level"),
+                        "confidence_score":  signals.get("confidence_score"),
+                        "final_regime":      signals.get("final_regime"),
+                        "final_regime_notes":signals.get("final_regime_notes"),
+                        "size_multiplier":   signals.get("size_multiplier"),
+                        "block_new_entries": int(bool(signals.get("block_new_entries", False))),
+                        "no_trade_reason":   (
+                            signals.get("final_regime_notes")
+                            if signals.get("final_regime") in ("NO_TRADE", "ABORT")
+                            else None
+                        ),
                     },
                     {"cycle_id": latest_cycle["cycle_id"]},
                 )
         except Exception as _cle:
-            self.logger.debug(f"cycle_log regime update error: {_cle}")
+            self.logger.debug(f"Cycle log regime update error: {_cle}")
 
+        # ── Step 5: Monitor open positions ────────────────────────────────
+        # IMPORTANT: positions are ALWAYS monitored regardless of regime
+        # ABORT only blocks new entries — never closes existing positions
         self.execution_engine.monitor_all_positions(signals)
 
-        self.perform_hard_exit_sweep()
+        # ── Step 6: Hard exit sweep ───────────────────────────────────────
+        self.execution_engine.perform_hard_exit_sweep()
 
+        # ── Step 7: Daily loss halt check ─────────────────────────────────
         self.check_daily_loss_halt()
 
+        # ── Step 8: Strategy decision and entry ───────────────────────────
         entry_possible = (
+            current_time >= dtime(9, 30) and
             current_time <= dtime(14, 30) and
-            not self.market_engine.state.get("daily_halted")
+            not self.market_engine.state.get("daily_halted") and
+            not signals.get("block_new_entries") and
+            bool(signals.get("or_computed", False)) and
+            signals.get("final_regime") not in ("NO_TRADE", "ABORT", None)
         )
 
         if entry_possible:
-            decision = self.strategy_engine.decide(signals)
-            if decision.get("action") == "ENTER":
-                self.execution_engine.process_entry_decision(decision, signals)
+            try:
+                decision = self.strategy_engine.decide(signals)
+                if decision.get("action") == "ENTER":
+                    self.execution_engine.process_entry_decision(decision, signals)
+            except Exception as e:
+                self.logger.error(f"Strategy/entry error: {e}", exc_info=True)
 
+        # ── Step 9: Update cycle log with P&L ────────────────────────────
         total_pnl = self.compute_total_daily_pnl()
-        latest_cycle = self.db.query_one(
-            "SELECT cycle_id FROM cycle_log WHERE trading_date=? "
-            "ORDER BY cycle_id DESC LIMIT 1",
-            (today_ist().isoformat(),),
-        )
-        if latest_cycle:
-            self.db.update(
-                "cycle_log",
-                {"daily_pnl_net": total_pnl},
-                {"cycle_id": latest_cycle["cycle_id"]},
+        try:
+            latest_cycle = self.db.query_one(
+                "SELECT cycle_id FROM cycle_log "
+                "WHERE trading_date=? ORDER BY cycle_id DESC LIMIT 1",
+                (today_ist().isoformat(),),
             )
+            if latest_cycle:
+                self.db.update(
+                    "cycle_log",
+                    {"daily_pnl_net": total_pnl},
+                    {"cycle_id": latest_cycle["cycle_id"]},
+                )
+        except Exception as _ple:
+            self.logger.debug(f"Cycle log P&L update error: {_ple}")
 
-        self._print_cycle_footer()
+        # ── Step 10: Print cycle footer ───────────────────────────────────
+        self._print_cycle_footer(signals, total_pnl)
         self.loop_count += 1
 
-    def _compute_max_drawdown(self, pnl_series: list) -> float:
-        if not pnl_series:
-            return 0.0
-        peak = pnl_series[0]
-        max_dd = 0.0
-        for val in pnl_series:
-            if val > peak:
-                peak = val
-            dd = peak - val
-            if dd > max_dd:
-                max_dd = dd
-        return max_dd
+    def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:
+        """Print concise cycle summary to console."""
+        open_positions = self.execution_engine._get_open_positions()
+        print_section("CYCLE SUMMARY")
+        print_kv_table({
+            "Cycle #":            self.loop_count,
+            "Time":               now_ist().strftime("%H:%M:%S"),
+            "Open Positions":     len(open_positions),
+            "Realized P&L (Rs)":  f"{self.market_engine.state.get('daily_pnl', 0):,.0f}",
+            "Unrealized P&L (Rs)":f"{self.compute_unrealized_pnl():,.0f}",
+            "Total P&L (Rs)":     f"{total_pnl:,.0f}",
+            "Capital (Rs)":       f"{self.market_engine.state.get('current_capital', 0):,.0f}",
+            "Daily Halted":       bool(self.market_engine.state.get("daily_halted")),
+            "Block New Entries":  bool(signals.get("block_new_entries")),
+            "Entries Today":      self.market_engine.state.get("entry_count", 0),
+            "Consec. Stops":      self.market_engine.state.get("consecutive_stops", 0),
+            "Vol Regime":         signals.get("vol_regime", "N/A"),
+            "Price Regime":       signals.get("price_regime", "N/A"),
+            "Final Regime":       signals.get("final_regime", "N/A"),
+            "Confidence":         signals.get("confidence_level", "N/A"),
+            "Size Multiplier":    signals.get("size_multiplier", 0),
+            "VIX":                signals.get("vix", "N/A"),
+            "VRP Smoothed":       f"{signals.get('vrp_smoothed', 0):.2f}pp"
+                                  if signals.get("vrp_smoothed") else "N/A",
+            "IV Behavior":        signals.get("iv_behavior", "N/A"),
+            "Day Move Used":      f"{signals.get('day_move_used_pct', 0):.1f}%",
+            "Cal Tier":           signals.get("calibration_tier", 0),
+        })
+        print()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # DAILY SUMMARY
+    # ─────────────────────────────────────────────────────────────────────
 
     def generate_daily_summary(self) -> dict:
+        """
+        Generate and persist the end-of-day summary.
+        Called after market close.
+        """
         trading_date = today_ist().isoformat()
-        state = self.market_engine.state
+        state        = self.market_engine.state
 
         trades = self.db.query(
-            "SELECT * FROM trade_entries WHERE trading_date=?", (trading_date,)
+            "SELECT * FROM trade_entries WHERE trading_date=?",
+            (trading_date,),
         )
         exits = self.db.query(
             "SELECT te.* FROM trade_exits te "
@@ -409,126 +580,187 @@ class MainEngine:
             (trading_date,),
         )
         decisions = self.db.query(
-            "SELECT * FROM strategy_decisions WHERE trading_date=?", (trading_date,)
+            "SELECT * FROM strategy_decisions WHERE trading_date=?",
+            (trading_date,),
         )
 
+        # Performance metrics
         trades_attempted = len(decisions)
         trades_executed  = len(trades)
-        trades_won  = sum(1 for e in exits if e["result"] == "WIN")
-        trades_lost = sum(1 for e in exits if e["result"] == "LOSS")
-        win_rate_pct = (trades_won / len(exits) * 100.0) if exits else 0.0
+        trades_won       = sum(1 for e in exits if e.get("result") == "WIN")
+        trades_lost      = sum(1 for e in exits if e.get("result") == "LOSS")
+        win_rate_pct     = (trades_won / len(exits) * 100.0) if exits else 0.0
 
-        gross_pnl_rs  = sum(e["gross_pnl_rupees"] or 0.0 for e in exits)
-        total_costs_rs = sum(e["total_costs_rupees"] or 0.0 for e in exits)
-        net_pnl_rs    = sum(e["net_pnl_rupees"] or 0.0 for e in exits)
+        gross_pnl_rs  = sum(float(e.get("gross_pnl_rupees") or 0) for e in exits)
+        total_costs_rs = sum(float(e.get("total_costs_rupees") or 0) for e in exits)
+        net_pnl_rs    = sum(float(e.get("net_pnl_rupees") or 0) for e in exits)
 
         capital_start = self._get_capital_at_day_start()
-        capital_end   = state.get("current_capital", self.config.starting_capital)
+        capital_end   = float(state.get("current_capital", self.config.starting_capital) or 0)
         net_pnl_pct   = (net_pnl_rs / capital_start * 100.0) if capital_start else 0.0
 
+        # Market data from cycle log
         spots = [c["spot"] for c in cycle_rows if c.get("spot") is not None]
         vixs  = [c["vix"]  for c in cycle_rows if c.get("vix")  is not None]
-        vrps  = [c["vrp"]  for c in cycle_rows if c.get("vrp")  is not None]
-        pnl_series = [c["daily_pnl_net"] for c in cycle_rows if c.get("daily_pnl_net") is not None]
+        vrps  = [c.get("vrp_smoothed") or c.get("vrp_raw")
+                 for c in cycle_rows
+                 if (c.get("vrp_smoothed") or c.get("vrp_raw")) is not None]
+        pnl_series = [c["daily_pnl_net"] for c in cycle_rows
+                      if c.get("daily_pnl_net") is not None]
 
+        # Strategies and no-trade reasons
         strategies_used: dict = {}
         for t in trades:
-            strategies_used[t["strategy_name"]] = strategies_used.get(t["strategy_name"], 0) + 1
+            strategies_used[t["strategy_name"]] = \
+                strategies_used.get(t["strategy_name"], 0) + 1
 
         no_trade_reasons: dict = {}
         for d in decisions:
-            if d["action"] == "NO_TRADE":
-                r = d["reason"] or "unknown"
+            if d.get("action") == "NO_TRADE":
+                r = d.get("reason") or "unknown"
                 no_trade_reasons[r] = no_trade_reasons.get(r, 0) + 1
 
-        avg_hold = (sum(e["hold_minutes"] or 0.0 for e in exits) / len(exits)) if exits else 0.0
+        # Performance metrics
+        avg_hold = (
+            sum(float(e.get("hold_minutes") or 0) for e in exits) / len(exits)
+        ) if exits else 0.0
         avg_credit = (
-            sum((t["entry_credit"] or t["entry_debit"] or 0.0) for t in trades) / len(trades)
+            sum(float(t.get("entry_credit") or 0) for t in trades) / len(trades)
         ) if trades else 0.0
         avg_vrp_entry = (
-            sum(t["entry_vrp"] or 0.0 for t in trades) / len(trades)
+            sum(float(t.get("entry_vrp_smoothed") or t.get("entry_vrp") or 0)
+                for t in trades) / len(trades)
         ) if trades else 0.0
 
-        gross_wins  = sum(e["net_pnl_rupees"] for e in exits if (e["net_pnl_rupees"] or 0) > 0)
-        gross_losses = abs(sum(e["net_pnl_rupees"] for e in exits if (e["net_pnl_rupees"] or 0) < 0))
-        profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else (None if gross_wins > 0 else 0.0)
+        gross_wins   = sum(float(e.get("net_pnl_rupees") or 0)
+                           for e in exits if (e.get("net_pnl_rupees") or 0) > 0)
+        gross_losses = abs(sum(float(e.get("net_pnl_rupees") or 0)
+                               for e in exits if (e.get("net_pnl_rupees") or 0) < 0))
+        profit_factor = (
+            round(gross_wins / gross_losses, 3) if gross_losses > 0
+            else (None if gross_wins > 0 else 0.0)
+        )
 
-        max_concurrent = max((c["open_positions"] or 0) for c in cycle_rows) if cycle_rows else 0
-        stops_fired    = sum(1 for e in exits if e["exit_reason"] == "CLOSE_STOP")
-        max_drawdown   = self._compute_max_drawdown(pnl_series)
+        max_concurrent = max(
+            (int(c.get("open_positions") or 0) for c in cycle_rows), default=0
+        )
+        stops_fired = sum(
+            1 for e in exits if e.get("exit_reason") == "CLOSE_STOP"
+        )
 
-        event_day_str = ExpiryCalendar.is_event_day(today_ist())
+        # Max drawdown from P&L series
+        max_drawdown = 0.0
+        if len(pnl_series) >= 2:
+            peak = pnl_series[0]
+            for val in pnl_series:
+                if val > peak:
+                    peak = val
+                dd = peak - val
+                if dd > max_drawdown:
+                    max_drawdown = dd
 
-        bars = self.market_engine.get_today_spot_bars()
-        opening_spot = closing_spot = high_val = low_val = None
-        day_range = day_range_pct = realized_move = straddle_ratio = 0.0
-        if not bars.empty:
-            mb = bars[bars["time"] >= "09:15:00"]
-            if not mb.empty:
-                opening_spot = float(mb["open"].iloc[0])
-            closing_spot = float(bars["close"].iloc[-1])
-            high_val = float(bars["high"].max())
-            low_val  = float(bars["low"].min())
-            day_range = high_val - low_val
-            day_range_pct = (day_range / opening_spot * 100.0) if opening_spot else 0.0
-            if opening_spot:
-                realized_move = abs(closing_spot - opening_spot)
-            opening_straddle = self.market_engine.state.get("_straddle_open_for_summary", 0)
-            straddle_ratio = (opening_straddle / day_range) if (day_range > 0 and opening_straddle > 0) else 0.0
+        # Dominant regime
+        dominant_regime = self._get_dominant_regime(cycle_rows)
+
+        # Dominant vol/price regimes
+        vol_counts: dict   = {}
+        price_counts: dict = {}
+        for c in cycle_rows:
+            vr = c.get("vol_regime")
+            pr = c.get("price_regime")
+            if vr:
+                vol_counts[vr]   = vol_counts.get(vr, 0) + 1
+            if pr:
+                price_counts[pr] = price_counts.get(pr, 0) + 1
+
+        dominant_vol_regime   = max(vol_counts,   key=lambda k: vol_counts[k])   if vol_counts   else None
+        dominant_price_regime = max(price_counts, key=lambda k: price_counts[k]) if price_counts else None
+
+        # Phantom trade stats
+        phantom_count_row = self.db.query_one(
+            "SELECT COUNT(*) as total, "
+            "SUM(would_have_been_profitable) as would_have_won "
+            "FROM phantom_trades WHERE trading_date=?",
+            (trading_date,),
+        )
+        phantom_blocked   = int(phantom_count_row["total"] or 0) if phantom_count_row else 0
+        phantom_would_win = int(phantom_count_row["would_have_won"] or 0) if phantom_count_row else 0
+
+        # Regime accuracy
+        acc_row = self.db.query_one(
+            "SELECT AVG(score_value) as avg_score "
+            "FROM regime_accuracy_scores WHERE trading_date=?",
+            (trading_date,),
+        )
+        regime_accuracy = float(acc_row["avg_score"] or 0) if acc_row else None
+
+        # Straddle ratio
+        opening_straddle = float(state.get("_straddle_open_for_summary") or 0)
+        realized_move    = 0.0
+        straddle_ratio   = 0.0
+        if spots and len(spots) >= 2:
+            realized_move = abs(spots[-1] - spots[0])
+            if opening_straddle > 0:
+                straddle_ratio = round(opening_straddle / realized_move, 3) \
+                    if realized_move > 0 else 0.0
 
         summary = {
-            "trading_date": trading_date,
-            "day_label": state.get("day_label"),
-            "trades_attempted": trades_attempted,
-            "trades_executed": trades_executed,
-            "trades_won": trades_won,
-            "trades_lost": trades_lost,
-            "win_rate_pct": win_rate_pct,
-            "gross_pnl_rupees": gross_pnl_rs,
-            "total_costs_rupees": total_costs_rs,
-            "net_pnl_rupees": net_pnl_rs,
-            "net_pnl_pct_capital": net_pnl_pct,
-            "max_intraday_drawdown": max_drawdown,
+            "trading_date":           trading_date,
+            "day_label":              state.get("day_label"),
+            "trades_attempted":       trades_attempted,
+            "trades_executed":        trades_executed,
+            "trades_won":             trades_won,
+            "trades_lost":            trades_lost,
+            "win_rate_pct":           round(win_rate_pct, 1),
+            "gross_pnl_rupees":       round(gross_pnl_rs, 2),
+            "total_costs_rupees":     round(total_costs_rs, 2),
+            "net_pnl_rupees":         round(net_pnl_rs, 2),
+            "net_pnl_pct_capital":    round(net_pnl_pct, 3),
+            "max_intraday_drawdown":  round(max_drawdown, 2),
             "max_concurrent_positions": max_concurrent,
-            "stops_fired": stops_fired,
-            "daily_halt_triggered": 1 if state.get("daily_halted") else 0,
-            "vix_open": vixs[0] if vixs else None,
-            "vix_close": vixs[-1] if vixs else None,
-            "vix_low": min(vixs) if vixs else None,
-            "vix_high": max(vixs) if vixs else None,
-            "nifty_open": spots[0] if spots else opening_spot,
-            "nifty_close": spots[-1] if spots else closing_spot,
-            "nifty_low": min(spots) if spots else low_val,
-            "nifty_high": max(spots) if spots else high_val,
-            "or_width": state.get("or_width"),
-            "or_condition": state.get("or_condition"),
-            "vrp_mean": (sum(vrps) / len(vrps)) if vrps else None,
-            "strategies_used_json": json.dumps(strategies_used),
-            "no_trade_reasons_json": json.dumps(no_trade_reasons),
-            "avg_hold_minutes": avg_hold,
-            "avg_credit_pts": avg_credit,
-            "avg_vrp_at_entry": avg_vrp_entry,
-            "profit_factor": profit_factor,
-            "capital_start": capital_start,
-            "capital_end": capital_end,
-            "capital_change_pct": (
-                (capital_end - capital_start) / capital_start * 100.0
+            "stops_fired":            stops_fired,
+            "daily_halt_triggered":   1 if state.get("daily_halted") else 0,
+            "vix_open":               vixs[0]  if vixs  else None,
+            "vix_close":              vixs[-1] if vixs  else None,
+            "vix_low":                min(vixs) if vixs else None,
+            "vix_high":               max(vixs) if vixs else None,
+            "nifty_open":             spots[0]  if spots else None,
+            "nifty_close":            spots[-1] if spots else None,
+            "nifty_low":              min(spots) if spots else None,
+            "nifty_high":             max(spots) if spots else None,
+            "or_width":               state.get("or_width"),
+            "or_condition":           state.get("or_condition"),
+            "vrp_mean":               round(sum(vrps) / len(vrps), 3) if vrps else None,
+            "vrp_smoothed_mean":      round(sum(vrps) / len(vrps), 3) if vrps else None,
+            "dominant_vol_regime":    dominant_vol_regime,
+            "dominant_price_regime":  dominant_price_regime,
+            "dominant_final_regime":  dominant_regime,
+            "strategies_used_json":   json.dumps(strategies_used),
+            "no_trade_reasons_json":  json.dumps(no_trade_reasons),
+            "avg_hold_minutes":       round(avg_hold, 1),
+            "avg_credit_pts":         round(avg_credit, 3),
+            "avg_vrp_at_entry":       round(avg_vrp_entry, 3),
+            "profit_factor":          profit_factor,
+            "capital_start":          round(capital_start, 2),
+            "capital_end":            round(capital_end, 2),
+            "capital_change_pct":     round(
+                (capital_end - capital_start) / capital_start * 100.0, 3
             ) if capital_start else 0.0,
-            "event_day": int(bool(event_day_str)),
-            "event_name": event_day_str,
-            "opening_spot": opening_spot,
-            "closing_spot": closing_spot,
-            "high": high_val,
-            "low": low_val,
-            "day_range_points": round(day_range, 2),
-            "day_range_pct": round(day_range_pct, 3),
-            "vix_close_val": vixs[-1] if vixs else None,
-            "opening_straddle": self.market_engine.state.get("_straddle_open_for_summary", 0),
-            "opening_iv_pct": round((self.market_engine.state.get("opening_iv") or 0) * 100.0, 3),
-            "realized_move": round(realized_move, 2),
-            "straddle_ratio": round(straddle_ratio, 3),
-            "dominant_regime": self._get_dominant_regime(cycle_rows),
-            "created_at": now_ist().isoformat(),
+            "event_day":              int(bool(ExpiryCalendar.is_event_day(today_ist()))),
+            "event_name":             ExpiryCalendar.is_event_day(today_ist()),
+            "opening_spot":           spots[0]  if spots else None,
+            "closing_spot":           spots[-1] if spots else None,
+            "day_range_points":       round(max(spots) - min(spots), 2) if spots else 0,
+            "day_range_pct":          round(
+                (max(spots) - min(spots)) / spots[0] * 100, 3
+            ) if spots and spots[0] else 0,
+            "opening_straddle":       opening_straddle,
+            "realized_move":          round(realized_move, 2),
+            "straddle_ratio":         straddle_ratio,
+            "phantom_trades_blocked": phantom_blocked,
+            "phantom_would_have_won": phantom_would_win,
+            "regime_accuracy_score":  regime_accuracy,
+            "created_at":             now_ist().isoformat(),
         }
 
         self.db.upsert(
@@ -541,62 +773,80 @@ class MainEngine:
         return summary
 
     def _get_dominant_regime(self, cycle_rows: list) -> str:
+        """Return the most frequent final regime from today's cycle log."""
         if not cycle_rows:
             return "UNKNOWN"
-        regime_counts: dict = {}
+        counts: dict = {}
         for c in cycle_rows:
             r = c.get("final_regime") or c.get("action_taken") or "UNKNOWN"
             if r not in ("SIGNAL_ONLY", "NO_TRADE", None):
-                regime_counts[r] = regime_counts.get(r, 0) + 1
-        if not regime_counts:
+                counts[r] = counts.get(r, 0) + 1
+        if not counts:
             return "NO_TRADE"
-        return max(regime_counts, key=lambda k: regime_counts[k])
+        return max(counts, key=lambda k: counts[k])
 
     def _print_daily_summary(
-        self, summary: dict, no_trade_reasons: dict, strategies_used: dict
+        self,
+        summary:          dict,
+        no_trade_reasons: dict,
+        strategies_used:  dict,
     ) -> None:
+        """Print end-of-day summary to console."""
         print_section(
-            f"END OF DAY SUMMARY — {summary['trading_date']} ({summary['day_label']})",
-            char="#"
+            f"END OF DAY SUMMARY — {summary['trading_date']} "
+            f"({summary.get('day_label', '')})",
+            char="#",
         )
-        pf = summary["profit_factor"]
-        pf_display = f"{pf:.3f}" if pf is not None else "N/A (no losses)"
+        pf = summary.get("profit_factor")
+        pf_display = f"{pf:.3f}" if pf is not None else "N/A"
+
         print_kv_table({
-            "Trades Attempted": summary["trades_attempted"],
-            "Trades Executed": summary["trades_executed"],
-            "Won / Lost": f"{summary['trades_won']} / {summary['trades_lost']}",
-            "Win Rate": f"{summary['win_rate_pct']:.1f}%",
-            "Gross P&L (Rs)": summary["gross_pnl_rupees"],
-            "Total Costs (Rs)": summary["total_costs_rupees"],
-            "Net P&L (Rs)": summary["net_pnl_rupees"],
+            "Trades Attempted":    summary["trades_attempted"],
+            "Trades Executed":     summary["trades_executed"],
+            "Won / Lost":          f"{summary['trades_won']} / {summary['trades_lost']}",
+            "Win Rate":            f"{summary['win_rate_pct']:.1f}%",
+            "Gross P&L (Rs)":      f"{summary['gross_pnl_rupees']:,.2f}",
+            "Total Costs (Rs)":    f"{summary['total_costs_rupees']:,.2f}",
+            "Net P&L (Rs)":        f"{summary['net_pnl_rupees']:,.2f}",
             "Net P&L (% capital)": f"{summary['net_pnl_pct_capital']:.3f}%",
-            "Profit Factor": pf_display,
-            "Stops Fired": summary["stops_fired"],
-            "Max Concurrent": summary["max_concurrent_positions"],
-            "Max Drawdown (Rs)": summary["max_intraday_drawdown"],
-            "Daily Halt": bool(summary["daily_halt_triggered"]),
-            "NIFTY Open/Close": f"{summary['nifty_open']} / {summary['nifty_close']}",
-            "NIFTY Range": f"{summary['nifty_low']} - {summary['nifty_high']}",
-            "VIX Open/Close": f"{summary['vix_open']} / {summary['vix_close']}",
-            "OR Condition/Width": f"{summary['or_condition']} / {summary['or_width']}",
-            "Mean VRP (pp)": summary["vrp_mean"],
-            "Avg Hold (min)": f"{summary['avg_hold_minutes']:.1f}",
-            "Capital Start -> End": (
-                f"{summary['capital_start']:.0f} -> {summary['capital_end']:.0f} "
+            "Profit Factor":       pf_display,
+            "Stops Fired":         summary["stops_fired"],
+            "Max Concurrent":      summary["max_concurrent_positions"],
+            "Max Drawdown (Rs)":   f"{summary['max_intraday_drawdown']:,.2f}",
+            "Daily Halt":          bool(summary["daily_halt_triggered"]),
+            "NIFTY Open/Close":    f"{summary.get('nifty_open')} / {summary.get('nifty_close')}",
+            "NIFTY Range":         f"{summary.get('nifty_low')} - {summary.get('nifty_high')}",
+            "VIX Open/Close":      f"{summary.get('vix_open')} / {summary.get('vix_close')}",
+            "OR Condition/Width":  f"{summary.get('or_condition')} / {summary.get('or_width')}",
+            "Mean VRP (pp)":       summary.get("vrp_mean"),
+            "Avg Hold (min)":      f"{summary['avg_hold_minutes']:.1f}",
+            "Opening Straddle":    f"{summary.get('opening_straddle', 0):.0f}pts",
+            "Realized Move":       f"{summary.get('realized_move', 0):.0f}pts",
+            "Straddle Ratio":      summary.get("straddle_ratio"),
+            "Dominant Vol Regime": summary.get("dominant_vol_regime"),
+            "Dominant Price Regime":summary.get("dominant_price_regime"),
+            "Dominant Regime":     summary.get("dominant_final_regime"),
+            "Phantom Blocked":     summary.get("phantom_trades_blocked", 0),
+            "Phantom Would Win":   summary.get("phantom_would_have_won", 0),
+            "Regime Accuracy":     summary.get("regime_accuracy_score"),
+            "Capital Start → End": (
+                f"Rs{summary['capital_start']:,.0f} → "
+                f"Rs{summary['capital_end']:,.0f} "
                 f"({summary['capital_change_pct']:.3f}%)"
             ),
-            "Event Day": f"{summary['event_day']} {summary['event_name']}",
-            "Dominant Regime": summary["dominant_regime"],
+            "Event Day":           f"{summary['event_day']} {summary.get('event_name', '')}",
         }, title="PERFORMANCE")
 
         if strategies_used:
             print("\n  Strategies used:")
             for k, v in strategies_used.items():
                 print(f"    {k}: {v}")
+
         if no_trade_reasons:
             print("\n  Top no-trade reasons:")
             for k, v in sorted(no_trade_reasons.items(), key=lambda x: -x[1])[:10]:
                 print(f"    [{v}x] {k}")
+
         print()
         self.logger.info(
             f"EOD SUMMARY: net_pnl=Rs{summary['net_pnl_rupees']:.2f} "
@@ -604,47 +854,120 @@ class MainEngine:
             f"trades={summary['trades_executed']}"
         )
 
+    # ─────────────────────────────────────────────────────────────────────
+    # END OF DAY TASKS
+    # ─────────────────────────────────────────────────────────────────────
+
     def perform_end_of_day_tasks(self) -> None:
+        """
+        Perform all end-of-day tasks after market close.
+        Called once per day after 15:35.
+        """
         if self._eod_done:
             return
+
         self.logger.info("Performing end-of-day tasks")
+        trading_date = today_ist().isoformat()
+
+        # ── Close any remaining open positions ────────────────────────────
         open_positions = self.execution_engine._get_open_positions()
         if open_positions:
-            self.logger.info(f"EOD: closing {len(open_positions)} remaining position(s)")
+            self.logger.info(
+                f"EOD: closing {len(open_positions)} remaining position(s)"
+            )
             self.execution_engine.close_all_positions("EOD_CLOSE")
-        self._run_calibration_cycle(force=True)
-        self._last_calibration_time = time_module.monotonic()
+
+        # ── Run EOD calibration tasks ─────────────────────────────────────
+        try:
+            self.cal_engine.run_eod_tasks(trading_date)
+        except Exception as e:
+            self.logger.error(f"EOD calibration tasks error: {e}", exc_info=True)
+
+        # ── Run weekly calibration on Sundays ─────────────────────────────
+        if today_ist().weekday() == 6:  # Sunday
+            try:
+                self._run_calibration_cycle(force=True, schedule="weekly")
+            except Exception as e:
+                self.logger.error(f"Weekly calibration error: {e}", exc_info=True)
+
+        # ── Generate daily summary ────────────────────────────────────────
         try:
             self.generate_daily_summary()
-        except Exception as _eod_e:
-            self.logger.error(f"EOD summary error (non-fatal): {_eod_e}", exc_info=True)
+        except Exception as e:
+            self.logger.error(f"Daily summary error (non-fatal): {e}", exc_info=True)
+
         self._eod_done = True
+        self.logger.info("End-of-day tasks complete.")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # GRACEFUL SHUTDOWN
+    # ─────────────────────────────────────────────────────────────────────
 
     def perform_graceful_shutdown(self) -> None:
-        self.logger.info("Graceful shutdown initiated")
+        """
+        Perform graceful shutdown.
+        Saves session state. Does NOT close open positions
+        (they will be resumed on next startup).
+        """
+        self.logger.info("Graceful shutdown initiated.")
+
         open_positions = self.execution_engine._get_open_positions()
         if open_positions:
             self.logger.info(
                 f"Shutdown: {len(open_positions)} open position(s) will remain open. "
                 f"Engine will resume monitoring on next start."
             )
+
         self.market_engine._save_session_state()
         self.logger.info(
             f"Session state saved. "
             f"entry_count={self.market_engine.state.get('entry_count', 0)}, "
-            f"daily_pnl={self.market_engine.state.get('daily_pnl', 0)}, "
+            f"daily_pnl={self.market_engine.state.get('daily_pnl', 0):.2f}, "
             f"open_positions={len(open_positions) if open_positions else 0}. "
             f"Restart engine to resume."
         )
         self.logger.info("Shutdown complete.")
-        self.db.close()
+
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SLEEP HELPER
+    # ─────────────────────────────────────────────────────────────────────
 
     def _sleep(self, seconds: float) -> None:
+        """Sleep for the given number of seconds."""
         time_module.sleep(max(0.0, seconds))
 
+    # ─────────────────────────────────────────────────────────────────────
+    # MAIN RUN LOOP
+    # ─────────────────────────────────────────────────────────────────────
+
     def run(self) -> None:
+        """
+        Main run loop.
+
+        Flow:
+        1. Print startup banner
+        2. Validate Upstox token
+        3. Verify lot size
+        4. Reconcile open positions
+        5. Carry forward capital
+        6. Run startup calibration
+        7. Enter main loop:
+           - Skip holidays
+           - Wait for market open
+           - Run spot bar cycle (every 60s)
+           - Run main trading cycle (every 45s)
+           - Run calibration cycle (every 3600s)
+           - Perform EOD tasks after 15:35
+        8. Graceful shutdown on exit
+        """
         self._print_startup_banner()
 
+        # ── Token validation ──────────────────────────────────────────────
         if not self.config.upstox_access_token:
             self.logger.error(
                 "FATAL: UPSTOX_ACCESS_TOKEN not set in env.txt. Cannot start."
@@ -660,74 +983,90 @@ class MainEngine:
             self.db.close()
             return
 
+        # ── Startup tasks ─────────────────────────────────────────────────
         self._verify_lot_size()
         self._reconcile_open_positions_on_startup()
         self._carry_forward_capital()
-        self._run_calibration_cycle(force=True)
+
+        # Startup calibration
+        self._run_calibration_cycle(force=True, schedule="startup")
         self._last_calibration_time = time_module.monotonic()
 
+        # Check for event day
         today_event = ExpiryCalendar.is_event_day(today_ist())
         if today_event:
-            self.logger.warning(f"EVENT DAY: {today_event}")
             self.logger.warning(
-                "NON-NEGOTIABLE: All position sizes reduced by 75%. Defined risk only."
+                f"EVENT DAY: {today_event} | "
+                f"Size reduced {int((1-self.config.event_size_multiplier)*100)}% | "
+                f"Defined risk only"
             )
 
+        # Pre-market status
         now_t = now_ist().time()
         if now_t < dtime(9, 15):
-            self.logger.info("Pre-market: Engine ready. Market opens at 09:15. Waiting.")
+            self.logger.info(
+                "Pre-market: Engine ready. Market opens at 09:15. Waiting."
+            )
         elif now_t > dtime(15, 30):
-            self.logger.info("Post-market: Engine ready. Next session starts at 09:15.")
+            self.logger.info(
+                "Post-market: Engine ready. Next session starts at 09:15."
+            )
         self.logger.info("Press Ctrl+C to stop.")
 
+        # ── Main loop ─────────────────────────────────────────────────────
         try:
             while self.running:
-                loop_start = now_ist()
+                loop_start   = now_ist()
                 current_time = loop_start.time()
+                now_mono     = time_module.monotonic()
 
+                # ── Holiday check ─────────────────────────────────────────
                 if ExpiryCalendar.is_holiday(today_ist()):
                     next_day = ExpiryCalendar.get_next_trading_day(today_ist())
                     self.logger.info(
-                        f"Non-trading day ({today_ist().strftime("%A %Y-%m-%d")}). "
+                        f"Non-trading day ({today_ist().strftime('%A %Y-%m-%d')}). "
                         f"Next trading day: {next_day}. Sleeping 300s."
                     )
                     self._sleep(300)
                     continue
 
+                # ── Pre-market wait ───────────────────────────────────────
                 if current_time < dtime(9, 15):
                     self._sleep(30)
                     continue
 
+                # ── Post-market EOD ───────────────────────────────────────
                 if current_time > dtime(15, 35):
-                    self.logger.info("Post-market — performing EOD tasks and stopping.")
+                    self.logger.info(
+                        "Post-market — performing EOD tasks and stopping."
+                    )
                     self.perform_end_of_day_tasks()
                     break
 
-                now_mono = time_module.monotonic()
-
+                # ── Spot bar cycle (every 60s) ────────────────────────────
                 if (now_mono - self._last_spot_time) >= self.config.spot_bar_interval_sec:
                     self._last_spot_time = now_mono
                     self._run_spot_cycle()
 
+                # ── Main trading cycle (every 45s) ────────────────────────
                 if (now_mono - self._last_cycle_time) >= self.config.regime_calc_interval_sec:
                     self._last_cycle_time = now_mono
                     try:
                         self.run_one_cycle()
                     except Exception as e:
-                        self.logger.error(f"UNHANDLED ERROR in run_one_cycle: {e}")
+                        self.logger.error(
+                            f"UNHANDLED ERROR in run_one_cycle: {e}"
+                        )
                         self.logger.error(traceback.format_exc())
                         self._sleep(30)
                         continue
 
-                pass
+                # ── Calibration cycle (every 3600s) ───────────────────────
+                if (now_mono - self._last_calibration_time) >= self.config.calibration_interval_sec:
+                    self._last_calibration_time = now_mono
+                    self._run_calibration_cycle(force=False, schedule="daily")
 
-                status_interval = self.config.STATUS_PRINT_INTERVAL_MIN * 60 if hasattr(self.config, 'STATUS_PRINT_INTERVAL_MIN') else 300
-                if (now_mono - self._last_status_print_time) >= status_interval:
-                    self._last_status_print_time = now_mono
-                    if self._market_open() and self.market_engine._snap_available():
-                        self.logger.debug("snap available")
-                    self.logger.debug("Status: market open, snap available")
-
+                # ── Loop timing ───────────────────────────────────────────
                 loop_duration = (now_ist() - loop_start).total_seconds()
                 if loop_duration > 60:
                     self.logger.warning(
@@ -751,7 +1090,12 @@ class MainEngine:
         self.db.close()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main() -> None:
+    """Main entry point."""
     engine = MainEngine()
     engine.run()
 
