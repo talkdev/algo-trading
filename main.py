@@ -203,11 +203,11 @@ class MainEngine:
 
     def perform_hard_exit_sweep(self) -> None:
         current_time = now_ist().time()
-        if current_time >= dtime(15, 0):
+        if current_time >= dtime(15, 15):
             open_positions = self.execution_engine._get_open_positions()
             if open_positions:
                 self.logger.info(
-                    f"HARD EXIT SWEEP @ 15:00 — "
+                    f"HARD EXIT SWEEP @ 15:15 — "
                     f"closing {len(open_positions)} position(s)"
                 )
                 self.execution_engine.close_all_positions("HARD_EXIT_15:00")
@@ -351,7 +351,7 @@ class MainEngine:
         self.check_daily_loss_halt()
 
         entry_possible = (
-            current_time <= dtime(15, 0) and
+            current_time <= dtime(14, 30) and
             not self.market_engine.state.get("daily_halted")
         )
 

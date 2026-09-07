@@ -1634,7 +1634,7 @@ class MarketDataEngine:
             orb_bars = bars[
                 (bars["time"] >= "09:15:00") & (bars["time"] < "09:30:00")
             ] if not bars.empty else pd.DataFrame()
-            coverage_ok = len(orb_bars) >= 45
+            coverage_ok = len(orb_bars) >= 10
             if coverage_ok or current_time >= dtime(10, 45):
                 or_result = self.compute_opening_range(bars)
                 if or_result:
@@ -1678,7 +1678,7 @@ class MarketDataEngine:
         if _day_label == "TUESDAY" and _actual_dte == 0:
             _tue_entry_start = "11:00"
             _tue_entry_end = "12:30"
-            _tue_hard_exit = "14:30"
+            _tue_hard_exit = "15:00"
             if self.state.get("entry_start") != _tue_entry_start:
                 self.state["entry_start"] = _tue_entry_start
                 self.state["entry_end"] = _tue_entry_end

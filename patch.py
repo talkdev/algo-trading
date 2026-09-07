@@ -1,4 +1,4 @@
-# patch6.py
+# patch7.py
 from __future__ import annotations
 import ast
 import shutil
@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime
 
 BASE = Path(__file__).resolve().parent
-BACKUP_DIR = BASE / f"_patch6_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+BACKUP_DIR = BASE / f"_patch7_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 _errors = []
 _applied = []
 _skipped = []
@@ -46,66 +46,170 @@ def rb(src, old, new, label):
     return result
 
 print("=" * 68)
-print("PATCH 6 - NIFTY OPTIONS SIGNAL QUALITY FIXES")
+print("PATCH 7 - NIFTY OPTIONS ENGINE STRUCTURAL FIXES")
 print(f"Base: {BASE}")
 print("=" * 68)
 
-mde_path = BASE / "market_data_engine.py"
-eod_path = BASE / "eod_report.py"
+re_path   = BASE / "regime_engine.py"
+mde_path  = BASE / "market_data_engine.py"
+ee_path   = BASE / "execution_engine.py"
+se_path   = BASE / "strategy_engine.py"
+me_path   = BASE / "main.py"
+core_path = BASE / "nifty_algo_core.py"
 
-print("\n[1/2] market_data_engine.py")
+print("\n[1/6] regime_engine.py")
+src = read(re_path)
+
+src = rb(src,
+'        if vol == VolatilityRegime.ABORT:\n            return FinalRegime.EMERGENCY_EXIT, ConfidenceLevel.NONE, 0.0, 0.0, False, "ABORT: VIX emergency"',
+'        if vol == VolatilityRegime.ABORT:\n            return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "ABORT: VIX high — new entries blocked"',
+"RE-P1: ABORT returns NO_TRADE not EMERGENCY_EXIT — blocks entries only never closes positions")
+
+src = rb(src,
+'        if self._check_straddle_explosion(straddle):\n            snap = RegimeSnapshot(\n                timestamp=ts, day_type=day_type, dte=dte,\n                event_day=self._event_day, event_name=self._event_name,\n                defined_risk_only=self._event_day,\n                volatility_regime=VolatilityRegime.ABORT.value,\n                price_regime=PriceRegime.OBSERVING.value,\n                price_regime_15=PriceRegime.OBSERVING.value,\n                price_regime_60=PriceRegime.OBSERVING.value,\n                mtf_aligned=False,\n                positioning_regime=PositioningRegime.UNCLEAR.value,\n                final_regime=FinalRegime.EMERGENCY_EXIT.value,',
+'        if self._check_straddle_explosion(straddle):\n            snap = RegimeSnapshot(\n                timestamp=ts, day_type=day_type, dte=dte,\n                event_day=self._event_day, event_name=self._event_name,\n                defined_risk_only=self._event_day,\n                volatility_regime=VolatilityRegime.ABORT.value,\n                price_regime=PriceRegime.OBSERVING.value,\n                price_regime_15=PriceRegime.OBSERVING.value,\n                price_regime_60=PriceRegime.OBSERVING.value,\n                mtf_aligned=False,\n                positioning_regime=PositioningRegime.UNCLEAR.value,\n                final_regime=FinalRegime.NO_TRADE.value,',
+"RE-P1b: straddle explosion returns NO_TRADE not EMERGENCY_EXIT")
+
+src = rb(src,
+'        vix_roc_emg = self.config.vix_roc_emergency_pct\n        if len(vix_df) >= 200:\n            vals = vix_df.sort_values(["date", "time"])["vix_value"].values\n            rocs = []\n            w = 6\n            for i in range(w, len(vals)):\n                if vals[i - w] > 0:\n                    rocs.append((vals[i] - vals[i - w]) / vals[i - w] * 100)\n            if rocs:\n                vix_roc_emg = float(np.percentile(rocs, 95))\n                self.logger.info(f"  VIX ROC emergency (p95): {vix_roc_emg:.2f}%")',
+'        vix_roc_emg = 15.0\n        self.logger.info(f"  VIX ROC emergency: {vix_roc_emg:.1f}% (absolute threshold — VIX up 15pct in 30min)")',
+"RE-P2: VIX ROC emergency absolute 15pct not self-calibrated from same-day ticks")
+
+src = rb(src,
+'        emg = self._t("vix_roc_emergency", "vix_roc_emergency_pct")\n        _vix_regime_now = self._engine_ref.market_engine.state.get("vix_regime", "NORMAL") if self._engine_ref else "NORMAL"\n        _emg_adjusted = emg * 1.5 if _vix_regime_now == "SUPPRESSED" else emg\n        if vix_roc >= _emg_adjusted:\n            details["trigger"] = "VIX_SPIKE"\n            return VolatilityRegime.ABORT, details',
+'        _prev_vix_close = 0.0\n        try:\n            _prev_row = self.db.query_one(\n                "SELECT vix_close FROM daily_summary WHERE trading_date < ? "\n                "AND vix_close IS NOT NULL AND vix_close > 0 "\n                "ORDER BY trading_date DESC LIMIT 1",\n                (str(datetime.now().date()),)\n            )\n            if _prev_row and _prev_row.get("vix_close"):\n                _prev_vix_close = float(_prev_row["vix_close"])\n        except Exception:\n            pass\n        _vix_pct_from_close = ((vix - _prev_vix_close) / _prev_vix_close * 100.0) if _prev_vix_close > 0 else 0.0\n        if _vix_pct_from_close >= 15.0 and vix >= 14.0:\n            details["trigger"] = "VIX_SPIKE_REAL"\n            self.logger.warning(f"REAL VIX EMERGENCY: VIX up {_vix_pct_from_close:.1f}pct from prev close {_prev_vix_close:.2f} to {vix:.2f}")\n            return VolatilityRegime.ABORT, details',
+"RE-P2b: VIX emergency = 15pct up from prev close AND VIX>=14 — spot-anchored not tick-noise")
+
+src = rb(src,
+'            4: getattr(_cal_state, "day_size_friday",    0.50) if _cal_state else 0.50,',
+'            4: getattr(_cal_state, "day_size_friday",    0.65) if _cal_state else 0.65,',
+"RE-P8: Friday day_size 0.50->0.65 same as Thursday (intraday-only no weekend risk)")
+
+src = rb(src,
+'        if now_ist().weekday() == 4:\n            raw_size = min(raw_size, 0.50)',
+'        if now_ist().weekday() == 4:\n            raw_size = min(raw_size, 0.65)',
+"RE-P8b: Friday raw_size cap 0.50->0.65 same as Thursday")
+
+src = rb(src,
+'            "day_size_friday": 0.45,',
+'            "day_size_friday": 0.65,',
+"RE-P8c: AutoCalibrator Friday default 0.45->0.65")
+
+src = rb(src,
+'            base_sizes = {1: 0.75, 2: 0.55, 3: 0.65, 4: 0.65, 5: 0.45}',
+'            base_sizes = {1: 0.75, 2: 0.55, 3: 0.65, 4: 0.65, 5: 0.65}',
+"RE-P8d: AutoCalibrator Friday base_size 0.45->0.65")
+
+write(re_path, src)
+check_syntax(re_path)
+
+print("\n[2/6] execution_engine.py")
+src = read(ee_path)
+
+src = rb(src,
+'        if final_regime == "EMERGENCY_EXIT":\n            open_positions = self._get_open_positions()\n            if open_positions:\n                self.logger.warning(\n                    f"REGIME ENGINE EMERGENCY_EXIT — force-closing "\n                    f"{len(open_positions)} position(s)"\n                )\n                self.close_all_positions("EMERGENCY_EXIT")\n            return',
+'        if final_regime == "EMERGENCY_EXIT":\n            self.logger.info("REGIME EMERGENCY_EXIT — blocking new entries only, positions managed by own rules")\n            return',
+"EE-P1: EMERGENCY_EXIT blocks new entries only never force-closes positions")
+
+src = rb(src,
+'        stt      = sell_pts * self.config.stt_options_sell\n        exchange = turnover * self.config.exchange_txn_rate\n        sebi     = turnover * self.config.sebi_rate\n        stamp    = buy_pts  * self.config.stamp_duty_buy_options',
+'        if action == "EXIT":\n            stt = buy_pts * self.config.stt_options_sell\n        else:\n            stt = sell_pts * self.config.stt_options_sell\n        exchange = turnover * self.config.exchange_txn_rate\n        sebi     = turnover * self.config.sebi_rate\n        stamp    = buy_pts  * self.config.stamp_duty_buy_options',
+"EE-P5: STT on exit applies to buy_pts (long wings sold) not sell_pts (shorts bought back)")
+
+src = rb(src,
+'        vwap_dist = signals.get("vwap_dist_pct")\n        if vwap_dist is not None and current_time < dtime(14, 30):\n            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.30:\n                return "CLOSE_VWAP", {"vwap_dist": vwap_dist}\n            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.30:\n                return "CLOSE_VWAP", {"vwap_dist": vwap_dist}\n            if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY"):\n                if vwap_dist > 0.25:\n                    return "CLOSE_CALL_SIDE", {"vwap_dist": vwap_dist}\n                if vwap_dist < -0.25:\n                    return "CLOSE_PUT_SIDE", {"vwap_dist": vwap_dist}',
+'        vwap_dist = signals.get("vwap_dist_pct")\n        if vwap_dist is not None and current_time < dtime(14, 30):\n            if strategy_name == "BULL_PUT_SPREAD" and vwap_dist < -0.40:\n                return "CLOSE_VWAP", {"vwap_dist": vwap_dist}\n            if strategy_name == "BEAR_CALL_SPREAD" and vwap_dist > 0.40:\n                return "CLOSE_VWAP", {"vwap_dist": vwap_dist}',
+"EE-P12: remove VWAP side-close for IC/IB (normal NIFTY excursion triggers it), widen spread exits to 0.40pct")
+
+src = rb(src,
+'        if strategy_type == "SELL" and current_time >= dtime(14, 30):\n            cheap_thresh = 5.00 if strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD") else 3.00',
+'        if strategy_type == "SELL" and current_time >= dtime(13, 0):\n            cheap_thresh = 3.00 if strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD") else 2.00',
+"EE-P11: cheap buyback from 13:00 not 14:30 threshold 2pts IC 3pts spreads")
+
+write(ee_path, src)
+check_syntax(ee_path)
+
+print("\n[3/6] strategy_engine.py")
+src = read(se_path)
+
+src = rb(src,
+'MIN_CREDITS = {\n    "IRON_BUTTERFLY":  12,\n    "IRON_CONDOR":     10,\n    "BULL_PUT_SPREAD": 8,\n    "BEAR_CALL_SPREAD":8,\n    "POST_EVENT_STRADDLE": 20,\n}',
+'MIN_CREDITS = {\n    "IRON_BUTTERFLY":  25,\n    "IRON_CONDOR":     22,\n    "BULL_PUT_SPREAD": 18,\n    "BEAR_CALL_SPREAD":18,\n    "POST_EVENT_STRADDLE": 25,\n}',
+"SE-P6: min credits raised for DTE 0-1 NIFTY 2026 Δ0.20-0.25 shorts 150-200pt wing")
+
+src = rb(src,
+'MIN_CREDITS_TUESDAY = {\n    "IRON_BUTTERFLY":  15,\n    "IRON_CONDOR":     12,\n    "BULL_PUT_SPREAD": 10,\n    "BEAR_CALL_SPREAD":10,\n}',
+'MIN_CREDITS_TUESDAY = {\n    "IRON_BUTTERFLY":  28,\n    "IRON_CONDOR":     25,\n    "BULL_PUT_SPREAD": 20,\n    "BEAR_CALL_SPREAD":20,\n}',
+"SE-P6b: Tuesday 0DTE min credits higher for gamma risk management")
+
+src = rb(src,
+'            _vix_min_scale = 0.65 if (s.get("vix") or 15.0) < 12.0 else (0.75 if (s.get("vix") or 15.0) < 14.0 else 1.0)\n            min_credit = min_credit * _vix_min_scale',
+'            _vix_min_scale = 1.0',
+"SE-P6c: remove VIX-based discount on min credit — low VIX is when 4-leg costs dominate most")
+
+src = rb(src,
+'            vix_regime = s.get("vix_regime", "NORMAL")\n            _vix_val_rp = s.get("vix") or 15.0\n            if _vix_val_rp < 11.5:\n                min_rupee = 100\n            elif _vix_val_rp < 13.0:\n                min_rupee = 150\n            elif _vix_val_rp < 15.0:\n                min_rupee = 175\n            else:\n                min_rupee = {"SUPPRESSED": 200, "LOW": 250, "NORMAL": 350,\n                             "ELEVATED": 450, "HIGH": 550}.get(vix_regime, 200)\n            if net_profit_at_target * C02 < min_rupee:\n                return {"valid": False, "reason": f"projected_profit_below_Rs{min_rupee}"}',
+'            _rtrip_costs_rs = (total_costs_pts + total_slippage) * 2.0 * C02\n            min_rupee = max(int(_rtrip_costs_rs * 3.0), 150)\n            if net_profit_at_target * C02 < min_rupee:\n                return {"valid": False, "reason": f"projected_profit_below_Rs{min_rupee}"}',
+"SE-P7: rupee gate = 3x round-trip costs scales with lot size VIX and structure")
+
+src = rb(src,
+'LOT_CAPS_BY_DAY = {\n    "MONDAY": 3, "TUESDAY": 2, "WEDNESDAY": 2,\n    "THURSDAY": 2, "FRIDAY": 1,\n}',
+'LOT_CAPS_BY_DAY = {\n    "MONDAY": 4, "TUESDAY": 3, "WEDNESDAY": 3,\n    "THURSDAY": 3, "FRIDAY": 3,\n}',
+"SE-P8: Friday lot cap 1->3 same as Thursday (intraday-only no weekend risk)")
+
+write(se_path, src)
+check_syntax(se_path)
+
+print("\n[4/6] market_data_engine.py")
 src = read(mde_path)
 
 src = rb(src,
-'        if spot is not None and spot > 0:\n            band = spot * 0.03\n            total_put = sum(\n                legs.get("put", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if (spot - band) <= strike < spot\n            )\n            total_call = sum(\n                legs.get("call", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if spot < strike <= (spot + band)\n            )',
-'        if spot is not None and spot > 0:\n            band = spot * 0.05\n            total_put = sum(\n                legs.get("put", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if (spot - band) <= strike < spot\n            )\n            total_call = sum(\n                legs.get("call", {}).get("oi", 0) or 0\n                for strike, legs in chain.items()\n                if spot < strike <= (spot + band)\n            )',
-"FIX-1: PCR band 3pct to 5pct for NIFTY meaningful OI range")
+'            coverage_ok = len(orb_bars) >= 45',
+'            coverage_ok = len(orb_bars) >= 10',
+"MDE-P3: ORB coverage 45->10 bars (15min window max 15 bars, 10 is sufficient for NIFTY)")
 
 src = rb(src,
-'    def compute_atm_iv(\n        self, chain: dict, spot: Optional[float]\n    ) -> Optional[float]:\n        if not chain or spot is None:\n            return None\n        step = self.config.nifty_strike_step\n        atm = round(spot / step) * step\n        if atm not in chain:\n            atm = min(chain.keys(), key=lambda k: abs(k - spot))\n        leg = chain.get(atm, {})\n        call, put = leg.get("call", {}), leg.get("put", {})\n        call_iv = call.get("iv", 0.0) or 0.0\n        put_iv = put.get("iv", 0.0) or 0.0\n        call_oi = call.get("oi", 0) or 0\n        put_oi = put.get("oi", 0) or 0\n\n        if call_iv <= 0 and put_iv <= 0:\n            return None\n\n        total_oi = call_oi + put_oi\n        if total_oi > 0:\n            atm_iv = (call_iv * call_oi + put_iv * put_oi) / total_oi\n        elif call_iv > 0 and put_iv > 0:\n            atm_iv = (call_iv + put_iv) / 2.0\n        elif call_iv > 0:\n            atm_iv = call_iv\n        else:\n            atm_iv = put_iv\n\n        if atm_iv < 0.05 or atm_iv > 0.80:\n            return None\n        try:\n            _vix_state = self.state.get("prev_vix")\n            if _vix_state and _vix_state > 0:\n                vix_decimal = _vix_state / 100.0\n                if atm_iv < vix_decimal * 0.60 or atm_iv > vix_decimal * 2.0:\n                    self.logger.warning(\n                        f"ATM IV {atm_iv*100:.2f}% vs VIX {_vix_state:.2f} — "\n                        f"ratio {atm_iv/vix_decimal:.2f} outside 0.60-2.00 range. "\n                        f"Chain data may be stale. Treating ATM IV as unavailable."\n                    )\n                    return None\n        except Exception:\n            pass\n        return atm_iv',
-'    def compute_atm_iv(\n        self, chain: dict, spot: Optional[float]\n    ) -> Optional[float]:\n        if not chain or spot is None:\n            return None\n        step = self.config.nifty_strike_step\n        atm = round(spot / step) * step\n        if atm not in chain:\n            atm = min(chain.keys(), key=lambda k: abs(k - spot))\n        iv_samples = []\n        for s_strike in [atm - step, atm, atm + step]:\n            leg = chain.get(s_strike, {})\n            if not leg:\n                continue\n            c_leg = leg.get("call", {})\n            p_leg = leg.get("put", {})\n            c_iv = c_leg.get("iv", 0.0) or 0.0\n            p_iv = p_leg.get("iv", 0.0) or 0.0\n            c_oi = c_leg.get("oi", 0) or 0\n            p_oi = p_leg.get("oi", 0) or 0\n            if c_iv <= 0 and p_iv <= 0:\n                continue\n            t_oi = c_oi + p_oi\n            if t_oi > 0:\n                s_iv = (c_iv * c_oi + p_iv * p_oi) / t_oi\n            elif c_iv > 0 and p_iv > 0:\n                s_iv = (c_iv + p_iv) / 2.0\n            elif c_iv > 0:\n                s_iv = c_iv\n            else:\n                s_iv = p_iv\n            if 0.05 <= s_iv <= 0.80:\n                w = 2.0 if s_strike == atm else 1.0\n                iv_samples.append((s_iv, w))\n        if not iv_samples:\n            return None\n        total_w = sum(w for _, w in iv_samples)\n        atm_iv = sum(iv * w for iv, w in iv_samples) / total_w\n        if atm_iv < 0.05 or atm_iv > 0.80:\n            return None\n        try:\n            _vix_state = self.state.get("prev_vix")\n            if _vix_state and _vix_state > 0:\n                vix_decimal = _vix_state / 100.0\n                if atm_iv < vix_decimal * 0.60 or atm_iv > vix_decimal * 2.0:\n                    self.logger.warning(\n                        f"ATM IV {atm_iv*100:.2f}% vs VIX {_vix_state:.2f} — "\n                        f"ratio {atm_iv/vix_decimal:.2f} outside 0.60-2.00 range. "\n                        f"Chain data may be stale. Treating ATM IV as unavailable."\n                    )\n                    return None\n        except Exception:\n            pass\n        return atm_iv',
-"FIX-2: ATM IV weighted average ATM-50 ATM ATM+50 reduces single-strike quote noise")
-
-src = rb(src,
-'    def compute_oi_change(\n        self, atm_strike: int, expiry_str: str,\n        current_ce_oi: int, current_pe_oi: int\n    ) -> float:\n        current_total = current_ce_oi + current_pe_oi\n        if current_total <= 0:\n            return 0.0\n        lookback = self.config.oi_change_lookback_min\n        cutoff = (now_ist() - timedelta(minutes=lookback + 5)).isoformat()\n        limit_ts = (now_ist() - timedelta(minutes=lookback)).isoformat()\n        row = self.db.query_one(\n            "SELECT ce_oi, pe_oi FROM options_chain "\n            "WHERE strike=? AND expiry_date=? AND timestamp>=? AND timestamp<=? "\n            "ORDER BY timestamp ASC LIMIT 1",\n            (atm_strike, expiry_str, cutoff, limit_ts),\n        )\n        if row:\n            prior = (row.get("ce_oi") or 0) + (row.get("pe_oi") or 0)\n            if prior > 0:\n                return (current_total - prior) / prior\n        return 0.0',
-'    def compute_oi_change(\n        self, atm_strike: int, expiry_str: str,\n        current_ce_oi: int, current_pe_oi: int\n    ) -> float:\n        current_total = current_ce_oi + current_pe_oi\n        if current_total <= 0:\n            return 0.0\n        lookback = self.config.oi_change_lookback_min\n        today_str = today_ist().isoformat()\n        cutoff_ts = (now_ist() - timedelta(minutes=lookback + 5)).isoformat()\n        limit_ts = (now_ist() - timedelta(minutes=lookback)).isoformat()\n        row = self.db.query_one(\n            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "\n            "WHERE trading_date=? AND strike=? AND expiry=? "\n            "AND capture_time >= ? AND capture_time <= ? "\n            "LIMIT 1",\n            (today_str, atm_strike, expiry_str, cutoff_ts, limit_ts),\n        )\n        if row and row.get("total_oi"):\n            prior = row["total_oi"]\n            if prior > 0:\n                return (current_total - prior) / prior\n        row2 = self.db.query_one(\n            "SELECT ce_oi, pe_oi FROM options_chain "\n            "WHERE strike=? AND expiry_date=? AND timestamp>=? AND timestamp<=? "\n            "ORDER BY timestamp ASC LIMIT 1",\n            (atm_strike, expiry_str, cutoff_ts, limit_ts),\n        )\n        if row2:\n            prior2 = (row2.get("ce_oi") or 0) + (row2.get("pe_oi") or 0)\n            if prior2 > 0:\n                return (current_total - prior2) / prior2\n        row3 = self.db.query_one(\n            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "\n            "WHERE trading_date=? AND strike=? AND expiry=? "\n            "ORDER BY capture_time ASC LIMIT 1",\n            (today_str, atm_strike, expiry_str),\n        )\n        if row3 and row3.get("total_oi"):\n            prior3 = row3["total_oi"]\n            if prior3 > 0 and prior3 != current_total:\n                return (current_total - prior3) / prior3\n        return 0.0',
-"FIX-3: OI change uses option_chain_snapshot every cycle with fallback to options_chain")
-
-src = rb(src,
-'        if skew < -1.5:\n            return otm_ce_iv, otm_pe_iv, 0.0\n        return otm_ce_iv, otm_pe_iv, skew',
-'        if skew < -1.5:\n            self.logger.debug(f"OTM skew={skew:.2f} negative calls>puts treating as neutral")\n            return otm_ce_iv, otm_pe_iv, 0.0\n        return otm_ce_iv, otm_pe_iv, skew',
-"FIX-4a: negative OTM skew debug log only not warning")
-
-src = rb(src,
-'        if skew is not None and skew < -1.5:\n            _now_t = now_ist().time()\n            from datetime import time as _dtime\n            if _now_t >= _dtime(10, 0):\n                self.logger.warning(\n                    f"OTM skew={skew:.2f} is negative beyond -1.5 — "\n                    f"NIFTY structural skew violation. Treating skew as UNKNOWN."\n                )\n            skew = None\n            skew_ratio = None',
-'        if skew is not None and skew < -1.5:\n            self.logger.debug(f"OTM skew={skew:.2f} negative treating as neutral 0.0")\n            skew = 0.0',
-"FIX-4b: negative skew in run_cycle set to 0.0 neutral eliminates UNKNOWN volatility cycles")
+'            _tue_hard_exit = "14:30"',
+'            _tue_hard_exit = "15:00"',
+"MDE-P10: Tuesday 0DTE hard exit 14:30->15:00 captures maximum theta decay on expiry day")
 
 write(mde_path, src)
-ok1 = check_syntax(mde_path)
-if ok1:
-    print("  market_data_engine.py syntax OK")
+check_syntax(mde_path)
 
-print("\n[2/2] eod_report.py")
-src = read(eod_path)
+print("\n[5/6] main.py")
+src = read(me_path)
 
 src = rb(src,
-'    volumes = [c["volume"] for c in candles if c.get("volume")]',
-'    volumes = [c["volume"] for c in candles if c.get("volume") is not None]',
-"FIX-5a: zero_volume_bars use is not None to include zero values in list")
+'        if current_time >= dtime(15, 0):\n            open_positions = self.execution_engine._get_open_positions()\n            if open_positions:\n                self.logger.info(\n                    f"HARD EXIT SWEEP @ 15:00 — "\n                    f"closing {len(open_positions)} position(s)"\n                )\n                self.execution_engine.close_all_positions("HARD_EXIT_15:00")',
+'        if current_time >= dtime(15, 15):\n            open_positions = self.execution_engine._get_open_positions()\n            if open_positions:\n                self.logger.info(\n                    f"HARD EXIT SWEEP @ 15:15 — "\n                    f"closing {len(open_positions)} position(s)"\n                )\n                self.execution_engine.close_all_positions("HARD_EXIT_15:00")',
+"ME-P9: hard exit sweep 15:00->15:15 captures 15 more minutes of theta decay")
 
 src = rb(src,
-'        "zero_volume_bars":  sum(1 for v in volumes if v == 0),',
-'        "zero_volume_bars":  sum(1 for v in volumes if (v or 0) == 0),\n        "volume_note":       "NSE index volume always 0 via Upstox API confirmed",',
-"FIX-5b: add volume_note to candle stats for LLM context")
+'        entry_possible = (\n            current_time <= dtime(15, 0) and\n            not self.market_engine.state.get("daily_halted")\n        )',
+'        entry_possible = (\n            current_time <= dtime(14, 30) and\n            not self.market_engine.state.get("daily_halted")\n        )',
+"ME-P9b: last new entry at 14:30 need 45min hold before 15:15 hard exit")
 
-write(eod_path, src)
-ok2 = check_syntax(eod_path)
-if ok2:
-    print("  eod_report.py syntax OK")
+write(me_path, src)
+check_syntax(me_path)
+
+print("\n[6/6] nifty_algo_core.py")
+src = read(core_path)
+
+src = rb(src,
+'STT_RATE=0.000625\nSTT_OPTIONS_SELL=0.000625',
+'STT_RATE=0.001\nSTT_OPTIONS_SELL=0.001',
+"CORE-P4: STT rate 0.0625pct->0.1pct (NSE rate from Oct 2024)")
+
+src = rb(src,
+'        stt_rate=_get_float(env, "STT_RATE", 0.000625),\n        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.000625),',
+'        stt_rate=_get_float(env, "STT_RATE", 0.001),\n        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.001),',
+"CORE-P4b: STT default in load_config 0.000625->0.001")
+
+write(core_path, src)
+check_syntax(core_path)
 
 print("\n" + "=" * 68)
-print("PATCH 6 SUMMARY")
+print("PATCH 7 SUMMARY")
 print("=" * 68)
 print(f"Applied : {len(_applied)}")
 for a in _applied:
@@ -122,5 +226,5 @@ if _errors:
     print("\n[FAIL]")
     sys.exit(1)
 else:
-    print("\n[SUCCESS] Patch 6 complete.")
+    print("\n[SUCCESS] Patch 7 complete.")
     sys.exit(0)
