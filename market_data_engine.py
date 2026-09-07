@@ -1678,8 +1678,8 @@ class MarketDataEngine:
         _day_label = self.state.get("day_label")
         _actual_dte = dte if dte is not None else self.state.get("actual_dte")
         if _day_label == "TUESDAY" and _actual_dte == 0:
-            _tue_entry_start = "11:00"
-            _tue_entry_end = "12:30"
+            _tue_entry_start = "10:30"
+            _tue_entry_end = "13:00"
             _tue_hard_exit = "15:00"
             if self.state.get("entry_start") != _tue_entry_start:
                 self.state["entry_start"] = _tue_entry_start
@@ -1687,7 +1687,7 @@ class MarketDataEngine:
                 self.state["hard_exit_time"] = _tue_hard_exit
                 self.logger.info(
                     f"Tuesday 0DTE: entry window {_tue_entry_start}-{_tue_entry_end} "
-                    f"hard exit {_tue_hard_exit} for gamma risk management"
+                    f"hard exit {_tue_hard_exit} captures full theta window"
                 )
 
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, bars)
