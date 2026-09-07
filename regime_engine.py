@@ -375,7 +375,7 @@ class AutoCalibrator:
             "day_size_tuesday": 0.55,
             "day_size_wednesday": 0.65,
             "day_size_thursday": 0.65,
-            "day_size_friday": 0.45,
+            "day_size_friday": 0.65,
         }
         try:
             df = self.db.get_daily_summary(days=730)
@@ -383,7 +383,7 @@ class AutoCalibrator:
                 return nifty_2026_defaults
             result = {}
             day_map = {1: "monday", 2: "tuesday", 3: "wednesday", 4: "thursday", 5: "friday"}
-            base_sizes = {1: 0.75, 2: 0.55, 3: 0.65, 4: 0.65, 5: 0.45}
+            base_sizes = {1: 0.75, 2: 0.55, 3: 0.65, 4: 0.65, 5: 0.65}
             for wd, name in day_map.items():
                 sub = df[df["weekday"] == wd].copy()
                 if len(sub) < 5:
@@ -695,17 +695,8 @@ class CalibrationEngine:
                 p75 = getattr(self.config, "vix_high", 22.0)
                 p90 = getattr(self.config, "vix_extreme_high", 28.0)
 
-        vix_roc_emg = self.config.vix_roc_emergency_pct
-        if len(vix_df) >= 200:
-            vals = vix_df.sort_values(["date", "time"])["vix_value"].values
-            rocs = []
-            w = 6
-            for i in range(w, len(vals)):
-                if vals[i - w] > 0:
-                    rocs.append((vals[i] - vals[i - w]) / vals[i - w] * 100)
-            if rocs:
-                vix_roc_emg = float(np.percentile(rocs, 95))
-                self.logger.info(f"  VIX ROC emergency (p95): {vix_roc_emg:.2f}%")
+        vix_roc_emg = 15.0
+        self.logger.info(f"  VIX ROC emergency: {vix_roc_emg:.1f}% (absolute threshold — VIX up 15pct in 30min)")
 
         daily = self.db.get_daily_summary(days=365)
         ranges = {wd: 150.0 for wd in range(5)}
@@ -951,11 +942,22 @@ class RegimeClassifier:
             "iv_hv": iv_hv, "straddle_ratio": s_ratio,
         }
 
-        emg = self._t("vix_roc_emergency", "vix_roc_emergency_pct")
-        _vix_regime_now = self._engine_ref.market_engine.state.get("vix_regime", "NORMAL") if self._engine_ref else "NORMAL"
-        _emg_adjusted = emg * 1.5 if _vix_regime_now == "SUPPRESSED" else emg
-        if vix_roc >= _emg_adjusted:
-            details["trigger"] = "VIX_SPIKE"
+        _prev_vix_close = 0.0
+        try:
+            _prev_row = self.db.query_one(
+                "SELECT vix_close FROM daily_summary WHERE trading_date < ? "
+                "AND vix_close IS NOT NULL AND vix_close > 0 "
+                "ORDER BY trading_date DESC LIMIT 1",
+                (str(datetime.now().date()),)
+            )
+            if _prev_row and _prev_row.get("vix_close"):
+                _prev_vix_close = float(_prev_row["vix_close"])
+        except Exception:
+            pass
+        _vix_pct_from_close = ((vix - _prev_vix_close) / _prev_vix_close * 100.0) if _prev_vix_close > 0 else 0.0
+        if _vix_pct_from_close >= 15.0 and vix >= 14.0:
+            details["trigger"] = "VIX_SPIKE_REAL"
+            self.logger.warning(f"REAL VIX EMERGENCY: VIX up {_vix_pct_from_close:.1f}pct from prev close {_prev_vix_close:.2f} to {vix:.2f}")
             return VolatilityRegime.ABORT, details
 
         vix_ceil = self._t("vix_p90", "vix_extreme_high")
@@ -1175,7 +1177,7 @@ class RegimeClassifier:
             notes.append(f"EVENT:{event_name}")
 
         if vol == VolatilityRegime.ABORT:
-            return FinalRegime.EMERGENCY_EXIT, ConfidenceLevel.NONE, 0.0, 0.0, False, "ABORT: VIX emergency"
+            return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "ABORT: VIX high — new entries blocked"
         if price == PriceRegime.OBSERVING:
             return FinalRegime.NO_TRADE, ConfidenceLevel.NONE, 0.0, 0.0, False, "NO_TRADE: Price regime OBSERVING — OR not established"
         if price == PriceRegime.CHOPPY:
@@ -1255,7 +1257,7 @@ class RegimeClassifier:
             1: getattr(_cal_state, "day_size_tuesday",   0.60) if _cal_state else 0.60,
             2: getattr(_cal_state, "day_size_wednesday", 0.75) if _cal_state else 0.75,
             3: getattr(_cal_state, "day_size_thursday",  0.75) if _cal_state else 0.75,
-            4: getattr(_cal_state, "day_size_friday",    0.50) if _cal_state else 0.50,
+            4: getattr(_cal_state, "day_size_friday",    0.65) if _cal_state else 0.65,
         }
         _vix_level = signals.get("vix") or 15.0
         _vix_size_cap = 1.0
@@ -1270,7 +1272,7 @@ class RegimeClassifier:
         raw_size = day_m * conf_m
         raw_size = min(raw_size, _vix_size_cap)
         if now_ist().weekday() == 4:
-            raw_size = min(raw_size, 0.50)
+            raw_size = min(raw_size, 0.65)
         final_size = raw_size * self.config.event_size_multiplier if event_day else raw_size
         defined_risk = event_day and self.config.defined_risk_only_on_event
 
@@ -1514,7 +1516,7 @@ class RegimeEngine:
                 price_regime_60=PriceRegime.OBSERVING.value,
                 mtf_aligned=False,
                 positioning_regime=PositioningRegime.UNCLEAR.value,
-                final_regime=FinalRegime.EMERGENCY_EXIT.value,
+                final_regime=FinalRegime.NO_TRADE.value,
                 confidence=ConfidenceLevel.NONE.value,
                 size_multiplier=0.0, raw_size_multiplier=0.0,
                 vix_level=signals.get("vix") or 0.0, vix_roc=0.0,
