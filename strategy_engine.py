@@ -981,9 +981,12 @@ class StrategyEngine:
             if net_profit_at_target <= 0.5:
                 return {"valid": False, "reason": f"net_profit_at_target_{net_profit_at_target:.2f}_non_positive"}
 
-            _rtrip_costs_rs = (total_costs_pts + total_slippage) * 2.0 * C02
-            min_rupee = max(int(_rtrip_costs_rs * 3.0), 150)
-            if net_profit_at_target * C02 < min_rupee:
+            _one_way_costs_rs = (total_costs_pts + total_slippage) * C02
+            _rtrip_costs_rs = _one_way_costs_rs * 2.0
+            min_rupee = max(int(_rtrip_costs_rs * 2.0), 150)
+            _gross_profit_at_target = gross_credit * self._get_target_pct(s) if gross_credit else net_credit * self._get_target_pct(s)
+            _gross_profit_rs = _gross_profit_at_target * C02
+            if _gross_profit_rs < min_rupee:
                 return {"valid": False, "reason": f"projected_profit_below_Rs{min_rupee}"}
 
         current_capital = state.get("current_capital", self.config.starting_capital)
