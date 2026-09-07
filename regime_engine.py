@@ -371,11 +371,11 @@ class AutoCalibrator:
 
     def _calibrate_day_size_multipliers(self):
         nifty_2026_defaults = {
-            "day_size_monday": 0.75,
-            "day_size_tuesday": 0.55,
-            "day_size_wednesday": 0.65,
-            "day_size_thursday": 0.65,
-            "day_size_friday": 0.65,
+            "day_size_monday": 0.55,
+            "day_size_tuesday": 0.80,
+            "day_size_wednesday": 0.70,
+            "day_size_thursday": 0.70,
+            "day_size_friday": 0.60,
         }
         try:
             df = self.db.get_daily_summary(days=730)
@@ -383,7 +383,7 @@ class AutoCalibrator:
                 return nifty_2026_defaults
             result = {}
             day_map = {1: "monday", 2: "tuesday", 3: "wednesday", 4: "thursday", 5: "friday"}
-            base_sizes = {1: 0.75, 2: 0.55, 3: 0.65, 4: 0.65, 5: 0.65}
+            base_sizes = {1: 0.55, 2: 0.80, 3: 0.70, 4: 0.70, 5: 0.60}
             for wd, name in day_map.items():
                 sub = df[df["weekday"] == wd].copy()
                 if len(sub) < 5:

@@ -203,11 +203,13 @@ class MainEngine:
 
     def perform_hard_exit_sweep(self) -> None:
         current_time = now_ist().time()
-        if current_time >= dtime(15, 15):
+        _is_tuesday = today_ist().weekday() == 1
+        _hard_sweep_time = dtime(15, 0) if _is_tuesday else dtime(15, 0)
+        if current_time >= _hard_sweep_time:
             open_positions = self.execution_engine._get_open_positions()
             if open_positions:
                 self.logger.info(
-                    f"HARD EXIT SWEEP @ 15:15 — "
+                    f"HARD EXIT SWEEP @ 15:00 — "
                     f"closing {len(open_positions)} position(s)"
                 )
                 self.execution_engine.close_all_positions("HARD_EXIT_15:00")

@@ -724,6 +724,16 @@ class ExecutionEngine:
                 )
                 if current_premium >= actual_stop:
                     return "CLOSE_STOP", {"current_premium": current_premium}
+            if strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY") and position.get("entry_credit"):
+                try:
+                    _entry_dt = datetime.fromisoformat(position["entry_time"])
+                    _hold_min = (now_ist() - _entry_dt).total_seconds() / 60.0
+                    if _hold_min <= 30.0:
+                        _early_stop = position["entry_credit"] * 1.25
+                        if current_premium >= _early_stop:
+                            return "CLOSE_STOP", {"reason_detail": f"early_entry_stop_30min_{current_premium:.2f}"}
+                except Exception:
+                    pass
         elif strategy_type == "SELL" and effective_stop is not None and current_premium >= effective_stop:
             return "CLOSE_STOP", {"current_premium": current_premium}
         if strategy_type == "BUY" and position.get("stop_value") is not None and current_premium <= position["stop_value"]:
@@ -889,25 +899,7 @@ class ExecutionEngine:
             return
 
         if signals.get("vix_spike_detected"):
-            open_positions = self._get_open_positions()
-            if open_positions:
-                legs_by_pos = {}
-                for pos in open_positions:
-                    pos_legs = self._get_position_legs(pos["position_id"])
-                    net_vega = sum(
-                        (-1 if l["action"] == "SELL" else 1) * (l.get("entry_vega") or 0)
-                        for l in pos_legs if l["leg_status"] == "OPEN"
-                    )
-                    legs_by_pos[pos["position_id"]] = net_vega
-                most_short_id = min(legs_by_pos, key=lambda k: legs_by_pos[k])
-                for pos in open_positions:
-                    if pos["position_id"] == most_short_id:
-                        self.logger.warning(
-                            f"VIX SPIKE: force-closing most short-vega position "
-                            f"{pos['strategy_name']} {pos['position_id'][:16]}"
-                        )
-                        self.execute_close(pos, "CLOSE_VIX_SPIKE", {})
-                        break
+            self.logger.warning("VIX spike detected — blocking new entries only, positions managed by own risk rules")
 
         for position in self._get_open_positions():
             action, context = self.monitor_position(position, signals)
