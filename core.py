@@ -138,7 +138,7 @@ NIFTY_LOT_SIZE=65
 NIFTY_STRIKE_STEP=50
 
 # ── Transaction Costs ─────────────────────────────────────────────────────────
-STT_OPTIONS_SELL=0.001
+STT_OPTIONS_SELL=0.0015
 STT_OPTIONS_EXERCISE=0.0015
 BROKERAGE_PER_ORDER=20.0
 EXCHANGE_TXN_RATE=0.0003552
@@ -736,7 +736,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),
 
         # Costs
-        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.001),
+        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),
         stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
         exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003552),

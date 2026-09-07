@@ -1048,12 +1048,12 @@ class RegimeClassifier:
 
         # ── Gate 2: VRP data error ────────────────────────────────────────
         if vrp_raw is not None and vrp_raw > 8.0:
-            details["trigger"] = "VRP_DATA_ERROR_CAPPED"
+            details["trigger"] = "VRP_DATA_ERROR_NEUTRAL"
             self.logger.warning(
                 f"VRP={vrp_raw:.2f}pp > 8pp — likely Parkinson RV error. "
-                f"Treating as SELL_PREMIUM."
+                f"Treating as NEUTRAL (no trade on bad data)."
             )
-            return VolatilityRegime.SELL_PREMIUM, details
+            return VolatilityRegime.NEUTRAL, details
 
         # ── Gate 3: IV behavior hard block ────────────────────────────────
         if iv_behavior in ("EXPANDING", "SPIKING"):
@@ -2700,8 +2700,8 @@ def _self_test() -> None:
     # VRP data error → SELL_PREMIUM (not ABORT)
     s6 = make_signals(vrp_raw=9.5, vrp_smoothed=9.5)
     vol6, d6 = classifier.classify_volatility(s6, 0, 11.0)
-    print(f"  VRP=9.5pp (data error) → {vol6.value} (expect SELL_PREMIUM)")
-    assert vol6 == VolatilityRegime.SELL_PREMIUM, f"Expected SELL_PREMIUM, got {vol6}"
+    print(f"  VRP=9.5pp (data error) → {vol6.value} (expect NEUTRAL - no trade on bad data)")
+    assert vol6 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL for data error, got {vol6}"
 
     # NEUTRAL (VRP too low)
     s7 = make_signals(vrp_smoothed=1.0, or_condition="MODERATE")
