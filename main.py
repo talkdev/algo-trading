@@ -1,3 +1,5 @@
+# file name is main.py
+
 from __future__ import annotations
 
 import json
@@ -220,7 +222,7 @@ class MainEngine:
             if candles:
                 trading_date = today_ist().isoformat()
                 rows = []
-                for c in candles[-20:]:
+                for c in candles:
                     if len(c) >= 6:
                         try:
                             from nifty_algo_core import parse_ist_timestamp
@@ -229,9 +231,13 @@ class MainEngine:
                                       .replace("+05:30", "")
                                       .replace("+0530", ""))
                             ts = datetime.fromisoformat(ts_raw)
+                            ts_clean = ts.strftime("%H:%M:%S")
+                            from datetime import time as _dtime
+                            if not (_dtime(9, 15) <= ts.time() <= _dtime(15, 29)):
+                                continue
                             rows.append((
                                 trading_date,
-                                ts.isoformat(),
+                                ts_clean,
                                 1,
                                 float(c[1]), float(c[2]),
                                 float(c[3]), float(c[4]),
@@ -245,12 +251,13 @@ class MainEngine:
                 if rows:
                     try:
                         self.db.executemany(
-                            "INSERT OR IGNORE INTO intraday_candles "
+                            "INSERT OR REPLACE INTO intraday_candles "
                             "(trading_date, candle_time, interval_min, "
                             "open, high, low, close, volume, source) "
                             "VALUES (?,?,?,?,?,?,?,?,?)",
                             rows,
                         )
+                        self.logger.debug(f"Spot cycle stored {len(rows)} bars for {trading_date}")
                     except Exception as e:
                         self.logger.warning(f"Spot bar insert error: {e}")
         except Exception as e:
@@ -306,11 +313,36 @@ class MainEngine:
                 regime_snap = self._regime_engine.process_signals(signals)
                 signals = merge_regime_into_signals(signals, regime_snap)
             else:
-                signals = merge_regime_into_signals(signals, self.market_engine)
+                self.logger.warning("RegimeEngine not available — signals will lack final_regime")
         except ImportError:
-            pass
+            self.logger.warning("regime_bridge import failed")
         except Exception as e:
-            self.logger.debug(f"Regime bridge error: {e}")
+            self.logger.error(f"Regime bridge error: {e}", exc_info=True)
+
+        try:
+            latest_cycle = self.db.query_one(
+                "SELECT cycle_id FROM cycle_log WHERE trading_date=? "
+                "ORDER BY cycle_id DESC LIMIT 1",
+                (today_ist().isoformat(),),
+            )
+            if latest_cycle and signals.get("final_regime"):
+                self.db.update(
+                    "cycle_log",
+                    {
+                        "final_regime": signals.get("final_regime"),
+                        "confidence": signals.get("confidence"),
+                        "price_regime_15": signals.get("price_regime_15"),
+                        "price_regime_60": signals.get("price_regime_60"),
+                        "mtf_aligned": int(signals.get("mtf_aligned", False)),
+                        "adx_15": signals.get("adx_15"),
+                        "adx_60": signals.get("adx_60"),
+                        "ema_structure": signals.get("ema_structure"),
+                        "no_trade_reason": signals.get("notes") if signals.get("final_regime") in ("NO_TRADE", "EMERGENCY_EXIT") else None,
+                    },
+                    {"cycle_id": latest_cycle["cycle_id"]},
+                )
+        except Exception as _cle:
+            self.logger.debug(f"cycle_log regime update error: {_cle}")
 
         self.execution_engine.monitor_all_positions(signals)
 
@@ -578,6 +610,7 @@ class MainEngine:
             self.logger.info(f"EOD: closing {len(open_positions)} remaining position(s)")
             self.execution_engine.close_all_positions("EOD_CLOSE")
         self._run_calibration_cycle(force=True)
+        self._last_calibration_time = time_module.monotonic()
         self.generate_daily_summary()
         self._eod_done = True
 
@@ -625,6 +658,7 @@ class MainEngine:
         self._reconcile_open_positions_on_startup()
         self._carry_forward_capital()
         self._run_calibration_cycle(force=True)
+        self._last_calibration_time = time_module.monotonic()
 
         today_event = ExpiryCalendar.is_event_day(today_ist())
         if today_event:
@@ -658,7 +692,7 @@ class MainEngine:
                     self._sleep(30)
                     continue
 
-                if current_time > dtime(15, 40):
+                if current_time > dtime(15, 35):
                     self.logger.info("Post-market — performing EOD tasks and stopping.")
                     self.perform_end_of_day_tasks()
                     break
@@ -679,7 +713,8 @@ class MainEngine:
                         self._sleep(30)
                         continue
 
-                if (now_mono - self._last_calibration_time) >= self.config.calibration_interval_sec:
+                _cal_interval = max(int(getattr(self.config, "calibration_interval_sec", 3600)), 3600)
+                if (now_mono - self._last_calibration_time) >= _cal_interval:
                     self._last_calibration_time = now_mono
                     self._run_calibration_cycle()
 
@@ -687,7 +722,8 @@ class MainEngine:
                 if (now_mono - self._last_status_print_time) >= status_interval:
                     self._last_status_print_time = now_mono
                     if self._market_open() and self.market_engine._snap_available():
-                        pass
+                        self.logger.debug("snap available")
+                    self.logger.debug("Status: market open, snap available")
 
                 loop_duration = (now_ist() - loop_start).total_seconds()
                 if loop_duration > 60:

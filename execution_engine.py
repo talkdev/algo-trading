@@ -1,3 +1,5 @@
+# file name is execution_engine.py
+
 from __future__ import annotations
 
 import json
@@ -708,11 +710,11 @@ class ExecutionEngine:
             is_dir = strategy_name in ("BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
             if is_dir:
                 gc = position.get("gross_credit") or position["entry_credit"]
-                credit_stop_limit = gc * 2.5
+                credit_stop_limit = gc * 2.2
                 if current_premium >= credit_stop_limit:
                     return "CLOSE_STOP", {"current_premium": current_premium}
             else:
-                credit_stop_limit = position["entry_credit"] * 1.8
+                credit_stop_limit = position["entry_credit"] * 1.6
                 actual_stop = min(
                     effective_stop if effective_stop is not None else credit_stop_limit,
                     credit_stop_limit
@@ -1170,7 +1172,11 @@ class ExecutionEngine:
                              f"{sig.get('trend_condition', '')}_"
                              f"{sig.get('direction', '')}")
                     state["last_stop_signal_combo"] = combo
-            if state.get("consecutive_stops", 0) >= 2:
+            elif reason == "EMERGENCY_EXIT":
+                state["last_stop_time"]   = now_ist().isoformat()
+                state["last_stop_reason"] = reason
+                state["consecutive_stops"] = 0
+            if reason == "CLOSE_STOP" and state.get("consecutive_stops", 0) >= 2:
                 state["daily_halted"] = True
                 self.logger.warning("2 consecutive stops — halting trading for the day")
         elif reason in ("CLOSE_ADX", "CLOSE_VWAP", "CLOSE_DELTA"):

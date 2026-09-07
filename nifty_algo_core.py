@@ -1,3 +1,5 @@
+# file name is nifty_algo_core.py
+
 from __future__ import annotations
 
 import os
@@ -670,6 +672,8 @@ CREATE TABLE IF NOT EXISTS session_state (
     vwap_valid INTEGER DEFAULT 0, expiry_last_checked TEXT,
     pre_event_spot REAL, pre_event_iv REAL, event_announcement_time TEXT,
     last_stop_signal_combo TEXT, gap_fade_opportunity INTEGER DEFAULT 0,
+    _straddle_open_for_regime REAL DEFAULT 0,
+    _straddle_open_for_summary REAL DEFAULT 0,
     created_at TEXT, updated_at TEXT
 );
 
@@ -1028,6 +1032,8 @@ MIGRATION_SQL = [
     "ALTER TABLE session_state ADD COLUMN event_announcement_time TEXT",
     "ALTER TABLE session_state ADD COLUMN last_stop_signal_combo TEXT",
     "ALTER TABLE session_state ADD COLUMN gap_fade_opportunity INTEGER DEFAULT 0",
+    "ALTER TABLE session_state ADD COLUMN _straddle_open_for_regime REAL DEFAULT 0",
+    "ALTER TABLE session_state ADD COLUMN _straddle_open_for_summary REAL DEFAULT 0",
     "ALTER TABLE calibration_state ADD COLUMN skew_bearish_threshold REAL DEFAULT 3.0",
     "ALTER TABLE calibration_state ADD COLUMN skew_bullish_threshold REAL DEFAULT -1.5",
     "ALTER TABLE calibration_state ADD COLUMN oi_buildup_threshold REAL DEFAULT 0.08",
@@ -1231,7 +1237,6 @@ class Database:
             )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
-            import pandas as pd
             return pd.DataFrame()
 
     def get_daily_summary(self, days=365):
@@ -1250,7 +1255,6 @@ class Database:
             df["weekday"] = pd.to_numeric(df["weekday"], errors="coerce")
             return df
         except Exception:
-            import pandas as pd
             return pd.DataFrame()
 
     def get_spot_history(self, days=30):
@@ -1267,7 +1271,6 @@ class Database:
             )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
-            import pandas as pd
             return pd.DataFrame()
 
     def get_connection(self):
@@ -1291,8 +1294,9 @@ class Database:
         return row["cnt"] if row else 0
 
     def get_vix_history(self, days=365, from_date=None):
+        import pandas as pd
+        from datetime import date, timedelta
         try:
-            import pandas as pd
             from datetime import date, timedelta
             cutoff = (date.today() - timedelta(days=days)).isoformat()
             if from_date and from_date > cutoff:
@@ -1303,12 +1307,12 @@ class Database:
             )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
-            import pandas as pd
             return pd.DataFrame()
 
     def get_daily_summary(self, days=365):
+        import pandas as pd
+        from datetime import date, timedelta
         try:
-            import pandas as pd
             from datetime import date, timedelta
             cutoff = (date.today() - timedelta(days=days)).isoformat()
             rows = self.query(
@@ -1325,12 +1329,12 @@ class Database:
             )
             return df
         except Exception:
-            import pandas as pd
             return pd.DataFrame()
 
     def get_spot_history(self, days=30):
+        import pandas as pd
+        from datetime import date, timedelta
         try:
-            import pandas as pd
             from datetime import date, timedelta
             cutoff = (date.today() - timedelta(days=days)).isoformat()
             rows = self.query(
@@ -1342,7 +1346,6 @@ class Database:
             )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
-            import pandas as pd
             return pd.DataFrame()
 
     def get_market_snapshots(self, days=365):
@@ -1356,7 +1359,6 @@ class Database:
             )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
-            import pandas as pd
             return pd.DataFrame()
 
     def close(self) -> None:
