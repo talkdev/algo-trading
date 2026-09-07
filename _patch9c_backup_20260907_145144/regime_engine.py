@@ -1006,11 +1006,10 @@ class RegimeClassifier:
         scores.append(-1 if ivr > ivr_s else -0.5 if ivr > self.config.ivr_neutral_low else 0 if ivr > ivr_b else 1)
 
         iv_hv_s = self._t("iv_hv_sell_threshold", "iv_hv_sell")
-        _iv_hv_safe = iv_hv if (iv_hv is not None and iv_hv > 0) else None
-        if _iv_hv_safe is None:
+        if iv_hv is None or iv_hv <= 0:
             scores.append(0)
         else:
-            scores.append(-1 if _iv_hv_safe > iv_hv_s else -0.5 if _iv_hv_safe > self.config.iv_hv_neutral else 0 if _iv_hv_safe > self.config.iv_hv_buy else 1)
+            scores.append(-1 if iv_hv > iv_hv_s else -0.5 if iv_hv > self.config.iv_hv_neutral else 0 if iv_hv > self.config.iv_hv_buy else 1)
 
         sr_s = self._t("straddle_ratio_sell", "straddle_ratio_sell")
         scores.append(-1 if s_ratio > sr_s else -0.5 if s_ratio > self.config.straddle_ratio_neutral_h else 0 if s_ratio > self.config.straddle_ratio_neutral_l else 1)
@@ -1591,8 +1590,6 @@ class RegimeEngine:
         cur_iv_pct = cur_iv_raw * 100.0 if cur_iv_raw < 2.0 else cur_iv_raw
         ivr     = self.classifier._calculate_ivr(cur_iv_pct)
         iv_hv   = self.classifier._calculate_iv_hv_ratio(cur_iv_pct)
-        if iv_hv is None:
-            iv_hv = 0.0
         s_ratio = self.classifier._calculate_straddle_ratio(
             signals.get("atm_straddle_price", 0) or 0,
             ts.weekday() if hasattr(ts, "weekday") else 0
