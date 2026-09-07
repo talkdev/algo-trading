@@ -1060,10 +1060,12 @@ class ExecutionEngine:
             opt      = chain.get(strike, {}).get(opt_type, {}) if chain else {}
             cur_delta = abs(float(opt.get("delta", leg.get("entry_delta", 0)) or 0))
 
-            if cur_delta > self.config.delta_close_threshold:
+            strategy_name_p1 = position.get("strategy_name", "")
+            delta_thresh_p1 = 0.72 if "BUTTERFLY" in strategy_name_p1 else self.config.delta_close_threshold
+            if cur_delta > delta_thresh_p1:
                 self.logger.warning(
                     f"PRIORITY 1 DELTA BREACH: {leg['action']} {opt_type} "
-                    f"{strike:.0f} delta={cur_delta:.3f} > {self.config.delta_close_threshold}"
+                    f"{strike:.0f} delta={cur_delta:.3f} > {delta_thresh_p1}"
                 )
                 return "CLOSE_STOP", EXIT_PRIORITY_DELTA_BREACH, {
                     "reason_detail": f"delta_breach_{cur_delta:.3f}",
@@ -1074,7 +1076,10 @@ class ExecutionEngine:
 
         # ── Priority 2: Spot proximity ────────────────────────────────────
         # Spot within 40pts of any short strike
-        proximity_pts = self.config.spot_proximity_pts  # default 40
+        strategy_name_p2 = position.get("strategy_name", "")
+        raw_params_p2 = json.loads(position.get("raw_params_json") or "{}")
+        wing_width_p2 = float(raw_params_p2.get("wing_width") or 150)
+        proximity_pts = max(int(wing_width_p2 * 0.55), 40) if "BUTTERFLY" in strategy_name_p2 else self.config.spot_proximity_pts
         if spot > 0:
             for leg in open_legs:
                 if leg["action"] != "SELL":
@@ -1449,7 +1454,11 @@ class ExecutionEngine:
                 "exit_premium":         exit_premium,
                 "gross_pnl_pts":        gross_pnl_pts,
                 "gross_pnl_rupees":     gross_pnl_rs,
-                "exit_slippage":        None,
+                "exit_slippage":        round(sum(
+                    abs(float(l.get("exit_price") or 0) - float(l.get("quoted_mid_at_exit") or l.get("exit_price") or 0))
+                    for l in exit_legs_info
+                    if l.get("exit_price") and l.get("quoted_mid_at_exit")
+                ), 3),
                 "exit_costs_pts":       exit_costs_rs / C02 if C02 else None,
                 "exit_costs_rupees":    exit_costs_rs,
                 "total_costs_rupees":   total_costs_rs,

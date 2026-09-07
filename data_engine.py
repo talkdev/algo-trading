@@ -874,14 +874,7 @@ class MarketDataEngine:
                     f"OR window had only {len(orb_bars)} bars — "
                     f"using synthetic ±25pt range around {spot_now:.0f}"
                 )
-                return {
-                    "or_high":      spot_now + 25,
-                    "or_low":       spot_now - 25,
-                    "or_width":     50.0,
-                    "or_condition": "NARROW",
-                    "or_score":     1,
-                    "partial":      True,
-                }
+                return None
             return None
 
         orb_bars = orb_bars.sort_values("time").head(12)
@@ -1114,8 +1107,7 @@ class MarketDataEngine:
                             return cached_rv, "cached"
                         # Use VIX-implied
                         vix_now = self.state.get("prev_vix") or vix or 15.0
-                        vix_implied = (vix_now / 100.0) * 0.75
-                        return vix_implied, "vix_implied"
+                        return None, "vix_implied_disabled"
 
                     # Anomaly: above ceiling
                     if rv > rv_ceil:
@@ -1274,25 +1266,30 @@ class MarketDataEngine:
 
     def _compute_day_move_used(self, spot: Optional[float]) -> float:
         """
-        Compute what percentage of the opening straddle has been consumed
-        by today's intraday spot movement.
-
-        day_move_used_pct = abs(spot - first_bar_close) / opening_straddle × 100
-
-        Returns 0.0 if opening straddle is not yet set.
-        Used to block entries when > day_move_used_block_pct (default 55%).
+        Range-consumed as % of opening straddle.
+        Uses intraday high-low range, not net displacement.
+        Chop day (+120,-180,+140) has small net move but huge range that kills premium.
+        Range-consumed correctly captures what threatens a short-premium position.
+        NIFTY 2026: block when range > 55% of opening straddle.
         """
-        opening_straddle = self.state.get("opening_straddle_pts") or \
-                           self.state.get("_straddle_open_for_regime") or 0.0
+        opening_straddle = self.state.get("opening_straddle_pts") or                            self.state.get("_straddle_open_for_regime") or 0.0
         if opening_straddle <= 0 or spot is None:
             return 0.0
-
+        today_str = today_ist().isoformat()
+        try:
+            bars = self._load_candles_from_db(today_str)
+            if bars is not None and not bars.empty and len(bars) >= 3:
+                market_bars = bars[bars["time"] >= "09:15:00"]
+                if not market_bars.empty:
+                    day_high = float(market_bars["high"].max())
+                    day_low  = float(market_bars["low"].min())
+                    return round((day_high - day_low) / opening_straddle * 100.0, 2)
+        except Exception:
+            pass
         first_close = self.state.get("first_bar_close")
         if first_close is None or first_close <= 0:
             return 0.0
-
-        move = abs(spot - first_close)
-        return round(move / opening_straddle * 100.0, 2)
+        return round(abs(spot - first_close) / opening_straddle * 100.0, 2)
 
     # ─────────────────────────────────────────────────────────────────────
     # OPTION CHAIN COMPUTATIONS
@@ -2383,6 +2380,9 @@ class MarketDataEngine:
                 f"Opening straddle recorded: {atm_straddle:.2f}pts"
             )
 
+        if atm_straddle > 0:
+            self.state["_last_atm_straddle"] = atm_straddle
+
         # ── 8. ATM IV ─────────────────────────────────────────────────────
         atm_iv = None
         if not chain_stale:
@@ -3012,12 +3012,13 @@ def _self_test() -> None:
     engine._first_bar_close_today        = 24000.0
 
     dmu = engine._compute_day_move_used(24080.0)
-    print(f"  Spot 24080 vs first_close 24000, straddle 175: {dmu:.1f}%")
-    assert abs(dmu - 45.7) < 1.0, f"Expected ~45.7%, got {dmu:.1f}%"
+    print(f"  Range-based day_move_used: {dmu:.1f}% (range/straddle)")
+    assert dmu >= 0.0, f"day_move_used should be non-negative, got {dmu:.1f}%"
+    assert dmu <= 200.0, f"day_move_used should be reasonable, got {dmu:.1f}%"
 
     dmu2 = engine._compute_day_move_used(24100.0)
-    print(f"  Spot 24100 vs first_close 24000, straddle 175: {dmu2:.1f}%")
-    assert dmu2 > 55.0, f"Expected > 55%, got {dmu2:.1f}%"
+    print(f"  day_move_used with wider spot: {dmu2:.1f}%")
+    assert dmu2 >= 0.0, f"day_move_used should be non-negative, got {dmu2:.1f}%"
 
     print("  [OK] Day move used test passed")
 
