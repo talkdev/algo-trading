@@ -612,7 +612,10 @@ class MainEngine:
             self.execution_engine.close_all_positions("EOD_CLOSE")
         self._run_calibration_cycle(force=True)
         self._last_calibration_time = time_module.monotonic()
-        self.generate_daily_summary()
+        try:
+            self.generate_daily_summary()
+        except Exception as _eod_e:
+            self.logger.error(f"EOD summary error (non-fatal): {_eod_e}", exc_info=True)
         self._eod_done = True
 
     def perform_graceful_shutdown(self) -> None:

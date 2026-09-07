@@ -737,6 +737,15 @@ class ExecutionEngine:
                 triggered = spot_move <= -price_stop_pts
             elif strategy_name == "BEAR_CALL_SPREAD":
                 triggered = spot_move >= price_stop_pts
+            elif strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY"):
+                _pos_legs = self._get_position_legs(position["position_id"])
+                _short_puts  = [l["strike"] for l in _pos_legs if l["action"] == "SELL" and l["option_type"] == "put"  and l["leg_status"] == "OPEN"]
+                _short_calls = [l["strike"] for l in _pos_legs if l["action"] == "SELL" and l["option_type"] == "call" and l["leg_status"] == "OPEN"]
+                _near_put  = min(_short_puts,  default=0)
+                _near_call = max(_short_calls, default=999999)
+                _put_breach  = _near_put > 0 and spot <= (_near_put + price_stop_pts)
+                _call_breach = _near_call < 999999 and spot >= (_near_call - price_stop_pts)
+                triggered = _put_breach or _call_breach
             else:
                 triggered = abs(spot_move) >= price_stop_pts
             if triggered:

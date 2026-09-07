@@ -606,14 +606,16 @@ class MarketDataEngine:
 
         last_close = float(post["close"].iloc[-1])
 
-        in_choppy_window = now <= dtime(10, 15)
+        in_choppy_window = now <= dtime(9, 45)
         if in_choppy_window:
-            recent_cutoff = (now_ist() - timedelta(minutes=20)).strftime("%H:%M:%S")
+            recent_cutoff = (now_ist() - timedelta(minutes=10)).strftime("%H:%M:%S")
             recent = post[post["time"] >= recent_cutoff]
             check_df = recent if not recent.empty else post
-            if (check_df["high"] > orb_high).any() and not (check_df["close"] > orb_high).any():
+            wick_high = int(((check_df["high"] > orb_high) & (check_df["close"] <= orb_high)).sum())
+            wick_low  = int(((check_df["low"] < orb_low)  & (check_df["close"] >= orb_low)).sum())
+            if wick_high >= 3:
                 return "CHOPPY"
-            if (check_df["low"] < orb_low).any() and not (check_df["close"] < orb_low).any():
+            if wick_low >= 3:
                 return "CHOPPY"
         else:
             if last_close > orb_high + 20:

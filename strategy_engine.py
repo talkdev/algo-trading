@@ -1043,17 +1043,22 @@ class StrategyEngine:
             final_lots = min(final_lots, max(1, int(margin_avail / margin_per_lot)))
             total_margin = margin_per_lot * final_lots
 
+        _opening_straddle_ref = s.get("atm_straddle_price") or 0
         if strategy_type == "SELL" and net_credit and net_credit > 0:
-            credit_stop_mult = 1.8 if actual_dte == 0 else (1.6 if actual_dte == 1 else 1.5)
-            credit_stop = net_credit * credit_stop_mult
-            static_stop = PRICE_STOPS.get(strategy_name, 80)
-            if actual_dte == 0:
-                static_stop = int(static_stop * 0.60)
-            elif actual_dte == 1:
-                static_stop = int(static_stop * 0.75)
-            elif actual_dte <= 3:
-                static_stop = int(static_stop * 0.90)
-            price_stop_pts = int(min(static_stop, max(credit_stop * 2.0, 30)))
+            _is_ic_ib = strategy_name in ("IRON_CONDOR", "IRON_BUTTERFLY")
+            if _is_ic_ib and _opening_straddle_ref > 20:
+                price_stop_pts = max(int(_opening_straddle_ref * 0.30), 40)
+            else:
+                credit_stop_mult = 1.8 if actual_dte == 0 else (1.6 if actual_dte == 1 else 1.5)
+                credit_stop = net_credit * credit_stop_mult
+                static_stop = PRICE_STOPS.get(strategy_name, 80)
+                if actual_dte == 0:
+                    static_stop = int(static_stop * 0.60)
+                elif actual_dte == 1:
+                    static_stop = int(static_stop * 0.75)
+                elif actual_dte <= 3:
+                    static_stop = int(static_stop * 0.90)
+                price_stop_pts = int(min(static_stop, max(credit_stop * 2.0, 30)))
         else:
             price_stop_pts = PRICE_STOPS.get(strategy_name, 80)
             if actual_dte == 0:
