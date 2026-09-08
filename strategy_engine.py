@@ -238,14 +238,21 @@ class StrategyEngine:
 
         actual_dte = signals.get("actual_dte")
         vol_regime = signals.get("vol_regime", "NEUTRAL")
-        if actual_dte is not None and actual_dte >= 2:
-            if vol_regime != "STRONG_SELL_PREMIUM":
+        if actual_dte is not None and actual_dte > 6:
+            return "NO_TRADE", f"dte_{actual_dte}_above_max_6_intraday_only"
+        if actual_dte is not None and actual_dte >= 4:
+            if vol_regime not in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM"):
                 return "NO_TRADE", (
-                    f"dte_{actual_dte}_requires_strong_sell_premium_not_{vol_regime}"
+                    f"dte_{actual_dte}_requires_sell_premium_not_{vol_regime}"
                 )
-            if confidence != "HIGH":
+            if confidence not in ("HIGH", "MEDIUM"):
                 return "NO_TRADE", (
-                    f"dte_{actual_dte}_requires_high_confidence_not_{confidence}"
+                    f"dte_{actual_dte}_requires_medium_high_confidence"
+                )
+        if actual_dte is not None and actual_dte in (2, 3):
+            if vol_regime not in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM"):
+                return "NO_TRADE", (
+                    f"dte_{actual_dte}_requires_sell_premium_not_{vol_regime}"
                 )
 
         day_move_used = float(signals.get("day_move_used_pct") or 0.0)
@@ -454,9 +461,17 @@ class StrategyEngine:
             dist_mult  = 1.0 * time_mult2
             floor_pts  = max(int(120 * time_mult2), 55)
         elif dte == 1:
-            dist_mult, floor_pts = 0.85, 150
+            dist_mult, floor_pts = 0.85, 130
+        elif dte == 2:
+            dist_mult, floor_pts = 0.65, 110
+        elif dte == 3:
+            dist_mult, floor_pts = 0.55, 100
+        elif dte == 4:
+            dist_mult, floor_pts = 0.48, 90
+        elif dte == 5:
+            dist_mult, floor_pts = 0.42, 85
         else:
-            dist_mult, floor_pts = 0.75, 150
+            dist_mult, floor_pts = 0.38, 80
 
         if adx_15 >= self.config.adx_strong_threshold:
             dist_mult *= 1.20
@@ -813,7 +828,15 @@ class StrategyEngine:
             return 0.50 if vix < 12.0 else (0.47 if vix < 14.0 else 0.45)
         if dte == 1:
             return 0.42 if vix < 12.0 else (0.38 if vix < 14.0 else 0.35)
-        return 0.32
+        if dte == 2:
+            return 0.30 if vix < 12.0 else (0.27 if vix < 14.0 else 0.24)
+        if dte == 3:
+            return 0.25 if vix < 12.0 else 0.22
+        if dte == 4:
+            return 0.22 if vix < 12.0 else 0.19
+        if dte == 5:
+            return 0.20 if vix < 12.0 else 0.17
+        return 0.18
 
     def _compute_ev_gate(
         self,
@@ -823,27 +846,26 @@ class StrategyEngine:
         total_slippage:  float,
         signals:         dict,
     ) -> Tuple[bool, str]:
-        """
-        True EV gate: EV = p_win * reward - (1-p_win) * risk - friction
-        p_win from (DTE, OR condition, VRP bucket) priors for NIFTY 2026.
-        Old gate had no probability term - this is the correct formulation.
-        """
         dte          = signals.get("actual_dte")
         or_condition = signals.get("or_condition", "MODERATE")
         vrp_smoothed = float(signals.get("vrp_smoothed") or 0.0)
         target_pct   = self._get_target_pct(dte, signals)
         reward_pts   = net_credit * target_pct
-        risk_pts     = max(wing - net_credit, net_credit * 2.0)
+        risk_pts     = net_credit * 2.5
         friction     = (entry_costs_pts + total_slippage) * 2.0
 
         p_win_table = {
-            0: {"VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62, "WIDE": 0.52},
-            1: {"VERY_NARROW": 0.68, "NARROW": 0.64, "MODERATE": 0.58, "WIDE": 0.48},
-            2: {"VERY_NARROW": 0.60, "NARROW": 0.56, "MODERATE": 0.50, "WIDE": 0.42},
+            0: {"VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62, "WIDE": 0.52, "VERY_WIDE": 0.44},
+            1: {"VERY_NARROW": 0.68, "NARROW": 0.64, "MODERATE": 0.58, "WIDE": 0.48, "VERY_WIDE": 0.40},
+            2: {"VERY_NARROW": 0.64, "NARROW": 0.60, "MODERATE": 0.54, "WIDE": 0.46, "VERY_WIDE": 0.38},
+            3: {"VERY_NARROW": 0.61, "NARROW": 0.57, "MODERATE": 0.51, "WIDE": 0.43, "VERY_WIDE": 0.35},
+            4: {"VERY_NARROW": 0.58, "NARROW": 0.54, "MODERATE": 0.48, "WIDE": 0.40, "VERY_WIDE": 0.32},
+            5: {"VERY_NARROW": 0.56, "NARROW": 0.52, "MODERATE": 0.46, "WIDE": 0.38, "VERY_WIDE": 0.30},
+            6: {"VERY_NARROW": 0.54, "NARROW": 0.50, "MODERATE": 0.44, "WIDE": 0.36, "VERY_WIDE": 0.28},
         }
         p_win_prior = p_win_table.get(
-            min(dte or 1, 2), {}
-        ).get(or_condition, 0.55)
+            min(dte or 1, 6), p_win_table[6]
+        ).get(or_condition, 0.50)
 
         if vrp_smoothed > 4.0:
             vrp_adj = 0.04
@@ -1045,8 +1067,11 @@ class StrategyEngine:
         if structural_loss_per_lot <= 0:
             structural_loss_per_lot = wing_for_sizing * C02 * 0.5
 
-        risk_pct_map = {0: 0.005, 1: 0.004, 2: 0.003}
-        risk_pct  = risk_pct_map.get(min(actual_dte or 1, 2), 0.003)
+        risk_pct_map = {
+            0: 0.005, 1: 0.004, 2: 0.003,
+            3: 0.0025, 4: 0.002, 5: 0.0018, 6: 0.0015
+        }
+        risk_pct  = risk_pct_map.get(min(actual_dte or 1, 6), 0.0015)
         max_risk  = current_capital * risk_pct
         raw_lots  = max_risk / structural_loss_per_lot
         final_lots = max(1, int(raw_lots * size_mult))

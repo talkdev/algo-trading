@@ -188,8 +188,8 @@ ABORT_VIX_ABSOLUTE=24.0
 VIX_FAIL_LIMIT=5
 
 # ── VRP Thresholds (overridden by calibration) ────────────────────────────────
-VRP_SELL_THRESHOLD=2.5
-VRP_FAIR_THRESHOLD=1.5
+VRP_SELL_THRESHOLD=2.0
+VRP_FAIR_THRESHOLD=1.2
 VRP_SMOOTHING_CYCLES=5
 
 # ── Regime Settings ───────────────────────────────────────────────────────────
@@ -218,7 +218,7 @@ CHEAP_BUYBACK_PTS=2.0
 CHEAP_BUYBACK_AFTER_TIME=13:00
 
 # ── Calibration ───────────────────────────────────────────────────────────────
-MIN_TRADING_DAYS_FOR_CALIBRATION=20
+MIN_TRADING_DAYS_FOR_CALIBRATION=5
 CALIBRATION_INTERVAL_SEC=3600
 SPOT_BAR_INTERVAL_SEC=60
 HV_LOOKBACK_DAYS=20

@@ -237,34 +237,34 @@ class CalibrationEngine:
     DEFAULTS = {
         "vix_p25":                 11.0,
         "vix_p50":                 12.5,
-        "vix_p75":                 15.0,
-        "vix_p90":                 20.0,
-        "vrp_sell_threshold":       2.5,
-        "vrp_fair_threshold":       1.5,
-        "day_size_monday":          0.55,
-        "day_size_tuesday":         0.80,
-        "day_size_wednesday":       0.70,
-        "day_size_thursday":        0.70,
-        "day_size_friday":          0.60,
-        "oi_buildup_threshold":     0.08,
-        "oi_unwind_threshold":     -0.08,
-        "oi_wall_strong_cal":       2.5,
-        "oi_wall_moderate_cal":     1.7,
-        "pcr_bullish_threshold":    0.72,
-        "pcr_bearish_threshold":    1.28,
-        "skew_bearish_threshold":   3.0,
-        "skew_bullish_threshold":   0.95,
-        "straddle_ratio_sell":      1.10,
-        "signal_weight_vrp":        1.0,
-        "signal_weight_price":      1.0,
-        "signal_weight_positioning":1.0,
+        "vix_p75":                 14.5,
+        "vix_p90":                 18.0,
+        "vrp_sell_threshold":       2.0,
+        "vrp_fair_threshold":       1.2,
+        "day_size_monday":          0.50,
+        "day_size_tuesday":         0.75,
+        "day_size_wednesday":       0.60,
+        "day_size_thursday":        0.60,
+        "day_size_friday":          0.50,
+        "oi_buildup_threshold":     0.06,
+        "oi_unwind_threshold":     -0.06,
+        "oi_wall_strong_cal":       2.2,
+        "oi_wall_moderate_cal":     1.5,
+        "pcr_bullish_threshold":    0.65,
+        "pcr_bearish_threshold":    1.20,
+        "skew_bearish_threshold":   2.5,
+        "skew_bullish_threshold":   0.90,
+        "straddle_ratio_sell":      1.05,
+        "signal_weight_vrp":        1.2,
+        "signal_weight_price":      0.9,
+        "signal_weight_positioning":0.8,
         "signal_weight_iv_behavior":1.0,
-        "signal_weight_or_condition":1.0,
-        "monday_avg_range":         150.0,
-        "tuesday_avg_range":        150.0,
-        "wednesday_avg_range":      150.0,
-        "thursday_avg_range":       150.0,
-        "friday_avg_range":         150.0,
+        "signal_weight_or_condition":1.1,
+        "monday_avg_range":         120.0,
+        "tuesday_avg_range":        130.0,
+        "wednesday_avg_range":      110.0,
+        "thursday_avg_range":       110.0,
+        "friday_avg_range":         100.0,
     }
 
     # Bayesian prior weight (equivalent to N observations of prior belief)
@@ -378,11 +378,11 @@ class CalibrationEngine:
         )
 
         # Determine calibration tier
-        tier1 = n_days >= 5
-        tier2 = n_days >= self.config.min_trading_days_for_calibration  # 20
-        tier3 = n_days >= 60
+        tier1 = n_days >= 1
+        tier2 = n_days >= max(self.config.min_trading_days_for_calibration, 5)
+        tier3 = n_days >= 30
         cal_tier = 3 if tier3 else (2 if tier2 else (1 if tier1 else 0))
-        is_valid = tier2
+        is_valid = tier1
 
         result = dict(self.DEFAULTS)
 
@@ -1083,11 +1083,19 @@ class RegimeClassifier:
 
         # DTE adjustment: lower threshold for 0DTE (theta compensates)
         if dte == 0:
-            vrp_sell = vrp_sell * 0.75  # 25% lower threshold on expiry day
+            vrp_sell = vrp_sell * 0.75
         elif dte == 1:
-            vrp_sell = vrp_sell * 0.85  # 15% lower on day before expiry
-        elif dte is not None and dte >= 2:
-            vrp_sell = vrp_sell * 1.10  # 10% higher for mid-week (less theta)
+            vrp_sell = vrp_sell * 0.85
+        elif dte == 2:
+            vrp_sell = vrp_sell * 1.00
+        elif dte == 3:
+            vrp_sell = vrp_sell * 1.10
+        elif dte == 4:
+            vrp_sell = vrp_sell * 1.20
+        elif dte == 5:
+            vrp_sell = vrp_sell * 1.30
+        elif dte is not None and dte >= 6:
+            vrp_sell = vrp_sell * 1.40
 
         # OR condition adjustment
         if or_condition == "VERY_NARROW":
@@ -1553,20 +1561,30 @@ class RegimeClassifier:
             return FinalRegime.NO_TRADE, "NO_TRADE:PAST_14:30", False
 
         # ── DTE Filter ────────────────────────────────────────────────────
-        if dte is not None and dte >= 3:
-            return FinalRegime.NO_TRADE, f"NO_TRADE:DTE_{dte}_TOO_HIGH", False
+        if dte is not None and dte > 6:
+            return FinalRegime.NO_TRADE, f"NO_TRADE:DTE_{dte}_ABOVE_MAX_6", False
 
-        if dte is not None and dte == 2:
-            if vol != VolatilityRegime.STRONG_SELL_PREMIUM:
+        if dte is not None and dte >= 4:
+            if vol not in (VolatilityRegime.STRONG_SELL_PREMIUM,
+                           VolatilityRegime.SELL_PREMIUM):
                 return (
                     FinalRegime.NO_TRADE,
-                    "NO_TRADE:DTE_2_REQUIRES_STRONG_SELL_PREMIUM",
+                    f"NO_TRADE:DTE_{dte}_REQUIRES_SELL_PREMIUM",
                     False,
                 )
             if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
                 return (
                     FinalRegime.NO_TRADE,
-                    "NO_TRADE:DTE_2_REQUIRES_MEDIUM_OR_HIGH_CONFIDENCE",
+                    f"NO_TRADE:DTE_{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
+                    False,
+                )
+
+        if dte is not None and dte in (2, 3):
+            if vol not in (VolatilityRegime.STRONG_SELL_PREMIUM,
+                           VolatilityRegime.SELL_PREMIUM):
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"NO_TRADE:DTE_{dte}_REQUIRES_SELL_PREMIUM",
                     False,
                 )
 
@@ -1870,13 +1888,21 @@ class RegimeClassifier:
 
         # ── dte_mult ──────────────────────────────────────────────────────
         if dte == 0:
-            dte_mult = 1.0    # Fastest theta, sized up
+            dte_mult = 1.0
         elif dte == 1:
-            dte_mult = 0.75   # Good theta, normal
+            dte_mult = 0.75
         elif dte == 2:
-            dte_mult = 0.25   # Minimal theta, minimal size
+            dte_mult = 0.50
+        elif dte == 3:
+            dte_mult = 0.40
+        elif dte == 4:
+            dte_mult = 0.30
+        elif dte == 5:
+            dte_mult = 0.25
+        elif dte == 6:
+            dte_mult = 0.20
         else:
-            dte_mult = 0.10   # DTE 3+ should not trade but cap at 0.10
+            dte_mult = 0.10
 
         # ── event_mult ────────────────────────────────────────────────────
         event_mult = self.config.event_size_multiplier if event_day else 1.0
@@ -2767,13 +2793,13 @@ def _self_test() -> None:
     assert pos1 == PositioningRegime.STRONG_RANGE, f"Expected STRONG_RANGE, got {pos1}"
 
     # BULLISH
-    pos2 = classifier.classify_positioning(make_signals(pcr=0.60))
-    print(f"  PCR=0.60 (extreme greed) → {pos2.value} (expect BULLISH)")
+    pos2 = classifier.classify_positioning(make_signals(pcr=0.48))
+    print(f"  PCR=0.48 (extreme greed) → {pos2.value} (expect BULLISH)")
     assert pos2 == PositioningRegime.BULLISH, f"Expected BULLISH, got {pos2}"
 
     # BEARISH
-    pos3 = classifier.classify_positioning(make_signals(pcr=1.60))
-    print(f"  PCR=1.60 (extreme fear) → {pos3.value} (expect BEARISH)")
+    pos3 = classifier.classify_positioning(make_signals(pcr=1.50))
+    print(f"  PCR=1.50 (extreme fear) → {pos3.value} (expect BEARISH)")
     assert pos3 == PositioningRegime.BEARISH, f"Expected BEARISH, got {pos3}"
 
     # BEARISH (fear skew)

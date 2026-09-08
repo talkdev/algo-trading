@@ -1933,6 +1933,49 @@ def generate_report(target_date: str) -> None:
 
     # ── Section 36: LLM Context ───────────────────────────────────────────
     md.append("## 36. LLM Analysis Context\n")
+    _vrp_curve_vals = [v["vrp_smoothed"] for v in vrp_curve
+                       if v.get("vrp_smoothed") is not None]
+    _vrp_sell_thresh = calibration_summary.get("vrp_sell_threshold") or 2.0
+    _vrp_fair_thresh = calibration_summary.get("vrp_fair_threshold") or 1.2
+    _vrp_above_sell  = sum(1 for v in _vrp_curve_vals if v > _vrp_sell_thresh)
+    _vrp_below_fair  = sum(1 for v in _vrp_curve_vals if v < _vrp_fair_thresh)
+    _vrp_negative    = sum(1 for v in _vrp_curve_vals if v < 0)
+    _parkinson_vals  = [float(c.get("parkinson_rv_pct") or 0)
+                        for c in cycle_rows if c.get("parkinson_rv_pct")]
+    _rv_spike_cycles = sum(
+        1 for i in range(1, len(_parkinson_vals))
+        if _parkinson_vals[i] > _parkinson_vals[i-1] * 1.5
+    ) if len(_parkinson_vals) > 1 else 0
+    _rv_floor_cycles = sum(
+        1 for v in _parkinson_vals if abs(v - 6.0) < 0.01
+    )
+    _actual_dte_today    = session_state.get("actual_dte") if session_state else None
+    _actual_expiry_today = session_state.get("actual_expiry") if session_state else None
+    _tenor_mismatch = (
+        _actual_dte_today == 0 and
+        _actual_expiry_today is not None and
+        _actual_expiry_today != target_date
+    )
+    _no_trade_by_gate: dict = {}
+    for _d in decisions:
+        if _d.get("action") == "NO_TRADE":
+            _r = str(_d.get("reason") or "unknown")
+            if "before_entry" in _r or "past_entry" in _r or "hard_exit" in _r:
+                _g = "timing"
+            elif "ev_gate" in _r or "params_invalid" in _r:
+                _g = "ev_or_params"
+            elif "confidence" in _r or "dte_" in _r:
+                _g = "regime_quality"
+            elif "VOL_NEUTRAL" in _r or "VOL_BUY" in _r or "ABORT" in _r:
+                _g = "volatility"
+            elif "consecutive" in _r or "daily_loss" in _r or "halt" in _r:
+                _g = "risk"
+            elif "or_not" in _r or "opening_range" in _r or "chain_stale" in _r:
+                _g = "data"
+            else:
+                _g = "other"
+            _no_trade_by_gate[_g] = _no_trade_by_gate.get(_g, 0) + 1
+
     nifty_context = {
         "engine_type":              "NIFTY intraday options only — no overnight positions",
         "expiry_structure":         "Weekly Tuesday expiry — 0DTE Tuesday, 1DTE Monday",
@@ -1947,24 +1990,63 @@ def generate_report(target_date: str) -> None:
         "vol_regime_today":         session_state.get("vix_regime") if session_state else None,
         "dominant_vol_regime":      daily_summary.get("dominant_vol_regime") if daily_summary else None,
         "dominant_price_regime":    daily_summary.get("dominant_price_regime") if daily_summary else None,
+        "actual_dte_today":         _actual_dte_today,
+        "actual_expiry_today":      _actual_expiry_today,
+        "tenor_mismatch_detected":  _tenor_mismatch,
+        "tenor_mismatch_note":      (
+            f"DTE=0 stored but expiry={_actual_expiry_today} != {target_date}"
+            if _tenor_mismatch else "ok"
+        ),
         "trades_taken_today":       len(trade_entries),
         "trades_blocked_phantom":   len(phantom_rows),
         "phantom_fnr_today":        phantom_summary.get("false_negative_rate_pct"),
         "exit_quality_score_today": exit_quality_sum.get("exit_quality_score"),
         "regime_accuracy_today":    regime_accuracy_sum.get("avg_score"),
         "net_pnl_today":            net_pnl,
+        "gross_pnl_today":          gross_pnl,
+        "total_costs_today":        total_costs,
         "cost_coverage_ratio":      round(gross_pnl / max(total_costs, 1), 2) if gross_pnl > 0 else None,
+        "cost_as_pct_gross":        round(total_costs / gross_pnl * 100, 1) if gross_pnl > 0 else None,
         "opening_straddle_pts":     session_state.get("opening_straddle_pts") if session_state else None,
         "vrp_mean_today":           vrp_stats.get("vrp_mean"),
+        "vrp_above_sell_threshold_cycles": _vrp_above_sell,
+        "vrp_below_fair_threshold_cycles": _vrp_below_fair,
+        "vrp_negative_cycles":      _vrp_negative,
+        "rv_spike_cycles":          _rv_spike_cycles,
+        "rv_floor_cycles":          _rv_floor_cycles,
         "iv_crush_today":           vrp_stats.get("iv_crush_pct"),
+        "atm_iv_open":              vrp_stats.get("atm_iv_open_pct"),
+        "atm_iv_close":             vrp_stats.get("atm_iv_close_pct"),
+        "parkinson_rv_mean":        vrp_stats.get("parkinson_rv_mean_pct"),
         "or_condition_today":       or_analysis.get("or_condition"),
         "or_width_pts":             or_analysis.get("or_width_pts"),
+        "or_width_pct":             or_analysis.get("or_width_pct"),
         "day_move_used_max":        max((float(c.get("day_move_used_pct") or 0) for c in cycle_rows), default=0),
         "abort_cycles_today":       sum(1 for c in cycle_rows if c.get("block_new_entries")),
         "sell_premium_cycles":      sum(1 for c in cycle_rows if c.get("vol_regime") in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")),
+        "strong_sell_cycles":       sum(1 for c in cycle_rows if c.get("vol_regime") == "STRONG_SELL_PREMIUM"),
         "neutral_cycles":           sum(1 for c in cycle_rows if c.get("vol_regime") == "NEUTRAL"),
+        "buy_options_cycles":       sum(1 for c in cycle_rows if c.get("vol_regime") == "BUY_OPTIONS"),
         "range_cycles":             sum(1 for c in cycle_rows if c.get("price_regime") == "RANGE"),
         "trending_cycles":          sum(1 for c in cycle_rows if c.get("price_regime") in ("UPTREND", "DOWNTREND", "STRONG_UPTREND", "STRONG_DOWNTREND")),
+        "choppy_cycles":            sum(1 for c in cycle_rows if c.get("price_regime") == "CHOPPY"),
+        "no_trade_by_gate":         _no_trade_by_gate,
+        "total_no_trade_decisions": sum(1 for d in decisions if d.get("action") == "NO_TRADE"),
+        "total_enter_decisions":    sum(1 for d in decisions if d.get("action") == "ENTER"),
+        "vix_open":                 vix_profile.get("vix_open"),
+        "vix_close":                vix_profile.get("vix_close"),
+        "vix_range":                vix_profile.get("vix_range"),
+        "nifty_range_pts":          spot_profile.get("range_pts"),
+        "nifty_range_pct":          spot_profile.get("range_pct"),
+        "day_mode":                 session_state.get("day_mode") if session_state else None,
+        "gap_direction":            session_state.get("gap_direction") if session_state else None,
+        "gap_size_pts":             session_state.get("gap_size_pts") if session_state else None,
+        "adx_profile":              adx_profile,
+        "pcr_profile":              pcr_profile,
+        "calibration_tier":         calibration_summary.get("calibration_tier"),
+        "calibration_valid":        calibration_summary.get("is_valid"),
+        "vrp_sell_threshold":       _vrp_sell_thresh,
+        "vrp_fair_threshold":       _vrp_fair_thresh,
     }
     md.append(md_kv(nifty_context))
     md.append(f"""
