@@ -37,6 +37,9 @@ except Exception:
         IST = None
 
 
+NIFTY_ENGINE_PROFIT_PATCH_V31 = "3.1"
+
+
 def now_ist() -> datetime:
     """Return current datetime in IST."""
     if IST is not None:
@@ -134,16 +137,46 @@ MAX_DAILY_LOSS_PCT=0.02
 MAX_RISK_PER_TRADE_PCT=0.006
 
 # ── NIFTY Contract Spec ───────────────────────────────────────────────────────
-NIFTY_LOT_SIZE=75
+# NSE revised the NIFTY 50 market lot from 75 to 65 for the January 2026
+# cycle (first weekly expiry 06-Jan-2026, first monthly 27-Jan-2026).
+NIFTY_LOT_SIZE=65
 NIFTY_STRIKE_STEP=50
 
 # ── Transaction Costs ─────────────────────────────────────────────────────────
 STT_OPTIONS_SELL=0.0015
 STT_OPTIONS_EXERCISE=0.0015
 BROKERAGE_PER_ORDER=20.0
-EXCHANGE_TXN_RATE=0.00053
+# NSE options: Rs 3,503 per crore of premium + Rs 50/cr IPFT = 0.03553%.
+EXCHANGE_TXN_RATE=0.0003553
 SEBI_RATE=0.000001
 STAMP_DUTY_BUY_OPTIONS=0.00003
+
+# ── v3.1 Profitability Calibration ────────────────────────────────────────────
+# Opening range classified as a fraction of spot (scale-invariant) and against
+# the opening ATM straddle. The more conservative of the two wins.
+OR_PCT_VERY_NARROW=0.0020
+OR_PCT_NARROW=0.0036
+OR_PCT_MODERATE=0.0055
+OR_PCT_WIDE=0.0078
+OR_STRADDLE_VERY_NARROW=0.24
+OR_STRADDLE_NARROW=0.42
+OR_STRADDLE_MODERATE=0.62
+OR_STRADDLE_WIDE=0.86
+# Structural distances as a fraction of spot.
+SPOT_PROXIMITY_PCT=0.0016
+SPOT_VELOCITY_PCT=0.0014
+# Fraction of the structural (wing) loss a working stop is assumed to avoid.
+# 0.0 sizes on the full wing loss; hard-capped at 0.80 in code.
+STOP_EFFICACY=0.55
+# Probability the stop is jumped and the structure prints toward the wing.
+GAMMA_TAIL_PROB_DTE0=0.055
+GAMMA_TAIL_PROB_DTE1P=0.025
+# Slippage in multiples of the half-spread, per leg.
+ENTRY_SLIPPAGE_MULT=0.35
+EXIT_SLIPPAGE_MULT=2.25
+# Rupee tolerance added to the relative bid/ask gate (cheap wings).
+SPREAD_ABS_TOLERANCE=0.85
+MAX_DTE_TRADEABLE=4
 
 # ── Trading Windows ───────────────────────────────────────────────────────────
 TRADING_WINDOW_START=09:45
@@ -650,6 +683,43 @@ class Config:
     # Misc
     gift_nifty_instrument_key: str
 
+    # ── v3.1 profitability calibration ────────────────────────────────────
+    # Opening-range width is classified as a FRACTION OF SPOT rather than in
+    # absolute points, so the classification does not silently drift toward
+    # "WIDE" as NIFTY rises. Chosen to reproduce the old 50/100/150/200pt
+    # bands at a ~25,000 index and to scale correctly above it.
+    or_pct_very_narrow:      float = 0.0020
+    or_pct_narrow:           float = 0.0036
+    or_pct_moderate:         float = 0.0055
+    or_pct_wide:             float = 0.0078
+    # Opening range measured against the opening ATM straddle, i.e. against
+    # the market's own priced expectation for the day's range. The more
+    # conservative of the two classifications wins.
+    or_straddle_very_narrow: float = 0.24
+    or_straddle_narrow:      float = 0.42
+    or_straddle_moderate:    float = 0.62
+    or_straddle_wide:        float = 0.86
+    # Structural distances as a fraction of spot (replace hardcoded points).
+    spot_proximity_pct:      float = 0.0016
+    spot_velocity_pct:       float = 0.0014
+    # Fraction of the structural (wing) loss that a working stop is assumed
+    # to avoid. 0.0 = size on the full wing loss, 1.0 = trust the stop
+    # completely. On NIFTY 0DTE the stop is NOT honoured through a gamma gap,
+    # so sizing takes only partial credit for it.
+    stop_efficacy:           float = 0.55
+    # Probability that the stop is jumped and the structure prints toward the
+    # wing (gap / gamma tail). Priced explicitly in the EV gate.
+    gamma_tail_prob_dte0:    float = 0.055
+    gamma_tail_prob_dte1p:   float = 0.025
+    # Slippage model, in multiples of the half-spread, per leg.
+    entry_slippage_mult:     float = 0.35
+    exit_slippage_mult:      float = 2.25
+    # Absolute rupee tolerance added to the relative bid/ask gate so that
+    # cheap protective wings (Rs 1-3) are not rejected over a 0.10 tick.
+    spread_abs_tolerance:    float = 0.85
+    # Highest DTE at which the credit structures may be opened.
+    max_dte_tradeable:       int   = 4
+
     def __repr__(self) -> str:
         def mask(s: str) -> str:
             if not s:
@@ -732,14 +802,14 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         max_risk_per_trade_pct=max_risk_per_trade_pct,
 
         # Contract
-        lot_size=_get_int(env, "NIFTY_LOT_SIZE", 75),
+        lot_size=_get_int(env, "NIFTY_LOT_SIZE", 65),
         nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),
 
         # Costs
         stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),
         stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
-        exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.00053),
+        exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003553),
         sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
         stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00003),
 
@@ -839,6 +909,25 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
 
         # Misc
         gift_nifty_instrument_key=env.get("GIFT_NIFTY_INSTRUMENT_KEY", "").strip(),
+
+        # v3.1 profitability calibration
+        or_pct_very_narrow=_get_float(env, "OR_PCT_VERY_NARROW", 0.0020),
+        or_pct_narrow=_get_float(env, "OR_PCT_NARROW", 0.0036),
+        or_pct_moderate=_get_float(env, "OR_PCT_MODERATE", 0.0055),
+        or_pct_wide=_get_float(env, "OR_PCT_WIDE", 0.0078),
+        or_straddle_very_narrow=_get_float(env, "OR_STRADDLE_VERY_NARROW", 0.24),
+        or_straddle_narrow=_get_float(env, "OR_STRADDLE_NARROW", 0.42),
+        or_straddle_moderate=_get_float(env, "OR_STRADDLE_MODERATE", 0.62),
+        or_straddle_wide=_get_float(env, "OR_STRADDLE_WIDE", 0.86),
+        spot_proximity_pct=_get_float(env, "SPOT_PROXIMITY_PCT", 0.0016),
+        spot_velocity_pct=_get_float(env, "SPOT_VELOCITY_PCT", 0.0014),
+        stop_efficacy=min(max(_get_float(env, "STOP_EFFICACY", 0.55), 0.0), 0.80),
+        gamma_tail_prob_dte0=_get_float(env, "GAMMA_TAIL_PROB_DTE0", 0.055),
+        gamma_tail_prob_dte1p=_get_float(env, "GAMMA_TAIL_PROB_DTE1P", 0.025),
+        entry_slippage_mult=_get_float(env, "ENTRY_SLIPPAGE_MULT", 0.35),
+        exit_slippage_mult=_get_float(env, "EXIT_SLIPPAGE_MULT", 2.25),
+        spread_abs_tolerance=_get_float(env, "SPREAD_ABS_TOLERANCE", 0.85),
+        max_dte_tradeable=_get_int(env, "MAX_DTE_TRADEABLE", 4),
     )
 
 

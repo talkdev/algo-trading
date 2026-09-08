@@ -199,16 +199,75 @@ class LiveOrderExecutor:
 
         return round(round(price / tick) * tick, 2)
 
+    # Broker statuses meaning "this order is done and fully executed".
+    _TERMINAL_OK = {"complete", "completed", "filled", "traded", "executed"}
+    _TERMINAL_BAD = {"cancelled", "canceled", "rejected", "expired", "lapsed"}
+
     def _get_fill_price(
-        self, order_id: str, fallback: float, retries: int = 3
+        self, order_id: str, fallback: float, retries: int = 8
     ) -> float:
-        """Fetch actual fill price from broker after order placement."""
+        """
+        Fetch the ACTUAL fill price and verify the order really completed.
+
+        v3.1: this previously polled three times and, on failure, returned the
+        price the strategy *expected*, while execute_leg_entry/exit
+        unconditionally reported status "FILLED". An unfilled or partially
+        filled leg was therefore written into position_legs as a clean fill.
+        From that moment the engine's book no longer matched the broker's, so
+        every downstream number — position premium, unrealised P&L, the daily
+        loss halt, every exit decision — was computed on a fiction. On a
+        four-legged structure this is precisely how a "defined risk" position
+        quietly becomes a naked one, and nothing in the logs would say so.
+
+        A non-completed order now raises, which routes into the existing
+        _emergency_unwind path instead of silently corrupting the book.
+        """
+        last_status = ""
         for attempt in range(retries):
             try:
-                details = self.client.get_order_details(order_id)
+                details = self.client.get_order_details(order_id) or {}
+                status  = str(
+                    details.get("status") or details.get("order_status") or ""
+                ).strip().lower()
+                last_status = status or last_status
+
+                filled  = details.get("filled_quantity")
+                pending = details.get("pending_quantity")
                 price   = details.get("average_price") or details.get("price")
-                if price:
-                    return float(price)
+
+                if status in self._TERMINAL_BAD:
+                    raise RuntimeError(
+                        f"order {order_id} terminated as '{status}' — not filled"
+                    )
+
+                if status in self._TERMINAL_OK:
+                    try:
+                        if pending is not None and float(pending) > 0:
+                            raise RuntimeError(
+                                f"order {order_id} reports '{status}' but "
+                                f"pending_quantity={pending}"
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                    if price and float(price) > 0:
+                        return float(price)
+                    raise RuntimeError(
+                        f"order {order_id} complete but broker returned no "
+                        f"average_price"
+                    )
+
+                # Not terminal yet: accept only if the broker explicitly says
+                # everything is filled and nothing is pending.
+                if filled is not None and pending is not None and price:
+                    try:
+                        if (float(filled) > 0 and float(pending) == 0
+                                and float(price) > 0):
+                            return float(price)
+                    except (TypeError, ValueError):
+                        pass
+
+            except RuntimeError:
+                raise
             except Exception as e:
                 self.logger.warning(
                     f"Could not fetch order details for {order_id} "
@@ -216,10 +275,11 @@ class LiveOrderExecutor:
                 )
             time_module.sleep(1)
 
-        self.logger.warning(
-            f"Using fallback price {fallback:.2f} for order {order_id}"
+        raise RuntimeError(
+            f"order {order_id} did not reach a confirmed filled state "
+            f"(last status='{last_status or 'unknown'}'); refusing to book a "
+            f"phantom fill at {fallback:.2f}"
         )
-        return fallback
 
     def execute_leg_entry(
         self, leg: dict, lots: int, chain: dict
@@ -520,6 +580,74 @@ class ExecutionEngine:
             return ask
         return float(leg.get("entry_price", 0) or 0)
 
+    def _liquidation_premium(
+        self, legs: List[dict], chain: dict
+    ) -> float:
+        """
+        v3.1: the premium the position can ACTUALLY be closed at right now.
+
+        _compute_current_premium marks at the mid. That is the correct number
+        to report, but it is the wrong number to make a profit-taking decision
+        on: closing a credit structure means BUYING BACK the shorts at the ask
+        and SELLING the longs at the bid. Deciding targets on the mid meant
+        the engine repeatedly declared a target reached, sent the exit, and
+        filled worse — systematically converting the modelled edge into
+        slippage, trade after trade, in a way that never shows up as a losing
+        decision anywhere in the logs.
+
+        Shorts are therefore marked at the ask and longs at the bid.
+        """
+        premium = 0.0
+        for leg in legs:
+            if leg.get("leg_status") != "OPEN":
+                continue
+            strike   = float(leg.get("strike", 0))
+            opt_type = str(leg.get("option_type", ""))
+            opt      = chain.get(strike, {}).get(opt_type, {}) if chain else {}
+            bid = float(opt.get("bid", 0) or 0)
+            ask = float(opt.get("ask", 0) or 0)
+            if leg["action"] == "SELL":
+                mark = ask if ask > 0 else self._get_mark_price(leg, chain)
+                premium += mark
+            else:
+                mark = bid if bid > 0 else self._get_mark_price(leg, chain)
+                premium -= mark
+        return premium
+
+    def _round_trip_cost_pts(self, legs: List[dict], chain: dict) -> float:
+        """
+        v3.1: approximate cost, in premium points, of closing this position
+        (statutory charges, brokerage and crossing the spread). Used to floor
+        the profit lock and the 0DTE de-risk ladder so that "taking a small
+        profit" is a profit AFTER costs rather than a rounding error that pays
+        the broker and the exchange.
+        """
+        C02 = float(self.config.lot_size or 1)
+        live = [l for l in legs if l.get("leg_status") != "CLOSED"]
+        n_legs = max(len(live), 1)
+        brokerage_pts = (self.config.brokerage_per_order * n_legs) / C02
+        pct_pts = 0.0
+        spread_pts = 0.0
+        for leg in live:
+            strike   = float(leg.get("strike", 0))
+            opt_type = str(leg.get("option_type", ""))
+            opt      = chain.get(strike, {}).get(opt_type, {}) if chain else {}
+            bid = float(opt.get("bid", 0) or 0)
+            ask = float(opt.get("ask", 0) or 0)
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+                spread_pts += (ask - bid) / 2.0
+            else:
+                mid = float(leg.get("entry_price", 0) or 0)
+                spread_pts += 0.35
+            # On exit, STT applies to the legs being SOLD, i.e. the ones that
+            # were originally bought.
+            _stt = self.config.stt_options_sell if leg.get("action") == "BUY" else 0.0
+            pct_pts += mid * (
+                self.config.exchange_txn_rate + self.config.sebi_rate + _stt
+            ) * 1.18
+        return round(brokerage_pts + pct_pts + spread_pts, 3)
+
     def _compute_current_premium(
         self, legs: List[dict], chain: dict
     ) -> float:
@@ -634,8 +762,22 @@ class ExecutionEngine:
             if oi < min_oi:
                 return "NO_GO", {"reason": f"leg_{strike:.0f}_{opt_type}_oi_{oi}_below_{min_oi}"}
 
-            if bid > 0 and ask > 0 and (ask - bid) / ((bid + ask) / 2) > 0.08:
-                return "NO_GO", {"reason": f"leg_{strike:.0f}_{opt_type}_spread_too_wide"}
+            # v3.1: an 8% relative gate here was TIGHTER than the 15%/30%
+            # gate the strategy engine used to build the trade, so sound
+            # structures were computed and then discarded at the door — and a
+            # Rs 1.50 protective wing quoted one tick wide reads as 6.7% and
+            # could never pass reliably. Rupee-aware and aligned with
+            # StrategyEngine._validate_leg.
+            if bid > 0 and ask > 0:
+                _mid_pt  = (bid + ask) / 2.0
+                _rel_cap = 0.15 if action == "SELL" else 0.30
+                _abs_cap = float(
+                    getattr(self.config, "spread_abs_tolerance", 0.85)
+                )
+                if (ask - bid) > max(_mid_pt * _rel_cap, _abs_cap):
+                    return "NO_GO", {
+                        "reason": f"leg_{strike:.0f}_{opt_type}_spread_too_wide"
+                    }
 
             # Price drift check: has price moved > 25% since strategy computed it?
             original_price = float(leg.get("exec_price", 0) or 0)
@@ -1031,13 +1173,23 @@ class ExecutionEngine:
         if chain_expiry and chain_expiry.isoformat() != position.get("target_expiry"):
             chain = {}  # Wrong expiry chain — use empty dict (falls back to entry price)
 
-        # Compute current premium
+        # v3.1: two marks are now maintained. current_premium is the MID —
+        # the right number to report and to trigger a stop on (it is not
+        # jumpy). liq_premium is the LIQUIDATION value — what it actually
+        # costs to get out — and it is the only honest basis for a
+        # profit-taking decision.
         current_premium = self._compute_current_premium(open_legs, chain)
+        liq_premium     = self._liquidation_premium(open_legs, chain)
+        if not chain:
+            liq_premium = current_premium
 
-        # Update last known premium
         self.db.update(
             "positions",
-            {"last_known_premium": current_premium, "updated_at": now_ist().isoformat()},
+            {
+                "last_known_premium":       current_premium,
+                "last_liquidation_premium": liq_premium,
+                "updated_at":               now_ist().isoformat(),
+            },
             {"position_id": position["position_id"]},
         )
 
@@ -1079,7 +1231,19 @@ class ExecutionEngine:
         strategy_name_p2 = position.get("strategy_name", "")
         raw_params_p2 = json.loads(position.get("raw_params_json") or "{}")
         wing_width_p2 = float(raw_params_p2.get("wing_width") or 150)
-        proximity_pts = max(int(wing_width_p2 * 0.55), 40) if "BUTTERFLY" in strategy_name_p2 else self.config.spot_proximity_pts
+        # v3.1: a flat 40pt proximity is 0.22% of an 18,000 index and only
+        # 0.15% of a 26,000 one — the structural protection silently weakened
+        # as NIFTY rose, so by 2026 the engine was sitting closer to its short
+        # strikes than it was designed to. Scaled to spot, with the configured
+        # absolute value kept as a floor.
+        _prox_base = float(self.config.spot_proximity_pts or 40)
+        _prox_pct  = float(getattr(self.config, "spot_proximity_pct", 0.0016))
+        _prox_scaled = max(_prox_base, spot * _prox_pct) if spot > 0 else _prox_base
+        proximity_pts = (
+            max(int(wing_width_p2 * 0.55), int(_prox_scaled))
+            if "BUTTERFLY" in strategy_name_p2
+            else _prox_scaled
+        )
         if spot > 0:
             for leg in open_legs:
                 if leg["action"] != "SELL":
@@ -1127,7 +1291,12 @@ class ExecutionEngine:
                     "price_stop_level": price_stop_put,
                 }
 
-        # Also check premium-based stop (for cases without price stop levels)
+        # Also check premium-based stop (for cases without price stop levels).
+        # v3.1: the trigger deliberately stays on the MID so that a single
+        # wide print cannot stop the position out on quote noise — but a hard
+        # guard now fires if the price we could genuinely get out at has run
+        # well past the stop. That is a real loss, not a quoting artefact, and
+        # previously the engine would sit through it.
         if entry_credit > 0 and stop_premium > 0:
             if current_premium >= stop_premium:
                 return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
@@ -1135,11 +1304,24 @@ class ExecutionEngine:
                     "current_premium": current_premium,
                     "stop_premium": stop_premium,
                 }
+            if liq_premium >= stop_premium * 1.20:
+                return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                    "reason_detail": (
+                        f"liquidation_stop_{liq_premium:.2f}>="
+                        f"{stop_premium * 1.20:.2f}"
+                    ),
+                    "current_premium": current_premium,
+                    "liquidation_premium": liq_premium,
+                    "stop_premium": stop_premium,
+                }
 
         # ── Priority 4: Profit lock ───────────────────────────────────────
         # Move stop to breakeven when profit reaches threshold
         if entry_credit > 0 and gross_credit > 0:
-            profit_pct = (gross_credit - current_premium) / gross_credit
+            # v3.1: measured on the liquidation mark — profit you cannot
+            # actually take is not profit, and locking against a mid you
+            # cannot trade at is how a "free trade" becomes a loser.
+            profit_pct = (gross_credit - liq_premium) / gross_credit
 
             # Profit lock threshold: 40% for DTE0, 25% for DTE1+
             lock_thresh = (
@@ -1149,12 +1331,20 @@ class ExecutionEngine:
             )
 
             if profit_pct >= lock_thresh and not profit_lock_activated:
-                # Move stop to breakeven (entry_credit level)
-                # This converts the position to a "free trade"
-                _achieved = gross_credit - current_premium
-                _keep = _achieved * 0.50
-                new_stop = current_premium + _keep
-                new_stop = max(new_stop, entry_credit * 0.80)
+                # v3.1: the old lock gave back HALF of everything achieved and
+                # then floored the stop at 0.80 x entry_credit — i.e. it was
+                # willing to hand back 20% of the credit from a position that
+                # was already comfortably in profit, and max() made that floor
+                # the binding constraint. Together with the inverted target
+                # ladder (F1) this is exactly why winners round-tripped to
+                # scratch. The give-back is cut to a quarter and the lock is
+                # floored so a locked trade cannot finish worse than covering
+                # its own round trip.
+                _achieved = gross_credit - liq_premium
+                _keep = _achieved * 0.25
+                new_stop = liq_premium + _keep
+                _rt_cost = self._round_trip_cost_pts(open_legs, chain)
+                new_stop = min(new_stop, max(entry_credit - _rt_cost, 0.05))
                 self.db.update(
                     "positions",
                     {
@@ -1177,7 +1367,7 @@ class ExecutionEngine:
 
             # If profit lock is active, check if we've given back too much
             if profit_lock_activated and profit_lock_stop_level:
-                if current_premium >= float(profit_lock_stop_level):
+                if liq_premium >= float(profit_lock_stop_level):
                     return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
                         "reason_detail": "profit_lock_stop_hit",
                         "current_premium": current_premium,
@@ -1227,35 +1417,82 @@ class ExecutionEngine:
                     (dtime(14, 0),  0.32),
                 ]
 
+            # ── v3.1 [F1]: the ladder was inverted by a min() ──────────
+            # These are PREMIUM LEVELS the position must fall BELOW to take
+            # profit, so a LOWER number is a HARDER target. Taking
+            # min(target_premium, time_target) therefore always selected the
+            # harder of the two — and since the stored entry target
+            # (credit x (1 - target_pct)) is almost always the lower one, it
+            # always won and the entire "accept less profit as the clock runs
+            # down" ladder was dead code. Winners were never harvested late:
+            # they were carried into the 15:00 hard exit or handed back to a
+            # stop. max() restores the intended behaviour — the target LOOSENS
+            # with time. This is the highest-impact single change to realised
+            # P&L in this patch.
+            #
+            # [F2] The comparison is made on the LIQUIDATION mark, because a
+            # target you can only reach at the mid is not a target.
+            _best_target = None
             for time_threshold, target_pct in time_targets:
                 if current_time >= time_threshold:
                     time_target = entry_credit * (1.0 - target_pct)
-                    # Use the tighter of stored target and time target
-                    effective_target = (
-                        min(target_premium, time_target)
-                        if target_premium > 0
-                        else time_target
+                    _best_target = (
+                        time_target if _best_target is None
+                        else max(_best_target, time_target)
                     )
-                    if current_premium <= effective_target:
-                        self.logger.info(
-                            f"PRIORITY 6 TIME TARGET: {position['strategy_name']} "
-                            f"premium={current_premium:.2f} <= target={effective_target:.2f} "
-                            f"after {time_threshold}"
-                        )
-                        return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
-                            "current_premium": current_premium,
-                            "time_target": effective_target,
-                            "time_threshold": str(time_threshold),
-                            "target_pct": target_pct,
-                        }
+
+            if _best_target is not None:
+                effective_target = (
+                    max(target_premium, _best_target)
+                    if target_premium > 0
+                    else _best_target
+                )
+                if liq_premium <= effective_target:
+                    self.logger.info(
+                        f"PRIORITY 6 TIME TARGET: {position['strategy_name']} "
+                        f"liq={liq_premium:.2f} <= target={effective_target:.2f}"
+                    )
+                    return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                        "current_premium": current_premium,
+                        "liquidation_premium": liq_premium,
+                        "time_target": effective_target,
+                        "reason_detail": "time_decayed_target_reached",
+                    }
 
             # Also check stored target_premium (set at entry)
-            if target_premium > 0 and current_premium <= target_premium:
+            if target_premium > 0 and liq_premium <= target_premium:
                 return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
                     "current_premium": current_premium,
+                    "liquidation_premium": liq_premium,
                     "target_premium": target_premium,
                     "reason_detail": "entry_target_reached",
                 }
+
+            # ── v3.1 [F4]: 0DTE gamma-time de-risk ladder ─────────────────
+            # After roughly 13:30 on NIFTY expiry day the remaining theta on a
+            # short structure is small while gamma is vertical: the position
+            # is risking the full width of the wing to earn a handful of
+            # residual points. There was no management of that at all — the
+            # engine simply held to the 15:00 bell. Professionals flatten into
+            # that window. From 13:30 any meaningful profit is taken; from
+            # 14:15 anything better than covering the round trip is taken.
+            # Losing positions remain governed by the stop logic above.
+            if actual_dte == 0 and entry_credit > 0:
+                _rt = self._round_trip_cost_pts(open_legs, chain)
+                if current_time >= dtime(14, 15):
+                    if liq_premium <= entry_credit - _rt:
+                        return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                            "current_premium": current_premium,
+                            "liquidation_premium": liq_premium,
+                            "reason_detail": "gamma_window_scratch_or_better_1415",
+                        }
+                elif current_time >= dtime(13, 30):
+                    if liq_premium <= entry_credit * 0.88 - _rt:
+                        return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                            "current_premium": current_premium,
+                            "liquidation_premium": liq_premium,
+                            "reason_detail": "gamma_window_derisk_1330",
+                        }
 
         # ── Priority 7: Hard exit ─────────────────────────────────────────
         try:

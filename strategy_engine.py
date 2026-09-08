@@ -29,11 +29,19 @@ BEAR_CALL_SPREAD = "BEAR_CALL_SPREAD"
 SELL = "SELL"
 BUY  = "BUY"
 
+# v3.1: the condor and the credit spreads were capped at DTE 2 while every
+# other DTE-indexed table in the engine (hard gates, p_win, targets, risk,
+# LOT_CAPS_BY_DAY) was populated out to DTE 6. On the Tuesday-expiry calendar
+# Wednesday is DTE 4 and Thursday is DTE 3, so those two sessions could select
+# a strategy and were then ALWAYS rejected by compute_params — 40% of the
+# trading week was structurally unreachable, and the only trace was a
+# "dte_4_above_max_2" line in the decision log. The regime engine now gates
+# DTE 3/4 explicitly and strictly (see regime_engine._classify_range).
 DTE_REQUIREMENTS: Dict[str, Tuple[int, int]] = {
     IRON_BUTTERFLY:   (0, 1),
-    IRON_CONDOR:      (0, 2),
-    BULL_PUT_SPREAD:  (0, 2),
-    BEAR_CALL_SPREAD: (0, 2),
+    IRON_CONDOR:      (0, 4),
+    BULL_PUT_SPREAD:  (0, 4),
+    BEAR_CALL_SPREAD: (0, 4),
 }
 
 MIN_CREDIT_RATIO: Dict[str, float] = {
@@ -503,8 +511,26 @@ class StrategyEngine:
         elif vix < 14.0:
             delta_target = max(delta_target - 0.01, 0.16)
 
-        wing = int(round((int(signals.get("wing_width") or 150)) / step) * step)
-        wing = max(wing, 100)
+        # ── Protective wing (v3.1) ────────────────────────────────────────
+        # The wing determines BOTH the maximum loss and how much of the short
+        # premium is handed back to the long. Taking it as a fixed number
+        # makes the engine's own credit/wing ratio gate behave arbitrarily:
+        # far-OTM 0DTE shorts with a fat wing can never reach the required
+        # ratio, so the engine silently stops trading in the afternoon. The
+        # wing is anchored to the ACTUAL short-strike distance (the only thing
+        # that determines how cheap the long is), with the adaptive
+        # straddle-based hint from data_engine as a fallback, then clamped by
+        # DTE so 0DTE max loss stays small where credits are small.
+        _wing_hint = int(signals.get("wing_width") or 150)
+        if short_dist is not None and short_dist > 0:
+            _wing_factor = 0.50 if dte == 0 else (0.60 if dte == 1 else 0.75)
+            _wing_raw = max(short_dist * _wing_factor, float(_wing_hint) * 0.60)
+        else:
+            _wing_raw = float(_wing_hint)
+        _wing_min = max(2 * step, 100)
+        _wing_max = 250 if dte == 0 else (350 if dte == 1 else 450)
+        wing = int(round(_wing_raw / step + 0.001) * step)
+        wing = int(max(_wing_min, min(wing, _wing_max)))
 
         if strategy_name == IRON_BUTTERFLY:
             return self._build_iron_butterfly(chain, spot, step, wing)
@@ -695,7 +721,17 @@ class StrategyEngine:
             return False, f"strike_{strike:.0f}_{opt_type}_oi_{oi}_below_{min_oi}"
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2.0
-            if mid > 0 and (ask - bid) / mid > (0.15 if action == "SELL" else 0.30):
+            # v3.1: a purely relative spread gate rejects cheap protective
+            # wings for no reason — a Rs 1.50 long option quoted 1.45/1.55 is
+            # a perfectly normal one-tick market but reads as 6.7%, and at
+            # Rs 0.80 a single tick reads as 12.5%. Since the long wing is
+            # what makes the structure defined-risk, rejecting it forces the
+            # engine either to skip the trade or to reach for a wider, worse
+            # wing. An absolute rupee tolerance is allowed on top of the
+            # relative cap.
+            _rel_cap = 0.15 if action == "SELL" else 0.30
+            _abs_cap = float(getattr(self.config, "spread_abs_tolerance", 0.85))
+            if mid > 0 and (ask - bid) > max(mid * _rel_cap, _abs_cap):
                 return False, f"strike_{strike:.0f}_{opt_type}_spread_too_wide"
         eff = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else ltp
         if eff < 0.50:
@@ -811,39 +847,90 @@ class StrategyEngine:
         is_exit: bool = False,
     ) -> float:
         """
-        Spread-aware slippage model.
-        Entry (is_exit=False): 50% of half-spread per leg (patient limit order).
-        Exit  (is_exit=True):  150% of half-spread per leg (urgent stop exit).
-        No bid/ask: 0.35 entry, 0.60 exit (conservative fallback).
-        NIFTY 2026: OTM 0DTE spreads widen 2-4x when stops fire under stress.
+        Spread-aware slippage for the whole structure, in premium points
+        (points are lot-invariant).
+
+        v3.1 notes
+        ----------
+        The docstring and the code disagreed (150% claimed, 3.0x applied) and,
+        more importantly, the entry number was double counting: exec_price is
+        already taken at the BID for shorts and the ASK for longs, so the full
+        spread has already been paid before this function is called. Charging
+        a further half-spread on entry inflated modelled friction and made the
+        engine reject sound structures.
+
+        Entry now carries only a small residual (queue and tick risk on a
+        marketable limit). The exit carries the genuinely large number,
+        because that is where the money is actually lost: an OTM NIFTY 0DTE
+        market quoting 0.10 wide at 11:00 quotes 0.50-1.00 wide when a stop
+        fires into a fast move, and that is exactly when the engine exits.
+
+        Both multiples are configurable (entry_slippage_mult /
+        exit_slippage_mult) so they can be re-fitted from the engine's own
+        exit-quality telemetry once it has enough sessions.
         """
+        entry_mult = float(getattr(self.config, "entry_slippage_mult", 0.35))
+        exit_mult  = float(getattr(self.config, "exit_slippage_mult", 2.25))
         total = 0.0
         for leg in legs:
             bid = float(leg.get("bid", 0) or 0)
             ask = float(leg.get("ask", 0) or 0)
             if bid > 0 and ask > 0:
                 half_spread = (ask - bid) / 2.0
-                total += half_spread * (3.0 if is_exit else 0.5)
+                total += half_spread * (exit_mult if is_exit else entry_mult)
             else:
                 total += 1.20 if is_exit else 0.35
         return round(total, 3)
 
+    def _round_trip_friction(
+        self,
+        legs:            List[dict],
+        entry_costs_pts: float,
+    ) -> float:
+        """
+        v3.1: TRUE round-trip friction, in premium points.
+
+        The old code approximated the round trip as
+        `(entry_costs + entry_slippage) * 1.5`, which understates it twice
+        over: the exit is a full second set of brokerage and statutory
+        charges, and exit slippage is several times entry slippage. Every
+        gate that compared credit against friction — the minimum-credit gate
+        and the EV gate — was therefore comparing against roughly half the
+        real number, so trades that were cost-negative in reality passed.
+        """
+        entry_slip = self._compute_slippage(legs, is_exit=False)
+        exit_slip  = self._compute_slippage(legs, is_exit=True)
+        # Exit charges are of the same order as entry charges: brokerage per
+        # order is identical, and STT simply moves to whichever legs are sold.
+        exit_costs_pts = entry_costs_pts * 0.95
+        return round(entry_costs_pts + entry_slip + exit_costs_pts + exit_slip, 4)
+
     def _get_target_pct(self, dte: Optional[int], signals: dict) -> float:
         """
-        NIFTY 2026 target percentages by DTE.
-        DTE 0 (Tuesday 0DTE): 45-50% — fastest gamma, exit before 13:30 gamma explosion.
-        DTE 1 (Monday 1DTE): 38-42% — good theta, moderate urgency.
-        DTE 2+ (Wed-Fri):    30-35% — least theta per hour, patient exit.
-        Higher DTE = lower target because less gamma urgency per unit of time.
-        DTE0 > DTE1 > DTE2 is the correct ordering for NIFTY intraday.
+        Fraction of the net credit taken as profit. (v3.1 recalibration.)
+
+        The old ladder asked for 45-50% of the credit on 0DTE. That is not
+        what NIFTY expiry day pays. Theta on the expiring contract is front-
+        and middle-loaded while the dangerous part of the move distribution
+        arrives after 13:30, so holding a 0DTE structure for half its credit
+        means holding it straight into the gamma window — the engine was
+        asking for the one outcome that costs the most to wait for.
+
+        The professional pattern on NIFTY 0DTE is the opposite: take 25-35%
+        quickly, bank it, let the cooldown re-arm. Expectancy per unit of
+        time-at-risk is far higher and tail exposure is a fraction of it.
+
+        Targets also FALL as VIX rises: a richer credit does not mean a bigger
+        percentage of it is reachable, it means the move that threatens it is
+        bigger too.
         """
         vix = float(signals.get("vix") or 11.0)
         if dte == 0:
-            return 0.50 if vix < 12.0 else (0.47 if vix < 14.0 else 0.45)
+            return 0.35 if vix < 12.0 else (0.32 if vix < 14.0 else 0.28)
         if dte == 1:
-            return 0.42 if vix < 12.0 else (0.38 if vix < 14.0 else 0.35)
+            return 0.32 if vix < 12.0 else (0.29 if vix < 14.0 else 0.26)
         if dte == 2:
-            return 0.30 if vix < 12.0 else (0.27 if vix < 14.0 else 0.24)
+            return 0.28 if vix < 12.0 else (0.25 if vix < 14.0 else 0.22)
         if dte == 3:
             return 0.25 if vix < 12.0 else 0.22
         if dte == 4:
@@ -852,6 +939,21 @@ class StrategyEngine:
             return 0.20 if vix < 12.0 else 0.17
         return 0.18
 
+    def _proximity_buffer_pts(self, spot: float) -> float:
+        """
+        v3.1: the distance from a short strike at which the engine closes.
+
+        Was a flat 40 points (config.spot_proximity_pts) — 0.22% of an 18,000
+        index but only 0.15% of a 26,000 one, so the structural protection
+        silently weakened as NIFTY rose. Now scaled to spot with the
+        configured absolute value as a floor.
+        """
+        base = float(self.config.spot_proximity_pts or 40)
+        pct  = float(getattr(self.config, "spot_proximity_pct", 0.0016))
+        if spot and spot > 0:
+            return max(base, spot * pct)
+        return base
+
     def _compute_ev_gate(
         self,
         net_credit:      float,
@@ -859,14 +961,40 @@ class StrategyEngine:
         entry_costs_pts: float,
         total_slippage:  float,
         signals:         dict,
+        legs:            Optional[List[dict]] = None,
+        stop_premium:    Optional[float] = None,
     ) -> Tuple[bool, str]:
+        """
+        Expected value of the structure, in premium points, over the intended
+        holding period. (v3.1 rebuild — see the three defects below.)
+        """
         dte          = signals.get("actual_dte")
         or_condition = signals.get("or_condition", "MODERATE")
         vrp_smoothed = float(signals.get("vrp_smoothed") or 0.0)
         target_pct   = self._get_target_pct(dte, signals)
         reward_pts   = net_credit * target_pct
-        risk_pts     = net_credit * 1.5
-        friction     = (entry_costs_pts + total_slippage) * 1.5
+
+        # ── Loss legs ─────────────────────────────────────────────────────
+        # Normal loss = the stop actually working. Previously hardcoded to
+        # 1.5 x credit with no relationship to the stop_premium the engine
+        # would really use.
+        if stop_premium and stop_premium > 0:
+            stop_loss_pts = max(stop_premium - net_credit, 0.0)
+        else:
+            stop_loss_pts = net_credit * 1.5
+        # [E2] Tail loss = the stop is jumped and the structure prints toward
+        # the wing. Not the full wing (partial fills and some recovery are
+        # normal) but far beyond the stop. A NIFTY 0DTE short-premium book
+        # does not die at the stop; it dies here, and this outcome was simply
+        # absent from the old two-outcome expectancy.
+        wing_loss_pts = max(float(wing) - net_credit, stop_loss_pts)
+        tail_loss_pts = max(stop_loss_pts, 0.80 * wing_loss_pts)
+
+        # True round-trip friction rather than entry x 1.5.
+        friction = (
+            self._round_trip_friction(legs, entry_costs_pts) if legs
+            else (entry_costs_pts + total_slippage) * 2.2
+        )
 
         p_win_table = {
             0: {"VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62, "WIDE": 0.52, "VERY_WIDE": 0.44},
@@ -877,44 +1005,114 @@ class StrategyEngine:
             5: {"VERY_NARROW": 0.56, "NARROW": 0.52, "MODERATE": 0.46, "WIDE": 0.38, "VERY_WIDE": 0.30},
             6: {"VERY_NARROW": 0.54, "NARROW": 0.50, "MODERATE": 0.44, "WIDE": 0.36, "VERY_WIDE": 0.28},
         }
+        # ── [E3] Empirical OR-conditional prior ───────────────────────────
+        # This was previously computed and then thrown away the moment the
+        # barrier model returned a number. It carries everything the
+        # lognormal geometry cannot see — positioning, pinning, and the
+        # engine's own historical hit rate by opening range — so it is now
+        # blended in rather than discarded.
         p_win_prior = p_win_table.get(
-            min(dte or 1, 6), p_win_table[6]
+            min(dte if dte is not None else 1, 6), p_win_table[6]
         ).get(or_condition, 0.50)
+        if vrp_smoothed > 3.5:
+            p_win_prior += 0.05
+        elif vrp_smoothed > 2.5:
+            p_win_prior += 0.025
+        elif vrp_smoothed < 2.0:
+            p_win_prior -= 0.03
+        p_win_prior = max(0.30, min(0.90, p_win_prior))
 
+        # ── [E1] Barrier model on the TRUE short-strike distance ──────────
+        # The old code used `wing * 0.5 - spot_proximity_pts` as the barrier,
+        # i.e. half the protective WING WIDTH. That is not the barrier that
+        # decides a credit spread — the distance from spot to the SHORT
+        # STRIKE is. With a 150pt wing the model used ~45pts against a real
+        # barrier of 250-300pts, so z was roughly 6x too small, p_win pinned
+        # to its 0.35 floor, and the EV gate rejected structurally excellent
+        # trades all day while reporting a plausible-looking reason.
         import math as _math_ev
+
         _atm_iv = float(signals.get("atm_iv") or 0.0)
-        _spot_ev = float(signals.get("spot") or 23900.0)
+        if _atm_iv >= 2.0:          # stored as a percentage, not a decimal
+            _atm_iv = _atm_iv / 100.0
+        _spot_ev = float(signals.get("spot") or 0.0)
         _now_ev = now_ist().time()
         _mins_to_exit = max(
             (datetime.combine(today_ist(), dtime(15, 0)) -
              datetime.combine(today_ist(), _now_ev)).total_seconds() / 60.0,
             5.0
         )
-        _sigma_t = _atm_iv * (_mins_to_exit / (375.0 * 252.0)) ** 0.5 if _atm_iv > 0 else 0.0
-        if _sigma_t > 0 and wing > 0 and _spot_ev > 0:
-            _barrier = max(wing * 0.5 - float(self.config.spot_proximity_pts), 20.0)
-            _z = _barrier / (_spot_ev * _sigma_t)
-            def _ncdf(x):
-                return 0.5 * (1.0 + _math_ev.erf(x / _math_ev.sqrt(2.0)))
-            p_win = max(0.35, min(0.92, 1.0 - 2.0 * _ncdf(-_z)))
-        else:
-            _or_c = or_condition or "MODERATE"
-            _pb = {"VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62,
-                   "WIDE": 0.52, "VERY_WIDE": 0.44}.get(_or_c, 0.55)
-            if dte and dte >= 2:
-                _pb = max(_pb - 0.06 * min(dte - 1, 4), 0.35)
-            _va = 0.06 if vrp_smoothed > 3.5 else (
-                0.03 if vrp_smoothed > 2.5 else (
-                -0.03 if vrp_smoothed < 2.0 else 0.0))
-            p_win = max(0.35, min(0.88, _pb + _va))
-        ev    = p_win * reward_pts - (1.0 - p_win) * risk_pts - friction
-        min_ev = max(net_credit * 0.02, friction * 0.15)
+        _sigma_t = (
+            _atm_iv * (_mins_to_exit / (375.0 * 252.0)) ** 0.5
+            if _atm_iv > 0 else 0.0
+        )
 
+        _barrier = 0.0
+        if legs and _spot_ev > 0:
+            _dists = [
+                abs(float(l["strike"]) - _spot_ev)
+                for l in legs if str(l.get("action")) == "SELL"
+            ]
+            if _dists:
+                # The engine exits on proximity, so the effective barrier is
+                # slightly nearer than the strike itself.
+                _barrier = max(min(_dists) - self._proximity_buffer_pts(_spot_ev), 15.0)
+
+        p_win_model = None
+        if _sigma_t > 0 and _barrier > 0 and _spot_ev > 0:
+            _z = _barrier / (_spot_ev * _sigma_t)
+
+            def _ncdf(x: float) -> float:
+                return 0.5 * (1.0 + _math_ev.erf(x / _math_ev.sqrt(2.0)))
+
+            # Reflection-principle no-touch probability for a driftless walk.
+            p_win_model = max(0.25, min(0.93, 1.0 - 2.0 * _ncdf(-_z)))
+
+        if p_win_model is None:
+            p_win = p_win_prior
+        else:
+            # 60/40 model/prior: the model is sharper intraday, the prior
+            # covers the rest.
+            p_win = 0.60 * p_win_model + 0.40 * p_win_prior
+        p_win = max(0.28, min(0.92, p_win))
+
+        # ── [E2] Three-outcome expectancy ─────────────────────────────────
+        p_tail = (
+            float(getattr(self.config, "gamma_tail_prob_dte0", 0.055))
+            if dte == 0 else
+            float(getattr(self.config, "gamma_tail_prob_dte1p", 0.025))
+        )
+        # A wide opening range and a trending tape both fatten the tail.
+        if or_condition in ("WIDE", "VERY_WIDE"):
+            p_tail *= 1.8
+        _adx_ev = float(signals.get("adx_15") or 0.0)
+        if _adx_ev >= float(self.config.adx_strong_threshold):
+            p_tail *= 1.5
+        p_tail = min(p_tail, 0.20)
+
+        p_win_eff = max(p_win * (1.0 - p_tail), 0.05)
+        p_stop    = max(1.0 - p_win_eff - p_tail, 0.0)
+
+        ev = (
+            p_win_eff * reward_pts
+            - p_stop * stop_loss_pts
+            - p_tail * tail_loss_pts
+            - friction
+        )
+
+        # Minimum acceptable edge. The old floor (2% of credit, or 15% of an
+        # already-understated friction number) let through trades whose whole
+        # expectancy was inside the cost of doing them.
+        min_ev = max(net_credit * 0.03, friction * 0.35, 0.75)
+
+        _detail = (
+            f"p_win={p_win:.2f},p_tail={p_tail:.3f},"
+            f"rew={reward_pts:.2f},stop={stop_loss_pts:.2f},"
+            f"tail={tail_loss_pts:.2f},fric={friction:.2f}"
+        )
         if ev < min_ev:
-            return False, (
-                f"ev_{ev:.2f}pts_below_min_{min_ev:.2f}pts(p_win={p_win:.2f})"
-            )
-        return True, f"ev_ok_{ev:.2f}pts"
+            return False, f"ev_{ev:.2f}pts_below_min_{min_ev:.2f}pts({_detail})"
+        return True, f"ev_ok_{ev:.2f}pts({_detail})"
 
     def compute_params(
         self,
@@ -992,14 +1190,21 @@ class StrategyEngine:
 
         day_label = state.get("day_label", "TUESDAY")
 
-        friction_pts        = (entry_costs_pts + total_slippage) * 1.5
-        min_credit_friction = friction_pts * 3.0
+        # v3.1: friction is the FULL round trip (entry charges + entry
+        # slippage + exit charges + exit slippage), not entry x 1.5. Every
+        # gate comparing credit to friction was previously measuring against
+        # roughly half the real number, so trades that were cost-negative in
+        # reality passed while the label claimed a 4x safety margin.
+        friction_pts        = self._round_trip_friction(
+            validated_legs, entry_costs_pts
+        )
+        min_credit_friction = friction_pts * 2.5
         if net_credit < min_credit_friction:
             return {
                 "valid": False,
                 "reason": (
-                    f"net_credit_{net_credit:.2f}pts_below_4x_friction_"
-                    f"{min_credit_friction:.2f}pts"
+                    f"net_credit_{net_credit:.2f}pts_below_2.5x_roundtrip_"
+                    f"friction_{min_credit_friction:.2f}pts"
                 ),
             }
 
@@ -1060,7 +1265,12 @@ class StrategyEngine:
                 }
 
         target_pct    = self._get_target_pct(actual_dte, signals)
-        exit_costs    = entry_costs_pts + total_slippage
+        # v3.1: what the target has to clear is the cost of getting OUT, and
+        # exit slippage on a stressed OTM 0DTE market is a multiple of entry
+        # slippage. Using entry costs as the proxy flattered every structure.
+        exit_costs    = entry_costs_pts * 0.95 + self._compute_slippage(
+            validated_legs, is_exit=True
+        )
         expected_edge = net_credit * target_pct - exit_costs
         vix           = float(signals.get("vix") or 11.0)
 
@@ -1082,41 +1292,85 @@ class StrategyEngine:
                 ),
             }
 
+        # v3.1: the stop level is now computed BEFORE the EV gate so the gate
+        # prices the loss leg the engine will actually take, instead of a
+        # hardcoded 1.5 x credit that bore no relationship to stop_premium.
+        _stop_mult_pre = min(float(state.get("stop_multiplier", 2.5) or 2.5), 2.5)
+        if strategy_name in (BULL_PUT_SPREAD, BEAR_CALL_SPREAD):
+            _stop_premium_pre = gross_credit * 2.5
+        else:
+            _stop_premium_pre = net_credit * _stop_mult_pre
+
         ev_ok, ev_reason = self._compute_ev_gate(
             net_credit, actual_wing_pts or 150,
             entry_costs_pts, total_slippage, signals,
+            legs=validated_legs, stop_premium=_stop_premium_pre,
         )
         if not ev_ok:
             return {"valid": False, "reason": f"ev_gate:{ev_reason}"}
 
         current_capital = state.get("current_capital", self.config.starting_capital)
         wing_for_sizing = actual_wing_pts or 150
-        _stop_loss_per_lot = 1.0 * net_credit * C02
-        _structural_per_lot = max(
-            (wing_for_sizing - net_credit) * C02, net_credit * C02
+
+        # ── [G1] Risk per lot ─────────────────────────────────────────────
+        # The old code sized as though the stop always works: it clamped the
+        # per-lot loss down to min(stop_loss, 2 x credit). On NIFTY 0DTE the
+        # stop is exactly what does NOT hold — a gap or a gamma acceleration
+        # through the short strike fills far past it, and the structure is
+        # worth (wing - credit) against you. Sizing on the stop therefore
+        # oversized every position by roughly 2-4x, which is the textbook way
+        # a premium-selling account is destroyed by a single session.
+        #
+        # Sizing is now anchored on the STRUCTURAL loss, with only partial
+        # credit for the stop working (config.stop_efficacy, hard-capped at
+        # 0.80 in load_config so this can never be switched off entirely).
+        _structural_per_lot = max((wing_for_sizing - net_credit) * C02, 1.0)
+        _stop_loss_per_lot  = max(
+            (float(_stop_premium_pre) - net_credit) * C02, 0.0
         )
-        if _structural_per_lot <= 0:
-            _structural_per_lot = wing_for_sizing * C02 * 0.5
+        _efficacy = float(getattr(self.config, "stop_efficacy", 0.55))
+        _efficacy = min(max(_efficacy, 0.0), 0.80)
+        structural_loss_per_lot = (
+            _efficacy * _stop_loss_per_lot
+            + (1.0 - _efficacy) * _structural_per_lot
+        )
+        # Never assume less risk than the stop itself; never more than the
+        # structural maximum.
         structural_loss_per_lot = min(
-            max(_stop_loss_per_lot, 0.5 * _structural_per_lot),
-            _structural_per_lot
+            max(structural_loss_per_lot, _stop_loss_per_lot, 1.0),
+            _structural_per_lot,
         )
 
-        risk_pct_map = {
-            0: 0.008, 1: 0.006, 2: 0.005,
-            3: 0.004, 4: 0.003, 5: 0.0025, 6: 0.002
+        # ── [G4] Risk budget ──────────────────────────────────────────────
+        # config.max_risk_per_trade_pct is loaded, safety-clamped at startup
+        # to below MAX_DAILY_LOSS_PCT/3, and was then ignored completely in
+        # favour of this hardcoded table — so tightening the configured risk
+        # limit had literally no effect on position size, and the daily-loss
+        # arithmetic the clamp was protecting did not hold. The table is now
+        # expressed as a FRACTION of the configured budget.
+        _budget = float(self.config.max_risk_per_trade_pct or 0.006)
+        risk_frac_map = {
+            0: 1.00, 1: 0.80, 2: 0.65,
+            3: 0.50, 4: 0.40, 5: 0.32, 6: 0.25,
         }
-        risk_pct  = risk_pct_map.get(min(actual_dte or 1, 6), 0.002)
+        risk_pct  = _budget * risk_frac_map.get(
+            min(actual_dte if actual_dte is not None else 1, 6), 0.25
+        )
         max_risk  = current_capital * risk_pct
-        _credit_risk_per_lot = net_credit * 2.0 * C02
-        if _credit_risk_per_lot > 0:
-            structural_loss_per_lot = min(structural_loss_per_lot, _credit_risk_per_lot)
         raw_lots  = max_risk / structural_loss_per_lot
         final_lots = max(1, int(raw_lots * size_mult))
 
-        day_cap = LOT_CAPS_BY_DAY.get(day_label, 3) * max(
-            1, int(current_capital / self.config.starting_capital)
+        # ── [G2] Day cap ──────────────────────────────────────────────────
+        # int(capital / starting_capital) is a step function: the cap doubles
+        # the instant equity doubles and does nothing in between — the single
+        # worst moment to double exposure is right after a run-up. Continuous
+        # square-root-of-equity scaling grows exposure smoothly and slows it
+        # as the account grows, which is the standard convention.
+        _equity_scale = max(
+            (current_capital / float(self.config.starting_capital or 1.0)) ** 0.5,
+            0.35,
         )
+        day_cap = max(1, int(LOT_CAPS_BY_DAY.get(day_label, 3) * _equity_scale))
         final_lots = min(final_lots, day_cap)
 
         if structural_loss_per_lot * final_lots > max_risk * 1.5:
@@ -1125,22 +1379,34 @@ class StrategyEngine:
         if strategy_name in (IRON_CONDOR, IRON_BUTTERFLY) and final_lots < 1:
             final_lots = 1
 
-        stop_mult = min(float(state.get("stop_multiplier", 2.5) or 2.5), 2.5)
-        if strategy_name in (BULL_PUT_SPREAD, BEAR_CALL_SPREAD):
-            stop_premium = gross_credit * 2.5
-        else:
-            stop_premium = net_credit * stop_mult
+        stop_mult    = _stop_mult_pre
+        stop_premium = _stop_premium_pre
 
         max_loss_per_lot = structural_loss_per_lot
 
+        # ── [G3] Margin ───────────────────────────────────────────────────
+        # The old model added 2% x spot x lot x n_shorts of exposure margin on
+        # top of the wing margin on 0DTE. That is the NAKED-option convention.
+        # For a fully hedged, defined-risk vertical or condor the exchange
+        # requirement is essentially the spread's maximum loss plus a modest
+        # add-on; at a 26,000 index the old term was roughly six times the
+        # wing margin, which pinned final_lots at 1 and threw away most of the
+        # achievable return without reducing any actual risk. Every short leg
+        # here is hedged by construction (the builders reject unhedged
+        # structures), so the add-on is a small percentage — and the genuine
+        # naked formula is retained for the case where a leg really is naked.
+        _shorts = [l for l in validated_legs if l["action"] == "SELL"]
+        _longs  = [l for l in validated_legs if l["action"] == "BUY"]
+        _fully_hedged = len(_longs) >= len(_shorts) and len(_longs) > 0
         _wing_margin = (actual_wing_pts or 150) * C02 * 1.10
-        if actual_dte == 0:
-            _spot_ref = float(signals.get("spot") or 23900)
-            _n_short = sum(1 for _l in validated_legs if _l["action"] == "SELL")
-            _elm = 0.02 * _spot_ref * C02 * _n_short
-            margin_per_lot = _wing_margin + _elm
+        if _fully_hedged:
+            # Add-on for expiry-day margin tightening and broker buffer.
+            _addon = 0.18 if actual_dte == 0 else 0.10
+            margin_per_lot = _wing_margin * (1.0 + _addon)
         else:
-            margin_per_lot = _wing_margin
+            _spot_ref = float(signals.get("spot") or 0) or 24000.0
+            _n_naked  = max(len(_shorts) - len(_longs), 0)
+            margin_per_lot = _wing_margin + 0.02 * _spot_ref * C02 * _n_naked
         total_margin   = margin_per_lot * final_lots
         if total_margin > current_capital * 0.80 and final_lots > 1:
             final_lots   = max(1, int(current_capital * 0.80 / margin_per_lot))
@@ -1774,19 +2040,38 @@ def _self_test() -> None:
     print_section("Slippage Computation Tests")
 
     legs_ba = [{"bid": 44.0, "ask": 46.0}, {"bid": 41.0, "ask": 43.0}]
+    # v3.1: these previously asserted the hardcoded 0.5x / 3.0x multiples, so
+    # the test pinned the old double-counted entry model in place rather than
+    # verifying the intended behaviour. They now follow the configured
+    # multipliers and assert the properties that actually matter.
+    _half = (46 - 44) / 2.0
     slip_entry = engine._compute_slippage(legs_ba, is_exit=False)
-    expected_entry = 2 * ((46 - 44) / 2.0 * 0.5)
+    expected_entry = 2 * (_half * config.entry_slippage_mult)
     assert abs(slip_entry - expected_entry) < 0.01, (
         f"Entry slippage: expected {expected_entry:.3f}, got {slip_entry:.3f}"
     )
     print(f"  Entry slippage (2 legs bid/ask): {slip_entry:.3f}pts [OK]")
 
     slip_exit = engine._compute_slippage(legs_ba, is_exit=True)
-    expected_exit = 2 * ((46 - 44) / 2.0 * 3.0)
+    expected_exit = 2 * (_half * config.exit_slippage_mult)
     assert abs(slip_exit - expected_exit) < 0.01, (
         f"Exit slippage: expected {expected_exit:.3f}, got {slip_exit:.3f}"
     )
     print(f"  Exit slippage (2 legs bid/ask): {slip_exit:.3f}pts [OK]")
+
+    # Exiting a stressed 0DTE market must always be modelled as dearer than
+    # entering one; if this inverts, every cost gate in the engine is wrong.
+    assert slip_exit > slip_entry, (
+        f"Exit slippage {slip_exit:.3f} must exceed entry {slip_entry:.3f}"
+    )
+
+    # The round trip must exceed the sum of its slippage legs (it also carries
+    # two sets of statutory charges) — this is the number the credit gates use.
+    _rt = engine._round_trip_friction(legs_ba, 1.0)
+    assert _rt > slip_entry + slip_exit, (
+        f"Round-trip friction {_rt:.3f} must exceed slippage alone"
+    )
+    print(f"  Round-trip friction (2 legs): {_rt:.3f}pts [OK]")
 
     legs_no_ba = [{"bid": 0, "ask": 0}, {"bid": 0, "ask": 0}]
     slip_no_ba = engine._compute_slippage(legs_no_ba, is_exit=False)

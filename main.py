@@ -318,20 +318,36 @@ class MainEngine:
 
     def compute_unrealized_pnl(self) -> float:
         """
-        Compute total unrealized P&L across all open positions.
-        Uses last_known_premium from positions table.
+        Total unrealised P&L across all open positions.
+
+        v3.1: this used the MID mark and ignored transaction costs. For a
+        short-premium book the mid is always the flattering side (shorts are
+        bought back at the ask), and the entry charges have already left the
+        account. The result was an unrealised number that was systematically
+        too good, feeding the daily-loss halt — the engine's last line of
+        defence — so the halt fired late, and only once the real drawdown was
+        already larger than the configured limit.
+
+        Now marked at liquidation value where available, net of the entry
+        costs already paid and an estimate of the cost still to be paid to
+        close the position.
         """
         C02        = self.config.lot_size
         unrealized = 0.0
 
         for pos in self.execution_engine._get_open_positions():
-            current_prem = pos.get("last_known_premium")
+            current_prem = pos.get("last_liquidation_premium")
+            if current_prem is None:
+                current_prem = pos.get("last_known_premium")
             if current_prem is None:
                 continue
             entry_credit = float(pos.get("entry_credit") or 0)
             lots         = int(pos.get("final_lots", 1) or 1)
-            # P&L = (entry_credit - current_premium) × lot_size × lots
-            unrealized += (entry_credit - current_prem) * C02 * lots
+            gross = (entry_credit - float(current_prem)) * C02 * lots
+
+            entry_costs = float(pos.get("entry_costs_rupees") or 0.0)
+            exit_costs  = entry_costs * 0.95
+            unrealized += gross - entry_costs - exit_costs
 
         return unrealized
 
