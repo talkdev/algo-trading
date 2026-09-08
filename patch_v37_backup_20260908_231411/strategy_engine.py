@@ -540,21 +540,7 @@ class StrategyEngine:
 
         _band_lo = float(getattr(self.config, "em_band_lo", 0.80)) * _em
         _band_hi = float(getattr(self.config, "em_band_hi", 1.35)) * _em
-        # v3.7: the absolute floor is one strike step, not two.
-        #
-        # With v3.6's corrected expected move the EM-relative floor is
-        # 0.80 * 82.1 = 65.7 points on a quiet 0DTE, but max(2 * step,
-        # floor_pts // 2) is a hardcoded 100 and overrode it. Delta
-        # selection asked for 95 points - strike 23750, delta 0.224,
-        # its 0.20 target - and the floor pushed the short to 23800,
-        # delta 0.138, halving the credit from 10.35 to 5.55 and putting
-        # fixed brokerage at 22% of it. All 86 surviving candidates were
-        # rejected by a constant rather than by economics.
-        #
-        # One step still stops a mis-quoted greek selling the money.
-        # Beyond that, 0.80 * EM is the market-relative floor and delta
-        # chooses the strike, which is what v3.2 said it would do.
-        _band_lo = max(_band_lo, float(step))
+        _band_lo = max(_band_lo, float(max(2 * step, floor_pts // 2)))
         _band_hi = max(_band_hi, _band_lo + step)
 
         def _dist_from_delta(_opt_type: str) -> Optional[float]:

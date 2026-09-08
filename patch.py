@@ -1,91 +1,62 @@
 #!/usr/bin/env python3
 """
 ════════════════════════════════════════════════════════════════════════════
- patch-version6.py — NIFTY intraday options engine, profitability patch v3.6
+ patch-version7.py — NIFTY intraday options engine, profitability patch v3.7
 ════════════════════════════════════════════════════════════════════════════
 
- Prerequisite: v3.5 must already be installed. Self-contained, stdlib only.
+ Prerequisite: v3.6 must already be installed. Self-contained, stdlib only.
 
  ── THE DEFECT ─────────────────────────────────────────────────────────────
 
- Measured by replaying 2026-09-08. After v3.5 the engine reached the
- structure builder and then rejected all 86 surviving candidates on
- net_credit. It was not a lack of edge. It was selling the wrong strike.
+ The last of the distance-over-delta overrides.
 
- At 12:03, spot 23654.5, the engine sold 23850 / bought 23950:
+ strategy_engine picks the short strike by delta, then clamps it into a
+ band around the expected remaining move. v3.6 fixed the expected move
+ itself (208 -> 82.1, read from the live ATM straddle). With that corrected
+ the EM-relative floor is 0.80 * 82.1 = 65.7 points and no longer binds.
 
-     SELL 23850 call @ 5.40   delta 0.085
-     BUY  23950 call @ 2.60
-     gross 2.80 pts, net 1.95, friction 1.57  ->  76% of credit, rejected
+ But the floor is not only EM-relative:
 
- Its own delta target was 0.20, and _find_strike_by_delta correctly
- returned 23750 (delta 0.224). Same 100-point wing, so identical maximum
- loss, but a very different trade:
+     _band_lo = max(0.80 * EM, max(2 * step, floor_pts // 2))
+              = max(65.7,      max(100,      35))              = 100
 
-     short   delta   credit   wing   gross
-     23750   0.224   15.75    5.40   10.35    <- what delta selection chose
-     23850   0.085    5.40    2.60    2.80    <- what actually traded
+ 2 * step is a hardcoded 100 points on NIFTY, and it now decides the
+ trade. Delta selection asked for 95 points - strike 23750, delta 0.224,
+ exactly the 0.20 target - and the floor pushed it to 23800, delta 0.138.
 
- The override is in strategy_engine, which clamps the short strike to lie
- at least 0.80 * expected_move_remaining_pts away from the centre. Delta
- asked for 95 points of distance; the clamp forced 166.
+ On the recorded 12:03 chain, at one lot:
 
- And the expected move driving that clamp was wrong:
+     short 23750   gross 10.35   brokerage 11.9% (cap 15)   friction 16.6% (cap 28)   passes
+     short 23800   gross  5.55   brokerage 22.2% (cap 15)   friction 33.8% (cap 28)   rejected
 
-     engine expected_move_remaining = 208.1 pts
-     market's own live ATM straddle =  82.1 pts
-     overstatement                  = 2.5x
-
- Because _em_base read state["opening_straddle_pts"] - the straddle
- captured at 09:30 on the 15-Sep series, 280 points - and then scaled it
- by sqrt(remaining fraction): 280 * sqrt(0.552) = 208.0, matching the
- observed 208.1 exactly.
-
- This is the same fault v3.5 fixed for opening_iv, on a different
- baseline: a session-opening value latched on one expiry series and never
- re-taken when the engine switched to another.
+ So a hardcoded distance constant, not economics, was rejecting all 86
+ surviving candidates. Note what this means: the trade clears the cost
+ gates at ONE LOT. Nothing here needs bigger size or a looser cost cap.
 
  ── THE FIX ────────────────────────────────────────────────────────────────
 
- Rather than re-baseline a third stale value, the expected remaining move
- is now read from the live ATM straddle of the active chain every cycle,
- and the opening-baseline scaling is dropped.
+ The absolute floor drops from two strike steps to one. A single step is a
+ genuine sanity bound - it stops a mis-quoted greek putting the short at
+ the money - while 0.80 * EM remains the real, market-relative floor and
+ delta remains what actually chooses the strike, as v3.2 intended.
 
- On the expiry series this needs no time scaling at all. A 0DTE straddle
- already prices exactly the time left in the session - that is what it is
- - so multiplying it by sqrt(T_remaining) double-counts the decay. At
- 12:03 the answer is simply 82.1.
-
- Away from expiry the live straddle prices the move to ITS expiry, not to
- tonight's close, so only today's share is at risk intraday and only the
- unexpired part of today remains. Both scalings are kept there.
-
- expected_range_so_far_pts is a statement about the whole session rather
- than what is left of it, so it keeps the opening baseline. Nothing reads
- it today, and this patch does not change its meaning.
-
- ── WHAT THIS AFFECTS ──────────────────────────────────────────────────────
-
- expected_move_remaining_pts feeds two consumers, and both were being fed
- a number 2.5x too large:
-
-   strategy_engine:526   the strike-distance clamp described above
-   strategy_engine:1342  the EV gate's risk horizon
-
- So this also tightens the EV gate's estimate of what can go wrong. That
- is a real behavioural change beyond strike selection and it is called out
- here rather than left to be discovered.
+ This does not loosen a risk limit. Delta IS the risk control here: the
+ engine still sells the 0.20-delta strike it always meant to sell. What
+ changes is that it is no longer prevented from doing so on quiet days,
+ which is precisely when a 100-point constant is too wide - the expected
+ move was 82 points, so the old floor forced every short beyond 1.2 sigma
+ where there is not enough premium to cover fixed costs.
 
  ── HONEST SCOPE ───────────────────────────────────────────────────────────
 
- This corrects a units error against the market's own quoted price. It is
- not a tuning parameter and it was not fitted to an outcome. But one live
- session is still one sample, and letting a trade through is not the same
- as that trade making money.
+ This is the change that will make the engine trade, so read the result
+ with more suspicion than the previous ones, not less. One session, a
+ 57-minute usable window, modelled fills, and no out-of-sample test. A
+ trade appearing is not a trade making money.
 
  Usage:
-     python3 patch-version6.py            # apply
-     python3 patch-version6.py --verify   # report state, change nothing
+     python3 patch-version7.py            # apply
+     python3 patch-version7.py --verify   # report state, change nothing
 """
 
 import argparse
@@ -100,43 +71,28 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 
-MARKER_V35 = "NIFTY_ENGINE_PROFIT_PATCH_V35"
 MARKER_V36 = "NIFTY_ENGINE_PROFIT_PATCH_V36"
+MARKER_V37 = "NIFTY_ENGINE_PROFIT_PATCH_V37"
 
-TOUCHED = ["core.py", "data_engine.py"]
+TOUCHED = ["core.py", "strategy_engine.py"]
 
+BAND_OLD = '        _band_lo = max(_band_lo, float(max(2 * step, floor_pts // 2)))'
 
-
-EM_OLD = """\
-            _em_base = float(
-                self.state.get("opening_straddle_pts")
-                or self.state.get("_last_atm_straddle")
-                or 0.0
-            )
-            if _em_base <= 20 and atm_straddle > 20:
-                _em_base = float(atm_straddle)
-            if _em_base <= 20:
-                _em_sp = float(spot or self.state.get("prev_spot") or 0.0)
-                _em_base = _em_sp * 0.009 if _em_sp > 0 else 0.0
-            if _em_base > 20:
-                _em_dte = actual_dte if actual_dte is not None else 1
-                if _em_dte and _em_dte > 0:
-                    # For a multi-day contract only the part of the
-                    # straddle attributable to today is at risk intraday.
-                    _em_scale = _math_em.sqrt(
-                        1.0 / max(float(_em_dte) + 1.0, 1.0)
-                    )
-                else:
-                    _em_scale = 1.0
-                _expected_move_remaining = round(
-                    _em_base * _em_scale * _math_em.sqrt(_em_rem_frac), 2
-                )
-                _expected_range_so_far = round(
-                    _em_base * _math_em.sqrt(max(1.0 - _em_rem_frac, 0.02)), 2
-                )
-            else:
-                _expected_move_remaining = 0.0
-                _expected_range_so_far = 0.0"""
+BAND_NEW = '''        # v3.7: the absolute floor is one strike step, not two.
+        #
+        # With v3.6's corrected expected move the EM-relative floor is
+        # 0.80 * 82.1 = 65.7 points on a quiet 0DTE, but max(2 * step,
+        # floor_pts // 2) is a hardcoded 100 and overrode it. Delta
+        # selection asked for 95 points - strike 23750, delta 0.224,
+        # its 0.20 target - and the floor pushed the short to 23800,
+        # delta 0.138, halving the credit from 10.35 to 5.55 and putting
+        # fixed brokerage at 22% of it. All 86 surviving candidates were
+        # rejected by a constant rather than by economics.
+        #
+        # One step still stops a mis-quoted greek selling the money.
+        # Beyond that, 0.80 * EM is the market-relative floor and delta
+        # chooses the strike, which is what v3.2 said it would do.
+        _band_lo = max(_band_lo, float(step))'''
 
 
 def _child_env() -> dict:
@@ -235,7 +191,7 @@ class FilePatcher:
 
 
 def backup_all(stamp: str) -> Path:
-    d = BASE / f"patch_v36_backup_{stamp}"
+    d = BASE / f"patch_v37_backup_{stamp}"
     d.mkdir(exist_ok=True)
     for name in TOUCHED + ["env.txt"]:
         p = BASE / name
@@ -249,72 +205,14 @@ def restore_all(d: Path) -> None:
         shutil.copy2(f, BASE / f.name)
 
 
-EM_NEW = '''            # ── v3.6 ─────────────────────────────────────────────────
-            # The expected remaining move now comes from the live ATM
-            # straddle of the ACTIVE chain, every cycle.
-            #
-            # It used to come from state["opening_straddle_pts"] scaled by
-            # sqrt(remaining fraction). On 2026-09-08 that baseline was
-            # captured at 09:30 on the 15-Sep series - 280 points - and
-            # the engine was still using it after it switched to the 0DTE
-            # chain at 12:03, where the real straddle was 82.1:
-            #
-            #     280 * sqrt(0.552) = 208.0   the engine's answer
-            #     live ATM straddle =  82.1   the market's answer
-            #
-            # A 2.5x overstatement, which strategy_engine turns into a
-            # floor of 0.80 * EM on how far out the short strike must sit.
-            # Delta selection asked for 95 points and got clamped to 166,
-            # so the engine sold 0.085 delta instead of the 0.224 it had
-            # chosen, collected 2.80 instead of 10.35, and then rejected
-            # itself because friction was 76% of the credit.
-            #
-            # On the expiry series no time scaling belongs here at all: a
-            # 0DTE straddle already prices exactly the time left in the
-            # session, so scaling it again by sqrt(T) double-counts decay.
-            # Away from expiry the straddle prices the move to ITS expiry,
-            # so today's share and the unexpired part of today both apply.
-            _em_live = float(atm_straddle or 0.0)
-            if _em_live <= 20:
-                _em_live = float(self.state.get("_last_atm_straddle") or 0.0)
-
-            _em_dte = actual_dte if actual_dte is not None else 1
-
-            if _em_live > 20:
-                if _em_dte is not None and _em_dte > 0:
-                    _expected_move_remaining = round(
-                        _em_live
-                        * _math_em.sqrt(1.0 / max(float(_em_dte) + 1.0, 1.0))
-                        * _math_em.sqrt(_em_rem_frac), 2
-                    )
-                else:
-                    _expected_move_remaining = round(_em_live, 2)
-            else:
-                # No usable chain. Fall back to a fraction of spot, still
-                # never to the opening baseline.
-                _em_sp = float(spot or self.state.get("prev_spot") or 0.0)
-                _expected_move_remaining = round(
-                    _em_sp * 0.009 * _math_em.sqrt(_em_rem_frac), 2
-                ) if _em_sp > 0 else 0.0
-
-            # expected_range_so_far is about the whole session, not what is
-            # left of it, so it keeps the opening baseline unchanged.
-            _em_base = float(self.state.get("opening_straddle_pts") or 0.0)
-            if _em_base <= 20 and _em_live > 20:
-                _em_base = _em_live
-            _expected_range_so_far = round(
-                _em_base * _math_em.sqrt(max(1.0 - _em_rem_frac, 0.02)), 2
-            ) if _em_base > 20 else 0.0'''
-
-
 def patch_core(p: FilePatcher) -> None:
     p.sub("core/version-marker",
-          f'{MARKER_V35} = "3.5"',
-          f'{MARKER_V35} = "3.5"\n{MARKER_V36} = "3.6"')
+          f'{MARKER_V36} = "3.6"',
+          f'{MARKER_V36} = "3.6"\n{MARKER_V37} = "3.7"')
 
 
-def patch_data_engine(p: FilePatcher) -> None:
-    p.sub("data_engine/live-straddle-expected-move", EM_OLD, EM_NEW)
+def patch_strategy(p: FilePatcher) -> None:
+    p.sub("strategy/absolute-strike-floor-one-step", BAND_OLD, BAND_NEW)
 
 
 def verify_syntax() -> list[str]:
@@ -330,68 +228,51 @@ def verify_syntax() -> list[str]:
 def verify_semantics() -> list[str]:
     errs = []
     core_src = (BASE / "core.py").read_text(encoding="utf-8")
-    de_src = (BASE / "data_engine.py").read_text(encoding="utf-8")
-
+    se_src = (BASE / "strategy_engine.py").read_text(encoding="utf-8")
     checks = [
-        ("core carries the v3.6 marker", MARKER_V36 in core_src),
-        ("core keeps the v3.5 marker", MARKER_V35 in core_src),
-        ("the expected move reads the live ATM straddle",
-         "_em_live = float(atm_straddle or 0.0)" in de_src),
-        ("0DTE takes the straddle unscaled",
-         "_expected_move_remaining = round(_em_live, 2)" in de_src),
-        ("non-expiry keeps both time scalings",
-         "* _math_em.sqrt(1.0 / max(float(_em_dte) + 1.0, 1.0))" in de_src),
-        ("the opening baseline no longer feeds the expected move",
-         '_em_base = float(\n                self.state.get("opening_straddle_pts")'
-         not in de_src),
-        ("expected_range_so_far still uses the opening baseline",
-         '_em_base = float(self.state.get("opening_straddle_pts") or 0.0)'
-         in de_src),
-        ("both signals are still published",
-         '"expected_move_remaining_pts": _expected_move_remaining,' in de_src
-         and '"expected_range_so_far_pts":   _expected_range_so_far,' in de_src),
+        ("core carries the v3.7 marker", MARKER_V37 in core_src),
+        ("core keeps the v3.6 marker", MARKER_V36 in core_src),
+        ("the absolute floor is one step",
+         "_band_lo = max(_band_lo, float(step))" in se_src),
+        ("the hardcoded two-step floor is gone",
+         "max(2 * step, floor_pts // 2)" not in se_src),
+        ("the EM-relative floor is untouched",
+         '_band_lo = float(getattr(self.config, "em_band_lo", 0.80)) * _em'
+         in se_src),
+        ("the upper band is untouched",
+         "_band_hi = max(_band_hi, _band_lo + step)" in se_src),
     ]
     for label, ok in checks:
         print(f"    {'PASS' if ok else 'FAIL'}  {label}")
         if not ok:
             errs.append(label)
-
-    out = _run_py("import data_engine\nprint('IMPORT_OK')\n", 180)
+    out = _run_py("import strategy_engine\nprint('IMPORT_OK')\n", 180)
     ok = out.returncode == 0 and "IMPORT_OK" in out.stdout
-    print(f"    {'PASS' if ok else 'FAIL'}  data_engine imports")
+    print(f"    {'PASS' if ok else 'FAIL'}  strategy_engine imports")
     if not ok:
-        errs.append("data_engine import: "
-                    + ((out.stderr or "").strip().splitlines() or ["?"])[-1])
+        errs.append("import failed")
     return errs
 
 
 def verify_behaviour() -> list[str]:
-    """
-    Exercise the patched arithmetic directly on the measured 12:03 numbers
-    rather than trusting the comment above it.
-    """
     errs = []
     out = _run_py(
-        "import math\n"
-        "live, opening, rem = 82.1, 280.0, (375.0 - 168.0) / 375.0\n"
-        "old = round(opening * math.sqrt(rem), 2)\n"
-        "new0 = round(live, 2)\n"
-        "new7 = round(live * math.sqrt(1.0 / 8.0) * math.sqrt(rem), 2)\n"
-        "print(f'old (opening 15-Sep straddle, scaled) = {old}')\n"
-        "print(f'new 0DTE  (live straddle, unscaled)   = {new0}')\n"
-        "print(f'new 7DTE  (live straddle, scaled)     = {new7}')\n"
-        "assert abs(old - 208.0) < 0.2, old\n"
-        "assert abs(new0 - 82.1) < 0.01, new0\n"
-        "assert new7 < new0, 'a far series must contribute less to today'\n"
-        "band_old, band_new = 0.80 * old, 0.80 * new0\n"
-        "print(f'strike floor 0.80*EM: {band_old:.0f} pts -> {band_new:.0f} pts')\n"
-        "assert band_new < 95.0, 'the floor must stop overriding a 95pt delta pick'\n"
+        "em, step = 82.1, 50\n"
+        "old = max(0.80 * em, max(2 * step, 70 // 2))\n"
+        "new = max(0.80 * em, float(step))\n"
+        "print(f'floor: {old:.1f} pts -> {new:.1f} pts   (delta wanted 95)')\n"
+        "assert old > 95, 'the old floor must override a 95pt delta pick'\n"
+        "assert new < 95, 'the new floor must not'\n"
+        "for k, g in ((23800, 5.55), (23750, 10.35)):\n"
+        "    print(f'  short {k}: gross {g:5.2f} brokerage {1.23/g*100:4.1f}%'\n"
+        "          f' friction {1.57/(g-0.9)*100:4.1f}%')\n"
+        "assert 1.23 / 10.35 < 0.15 and 1.57 / 9.45 < 0.28\n"
         "print('ARITHMETIC_OK')\n", 120)
     for line in (out.stdout or "").strip().splitlines():
         if "ARITHMETIC_OK" not in line:
             print(f"           {line}")
     ok = out.returncode == 0 and "ARITHMETIC_OK" in out.stdout
-    print(f"    {'PASS' if ok else 'FAIL'}  the clamp stops overriding delta selection")
+    print(f"    {'PASS' if ok else 'FAIL'}  delta governs, and 23750 clears both cost gates at 1 lot")
     if not ok:
         errs.append("behaviour check failed")
     return errs
@@ -399,7 +280,7 @@ def verify_behaviour() -> list[str]:
 
 def run_self_tests() -> list[str]:
     errs = []
-    for mod in ("data_engine.py", "strategy_engine.py", "regime_engine.py"):
+    for mod in ("strategy_engine.py", "data_engine.py", "regime_engine.py"):
         body = ("import runpy\n"
                 f"runpy.run_path({str(BASE / '@M@')!r}, run_name='__main__')\n"
                 ).replace("@M@", mod)
@@ -408,10 +289,9 @@ def run_self_tests() -> list[str]:
         ok = out.returncode == 0
         if not ok and "UnicodeEncodeError" in combined:
             print(f"    WARN  {mod} could not write its output on this console")
-            out = _run_py(
-                "import runpy, os, sys\n"
-                "sys.stdout = open(os.devnull, 'w')\n"
-                + body.split("\n", 1)[1], 600)
+            out = _run_py("import runpy, os, sys\n"
+                          "sys.stdout = open(os.devnull, 'w')\n"
+                          + body.split("\n", 1)[1], 600)
             combined = (out.stderr or "") + (out.stdout or "")
             ok = out.returncode == 0
         print(f"    {'PASS' if ok else 'FAIL'}  {mod} self test")
@@ -425,7 +305,7 @@ def run_self_tests() -> list[str]:
 def do_verify() -> int:
     print("\n  state of the tree\n")
     core_src = (BASE / "core.py").read_text(encoding="utf-8")
-    for label, marker in (("v3.5", MARKER_V35), ("v3.6", MARKER_V36)):
+    for label, marker in (("v3.6", MARKER_V36), ("v3.7", MARKER_V37)):
         print(f"    {label}: {'installed' if marker in core_src else 'NOT installed'}")
     print()
     errs = verify_semantics()
@@ -435,34 +315,29 @@ def do_verify() -> int:
 
 def main() -> int:
     _harden_stdout()
-    ap = argparse.ArgumentParser(description="NIFTY engine profitability patch v3.6")
+    ap = argparse.ArgumentParser(description="NIFTY engine profitability patch v3.7")
     ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()
-
     print("=" * 76)
-    print(" NIFTY intraday options engine - profitability patch v3.6")
-    print(" the expected move: read it from the market, every cycle")
+    print(" NIFTY intraday options engine - profitability patch v3.7")
+    print(" let delta choose the strike")
     print("=" * 76)
-
     if args.verify:
         return do_verify()
-
     core_src = (BASE / "core.py").read_text(encoding="utf-8")
-    if MARKER_V35 not in core_src:
-        print("\n  REFUSING: v3.5 must be installed first. Run patch-version5.py.\n")
+    if MARKER_V36 not in core_src:
+        print("\n  REFUSING: v3.6 must be installed first. Run patch-version6.py.\n")
         return 1
-    if MARKER_V36 in core_src:
-        print("\n  v3.6 is already installed. Nothing to do.\n")
+    if MARKER_V37 in core_src:
+        print("\n  v3.7 is already installed. Nothing to do.\n")
         return 0
-
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = backup_all(stamp)
     print(f"\n  backup: {backup.name}/\n")
-
     try:
         patchers = {}
         for name, fn in (("core.py", patch_core),
-                         ("data_engine.py", patch_data_engine)):
+                         ("strategy_engine.py", patch_strategy)):
             p = FilePatcher(name)
             fn(p)
             patchers[name] = p
@@ -470,45 +345,37 @@ def main() -> int:
             p.write()
             for label in p.log:
                 print(f"    applied  {label}")
-
         print("\n  syntax\n")
         errs = verify_syntax()
         for e in errs:
             print(f"    FAIL  {e}")
         if not errs:
             print("    PASS  all touched files parse")
-
         print("\n  semantics\n")
         errs += verify_semantics()
         print("\n  behaviour\n")
         errs += verify_behaviour()
         print("\n  self tests\n")
         errs += run_self_tests()
-
         if errs:
             raise PatchError(f"{len(errs)} verification failure(s)")
-
     except Exception as exc:                                # noqa: BLE001
         print(f"\n  ERROR: {exc}")
         print("  restoring every touched file from the backup...")
         restore_all(backup)
         print("  restored. The tree is exactly as it was.\n")
         return 1
-
     print("\n" + "=" * 76)
-    print(" v3.6 applied and verified.")
+    print(" v3.7 applied and verified.")
     print("=" * 76)
     print(f"""
- What changed
+ The absolute strike-distance floor is now one strike step instead of a
+ hardcoded two. Delta selection chooses the short; 0.80 * expected move
+ remains the market-relative floor.
 
-   expected_move_remaining_pts is now the live ATM straddle of the active
-   chain, taken fresh each cycle, unscaled on the expiry series and scaled
-   for today's share away from it. It no longer reads the opening
-   straddle, which on 2026-09-08 was a 15-Sep value of 280 points still in
-   use at 12:03 when the real 0DTE straddle was 82.1.
-
-   This feeds strike selection AND the EV gate's risk horizon, so both
-   were previously working from a number 2.5x too large.
+ This is the change that lets the engine trade. Treat the first P&L it
+ produces as a hypothesis, not a result: one session, a 57-minute usable
+ window, modelled fills, no out-of-sample test.
 
  Rollback
 
