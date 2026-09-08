@@ -1083,11 +1083,11 @@ class RegimeClassifier:
 
         # DTE adjustment: lower threshold for 0DTE (theta compensates)
         if dte == 0:
-            vrp_sell = vrp_sell * 0.75
-        elif dte == 1:
-            vrp_sell = vrp_sell * 0.85
-        elif dte == 2:
             vrp_sell = vrp_sell * 1.00
+        elif dte == 1:
+            vrp_sell = vrp_sell * 0.95
+        elif dte == 2:
+            vrp_sell = vrp_sell * 1.05
         elif dte == 3:
             vrp_sell = vrp_sell * 1.10
         elif dte == 4:
@@ -1098,16 +1098,12 @@ class RegimeClassifier:
             vrp_sell = vrp_sell * 1.40
 
         # OR condition adjustment
-        if or_condition == "VERY_NARROW":
-            vrp_sell = vrp_sell * 0.75  # Narrow OR = lower expected move = lower threshold
-        elif or_condition == "NARROW":
-            vrp_sell = vrp_sell * 0.85
-        elif or_condition == "WIDE":
-            vrp_sell = vrp_sell * 1.20  # Wide OR = more risk = higher threshold needed
+        if or_condition == "WIDE":
+            vrp_sell = vrp_sell * 1.20
         elif or_condition == "VERY_WIDE":
-            vrp_sell = vrp_sell * 1.40
+            vrp_sell = vrp_sell * 1.50
 
-        vrp_sell = max(vrp_sell, 1.0)  # Never go below 1.0pp absolute
+        vrp_sell = max(vrp_sell, 2.0)
         vrp_very_rich = vrp_sell * 1.30  # STRONG_SELL threshold
 
         details["vrp_sell_adjusted"] = round(vrp_sell, 3)
