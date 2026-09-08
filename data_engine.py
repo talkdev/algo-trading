@@ -335,7 +335,7 @@ class MarketDataEngine:
         self._chain_fetch_time: Optional[datetime] = None
 
         # VRP smoothing buffer (list of raw VRP floats, most recent last)
-        self._vrp_buffer: List[float] = []
+        self._vrp_buffer: List[float] = self._seed_vrp_buffer()
 
         # Calibration cache (refreshed hourly)
         self._cached_calibration: Optional[dict]   = None
@@ -1119,7 +1119,6 @@ class MarketDataEngine:
                             return cached_rv, "cached"
                         return None, "anomaly_no_cache"
 
-                    # Anomaly: dropped > 50% from cached (data error)
                     if cached_rv and cached_rv >= rv_floor:
                         if rv < cached_rv * 0.50:
                             self.logger.debug(
@@ -1127,6 +1126,12 @@ class MarketDataEngine:
                                 f"from cached {cached_rv*100:.2f}% — using cached"
                             )
                             return cached_rv, "cached"
+                        if rv > cached_rv * 1.50:
+                            self.logger.warning(
+                                f"Parkinson RV spike {rv*100:.2f}% > 1.5x cached "
+                                f"{cached_rv*100:.2f}% — bad candle, using cached"
+                            )
+                            return cached_rv, "cached_spike_guard"
 
                     # Valid RV
                     self.state["parkinson_rv_pct"]            = rv
@@ -1272,9 +1277,22 @@ class MarketDataEngine:
         Range-consumed correctly captures what threatens a short-premium position.
         NIFTY 2026: block when range > 55% of opening straddle.
         """
-        opening_straddle = self.state.get("opening_straddle_pts") or                            self.state.get("_straddle_open_for_regime") or 0.0
+        opening_straddle = (
+            self.state.get("opening_straddle_pts") or
+            self.state.get("_straddle_open_for_regime") or 0.0
+        )
         if opening_straddle <= 0 or spot is None:
             return 0.0
+        _dte = self.state.get("actual_dte", 0) or 0
+        if _dte >= 2:
+            import math as _math
+            _theta_frac = max(1.0 / max(_dte, 1), 0.10)
+            _straddle_ref = max(
+                opening_straddle * _math.sqrt(_theta_frac),
+                60.0
+            )
+        else:
+            _straddle_ref = opening_straddle
         today_str = today_ist().isoformat()
         try:
             bars = self._load_candles_from_db(today_str)
@@ -1283,13 +1301,13 @@ class MarketDataEngine:
                 if not market_bars.empty:
                     day_high = float(market_bars["high"].max())
                     day_low  = float(market_bars["low"].min())
-                    return round((day_high - day_low) / opening_straddle * 100.0, 2)
+                    return round((day_high - day_low) / _straddle_ref * 100.0, 2)
         except Exception:
             pass
         first_close = self.state.get("first_bar_close")
         if first_close is None or first_close <= 0:
             return 0.0
-        return round(abs(spot - first_close) / opening_straddle * 100.0, 2)
+        return round(abs(spot - first_close) / _straddle_ref * 100.0, 2)
 
     # ─────────────────────────────────────────────────────────────────────
     # OPTION CHAIN COMPUTATIONS
@@ -1880,12 +1898,19 @@ class MarketDataEngine:
                         preferred = [f for f in future if f[0] >= 1]
                         expiry    = preferred[0][1] if preferred else future[0][1]
 
-                    trading_dte = ExpiryCalendar.get_dte(today)
+                    calendar_dte = ExpiryCalendar.get_dte(today)
+                    expiry_dte = 0
+                    _d = today + timedelta(days=1)
+                    while _d <= expiry:
+                        if not ExpiryCalendar.is_holiday(_d):
+                            expiry_dte += 1
+                        _d += timedelta(days=1)
                     self.state["actual_expiry"]       = expiry.isoformat()
-                    self.state["actual_dte"]          = trading_dte
+                    self.state["actual_dte"]          = expiry_dte
                     self.state["expiry_last_checked"] = now_ist().isoformat()
                     self.logger.info(
-                        f"Active expiry: {expiry} (DTE={trading_dte} trading days)"
+                        f"Active expiry: {expiry} "
+                        f"(calendar_dte={calendar_dte} expiry_dte={expiry_dte})"
                     )
 
             except Exception as e:
@@ -2259,6 +2284,21 @@ class MarketDataEngine:
     # ─────────────────────────────────────────────────────────────────────
     # MAIN CYCLE
     # ─────────────────────────────────────────────────────────────────────
+
+    def _seed_vrp_buffer(self) -> List[float]:
+        try:
+            rows = self.db.get_vrp_smoothed_history(
+                n_cycles=self.config.vrp_smoothing_cycles
+            )
+            if rows:
+                seeded = list(reversed(rows))
+                self.logger.debug(
+                    f"VRP buffer seeded from DB: {len(seeded)} values"
+                )
+                return seeded
+        except Exception:
+            pass
+        return []
 
     def run_cycle(self) -> dict:
         """
