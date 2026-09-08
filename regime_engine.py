@@ -1211,26 +1211,9 @@ class RegimeClassifier:
         Priority order:
         1. OBSERVING: OR not established
         2. CHOPPY: OR established but fake breakouts detected
-        _now_t_pr = now_ist().time()
-        _orb_primary = _now_t_pr < dtime(11, 0)
-        if _orb_primary or not adx_15_mature or adx_15 <= 0:
-            if orb_structure == "UPTREND":
-                if adx_15_mature and adx_15 >= adx_trend:
-                    return PriceRegime.UPTREND
-                _vwap_s = signals.get("vwap_signal", "UNKNOWN")
-                if _vwap_s in ("BULLISH", "BULLISH_EXTENDED", "NEUTRAL", "UNKNOWN"):
-                    return PriceRegime.UPTREND
-                return PriceRegime.RANGE
-            if orb_structure == "DOWNTREND":
-                if adx_15_mature and adx_15 >= adx_trend:
-                    return PriceRegime.DOWNTREND
-                _vwap_s = signals.get("vwap_signal", "UNKNOWN")
-                if _vwap_s in ("BEARISH", "BEARISH_EXTENDED", "NEUTRAL", "UNKNOWN"):
-                    return PriceRegime.DOWNTREND
-                return PriceRegime.RANGE
-            if orb_structure == "CHOPPY":
-                return PriceRegime.CHOPPY
-            return PriceRegime.RANGE
+        3. ADX immature -> opening-range structure, confirmed by VWAP
+           (v3.2: this block used to live inside this docstring, so it
+           was prose and never ran; it is now real code below)
         4. STRONG_DOWNTREND: ADX > 35, bearish EMA, spot > 100pts below OR
         5. STRONG_UPTREND: ADX > 35, bullish EMA, spot > 100pts above OR
         6. DOWNTREND: ADX >= 25, bearish EMA, spot below OR low
@@ -1263,12 +1246,30 @@ class RegimeClassifier:
             return PriceRegime.CHOPPY
 
         # ── Step 3: ADX maturity ──────────────────────────────────────────
-        # If ADX is not mature, fall back to ORB structure
+        # v3.2: when the trend reading is not yet trustworthy the engine
+        # falls back to the opening-range structure - but an ORB label on
+        # its own is the single most over-traded signal on NIFTY: price
+        # pokes 20 points through the range and reverts constantly. The
+        # confirmation a professional applies is VWAP: a breakout that is
+        # not supported by the volume-weighted average price is noise,
+        # and calling it a trend makes the engine sell the WRONG side.
+        # This is the logic that was stranded inside the docstring.
         if not adx_15_mature or adx_15 <= 0:
+            _vwap_s = signals.get("vwap_signal", "UNKNOWN")
             if orb_structure == "UPTREND":
-                return PriceRegime.UPTREND
+                if adx_15 >= adx_trend:
+                    return PriceRegime.UPTREND
+                if _vwap_s in ("BULLISH", "BULLISH_EXTENDED",
+                               "NEUTRAL", "UNKNOWN"):
+                    return PriceRegime.UPTREND
+                return PriceRegime.RANGE
             if orb_structure == "DOWNTREND":
-                return PriceRegime.DOWNTREND
+                if adx_15 >= adx_trend:
+                    return PriceRegime.DOWNTREND
+                if _vwap_s in ("BEARISH", "BEARISH_EXTENDED",
+                               "NEUTRAL", "UNKNOWN"):
+                    return PriceRegime.DOWNTREND
+                return PriceRegime.RANGE
             if orb_structure == "CHOPPY":
                 return PriceRegime.CHOPPY
             return PriceRegime.RANGE
@@ -1372,8 +1373,18 @@ class RegimeClassifier:
         oi_building  = oi_change > oi_build
         oi_unwinding = oi_change < oi_unwind
 
-        pcr_extreme_bull = pcr > pcr_bear * 1.20
-        pcr_extreme_bear = pcr < pcr_bull * 0.80
+        # v3.2: the extremes were purely relative to the calibrated
+        # thresholds, so with the shipped defaults "extreme fear" meant
+        # PCR > 1.28 * 1.20 = 1.536. On the NIFTY weekly chain a PCR of
+        # 1.50 IS an extreme - the contrarian read that positioning is
+        # supposed to provide simply never fired, and the engine fell
+        # through to UNCLEAR, which halves its size and often blocks the
+        # trade outright. Absolute bounds are applied alongside the
+        # relative ones so calibration can tighten but not un-fire them.
+        _pcr_abs_bull = 1.45
+        _pcr_abs_bear = 0.58
+        pcr_extreme_bull = pcr > min(pcr_bear * 1.20, _pcr_abs_bull)
+        pcr_extreme_bear = pcr < max(pcr_bull * 0.80, _pcr_abs_bear)
         pcr_bullish      = pcr > pcr_bear
         pcr_bearish      = pcr < pcr_bull
 
@@ -2827,9 +2838,19 @@ def _self_test() -> None:
     assert vol2 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL, got {vol2}"
 
     # NEUTRAL (day move used)
-    s3 = make_signals(vrp_smoothed=3.2, day_move_used_pct=60.0)
+    # v3.2: day_move_used_pct is no longer "percentage of the whole-day
+    # straddle consumed" - it is the realised range as a percentage of
+    # the range the market PRICED for the elapsed part of the session,
+    # so 100 means "running exactly as priced" and the block threshold
+    # moved from 60 to 125. The fixture is derived from the configured
+    # threshold so it tests the behaviour rather than pinning a number.
+    _dm_block = float(classifier.config.day_move_used_block_pct)
+    s3 = make_signals(vrp_smoothed=3.2, day_move_used_pct=_dm_block + 15.0)
     vol3, d3 = classifier.classify_volatility(s3, 0, 11.0)
-    print(f"  VRP=3.2pp, day_move=60% → {vol3.value} (expect NEUTRAL)")
+    print(
+        f"  VRP=3.2pp, day_move={_dm_block + 15.0:.0f}% "
+        f"(block={_dm_block:.0f}%) → {vol3.value} (expect NEUTRAL)"
+    )
     assert vol3 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL, got {vol3}"
 
     # ABORT (real VIX spike)

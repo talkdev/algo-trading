@@ -493,23 +493,94 @@ class StrategyEngine:
             dist_mult *= 1.20
             floor_pts  = int(floor_pts * 1.10)
 
-        if opening_straddle > 20:
-            short_dist = max(int(opening_straddle * dist_mult), floor_pts)
-            short_dist = int(round(short_dist / step) * step)
-        else:
-            short_dist = None
-
+        # ── v3.2: delta-primary strike selection ──────────────────────
+        # v3.1 placed the shorts at 1.3 * sqrt(time-left) * the OPENING
+        # straddle and only used delta if that failed. At 10:30 that is
+        # ~1.16x the straddle, roughly 1.4 sigma, delta ~0.08. The credit
+        # available there cannot clear the engine's own credit/wing gate,
+        # so 0DTE structurally self-rejected all day with
+        # "credit_ratio_below_min" - a silent, total loss of opportunity.
+        #
+        # Professionals place short premium by DELTA, because delta is
+        # the probability-of-touch proxy the market itself is quoting,
+        # and because equal DISTANCE on a skewed chain means unequal
+        # RISK: the NIFTY put side is always richer, so a distance-
+        # symmetric condor is structurally short delta. Each side is now
+        # chosen by delta independently, then clamped into a sanity band
+        # around the expected REMAINING move so a mis-quoted greek can
+        # never put a strike somewhere absurd.
         if adx_15 >= self.config.adx_strong_threshold:
-            delta_target = 0.17
+            delta_target = float(getattr(self.config, "short_delta_strong", 0.15))
         elif adx_15 >= self.config.adx_trend_threshold:
-            delta_target = 0.20
+            delta_target = float(getattr(self.config, "short_delta_trend", 0.18))
         else:
-            delta_target = 0.22
+            delta_target = float(getattr(self.config, "short_delta_flat", 0.22))
 
         if vix < 12.0:
-            delta_target = max(delta_target - 0.02, 0.15)
+            delta_target = max(delta_target - 0.02, 0.10)
         elif vix < 14.0:
-            delta_target = max(delta_target - 0.01, 0.16)
+            delta_target = max(delta_target - 0.01, 0.11)
+
+        # Expected remaining move: the market's own priced expectation for
+        # what is left of the session (published by data_engine).
+        _em = float(signals.get("expected_move_remaining_pts") or 0.0)
+        if _em <= 10 and opening_straddle > 20:
+            _now_em = _test_time if _test_time is not None else now_ist().time()
+            _elapsed_em = max(0.0, (
+                datetime.combine(today_ist(), _now_em) -
+                datetime.combine(today_ist(), dtime(9, 15))
+            ).total_seconds() / 60.0)
+            _rem_em = min(max((375.0 - _elapsed_em) / 375.0, 0.04), 1.0)
+            _scale_em = (
+                math.sqrt(1.0 / (float(dte) + 1.0)) if (dte and dte > 0) else 1.0
+            )
+            _em = opening_straddle * _scale_em * math.sqrt(_rem_em)
+        if _em <= 10 and spot > 0:
+            _em = spot * 0.004
+
+        _band_lo = float(getattr(self.config, "em_band_lo", 0.80)) * _em
+        _band_hi = float(getattr(self.config, "em_band_hi", 1.35)) * _em
+        _band_lo = max(_band_lo, float(max(2 * step, floor_pts // 2)))
+        _band_hi = max(_band_hi, _band_lo + step)
+
+        def _dist_from_delta(_opt_type: str) -> Optional[float]:
+            _k = self._find_strike_by_delta(
+                chain, _opt_type, delta_target, tolerance=0.12
+            )
+            if _k is None:
+                return None
+            _d = abs(float(_k) - float(_center_ref))
+            return _d if _d > 0 else None
+
+        def _clamp_band(_d: Optional[float]) -> Optional[float]:
+            if _d is None:
+                return None
+            _d = min(max(_d, _band_lo), _band_hi)
+            _d = round(_d / step) * step
+            _d = min(max(_d, math.floor(_band_lo / step) * step),
+                     math.ceil(_band_hi / step) * step)
+            return max(_d, float(step))
+
+        _straddle_dist = None
+        if opening_straddle > 20:
+            _straddle_dist = max(
+                float(opening_straddle) * dist_mult, float(floor_pts)
+            )
+
+        _dist_call = _clamp_band(_dist_from_delta("call"))
+        _dist_put  = _clamp_band(_dist_from_delta("put"))
+        _fallback  = _clamp_band(_straddle_dist) if _straddle_dist else None
+        if _fallback is None:
+            _fallback = _clamp_band(_em)
+        if _dist_call is None:
+            _dist_call = _fallback
+        if _dist_put is None:
+            _dist_put = _fallback
+
+        if _dist_call is None or _dist_put is None:
+            short_dist = None
+        else:
+            short_dist = (int(_dist_call), int(_dist_put))
 
         # ── Protective wing (v3.1) ────────────────────────────────────────
         # The wing determines BOTH the maximum loss and how much of the short
@@ -522,9 +593,15 @@ class StrategyEngine:
         # straddle-based hint from data_engine as a fallback, then clamped by
         # DTE so 0DTE max loss stays small where credits are small.
         _wing_hint = int(signals.get("wing_width") or 150)
-        if short_dist is not None and short_dist > 0:
+        if isinstance(short_dist, (tuple, list)):
+            _short_dist_ref = min(float(short_dist[0]), float(short_dist[1]))
+        else:
+            _short_dist_ref = float(short_dist) if short_dist else 0.0
+        if _short_dist_ref > 0:
             _wing_factor = 0.50 if dte == 0 else (0.60 if dte == 1 else 0.75)
-            _wing_raw = max(short_dist * _wing_factor, float(_wing_hint) * 0.60)
+            _wing_raw = max(
+                _short_dist_ref * _wing_factor, float(_wing_hint) * 0.60
+            )
         else:
             _wing_raw = float(_wing_hint)
         _wing_min = max(2 * step, 100)
@@ -583,8 +660,15 @@ class StrategyEngine:
     ) -> Tuple[Optional[List[dict]], Optional[str]]:
         _cr = center_ref if center_ref is not None else spot
         if short_dist is not None:
-            sc = int(round((_cr + short_dist) / step) * step)
-            sp = int(round((_cr - short_dist) / step) * step)
+            # v3.2: short_dist may be a (call_distance, put_distance)
+            # pair so the two sides can sit at equal DELTA rather than
+            # equal distance, which is what NIFTY skew requires.
+            if isinstance(short_dist, (tuple, list)):
+                _sd_c, _sd_p = float(short_dist[0]), float(short_dist[1])
+            else:
+                _sd_c = _sd_p = float(short_dist)
+            sc = int(round((_cr + _sd_c) / step) * step)
+            sp = int(round((_cr - _sd_p) / step) * step)
         else:
             sc = self._find_strike_by_delta(chain, "call", delta_target)
             sp = self._find_strike_by_delta(chain, "put",  delta_target)
@@ -627,7 +711,11 @@ class StrategyEngine:
     ) -> Tuple[Optional[List[dict]], Optional[str]]:
         _cr = center_ref if center_ref is not None else spot
         if short_dist is not None:
-            sp = int(round((_cr - short_dist) / step) * step)
+            _sd_p = float(
+                short_dist[1] if isinstance(short_dist, (tuple, list))
+                else short_dist
+            )
+            sp = int(round((_cr - _sd_p) / step) * step)
         else:
             sp_f = self._find_strike_by_delta(chain, "put", delta_target)
             if sp_f is None:
@@ -660,7 +748,11 @@ class StrategyEngine:
     ) -> Tuple[Optional[List[dict]], Optional[str]]:
         _cr = center_ref if center_ref is not None else spot
         if short_dist is not None:
-            sc = int(round((_cr + short_dist) / step) * step)
+            _sd_c = float(
+                short_dist[0] if isinstance(short_dist, (tuple, list))
+                else short_dist
+            )
+            sc = int(round((_cr + _sd_c) / step) * step)
         else:
             sc_f = self._find_strike_by_delta(chain, "call", delta_target)
             if sc_f is None:
@@ -800,6 +892,86 @@ class StrategyEngine:
             })
         return validated, None
 
+    def _structure_wing_pts(self, legs: List[dict]) -> Optional[float]:
+        """
+        v3.2: the narrowest short-to-long distance in the structure, in
+        points. This is the real maximum loss per unit and it is needed
+        BEFORE sizing, because the cost gates have to be priced at the
+        size the engine is actually going to trade (see _estimate_lots).
+        """
+        try:
+            shorts = [l for l in legs if l.get("action") == "SELL"]
+            longs  = [l for l in legs if l.get("action") == "BUY"]
+            if not shorts or not longs:
+                return None
+            widths = []
+            for side in ("call", "put"):
+                s = [float(l["strike"]) for l in shorts
+                     if l.get("option_type") == side]
+                b = [float(l["strike"]) for l in longs
+                     if l.get("option_type") == side]
+                if s and b:
+                    if side == "call":
+                        widths.append(abs(max(b) - min(s)))
+                    else:
+                        widths.append(abs(min(s) - min(b)))
+            widths = [w for w in widths if w > 0]
+            return float(min(widths)) if widths else None
+        except Exception:
+            return None
+
+    def _risk_fraction_for_dte(self, dte: Optional[int]) -> float:
+        """Fraction of the configured per-trade risk budget, by DTE."""
+        table = {0: 1.00, 1: 0.80, 2: 0.65, 3: 0.50, 4: 0.40,
+                 5: 0.32, 6: 0.25}
+        return table.get(min(dte if dte is not None else 1, 6), 0.25)
+
+    def _estimate_lots(
+        self,
+        wing_pts:   float,
+        credit_pts: float,
+        dte:        Optional[int],
+        size_mult:  float,
+        state:      dict,
+    ) -> int:
+        """
+        v3.2: a provisional lot count, used ONLY to price the cost gates.
+
+        Brokerage is charged PER ORDER, not per lot: a four-leg condor is
+        eight orders round trip, about Rs 189 with GST. At one lot that
+        is 2.9 premium points and can be 15% of the whole credit; at four
+        lots it is 0.7 points. v3.1 priced every gate at lots = 1 and
+        sized afterwards, so the friction the gates saw bore no relation
+        to the friction the trade would actually pay.
+        """
+        try:
+            C02 = float(self.config.lot_size or 1)
+            cap = float(
+                state.get("current_capital", self.config.starting_capital)
+                or self.config.starting_capital
+            )
+            budget = float(self.config.max_risk_per_trade_pct or 0.006)
+            max_risk = cap * budget * self._risk_fraction_for_dte(dte)
+            # Mirror the engine's own efficacy-blended risk measure so the
+            # provisional size matches the size that will really be used.
+            eff = float(getattr(self.config, "stop_efficacy", 0.55))
+            if dte == 0:
+                sm = float(getattr(self.config, "stop_mult_dte0", 1.40))
+            elif dte == 1:
+                sm = float(getattr(self.config, "stop_mult_dte1", 1.55))
+            else:
+                sm = float(getattr(self.config, "stop_mult_dte2p", 1.70))
+            stop_lot = max((sm - 1.0) * float(credit_pts) * C02, 1.0)
+            struct_lot = max((float(wing_pts) - float(credit_pts)) * C02, 1.0)
+            per_lot = min(
+                max(eff * stop_lot + (1.0 - eff) * struct_lot, stop_lot, 1.0),
+                struct_lot,
+            )
+            lots = (max_risk / per_lot) * max(float(size_mult), 0.10)
+            return int(max(1, min(round(lots), 50)))
+        except Exception:
+            return 1
+
     def _compute_costs(
         self,
         legs:   List[dict],
@@ -924,20 +1096,36 @@ class StrategyEngine:
         percentage of it is reachable, it means the move that threatens it is
         bigger too.
         """
+        # ── v3.2: the target and the stop are ONE decision ────────────
+        # What matters is not either number alone but the reward/risk
+        # they imply and therefore the win rate the system must beat.
+        # v3.1 took 35% of the credit while risking 150% of it, so the
+        # trade had to win 81% of the time before friction - a bar no
+        # 0.15-0.22 delta NIFTY structure clears, and the engine's own
+        # p_win table peaks at 0.72. v3.2 pairs a larger target with a
+        # much tighter stop (see the stop multiples in core.Config):
+        # 50% of the credit against a risk of 40%, i.e. reward/risk of
+        # 1.25 and a break-even win rate near 55% before friction. That
+        # is also how a NIFTY premium seller actually behaves - hold
+        # through most of the decay, and cut the moment the structure
+        # is genuinely wrong, rather than scalping a third of the
+        # credit while leaving a catastrophic tail open.
         vix = float(signals.get("vix") or 11.0)
         if dte == 0:
-            return 0.35 if vix < 12.0 else (0.32 if vix < 14.0 else 0.28)
-        if dte == 1:
-            return 0.32 if vix < 12.0 else (0.29 if vix < 14.0 else 0.26)
-        if dte == 2:
-            return 0.28 if vix < 12.0 else (0.25 if vix < 14.0 else 0.22)
-        if dte == 3:
-            return 0.25 if vix < 12.0 else 0.22
-        if dte == 4:
-            return 0.22 if vix < 12.0 else 0.19
-        if dte == 5:
-            return 0.20 if vix < 12.0 else 0.17
-        return 0.18
+            base_t = float(getattr(self.config, "target_pct_dte0", 0.50))
+        elif dte == 1:
+            base_t = float(getattr(self.config, "target_pct_dte1", 0.45))
+        elif dte == 2:
+            base_t = float(getattr(self.config, "target_pct_dte2p", 0.40))
+        else:
+            base_t = float(getattr(self.config, "target_pct_dte2p", 0.40)) - 0.03
+        # Richer implied vol means a wider distribution, so take the
+        # money a little sooner.
+        if vix >= 14.0:
+            base_t -= 0.07
+        elif vix >= 12.0:
+            base_t -= 0.035
+        return round(min(max(base_t, 0.18), 0.70), 4)
 
     def _proximity_buffer_pts(self, spot: float) -> float:
         """
@@ -954,6 +1142,45 @@ class StrategyEngine:
             return max(base, spot * pct)
         return base
 
+    def _price_stop_pts(
+        self,
+        wing_pts:       float,
+        short_dist_pts: float,
+        spot:           float,
+    ) -> float:
+        """
+        v3.2: how far INSIDE the short strike the spot backstop sits.
+
+        v3.1 used 0.42 x the OPENING STRADDLE. With a 175-point straddle
+        that put the stop 73 points inside the short strike, so a
+        structure sold 200 points away was flattened after roughly 130
+        points of movement - about half a sigma, an ordinary hour on
+        NIFTY. The engine was therefore designed to take frequent small
+        losses while its own p_win model assumed the far-away strike was
+        the barrier. That single mismatch is enough to turn a positive
+        edge into a negative one.
+
+        The spot stop is now a BACKSTOP tied to the STRUCTURE - a
+        fraction of the wing, floored in points and capped as a fraction
+        of the short-strike distance - and the premium stop is the
+        primary risk control, which is how a professional book is run.
+        """
+        frac = float(getattr(self.config, "price_stop_wing_frac", 0.30))
+        floor_pts = float(getattr(self.config, "price_stop_min_pts", 25.0))
+        cap_frac = float(getattr(self.config, "price_stop_max_frac_of_dist", 0.40))
+        prox = self._proximity_buffer_pts(spot)
+        val = max(float(wing_pts) * frac, floor_pts, prox)
+        # An at-the-money structure (the iron butterfly) has no room
+        # INSIDE its short strike - spot is already there. Capping the
+        # backstop at a fraction of a zero distance produced a stop
+        # level on the wrong side of the strike, which fired on the very
+        # first monitoring cycle: the butterfly could never be held.
+        if short_dist_pts and short_dist_pts > prox:
+            val = min(val, float(short_dist_pts) * cap_frac)
+        else:
+            val = max(float(wing_pts) * 0.55, prox)
+        return round(max(val, 10.0), 1)
+
     def _compute_ev_gate(
         self,
         net_credit:      float,
@@ -963,6 +1190,7 @@ class StrategyEngine:
         signals:         dict,
         legs:            Optional[List[dict]] = None,
         stop_premium:    Optional[float] = None,
+        barrier_pull_pts: float = 0.0,
     ) -> Tuple[bool, str]:
         """
         Expected value of the structure, in premium points, over the intended
@@ -988,7 +1216,21 @@ class StrategyEngine:
         # does not die at the stop; it dies here, and this outcome was simply
         # absent from the old two-outcome expectancy.
         wing_loss_pts = max(float(wing) - net_credit, stop_loss_pts)
-        tail_loss_pts = max(stop_loss_pts, 0.80 * wing_loss_pts)
+        # v3.2: the tail was priced at 80% of the FULL structural loss,
+        # which is an overnight-gap assumption. NIFTY does not gap
+        # intraday: it is cash settled, continuously quoted, and this
+        # engine is flat by 15:00 with three independent exits (premium
+        # stop, spot backstop, delta) checked every cycle. The realistic
+        # failure is a fast trend that fills the stop late, not a jump to
+        # max loss - so the tail is the stop plus part of the distance
+        # from there to the wing. At 0.055 x 0.80 x wing the old term
+        # alone cost 4.4% of the wing, more than the entire profit target
+        # of a typical 0DTE condor, so no wide-wing structure could ever
+        # show positive EV however good the setup was.
+        tail_loss_pts = max(
+            stop_loss_pts,
+            stop_loss_pts + 0.30 * max(wing_loss_pts - stop_loss_pts, 0.0),
+        )
 
         # True round-trip friction rather than entry x 1.5.
         friction = (
@@ -1037,43 +1279,163 @@ class StrategyEngine:
             _atm_iv = _atm_iv / 100.0
         _spot_ev = float(signals.get("spot") or 0.0)
         _now_ev = now_ist().time()
+        # v3.2: the hard exit was hardcoded to 15:00 while the engine
+        # reads it from state/config everywhere else, so on a shortened
+        # or reconfigured session the EV gate priced the wrong horizon.
+        try:
+            _he_str = self.market_engine.state.get("hard_exit_time")
+            _he_ev = (
+                datetime.strptime(_he_str, "%H:%M").time() if _he_str
+                else self.config.hard_exit_time
+            )
+        except Exception:
+            _he_ev = self.config.hard_exit_time
         _mins_to_exit = max(
-            (datetime.combine(today_ist(), dtime(15, 0)) -
+            (datetime.combine(today_ist(), _he_ev) -
              datetime.combine(today_ist(), _now_ev)).total_seconds() / 60.0,
             5.0
         )
+        # ── v3.2 [E7] the horizon is time-to-TARGET, not time-to-close ─
+        # The reward leg is a partial close at ~35-40% of the credit,
+        # which on a quiet tape arrives well before the hard exit. v3.1
+        # priced the reward over that short horizon but the risk over the
+        # whole remaining session - a mismatch that inflates the touch
+        # probability against a profit that has usually already been
+        # taken. Theta on a short structure runs roughly with sqrt(time),
+        # so capturing ~38% of the premium consumes about 60% of the
+        # remaining clock, and that is the window the barrier must hold.
+        _horizon_frac = min(max(1.0 - (1.0 - target_pct) ** 2, 0.35), 0.95)
+        _mins_horizon = max(_mins_to_exit * _horizon_frac, 20.0)
+        # ── v3.2 [E8] price the barrier under FORECAST vol, not implied ─
+        # Selling premium is a bet that realised volatility comes in below
+        # implied - that is the entire edge, and the engine gates on
+        # exactly that (VRP). Measuring your own risk at full implied vol
+        # therefore assumes your edge does not exist, and the gate
+        # rejects every trade the strategy was built to take. A variance
+        # blend of implied and the Parkinson realised estimate is the
+        # standard compromise: it keeps most of implied's caution while
+        # acknowledging the spread the position is being paid for.
+        _rv_ev = float(signals.get("parkinson_rv") or 0.0)
+        if _rv_ev >= 2.0:
+            _rv_ev = _rv_ev / 100.0
+        if _atm_iv > 0 and _rv_ev > 0:
+            _sigma_ann = _math_ev.sqrt(
+                0.55 * _atm_iv ** 2 + 0.45 * max(_rv_ev, _atm_iv * 0.55) ** 2
+            )
+        else:
+            _sigma_ann = _atm_iv
         _sigma_t = (
-            _atm_iv * (_mins_to_exit / (375.0 * 252.0)) ** 0.5
-            if _atm_iv > 0 else 0.0
+            _sigma_ann * (_mins_horizon / (375.0 * 252.0)) ** 0.5
+            if _sigma_ann > 0 else 0.0
         )
+        _horizon_scale = (_mins_horizon / _mins_to_exit) ** 0.5
 
-        _barrier = 0.0
+        # ── v3.2 [E4] sigma from the market, not from the broker ──────
+        # The ATM IV printed on a 0DTE chain is the noisiest number the
+        # broker publishes: the sqrt(T) in the denominator is collapsing
+        # all afternoon and different venues stamp it differently. The
+        # ATM straddle is a PRICE, cannot be mis-scaled, and is the
+        # market's own statement of the expected move. Both estimates are
+        # computed and the LARGER (more conservative, lower p_win) wins.
+        _sigma_pts_iv = _spot_ev * _sigma_t if _sigma_t > 0 else 0.0
+        _sigma_pts_straddle = 0.0
+        _em_ev = float(signals.get("expected_move_remaining_pts") or 0.0)
+        if _em_ev > 0:
+            # A straddle is worth 0.7979 sigma for a driftless lognormal,
+            # so sigma follows from dividing by that. It is then put on
+            # the same forecast-vol and same horizon footing as the
+            # IV-derived estimate above.
+            _vol_ratio_ev = (
+                (_sigma_ann / _atm_iv) if (_atm_iv > 0 and _sigma_ann > 0)
+                else 1.0
+            )
+            _sigma_pts_straddle = (
+                (_em_ev / 0.7979) * _vol_ratio_ev * _horizon_scale
+            )
+        _sigma_pts = max(_sigma_pts_iv, _sigma_pts_straddle)
+
+        # ── v3.2 [E5] the barrier the engine ACTUALLY defends ─────────
+        # p_win was modelled as the no-touch probability of the short
+        # strike less a 40-point proximity buffer. But the position is
+        # closed by whichever of these fires FIRST: the delta breach, the
+        # proximity exit, or the spot price-stop - and the price stop can
+        # sit a long way inside the strike. Modelling the far barrier
+        # inflates p_win, and every inflated p_win passes a trade whose
+        # real expectancy is negative. The barrier is now pulled in by
+        # the largest of the live triggers (barrier_pull_pts is supplied
+        # by compute_params, which knows the stop it is about to write).
+        _pull = max(
+            float(barrier_pull_pts or 0.0),
+            self._proximity_buffer_pts(_spot_ev),
+        )
+        _barriers: List[float] = []
         if legs and _spot_ev > 0:
             _dists = [
                 abs(float(l["strike"]) - _spot_ev)
                 for l in legs if str(l.get("action")) == "SELL"
             ]
-            if _dists:
-                # The engine exits on proximity, so the effective barrier is
-                # slightly nearer than the strike itself.
-                _barrier = max(min(_dists) - self._proximity_buffer_pts(_spot_ev), 15.0)
+            # An iron butterfly sells AT the money, so its distance to
+            # the short strike is zero and the strike is simply not the
+            # barrier: what defines the fly is how far spot can travel
+            # before the structure reaches its stop, which is a
+            # function of the wing and the credit taken in. Without
+            # this the model pinned every butterfly to its p_win floor
+            # and the EV gate refused the strategy outright.
+            _atm_floor = max(0.55 * float(wing), 0.70 * net_credit, 25.0)
+            _barriers = [
+                (max(d - _pull, 12.0) if d > _pull else _atm_floor)
+                for d in _dists
+            ]
+        _barrier = min(_barriers) if _barriers else 0.0
 
         p_win_model = None
-        if _sigma_t > 0 and _barrier > 0 and _spot_ev > 0:
-            _z = _barrier / (_spot_ev * _sigma_t)
+        if _sigma_pts > 0 and _barriers and _spot_ev > 0:
 
             def _ncdf(x: float) -> float:
                 return 0.5 * (1.0 + _math_ev.erf(x / _math_ev.sqrt(2.0)))
 
-            # Reflection-principle no-touch probability for a driftless walk.
-            p_win_model = max(0.25, min(0.93, 1.0 - 2.0 * _ncdf(-_z)))
+            # ── v3.2 [E6] two-sided no-touch ──────────────────────────
+            # An iron condor has TWO barriers. v3.1 priced only the
+            # nearer one, which understates the touch probability by the
+            # whole of the far side - material whenever the structure is
+            # anywhere near symmetric, which by construction it is.
+            _p_touch = 0.0
+            for _b in _barriers:
+                _z = _b / _sigma_pts
+                _p_touch += 2.0 * _ncdf(-_z)
+
+            # ── v3.2 [E9] expiry pinning ──────────────────────────────
+            # A driftless random walk is the wrong path model for a
+            # NIFTY expiry session. Open interest concentrates at round
+            # strikes and the tape demonstrably gravitates toward max
+            # pain into the afternoon - which is a large part of why the
+            # straddle can be systematically overpriced in the first
+            # place. GBM therefore overstates first-touch on pinned days.
+            # The engine already computes max_pain on every single cycle
+            # and then used it for nothing at all; when spot is sitting
+            # inside half an expected move of it, the touch probability
+            # is haircut accordingly.
+            _mp = float(signals.get("max_pain") or 0.0)
+            if _mp > 0 and _spot_ev > 0 and dte == 0:
+                _pin_dist = abs(_mp - _spot_ev)
+                if _pin_dist < 0.5 * _sigma_pts:
+                    _p_touch *= 0.85
+                elif _pin_dist < 1.0 * _sigma_pts:
+                    _p_touch *= 0.93
+            p_win_model = max(0.20, min(0.93, 1.0 - _p_touch))
 
         if p_win_model is None:
             p_win = p_win_prior
         else:
-            # 60/40 model/prior: the model is sharper intraday, the prior
-            # covers the rest.
-            p_win = 0.60 * p_win_model + 0.40 * p_win_prior
+            # v3.2: 50/50. The 60/40 tilt gave a driftless lognormal the
+            # casting vote over the engine's own calibrated hit rate by
+            # opening range. The model cannot see pinning, the max-pain
+            # magnet, the intraday mean reversion that makes NIFTY paths
+            # less diffusive than their terminal volatility implies, or
+            # any of the positioning the prior is built from - and on a
+            # two-sided touch problem those effects are exactly what
+            # decides the outcome. Equal weight is the honest split.
+            p_win = 0.50 * p_win_model + 0.50 * p_win_prior
         p_win = max(0.28, min(0.92, p_win))
 
         # ── [E2] Three-outcome expectancy ─────────────────────────────────
@@ -1093,11 +1455,36 @@ class StrategyEngine:
         p_win_eff = max(p_win * (1.0 - p_tail), 0.05)
         p_stop    = max(1.0 - p_win_eff - p_tail, 0.0)
 
+        # ── v3.2 [E10] charge friction PER PATH, and only once ────────
+        # Two errors were compounded here. First, net_credit is already
+        # net of entry costs and entry slippage, and reward and stop are
+        # both expressed against it - yet v3.1 then subtracted the whole
+        # ROUND TRIP again, billing the entry half of the friction twice.
+        # Second, it charged the STRESSED exit (2.25x the half-spread,
+        # the modelled cost of bailing out of a 0DTE structure that has
+        # gone wrong) to the WINNING path as well. A win is a resting
+        # limit that buys back decayed options near mid; it does not pay
+        # panic prices. Pricing the good outcome at the bad outcome's
+        # exit cost is a systematic tax on exactly the trades the engine
+        # should be taking, and on a 20-point credit it is enough on its
+        # own to turn a positive expectancy negative.
+        _exit_costs_pts = entry_costs_pts * 0.95
+        _slip_exit_stressed = (
+            self._compute_slippage(legs, is_exit=True) if legs
+            else total_slippage * 2.0
+        )
+        _calm_mult = max(
+            float(getattr(self.config, "entry_slippage_mult", 0.35)) * 2.0,
+            0.50,
+        )
+        _exit_mult = max(float(getattr(self.config, "exit_slippage_mult", 2.25)), 0.01)
+        _slip_exit_calm = _slip_exit_stressed * min(_calm_mult / _exit_mult, 1.0)
+        _fric_win  = _exit_costs_pts + _slip_exit_calm
+        _fric_loss = _exit_costs_pts + _slip_exit_stressed
         ev = (
-            p_win_eff * reward_pts
-            - p_stop * stop_loss_pts
-            - p_tail * tail_loss_pts
-            - friction
+            p_win_eff * (reward_pts - _fric_win)
+            - p_stop * (stop_loss_pts + _fric_loss)
+            - p_tail * (tail_loss_pts + _fric_loss)
         )
 
         # Minimum acceptable edge. The old floor (2% of credit, or 15% of an
@@ -1177,9 +1564,28 @@ class StrategyEngine:
         if gross_credit <= 0:
             return {"valid": False, "reason": f"gross_credit_{gross_credit:.2f}_non_positive"}
 
+        # ── v3.2 [F1] price the cost gates at the size actually traded ─
+        # Brokerage is per ORDER. Charging a four-leg structure's eight
+        # round-trip orders against ONE lot (as v3.1 did) inflates the
+        # modelled friction by the eventual lot count - typically 2-4x -
+        # so every credit-versus-friction gate in the engine was
+        # comparing against a number the trade would never pay. A
+        # provisional size is derived from the risk budget first, the
+        # gates are priced at that size, and the FINAL size is
+        # re-validated against the same gate further down.
+        _wing_est = self._structure_wing_pts(validated_legs) or float(
+            signals.get("wing_width") or 150
+        )
+        _est_lots = self._estimate_lots(
+            _wing_est, gross_credit, actual_dte, size_mult, state
+        )
         total_slippage   = self._compute_slippage(validated_legs)
-        entry_costs_dict = self._compute_costs(validated_legs, 1, "ENTRY")
-        entry_costs_pts  = entry_costs_dict["total_rupees"] / C02 if C02 > 0 else 0
+        entry_costs_dict = self._compute_costs(validated_legs, _est_lots, "ENTRY")
+        _cost_divisor    = C02 * max(_est_lots, 1)
+        entry_costs_pts  = (
+            entry_costs_dict["total_rupees"] / _cost_divisor
+            if _cost_divisor > 0 else 0
+        )
         net_credit       = gross_credit - total_slippage - entry_costs_pts
 
         if net_credit <= 0:
@@ -1198,15 +1604,102 @@ class StrategyEngine:
         friction_pts        = self._round_trip_friction(
             validated_legs, entry_costs_pts
         )
-        min_credit_friction = friction_pts * 2.5
+        # v3.2: expressed as a fraction of the credit rather than as a
+        # bare multiple, and priced at the size the trade will really be
+        # done at. A structure whose round trip eats more than ~28% of
+        # the credit has no realistic path to a profit after a single
+        # adverse tick, however good the setup looks.
+        _fric_frac_cap = float(
+            getattr(self.config, "max_friction_frac_of_credit", 0.28)
+        )
+        min_credit_friction = friction_pts / max(_fric_frac_cap, 0.01)
         if net_credit < min_credit_friction:
             return {
                 "valid": False,
                 "reason": (
-                    f"net_credit_{net_credit:.2f}pts_below_2.5x_roundtrip_"
-                    f"friction_{min_credit_friction:.2f}pts"
+                    f"net_credit_{net_credit:.2f}pts_friction_"
+                    f"{friction_pts:.2f}pts_is_"
+                    f"{(friction_pts / max(net_credit, 0.01)) * 100:.0f}pct_"
+                    f"above_{_fric_frac_cap * 100:.0f}pct_cap"
                 ),
             }
+
+        # Fixed brokerage on its own must stay small relative to the
+        # credit: it is the one cost that does NOT scale with the size of
+        # the edge, and it is what makes tiny credit structures a
+        # guaranteed loss no matter how the market behaves.
+        _brk_pts = (
+            self.config.brokerage_per_order * len(validated_legs) * 2.0
+        ) / (C02 * max(_est_lots, 1)) if C02 > 0 else 0.0
+        _brk_cap = float(
+            getattr(self.config, "max_brokerage_frac_of_credit", 0.15)
+        )
+        if net_credit > 0 and _brk_pts > net_credit * _brk_cap:
+            return {
+                "valid": False,
+                "reason": (
+                    f"brokerage_{_brk_pts:.2f}pts_at_{_est_lots}lots_is_"
+                    f"{(_brk_pts / net_credit) * 100:.0f}pct_of_credit_"
+                    f"above_{_brk_cap * 100:.0f}pct"
+                ),
+            }
+
+        # ── v3.2 [F2] structure economics ─────────────────────────────
+        # A long wing that costs more than a third of the short it
+        # protects is not insurance, it is a second position working
+        # against the first: it caps the loss but hands back so much
+        # premium that the remaining edge cannot clear the round trip.
+        _wing_cost_cap = float(getattr(self.config, "wing_cost_frac_max", 0.50))
+        # An iron butterfly sells the at-the-money straddle, so its wings
+        # always cost a large share of the shorts - that is the structure,
+        # not a defect in it. The fly is governed by its credit/wing ratio
+        # instead, which is already checked above.
+        for _side in (() if strategy_name == IRON_BUTTERFLY else ("call", "put")):
+            _s_prem = sum(
+                float(l.get("exec_price") or 0) for l in validated_legs
+                if l["action"] == "SELL" and l["option_type"] == _side
+            )
+            _b_prem = sum(
+                float(l.get("exec_price") or 0) for l in validated_legs
+                if l["action"] == "BUY" and l["option_type"] == _side
+            )
+            if _s_prem > 0 and _b_prem > _s_prem * _wing_cost_cap:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"{_side}_wing_costs_{(_b_prem / _s_prem) * 100:.0f}pct_"
+                        f"of_short_premium_above_{_wing_cost_cap * 100:.0f}pct"
+                    ),
+                }
+
+        # A four-legged condor whose weaker side contributes almost
+        # nothing is paying two extra legs of brokerage and two extra
+        # spreads to collect a rounding error. The correct structure in
+        # that situation is the single-sided vertical, which the regime
+        # engine will select on its own once price confirms a direction.
+        if strategy_name == IRON_CONDOR:
+            _side_credit = {}
+            for _side in ("call", "put"):
+                _side_credit[_side] = sum(
+                    (float(l.get("exec_price") or 0)
+                     if l["action"] == "SELL"
+                     else -float(l.get("exec_price") or 0))
+                    for l in validated_legs if l["option_type"] == _side
+                )
+            _tot_side = sum(max(v, 0.0) for v in _side_credit.values())
+            _weak = min(_side_credit.values()) if _side_credit else 0.0
+            _weak_min = float(
+                getattr(self.config, "condor_weak_side_min_frac", 0.30)
+            )
+            if _tot_side > 0 and _weak < _tot_side * _weak_min:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"condor_weak_side_only_"
+                        f"{(_weak / _tot_side) * 100:.0f}pct_of_credit_"
+                        f"two_extra_legs_not_paid_for"
+                    ),
+                }
 
         actual_wing_pts = None
         if strategy_name in (IRON_CONDOR, IRON_BUTTERFLY):
@@ -1265,46 +1758,84 @@ class StrategyEngine:
                 }
 
         target_pct    = self._get_target_pct(actual_dte, signals)
-        # v3.1: what the target has to clear is the cost of getting OUT, and
-        # exit slippage on a stressed OTM 0DTE market is a multiple of entry
-        # slippage. Using entry costs as the proxy flattered every structure.
+        # v3.2: the profit target has to clear the WHOLE round trip, not
+        # just the exit. v3.1 compared the target against exit costs only,
+        # so the entry brokerage, entry STT and entry spread were counted
+        # nowhere in this gate - the one gate whose entire job is to ask
+        # "is the money we are trying to make bigger than the money it
+        # costs to try". Its own reported margin was therefore roughly
+        # double the truth.
         exit_costs    = entry_costs_pts * 0.95 + self._compute_slippage(
             validated_legs, is_exit=True
         )
-        expected_edge = net_credit * target_pct - exit_costs
+        expected_edge = net_credit * target_pct - friction_pts
         vix           = float(signals.get("vix") or 11.0)
 
-        if vix < 11.5:
-            min_edge_mult = 0.60
-        elif vix < 13.0:
-            min_edge_mult = 0.70
-        elif vix < 15.0:
-            min_edge_mult = 0.85
-        else:
-            min_edge_mult = 1.00
+        _tgt_over_fric = float(
+            getattr(self.config, "min_target_over_friction", 1.25)
+        )
+        if vix >= 15.0:
+            _tgt_over_fric *= 1.15
+        _min_gross_target = friction_pts * _tgt_over_fric
 
-        if expected_edge < exit_costs * min_edge_mult:
+        if net_credit * target_pct < _min_gross_target:
             return {
                 "valid": False,
                 "reason": (
-                    f"expected_edge_{expected_edge:.2f}pts_below_min_"
-                    f"{exit_costs * min_edge_mult:.2f}pts"
+                    f"target_{net_credit * target_pct:.2f}pts_below_"
+                    f"{_tgt_over_fric:.2f}x_roundtrip_friction_"
+                    f"{friction_pts:.2f}pts(edge={expected_edge:.2f})"
                 ),
             }
 
         # v3.1: the stop level is now computed BEFORE the EV gate so the gate
         # prices the loss leg the engine will actually take, instead of a
         # hardcoded 1.5 x credit that bore no relationship to stop_premium.
-        _stop_mult_pre = min(float(state.get("stop_multiplier", 2.5) or 2.5), 2.5)
-        if strategy_name in (BULL_PUT_SPREAD, BEAR_CALL_SPREAD):
-            _stop_premium_pre = gross_credit * 2.5
+        # ── v3.2 [G0] the stop that decides whether this can be a ─────
+        # profitable system at all.
+        #
+        # v3.1 stopped at 2.5x the credit and targeted 35% of it:
+        #     loss on stop = 1.5C, gain on win = 0.35C
+        #     break-even win rate = 1.5 / 1.85 = 81%, before friction.
+        # No 0.15-0.22 delta NIFTY structure survives an 81% bar - the
+        # engine's own p_win table peaks at 0.72. The geometry was
+        # negative-expectancy by construction, and the verticals were
+        # worse still: a hardcoded 2.5 on the GROSS credit, so the stop
+        # ignored the costs already paid to get in.
+        #
+        # Stops are now DTE-aware multiples of the NET credit, identical
+        # for every structure, and capped at the structural loss - you
+        # cannot lose more than the wing, so a stop above it is fiction
+        # that only serves to oversize the position.
+        if actual_dte == 0:
+            _stop_mult_pre = float(getattr(self.config, "stop_mult_dte0", 1.40))
+        elif actual_dte == 1:
+            _stop_mult_pre = float(getattr(self.config, "stop_mult_dte1", 1.55))
         else:
-            _stop_premium_pre = net_credit * _stop_mult_pre
+            _stop_mult_pre = float(getattr(self.config, "stop_mult_dte2p", 1.70))
+        _stop_mult_pre = min(max(_stop_mult_pre, 1.15), 3.00)
+        _stop_premium_pre = net_credit * _stop_mult_pre
+        _wing_cap_pre = float(actual_wing_pts or 150)
+        if _wing_cap_pre > 0:
+            _stop_premium_pre = min(_stop_premium_pre, _wing_cap_pre)
+        _stop_premium_pre = max(_stop_premium_pre, net_credit * 1.10)
 
+        # v3.2: the spot backstop is computed BEFORE the EV gate so the
+        # gate can price the barrier the engine will genuinely defend
+        # rather than the short strike it will never let price reach.
+        _short_dists_cp = [
+            abs(float(l["strike"]) - spot)
+            for l in validated_legs if l["action"] == "SELL"
+        ]
+        _min_short_dist_cp = min(_short_dists_cp) if _short_dists_cp else 0.0
+        price_stop_pts = self._price_stop_pts(
+            actual_wing_pts or 150, _min_short_dist_cp, spot
+        )
         ev_ok, ev_reason = self._compute_ev_gate(
             net_credit, actual_wing_pts or 150,
             entry_costs_pts, total_slippage, signals,
             legs=validated_legs, stop_premium=_stop_premium_pre,
+            barrier_pull_pts=price_stop_pts,
         )
         if not ev_ok:
             return {"valid": False, "reason": f"ev_gate:{ev_reason}"}
@@ -1358,7 +1889,25 @@ class StrategyEngine:
         )
         max_risk  = current_capital * risk_pct
         raw_lots  = max_risk / structural_loss_per_lot
-        final_lots = max(1, int(raw_lots * size_mult))
+        # ── v3.2 [G5] minimum economic size ───────────────────────────
+        # max(1, int(...)) forced a one-lot trade whenever the risk
+        # budget said less than one lot - routinely 2-3x the intended
+        # risk, and always on the trades the engine was least confident
+        # about (size_mult is small exactly when confidence is low). It
+        # also truncated 1.9 lots to 1. Below a configurable fraction of
+        # a lot the correct professional action is not to trade.
+        _sized = raw_lots * max(float(size_mult), 0.0)
+        _min_frac = float(getattr(self.config, "min_lots_fraction", 0.60))
+        if _sized < _min_frac:
+            return {
+                "valid": False,
+                "reason": (
+                    f"risk_budget_allows_only_{_sized:.2f}_lots_below_"
+                    f"min_{_min_frac:.2f}_forcing_1_lot_would_be_"
+                    f"{(1.0 / max(_sized, 0.01)):.1f}x_intended_risk"
+                ),
+            }
+        final_lots = max(1, int(round(_sized)))
 
         # ── [G2] Day cap ──────────────────────────────────────────────────
         # int(capital / starting_capital) is a step function: the cap doubles
@@ -1376,13 +1925,67 @@ class StrategyEngine:
         if structural_loss_per_lot * final_lots > max_risk * 1.5:
             final_lots = max(1, int(max_risk / structural_loss_per_lot))
 
-        if strategy_name in (IRON_CONDOR, IRON_BUTTERFLY) and final_lots < 1:
-            final_lots = 1
+        # v3.2: the old unconditional "condors always get at least one
+        # lot" override is gone - the minimum-economic-size gate above
+        # already decided whether this trade is worth doing at all.
+        final_lots = max(1, int(final_lots))
+
+        # ── v3.2 [F3] re-validate the economics at the FINAL size ─────
+        # The gates above were priced at the provisional lot count. If
+        # the daily-loss projection, the margin cap or the day cap has
+        # cut the size since then, the per-lot fixed costs have risen and
+        # the trade may no longer be worth doing. This is the check that
+        # stops the engine from trading a structure whose edge evaporated
+        # the moment it was made smaller.
+        _final_costs = self._compute_costs(validated_legs, final_lots, "ENTRY")
+        _final_div   = C02 * max(final_lots, 1)
+        _final_costs_pts = (
+            _final_costs["total_rupees"] / _final_div if _final_div > 0 else 0.0
+        )
+        _final_net_credit = gross_credit - total_slippage - _final_costs_pts
+        _final_friction = self._round_trip_friction(
+            validated_legs, _final_costs_pts
+        )
+        if _final_net_credit <= 0:
+            return {
+                "valid": False,
+                "reason": (
+                    f"net_credit_{_final_net_credit:.2f}_non_positive_at_"
+                    f"final_size_{final_lots}_lots"
+                ),
+            }
+        if _final_friction > _final_net_credit * max(_fric_frac_cap, 0.01):
+            return {
+                "valid": False,
+                "reason": (
+                    f"friction_{_final_friction:.2f}pts_is_"
+                    f"{(_final_friction / _final_net_credit) * 100:.0f}pct_"
+                    f"of_credit_at_final_size_{final_lots}_lots"
+                ),
+            }
+        entry_costs_pts = _final_costs_pts
+        entry_costs_dict = _final_costs
+        net_credit = _final_net_credit
+        friction_pts = _final_friction
+        target_premium = net_credit * (1.0 - target_pct)
+        _stop_premium_pre = min(
+            max(net_credit * _stop_mult_pre, net_credit * 1.10),
+            float(actual_wing_pts or 150),
+        )
 
         stop_mult    = _stop_mult_pre
         stop_premium = _stop_premium_pre
 
         max_loss_per_lot = structural_loss_per_lot
+        # v3.2: `structural_loss_per_lot` is the stop-efficacy BLEND used
+        # for sizing - it deliberately assumes the stop usually works.
+        # That is the right number for deciding how big to go and the
+        # wrong one for asking "if this trade goes to max loss, do we
+        # breach the daily cap", which is precisely what
+        # execution_engine does with it. The unblended structural loss is
+        # published alongside so the survival check can use the survival
+        # number.
+        _true_max_loss_per_lot = float(_structural_per_lot)
 
         # ── [G3] Margin ───────────────────────────────────────────────────
         # The old model added 2% x spot x lot x n_shorts of exposure margin on
@@ -1414,18 +2017,35 @@ class StrategyEngine:
 
         target_premium   = net_credit * (1.0 - target_pct)
         opening_straddle = float(signals.get("opening_straddle_pts") or 0)
-        price_stop_pts   = (
-            max(int(opening_straddle * self.config.price_stop_straddle_mult), 30)
-            if opening_straddle > 20 else 50
-        )
+        # price_stop_pts was computed above, coherently with the wing and
+        # the short-strike distance, and already used by the EV gate.
 
+        # ── v3.2: the spot backstop must sit on the side of the short ─
+        # strike that price has to travel TOWARD, and for an at-the-money
+        # structure that is the far side. v3.1 wrote
+        # `short_call_strike - price_stop_pts` unconditionally, so on an
+        # iron butterfly (short strike == spot) the call stop level came
+        # out BELOW the current spot and the put stop level ABOVE it:
+        # both were already breached the instant the position was opened,
+        # and priority 3 flattened the trade on its first monitoring
+        # cycle, every single time. The butterfly - the engine's chosen
+        # structure for its highest-conviction, very-narrow-range days -
+        # could not be held for one cycle.
+        _atm_stop_pts = max(float(actual_wing_pts or 150) * 0.55,
+                            price_stop_pts)
         price_stop_call = price_stop_put = None
         for leg in validated_legs:
             if leg["action"] == "SELL":
                 if leg["option_type"] == "call":
-                    price_stop_call = leg["strike"] - price_stop_pts
+                    _lvl = leg["strike"] - price_stop_pts
+                    if spot > 0 and _lvl <= spot + 5.0:
+                        _lvl = leg["strike"] + _atm_stop_pts
+                    price_stop_call = _lvl
                 elif leg["option_type"] == "put":
-                    price_stop_put  = leg["strike"] + price_stop_pts
+                    _lvl = leg["strike"] + price_stop_pts
+                    if spot > 0 and _lvl >= spot - 5.0:
+                        _lvl = leg["strike"] - _atm_stop_pts
+                    price_stop_put = _lvl
 
         hard_exit_str = state.get(
             "hard_exit_time", self.config.hard_exit_time.strftime("%H:%M")
@@ -1444,9 +2064,11 @@ class StrategyEngine:
             "entry_credit":           round(net_credit, 3),
             "total_slippage":         round(total_slippage, 3),
             "total_costs_pts":        round(entry_costs_pts, 4),
-            "total_costs_rupees_per_lot": round(entry_costs_dict["total_rupees"], 2),
+            "total_costs_rupees_per_lot": round(entry_costs_pts * C02, 2),
             "total_fixed_costs_rupees":   0.0,
-            "entry_costs_rupees":     round(entry_costs_dict["total_rupees"] * final_lots, 2),
+            "entry_costs_rupees":     round(entry_costs_dict["total_rupees"], 2),
+            "round_trip_friction_pts": round(friction_pts, 3),
+            "stop_multiple":          round(stop_mult, 3),
             "stop_premium":           round(stop_premium, 3),
             "target_premium":         round(target_premium, 3),
             "price_stop_pts":         price_stop_pts,
@@ -1457,6 +2079,8 @@ class StrategyEngine:
             "final_lots":             final_lots,
             "max_loss_per_lot":       round(max_loss_per_lot, 2),
             "total_max_risk":         round(max_loss_per_lot * final_lots, 2),
+            "structural_max_loss_per_lot": round(_true_max_loss_per_lot, 2),
+            "total_structural_risk":  round(_true_max_loss_per_lot * final_lots, 2),
             "estimated_margin":       round(total_margin, 2),
             "wing_width":             actual_wing_pts,
             "last_known_premium":     round(net_credit, 3),

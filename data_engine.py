@@ -1434,6 +1434,42 @@ class MarketDataEngine:
             )
         else:
             _straddle_ref = opening_straddle
+        # ── v3.2: normalise by ELAPSED TIME ───────────────────────────
+        # The realised range was compared against the straddle for the
+        # WHOLE day. That makes the ratio meaninglessly small at 10:00
+        # (nothing can have happened yet) and mechanically large at
+        # 14:00 (the day has, by definition, done most of its range) -
+        # so a flat 60% threshold blocked the afternoon on ordinary
+        # sessions and never triggered in the morning on violent ones.
+        # A range is only informative against the range the market
+        # PRICED for the time elapsed, which under a diffusion is the
+        # straddle scaled by sqrt(elapsed fraction). 100 now means "the
+        # day is running exactly as priced"; the gate blocks above 125.
+        import math as _math_dm
+        _elapsed_dm = max(0.0, (
+            datetime.combine(today_ist(), now_ist().time()) -
+            datetime.combine(today_ist(), dtime(9, 15))
+        ).total_seconds() / 60.0)
+        _frac_dm = min(max(_elapsed_dm / 375.0, 0.06), 1.0)
+        # ── v3.3: convert the priced DISPLACEMENT into a priced RANGE ──
+        # The numerator below is day_high - day_low, a range. A straddle
+        # prices E[|displacement|], not E[range]. For a driftless
+        # diffusion those differ by exactly 2.0 in continuous time, and
+        # by 1.933 when the path is observed at 1-minute bars as it is
+        # here. v3.2 omitted the conversion and asserted that 100 meant
+        # 'running exactly as priced'; the true figure was ~193, which
+        # sits above the 125 block threshold, so classify_volatility
+        # returned NEUTRAL on effectively every cycle of every session
+        # and no trade could ever be reached. Measured on a replayed
+        # session: the regime layer went from passing 109 of 787 cycles
+        # to passing 0 of 789.
+        _range_factor_dm = float(
+            getattr(self.config, 'day_move_range_factor', 1.93)
+        )
+        _straddle_ref = max(
+            _straddle_ref * _math_dm.sqrt(_frac_dm) * _range_factor_dm,
+            12.0,
+        )
         today_str = today_ist().isoformat()
         try:
             bars = self._load_candles_from_db(today_str)
@@ -2083,7 +2119,23 @@ class MarketDataEngine:
 
         try:
             expiry_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-            dte         = ExpiryCalendar.get_dte(today_ist())
+            # v3.2: the expiry is discovered from the broker's live
+            # contract list and then DTE was overwritten with a
+            # calendar-only recomputation, so the two could disagree
+            # (holiday-shifted expiries, an extra series listed). Every
+            # DTE-indexed table in the engine - stop multiple, target,
+            # risk fraction, p_win - keys off this number, so it must
+            # describe the contract that is actually going to be traded.
+            _today_exp = today_ist()
+            if expiry_date <= _today_exp:
+                dte = 0
+            else:
+                dte = 0
+                _d_walk = _today_exp + timedelta(days=1)
+                while _d_walk <= expiry_date:
+                    if not ExpiryCalendar.is_holiday(_d_walk):
+                        dte += 1
+                    _d_walk += timedelta(days=1)
             self.state["actual_dte"] = dte
             return expiry_date, dte
         except Exception:
@@ -2710,16 +2762,58 @@ class MarketDataEngine:
         # ── 20. Technical indicators ──────────────────────────────────────
         df15 = TechnicalEngine.resample_bars(bars, self.config.mtf_resample_15)
         df60 = TechnicalEngine.resample_bars(bars, self.config.mtf_resample_60)
+        # v3.2: the engine's whole trend filter ran on 15-minute bars.
+        # calculate_adx() needs 2*period+1 bars before it returns
+        # anything: with period 14 that is 29 fifteen-minute bars =
+        # 7h15m, and a NIFTY session is 25 bars long. adx_15 was
+        # therefore 0.0 for most of the day and adx_15_mature
+        # (len >= period*2 = 28 bars) was mathematically unreachable -
+        # always False. Every downstream consumer (the condor's strong-
+        # ADX block, the butterfly's flat-ADX requirement, the strike
+        # widening on trend, the EV gate's tail fattening and the whole
+        # ADX branch of classify_price) was reading a constant zero.
+        # A 5-minute series gives 75 bars per session, so a Wilder ADX
+        # can genuinely mature inside the trading day.
+        df5 = TechnicalEngine.resample_bars(
+            bars, getattr(self.config, "adx_fast_resample", "300s")
+        )
 
         _adx_min_15 = max(8, min(self.config.min_bars_for_adx, 10))
         _adx_min_60 = max(4, _adx_min_15 // 2)
 
-        adx_15        = 0.0
+        adx_15_raw    = 0.0
         adx_15_mature = False
         if not df15.empty and len(df15) >= _adx_min_15:
             _period_15    = min(self.config.adx_period, max(5, len(df15) - 2))
-            adx_15        = TechnicalEngine.calculate_adx(df15, _period_15)
-            adx_15_mature = len(df15) >= self.config.adx_period * 2
+            adx_15_raw    = TechnicalEngine.calculate_adx(df15, _period_15)
+            adx_15_mature = (
+                adx_15_raw > 0.0 and len(df15) >= 2 * _period_15 + 2
+            )
+
+        # Adaptive Wilder period on the fast series: always chosen so the
+        # 2*period+1 requirement is satisfied by the bars available.
+        adx_5        = 0.0
+        adx_5_mature = False
+        _period_5    = 0
+        if not df5.empty and len(df5) >= 11:
+            _period_5 = max(5, min(self.config.adx_period, (len(df5) - 1) // 2))
+            if len(df5) >= 2 * _period_5 + 1:
+                adx_5 = TechnicalEngine.calculate_adx(df5, _period_5)
+                adx_5_mature = (
+                    adx_5 > 0.0 and _period_5 >= 9 and len(df5) >= 2 * _period_5 + 2
+                )
+
+        # The effective reading every downstream gate consumes: the
+        # 15-minute value when it is genuinely mature, otherwise the
+        # fast-series value, which on NIFTY intraday is the number a
+        # discretionary trader would actually be looking at.
+        if adx_15_mature and adx_15_raw > 0.0:
+            adx_15 = adx_15_raw
+        elif adx_5 > 0.0:
+            adx_15 = adx_5
+        else:
+            adx_15 = adx_15_raw
+        adx_15_mature = bool(adx_15_mature or adx_5_mature)
 
         adx_60        = 0.0
         adx_60_mature = False
@@ -2728,7 +2822,21 @@ class MarketDataEngine:
             adx_60        = TechnicalEngine.calculate_adx(df60, _period_60)
             adx_60_mature = len(df60) >= self.config.adx_period * 2
 
+        # v3.2: classify_ema_structure needs ema_slow (21) bars. On the
+        # 15-minute series that is 5h15m, so ema_structure only leaves
+        # INSUFFICIENT_DATA at about 14:30 - and every price-regime
+        # branch that requires BULLISH/BEARISH/TRANSITIONAL was
+        # unreachable before then. A 9/21 EMA pair on 5-minute bars is
+        # the standard intraday structure read and is available from
+        # roughly 11:00.
         ema_structure = TechnicalEngine.classify_ema_structure(
+            df5, self.config.ema_fast, self.config.ema_slow
+        )
+        if ema_structure == "INSUFFICIENT_DATA":
+            ema_structure = TechnicalEngine.classify_ema_structure(
+                df15, self.config.ema_fast, self.config.ema_slow
+            )
+        ema_15_structure = TechnicalEngine.classify_ema_structure(
             df15, self.config.ema_fast, self.config.ema_slow
         )
         ema_60 = TechnicalEngine.classify_ema_structure(
@@ -2940,6 +3048,54 @@ class MarketDataEngine:
             _adaptive_wing_width = int(self.state.get("wing_width", 150) or 150)
         self.state["wing_width"] = _adaptive_wing_width
 
+        # ── 26c. Expected remaining move (v3.2) ───────────────────────
+        # The market's own priced expectation for what is LEFT of the
+        # session. This is the only honest yardstick for how far a short
+        # strike should be placed, and it is what the EV gate needs to
+        # size its barrier. It is deliberately taken from the straddle
+        # rather than from the broker's ATM IV, which on expiry day is
+        # the noisiest number on the chain.
+        try:
+            import math as _math_em
+            _em_now = now_ist().time()
+            _em_elapsed = max(0.0, (
+                datetime.combine(today_ist(), _em_now) -
+                datetime.combine(today_ist(), dtime(9, 15))
+            ).total_seconds() / 60.0)
+            _em_rem_frac = min(max((375.0 - _em_elapsed) / 375.0, 0.04), 1.0)
+            _em_base = float(
+                self.state.get("opening_straddle_pts")
+                or self.state.get("_last_atm_straddle")
+                or 0.0
+            )
+            if _em_base <= 20 and atm_straddle > 20:
+                _em_base = float(atm_straddle)
+            if _em_base <= 20:
+                _em_sp = float(spot or self.state.get("prev_spot") or 0.0)
+                _em_base = _em_sp * 0.009 if _em_sp > 0 else 0.0
+            if _em_base > 20:
+                _em_dte = actual_dte if actual_dte is not None else 1
+                if _em_dte and _em_dte > 0:
+                    # For a multi-day contract only the part of the
+                    # straddle attributable to today is at risk intraday.
+                    _em_scale = _math_em.sqrt(
+                        1.0 / max(float(_em_dte) + 1.0, 1.0)
+                    )
+                else:
+                    _em_scale = 1.0
+                _expected_move_remaining = round(
+                    _em_base * _em_scale * _math_em.sqrt(_em_rem_frac), 2
+                )
+                _expected_range_so_far = round(
+                    _em_base * _math_em.sqrt(max(1.0 - _em_rem_frac, 0.02)), 2
+                )
+            else:
+                _expected_move_remaining = 0.0
+                _expected_range_so_far = 0.0
+        except Exception:
+            _expected_move_remaining = 0.0
+            _expected_range_so_far = 0.0
+
         # ── 27. Build signals dict ────────────────────────────────────────
         signals: dict = {
             # Identity
@@ -2968,6 +3124,8 @@ class MarketDataEngine:
             # Day move
             "day_move_used_pct":        day_move_used_pct,
             "opening_straddle_pts":     self.state.get("opening_straddle_pts", 0.0),
+            "expected_move_remaining_pts": _expected_move_remaining,
+            "expected_range_so_far_pts":   _expected_range_so_far,
 
             # Opening range
             "or_condition":             self.state.get("or_condition"),
@@ -2985,6 +3143,11 @@ class MarketDataEngine:
 
             # Technical
             "adx_15":                   adx_15,
+            "adx_15_raw":               adx_15_raw,
+            "adx_5":                    adx_5,
+            "adx_5_mature":             adx_5_mature,
+            "adx_5_period":             _period_5,
+            "ema_15_structure":         ema_15_structure,
             "adx_60":                   adx_60,
             "adx_15_mature":            adx_15_mature,
             "adx_60_mature":            adx_60_mature,

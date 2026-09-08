@@ -38,6 +38,8 @@ except Exception:
 
 
 NIFTY_ENGINE_PROFIT_PATCH_V31 = "3.1"
+NIFTY_ENGINE_PROFIT_PATCH_V32 = "3.2"
+NIFTY_ENGINE_PROFIT_PATCH_V33 = "3.3"
 
 
 def now_ist() -> datetime:
@@ -143,8 +145,13 @@ NIFTY_LOT_SIZE=65
 NIFTY_STRIKE_STEP=50
 
 # ── Transaction Costs ─────────────────────────────────────────────────────────
-STT_OPTIONS_SELL=0.0015
-STT_OPTIONS_EXERCISE=0.0015
+# STT on the SALE of an option is 0.10% of the premium (statutory,
+# w.e.f. 01-Oct-2024). v3.1 carried 0.15%, overstating the single
+# largest variable cost of a premium-selling book by 50% and
+# rejecting structurally sound trades on cost grounds.
+STT_OPTIONS_SELL=0.001
+# STT on EXERCISE is 0.125% of intrinsic value, payable by the buyer.
+STT_OPTIONS_EXERCISE=0.00125
 BROKERAGE_PER_ORDER=20.0
 # NSE options: Rs 3,503 per crore of premium + Rs 50/cr IPFT = 0.03553%.
 EXCHANGE_TXN_RATE=0.0003553
@@ -228,7 +235,10 @@ VRP_SMOOTHING_CYCLES=5
 # ── Regime Settings ───────────────────────────────────────────────────────────
 REGIME_CALC_INTERVAL_SEC=15
 REGIME_PERSISTENCE_CYCLES=3
-DAY_MOVE_USED_BLOCK_PCT=60.0
+# v3.2: day_move_used_pct is now the realised range as a percentage of
+# the range the market PRICED for the elapsed part of the session
+# (opening straddle x sqrt(elapsed fraction)). 100 = exactly on plan.
+DAY_MOVE_USED_BLOCK_PCT=125.0
 
 # ── OI / Positioning Thresholds (overridden by calibration) ──────────────────
 OI_CHANGE_LOOKBACK_MIN=30
@@ -268,6 +278,56 @@ STRADDLE_ROC_ALERT_PCT=12.0
 
 # ── Phantom Trade Tracking ────────────────────────────────────────────────────
 PHANTOM_TRADE_TRACKING=true
+
+# ── v3.2 Profitability Calibration ────────────────────────────────────────────
+# Premium stop as a multiple of the NET credit received, by DTE. v3.1 used a
+# flat 2.5 (loss = 1.5x credit) against a 35% target, i.e. an 81% break-even
+# win rate. These values put break-even in the 57-65% band, which a 0.15-0.22
+# delta NIFTY short structure genuinely achieves.
+STOP_MULT_DTE0=1.40
+STOP_MULT_DTE1=1.55
+STOP_MULT_DTE2P=1.70
+# Profit target as a fraction of the net credit, by DTE. Read together with
+# the stop multiples above: 0.50 against 1.40 is reward/risk 1.25 and a
+# break-even win rate near 55%, versus 81% under v3.1.
+TARGET_PCT_DTE0=0.50
+TARGET_PCT_DTE1=0.45
+TARGET_PCT_DTE2P=0.40
+# Short-leg delta at which a leg is closed. v3.1 used one flat 0.28 for every
+# DTE, which is barely above the delta the engine sells at.
+DELTA_CLOSE_DTE0=0.35
+DELTA_CLOSE_DTE1P=0.30
+# Spot backstop: how far INSIDE the short strike the spot stop sits, as a
+# fraction of the wing, floored in points and capped as a fraction of the
+# short-strike distance. Replaces 0.42 x opening straddle.
+PRICE_STOP_WING_FRAC=0.30
+PRICE_STOP_MIN_PTS=25
+PRICE_STOP_MAX_FRAC_OF_DIST=0.40
+# Delta-primary strike selection. Target short delta by trend strength.
+SHORT_DELTA_FLAT=0.22
+SHORT_DELTA_TREND=0.18
+SHORT_DELTA_STRONG=0.15
+# Sanity band for the short strike, as a multiple of the expected REMAINING
+# move (opening straddle scaled by sqrt of the session fraction left).
+EM_BAND_LO=0.80
+EM_BAND_HI=1.35
+# Round-trip friction must not exceed this fraction of the net credit, and
+# brokerage alone must not exceed this fraction of it.
+MAX_FRICTION_FRAC_OF_CREDIT=0.28
+MAX_BROKERAGE_FRAC_OF_CREDIT=0.15
+# The profit target must clear the whole round trip by this factor.
+MIN_TARGET_OVER_FRICTION=1.25
+# Below this many lots the trade is skipped rather than rounded up to one lot.
+MIN_LOTS_FRACTION=0.60
+# A long wing costing more than this fraction of the short it protects hands
+# back too much of the premium to be worth buying at that strike.
+WING_COST_FRAC_MAX=0.50
+# An iron condor whose weaker side contributes less than this fraction of the
+# gross credit is paying two extra legs of friction for nothing.
+CONDOR_WEAK_SIDE_MIN_FRAC=0.30
+# Fast intraday trend timeframe. 15-minute ADX cannot mature inside a NIFTY
+# session (it needs 2*period+1 = 29 bars; the session has 25).
+ADX_FAST_RESAMPLE=300s
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 GIFT_NIFTY_INSTRUMENT_KEY=
@@ -640,6 +700,14 @@ class Config:
     regime_calc_interval_sec:  int
     regime_persistence_cycles: int
     day_move_used_block_pct:   float
+    # v3.3: day_move_used_pct divides a high-low RANGE by a straddle,
+    # and a straddle prices |displacement|, not range. For a driftless
+    # diffusion E[range]/E[|displacement|] = 2.0 in continuous time and
+    # 1.933 when sampled at 1-minute bars, which is how this engine
+    # observes the session. Without this factor a perfectly ordinary
+    # day scores ~193 against a 125 threshold and the volatility gate
+    # returns NEUTRAL on every cycle. Env-driven so it can be re-fitted.
+    day_move_range_factor:     float
 
     # OI / positioning thresholds (defaults, overridden by calibration)
     oi_change_lookback_min: int
@@ -719,6 +787,46 @@ class Config:
     spread_abs_tolerance:    float = 0.85
     # Highest DTE at which the credit structures may be opened.
     max_dte_tradeable:       int   = 4
+
+    # ── v3.2 profitability calibration ────────────────────────────────
+    # Premium stop as a multiple of the NET credit, by DTE. The v3.1
+    # value (a flat 2.5, i.e. a loss of 1.5x the credit) against a 35%
+    # target implied an 81% break-even win rate, which no 0.15-0.22
+    # delta NIFTY structure delivers. Paired with the targets below
+    # they put the break-even win rate near 55%.
+    stop_mult_dte0:            float = 1.40
+    stop_mult_dte1:            float = 1.55
+    stop_mult_dte2p:           float = 1.70
+    # Profit target as a fraction of the net credit, by DTE. Paired with
+    # the stop multiples above: 0.50 against 1.40 is reward/risk 1.25.
+    target_pct_dte0:           float = 0.50
+    target_pct_dte1:           float = 0.45
+    target_pct_dte2p:          float = 0.40
+    # Short-leg delta at which the engine closes, by DTE.
+    delta_close_dte0:          float = 0.35
+    delta_close_dte1p:         float = 0.30
+    # Spot backstop geometry (replaces 0.42 x opening straddle, which
+    # placed the stop far INSIDE the short strike).
+    price_stop_wing_frac:      float = 0.30
+    price_stop_min_pts:        float = 25.0
+    price_stop_max_frac_of_dist: float = 0.40
+    # Delta-primary strike selection.
+    short_delta_flat:          float = 0.22
+    short_delta_trend:         float = 0.18
+    short_delta_strong:        float = 0.15
+    em_band_lo:                float = 0.80
+    em_band_hi:                float = 1.35
+    # Friction discipline.
+    max_friction_frac_of_credit:  float = 0.28
+    max_brokerage_frac_of_credit: float = 0.15
+    min_target_over_friction:     float = 1.25
+    # Minimum economic size, in lots, before a trade is worth doing.
+    min_lots_fraction:         float = 0.60
+    # Structure economics.
+    wing_cost_frac_max:        float = 0.50
+    condor_weak_side_min_frac: float = 0.30
+    # Fast intraday trend timeframe (15m ADX cannot mature intraday).
+    adx_fast_resample:         str   = "300s"
 
     def __repr__(self) -> str:
         def mask(s: str) -> str:
@@ -806,8 +914,8 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),
 
         # Costs
-        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),
-        stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),
+        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.001),
+        stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.00125),
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
         exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003553),
         sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
@@ -864,7 +972,9 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         # Regime
         regime_calc_interval_sec=_get_int(env, "REGIME_CALC_INTERVAL_SEC", 15),
         regime_persistence_cycles=_get_int(env, "REGIME_PERSISTENCE_CYCLES", 3),
-        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 60.0),
+        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 125.0),
+        day_move_range_factor=min(max(
+            _get_float(env, "DAY_MOVE_RANGE_FACTOR", 1.93), 1.0), 2.5),
 
         # OI / positioning
         oi_change_lookback_min=_get_int(env, "OI_CHANGE_LOOKBACK_MIN", 30),
@@ -928,6 +1038,31 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         exit_slippage_mult=_get_float(env, "EXIT_SLIPPAGE_MULT", 2.25),
         spread_abs_tolerance=_get_float(env, "SPREAD_ABS_TOLERANCE", 0.85),
         max_dte_tradeable=_get_int(env, "MAX_DTE_TRADEABLE", 4),
+
+        # v3.2 profitability calibration
+        stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.40), 1.15), 2.50),
+        stop_mult_dte1=min(max(_get_float(env, "STOP_MULT_DTE1", 1.55), 1.15), 2.50),
+        stop_mult_dte2p=min(max(_get_float(env, "STOP_MULT_DTE2P", 1.70), 1.15), 3.00),
+        target_pct_dte0=min(max(_get_float(env, "TARGET_PCT_DTE0", 0.50), 0.18), 0.70),
+        target_pct_dte1=min(max(_get_float(env, "TARGET_PCT_DTE1", 0.45), 0.18), 0.70),
+        target_pct_dte2p=min(max(_get_float(env, "TARGET_PCT_DTE2P", 0.40), 0.18), 0.70),
+        delta_close_dte0=min(max(_get_float(env, "DELTA_CLOSE_DTE0", 0.35), 0.20), 0.55),
+        delta_close_dte1p=min(max(_get_float(env, "DELTA_CLOSE_DTE1P", 0.30), 0.18), 0.50),
+        price_stop_wing_frac=min(max(_get_float(env, "PRICE_STOP_WING_FRAC", 0.30), 0.10), 0.80),
+        price_stop_min_pts=max(_get_float(env, "PRICE_STOP_MIN_PTS", 25.0), 5.0),
+        price_stop_max_frac_of_dist=min(max(_get_float(env, "PRICE_STOP_MAX_FRAC_OF_DIST", 0.40), 0.15), 0.80),
+        short_delta_flat=min(max(_get_float(env, "SHORT_DELTA_FLAT", 0.22), 0.08), 0.35),
+        short_delta_trend=min(max(_get_float(env, "SHORT_DELTA_TREND", 0.18), 0.07), 0.32),
+        short_delta_strong=min(max(_get_float(env, "SHORT_DELTA_STRONG", 0.15), 0.06), 0.30),
+        em_band_lo=min(max(_get_float(env, "EM_BAND_LO", 0.80), 0.40), 1.20),
+        em_band_hi=min(max(_get_float(env, "EM_BAND_HI", 1.35), 0.90), 2.50),
+        max_friction_frac_of_credit=min(max(_get_float(env, "MAX_FRICTION_FRAC_OF_CREDIT", 0.28), 0.05), 0.60),
+        max_brokerage_frac_of_credit=min(max(_get_float(env, "MAX_BROKERAGE_FRAC_OF_CREDIT", 0.15), 0.02), 0.40),
+        min_target_over_friction=min(max(_get_float(env, "MIN_TARGET_OVER_FRICTION", 1.25), 1.00), 3.00),
+        min_lots_fraction=min(max(_get_float(env, "MIN_LOTS_FRACTION", 0.60), 0.10), 1.00),
+        wing_cost_frac_max=min(max(_get_float(env, "WING_COST_FRAC_MAX", 0.50), 0.10), 0.70),
+        condor_weak_side_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),
+        adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "300s",
     )
 
 
