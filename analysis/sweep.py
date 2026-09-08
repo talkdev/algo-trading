@@ -1,3 +1,19 @@
+# ============================================================================
+# SUPERSEDED - DO NOT CITE THESE NUMBERS.
+#
+# This script labels its scenario "VRP +2pp", but it layers a jump process on
+# top of a 10.5% diffusion, which lifts TRUE realised vol to ~13.20% while
+# still pricing options at IV 12.5%. It therefore tests a NEGATIVE variance
+# risk premium under a positive label, and unsurprisingly shows every
+# configuration losing. The losses are an artefact of the vol mis-specification,
+# not evidence about the strategy.
+#
+# Use analysis/sweep_fair.py instead: it holds realised vol at 10.5% in both
+# worlds and sets IV = realised + VRP, which is what "VRP +2pp" actually means.
+#
+# Kept only for provenance of how the error was found.
+# ============================================================================
+
 import importlib.util, sys, io, contextlib
 spec=importlib.util.spec_from_file_location("mc","/home/user/algo-trading/analysis/mc_realistic.py")
 mc=importlib.util.module_from_spec(spec)
