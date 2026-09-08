@@ -86,6 +86,7 @@ import sqlite3
 import sys
 import tempfile
 import uuid
+import warnings
 from collections import Counter, defaultdict
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
@@ -456,6 +457,8 @@ class Results:
         self.days: List[str] = []
         self.daily_pnl: Dict[str, float] = defaultdict(float)
         self.entries_considered = 0
+        self.reason_log: List[Tuple[str, str, str]] = []   # (date, bucket, raw)
+        self._cur_day = "?"
 
     # -- accumulation -----------------------------------------------------
     def add_trade(self, t: Trade) -> None:
@@ -465,6 +468,7 @@ class Results:
     def add_rejection(self, reason: str) -> None:
         self.entries_considered += 1
         bucket = self._bucket(reason)
+        self.reason_log.append((self._cur_day, bucket, str(reason)))
         self.rejections[bucket] += 1
         if len(self.rejection_detail[bucket]) < 5:
             self.rejection_detail[bucket].append(reason)
@@ -489,7 +493,8 @@ class Results:
                 break
         low = r.lower()
         for key in (
-            "ev_gate", "net_credit", "credit_ratio", "brokerage", "friction",
+            "ev_gate", "credit_risk_ratio", "net_credit", "credit_ratio",
+            "brokerage", "friction",
             "target_", "risk_budget", "wing_cost", "condor_weak_side",
             "margin", "daily", "confidence", "expanding", "cooldown",
             "consecutive", "entry_window", "day_move", "chain_stale",
@@ -499,8 +504,8 @@ class Results:
             if key in low:
                 return key.rstrip("_")
         # Drop any trailing free text / numbers so variants of one gate group.
-        head = re.split(r"[ \u2014\-(]", r, 1)[0]
-        return (head or r)[:30].upper()
+        head = re.split(r"[ \u2014\-(]", r, maxsplit=1)[0]
+        return (head or r)[:36].upper()
 
     # -- statistics -------------------------------------------------------
     def summary(self) -> dict:
@@ -828,6 +833,7 @@ class BacktestRunner:
             return
 
         self.results.days.append(trading_date)
+        self.results._cur_day = trading_date
         state = self.me.state
         state["daily_halted"] = False
         live: Optional[dict] = None
@@ -1011,6 +1017,245 @@ def print_audit(store: HistoricalStore) -> int:
     return 0 if usable else 1
 
 
+# Gate order as actually implemented in StrategyEngine.decide(). Verified by
+# reading the function, not assumed: the regime verdict is consumed first,
+# then safety interlocks, then the entry window, then position limits, then
+# structure validation (credit_risk_ratio at strategy_engine.py:1244), and
+# the EV gate last (strategy_engine.py:1304).
+#
+# This ordering is what makes the raw census misleading. A gate late in the
+# chain is only ever offered the candidates every earlier gate approved, so
+# its share of TOTAL cycles understates it badly. The number that matters is
+# the conditional one: of the candidates that reached this gate, how many did
+# it kill.
+STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
+    ("regime verdict", (
+        "VOL_NEUTRAL", "VOL_BUY_OPTIONS", "CHOPPY_MARKET", "regime",
+        "RANGE_UNCLEAR", "STRADDLE_EXPLOSION", "or_not_established",
+        "NO_CLEAR", "UNCLEAR", "TRENDING", "EXPANSION")),
+    ("safety interlocks", (
+        "vix", "circuit_breaker", "expanding", "spiking", "daily_loss_halt",
+        "daily", "abort")),
+    ("entry window", ("entry_window",)),
+    ("position limits", (
+        "max_concurrent", "max_entries", "position_already_open",
+        "cooldown", "consecutive")),
+    ("structure build", (
+        "no_strategy", "strike", "lots", "net_credit", "credit_ratio",
+        "credit_risk", "wing_cost", "condor_weak_side", "friction",
+        "brokerage", "risk_budget", "target", "margin", "chain_stale",
+        "fill_unavailable")),
+    ("EV gate", ("ev_gate",)),
+]
+
+
+def _stage_of(bucket: str) -> int:
+    b = bucket.lower()
+    for i, (_, keys) in enumerate(STAGE_ORDER):
+        for k in keys:
+            if k.lower() in b:
+                return i
+    return len(STAGE_ORDER) - 1
+
+
+_NUM = re.compile(r"(-?\d+\.?\d*)")
+
+
+def _margin_of(raw: str) -> Optional[float]:
+    """
+    Pull a (value, threshold) pair out of a reason string such as
+    'ev_-6.60pts_below_min_1.47pts' or 'credit_risk_ratio_0.41_below_min_0.50'
+    and return how far short it fell. Returns None when the reason carries no
+    numbers, which is itself worth knowing.
+    """
+    low = raw.lower()
+    if not any(w in low for w in ("below", "above", "min_", "max_", "_vs_")):
+        return None
+    nums = [float(x) for x in _NUM.findall(raw)]
+    if len(nums) < 2:
+        return None
+    return abs(nums[-1] - nums[0])
+
+
+def print_funnel(res: "Results") -> None:
+    """
+    Where candidates die, in the order the engine actually kills them.
+    """
+    if not res.reason_log:
+        return
+    total = len(res.reason_log) + len(res.trades)
+
+    blocked_by_stage: Dict[int, Counter] = defaultdict(Counter)
+    for _d, bucket, _raw in res.reason_log:
+        blocked_by_stage[_stage_of(bucket)][bucket] += 1
+
+    print()
+    print(hr())
+    print("ENTRY FUNNEL  (gates in the order decide() applies them)")
+    print(hr())
+    print("  A late gate only ever sees what the earlier gates let through, so")
+    print("  its share of all cycles understates it. Read the pass rate.")
+    print()
+    print(f"  {'stage':<20} {'blocked':>8} {'reached':>8} {'passed':>8} "
+          f"{'pass rate':>10}   top gate")
+    print(f"  {hr('-', 88)}")
+
+    reached = total
+    terminal = None
+    for i, (name, _keys) in enumerate(STAGE_ORDER):
+        blocked = sum(blocked_by_stage[i].values())
+        if blocked == 0 and reached == total and i == 0:
+            pass
+        passed = reached - blocked
+        rate = (100.0 * passed / reached) if reached else 0.0
+        top = blocked_by_stage[i].most_common(1)
+        topname = f"{top[0][0]} ({top[0][1]})" if top else "-"
+        if blocked or reached != total:
+            print(f"  {name:<20} {blocked:>8} {reached:>8} {passed:>8} "
+                  f"{rate:>9.0f}%   {topname}")
+        if blocked and passed == 0 and terminal is None:
+            terminal = (name, blocked)
+        reached = passed
+        if reached <= 0:
+            break
+
+    print(f"  {hr('-', 88)}")
+    print(f"  {'ENTERED':<20} {'':>8} {'':>8} {len(res.trades):>8}")
+
+    if terminal:
+        name, blocked = terminal
+        print()
+        print(f"  >> TERMINAL GATE: '{name}' rejected {blocked} of {blocked} "
+              f"candidates (0% pass).")
+        print(f"     Nothing downstream of it was ever evaluated. If you change")
+        print(f"     one thing, change this. Every other gate is speculation")
+        print(f"     until this one lets something through.")
+
+    # -- near-miss margins ------------------------------------------------
+    margins: Dict[str, List[float]] = defaultdict(list)
+    nonum: Counter = Counter()
+    for _d, bucket, raw in res.reason_log:
+        m = _margin_of(raw)
+        if m is None:
+            nonum[bucket] += 1
+        else:
+            margins[bucket].append(m)
+    if margins:
+        print()
+        print("  NEAR-MISS MARGINS  (how far short, when the reason says)")
+        print(f"  {hr('-', 74)}")
+        print(f"  {'gate':<34} {'n':>5} {'median':>10} {'best':>10}")
+        for k in sorted(margins, key=lambda x: -len(margins[x]))[:8]:
+            v = sorted(margins[k])
+            med = v[len(v) // 2]
+            print(f"  {k:<34} {len(v):>5} {med:>10.2f} {min(v):>10.2f}")
+        print()
+        print("  A gate missing by a hair on most cycles is mis-calibrated.")
+        print("  A gate missing by a mile is telling you the trade was not there.")
+
+    # -- episodes ---------------------------------------------------------
+    # 787 consecutive VOL_NEUTRAL cycles is ONE market condition observed 787
+    # times, not 787 independent observations. Counting contiguous runs is a
+    # far better guide to how much evidence you actually have.
+    episodes: Counter = Counter()
+    last = None
+    for d, bucket, _raw in res.reason_log:
+        keyed = (d, bucket)
+        if keyed != last:
+            episodes[bucket] += 1
+        last = keyed
+    print()
+    print("  EPISODES  (contiguous runs - the honest sample size)")
+    print(f"  {hr('-', 74)}")
+    print(f"  {'gate':<34} {'cycles':>8} {'episodes':>10} {'cycles/ep':>11}")
+    for k, c in res.rejections.most_common(8):
+        e = episodes.get(k, 0)
+        print(f"  {k:<34} {c:>8} {e:>10} {(c / e if e else 0):>11.0f}")
+    print()
+    print("  Treat 'episodes', not 'cycles', as n when judging significance.")
+
+
+_EVF = re.compile(
+    r"ev_(?P<ev>-?[\d.]+)pts_below_min_(?P<min>[\d.]+)pts"
+    r".*?p_win=(?P<p_win>[\d.]+)"
+    r".*?p_tail=(?P<p_tail>[\d.]+)"
+    r".*?rew=(?P<rew>-?[\d.]+)"
+    r".*?stop=(?P<stop>-?[\d.]+)"
+    r".*?tail=(?P<tail>-?[\d.]+)"
+    r".*?fric=(?P<fric>-?[\d.]+)"
+)
+
+
+def print_ev_decomposition(res: "Results") -> None:
+    """
+    Break the EV gate's verdict into its four terms.
+
+    'EV was -6.6' is not actionable. 'The tail term cost 4.4 points and
+    friction cost 4.2, against a reward of 3.3' tells you exactly which
+    assumption to argue with. The engine already prints every input in the
+    rejection string; this just stops them being thrown away.
+    """
+    rows = []
+    for _d, bucket, raw in res.reason_log:
+        if "ev_gate" not in bucket:
+            continue
+        m = _EVF.search(raw)
+        if m:
+            rows.append({k: float(v) for k, v in m.groupdict().items()})
+    if not rows:
+        return
+
+    def med(key: str) -> float:
+        v = sorted(r[key] for r in rows)
+        return v[len(v) // 2]
+
+    n = len(rows)
+    p_win, p_tail = med("p_win"), med("p_tail")
+    rew, stop, tail, fric = med("rew"), med("stop"), med("tail"), med("fric")
+    pwe = p_win * (1.0 - p_tail)
+    pst = max(1.0 - pwe - p_tail, 0.0)
+
+    c_rew, c_stop = pwe * rew, -pst * stop
+    c_tail, c_fric = -p_tail * tail, -fric
+    ev_med = med("ev")
+
+    print()
+    print(hr())
+    print(f"EV DECOMPOSITION  (median of {n} rejected candidates)")
+    print(hr())
+    print("  Which term is actually killing expected value.")
+    print()
+    print(f"  {'term':<26} {'probability':>12} {'points':>10} {'contribution':>14}")
+    print(f"  {hr('-', 66)}")
+    print(f"  {'reward (target hit)':<26} {pwe:>12.3f} {rew:>10.2f} {c_rew:>+14.2f}")
+    print(f"  {'stop loss':<26} {pst:>12.3f} {stop:>10.2f} {c_stop:>+14.2f}")
+    print(f"  {'tail (stop jumped)':<26} {p_tail:>12.3f} {tail:>10.2f} {c_tail:>+14.2f}")
+    print(f"  {'round-trip friction':<26} {'':>12} {fric:>10.2f} {c_fric:>+14.2f}")
+    print(f"  {hr('-', 66)}")
+    print(f"  {'EXPECTED VALUE':<26} {'':>12} {'':>10} "
+          f"{c_rew + c_stop + c_tail + c_fric:>+14.2f}"
+          f"   (engine: {ev_med:+.2f})")
+    print(f"  {'required minimum':<26} {'':>12} {'':>10} {med('min'):>+14.2f}")
+
+    worst = min(
+        [("tail", c_tail), ("friction", c_fric), ("stop", c_stop)],
+        key=lambda x: x[1],
+    )
+    print()
+    print(f"  Largest drag: {worst[0].upper()} at {worst[1]:+.2f} pts.")
+    if c_fric < -2.0:
+        print(f"  Friction of {fric:.2f} pts is heavy - that is roughly a 1-lot")
+        print(f"  cost base. Friction per point falls fast with size, so check")
+        print(f"  whether sizing collapsed to 1 lot before blaming the gate.")
+    if -c_tail > c_rew:
+        print(f"  The tail term alone ({c_tail:+.2f}) exceeds the entire reward")
+        print(f"  ({c_rew:+.2f}). With tail_loss = 0.80 x (wing - credit), a wide")
+        print(f"  wing on a thin credit makes this gate close to unsatisfiable.")
+    print()
+    print("  This is the engine's OPINION of these trades, not their outcome.")
+    print("  Only replaying the rejected structures can say if it was right.")
+
+
 def print_report(res: Results, config: Config, args) -> None:
     s = res.summary()
     print()
@@ -1076,6 +1321,10 @@ def print_report(res: Results, config: Config, args) -> None:
               f"{', '.join(res.halted_days[:6])}"
               f"{' ...' if len(res.halted_days) > 6 else ''}")
 
+    # -- funnel -----------------------------------------------------------
+    print_funnel(res)
+    print_ev_decomposition(res)
+
     # -- rejections -------------------------------------------------------
     print()
     print(hr())
@@ -1085,11 +1334,11 @@ def print_report(res: Results, config: Config, args) -> None:
         print("  none recorded")
     else:
         total = sum(res.rejections.values())
-        print(f"  {'gate':<26} {'count':>7} {'share':>7}   example")
+        print(f"  {'gate':<38} {'count':>7} {'share':>7}   example")
         print(f"  {hr('-', 74)}")
         for gate, cnt in res.rejections.most_common(14):
-            ex = (res.rejection_detail[gate][0] or "")[:30]
-            print(f"  {gate:<26} {cnt:>7} {cnt/total*100:>6.1f}%   {ex}")
+            ex = (res.rejection_detail[gate][0] or "")[:70]
+            print(f"  {gate:<38} {cnt:>7} {cnt/total*100:>6.1f}%   {ex}")
     print()
     print(hr("═"))
     print("""
@@ -1421,7 +1670,40 @@ def self_test() -> int:
 #  CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
+def install_warning_dedupe() -> None:
+    """
+    Print each distinct warning once instead of once per cycle.
+
+    pandas calls warnings.catch_warnings() internally, which bumps the filter
+    version and invalidates every module's __warningregistry__. Since the
+    replay loop goes through pandas on every single cycle, Python's built-in
+    "show this location only once" behaviour is destroyed and a single
+    deprecated call site emits one line per cycle - thousands of lines that
+    bury the report and look like a hang.
+
+    This dedupes on (category, filename, lineno) in our own dict, which no
+    amount of filter mutation can clear. Nothing is suppressed: every distinct
+    warning is still shown, and a count of what was collapsed is available.
+    """
+    seen: Dict[tuple, int] = {}
+    original = warnings.showwarning
+
+    def showwarning(message, category, filename, lineno, file=None, line=None):
+        key = (category, filename, lineno)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] == 1:
+            original(message, category, filename, lineno, file, line)
+        elif seen[key] == 2:
+            sys.stderr.write(
+                f"  ... further identical warnings from {Path(filename).name}:"
+                f"{lineno} suppressed\n"
+            )
+
+    warnings.showwarning = showwarning
+
+
 def main() -> int:
+    install_warning_dedupe()
     ap = argparse.ArgumentParser(
         description="Event-driven replay backtester for the NIFTY intraday "
                     "options engine.",
