@@ -809,9 +809,9 @@ class StrategyEngine:
             ask = float(leg.get("ask", 0) or 0)
             if bid > 0 and ask > 0:
                 half_spread = (ask - bid) / 2.0
-                total += half_spread * (1.5 if is_exit else 0.5)
+                total += half_spread * (3.0 if is_exit else 0.5)
             else:
-                total += 0.60 if is_exit else 0.35
+                total += 1.20 if is_exit else 0.35
         return round(total, 3)
 
     def _get_target_pct(self, dte: Optional[int], signals: dict) -> float:
@@ -851,7 +851,7 @@ class StrategyEngine:
         vrp_smoothed = float(signals.get("vrp_smoothed") or 0.0)
         target_pct   = self._get_target_pct(dte, signals)
         reward_pts   = net_credit * target_pct
-        risk_pts     = net_credit * 2.5
+        risk_pts     = net_credit * 1.5
         friction     = (entry_costs_pts + total_slippage) * 2.0
 
         p_win_table = {
@@ -868,17 +868,19 @@ class StrategyEngine:
         ).get(or_condition, 0.50)
 
         if vrp_smoothed > 4.0:
-            vrp_adj = 0.04
+            vrp_adj = 0.08
         elif vrp_smoothed > 3.0:
+            vrp_adj = 0.05
+        elif vrp_smoothed > 2.0:
             vrp_adj = 0.02
-        elif vrp_smoothed < 2.0:
+        elif vrp_smoothed < 1.5:
             vrp_adj = -0.04
         else:
             vrp_adj = 0.0
 
-        p_win = min(0.85, max(0.35, p_win_prior + vrp_adj))
+        p_win = min(0.88, max(0.35, p_win_prior + vrp_adj))
         ev    = p_win * reward_pts - (1.0 - p_win) * risk_pts - friction
-        min_ev = max(net_credit * 0.08, friction * 0.5)
+        min_ev = max(net_credit * 0.03, friction * 0.25)
 
         if ev < min_ev:
             return False, (
@@ -1061,11 +1063,13 @@ class StrategyEngine:
 
         current_capital = state.get("current_capital", self.config.starting_capital)
         wing_for_sizing = actual_wing_pts or 150
-        structural_loss_per_lot = max(
+        _stop_loss_per_lot = 1.5 * net_credit * C02
+        _structural_per_lot = max(
             (wing_for_sizing - net_credit) * C02, net_credit * C02
         )
-        if structural_loss_per_lot <= 0:
-            structural_loss_per_lot = wing_for_sizing * C02 * 0.5
+        if _structural_per_lot <= 0:
+            _structural_per_lot = wing_for_sizing * C02 * 0.5
+        structural_loss_per_lot = min(_stop_loss_per_lot, _structural_per_lot)
 
         risk_pct_map = {
             0: 0.005, 1: 0.004, 2: 0.003,
@@ -1084,16 +1088,8 @@ class StrategyEngine:
         if structural_loss_per_lot * final_lots > max_risk * 1.5:
             final_lots = max(1, int(max_risk / structural_loss_per_lot))
 
-        if strategy_name in (IRON_CONDOR, IRON_BUTTERFLY) and final_lots < 2:
-            if raw_lots * size_mult < 1.0:
-                return {
-                    "valid": False,
-                    "reason": (
-                        f"intended_lots_{raw_lots * size_mult:.2f}_below_"
-                        f"minimum_2_for_{strategy_name}"
-                    ),
-                }
-            final_lots = 2
+        if strategy_name in (IRON_CONDOR, IRON_BUTTERFLY) and final_lots < 1:
+            final_lots = 1
 
         stop_mult = min(float(state.get("stop_multiplier", 2.5) or 2.5), 2.5)
         if strategy_name in (BULL_PUT_SPREAD, BEAR_CALL_SPREAD):
@@ -1730,7 +1726,7 @@ def _self_test() -> None:
     print(f"  Entry slippage (2 legs bid/ask): {slip_entry:.3f}pts [OK]")
 
     slip_exit = engine._compute_slippage(legs_ba, is_exit=True)
-    expected_exit = 2 * ((46 - 44) / 2.0 * 1.5)
+    expected_exit = 2 * ((46 - 44) / 2.0 * 3.0)
     assert abs(slip_exit - expected_exit) < 0.01, (
         f"Exit slippage: expected {expected_exit:.3f}, got {slip_exit:.3f}"
     )
@@ -1743,6 +1739,13 @@ def _self_test() -> None:
         f"No bid/ask slippage: expected {expected_no_ba:.3f}, got {slip_no_ba:.3f}"
     )
     print(f"  Entry slippage (no bid/ask): {slip_no_ba:.3f}pts [OK]")
+
+    slip_exit_no_ba = engine._compute_slippage(legs_no_ba, is_exit=True)
+    expected_exit_no_ba = 2 * 1.20
+    assert abs(slip_exit_no_ba - expected_exit_no_ba) < 0.01, (
+        f"Exit no bid/ask slippage: expected {expected_exit_no_ba:.3f}, got {slip_exit_no_ba:.3f}"
+    )
+    print(f"  Exit slippage (no bid/ask): {slip_exit_no_ba:.3f}pts [OK]")
 
     print("  [OK] Slippage computation tests passed")
 

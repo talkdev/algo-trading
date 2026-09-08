@@ -2232,9 +2232,11 @@ def _self_test() -> None:
     print_section("NIFTY ALGO v3.0 — CALIBRATION ENGINE SELF-TEST", char="#")
 
     from core import load_config, Database, setup_logging
+    import tempfile
 
     config = load_config()
-    db     = Database(config.db_path)
+    _test_db_path = Path(tempfile.mkdtemp()) / "cal_selftest.db"
+    db     = Database(_test_db_path)
     logger = setup_logging(db, config.log_dir)
 
     # ── CalibrationState tests ────────────────────────────────────────────
