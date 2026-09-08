@@ -45,7 +45,7 @@ LOG_DIR          = Path(_ENV.get("LOG_DIR", "logs"))
 if not LOG_DIR.is_absolute():
     LOG_DIR = BASE_DIR / LOG_DIR
 
-LOT_SIZE              = int(_ENV.get("NIFTY_LOT_SIZE", "65") or 65)
+LOT_SIZE              = int(_ENV.get("NIFTY_LOT_SIZE", "75") or 75)
 STARTING_CAPITAL      = float(_ENV.get("STARTING_CAPITAL", "1000000") or 1_000_000)
 MAX_DAILY_LOSS_PCT    = float(_ENV.get("MAX_DAILY_LOSS_PCT", "0.02") or 0.02)
 BROKERAGE_PER_ORDER   = float(_ENV.get("BROKERAGE_PER_ORDER", "20.0") or 20.0)

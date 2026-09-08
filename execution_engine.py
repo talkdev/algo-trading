@@ -1151,7 +1151,10 @@ class ExecutionEngine:
             if profit_pct >= lock_thresh and not profit_lock_activated:
                 # Move stop to breakeven (entry_credit level)
                 # This converts the position to a "free trade"
-                new_stop = max(entry_credit, entry_credit * 0.90)
+                _achieved = gross_credit - current_premium
+                _keep = _achieved * 0.50
+                new_stop = current_premium + _keep
+                new_stop = max(new_stop, entry_credit * 0.80)
                 self.db.update(
                     "positions",
                     {
@@ -1212,13 +1215,16 @@ class ExecutionEngine:
         if entry_credit > 0:
             if actual_dte == 0:
                 time_targets = [
-                    (dtime(13, 30), 0.40),  # 40% profit after 13:30
-                    (dtime(14, 30), 0.30),  # 30% profit after 14:30
+                    (dtime(11, 30), 0.50),
+                    (dtime(12, 30), 0.42),
+                    (dtime(13, 30), 0.35),
+                    (dtime(14, 15), 0.25),
                 ]
             else:
                 time_targets = [
-                    (dtime(13, 0),  0.45),  # 45% profit after 13:00
-                    (dtime(14, 0),  0.40),  # 40% profit after 14:00
+                    (dtime(12, 0),  0.48),
+                    (dtime(13, 0),  0.40),
+                    (dtime(14, 0),  0.32),
                 ]
 
             for time_threshold, target_pct in time_targets:
@@ -1286,6 +1292,19 @@ class ExecutionEngine:
                 "Existing positions managed by own exit rules."
             )
 
+
+        _open = self._get_open_positions()
+        if _open:
+            _cur_straddle = float(signals.get("atm_straddle_price") or 0)
+            _open_straddle = float(self.market_engine.state.get("_straddle_open_for_regime") or 0)
+            if (_cur_straddle > 0 and _open_straddle > 0 and
+                    _cur_straddle > _open_straddle * 1.18):
+                self.logger.warning(
+                    f"STRADDLE EXPLOSION EXIT: straddle {_cur_straddle:.0f} > "
+                    f"1.18x opening {_open_straddle:.0f} — closing all positions"
+                )
+                self.close_all_positions("STRADDLE_EXPLOSION_EXIT")
+                return
         for position in self._get_open_positions():
             action, priority, context = self.monitor_position(position, signals)
 
@@ -1618,12 +1637,10 @@ class ExecutionEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _self_test() -> None:
-    """
-    Standalone self-test for execution_engine.py.
-    Tests: transaction costs, mark price, premium computation,
-           exit priority system, P&L computation, state updates.
-    Run: python execution_engine.py
-    """
+    import tempfile as _tf3
+    from core import load_env_file, ENV_FILE, BASE_DIR
+    _env3 = load_env_file(ENV_FILE)
+    _prod3 = str(BASE_DIR / _env3.get("DB_PATH", "data/nifty_algo_v3.db"))
     print_section("NIFTY ALGO v3.0 — EXECUTION ENGINE SELF-TEST", char="#")
 
     from core import load_config, Database, RateLimiter, UpstoxClient, setup_logging

@@ -58,15 +58,15 @@ class CalibrationState:
     vix_p90:             float = 20.0
 
     # VRP thresholds
-    vrp_sell_threshold:  float = 2.5
-    vrp_fair_threshold:  float = 1.5
+    vrp_sell_threshold:  float = 2.0
+    vrp_fair_threshold:  float = 1.0
 
     # Day size multipliers
-    day_size_monday:     float = 0.55
-    day_size_tuesday:    float = 0.80
-    day_size_wednesday:  float = 0.70
-    day_size_thursday:   float = 0.70
-    day_size_friday:     float = 0.60
+    day_size_monday:     float = 0.60
+    day_size_tuesday:    float = 0.85
+    day_size_wednesday:  float = 0.65
+    day_size_thursday:   float = 0.65
+    day_size_friday:     float = 0.55
 
     # OI thresholds
     oi_buildup_threshold:  float = 0.08
@@ -163,12 +163,12 @@ NIFTY_2026_DEFAULTS = CalibrationState(
     vix_p75=14.5,
     vix_p90=18.0,
     vrp_sell_threshold=2.0,
-    vrp_fair_threshold=1.2,
-    day_size_monday=0.50,
-    day_size_tuesday=0.75,
-    day_size_wednesday=0.60,
-    day_size_thursday=0.60,
-    day_size_friday=0.50,
+    vrp_fair_threshold=1.0,
+    day_size_monday=0.60,
+    day_size_tuesday=0.85,
+    day_size_wednesday=0.65,
+    day_size_thursday=0.65,
+    day_size_friday=0.55,
     oi_buildup_threshold=0.08,
     oi_unwind_threshold=-0.08,
     oi_wall_strong_cal=2.5,
@@ -248,7 +248,7 @@ class CalibrationEngine:
     """
 
     # Bayesian prior weight
-    PRIOR_WEIGHT = 30
+    PRIOR_WEIGHT = 15
 
     # Minimum sample sizes for each calibration component
     MIN_SAMPLES_VIX         = 5
@@ -1599,6 +1599,14 @@ class CalibrationEngine:
             return
 
         try:
+            _vrp_raw_log = signals.get("vrp_raw")
+            _vrp_smo_log = signals.get("vrp_smoothed")
+            if _vrp_raw_log is None:
+                _vrp_raw_log = signals.get("_last_vrp_raw")
+            if _vrp_smo_log is None:
+                _vrp_smo_log = signals.get("_last_vrp_smoothed")
+            if _vrp_raw_log is None and _vrp_smo_log is None:
+                return
             self.db.insert("phantom_trades", {
                 "trading_date":           today_ist().isoformat(),
                 "block_time":             now_ist().isoformat(),
@@ -1606,8 +1614,8 @@ class CalibrationEngine:
                 "strategy_would_be":      strategy_would_be,
                 "strikes_json":           strikes_json,
                 "credit_would_be":        credit_would_be,
-                "vrp_at_block":           signals.get("vrp_raw"),
-                "vrp_smoothed_at_block":  signals.get("vrp_smoothed"),
+                "vrp_at_block":           _vrp_raw_log,
+                "vrp_smoothed_at_block":  _vrp_smo_log,
                 "or_condition":           signals.get("or_condition"),
                 "adx_at_block":           signals.get("adx_15"),
                 "positioning_at_block":   signals.get("positioning_regime"),
@@ -2223,6 +2231,13 @@ class CalibrationEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _self_test() -> None:
+    from core import load_env_file, ENV_FILE
+    _env_check = load_env_file(ENV_FILE)
+    _prod_db = _env_check.get("DB_PATH", "")
+    import tempfile as _tf
+    _tmp_dir = _tf.mkdtemp()
+    if _prod_db and str(Path(_tmp_dir).parent) not in _prod_db:
+        pass
     """
     Standalone self-test for calibration_engine.py.
     Tests: CalibrationState, Bayesian shrinkage, all calibration components,
@@ -2288,13 +2303,14 @@ def _self_test() -> None:
 
     # With 30 observations: should be 50/50
     shrunk_30 = engine._shrink(5.0, 2.5, 30)
-    print(f"  n=30: shrink(5.0, 2.5) = {shrunk_30:.4f} (expect 3.7500)")
-    assert abs(shrunk_30 - 3.75) < 0.01, f"With n=30, should be 3.75, got {shrunk_30}"
+    _expected_30 = 30/(30+15)*5.0 + 15/(30+15)*2.5
+    print(f"  n=30: shrink(5.0, 2.5) = {shrunk_30:.4f} (expect {_expected_30:.4f} with prior_weight=15)")
+    assert abs(shrunk_30 - _expected_30) < 0.01, f"With n=30 prior=15, should be {_expected_30:.4f}, got {shrunk_30}"
 
     # With 300 observations: should be close to data
     shrunk_300 = engine._shrink(5.0, 2.5, 300)
-    print(f"  n=300: shrink(5.0, 2.5) = {shrunk_300:.4f} (expect ~4.77)")
-    assert shrunk_300 > 4.5, f"With n=300, should be close to 5.0, got {shrunk_300}"
+    print(f"  n=300: shrink(5.0, 2.5) = {shrunk_300:.4f} (expect >4.7)")
+    assert shrunk_300 > 4.7, f"With n=300, should be close to 5.0, got {shrunk_300}"
 
     # Monotonicity: more data → closer to data estimate
     s1 = engine._shrink(5.0, 2.5, 10)

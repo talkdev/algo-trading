@@ -239,13 +239,13 @@ class CalibrationEngine:
         "vix_p50":                 12.5,
         "vix_p75":                 14.5,
         "vix_p90":                 18.0,
-        "vrp_sell_threshold":       2.5,
-        "vrp_fair_threshold":       1.5,
-        "day_size_monday":          0.50,
-        "day_size_tuesday":         0.75,
-        "day_size_wednesday":       0.60,
-        "day_size_thursday":        0.60,
-        "day_size_friday":          0.50,
+        "vrp_sell_threshold":       2.0,
+        "vrp_fair_threshold":       1.0,
+        "day_size_monday":          0.60,
+        "day_size_tuesday":         0.85,
+        "day_size_wednesday":       0.65,
+        "day_size_thursday":        0.65,
+        "day_size_friday":          0.55,
         "oi_buildup_threshold":     0.06,
         "oi_unwind_threshold":     -0.06,
         "oi_wall_strong_cal":       2.2,
@@ -255,10 +255,10 @@ class CalibrationEngine:
         "skew_bearish_threshold":   2.5,
         "skew_bullish_threshold":   0.90,
         "straddle_ratio_sell":      1.05,
-        "signal_weight_vrp":        1.2,
-        "signal_weight_price":      0.9,
-        "signal_weight_positioning":0.8,
-        "signal_weight_iv_behavior":1.0,
+        "signal_weight_vrp":        0.8,
+        "signal_weight_price":      1.2,
+        "signal_weight_positioning":1.0,
+        "signal_weight_iv_behavior":1.3,
         "signal_weight_or_condition":1.1,
         "monday_avg_range":         120.0,
         "tuesday_avg_range":        130.0,
@@ -268,7 +268,7 @@ class CalibrationEngine:
     }
 
     # Bayesian prior weight (equivalent to N observations of prior belief)
-    PRIOR_WEIGHT = 30
+    PRIOR_WEIGHT = 15
 
     def __init__(self, db: Database, config: Config, logger):
         self.db     = db
@@ -1188,7 +1188,26 @@ class RegimeClassifier:
         Priority order:
         1. OBSERVING: OR not established
         2. CHOPPY: OR established but fake breakouts detected
-        3. ADX maturity check: need mature ADX for trend classification
+        _now_t_pr = now_ist().time()
+        _orb_primary = _now_t_pr < dtime(11, 0)
+        if _orb_primary or not adx_15_mature or adx_15 <= 0:
+            if orb_structure == "UPTREND":
+                if adx_15_mature and adx_15 >= adx_trend:
+                    return PriceRegime.UPTREND
+                _vwap_s = signals.get("vwap_signal", "UNKNOWN")
+                if _vwap_s in ("BULLISH", "BULLISH_EXTENDED", "NEUTRAL", "UNKNOWN"):
+                    return PriceRegime.UPTREND
+                return PriceRegime.RANGE
+            if orb_structure == "DOWNTREND":
+                if adx_15_mature and adx_15 >= adx_trend:
+                    return PriceRegime.DOWNTREND
+                _vwap_s = signals.get("vwap_signal", "UNKNOWN")
+                if _vwap_s in ("BEARISH", "BEARISH_EXTENDED", "NEUTRAL", "UNKNOWN"):
+                    return PriceRegime.DOWNTREND
+                return PriceRegime.RANGE
+            if orb_structure == "CHOPPY":
+                return PriceRegime.CHOPPY
+            return PriceRegime.RANGE
         4. STRONG_DOWNTREND: ADX > 35, bearish EMA, spot > 100pts below OR
         5. STRONG_UPTREND: ADX > 35, bullish EMA, spot > 100pts above OR
         6. DOWNTREND: ADX >= 25, bearish EMA, spot below OR low
@@ -1209,8 +1228,8 @@ class RegimeClassifier:
         spot          = float(signals.get("spot") or 0.0)
         orb_structure = signals.get("orb_price_regime", "OBSERVING")
 
-        adx_trend  = self.config.adx_trend_threshold   # default 25
-        adx_strong = self.config.adx_strong_threshold  # default 35
+        adx_trend  = self.config.adx_trend_threshold
+        adx_strong = self.config.adx_strong_threshold
 
         # ── Step 1: OBSERVING ─────────────────────────────────────────────
         if not or_computed:
@@ -1268,7 +1287,12 @@ class RegimeClassifier:
                 return PriceRegime.UPTREND
             return PriceRegime.RANGE
 
-        # ── Step 8: RANGE (default) ───────────────────────────────────────
+        vwap_signal_pr = signals.get("vwap_signal", "UNKNOWN")
+        vwap_dist_pr   = float(signals.get("vwap_dist_pct") or 0.0)
+        if adx_15 >= (adx_trend - 3) and vwap_signal_pr in ("BULLISH", "BULLISH_EXTENDED") and vwap_dist_pr > 0.20:
+            return PriceRegime.UPTREND
+        if adx_15 >= (adx_trend - 3) and vwap_signal_pr in ("BEARISH", "BEARISH_EXTENDED") and vwap_dist_pr < -0.20:
+            return PriceRegime.DOWNTREND
         return PriceRegime.RANGE
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1325,10 +1349,10 @@ class RegimeClassifier:
         oi_building  = oi_change > oi_build
         oi_unwinding = oi_change < oi_unwind
 
-        pcr_extreme_bull = pcr < pcr_bull * 0.85
-        pcr_extreme_bear = pcr > pcr_bear * 1.15
-        pcr_bullish      = pcr < pcr_bull
-        pcr_bearish      = pcr > pcr_bear
+        pcr_extreme_bull = pcr > pcr_bear * 1.20
+        pcr_extreme_bear = pcr < pcr_bull * 0.80
+        pcr_bullish      = pcr > pcr_bear
+        pcr_bearish      = pcr < pcr_bull
 
         skew_bearish = skew_ratio is not None and skew_ratio > skew_bear
         skew_bullish = skew_ratio is not None and skew_ratio < skew_bull
@@ -1374,6 +1398,9 @@ class RegimeClassifier:
         if wall_range:
             return PositioningRegime.RANGE
 
+        _chain_sz = int(signals.get("chain_size") or 0)
+        if _chain_sz < 30:
+            return PositioningRegime.RANGE
         return PositioningRegime.UNCLEAR
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1665,12 +1692,11 @@ class RegimeClassifier:
 
         # ── STRONG_RANGE or RANGE positioning → condor/fly ───────────────
         if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):
-            # Tuesday afternoon pin trade (13:00-15:00, DTE 0)
             if (dte == 0 and
                     current_time >= time(13, 0) and
                     max_pain > 0 and
-                    abs(spot - max_pain) <= 50 and
-                    r_str >= 1.7):
+                    abs(spot - max_pain) <= 80 and
+                    r_str >= 1.5):
                 return (
                     FinalRegime.PREMIUM_SELL_RANGE,
                     "RANGE_TUESDAY_AFTERNOON_PIN",
@@ -2590,7 +2616,10 @@ def get_strategy_from_regime(signals: dict) -> str:
 
 def _self_test() -> None:
     from datetime import time as dtime
-
+    import tempfile as _tf4
+    from core import load_env_file, ENV_FILE, BASE_DIR
+    _env4 = load_env_file(ENV_FILE)
+    _prod4 = str(BASE_DIR / _env4.get("DB_PATH", "data/nifty_algo_v3.db"))
     """
     Standalone self-test for regime_engine.py.
     Tests: calibration loading, all four classifiers, final decision tree,
@@ -2790,13 +2819,13 @@ def _self_test() -> None:
 
     # BULLISH
     pos2 = classifier.classify_positioning(make_signals(pcr=0.48))
-    print(f"  PCR=0.48 (extreme greed) → {pos2.value} (expect BULLISH)")
-    assert pos2 == PositioningRegime.BULLISH, f"Expected BULLISH, got {pos2}"
+    print(f"  PCR=0.48 (extreme greed/low PCR) → {pos2.value} (contrarian: expect BEARISH)")
+    assert pos2 == PositioningRegime.BEARISH, f"Expected BEARISH (contrarian low-PCR), got {pos2}"
 
     # BEARISH
     pos3 = classifier.classify_positioning(make_signals(pcr=1.50))
-    print(f"  PCR=1.50 (extreme fear) → {pos3.value} (expect BEARISH)")
-    assert pos3 == PositioningRegime.BEARISH, f"Expected BEARISH, got {pos3}"
+    print(f"  PCR=1.50 (extreme fear/high PCR) → {pos3.value} (contrarian: expect BULLISH)")
+    assert pos3 == PositioningRegime.BULLISH, f"Expected BULLISH (contrarian high-PCR), got {pos3}"
 
     # BEARISH (fear skew)
     pos4 = classifier.classify_positioning(make_signals(

@@ -134,14 +134,14 @@ MAX_DAILY_LOSS_PCT=0.02
 MAX_RISK_PER_TRADE_PCT=0.006
 
 # ── NIFTY Contract Spec ───────────────────────────────────────────────────────
-NIFTY_LOT_SIZE=65
+NIFTY_LOT_SIZE=75
 NIFTY_STRIKE_STEP=50
 
 # ── Transaction Costs ─────────────────────────────────────────────────────────
 STT_OPTIONS_SELL=0.0015
 STT_OPTIONS_EXERCISE=0.0015
 BROKERAGE_PER_ORDER=20.0
-EXCHANGE_TXN_RATE=0.0003552
+EXCHANGE_TXN_RATE=0.00053
 SEBI_RATE=0.000001
 STAMP_DUTY_BUY_OPTIONS=0.00003
 
@@ -150,7 +150,7 @@ TRADING_WINDOW_START=09:45
 TRADING_WINDOW_LAST_ENTRY=14:00
 HARD_EXIT_TIME=15:00
 TUESDAY_HARD_EXIT=15:00
-TUESDAY_LAST_ENTRY=13:00
+TUESDAY_LAST_ENTRY=12:30
 
 # ── Position Limits ───────────────────────────────────────────────────────────
 MAX_CONCURRENT_POSITIONS=1
@@ -167,8 +167,8 @@ MAX_RETRIES=3
 
 # ── Technical Analysis ────────────────────────────────────────────────────────
 ADX_PERIOD=14
-ADX_TREND_THRESHOLD=25.0
-ADX_STRONG_THRESHOLD=35.0
+ADX_TREND_THRESHOLD=20.0
+ADX_STRONG_THRESHOLD=28.0
 EMA_FAST=9
 EMA_SLOW=21
 MTF_RESAMPLE_15=900s
@@ -188,14 +188,14 @@ ABORT_VIX_ABSOLUTE=24.0
 VIX_FAIL_LIMIT=5
 
 # ── VRP Thresholds (overridden by calibration) ────────────────────────────────
-VRP_SELL_THRESHOLD=2.5
-VRP_FAIR_THRESHOLD=1.5
+VRP_SELL_THRESHOLD=2.0
+VRP_FAIR_THRESHOLD=1.0
 VRP_SMOOTHING_CYCLES=5
 
 # ── Regime Settings ───────────────────────────────────────────────────────────
-REGIME_CALC_INTERVAL_SEC=45
+REGIME_CALC_INTERVAL_SEC=15
 REGIME_PERSISTENCE_CYCLES=3
-DAY_MOVE_USED_BLOCK_PCT=55.0
+DAY_MOVE_USED_BLOCK_PCT=60.0
 
 # ── OI / Positioning Thresholds (overridden by calibration) ──────────────────
 OI_CHANGE_LOOKBACK_MIN=30
@@ -209,12 +209,12 @@ SKEW_BEARISH_THRESHOLD=3.0
 SKEW_BULLISH_THRESHOLD=0.95
 
 # ── Exit Rules ────────────────────────────────────────────────────────────────
-DELTA_CLOSE_THRESHOLD=0.40
+DELTA_CLOSE_THRESHOLD=0.28
 SPOT_PROXIMITY_PTS=40
-PRICE_STOP_STRADDLE_MULT=0.30
+PRICE_STOP_STRADDLE_MULT=0.42
 PROFIT_LOCK_PCT_DTE0=0.40
 PROFIT_LOCK_PCT_DTE1PLUS=0.25
-CHEAP_BUYBACK_PTS=2.0
+CHEAP_BUYBACK_PTS=5.0
 CHEAP_BUYBACK_AFTER_TIME=13:00
 
 # ── Calibration ───────────────────────────────────────────────────────────────
@@ -732,14 +732,14 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         max_risk_per_trade_pct=max_risk_per_trade_pct,
 
         # Contract
-        lot_size=_get_int(env, "NIFTY_LOT_SIZE", 65),
+        lot_size=_get_int(env, "NIFTY_LOT_SIZE", 75),
         nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),
 
         # Costs
         stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),
         stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
-        exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003552),
+        exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.00053),
         sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
         stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00003),
 
@@ -748,7 +748,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),
         hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 0)),
         tuesday_hard_exit=_get_time(env, "TUESDAY_HARD_EXIT", dtime(15, 0)),
-        tuesday_last_entry=_get_time(env, "TUESDAY_LAST_ENTRY", dtime(13, 0)),
+        tuesday_last_entry=_get_time(env, "TUESDAY_LAST_ENTRY", dtime(12, 30)),
 
         # Limits
         max_concurrent_positions=_get_int(env, "MAX_CONCURRENT_POSITIONS", 1),
@@ -766,8 +766,8 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
 
         # Technical
         adx_period=_get_int(env, "ADX_PERIOD", 14),
-        adx_trend_threshold=_get_float(env, "ADX_TREND_THRESHOLD", 25.0),
-        adx_strong_threshold=_get_float(env, "ADX_STRONG_THRESHOLD", 35.0),
+        adx_trend_threshold=_get_float(env, "ADX_TREND_THRESHOLD", 20.0),
+        adx_strong_threshold=_get_float(env, "ADX_STRONG_THRESHOLD", 28.0),
         ema_fast=_get_int(env, "EMA_FAST", 9),
         ema_slow=_get_int(env, "EMA_SLOW", 21),
         mtf_resample_15=env.get("MTF_RESAMPLE_15", "900s"),
@@ -787,14 +787,14 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         vix_fail_limit=_get_int(env, "VIX_FAIL_LIMIT", 5),
 
         # VRP
-        vrp_sell_threshold_default=_get_float(env, "VRP_SELL_THRESHOLD", 2.5),
-        vrp_fair_threshold_default=_get_float(env, "VRP_FAIR_THRESHOLD", 1.5),
+        vrp_sell_threshold_default=_get_float(env, "VRP_SELL_THRESHOLD", 2.0),
+        vrp_fair_threshold_default=_get_float(env, "VRP_FAIR_THRESHOLD", 1.0),
         vrp_smoothing_cycles=_get_int(env, "VRP_SMOOTHING_CYCLES", 5),
 
         # Regime
-        regime_calc_interval_sec=_get_int(env, "REGIME_CALC_INTERVAL_SEC", 45),
+        regime_calc_interval_sec=_get_int(env, "REGIME_CALC_INTERVAL_SEC", 15),
         regime_persistence_cycles=_get_int(env, "REGIME_PERSISTENCE_CYCLES", 3),
-        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 55.0),
+        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 60.0),
 
         # OI / positioning
         oi_change_lookback_min=_get_int(env, "OI_CHANGE_LOOKBACK_MIN", 30),
@@ -808,12 +808,12 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         skew_bullish_threshold=_get_float(env, "SKEW_BULLISH_THRESHOLD", 0.95),
 
         # Exit rules
-        delta_close_threshold=_get_float(env, "DELTA_CLOSE_THRESHOLD", 0.40),
+        delta_close_threshold=_get_float(env, "DELTA_CLOSE_THRESHOLD", 0.28),
         spot_proximity_pts=_get_int(env, "SPOT_PROXIMITY_PTS", 40),
-        price_stop_straddle_mult=_get_float(env, "PRICE_STOP_STRADDLE_MULT", 0.30),
+        price_stop_straddle_mult=_get_float(env, "PRICE_STOP_STRADDLE_MULT", 0.42),
         profit_lock_pct_dte0=_get_float(env, "PROFIT_LOCK_PCT_DTE0", 0.40),
         profit_lock_pct_dte1plus=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS", 0.25),
-        cheap_buyback_pts=_get_float(env, "CHEAP_BUYBACK_PTS", 2.0),
+        cheap_buyback_pts=_get_float(env, "CHEAP_BUYBACK_PTS", 5.0),
         cheap_buyback_after_time=_get_time(env, "CHEAP_BUYBACK_AFTER_TIME", dtime(13, 0)),
 
         # Calibration

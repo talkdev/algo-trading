@@ -41,7 +41,7 @@ DB_PATH          = Path(_ENV.get("DB_PATH", "data/nifty_algo_v3.db"))
 if not DB_PATH.is_absolute():
     DB_PATH = BASE_DIR / DB_PATH
 
-LOT_SIZE         = int(_ENV.get("NIFTY_LOT_SIZE", "65") or 65)
+LOT_SIZE         = int(_ENV.get("NIFTY_LOT_SIZE", "75") or 75)
 STARTING_CAPITAL = float(_ENV.get("STARTING_CAPITAL", "1000000") or 1_000_000)
 
 
