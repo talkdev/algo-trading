@@ -18,14 +18,6 @@ env.txt
 *.token
 *.secret
 
-# Engine database
-/data/
-*.db
-*.db-wal
-*.db-shm
-*.sqlite
-*.sqlite3
-
 # Logs
 /logs/
 *.log
