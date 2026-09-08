@@ -1,90 +1,91 @@
 #!/usr/bin/env python3
 """
 ════════════════════════════════════════════════════════════════════════════
- patch-version5.py — NIFTY intraday options engine, profitability patch v3.5
+ patch-version6.py — NIFTY intraday options engine, profitability patch v3.6
 ════════════════════════════════════════════════════════════════════════════
 
- Prerequisite: v3.4 must already be installed. Self-contained, stdlib only.
+ Prerequisite: v3.5 must already be installed. Self-contained, stdlib only.
 
  ── THE DEFECT ─────────────────────────────────────────────────────────────
 
- Measured by replaying 2026-09-08 through the real decision code. After
- v3.4 unblocked the variance-premium guard, the engine still took zero
- trades and the entire 0DTE window died on one gate:
+ Measured by replaying 2026-09-08. After v3.5 the engine reached the
+ structure builder and then rejected all 86 surviving candidates on
+ net_credit. It was not a lack of edge. It was selling the wrong strike.
 
-     IV_SPIKING_HARD_BLOCK    556 of the 562 afternoon cycles
+ At 12:03, spot 23654.5, the engine sold 23850 / bought 23950:
 
- _compute_iv_behavior classifies IV against the session's opening IV and
- hard-blocks new entries on EXPANDING or SPIKING. Both halves of that
- comparison were wrong on expiry day.
+     SELL 23850 call @ 5.40   delta 0.085
+     BUY  23950 call @ 2.60
+     gross 2.80 pts, net 1.95, friction 1.57  ->  76% of credit, rejected
 
- 1. The baseline outlived the series it was taken from.
+ Its own delta target was 0.20, and _find_strike_by_delta correctly
+ returned 23750 (delta 0.224). Same 100-point wing, so identical maximum
+ loss, but a very different trade:
 
-    The engine opened on the 15-Sep chain and latched opening_iv at
-    10.13%. At 12:03 it switched to the 0DTE chain and went on comparing
-    against that stale number. A five-day option and an expiring one are
-    different instruments; their implied vols are not commensurable. The
-    apparent "spike" at 12:05 was a change of contract, not of volatility.
+     short   delta   credit   wing   gross
+     23750   0.224   15.75    5.40   10.35    <- what delta selection chose
+     23850   0.085    5.40    2.60    2.80    <- what actually traded
 
- 2. Raw ATM IV is not comparable against itself across an expiry session.
+ The override is in strategy_engine, which clamps the short strike to lie
+ at least 0.80 * expected_move_remaining_pts away from the centre. Delta
+ asked for 95 points of distance; the clamp forced 166.
 
-    As T collapses the annualisation factor blows up. Measured ATM IV on
-    the 0DTE series ran 21.9% at 12:05 to 64.4% at 15:20 on a day whose
-    entire spot range was 90 points. Nothing was spiking; the clock was
-    running out. v3.1 saw this coming and widened the bands by sqrt(T),
-    but capped the widening at 3.2x while the drift reached +536%, so the
-    artefact won anyway.
+ And the expected move driving that clamp was wrong:
 
-        time    raw IV   vs open    IV*sqrt(T)   vs 12:05
-        12:05    21.87     +116%         16.17         --
-        13:30    25.73     +154%         14.56       -10%
-        14:30    37.44     +270%         14.98        -7%
-        15:20    64.43     +536%         10.52       -35%
+     engine expected_move_remaining = 208.1 pts
+     market's own live ATM straddle =  82.1 pts
+     overstatement                  = 2.5x
+
+ Because _em_base read state["opening_straddle_pts"] - the straddle
+ captured at 09:30 on the 15-Sep series, 280 points - and then scaled it
+ by sqrt(remaining fraction): 280 * sqrt(0.552) = 208.0, matching the
+ observed 208.1 exactly.
+
+ This is the same fault v3.5 fixed for opening_iv, on a different
+ baseline: a session-opening value latched on one expiry series and never
+ re-taken when the engine switched to another.
 
  ── THE FIX ────────────────────────────────────────────────────────────────
 
- Compare a quantity that does not depend on T. IV * sqrt(T_remaining) is
- proportional to the expected move in points, which is what a premium
- seller is actually short. On the measured session it decays smoothly from
- 16.17 to 10.52 - a 35% vol crush, correctly read as DECLINING, which is a
- sell condition and not a block. A genuine volatility expansion still
- shows through, because it moves the expected move itself rather than just
- the annualisation.
+ Rather than re-baseline a third stale value, the expected remaining move
+ is now read from the live ATM straddle of the active chain every cycle,
+ and the opening-baseline scaling is dropped.
 
- And re-take the baseline whenever the active expiry changes, recording
- the remaining-time fraction at which it was taken so the two sides of the
- comparison are always the same instrument measured the same way.
+ On the expiry series this needs no time scaling at all. A 0DTE straddle
+ already prices exactly the time left in the session - that is what it is
+ - so multiplying it by sqrt(T_remaining) double-counts the decay. At
+ 12:03 the answer is simply 82.1.
 
- The two changes ship together because they are two halves of one broken
- comparison: fixing the baseline without the normalisation still blocks on
- the sqrt(T) ramp, and normalising against a baseline from another series
- still compares different instruments. Neither is measurable alone.
+ Away from expiry the live straddle prices the move to ITS expiry, not to
+ tonight's close, so only today's share is at risk intraday and only the
+ unexpired part of today remains. Both scalings are kept there.
 
- ── COMPATIBILITY ──────────────────────────────────────────────────────────
+ expected_range_so_far_pts is a statement about the whole session rather
+ than what is left of it, so it keeps the opening baseline. Nothing reads
+ it today, and this patch does not change its meaning.
 
- The normalised path engages only when a baseline remaining-time fraction
- was recorded. Any caller that sets opening_iv by hand and nothing else -
- including data_engine's own self test - keeps the exact v3.1 behaviour,
- sqrt(T) tolerance widening included. This patch therefore changes no
- existing test.
+ ── WHAT THIS AFFECTS ──────────────────────────────────────────────────────
 
- ── WHAT THIS DOES NOT FIX ─────────────────────────────────────────────────
+ expected_move_remaining_pts feeds two consumers, and both were being fed
+ a number 2.5x too large:
 
- The morning of 2026-09-08 is unrecoverable from the recording. The live
- collector polled the 15-Sep series until 12:03, so for 206 cycles the
- 0DTE chain the engine needed simply is not in the database, and those
- cycles are correctly rejected as dte 5 above max 4. That is a defect in
- the collector, not in the decision code, and no patch to this repo can
- recover data that was never captured. Until it is fixed every session you
- record will lose its morning.
+   strategy_engine:526   the strike-distance clamp described above
+   strategy_engine:1342  the EV gate's risk horizon
 
- One live session remains one sample. Removing a blocker that was
- provably misfiring is not evidence that the trades it now permits make
- money.
+ So this also tightens the EV gate's estimate of what can go wrong. That
+ is a real behavioural change beyond strike selection and it is called out
+ here rather than left to be discovered.
+
+ ── HONEST SCOPE ───────────────────────────────────────────────────────────
+
+ This corrects a units error against the market's own quoted price. It is
+ not a tuning parameter and it was not fitted to an outcome. But one live
+ session is still one sample, and letting a trade through is not the same
+ as that trade making money.
 
  Usage:
-     python3 patch-version5.py            # apply
-     python3 patch-version5.py --verify   # report state, change nothing
+     python3 patch-version6.py            # apply
+     python3 patch-version6.py --verify   # report state, change nothing
 """
 
 import argparse
@@ -99,36 +100,43 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 
-MARKER_V34 = "NIFTY_ENGINE_PROFIT_PATCH_V34"
 MARKER_V35 = "NIFTY_ENGINE_PROFIT_PATCH_V35"
+MARKER_V36 = "NIFTY_ENGINE_PROFIT_PATCH_V36"
 
 TOUCHED = ["core.py", "data_engine.py"]
 
 
 
-OLD_IV_BLOCK = """\
-        atm_iv_pct    = atm_iv * 100.0 if atm_iv < 2.0 else atm_iv
-        opening_iv_pct = opening_iv * 100.0 if opening_iv < 2.0 else opening_iv
-
-        iv_change_pct = (atm_iv_pct - opening_iv_pct) / opening_iv_pct * 100.0
-
-        # v3.1: on expiry day the MEASURED ATM IV drifts upward through the
-        # afternoon even in a dead-flat market, because the sqrt(T) in the
-        # denominator collapses faster than the residual premium does. With
-        # fixed bands, EXPANDING — a hard entry block — fires on quiet 0DTE
-        # afternoons and kills the highest-theta window of the week. The
-        # bands are therefore inflated by the same sqrt(T) factor on 0DTE,
-        # which neutralises the artefact while leaving a genuine volatility
-        # expansion (which is far larger) fully detected.
-        _dte_iv = self.state.get("actual_dte", 0)
-        _tol = 1.0
-        if _dte_iv == 0:
-            _elapsed = max(0.0, (
-                datetime.combine(today_ist(), now_ist().time()) -
-                datetime.combine(today_ist(), dtime(9, 15))
-            ).total_seconds() / 60.0)
-            _rem_frac = max((375.0 - _elapsed) / 375.0, 0.04)
-            _tol = min(max(_rem_frac ** -0.5, 1.0), 3.2)"""
+EM_OLD = """\
+            _em_base = float(
+                self.state.get("opening_straddle_pts")
+                or self.state.get("_last_atm_straddle")
+                or 0.0
+            )
+            if _em_base <= 20 and atm_straddle > 20:
+                _em_base = float(atm_straddle)
+            if _em_base <= 20:
+                _em_sp = float(spot or self.state.get("prev_spot") or 0.0)
+                _em_base = _em_sp * 0.009 if _em_sp > 0 else 0.0
+            if _em_base > 20:
+                _em_dte = actual_dte if actual_dte is not None else 1
+                if _em_dte and _em_dte > 0:
+                    # For a multi-day contract only the part of the
+                    # straddle attributable to today is at risk intraday.
+                    _em_scale = _math_em.sqrt(
+                        1.0 / max(float(_em_dte) + 1.0, 1.0)
+                    )
+                else:
+                    _em_scale = 1.0
+                _expected_move_remaining = round(
+                    _em_base * _em_scale * _math_em.sqrt(_em_rem_frac), 2
+                )
+                _expected_range_so_far = round(
+                    _em_base * _math_em.sqrt(max(1.0 - _em_rem_frac, 0.02)), 2
+                )
+            else:
+                _expected_move_remaining = 0.0
+                _expected_range_so_far = 0.0"""
 
 
 def _child_env() -> dict:
@@ -227,7 +235,7 @@ class FilePatcher:
 
 
 def backup_all(stamp: str) -> Path:
-    d = BASE / f"patch_v35_backup_{stamp}"
+    d = BASE / f"patch_v36_backup_{stamp}"
     d.mkdir(exist_ok=True)
     for name in TOUCHED + ["env.txt"]:
         p = BASE / name
@@ -241,166 +249,73 @@ def restore_all(d: Path) -> None:
         shutil.copy2(f, BASE / f.name)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  edits
-# ═══════════════════════════════════════════════════════════════════════════
+EM_NEW = '''            # ── v3.6 ─────────────────────────────────────────────────
+            # The expected remaining move now comes from the live ATM
+            # straddle of the ACTIVE chain, every cycle.
+            #
+            # It used to come from state["opening_straddle_pts"] scaled by
+            # sqrt(remaining fraction). On 2026-09-08 that baseline was
+            # captured at 09:30 on the 15-Sep series - 280 points - and
+            # the engine was still using it after it switched to the 0DTE
+            # chain at 12:03, where the real straddle was 82.1:
+            #
+            #     280 * sqrt(0.552) = 208.0   the engine's answer
+            #     live ATM straddle =  82.1   the market's answer
+            #
+            # A 2.5x overstatement, which strategy_engine turns into a
+            # floor of 0.80 * EM on how far out the short strike must sit.
+            # Delta selection asked for 95 points and got clamped to 166,
+            # so the engine sold 0.085 delta instead of the 0.224 it had
+            # chosen, collected 2.80 instead of 10.35, and then rejected
+            # itself because friction was 76% of the credit.
+            #
+            # On the expiry series no time scaling belongs here at all: a
+            # 0DTE straddle already prices exactly the time left in the
+            # session, so scaling it again by sqrt(T) double-counts decay.
+            # Away from expiry the straddle prices the move to ITS expiry,
+            # so today's share and the unexpired part of today both apply.
+            _em_live = float(atm_straddle or 0.0)
+            if _em_live <= 20:
+                _em_live = float(self.state.get("_last_atm_straddle") or 0.0)
+
+            _em_dte = actual_dte if actual_dte is not None else 1
+
+            if _em_live > 20:
+                if _em_dte is not None and _em_dte > 0:
+                    _expected_move_remaining = round(
+                        _em_live
+                        * _math_em.sqrt(1.0 / max(float(_em_dte) + 1.0, 1.0))
+                        * _math_em.sqrt(_em_rem_frac), 2
+                    )
+                else:
+                    _expected_move_remaining = round(_em_live, 2)
+            else:
+                # No usable chain. Fall back to a fraction of spot, still
+                # never to the opening baseline.
+                _em_sp = float(spot or self.state.get("prev_spot") or 0.0)
+                _expected_move_remaining = round(
+                    _em_sp * 0.009 * _math_em.sqrt(_em_rem_frac), 2
+                ) if _em_sp > 0 else 0.0
+
+            # expected_range_so_far is about the whole session, not what is
+            # left of it, so it keeps the opening baseline unchanged.
+            _em_base = float(self.state.get("opening_straddle_pts") or 0.0)
+            if _em_base <= 20 and _em_live > 20:
+                _em_base = _em_live
+            _expected_range_so_far = round(
+                _em_base * _math_em.sqrt(max(1.0 - _em_rem_frac, 0.02)), 2
+            ) if _em_base > 20 else 0.0'''
+
 
 def patch_core(p: FilePatcher) -> None:
     p.sub("core/version-marker",
-          f'{MARKER_V34} = "3.4"',
-          f'{MARKER_V34} = "3.4"\n{MARKER_V35} = "3.5"')
-
-
-HELPER_ANCHOR = "    def _compute_iv_behavior("
-
-HELPER_NEW = '''    def _session_rem_frac(self) -> float:
-        """
-        Fraction of the 09:15-15:30 session still to run, floored at 0.04.
-
-        v3.5: hoisted out of _compute_iv_behavior so the IV baseline and the
-        live reading are normalised by the same clock.
-        """
-        _elapsed = max(0.0, (
-            datetime.combine(today_ist(), now_ist().time()) -
-            datetime.combine(today_ist(), dtime(9, 15))
-        ).total_seconds() / 60.0)
-        return max((375.0 - _elapsed) / 375.0, 0.04)
-
-    def _compute_iv_behavior('''
-
-
-INIT_OLD = '''            self.state["opening_iv"]          = atm_iv
-            self.state["session_initialized"] = True'''
-
-INIT_NEW = '''            self.state["opening_iv"]          = atm_iv
-            self.state["session_initialized"] = True
-            # v3.5: record which series the baseline came from and how much
-            # of the session was left when it was taken. Without both, the
-            # baseline cannot be compared against anything later on.
-            self.state["opening_iv_expiry"]   = self.state.get("actual_expiry")
-            self.state["opening_iv_rem_frac"] = self._session_rem_frac()'''
-
-
-GUARD_OLD = '''        if bars is None or len(bars) < 6:
-            return "UNKNOWN", 0.0'''
-
-GUARD_NEW = '''        if bars is None or len(bars) < 6:
-            return "UNKNOWN", 0.0
-
-        # v3.5: a baseline taken on a different expiry series is not a
-        # baseline. On 2026-09-08 the engine opened on the 15-Sep chain,
-        # latched 10.13%, then switched to the 0DTE chain at 12:03 and read
-        # the change of contract as a volatility spike for the rest of the
-        # day. Re-take it, and say so in the log.
-        _cur_exp  = self.state.get("actual_expiry")
-        _base_exp = self.state.get("opening_iv_expiry")
-        if _cur_exp and _base_exp and _cur_exp != _base_exp:
-            self.state["opening_iv"]          = atm_iv
-            self.state["opening_iv_expiry"]   = _cur_exp
-            self.state["opening_iv_rem_frac"] = self._session_rem_frac()
-            self.logger.info(
-                f"IV baseline re-taken on expiry change {_base_exp} -> "
-                f"{_cur_exp}: opening_iv={atm_iv * 100.0:.2f}%"
-            )
-            return "UNKNOWN", 0.0'''
-
-
-IV_NEW = '''        atm_iv_pct     = atm_iv * 100.0 if atm_iv < 2.0 else atm_iv
-        opening_iv_pct = opening_iv * 100.0 if opening_iv < 2.0 else opening_iv
-
-        # ── v3.5 ──────────────────────────────────────────────────────────
-        # Raw ATM IV cannot be compared against itself across an expiry
-        # session. As T collapses the annualisation factor blows up: the
-        # measured 0DTE series ran 21.9% at 12:05 to 64.4% at 15:20 on a day
-        # whose whole range was 90 points, a +536% drift that the v3.1
-        # sqrt(T) band widening could not absorb because it caps at 3.2x.
-        # 556 of 562 afternoon cycles were hard-blocked as SPIKING - the
-        # entire 0DTE window, which is the only part of the day worth
-        # trading.
-        #
-        # IV * sqrt(T_remaining) is proportional to the expected move in
-        # points, which is the thing a premium seller is short, and it does
-        # not depend on T. On the measured session it decays 16.17 -> 10.52,
-        # a 35% crush read correctly as DECLINING. A real expansion still
-        # registers because it moves the expected move itself.
-        #
-        # The normalised path needs a baseline taken at a known point in the
-        # session. Where that is absent - a caller that sets opening_iv by
-        # hand, including this module's own self test - behaviour falls back
-        # to v3.1 exactly, sqrt(T) tolerance widening included.
-        _dte_iv   = self.state.get("actual_dte", 0)
-        _rem_base = self.state.get("opening_iv_rem_frac")
-        _tol = 1.0
-
-        if _dte_iv == 0 and _rem_base:
-            _rem_now   = self._session_rem_frac()
-            _cur_norm  = atm_iv_pct * math.sqrt(max(_rem_now, 1e-6))
-            _base_norm = opening_iv_pct * math.sqrt(max(float(_rem_base), 1e-6))
-            if _base_norm <= 0.0:
-                return "UNKNOWN", 0.0
-            iv_change_pct = (_cur_norm - _base_norm) / _base_norm * 100.0
-        else:
-            iv_change_pct = (atm_iv_pct - opening_iv_pct) / opening_iv_pct * 100.0
-            if _dte_iv == 0:
-                _rem_frac = self._session_rem_frac()
-                _tol = min(max(_rem_frac ** -0.5, 1.0), 3.2)'''
-
-
-TEST_SETUP_OLD = '''    engine.state["opening_iv"] = 0.125  # 12.5%
-    engine.state["session_initialized"] = True'''
-
-TEST_SETUP_NEW = '''    engine.state["opening_iv"] = 0.125  # 12.5%
-    engine.state["session_initialized"] = True
-    # v3.5: pin the series away from expiry so the band assertions below are
-    # deterministic. They were not: v3.1's sqrt(T) tolerance widening reads
-    # the wall clock, so out of hours _tol reached its 3.2 cap, the STABLE
-    # band opened to +/-16%, and "IV 13.8% vs open 12.5%" (+10.4%) returned
-    # STABLE instead of EXPANDING. This test therefore passed during market
-    # hours and failed outside them, on the tree as it stood before v3.5.
-    # The 0DTE path it used to exercise by accident is now covered on
-    # purpose, with the clock pinned, at the end of this block.
-    engine.state["actual_dte"] = 5'''
-
-TEST_0DTE_OLD = '''    print("  [OK] IV behavior test passed")'''
-
-TEST_0DTE_NEW = '''    # v3.5: the measured 2026-09-08 afternoon, with the session clock
-    # pinned so the result does not depend on when the test is run. The
-    # baseline is the 0DTE reading at 12:05 (22.0% with 205 of 375 minutes
-    # left) and the live reading is 15:20 (64.4% with 10 minutes left).
-    # Raw, that is +193% and a hard SPIKING block. Normalised it is a 35%
-    # collapse in the expected move, which is what actually happened.
-    engine.state["actual_dte"]          = 0
-    engine.state["opening_iv"]          = 0.22
-    engine.state["opening_iv_rem_frac"] = 205.0 / 375.0
-    engine.state["opening_iv_expiry"]   = "2026-09-08"
-    engine.state["actual_expiry"]       = "2026-09-08"
-    _saved_rem_frac = engine._session_rem_frac
-    engine._session_rem_frac = lambda: 10.0 / 375.0
-    try:
-        beh0, chg0 = engine._compute_iv_behavior(0.6443, test_bars)
-    finally:
-        engine._session_rem_frac = _saved_rem_frac
-    print(f"  0DTE IV 64.4% vs open 22.0% into the close: {beh0} ({chg0:.1f}%)")
-    assert beh0 in ("CRUSHING", "DECLINING"), (
-        f"A quiet expiry afternoon must read as a vol crush, got {beh0} {chg0}"
-    )
-    assert chg0 < -20.0, f"Expected a large negative normalised change, got {chg0}"
-
-    print("  [OK] IV behavior test passed")'''
+          f'{MARKER_V35} = "3.5"',
+          f'{MARKER_V35} = "3.5"\n{MARKER_V36} = "3.6"')
 
 
 def patch_data_engine(p: FilePatcher) -> None:
-    p.sub("data_engine/session-rem-frac-helper", HELPER_ANCHOR, HELPER_NEW)
-    p.sub("data_engine/deterministic-iv-band-test", TEST_SETUP_OLD, TEST_SETUP_NEW)
-    p.sub("data_engine/0dte-normalisation-test", TEST_0DTE_OLD, TEST_0DTE_NEW)
-    p.sub("data_engine/baseline-records-series-and-clock", INIT_OLD, INIT_NEW)
-    p.sub("data_engine/rebaseline-on-expiry-change", GUARD_OLD, GUARD_NEW)
-    p.sub("data_engine/time-normalised-iv-behavior", OLD_IV_BLOCK, IV_NEW)
+    p.sub("data_engine/live-straddle-expected-move", EM_OLD, EM_NEW)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  verification
-# ═══════════════════════════════════════════════════════════════════════════
 
 def verify_syntax() -> list[str]:
     errs = []
@@ -418,74 +333,65 @@ def verify_semantics() -> list[str]:
     de_src = (BASE / "data_engine.py").read_text(encoding="utf-8")
 
     checks = [
-        ("core carries the v3.5 marker", MARKER_V35 in core_src),
-        ("core keeps the v3.4 marker", MARKER_V34 in core_src),
-        ("the session-clock helper exists",
-         "def _session_rem_frac(self) -> float:" in de_src),
-        ("the baseline records its expiry series",
-         '"opening_iv_expiry"]   = self.state.get("actual_expiry")' in de_src),
-        ("the baseline records its clock",
-         '"opening_iv_rem_frac"] = self._session_rem_frac()' in de_src),
-        ("the baseline is re-taken on an expiry change",
-         "IV baseline re-taken on expiry change" in de_src),
-        ("IV behaviour is compared in time-normalised space",
-         "_cur_norm  = atm_iv_pct * math.sqrt(max(_rem_now, 1e-6))" in de_src),
-        ("the v3.1 path survives when no baseline clock exists",
-         "_tol = min(max(_rem_frac ** -0.5, 1.0), 3.2)" in de_src),
-        ("the band test no longer depends on the wall clock",
-         'engine.state["actual_dte"] = 5' in de_src),
-        ("the 0DTE normalisation is covered by a test",
-         "A quiet expiry afternoon must read as a vol crush" in de_src),
-        ("the bare raw comparison is no longer unconditional",
-         de_src.count(
-             "iv_change_pct = (atm_iv_pct - opening_iv_pct) / opening_iv_pct"
-             " * 100.0") == 1),
+        ("core carries the v3.6 marker", MARKER_V36 in core_src),
+        ("core keeps the v3.5 marker", MARKER_V35 in core_src),
+        ("the expected move reads the live ATM straddle",
+         "_em_live = float(atm_straddle or 0.0)" in de_src),
+        ("0DTE takes the straddle unscaled",
+         "_expected_move_remaining = round(_em_live, 2)" in de_src),
+        ("non-expiry keeps both time scalings",
+         "* _math_em.sqrt(1.0 / max(float(_em_dte) + 1.0, 1.0))" in de_src),
+        ("the opening baseline no longer feeds the expected move",
+         '_em_base = float(\n                self.state.get("opening_straddle_pts")'
+         not in de_src),
+        ("expected_range_so_far still uses the opening baseline",
+         '_em_base = float(self.state.get("opening_straddle_pts") or 0.0)'
+         in de_src),
+        ("both signals are still published",
+         '"expected_move_remaining_pts": _expected_move_remaining,' in de_src
+         and '"expected_range_so_far_pts":   _expected_range_so_far,' in de_src),
     ]
     for label, ok in checks:
         print(f"    {'PASS' if ok else 'FAIL'}  {label}")
         if not ok:
             errs.append(label)
 
-    out = _run_py(
-        "import data_engine, inspect\n"
-        "src = inspect.getsource(data_engine.MarketDataEngine._compute_iv_behavior)\n"
-        "print('NORM' if 'math.sqrt' in src else 'NONORM')\n", 180)
-    ok = out.returncode == 0 and "NORM" in out.stdout and "NONORM" not in out.stdout
-    print(f"    {'PASS' if ok else 'FAIL'}  data_engine imports and carries the fix")
+    out = _run_py("import data_engine\nprint('IMPORT_OK')\n", 180)
+    ok = out.returncode == 0 and "IMPORT_OK" in out.stdout
+    print(f"    {'PASS' if ok else 'FAIL'}  data_engine imports")
     if not ok:
-        errs.append("data_engine import check: "
+        errs.append("data_engine import: "
                     + ((out.stderr or "").strip().splitlines() or ["?"])[-1])
     return errs
 
 
 def verify_behaviour() -> list[str]:
     """
-    Prove the arithmetic on the real measured numbers rather than asserting
-    it in a comment. A quiet expiry afternoon must read as a vol crush.
+    Exercise the patched arithmetic directly on the measured 12:03 numbers
+    rather than trusting the comment above it.
     """
     errs = []
     out = _run_py(
         "import math\n"
-        "pts = [('12:05', 21.87), ('13:30', 25.73), ('15:20', 64.43)]\n"
-        "base = None\n"
-        "res = []\n"
-        "for t, iv in pts:\n"
-        "    h, m = t.split(':')\n"
-        "    rem = (15 * 60 + 30) - (int(h) * 60 + int(m))\n"
-        "    n = iv * math.sqrt(max(rem, 1) / 375.0)\n"
-        "    base = n if base is None else base\n"
-        "    res.append((t, iv, (iv - 10.13) / 10.13 * 100.0,"
-        " n, (n - base) / base * 100.0))\n"
-        "for t, iv, raw, n, nn in res:\n"
-        "    print(f'{t} raw={raw:+.0f}% norm={nn:+.0f}%')\n"
-        "assert res[-1][2] > 500, 'raw drift should be enormous'\n"
-        "assert res[-1][4] < -20, 'normalised should read as a crush'\n"
+        "live, opening, rem = 82.1, 280.0, (375.0 - 168.0) / 375.0\n"
+        "old = round(opening * math.sqrt(rem), 2)\n"
+        "new0 = round(live, 2)\n"
+        "new7 = round(live * math.sqrt(1.0 / 8.0) * math.sqrt(rem), 2)\n"
+        "print(f'old (opening 15-Sep straddle, scaled) = {old}')\n"
+        "print(f'new 0DTE  (live straddle, unscaled)   = {new0}')\n"
+        "print(f'new 7DTE  (live straddle, scaled)     = {new7}')\n"
+        "assert abs(old - 208.0) < 0.2, old\n"
+        "assert abs(new0 - 82.1) < 0.01, new0\n"
+        "assert new7 < new0, 'a far series must contribute less to today'\n"
+        "band_old, band_new = 0.80 * old, 0.80 * new0\n"
+        "print(f'strike floor 0.80*EM: {band_old:.0f} pts -> {band_new:.0f} pts')\n"
+        "assert band_new < 95.0, 'the floor must stop overriding a 95pt delta pick'\n"
         "print('ARITHMETIC_OK')\n", 120)
-    ok = out.returncode == 0 and "ARITHMETIC_OK" in out.stdout
     for line in (out.stdout or "").strip().splitlines():
-        if line and "ARITHMETIC_OK" not in line:
+        if "ARITHMETIC_OK" not in line:
             print(f"           {line}")
-    print(f"    {'PASS' if ok else 'FAIL'}  raw drift blocks, normalised drift sells")
+    ok = out.returncode == 0 and "ARITHMETIC_OK" in out.stdout
+    print(f"    {'PASS' if ok else 'FAIL'}  the clamp stops overriding delta selection")
     if not ok:
         errs.append("behaviour check failed")
     return errs
@@ -493,19 +399,19 @@ def verify_behaviour() -> list[str]:
 
 def run_self_tests() -> list[str]:
     errs = []
-    for mod in ("data_engine.py", "regime_engine.py"):
-        out = _run_py(
-            "import runpy\n"
-            f"runpy.run_path({str(BASE / mod)!r}, run_name='__main__')\n", 600)
+    for mod in ("data_engine.py", "strategy_engine.py", "regime_engine.py"):
+        body = ("import runpy\n"
+                f"runpy.run_path({str(BASE / '@M@')!r}, run_name='__main__')\n"
+                ).replace("@M@", mod)
+        out = _run_py(body, 600)
         combined = (out.stderr or "") + (out.stdout or "")
         ok = out.returncode == 0
         if not ok and "UnicodeEncodeError" in combined:
             print(f"    WARN  {mod} could not write its output on this console")
-            print("          (a display problem, not a failed assertion)")
             out = _run_py(
                 "import runpy, os, sys\n"
                 "sys.stdout = open(os.devnull, 'w')\n"
-                f"runpy.run_path({str(BASE / mod)!r}, run_name='__main__')\n", 600)
+                + body.split("\n", 1)[1], 600)
             combined = (out.stderr or "") + (out.stdout or "")
             ok = out.returncode == 0
         print(f"    {'PASS' if ok else 'FAIL'}  {mod} self test")
@@ -519,7 +425,7 @@ def run_self_tests() -> list[str]:
 def do_verify() -> int:
     print("\n  state of the tree\n")
     core_src = (BASE / "core.py").read_text(encoding="utf-8")
-    for label, marker in (("v3.4", MARKER_V34), ("v3.5", MARKER_V35)):
+    for label, marker in (("v3.5", MARKER_V35), ("v3.6", MARKER_V36)):
         print(f"    {label}: {'installed' if marker in core_src else 'NOT installed'}")
     print()
     errs = verify_semantics()
@@ -529,25 +435,24 @@ def do_verify() -> int:
 
 def main() -> int:
     _harden_stdout()
-    ap = argparse.ArgumentParser(description="NIFTY engine profitability patch v3.5")
-    ap.add_argument("--verify", action="store_true",
-                    help="report the state of the tree and change nothing")
+    ap = argparse.ArgumentParser(description="NIFTY engine profitability patch v3.6")
+    ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()
 
     print("=" * 76)
-    print(" NIFTY intraday options engine - profitability patch v3.5")
-    print(" the IV baseline: wrong series, and wrong units")
+    print(" NIFTY intraday options engine - profitability patch v3.6")
+    print(" the expected move: read it from the market, every cycle")
     print("=" * 76)
 
     if args.verify:
         return do_verify()
 
     core_src = (BASE / "core.py").read_text(encoding="utf-8")
-    if MARKER_V34 not in core_src:
-        print("\n  REFUSING: v3.4 must be installed first. Run patch-version4.py.\n")
+    if MARKER_V35 not in core_src:
+        print("\n  REFUSING: v3.5 must be installed first. Run patch-version5.py.\n")
         return 1
-    if MARKER_V35 in core_src:
-        print("\n  v3.5 is already installed. Nothing to do.\n")
+    if MARKER_V36 in core_src:
+        print("\n  v3.6 is already installed. Nothing to do.\n")
         return 0
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -575,10 +480,8 @@ def main() -> int:
 
         print("\n  semantics\n")
         errs += verify_semantics()
-
         print("\n  behaviour\n")
         errs += verify_behaviour()
-
         print("\n  self tests\n")
         errs += run_self_tests()
 
@@ -593,26 +496,19 @@ def main() -> int:
         return 1
 
     print("\n" + "=" * 76)
-    print(" v3.5 applied and verified.")
+    print(" v3.6 applied and verified.")
     print("=" * 76)
     print(f"""
  What changed
 
-   data_engine._compute_iv_behavior now compares IV * sqrt(T_remaining)
-   instead of raw IV on the expiry series, and re-takes its baseline
-   whenever the active expiry changes, recording the clock at which it was
-   taken. Measured effect on 2026-09-08: IV_SPIKING_HARD_BLOCK was the
-   terminal gate on 556 of the 562 afternoon cycles.
+   expected_move_remaining_pts is now the live ATM straddle of the active
+   chain, taken fresh each cycle, unscaled on the expiry series and scaled
+   for today's share away from it. It no longer reads the opening
+   straddle, which on 2026-09-08 was a 15-Sep value of 280 points still in
+   use at 12:03 when the real 0DTE straddle was 82.1.
 
-   Callers that set opening_iv without a baseline clock keep v3.1
-   behaviour exactly, so no existing test changes.
-
- What is still broken, and not by this patch
-
-   The collector polled the 15-Sep series until 12:03 on 2026-09-08, so
-   the morning 206 cycles have no 0DTE chain to trade and are correctly
-   rejected as dte 5 above max 4. Fix the collector or every session you
-   record will keep losing its morning.
+   This feeds strike selection AND the EV gate's risk horizon, so both
+   were previously working from a number 2.5x too large.
 
  Rollback
 
