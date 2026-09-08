@@ -1164,10 +1164,18 @@ def print_audit(store: HistoricalStore) -> int:
 # the conditional one: of the candidates that reached this gate, how many did
 # it kill.
 STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
+    # The regime combiner applies its own time gates (before 09:45, past
+    # 14:30) and its confidence block in the same pass that produces the
+    # verdict, so they belong here and not later. Leaving PAST_14:30 out
+    # cost a full run: 231 cycles rejected by that gate fell through to
+    # UNCLASSIFIED, which sorts after every real stage, so the funnel
+    # credited them with reaching AND passing the EV gate and reported it
+    # at 100%. Nothing had reached it at all.
     ("regime verdict", (
         "VOL_NEUTRAL", "VOL_BUY_OPTIONS", "CHOPPY_MARKET", "regime",
         "RANGE_UNCLEAR", "STRADDLE_EXPLOSION", "or_not_established",
-        "NO_CLEAR", "UNCLEAR", "TRENDING", "EXPANSION")),
+        "NO_CLEAR", "UNCLEAR", "TRENDING", "EXPANSION",
+        "PAST_14", "BEFORE_09", "CONFIDENCE_NONE")),
     ("safety interlocks", (
         "vix", "circuit_breaker", "expanding", "spiking", "daily_loss_halt",
         "daily", "abort")),
