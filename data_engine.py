@@ -3115,35 +3115,62 @@ class MarketDataEngine:
                 datetime.combine(today_ist(), dtime(9, 15))
             ).total_seconds() / 60.0)
             _em_rem_frac = min(max((375.0 - _em_elapsed) / 375.0, 0.04), 1.0)
-            _em_base = float(
-                self.state.get("opening_straddle_pts")
-                or self.state.get("_last_atm_straddle")
-                or 0.0
-            )
-            if _em_base <= 20 and atm_straddle > 20:
-                _em_base = float(atm_straddle)
-            if _em_base <= 20:
-                _em_sp = float(spot or self.state.get("prev_spot") or 0.0)
-                _em_base = _em_sp * 0.009 if _em_sp > 0 else 0.0
-            if _em_base > 20:
-                _em_dte = actual_dte if actual_dte is not None else 1
-                if _em_dte and _em_dte > 0:
-                    # For a multi-day contract only the part of the
-                    # straddle attributable to today is at risk intraday.
-                    _em_scale = _math_em.sqrt(
-                        1.0 / max(float(_em_dte) + 1.0, 1.0)
+            # ── v3.6 ─────────────────────────────────────────────────
+            # The expected remaining move now comes from the live ATM
+            # straddle of the ACTIVE chain, every cycle.
+            #
+            # It used to come from state["opening_straddle_pts"] scaled by
+            # sqrt(remaining fraction). On 2026-09-08 that baseline was
+            # captured at 09:30 on the 15-Sep series - 280 points - and
+            # the engine was still using it after it switched to the 0DTE
+            # chain at 12:03, where the real straddle was 82.1:
+            #
+            #     280 * sqrt(0.552) = 208.0   the engine's answer
+            #     live ATM straddle =  82.1   the market's answer
+            #
+            # A 2.5x overstatement, which strategy_engine turns into a
+            # floor of 0.80 * EM on how far out the short strike must sit.
+            # Delta selection asked for 95 points and got clamped to 166,
+            # so the engine sold 0.085 delta instead of the 0.224 it had
+            # chosen, collected 2.80 instead of 10.35, and then rejected
+            # itself because friction was 76% of the credit.
+            #
+            # On the expiry series no time scaling belongs here at all: a
+            # 0DTE straddle already prices exactly the time left in the
+            # session, so scaling it again by sqrt(T) double-counts decay.
+            # Away from expiry the straddle prices the move to ITS expiry,
+            # so today's share and the unexpired part of today both apply.
+            _em_live = float(atm_straddle or 0.0)
+            if _em_live <= 20:
+                _em_live = float(self.state.get("_last_atm_straddle") or 0.0)
+
+            _em_dte = actual_dte if actual_dte is not None else 1
+
+            if _em_live > 20:
+                if _em_dte is not None and _em_dte > 0:
+                    _expected_move_remaining = round(
+                        _em_live
+                        * _math_em.sqrt(1.0 / max(float(_em_dte) + 1.0, 1.0))
+                        * _math_em.sqrt(_em_rem_frac), 2
                     )
                 else:
-                    _em_scale = 1.0
-                _expected_move_remaining = round(
-                    _em_base * _em_scale * _math_em.sqrt(_em_rem_frac), 2
-                )
-                _expected_range_so_far = round(
-                    _em_base * _math_em.sqrt(max(1.0 - _em_rem_frac, 0.02)), 2
-                )
+                    _expected_move_remaining = round(_em_live, 2)
             else:
-                _expected_move_remaining = 0.0
-                _expected_range_so_far = 0.0
+                # No usable chain. Fall back to a fraction of spot, still
+                # never to the opening baseline.
+                _em_sp = float(spot or self.state.get("prev_spot") or 0.0)
+                _expected_move_remaining = round(
+                    _em_sp * 0.009 * _math_em.sqrt(_em_rem_frac), 2
+                ) if _em_sp > 0 else 0.0
+
+            # expected_range_so_far is about the whole session, not what is
+            # left of it, so it keeps the opening baseline unchanged.
+            _em_base = float(self.state.get("opening_straddle_pts") or 0.0)
+            if _em_base <= 20 and _em_live > 20:
+                _em_base = _em_live
+            _expected_range_so_far = round(
+                _em_base * _math_em.sqrt(max(1.0 - _em_rem_frac, 0.02)), 2
+            ) if _em_base > 20 else 0.0
         except Exception:
             _expected_move_remaining = 0.0
             _expected_range_so_far = 0.0
