@@ -177,6 +177,46 @@ class MainEngine:
             f"As of 2026, NIFTY lot size = 75 units (verify current spec)."
         )
 
+    def _validate_session_state_integrity(self) -> None:
+        today_str = today_ist().isoformat()
+        state = self.market_engine.state
+        actual_stops = self.db.query(
+            "SELECT COUNT(*) as cnt FROM trade_exits "
+            "WHERE trade_id IN ("
+            "SELECT position_id FROM positions WHERE trading_date=?"
+            ") AND exit_reason='CLOSE_STOP'",
+            (today_str,),
+        )
+        real_stops = actual_stops[0]["cnt"] if actual_stops else 0
+        stored_stops = int(state.get("consecutive_stops", 0) or 0)
+        if stored_stops != real_stops:
+            self.logger.warning(
+                f"Session state integrity: consecutive_stops={stored_stops} "
+                f"but actual stop exits today={real_stops}. Correcting."
+            )
+            state["consecutive_stops"] = real_stops
+        actual_pnl_row = self.db.query_one(
+            "SELECT COALESCE(SUM(net_pnl_rupees),0) as total "
+            "FROM trade_exits WHERE trade_id IN ("
+            "SELECT position_id FROM positions WHERE trading_date=?)",
+            (today_str,),
+        )
+        actual_pnl = float(actual_pnl_row["total"] if actual_pnl_row else 0)
+        if actual_pnl > -self.config.starting_capital * self.config.max_daily_loss_pct:
+            if state.get("daily_halted") and real_stops < 2:
+                self.logger.warning(
+                    "Session state integrity: daily_halted=True but losses within limit. "
+                    "Clearing halt flag."
+                )
+                state["daily_halted"] = False
+        state["daily_pnl"] = actual_pnl
+        self.market_engine._save_session_state()
+        self.logger.info(
+            f"Session state validated: stops={real_stops} "
+            f"halted={state.get('daily_halted')} "
+            f"pnl=Rs{actual_pnl:.0f}"
+        )
+
     def _carry_forward_capital(self) -> None:
         """
         Carry forward capital from the previous trading session.
@@ -255,8 +295,22 @@ class MainEngine:
     # INTRADAY HELPERS
     # ─────────────────────────────────────────────────────────────────────
 
+    def _reset_daily_state_if_new_day(self) -> None:
+        today_str = today_ist().isoformat()
+        state = self.market_engine.state
+        if state.get("trading_date") == today_str:
+            return
+        state["consecutive_stops"] = 0
+        state["daily_halted"] = False
+        state["daily_pnl"] = 0.0
+        state["entry_count"] = 0
+        state["last_stop_time"] = None
+        state["last_stop_reason"] = ""
+        state["last_stop_signal_combo"] = ""
+        self.market_engine._save_session_state()
+        self.logger.info(f"Daily state reset for new day: {today_str}")
+
     def _market_open(self) -> bool:
-        """Return True if NSE market is currently open."""
         if ExpiryCalendar.is_holiday(today_ist()):
             return False
         now = now_ist().time()
@@ -429,6 +483,7 @@ class MainEngine:
         current_time = now_ist().time()
 
         # ── Step 1: Reset if new day ──────────────────────────────────────
+        self._reset_daily_state_if_new_day()
         self.market_engine.reset_if_new_day()
 
         # ── Step 2: Market data cycle ─────────────────────────────────────
@@ -520,6 +575,18 @@ class MainEngine:
             self.logger.debug(f"Cycle log P&L update error: {_ple}")
 
         # ── Step 10: Print cycle footer ───────────────────────────────────
+        _atm_iv_none = self.market_engine.state.get("_atm_iv_none_cycles", 0)
+        _vrp_none = self.market_engine.state.get("_vrp_none_cycles", 0)
+        if _atm_iv_none >= 3:
+            self.logger.critical(
+                f"SIGNAL HEALTH: ATM IV None for {_atm_iv_none} cycles — "
+                f"VRP computation degraded"
+            )
+        if _vrp_none >= 3:
+            self.logger.critical(
+                f"SIGNAL HEALTH: VRP None for {_vrp_none} cycles — "
+                f"vol regime defaulting to NEUTRAL"
+            )
         self._print_cycle_footer(signals, total_pnl)
         self.loop_count += 1
 
@@ -986,6 +1053,7 @@ class MainEngine:
         # ── Startup tasks ─────────────────────────────────────────────────
         self._verify_lot_size()
         self._reconcile_open_positions_on_startup()
+        self._validate_session_state_integrity()
         self._carry_forward_capital()
 
         # Startup calibration
@@ -1001,9 +1069,29 @@ class MainEngine:
                 f"Defined risk only"
             )
 
-        # Pre-market status
         now_t = now_ist().time()
-        if now_t < dtime(9, 15):
+        if dtime(9, 0) <= now_t <= dtime(9, 15):
+            self.logger.info("Pre-market validation starting...")
+            _retries = 0
+            while _retries < 5:
+                try:
+                    _spot, _vix = self.market_engine.fetch_spot_and_vix()
+                    if _spot and _spot > 10000 and _vix and _vix > 5:
+                        self.logger.info(
+                            f"Pre-market validation passed: "
+                            f"spot={_spot:.0f} vix={_vix:.2f}"
+                        )
+                        break
+                    else:
+                        self.logger.warning(
+                            f"Pre-market validation attempt {_retries+1}: "
+                            f"spot={_spot} vix={_vix} — retrying"
+                        )
+                except Exception as _pme:
+                    self.logger.warning(f"Pre-market validation error: {_pme}")
+                _retries += 1
+                time_module.sleep(30)
+        elif now_t < dtime(9, 15):
             self.logger.info(
                 "Pre-market: Engine ready. Market opens at 09:15. Waiting."
             )
@@ -1073,7 +1161,7 @@ class MainEngine:
                         f"Main loop iteration took {loop_duration:.0f}s"
                     )
 
-                self._sleep(max(0.5, 1.0 - loop_duration))
+                self._sleep(max(0.2, 1.0 - loop_duration))
 
         except KeyboardInterrupt:
             self.logger.info("Shutdown signal received.")

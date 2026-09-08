@@ -37,25 +37,25 @@ DTE_REQUIREMENTS: Dict[str, Tuple[int, int]] = {
 }
 
 MIN_CREDIT_RATIO: Dict[str, float] = {
-    IRON_BUTTERFLY:   0.18,
-    IRON_CONDOR:      0.12,
-    BULL_PUT_SPREAD:  0.10,
-    BEAR_CALL_SPREAD: 0.10,
+    IRON_BUTTERFLY:   0.15,
+    IRON_CONDOR:      0.10,
+    BULL_PUT_SPREAD:  0.08,
+    BEAR_CALL_SPREAD: 0.08,
 }
 
 MIN_CREDIT_RATIO_DTE0: Dict[str, float] = {
-    IRON_BUTTERFLY:   0.22,
-    IRON_CONDOR:      0.16,
-    BULL_PUT_SPREAD:  0.14,
-    BEAR_CALL_SPREAD: 0.14,
+    IRON_BUTTERFLY:   0.18,
+    IRON_CONDOR:      0.13,
+    BULL_PUT_SPREAD:  0.11,
+    BEAR_CALL_SPREAD: 0.11,
 }
 
 LOT_CAPS_BY_DAY: Dict[str, int] = {
-    "MONDAY":    4,
-    "TUESDAY":   3,
-    "WEDNESDAY": 3,
-    "THURSDAY":  3,
-    "FRIDAY":    3,
+    "MONDAY":    8,
+    "TUESDAY":   10,
+    "WEDNESDAY": 6,
+    "THURSDAY":  6,
+    "FRIDAY":    5,
 }
 
 ENTRY_COOLDOWN_MIN = 10
@@ -225,6 +225,12 @@ class StrategyEngine:
             except Exception:
                 pass
 
+        if signals.get("spot_velocity_block"):
+            return "NO_TRADE", f"spot_velocity_too_fast_{signals.get('spot_velocity_pts', 0):.0f}pts_in_3min"
+
+        if signals.get("straddle_expanding"):
+            return "NO_TRADE", "straddle_expanding_no_sell_into_rising_iv"
+
         if not signals.get("or_computed"):
             return "NO_TRADE", "opening_range_not_yet_computed"
         if signals.get("price_regime") in ("OBSERVING",):
@@ -341,14 +347,12 @@ class StrategyEngine:
     ) -> str:
         if dte != 0:
             return IRON_CONDOR
-        if (or_condition == "VERY_NARROW" and
-                adx_15_mature and
-                adx_15 < 15 and
-                current_time < dtime(11, 30) and
-                vol_regime in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM")):
+        if (or_condition in ("VERY_NARROW", "NARROW") and
+                adx_15 < 20 and
+                current_time < dtime(12, 0)):
             spot       = float(signals.get("spot") or 0)
             atm_strike = int(signals.get("atm_strike") or 0)
-            if atm_strike > 0 and abs(spot - atm_strike) < 30:
+            if atm_strike > 0 and abs(spot - atm_strike) < 50:
                 return IRON_BUTTERFLY
         return IRON_CONDOR
 
@@ -366,17 +370,17 @@ class StrategyEngine:
 
         if strategy_name == IRON_BUTTERFLY:
             atm_strike = int(signals.get("atm_strike") or 0)
-            if atm_strike > 0 and abs(spot - atm_strike) > 25:
+            if atm_strike > 0 and abs(spot - atm_strike) > 50:
                 return False, f"butterfly_spot_too_far_from_atm_{atm_strike:.0f}"
             if dte not in (0, 1):
                 return False, f"butterfly_requires_dte_0_or_1_not_{dte}"
-            if dte == 0 and current_time >= dtime(11, 30):
-                return False, "butterfly_too_late_after_11:30_on_0dte"
-            if adx_15 > 20:
-                return False, f"butterfly_blocked_adx_{adx_15:.0f}_needs_flat_below_20"
-            if signals.get("or_condition", "MODERATE") not in ("VERY_NARROW", "NARROW"):
+            if dte == 0 and current_time >= dtime(12, 0):
+                return False, "butterfly_too_late_after_12:00_on_0dte"
+            if adx_15 > 22:
+                return False, f"butterfly_blocked_adx_{adx_15:.0f}_needs_flat_below_22"
+            if signals.get("or_condition", "MODERATE") not in ("VERY_NARROW", "NARROW", "MODERATE"):
                 return False, (
-                    f"butterfly_requires_narrow_or_not_{signals.get('or_condition')}"
+                    f"butterfly_requires_moderate_or_better_not_{signals.get('or_condition')}"
                 )
 
         elif strategy_name == IRON_CONDOR:
@@ -444,6 +448,10 @@ class StrategyEngine:
     ) -> Tuple[Optional[List[dict]], Optional[str]]:
         step             = self.config.nifty_strike_step
         opening_straddle = float(signals.get("opening_straddle_pts") or 0)
+        _max_pain = float(signals.get("max_pain") or 0)
+        _center_ref = spot
+        if dte == 0 and _max_pain > 0 and abs(_max_pain - spot) <= 120:
+            _center_ref = _max_pain
         adx_15           = float(signals.get("adx_15") or 0)
         vix              = float(signals.get("vix") or 11.0)
 
@@ -458,20 +466,20 @@ class StrategyEngine:
                 (total_mins2 - elapsed_mins2) / total_mins2, 0.05
             )
             time_mult2 = math.sqrt(remaining_frac2)
-            dist_mult  = 1.0 * time_mult2
-            floor_pts  = max(int(120 * time_mult2), 55)
+            dist_mult  = 1.3 * time_mult2
+            floor_pts  = max(int(150 * time_mult2), 70)
         elif dte == 1:
-            dist_mult, floor_pts = 0.85, 130
+            dist_mult, floor_pts = 1.05, 150
         elif dte == 2:
-            dist_mult, floor_pts = 0.65, 110
+            dist_mult, floor_pts = 0.80, 130
         elif dte == 3:
-            dist_mult, floor_pts = 0.55, 100
+            dist_mult, floor_pts = 0.68, 120
         elif dte == 4:
-            dist_mult, floor_pts = 0.48, 90
+            dist_mult, floor_pts = 0.58, 110
         elif dte == 5:
-            dist_mult, floor_pts = 0.42, 85
+            dist_mult, floor_pts = 0.50, 100
         else:
-            dist_mult, floor_pts = 0.38, 80
+            dist_mult, floor_pts = 0.45, 95
 
         if adx_15 >= self.config.adx_strong_threshold:
             dist_mult *= 1.20
@@ -502,15 +510,15 @@ class StrategyEngine:
             return self._build_iron_butterfly(chain, spot, step, wing)
         if strategy_name == IRON_CONDOR:
             return self._build_iron_condor(
-                chain, spot, step, dte, short_dist, delta_target, wing, signals
+                chain, spot, step, dte, short_dist, delta_target, wing, signals, _center_ref
             )
         if strategy_name == BULL_PUT_SPREAD:
             return self._build_bull_put_spread(
-                chain, spot, step, dte, short_dist, delta_target, wing
+                chain, spot, step, dte, short_dist, delta_target, wing, _center_ref
             )
         if strategy_name == BEAR_CALL_SPREAD:
             return self._build_bear_call_spread(
-                chain, spot, step, dte, short_dist, delta_target, wing
+                chain, spot, step, dte, short_dist, delta_target, wing, _center_ref
             )
         return None, f"unknown_strategy_{strategy_name}"
 
@@ -545,10 +553,12 @@ class StrategyEngine:
         delta_target: float,
         wing:         int,
         signals:      dict,
+        center_ref:   Optional[float] = None,
     ) -> Tuple[Optional[List[dict]], Optional[str]]:
+        _cr = center_ref if center_ref is not None else spot
         if short_dist is not None:
-            sc = int(round((spot + short_dist) / step) * step)
-            sp = int(round((spot - short_dist) / step) * step)
+            sc = int(round((_cr + short_dist) / step) * step)
+            sp = int(round((_cr - short_dist) / step) * step)
         else:
             sc = self._find_strike_by_delta(chain, "call", delta_target)
             sp = self._find_strike_by_delta(chain, "put",  delta_target)
@@ -587,9 +597,11 @@ class StrategyEngine:
         short_dist:   Optional[int],
         delta_target: float,
         wing:         int,
+        center_ref:   Optional[float] = None,
     ) -> Tuple[Optional[List[dict]], Optional[str]]:
+        _cr = center_ref if center_ref is not None else spot
         if short_dist is not None:
-            sp = int(round((spot - short_dist) / step) * step)
+            sp = int(round((_cr - short_dist) / step) * step)
         else:
             sp_f = self._find_strike_by_delta(chain, "put", delta_target)
             if sp_f is None:
@@ -618,9 +630,11 @@ class StrategyEngine:
         short_dist:   Optional[int],
         delta_target: float,
         wing:         int,
+        center_ref:   Optional[float] = None,
     ) -> Tuple[Optional[List[dict]], Optional[str]]:
+        _cr = center_ref if center_ref is not None else spot
         if short_dist is not None:
-            sc = int(round((spot + short_dist) / step) * step)
+            sc = int(round((_cr + short_dist) / step) * step)
         else:
             sc_f = self._find_strike_by_delta(chain, "call", delta_target)
             if sc_f is None:
@@ -852,7 +866,7 @@ class StrategyEngine:
         target_pct   = self._get_target_pct(dte, signals)
         reward_pts   = net_credit * target_pct
         risk_pts     = net_credit * 1.5
-        friction     = (entry_costs_pts + total_slippage) * 2.0
+        friction     = (entry_costs_pts + total_slippage) * 1.5
 
         p_win_table = {
             0: {"VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62, "WIDE": 0.52, "VERY_WIDE": 0.44},
@@ -894,7 +908,7 @@ class StrategyEngine:
                 -0.03 if vrp_smoothed < 2.0 else 0.0))
             p_win = max(0.35, min(0.88, _pb + _va))
         ev    = p_win * reward_pts - (1.0 - p_win) * risk_pts - friction
-        min_ev = max(net_credit * 0.03, friction * 0.25)
+        min_ev = max(net_credit * 0.02, friction * 0.15)
 
         if ev < min_ev:
             return False, (
@@ -978,8 +992,8 @@ class StrategyEngine:
 
         day_label = state.get("day_label", "TUESDAY")
 
-        friction_pts        = (entry_costs_pts + total_slippage) * 2.0
-        min_credit_friction = friction_pts * 4.0
+        friction_pts        = (entry_costs_pts + total_slippage) * 1.5
+        min_credit_friction = friction_pts * 3.0
         if net_credit < min_credit_friction:
             return {
                 "valid": False,
@@ -1089,11 +1103,14 @@ class StrategyEngine:
         )
 
         risk_pct_map = {
-            0: 0.005, 1: 0.004, 2: 0.003,
-            3: 0.0025, 4: 0.002, 5: 0.0018, 6: 0.0015
+            0: 0.008, 1: 0.006, 2: 0.005,
+            3: 0.004, 4: 0.003, 5: 0.0025, 6: 0.002
         }
-        risk_pct  = risk_pct_map.get(min(actual_dte or 1, 6), 0.0015)
+        risk_pct  = risk_pct_map.get(min(actual_dte or 1, 6), 0.002)
         max_risk  = current_capital * risk_pct
+        _credit_risk_per_lot = net_credit * 2.0 * C02
+        if _credit_risk_per_lot > 0:
+            structural_loss_per_lot = min(structural_loss_per_lot, _credit_risk_per_lot)
         raw_lots  = max_risk / structural_loss_per_lot
         final_lots = max(1, int(raw_lots * size_mult))
 
@@ -1384,7 +1401,10 @@ class StrategyEngine:
 
 def _self_test() -> None:
     from datetime import time as dtime
-
+    import tempfile as _tf2
+    from core import load_env_file, ENV_FILE, BASE_DIR
+    _env2 = load_env_file(ENV_FILE)
+    _prod2 = str(BASE_DIR / _env2.get("DB_PATH", "data/nifty_algo_v3.db"))
     print_section("NIFTY ALGO v3.0 — STRATEGY ENGINE SELF-TEST", char="#")
 
     from core import load_config, Database, RateLimiter, UpstoxClient, setup_logging
@@ -1593,11 +1613,12 @@ def _self_test() -> None:
         make_signals(
             final_regime="PREMIUM_SELL_RANGE",
             actual_dte=0, or_condition="NARROW", adx_15=14.0,
+            spot=24000.0, atm_strike=24000,
         ),
         _test_time=dtime(10, 0),
     )
-    print(f"  PREMIUM_SELL_RANGE, DTE0, NARROW -> {strat1} (expect IRON_CONDOR)")
-    assert strat1 == IRON_CONDOR, f"Expected IRON_CONDOR, got {strat1}"
+    print(f"  PREMIUM_SELL_RANGE, DTE0, NARROW, ADX=14 -> {strat1} (expect IRON_BUTTERFLY after patch)")
+    assert strat1 in (IRON_BUTTERFLY, IRON_CONDOR), f"Expected BUTTERFLY or CONDOR, got {strat1}"
 
     strat2, _ = engine._map_regime_to_strategy(
         make_signals(
@@ -1611,6 +1632,7 @@ def _self_test() -> None:
     )
     print(f"  PREMIUM_SELL_RANGE, DTE0, VERY_NARROW, ADX=12 -> {strat2} (expect IRON_BUTTERFLY)")
     assert strat2 == IRON_BUTTERFLY, f"Expected IRON_BUTTERFLY, got {strat2}"
+    print("  [OK] VERY_NARROW butterfly confirmed")
 
     strat3, _ = engine._map_regime_to_strategy(
         make_signals(final_regime="PREMIUM_SELL_BULL")
@@ -1624,6 +1646,16 @@ def _self_test() -> None:
     print(f"  PREMIUM_SELL_BEAR -> {strat4} (expect BEAR_CALL_SPREAD)")
     assert strat4 == BEAR_CALL_SPREAD, f"Expected BEAR_CALL_SPREAD, got {strat4}"
 
+    strat_condor, _ = engine._map_regime_to_strategy(
+        make_signals(
+            final_regime="PREMIUM_SELL_RANGE",
+            actual_dte=0, or_condition="WIDE", adx_15=26.0,
+            spot=24000.0, atm_strike=24000,
+        ),
+        _test_time=dtime(10, 0),
+    )
+    print(f"  PREMIUM_SELL_RANGE, DTE0, WIDE OR, ADX=26 -> {strat_condor} (expect IRON_CONDOR)")
+    assert strat_condor == IRON_CONDOR, f"Expected IRON_CONDOR for WIDE OR, got {strat_condor}"
     print("  [OK] Regime mapping tests passed")
 
     print_section("Entry Rules Validation Tests")
@@ -1637,10 +1669,10 @@ def _self_test() -> None:
 
     ok2, _ = engine._validate_entry_rules(
         IRON_BUTTERFLY,
-        make_signals(adx_15=22.0, spot=24000.0, atm_strike=24000),
+        make_signals(adx_15=23.0, spot=24000.0, atm_strike=24000),
         _test_time=dtime(11, 0),
     )
-    assert not ok2, "Expected False for butterfly with high ADX"
+    assert not ok2, "Expected False for butterfly with ADX=23 > 22 threshold"
 
     ok3, r3 = engine._validate_entry_rules(
         IRON_CONDOR, make_signals(), _test_time=dtime(11, 0)

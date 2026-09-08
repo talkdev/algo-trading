@@ -482,6 +482,11 @@ class MarketDataEngine:
             "first_bar_close":             None,
             "_straddle_open_for_regime":   0.0,
             "_straddle_open_for_summary":  0.0,
+            "_last_valid_atm_iv":           None,
+            "_atm_iv_none_cycles":          0,
+            "_vrp_none_cycles":             0,
+            "_stale_count":                 0,
+            "_straddle_hist":               [],
             "created_at":                  now_ist().isoformat(),
             "updated_at":                  now_ist().isoformat(),
         }
@@ -544,8 +549,12 @@ class MarketDataEngine:
         self.last_chain              = {}
         self.last_chain_expiry       = None
         self._chain_fetch_time       = None
-        self._vrp_buffer             = []
+        self._vrp_buffer             = self._seed_vrp_buffer()
         self._pcr_baseline_set       = False
+        self.state["_straddle_hist"]  = []
+        self.state["_stale_count"]    = 0
+        self.state["_atm_iv_none_cycles"] = 0
+        self.state["_vrp_none_cycles"]    = 0
         self._first_bar_close_today  = None
         self._first_bar_date         = None
         self._vix_fail_count         = 0
@@ -856,9 +865,8 @@ class MarketDataEngine:
             return None
 
         orb_bars = bars[
-            (bars["time"] >= "09:15:00") & (bars["time"] < "09:30:00")
+            (bars["time"] >= "09:15:00") & (bars["time"] < "09:45:00")
         ]
-        # Filter out bad bars
         orb_bars = orb_bars[
             (orb_bars["high"] > orb_bars["low"]) &
             ((orb_bars["high"] - orb_bars["low"]) <= 1000) &
@@ -866,7 +874,7 @@ class MarketDataEngine:
             (orb_bars["low"] > 0)
         ]
 
-        if len(orb_bars) < 10:
+        if len(orb_bars) < 20:
             # Synthetic fallback after 10:45
             spot_now = self.state.get("prev_spot")
             if spot_now and spot_now > 0 and now_ist().time() >= dtime(10, 45):
@@ -1079,7 +1087,15 @@ class MarketDataEngine:
 
         # ── Compute from bars ─────────────────────────────────────────────
         if bars is not None and not bars.empty and len(bars) >= 20:
-            rolling = bars.tail(60)
+            _dte_rv = self.state.get("actual_dte", 2)
+            if _dte_rv is None:
+                _dte_rv = 2
+            if _dte_rv == 0:
+                rolling = bars[bars["time"] >= "09:15:00"] if "time" in bars.columns else bars
+            elif _dte_rv == 1:
+                rolling = bars.tail(120)
+            else:
+                rolling = bars.tail(90)
             valid   = rolling[
                 (rolling["high"] > rolling["low"]) &
                 (rolling["high"] > 0) &
@@ -1379,13 +1395,15 @@ class MarketDataEngine:
         if vix_state and vix_state > 0:
             vix_decimal = vix_state / 100.0
             ratio = atm_iv / vix_decimal
-            _dte_now = self.state.get("actual_dte", 2) or 2
+            _dte_now = self.state.get("actual_dte", 2)
+            if _dte_now is None:
+                _dte_now = 2
             if _dte_now == 0:
-                _ratio_lo, _ratio_hi = 0.40, 5.00
+                _ratio_lo, _ratio_hi = 0.25, 9.00
             elif _dte_now == 1:
-                _ratio_lo, _ratio_hi = 0.50, 3.00
+                _ratio_lo, _ratio_hi = 0.35, 5.00
             else:
-                _ratio_lo, _ratio_hi = 0.60, 2.00
+                _ratio_lo, _ratio_hi = 0.50, 3.00
             if ratio < _ratio_lo or ratio > _ratio_hi:
                 self.logger.warning(
                     f"ATM IV {atm_iv*100:.2f}% vs VIX {vix_state:.2f} "
@@ -1746,7 +1764,7 @@ class MarketDataEngine:
         # Age check
         if self._chain_fetch_time is not None:
             fetch_age = (now - self._chain_fetch_time).total_seconds()
-            if fetch_age > 480:
+            if fetch_age > 600:
                 self.logger.warning(
                     f"Chain stale: fetched {fetch_age:.0f}s ago (> 480s)"
                 )
@@ -1762,17 +1780,22 @@ class MarketDataEngine:
             atm = min(strikes, key=lambda k: abs(k - spot))
 
         atm_legs = chain.get(atm, {})
+        stale_legs = 0
         for opt_type in ("call", "put"):
             leg = atm_legs.get(opt_type, {})
             bid = float(leg.get("bid", 0) or 0)
             ask = float(leg.get("ask", 0) or 0)
             ltp = float(leg.get("ltp", 0) or 0)
             if bid <= 0 and ask <= 0 and ltp <= 0:
-                self.logger.warning(
-                    f"Chain stale: ATM {opt_type} has zero bid/ask/ltp"
-                )
+                stale_legs += 1
+        if stale_legs >= 2:
+            _sc = self.state.get("_stale_count", 0) + 1
+            self.state["_stale_count"] = _sc
+            if _sc >= 2:
+                self.logger.warning("Chain stale: ATM both legs zero for 2+ cycles")
                 return True
-
+            return False
+        self.state["_stale_count"] = 0
         return False
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2309,17 +2332,6 @@ class MarketDataEngine:
             pass
         return []
 
-    def _seed_vrp_buffer(self) -> List[float]:
-        try:
-            rows = self.db.get_vrp_smoothed_history(
-                n_cycles=self.config.vrp_smoothing_cycles
-            )
-            if rows:
-                return list(reversed(rows))
-        except Exception:
-            pass
-        return []
-
     def run_cycle(self) -> dict:
         """
         Execute one complete market data cycle.
@@ -2432,7 +2444,9 @@ class MarketDataEngine:
         current_time = now_ist().time()
         if (atm_straddle > 20 and
                 self.state.get("_straddle_open_for_regime", 0) == 0 and
-                current_time >= dtime(9, 30)):
+                current_time >= dtime(9, 30) and
+                not chain_stale and
+                atm_ce > 0 and atm_pe > 0):
             self.state["_straddle_open_for_regime"]  = atm_straddle
             self.state["_straddle_open_for_summary"] = atm_straddle
             self.state["opening_straddle_pts"]       = atm_straddle
@@ -2447,7 +2461,21 @@ class MarketDataEngine:
         atm_iv = None
         if not chain_stale:
             atm_iv = self.compute_atm_iv(chain, spot)
-        elif chain_stale and dtime(9, 15) <= current_time <= dtime(15, 30):
+        if atm_iv is None:
+            _cached_iv = self.state.get("_last_valid_atm_iv")
+            if _cached_iv is not None and _cached_iv > 0:
+                atm_iv = _cached_iv
+        if atm_iv is not None and atm_iv > 0:
+            self.state["_last_valid_atm_iv"] = atm_iv
+            self.state["_atm_iv_none_cycles"] = 0
+        else:
+            self.state["_atm_iv_none_cycles"] = self.state.get("_atm_iv_none_cycles", 0) + 1
+            if self.state["_atm_iv_none_cycles"] >= 3:
+                self.logger.critical(
+                    f"SIGNAL ALERT: ATM IV has been None for "
+                    f"{self.state['_atm_iv_none_cycles']} consecutive cycles"
+                )
+        if chain_stale and dtime(9, 15) <= current_time <= dtime(15, 30):
             self.logger.warning(
                 "Chain is stale during market hours — skipping IV/VRP computation"
             )
@@ -2494,6 +2522,15 @@ class MarketDataEngine:
         # ── 13. Parkinson RV and VRP ──────────────────────────────────────
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, bars)
         vrp_raw, vrp_smoothed   = self._compute_vrp_smoothed(atm_iv, parkinson_rv)
+        if vrp_smoothed is None:
+            self.state["_vrp_none_cycles"] = self.state.get("_vrp_none_cycles", 0) + 1
+            if self.state["_vrp_none_cycles"] >= 3:
+                self.logger.critical(
+                    f"SIGNAL ALERT: VRP has been None for "
+                    f"{self.state['_vrp_none_cycles']} consecutive cycles"
+                )
+        else:
+            self.state["_vrp_none_cycles"] = 0
 
         # ── 14. IV behavior ───────────────────────────────────────────────
         iv_behavior, iv_change_pct = self._compute_iv_behavior(atm_iv, bars)
@@ -2504,9 +2541,9 @@ class MarketDataEngine:
         # ── 16. Opening range ─────────────────────────────────────────────
         if current_time >= dtime(9, 30) and not self.state.get("or_computed"):
             orb_bars     = bars[
-                (bars["time"] >= "09:15:00") & (bars["time"] < "09:30:00")
+                (bars["time"] >= "09:15:00") & (bars["time"] < "09:45:00")
             ] if not bars.empty else pd.DataFrame()
-            coverage_ok  = len(orb_bars) >= 10
+            coverage_ok  = len(orb_bars) >= 20
             if coverage_ok or current_time >= dtime(10, 45):
                 or_result = self.compute_opening_range(bars)
                 if or_result:
@@ -2707,6 +2744,15 @@ class MarketDataEngine:
                     f"hard exit {tue_exit}"
                 )
 
+        _spot_velocity_block = False
+        _sv = 0.0
+        if not bars.empty and len(bars) >= 3:
+            _recent3 = bars.tail(3)
+            if len(_recent3) >= 2:
+                _sv = abs(float(_recent3["close"].iloc[-1]) - float(_recent3["close"].iloc[0]))
+                if _sv > 35:
+                    _spot_velocity_block = True
+
         # ── 27. Build signals dict ────────────────────────────────────────
         signals: dict = {
             # Identity
@@ -2836,9 +2882,26 @@ class MarketDataEngine:
             "block_new_entries":        False,
             "no_trade_reason":          None,
             "borderline_sell":          False,
+            "spot_velocity_block":       _spot_velocity_block,
+            "spot_velocity_pts":         _sv,
         }
 
         # ── 28. Save session state and persist data ───────────────────────
+        _straddle_expanding = False
+        _straddle_5min_ago = None
+        _straddle_hist = self.state.get("_straddle_hist", [])
+        _now_ts = now_ist()
+        if atm_straddle > 0:
+            _straddle_hist.append((_now_ts.timestamp(), atm_straddle))
+            _straddle_hist = [(t, v) for t, v in _straddle_hist if _now_ts.timestamp() - t <= 600]
+            self.state["_straddle_hist"] = _straddle_hist
+            _old5 = [(t, v) for t, v in _straddle_hist if _now_ts.timestamp() - t >= 270]
+            if _old5:
+                _straddle_5min_ago = _old5[0][1]
+                if _straddle_5min_ago > 0 and atm_straddle > _straddle_5min_ago * 1.06:
+                    _straddle_expanding = True
+        signals["straddle_expanding"] = _straddle_expanding
+        signals["straddle_5min_ago"] = _straddle_5min_ago
         self._save_session_state()
         self._persist_cycle_log(signals)
         self._persist_option_chain_snapshot(chain, expiry, signals)
@@ -2927,11 +2990,10 @@ class MarketDataEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _self_test() -> None:
-    """
-    Standalone self-test for data_engine.py.
-    Tests: candle loading, technical indicators, opening range, VRP computation.
-    Run: python data_engine.py
-    """
+    import tempfile as _tf5
+    from core import load_env_file, ENV_FILE, BASE_DIR
+    _env5 = load_env_file(ENV_FILE)
+    _prod5 = str(BASE_DIR / _env5.get("DB_PATH", "data/nifty_algo_v3.db"))
     print_section("NIFTY ALGO v3.0 — DATA ENGINE SELF-TEST", char="#")
 
     from core import load_config, Database, RateLimiter, UpstoxClient, setup_logging
