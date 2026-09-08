@@ -1,3 +1,15 @@
+# ============================================================================
+# PARTIAL-USE WARNING.
+#
+# The "realistic" scenarios here inflate true realised vol (~13.20%) above the
+# IV used for pricing (12.5%), so the EV/PnL LEVELS they report describe a
+# negative-VRP world and must not be read as evidence about the strategy.
+#
+# The exit-tag DISTRIBUTION (which stop fires, and how often) is still
+# informative and is what this file is cited for.
+# For EV levels use analysis/sweep_fair.py / analysis/design_validation2.py.
+# ============================================================================
+
 """
 Same engine trade, but with the three effects that actually kill intraday
 short-gamma books and which a pure-GBM model hides:
