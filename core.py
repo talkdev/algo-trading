@@ -188,8 +188,8 @@ ABORT_VIX_ABSOLUTE=24.0
 VIX_FAIL_LIMIT=5
 
 # ── VRP Thresholds (overridden by calibration) ────────────────────────────────
-VRP_SELL_THRESHOLD=2.0
-VRP_FAIR_THRESHOLD=1.2
+VRP_SELL_THRESHOLD=2.5
+VRP_FAIR_THRESHOLD=1.5
 VRP_SMOOTHING_CYCLES=5
 
 # ── Regime Settings ───────────────────────────────────────────────────────────
