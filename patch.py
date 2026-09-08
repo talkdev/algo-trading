@@ -1,103 +1,103 @@
 #!/usr/bin/env python3
-# ============================================================================
-#  patch-version3.py
-#  v3.2 -> v3.3   SINGLE-DEFECT REGRESSION FIX
-# ============================================================================
-#
-#  WHAT THIS FIXES, AND HOW IT WAS FOUND
-#  -------------------------------------
-#  v3.2 changed day_move_used_pct from "realised range as a percentage of the
-#  WHOLE-day opening straddle" to "realised range against the range priced for
-#  the ELAPSED part of the session", and moved the block threshold 60 -> 125.
-#
-#  The normalisation was the right idea. The calibration that went with it was
-#  wrong, and wrong in a way that silently disabled the entire engine.
-#
-#  This was not found by reading the code. It was found by measurement:
-#  backtest_engine.py replayed a recorded session (2026-09-08) against both
-#  versions and the entry funnel changed like this:
-#
-#      v3.1 baseline    regime verdict blocked 678/787   ->  109 reached sizing
-#      v3.2 patched     regime verdict blocked 789/789   ->    0 reached sizing
-#
-#  Every one of the 109 cycles that used to reach strike selection was now
-#  classified VOL_NEUTRAL. RANGE_UNCLEAR and VOL_BUY_OPTIONS disappeared from
-#  the census entirely, because the volatility branch short-circuits before
-#  the positioning branch is ever consulted.
-#
-#  THE DEFECT
-#  ----------
-#  data_engine._compute_day_move_used divides a RANGE by a STRADDLE:
-#
-#      numerator    day_high - day_low            <- a high-low RANGE
-#      denominator  opening_straddle * sqrt(t)    <- prices |displacement|
-#
-#  Those two quantities are not on the same scale. For a driftless diffusion
-#
-#      E[range]          = sqrt(8T/pi) * sigma
-#      E[|displacement|] = sqrt(2T/pi) * sigma
-#      ratio             = 2.0   exactly, in continuous time
-#
-#  and an ATM straddle is priced at very nearly E[|displacement|]
-#  (0.7979 * sigma * sqrt(T) * S under Black-Scholes).
-#
-#  Monte Carlo over 40,000 paths of 375 one-minute steps - i.e. sampled the
-#  way a real session is actually observed - gives 1.933 rather than the
-#  continuous-time 2.0, because discrete monitoring cannot see the true
-#  extremum between bars. 1.933 is therefore the honest factor for this
-#  engine, which reads 1-minute bars.
-#
-#  So a session running EXACTLY as the market priced it scores ~193, not 100.
-#  The v3.2 comment claiming "100 now means the day is running exactly as
-#  priced" was simply false, and the 125 threshold it justified sits BELOW an
-#  ordinary day. The gate fired on essentially every cycle of every session.
-#
-#  THE FIX
-#  -------
-#  Divide by the range-equivalent of the priced move rather than by the priced
-#  displacement, so that the documented semantics become true:
-#
-#      denominator = opening_straddle * sqrt(elapsed_frac) * DAY_MOVE_RANGE_FACTOR
-#
-#  With DAY_MOVE_RANGE_FACTOR = 1.93, 100 genuinely means "running as priced"
-#  and the existing 125 threshold recovers its intended meaning: block when
-#  the session is running about a quarter hotter than the market paid for.
-#  The factor is env-driven so it can be re-fitted from recorded sessions
-#  without a code change.
-#
-#  SCOPE
-#  -----
-#  ONE defect. Nothing else is touched. That is deliberate: the whole point of
-#  the measurement loop is that a change can be attributed, and a 53-edit
-#  patch cannot be. Re-run the backtest after this and the funnel should show
-#  the regime layer passing traffic again - at which point the credit_risk
-#  and EV gates become measurable, which they currently are not.
-#
-#  WHAT THIS DOES NOT CLAIM
-#  ------------------------
-#  This does not make the engine profitable and is not evidence that it is.
-#  It removes a gate that was blocking on a unit error. What the engine then
-#  does with the traffic is an open question that needs 20+ recorded sessions
-#  to answer.
-#
-#  SAFETY
-#  ------
-#    * refuses to run unless the v3.2 marker is present
-#    * exits 0 if the v3.3 marker is already present (idempotent)
-#    * backs every touched file up first; ANY failure restores all of them
-#    * AST-parses every touched file, then runs semantic assertions
-#
-#  USAGE
-#  -----
-#      python patch-version3.py            apply
-#      python patch-version3.py --verify   check an already-patched tree
-#
-# ============================================================================
+"""
+════════════════════════════════════════════════════════════════════════════
+ patch-version4.py — NIFTY intraday options engine, profitability patch v3.4
+════════════════════════════════════════════════════════════════════════════
 
-from __future__ import annotations
+ Prerequisite: v3.2 and v3.3 must already be installed (this script refuses
+ to run otherwise). Self-contained: no imports outside the stdlib, no network.
 
+ ── WHAT THIS FIXES, AND HOW IT WAS FOUND ─────────────────────────────────
+
+ Unlike v3.2 and v3.3, which were derived by reading the source, this patch
+ was derived by *measurement*. The engine was replayed cycle-by-cycle over
+ the only genuinely live session in the recorded database — 2026-09-08,
+ 768 market-hours snapshots of the 0DTE expiry series — and it placed zero
+ trades. Instrumenting the regime classifier produced this census of
+ terminal volatility triggers:
+
+     544  NEUTRAL  <- VRP_DATA_ERROR_NEUTRAL      (70.8% of all cycles)
+      15  NEUTRAL  <- IV_SPIKING_HARD_BLOCK
+      41  NEUTRAL  <- DAY_MOVE_USED_*             (spread over many values)
+
+ DEFECT 1 — the VRP data-error guard rejects the premium it exists to sell.
+
+   regime_engine.classify_volatility discards a cycle as corrupt when
+
+       vrp_raw > max(8.0, 0.70 * atm_iv)
+
+   On the measured session the broker's ATM IV on the expiry series ran
+   27-29%, Parkinson RV ran ~6%, and India VIX sat at 11.2. So vrp_raw was
+   about 22pp against a bound of 20.2pp, and 544 cycles were thrown away as
+   bad data.
+
+   None of it was bad data. It was verified against the raw stored chain:
+   the 28.8% median ATM IV is the broker's own number, and the ~6% realised
+   vol is correct for a session whose entire spot range was 90 points. VIX
+   prices roughly 30 calendar days; a contract with hours left to live
+   prices pin risk and gamma, and printing at two to three times VIX is its
+   ordinary state on expiry day. Realised vol coming in at a fifth of
+   implied is not a measurement failure — it is the variance risk premium,
+   and harvesting it is the whole reason a premium-selling engine exists.
+   The guard was standing the engine down precisely on the conditions it
+   was built for.
+
+   A genuine Parkinson failure does not present as a low ratio. It presents
+   as realised vol collapsing to essentially nothing, because the bar feed
+   is empty, flat, or degenerate. The test is therefore split in two:
+
+     * an absolute floor catches the real failure — realised vol at or
+       below 0.5% annualised is not a quiet market, it is a missing feed;
+     * the ratio bound is kept, but relaxed to 0.92 on the expiry series,
+       where a low ratio is the expected reading rather than a suspect one,
+       and left at v3.1's 0.70 everywhere else.
+
+   The 8pp absolute floor is retained for the case where ATM IV is
+   unavailable, exactly as before.
+
+ DEFECT 2 — the v3.2 threshold migration never actually migrated.
+
+   v3.2 raised the day-move block threshold to 125% and v3.3 rescaled the
+   quantity being compared against it. But env.txt overrides code defaults,
+   the v3.2 migration only *appended* keys it could not find, and env.txt
+   already contained the v3.1 line
+
+       DAY_MOVE_USED_BLOCK_PCT=60.0
+
+   so the append was skipped and the engine kept running the v3.1 threshold
+   while its source claimed 125. The measured day_move_used had a median of
+   28.1 and a maximum of 153.2, so the stale 60 was binding on the tail of
+   the distribution. This patch rewrites the existing key in place rather
+   than appending, and reports the old value it replaced.
+
+ ── HONEST SCOPE ───────────────────────────────────────────────────────────
+
+ One live session is one sample. These two edits remove blockers that were
+ demonstrably misfiring on real data; they are NOT evidence that the
+ resulting trades are profitable, and nothing here has been validated
+ against a profitable out-of-sample record. Treat the result as an engine
+ that can now express an opinion, not as an engine known to be right.
+
+ ── ALSO CHANGED ───────────────────────────────────────────────────────────
+
+ This patch edits one assertion in regime_engine's built-in self test. The
+ fixture s6 (vrp_raw 9.5pp at 12.5% ATM IV, actual_dte 0) asserted that the
+ guard fires. Under the corrected contract it must not, so the fixture is
+ replaced with three cases that test the new contract directly: a dead bar
+ feed still trips the guard, a rich 0DTE premium does not, and an absurd
+ ratio away from the expiry series still does. Changing a test alongside
+ the behaviour it pins is deliberate and is called out here so it is not
+ mistaken for the test being quietly weakened.
+
+ Usage:
+     python3 patch-version4.py            # apply
+     python3 patch-version4.py --verify   # report state, change nothing
+"""
+
+import argparse
 import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -108,15 +108,72 @@ BASE = Path(__file__).resolve().parent
 
 MARKER_V32 = "NIFTY_ENGINE_PROFIT_PATCH_V32"
 MARKER_V33 = "NIFTY_ENGINE_PROFIT_PATCH_V33"
+MARKER_V34 = "NIFTY_ENGINE_PROFIT_PATCH_V34"
 
-TOUCHED = ["core.py", "data_engine.py"]
+TOUCHED = ["core.py", "regime_engine.py"]
 
-RANGE_FACTOR = 1.93
+DTE0_VRP_FRAC = 0.92
+BASE_VRP_FRAC = 0.70
+RV_DEAD_PCT = 0.5
+BLOCK_PCT = 125.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  patcher
-# ═══════════════════════════════════════════════════════════════════════════
+def _child_env() -> dict:
+    """
+    Force UTF-8 on any Python we spawn.
+
+    regime_engine's self test prints arrows and box characters. When its
+    stdout is a console Windows routes it through WriteConsoleW and it
+    survives, but subprocess.run captures output through a PIPE, and a
+    piped stdout falls back to the process locale encoding - cp1252 on a
+    default Windows install - so the child dies with UnicodeEncodeError
+    before it can report whether the assertions passed. That failure is an
+    artefact of how this script calls the test, not a real test failure,
+    and it was rolling back a correctly applied patch.
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
+# Injected ahead of everything else in any Python we spawn. Environment
+# variables turned out not to be enough on the reported Windows 3.13 box, so
+# this rebinds sys.stdout/sys.stderr to explicit UTF-8 wrappers around the
+# raw byte buffers from inside the child itself. After this runs, the child's
+# print() cannot raise UnicodeEncodeError no matter what the locale, the
+# console codepage or PYTHONIOENCODING happen to be.
+_UTF8_PRELUDE = (
+    "import sys, io\n"
+    "for _nm in ('stdout', 'stderr'):\n"
+    "    try:\n"
+    "        _st = getattr(sys, _nm)\n"
+    "        if _st is not None and hasattr(_st, 'buffer'):\n"
+    "            setattr(sys, _nm, io.TextIOWrapper(\n"
+    "                _st.buffer, encoding='utf-8', errors='replace',\n"
+    "                line_buffering=True))\n"
+    "    except Exception:\n"
+    "        pass\n"
+)
+
+
+def _run_py(body: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run Python in the repo with UTF-8 forced three separate ways."""
+    return subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", _UTF8_PRELUDE + body],
+        cwd=BASE, capture_output=True, text=True, timeout=timeout,
+        encoding="utf-8", errors="replace", env=_child_env(),
+    )
+
+
+def _harden_stdout() -> None:
+    """Survive being redirected to a file or pipe on a cp1252 console."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
 
 class PatchError(RuntimeError):
     pass
@@ -139,7 +196,7 @@ class FilePatcher:
         if n == 0:
             raise PatchError(
                 f"[{self.name}] anchor not found for '{label}'.\n"
-                f"  looked for:\n    {old[:160]!r}"
+                f"  looked for:\n    {old[:200]!r}"
             )
         if n > 1:
             raise PatchError(
@@ -157,7 +214,7 @@ class FilePatcher:
 
 
 def backup_all(stamp: str) -> Path:
-    d = BASE / f"patch_v33_backup_{stamp}"
+    d = BASE / f"patch_v34_backup_{stamp}"
     d.mkdir(exist_ok=True)
     for name in TOUCHED + ["env.txt"]:
         p = BASE / name
@@ -178,88 +235,175 @@ def restore_all(d: Path) -> None:
 def patch_core(p: FilePatcher) -> None:
     p.sub(
         "core/version-marker",
-        f'{MARKER_V32} = "3.2"',
-        f'{MARKER_V32} = "3.2"\n{MARKER_V33} = "3.3"',
-    )
-
-    p.sub(
-        "core/config-field",
-        "    day_move_used_block_pct:   float",
-        "    day_move_used_block_pct:   float\n"
-        "    # v3.3: day_move_used_pct divides a high-low RANGE by a straddle,\n"
-        "    # and a straddle prices |displacement|, not range. For a driftless\n"
-        "    # diffusion E[range]/E[|displacement|] = 2.0 in continuous time and\n"
-        "    # 1.933 when sampled at 1-minute bars, which is how this engine\n"
-        "    # observes the session. Without this factor a perfectly ordinary\n"
-        "    # day scores ~193 against a 125 threshold and the volatility gate\n"
-        "    # returns NEUTRAL on every cycle. Env-driven so it can be re-fitted.\n"
-        "    day_move_range_factor:     float",
-    )
-
-    p.sub(
-        "core/config-load",
-        '        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 125.0),',
-        '        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 125.0),\n'
-        '        day_move_range_factor=min(max(\n'
-        f'            _get_float(env, "DAY_MOVE_RANGE_FACTOR", {RANGE_FACTOR}), 1.0), 2.5),',
+        f'{MARKER_V33} = "3.3"',
+        f'{MARKER_V33} = "3.3"\n{MARKER_V34} = "3.4"',
     )
 
 
-def patch_data_engine(p: FilePatcher) -> None:
-    old = (
-        "        _frac_dm = min(max(_elapsed_dm / 375.0, 0.06), 1.0)\n"
-        "        _straddle_ref = max(_straddle_ref * _math_dm.sqrt(_frac_dm), 12.0)"
-    )
-    new = (
-        "        _frac_dm = min(max(_elapsed_dm / 375.0, 0.06), 1.0)\n"
-        "        # ── v3.3: convert the priced DISPLACEMENT into a priced RANGE ──\n"
-        "        # The numerator below is day_high - day_low, a range. A straddle\n"
-        "        # prices E[|displacement|], not E[range]. For a driftless\n"
-        "        # diffusion those differ by exactly 2.0 in continuous time, and\n"
-        "        # by 1.933 when the path is observed at 1-minute bars as it is\n"
-        "        # here. v3.2 omitted the conversion and asserted that 100 meant\n"
-        "        # 'running exactly as priced'; the true figure was ~193, which\n"
-        "        # sits above the 125 block threshold, so classify_volatility\n"
-        "        # returned NEUTRAL on effectively every cycle of every session\n"
-        "        # and no trade could ever be reached. Measured on a replayed\n"
-        "        # session: the regime layer went from passing 109 of 787 cycles\n"
-        "        # to passing 0 of 789.\n"
-        "        _range_factor_dm = float(\n"
-        f"            getattr(self.config, 'day_move_range_factor', {RANGE_FACTOR})\n"
-        "        )\n"
-        "        _straddle_ref = max(\n"
-        "            _straddle_ref * _math_dm.sqrt(_frac_dm) * _range_factor_dm,\n"
-        "            12.0,\n"
-        "        )"
-    )
-    p.sub("data_engine/day-move-range-factor", old, new)
+VRP_OLD = '''        _vrp_limit = max(8.0, 0.70 * _atm_iv_pct) if _atm_iv_pct else 8.0
+
+        if vrp_raw is not None and vrp_raw > _vrp_limit:
+            details["trigger"] = "VRP_DATA_ERROR_NEUTRAL"
+            self.logger.warning(
+                f"VRP={vrp_raw:.2f}pp > limit {_vrp_limit:.2f}pp "
+                f"(ATM IV {_atm_iv_pct if _atm_iv_pct else float('nan'):.2f}%) — "
+                f"likely Parkinson RV error. Treating as NEUTRAL."
+            )
+            return VolatilityRegime.NEUTRAL, details'''
+
+VRP_NEW = '''        # ── v3.4 ──────────────────────────────────────────────────────────
+        # Measured over the 2026-09-08 0DTE session: this guard was the
+        # terminal gate on 544 of 768 market-hours cycles, 70.8% of the day.
+        # Broker ATM IV on the expiry series ran 27-29% against a Parkinson
+        # RV near 6% and a VIX of 11.2, so vrp_raw sat around 22pp and
+        # cleared the 0.70 x IV bound of 20.2pp. Every one of those cycles
+        # was discarded as corrupt input.
+        #
+        # None of it was corrupt. The 28.8% median ATM IV is the broker's
+        # own figure in the stored chain and the ~6% realised vol is right
+        # for a session with a 90-point total range. VIX prices roughly 30
+        # calendar days; a contract with hours left prices pin risk and
+        # gamma, and two to three times VIX is its ordinary state on expiry
+        # day. Realised vol at a fifth of implied is not a broken feed — it
+        # is the variance risk premium this engine exists to sell.
+        #
+        # A real Parkinson failure does not look like a low ratio. It looks
+        # like realised vol collapsing to nothing because the bar feed is
+        # empty, flat or degenerate. So the test is split: an absolute floor
+        # catches the true failure, and the ratio bound is relaxed on the
+        # expiry series where a low ratio is the expected reading.
+        _rv_pct = None
+        _rv_raw = signals.get("parkinson_rv")
+        if _rv_raw is not None:
+            try:
+                _rv_pct = float(_rv_raw)
+                if _rv_pct <= 2.0:          # stored as a decimal, not a pct
+                    _rv_pct *= 100.0
+            except (TypeError, ValueError):
+                _rv_pct = None
+
+        try:
+            _dte_vrp = int(dte) if dte is not None else None
+        except (TypeError, ValueError):
+            _dte_vrp = None
+
+        # 0.92 on the expiry series admits realised vol down to 8% of
+        # implied before the reading is called impossible; 0.70 elsewhere,
+        # unchanged from v3.1.
+        _vrp_frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte_vrp == 0 else VRP_DATA_ERROR_FRAC
+        _vrp_limit = max(8.0, _vrp_frac * _atm_iv_pct) if _atm_iv_pct else 8.0
+
+        _rv_dead = _rv_pct is not None and _rv_pct <= VRP_RV_DEAD_PCT
+        _vrp_over = vrp_raw is not None and vrp_raw > _vrp_limit
+
+        if _rv_dead or _vrp_over:
+            details["trigger"] = "VRP_DATA_ERROR_NEUTRAL"
+            details["vrp_limit"] = _vrp_limit
+            details["vrp_reason"] = "rv_dead" if _rv_dead else "ratio"
+            _why = (
+                f"realised vol {_rv_pct:.2f}% at or below the "
+                f"{VRP_RV_DEAD_PCT:.2f}% floor — bar feed looks empty"
+                if _rv_dead else
+                f"VRP={vrp_raw:.2f}pp > limit {_vrp_limit:.2f}pp"
+            )
+            self.logger.warning(
+                f"{_why} (ATM IV "
+                f"{_atm_iv_pct if _atm_iv_pct else float('nan'):.2f}%, "
+                f"dte={_dte_vrp}) — likely Parkinson RV error. "
+                f"Treating as NEUTRAL."
+            )
+            return VolatilityRegime.NEUTRAL, details'''
 
 
-ENV_APPEND = f"""
-# ── v3.3 ────────────────────────────────────────────────────────────────
-# day_move_used_pct divides a high-low RANGE by a straddle, and a straddle
-# prices |displacement| rather than range. The two differ by a factor of 2.0
-# in continuous time and 1.933 at 1-minute sampling. Without this conversion
-# an ordinary session scores ~193 against DAY_MOVE_USED_BLOCK_PCT=125 and the
-# volatility gate blocks every cycle. With it, 100 means "running exactly as
-# the market priced it" and 125 means "running about a quarter hotter".
-DAY_MOVE_RANGE_FACTOR={RANGE_FACTOR}
-"""
+CONST_OLD = '''class RegimeClassifier:'''
+
+CONST_NEW = f'''# {MARKER_V34}: bounds for the VRP data-error guard. The expiry series gets a
+# looser ratio because a low realised-to-implied ratio is its normal state,
+# and an absolute floor carries the burden of catching a genuinely dead feed.
+VRP_DATA_ERROR_FRAC = {BASE_VRP_FRAC}
+VRP_DATA_ERROR_FRAC_DTE0 = {DTE0_VRP_FRAC}
+VRP_RV_DEAD_PCT = {RV_DEAD_PCT}
+
+
+class RegimeClassifier:'''
+
+
+TEST_OLD = '''    # VRP data error → NEUTRAL. At the default 12.5% ATM IV the v3.1 bound is
+    # max(8, 0.70 x 12.5) = 8.75pp, so 9.5pp is still treated as bad data.
+    s6 = make_signals(vrp_raw=9.5, vrp_smoothed=9.5)
+    vol6, d6 = classifier.classify_volatility(s6, 0, 11.0)
+    print(f"  VRP=9.5pp @ IV 12.5% → {vol6.value} (expect NEUTRAL - bad data)")
+    assert vol6 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL for data error, got {vol6}"'''
+
+TEST_NEW = '''    # v3.4 replaces the old s6 fixture. It asserted that 9.5pp of VRP at
+    # 12.5% ATM IV on the expiry series is bad data; under the corrected
+    # contract that is an ordinary 0DTE reading and must pass. The guard is
+    # now pinned by the three cases that actually define it.
+
+    # (a) a dead bar feed is still a data error, whatever the ratio says
+    s6 = make_signals(vrp_raw=9.5, vrp_smoothed=9.5, parkinson_rv=0.0)
+    vol6, d6 = classifier.classify_volatility(s6, 0, 11.0)
+    print(f"  RV=0% (dead feed)    -> {vol6.value} (expect NEUTRAL - bad data)")
+    assert vol6 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL for dead feed, got {vol6}"
+    assert d6.get("trigger") == "VRP_DATA_ERROR_NEUTRAL", (
+        f"A dead bar feed must trip the data-error guard, got {d6}"
+    )
+    assert d6.get("vrp_reason") == "rv_dead", f"Expected the absolute floor to fire, got {d6}"
+
+    # (b) the measured 2026-09-08 condition: 28% ATM IV against 6% realised
+    #     on the expiry series is a real variance premium, not a broken feed
+    s6c = make_signals(vrp_raw=22.0, vrp_smoothed=22.0, atm_iv=0.28,
+                       parkinson_rv=0.06, actual_dte=0)
+    vol6c, d6c = classifier.classify_volatility(s6c, 0, 11.0)
+    print(f"  VRP=22pp @ IV 28% 0DTE -> {vol6c.value} (expect NOT bad data)")
+    assert d6c.get("trigger") != "VRP_DATA_ERROR_NEUTRAL", (
+        f"A genuine 0DTE variance premium must not be called a data error, got {d6c}"
+    )
+
+    # (c) away from the expiry series the v3.1 ratio still applies
+    s6d = make_signals(vrp_raw=11.0, vrp_smoothed=11.0, atm_iv=0.125,
+                       parkinson_rv=0.015, actual_dte=2)
+    vol6d, d6d = classifier.classify_volatility(s6d, 0, 11.0)
+    print(f"  VRP=11pp @ IV 12.5% dte2 -> {vol6d.value} (expect NEUTRAL - bad data)")
+    assert d6d.get("trigger") == "VRP_DATA_ERROR_NEUTRAL", (
+        f"An impossible ratio off the expiry series is still a data error, got {d6d}"
+    )'''
+
+
+def patch_regime(p: FilePatcher) -> None:
+    p.sub("regime/vrp-guard-constants", CONST_OLD, CONST_NEW)
+    p.sub("regime/vrp-data-error-guard", VRP_OLD, VRP_NEW)
+    p.sub("regime/self-test-vrp-contract", TEST_OLD, TEST_NEW)
 
 
 def migrate_env() -> None:
+    """Rewrite the stale v3.1 threshold in place. v3.2 only appended."""
     env_path = BASE / "env.txt"
     if not env_path.exists():
-        print("  env.txt not present - core.ENV_TEMPLATE carries the default")
+        print("  env.txt not present - core.load_config carries the 125.0 default")
         return
     text = env_path.read_text(encoding="utf-8")
-    if "DAY_MOVE_RANGE_FACTOR" in text:
-        print("  env.txt already current")
+    pat = re.compile(r"^(\s*DAY_MOVE_USED_BLOCK_PCT\s*=\s*)([0-9.]+)\s*$", re.M)
+    m = pat.search(text)
+    if not m:
+        if not text.endswith("\n"):
+            text += "\n"
+        text += (
+            f"\n# {MARKER_V34}: v3.3 rescaled day_move_used so 100 means "
+            f"'the day has spent exactly what it was priced for'.\n"
+            f"DAY_MOVE_USED_BLOCK_PCT={BLOCK_PCT}\n"
+        )
+        env_path.write_text(text, encoding="utf-8")
+        print(f"  env.txt: added DAY_MOVE_USED_BLOCK_PCT={BLOCK_PCT}")
         return
-    if not text.endswith("\n"):
-        text += "\n"
-    env_path.write_text(text + ENV_APPEND, encoding="utf-8")
-    print(f"  env.txt: appended DAY_MOVE_RANGE_FACTOR={RANGE_FACTOR}")
+    old_val = m.group(2)
+    if abs(float(old_val) - BLOCK_PCT) < 1e-9:
+        print(f"  env.txt: DAY_MOVE_USED_BLOCK_PCT already {BLOCK_PCT}")
+        return
+    text = pat.sub(lambda _m: f"{_m.group(1)}{BLOCK_PCT}", text, count=1)
+    env_path.write_text(text, encoding="utf-8")
+    print(f"  env.txt: DAY_MOVE_USED_BLOCK_PCT {old_val} -> {BLOCK_PCT} "
+          f"(stale v3.1 value was overriding the v3.2 code default)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -278,155 +422,212 @@ def verify_syntax() -> list[str]:
 
 
 def verify_semantics() -> list[str]:
-    """Assertions against the patched source and the imported config."""
     errs = []
     core_src = (BASE / "core.py").read_text(encoding="utf-8")
-    de_src = (BASE / "data_engine.py").read_text(encoding="utf-8")
+    rg_src = (BASE / "regime_engine.py").read_text(encoding="utf-8")
+    env_src = ""
+    if (BASE / "env.txt").exists():
+        env_src = (BASE / "env.txt").read_text(encoding="utf-8")
 
     checks = [
-        ("core carries the v3.3 marker", MARKER_V33 in core_src),
+        ("core carries the v3.4 marker", MARKER_V34 in core_src),
+        ("core keeps the v3.3 marker", MARKER_V33 in core_src),
         ("core keeps the v3.2 marker", MARKER_V32 in core_src),
-        ("config declares day_move_range_factor",
-         "day_move_range_factor:     float" in core_src),
-        ("load_config reads DAY_MOVE_RANGE_FACTOR",
-         'DAY_MOVE_RANGE_FACTOR"' in core_src),
-        ("data_engine applies the range factor",
-         "_range_factor_dm" in de_src),
-        ("the factor multiplies the straddle reference",
-         "_math_dm.sqrt(_frac_dm) * _range_factor_dm" in de_src),
-        ("the bare v3.2 form is gone",
-         "max(_straddle_ref * _math_dm.sqrt(_frac_dm), 12.0)" not in de_src),
-        ("block threshold left at 125",
-         'DAY_MOVE_USED_BLOCK_PCT", 125.0' in core_src),
+        ("the DTE-aware VRP fractions are declared",
+         "VRP_DATA_ERROR_FRAC_DTE0 = " in rg_src),
+        ("the dead-feed floor is declared", "VRP_RV_DEAD_PCT = " in rg_src),
+        ("the guard selects its fraction by DTE",
+         "_vrp_frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte_vrp == 0" in rg_src),
+        ("the guard reads realised vol", 'signals.get("parkinson_rv")' in rg_src),
+        ("the guard fires on a dead feed", "_rv_dead or _vrp_over" in rg_src),
+        ("the reason is recorded for the audit trail",
+         '"vrp_reason"' in rg_src),
+        ("the flat 0.70 form is gone",
+         "max(8.0, 0.70 * _atm_iv_pct)" not in rg_src),
+        ("the self test pins the 0DTE contract",
+         "A genuine 0DTE variance premium must not be called a data error" in rg_src),
+        ("the self test still pins the dead-feed case",
+         "A dead bar feed must trip the data-error guard" in rg_src),
     ]
+    if env_src:
+        checks.append(
+            (f"env.txt block threshold is {BLOCK_PCT}",
+             re.search(rf"^\s*DAY_MOVE_USED_BLOCK_PCT\s*=\s*{BLOCK_PCT}\s*$",
+                       env_src, re.M) is not None))
+
     for label, ok in checks:
+        print(f"    {'PASS' if ok else 'FAIL'}  {label}")
         if not ok:
             errs.append(label)
 
-    # live config
+    # the classifier must import and the constants must be live
     try:
-        out = subprocess.run(
-            [sys.executable, "-c",
-             "import core;c=core.load_config();"
-             "print(c.day_move_range_factor, c.day_move_used_block_pct)"],
-            cwd=str(BASE), capture_output=True, text=True, timeout=120,
-        )
+        out = _run_py(
+            "import regime_engine as r\n"
+            "print(r.VRP_DATA_ERROR_FRAC_DTE0, r.VRP_DATA_ERROR_FRAC,"
+            " r.VRP_RV_DEAD_PCT)\n", 120)
         if out.returncode != 0:
-            errs.append(f"load_config failed: {out.stderr.strip()[:200]}")
+            errs.append("regime_engine does not import: "
+                        + (out.stderr.strip().splitlines() or ["?"])[-1])
         else:
-            f, b = (float(x) for x in out.stdout.split())
-            if abs(f - RANGE_FACTOR) > 1e-9:
-                errs.append(f"day_move_range_factor is {f}, expected {RANGE_FACTOR}")
-            if abs(b - 125.0) > 1e-9:
-                errs.append(f"day_move_used_block_pct is {b}, expected 125.0")
-    except Exception as e:                                    # pragma: no cover
-        errs.append(f"config import error: {e}")
-
-    # arithmetic: an as-priced day must now land near 100, not near 193
-    as_priced = 1.933 / RANGE_FACTOR * 100.0
-    if not (95.0 <= as_priced <= 105.0):
-        errs.append(
-            f"an as-priced session would score {as_priced:.0f}, not ~100"
-        )
-    if as_priced >= 125.0:
-        errs.append("an as-priced session would still trip the block threshold")
+            got = out.stdout.strip()
+            want = f"{DTE0_VRP_FRAC} {BASE_VRP_FRAC} {RV_DEAD_PCT}"
+            ok = got == want
+            print(f"    {'PASS' if ok else 'FAIL'}  live constants are {want}"
+                  + ("" if ok else f" (got {got})"))
+            if not ok:
+                errs.append("live constants differ")
+    except Exception as e:                                  # noqa: BLE001
+        errs.append(f"import check failed: {e}")
 
     return errs
+
+
+def run_self_tests() -> list[str]:
+    """regime_engine ships its own test block; it must still pass."""
+    errs = []
+    out = _run_py(
+        "import runpy\n"
+        f"runpy.run_path({str(BASE / 'regime_engine.py')!r}, run_name='__main__')\n",
+        300)
+    ok = out.returncode == 0
+    combined = (out.stderr or "") + (out.stdout or "")
+
+    # Last line of defence. If the child still died purely because it could
+    # not encode a character for its console, that says nothing about whether
+    # the assertions hold, and it must not roll back a correct patch.
+    if not ok and "UnicodeEncodeError" in combined:
+        print("    WARN  regime_engine.py self test could not write its output "
+              "on this console")
+        print("          (UnicodeEncodeError - a display problem, not a failed "
+              "assertion)")
+        print("          re-running with all output discarded so the asserts "
+              "still count...")
+        out = _run_py(
+            "import runpy, os, sys\n"
+            "sys.stdout = open(os.devnull, 'w')\n"
+            f"runpy.run_path({str(BASE / 'regime_engine.py')!r},"
+            " run_name='__main__')\n",
+            300)
+        ok = out.returncode == 0
+        combined = (out.stderr or "") + (out.stdout or "")
+
+    print(f"    {'PASS' if ok else 'FAIL'}  regime_engine.py self test")
+    if not ok:
+        tail = (combined.strip().splitlines() or ["(no stderr)"])[-6:]
+        for line in tail:
+            print(f"           {line}")
+        errs.append("regime_engine self test failed")
+    return errs
+
+
+def do_verify() -> int:
+    print("\n  state of the tree\n")
+    core_src = (BASE / "core.py").read_text(encoding="utf-8")
+    for label, marker in (("v3.2", MARKER_V32), ("v3.3", MARKER_V33),
+                          ("v3.4", MARKER_V34)):
+        print(f"    {label}: {'installed' if marker in core_src else 'NOT installed'}")
+    print()
+    errs = verify_semantics()
+    print()
+    return 1 if errs else 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  driver
 # ═══════════════════════════════════════════════════════════════════════════
 
-def do_verify() -> int:
-    print()
-    print("=" * 78)
-    print("VERIFYING v3.3")
-    print("=" * 78)
-    errs = verify_syntax() + verify_semantics()
-    if errs:
-        for e in errs:
-            print(f"  FAIL  {e}")
-        print(f"\n  {len(errs)} check(s) failed.")
-        return 1
-    print("  all checks passed.")
-    return 0
-
-
 def main() -> int:
-    print()
-    print("=" * 78)
-    print("PATCH v3.2 -> v3.3   (day-move range/displacement unit fix)")
-    print("=" * 78)
+    _harden_stdout()
+    ap = argparse.ArgumentParser(description="NIFTY engine profitability patch v3.4")
+    ap.add_argument("--verify", action="store_true",
+                    help="report the state of the tree and change nothing")
+    args = ap.parse_args()
 
-    if "--verify" in sys.argv:
+    print("=" * 76)
+    print(" NIFTY intraday options engine — profitability patch v3.4")
+    print(" the VRP data-error guard, and the v3.2 threshold that never migrated")
+    print("=" * 76)
+
+    if args.verify:
         return do_verify()
 
     core_src = (BASE / "core.py").read_text(encoding="utf-8")
-    if MARKER_V33 in core_src:
-        print(f"  Already at v3.3 (marker {MARKER_V33} found). Nothing to do.")
+    if MARKER_V32 not in core_src or MARKER_V33 not in core_src:
+        print("\n  REFUSING: v3.2 and v3.3 must be installed first.")
+        print("  Run patch-version2.py then patch-version3.py.\n")
+        return 1
+    if MARKER_V34 in core_src:
+        print("\n  v3.4 is already installed. Nothing to do.\n")
         return 0
-    if MARKER_V32 not in core_src:
-        print("  ERROR: this patch upgrades v3.2 -> v3.3 and the v3.2 marker")
-        print(f"         ({MARKER_V32}) is not present in core.py.")
-        print("         Apply patch-version2.py first.")
-        return 2
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = backup_all(stamp)
-    print(f"  backup -> {backup.name}")
+    print(f"\n  backup: {backup.name}/\n")
 
     try:
-        patchers = {n: FilePatcher(n) for n in TOUCHED}
-        patch_core(patchers["core.py"])
-        patch_data_engine(patchers["data_engine.py"])
-        for p in patchers.values():
+        patchers = {}
+        for name, fn in (("core.py", patch_core),
+                         ("regime_engine.py", patch_regime)):
+            p = FilePatcher(name)
+            fn(p)
+            patchers[name] = p
+        for name, p in patchers.items():
             p.write()
             for label in p.log:
-                print(f"  applied  {label}")
+                print(f"    applied  {label}")
         migrate_env()
 
+        print("\n  syntax\n")
         errs = verify_syntax()
-        if errs:
-            raise PatchError("syntax: " + "; ".join(errs))
-        errs = verify_semantics()
-        if errs:
-            raise PatchError("semantics: " + "; ".join(errs))
+        for e in errs:
+            print(f"    FAIL  {e}")
+        if not errs:
+            print("    PASS  all touched files parse")
 
-    except Exception as e:
-        print()
-        print(f"  FAILED: {e}")
-        print("  restoring every touched file from backup ...")
+        print("\n  semantics\n")
+        errs += verify_semantics()
+
+        print("\n  self tests\n")
+        errs += run_self_tests()
+
+        if errs:
+            raise PatchError(f"{len(errs)} verification failure(s)")
+
+    except Exception as exc:                                # noqa: BLE001
+        print(f"\n  ERROR: {exc}")
+        print("  restoring every touched file from the backup...")
         restore_all(backup)
-        print("  restored. The tree is exactly as it was.")
+        print("  restored. The tree is exactly as it was.\n")
         return 1
 
-    print()
-    print("-" * 78)
-    print("  v3.3 applied and verified.")
-    print("-" * 78)
+    print("\n" + "=" * 76)
+    print(" v3.4 applied and verified.")
+    print("=" * 76)
     print(f"""
-  WHAT CHANGED
-    day_move_used_pct now divides the realised high-low range by the range
-    the market priced for the elapsed session, instead of by the priced
-    DISPLACEMENT. 100 finally means what v3.2 claimed it meant.
+ What changed
 
-  WHY IT MATTERED
-    A perfectly ordinary session scored ~193 against a 125 block threshold,
-    so classify_volatility returned NEUTRAL on every cycle. On a replayed
-    session the regime layer passed 109 of 787 cycles before v3.2 and 0 of
-    789 after it. This restores the traffic.
+   1. regime_engine.classify_volatility — the VRP data-error guard is now
+      DTE-aware. It admits realised vol down to 8% of implied on the expiry
+      series ({DTE0_VRP_FRAC}) and keeps v3.1's {BASE_VRP_FRAC} elsewhere, and it
+      carries an absolute floor: realised vol at or below {RV_DEAD_PCT}% is
+      treated as a dead bar feed regardless of the ratio. Measured effect on
+      2026-09-08: the guard was the terminal gate on 544 of 768 cycles.
 
-  WHAT TO DO NEXT
-    1. python backtest_engine.py --from <a> --to <b>
-       The funnel should show the regime layer passing cycles again, and
-       credit_risk_ratio / EV becoming measurable for the first time since
-       v3.2 was applied.
-    2. Do NOT tune anything else until you have 20+ recorded sessions.
-    3. Roll back at any time from {backup.name}
+   2. env.txt — DAY_MOVE_USED_BLOCK_PCT rewritten in place to {BLOCK_PCT}. The
+      v3.2 migration only appended absent keys, so the v3.1 value of 60.0
+      had been silently overriding the code default ever since.
 
-  THIS IS NOT EVIDENCE OF PROFITABILITY. It removes a unit error that was
-  blocking the engine. Whether the engine makes money is still unmeasured.
+ What this does not tell you
+
+   These edits remove two blockers that were demonstrably misfiring on real
+   recorded data. They are not evidence that the trades now permitted are
+   profitable. One live session is one sample. Re-run the backtester and
+   read the funnel before putting size on this.
+
+ Rollback
+
+   cp {backup.name}/* .
 """)
     return 0
 
