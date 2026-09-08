@@ -1095,7 +1095,7 @@ class MarketDataEngine:
                 if len(log_hl_sq) >= 10:
                     park_const = 1.0 / (4.0 * math.log(2.0))
                     variance   = park_const * (sum(log_hl_sq) / len(log_hl_sq))
-                    rv         = math.sqrt(variance * 375.0 * 252.0) * 1.15
+                    rv         = math.sqrt(variance * 375.0 * 252.0) * 1.05
 
                     # Anomaly: below floor
                     if rv < rv_floor:
@@ -1177,10 +1177,6 @@ class MarketDataEngine:
         Returns (vrp_raw, vrp_smoothed). Both can be None if data unavailable.
         """
         if atm_iv is None or parkinson_rv is None:
-            # Try to use last smoothed value
-            if self._vrp_buffer:
-                smoothed = self._vrp_buffer[-1]
-                return None, smoothed
             return None, None
 
         atm_iv_pct = atm_iv * 100.0 if atm_iv < 2.0 else atm_iv
@@ -1906,7 +1902,13 @@ class MarketDataEngine:
                         preferred = [f for f in future if f[0] >= 1]
                         expiry    = preferred[0][1] if preferred else future[0][1]
 
-                    calendar_dte = ExpiryCalendar.get_dte(today)
+                    is_tue_full = today.weekday() == 1
+                    if is_tue_full:
+                        zero_dte_today = [f for f in future if f[0] == 0]
+                        expiry = zero_dte_today[0][1] if zero_dte_today else future[0][1]
+                    else:
+                        preferred = [f for f in future if f[0] >= 1]
+                        expiry = preferred[0][1] if preferred else future[0][1]
                     expiry_dte = 0
                     _d = today + timedelta(days=1)
                     while _d <= expiry:
@@ -1917,8 +1919,7 @@ class MarketDataEngine:
                     self.state["actual_dte"]          = expiry_dte
                     self.state["expiry_last_checked"] = now_ist().isoformat()
                     self.logger.info(
-                        f"Active expiry: {expiry} "
-                        f"(calendar_dte={calendar_dte} expiry_dte={expiry_dte})"
+                        f"Active expiry: {expiry} expiry_dte={expiry_dte}"
                     )
 
             except Exception as e:
@@ -2304,6 +2305,17 @@ class MarketDataEngine:
                     f"VRP buffer seeded from DB: {len(seeded)} values"
                 )
                 return seeded
+        except Exception:
+            pass
+        return []
+
+    def _seed_vrp_buffer(self) -> List[float]:
+        try:
+            rows = self.db.get_vrp_smoothed_history(
+                n_cycles=self.config.vrp_smoothing_cycles
+            )
+            if rows:
+                return list(reversed(rows))
         except Exception:
             pass
         return []

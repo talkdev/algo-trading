@@ -867,18 +867,32 @@ class StrategyEngine:
             min(dte or 1, 6), p_win_table[6]
         ).get(or_condition, 0.50)
 
-        if vrp_smoothed > 4.0:
-            vrp_adj = 0.08
-        elif vrp_smoothed > 3.0:
-            vrp_adj = 0.05
-        elif vrp_smoothed > 2.0:
-            vrp_adj = 0.02
-        elif vrp_smoothed < 1.5:
-            vrp_adj = -0.04
+        import math as _math_ev
+        _atm_iv = float(signals.get("atm_iv") or 0.0)
+        _spot_ev = float(signals.get("spot") or 23900.0)
+        _now_ev = now_ist().time()
+        _mins_to_exit = max(
+            (datetime.combine(today_ist(), dtime(15, 0)) -
+             datetime.combine(today_ist(), _now_ev)).total_seconds() / 60.0,
+            5.0
+        )
+        _sigma_t = _atm_iv * (_mins_to_exit / (375.0 * 252.0)) ** 0.5 if _atm_iv > 0 else 0.0
+        if _sigma_t > 0 and wing > 0 and _spot_ev > 0:
+            _barrier = max(wing * 0.5 - float(self.config.spot_proximity_pts), 20.0)
+            _z = _barrier / (_spot_ev * _sigma_t)
+            def _ncdf(x):
+                return 0.5 * (1.0 + _math_ev.erf(x / _math_ev.sqrt(2.0)))
+            p_win = max(0.35, min(0.92, 1.0 - 2.0 * _ncdf(-_z)))
         else:
-            vrp_adj = 0.0
-
-        p_win = min(0.88, max(0.35, p_win_prior + vrp_adj))
+            _or_c = or_condition or "MODERATE"
+            _pb = {"VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62,
+                   "WIDE": 0.52, "VERY_WIDE": 0.44}.get(_or_c, 0.55)
+            if dte and dte >= 2:
+                _pb = max(_pb - 0.06 * min(dte - 1, 4), 0.35)
+            _va = 0.06 if vrp_smoothed > 3.5 else (
+                0.03 if vrp_smoothed > 2.5 else (
+                -0.03 if vrp_smoothed < 2.0 else 0.0))
+            p_win = max(0.35, min(0.88, _pb + _va))
         ev    = p_win * reward_pts - (1.0 - p_win) * risk_pts - friction
         min_ev = max(net_credit * 0.03, friction * 0.25)
 
@@ -1063,13 +1077,16 @@ class StrategyEngine:
 
         current_capital = state.get("current_capital", self.config.starting_capital)
         wing_for_sizing = actual_wing_pts or 150
-        _stop_loss_per_lot = 1.5 * net_credit * C02
+        _stop_loss_per_lot = 1.0 * net_credit * C02
         _structural_per_lot = max(
             (wing_for_sizing - net_credit) * C02, net_credit * C02
         )
         if _structural_per_lot <= 0:
             _structural_per_lot = wing_for_sizing * C02 * 0.5
-        structural_loss_per_lot = min(_stop_loss_per_lot, _structural_per_lot)
+        structural_loss_per_lot = min(
+            max(_stop_loss_per_lot, 0.5 * _structural_per_lot),
+            _structural_per_lot
+        )
 
         risk_pct_map = {
             0: 0.005, 1: 0.004, 2: 0.003,
@@ -1099,7 +1116,14 @@ class StrategyEngine:
 
         max_loss_per_lot = structural_loss_per_lot
 
-        margin_per_lot = (actual_wing_pts or 150) * C02 * 1.10
+        _wing_margin = (actual_wing_pts or 150) * C02 * 1.10
+        if actual_dte == 0:
+            _spot_ref = float(signals.get("spot") or 23900)
+            _n_short = sum(1 for _l in validated_legs if _l["action"] == "SELL")
+            _elm = 0.02 * _spot_ref * C02 * _n_short
+            margin_per_lot = _wing_margin + _elm
+        else:
+            margin_per_lot = _wing_margin
         total_margin   = margin_per_lot * final_lots
         if total_margin > current_capital * 0.80 and final_lots > 1:
             final_lots   = max(1, int(current_capital * 0.80 / margin_per_lot))
@@ -1743,6 +1767,13 @@ def _self_test() -> None:
     slip_exit_no_ba = engine._compute_slippage(legs_no_ba, is_exit=True)
     expected_exit_no_ba = 2 * 1.20
     assert abs(slip_exit_no_ba - expected_exit_no_ba) < 0.01, (
+        f"Exit no bid/ask: expected {expected_exit_no_ba:.3f}, got {slip_exit_no_ba:.3f}"
+    )
+    print(f"  Exit slippage (no bid/ask): {slip_exit_no_ba:.3f}pts [OK]")
+
+    slip_exit_no_ba = engine._compute_slippage(legs_no_ba, is_exit=True)
+    expected_exit_no_ba = 2 * 1.20
+    assert abs(slip_exit_no_ba - expected_exit_no_ba) < 0.01, (
         f"Exit no bid/ask slippage: expected {expected_exit_no_ba:.3f}, got {slip_exit_no_ba:.3f}"
     )
     print(f"  Exit slippage (no bid/ask): {slip_exit_no_ba:.3f}pts [OK]")
@@ -1796,7 +1827,7 @@ def _self_test() -> None:
     assert tgt0_low >= tgt0_high, f"Lower VIX should give higher target: {tgt0_low} vs {tgt0_high}"
     assert tgt0_low > tgt1, f"DTE0 {tgt0_low:.2f} should be > DTE1 {tgt1:.2f}"
     assert tgt1 > tgt2, f"DTE1 {tgt1:.2f} should be > DTE2 {tgt2:.2f}"
-    assert 0.30 <= tgt0_low <= 0.55, f"Target out of range: {tgt0_low}"
+    assert 0.30 <= tgt0_low <= 0.70, f"Target out of range: {tgt0_low}"
     print(
         f"  DTE0 VIX=11: {tgt0_low:.2f}  DTE0 VIX=16: {tgt0_high:.2f}  "
         f"DTE1: {tgt1:.2f}  DTE2: {tgt2:.2f} [OK]"

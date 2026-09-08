@@ -556,3 +556,18 @@ nifty_algo_v3/
 
 
 Long Call, Long Put, Covered Call, Protective Put, Bull Call Spread, Bear Put Spread, Bull Put Spread, Bear Call Spread, Long Straddle, Long Strangle, Short Straddle, Short Strangle, Bull Call Ratio Spread, Bear Put Ratio Spread, Call Ratio Backspread, Put Ratio Backspread, Call Debit Spread, Put Debit Spread, Call Credit Spread, Put Credit Spread, Iron Condor, Iron Fly, Long Iron Condor, Long Iron Fly, Jade Lizard, Reverse Jade Lizard, Call Butterfly, Put Butterfly, Broken Wing Butterfly, Double Butterfly, Calendar Spread, Diagonal Spread, Double Calendar Spread, Call Calendar Spread, Put Calendar Spread, Covered Call with Protective Put, Collar, Risk Reversal, Call Ratio Spread, Put Ratio Spread, Box Spread, Synthetic Long Stock, Synthetic Short Stock, Synthetic Long Call, Synthetic Long Put, Synthetic Straddle, Synthetic Strangle, Gamma Scalping, Delta-Neutral Option Selling, Delta-Neutral Straddle, Delta-Neutral Strangle, Volatility Arbitrage, IV-RV Arbitrage, IV Rank Strategy, IV Percentile Strategy, Expected Move Strategy, Mean-Reversion Option Selling, VWAP-Based Option Strategy, Opening Range Breakout Option Strategy, Trend-Following Option Strategy, Momentum Option Buying, Breakout Straddle, Volatility Expansion Straddle, Volatility Crush Strategy, Event-Driven Straddle, OI-Based Option Strategy, OI Unwinding Strategy, PCR-Based Strategy, Max Pain Strategy, Support-Resistance Option Selling, ATM Straddle Scalping, OTM Strangle Scalping, Expiry-Day Iron Fly, Expiry-Day Iron Condor, Expiry-Day Short Straddle, Expiry-Day Short Strangle, Expiry-Day Directional Debit Spread, Expiry-Day Gamma Scalping, 0DTE Mean Reversion, 0DTE Momentum, 0DTE ORB Strategy, 0DTE VWAP Strategy, 0DTE Delta-Neutral Strategy, Regime-Based Option Strategy, Price-Volatility Regime Matrix, Adaptive Option Selling, Dynamic Strike Selection, Dynamic Delta Hedging, Dynamic Iron Fly, Dynamic Iron Condor, Dynamic Straddle Adjustment, Dynamic Strangle Adjustment, Volatility Regime Switching, Trend-Regime Switching, IV-RV Regime Switching, Multi-Leg Adaptive Strategy, Portfolio-Level Delta Hedging, Gamma-Theta Optimization, Vega-Theta Optimization, Volatility Surface Arbitrage, Skew Trading, Term-Structure Trading, Dispersion Trading, Correlation Trading, Tail-Risk Hedging, Statistical Arbitrage with Options, Machine-Learning Regime Strategy, Reinforcement-Learning Options Strategy, Volatility Forecasting Strategy, Dealer Gamma Exposure Strategy, Gamma Exposure (GEX) Strategy, Vanna-Volga Strategy, Volatility Risk Premium (VRP) Strategy, Systematic Delta-Hedged Short Volatility, Systematic Long Volatility, Adaptive VRP Strategy, Multi-Regime NIFTY Options Strategy
+
+
+Pro-desk operating template (NIFTY intraday, VIX ~11, Tuesday expiry)
+
+- **Monday (DTE1):** 1 trade max, verticals only, 0.16–0.20Δ, target 0.45C/stop 1.0C,
+  flat by 15:00 — overnight gap into Tuesday expiry is uncompensated.
+- **Tuesday (0DTE):** 10:00–13:00 window only; condors at 0.14–0.18Δ / ≥0.85× live
+  straddle; pin-trade only on pin-score after 13:00 with ≤0.15Δ shorts; hard exit 15:15.
+- **Wed–Fri (DTE5→2):** sell only into rich pockets (VRP>3.5, event skew); else long
+  ORB debit spreads on confirmed trends; default = flat.
+- **Every day:** no trade in first 30 min; no new risk after 2 stops; no new 0DTE short
+  within 30 min of a scheduled event; size = min(Kelly/4 vol-target, 1% stop-risk,
+  ELM-aware margin/3).
+- **Weekly review:** EV/lot by bucket must be positive net of *honest* friction before
+  any size increase; any threshold change needs 30+ bucket trades.

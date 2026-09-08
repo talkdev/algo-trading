@@ -239,8 +239,8 @@ class CalibrationEngine:
         "vix_p50":                 12.5,
         "vix_p75":                 14.5,
         "vix_p90":                 18.0,
-        "vrp_sell_threshold":       2.0,
-        "vrp_fair_threshold":       1.2,
+        "vrp_sell_threshold":       2.5,
+        "vrp_fair_threshold":       1.5,
         "day_size_monday":          0.50,
         "day_size_tuesday":         0.75,
         "day_size_wednesday":       0.60,
@@ -1085,7 +1085,7 @@ class RegimeClassifier:
         if dte == 0:
             vrp_sell = vrp_sell * 1.00
         elif dte == 1:
-            vrp_sell = vrp_sell * 0.95
+            vrp_sell = vrp_sell * 1.00
         elif dte == 2:
             vrp_sell = vrp_sell * 1.05
         elif dte == 3:
