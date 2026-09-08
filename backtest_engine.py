@@ -200,8 +200,28 @@ class HistoricalStore:
                 "WHERE interval_min=1 GROUP BY trading_date"
             )
         }
+        # Expiries per session. A day whose only recorded series is far-dated
+        # cannot exercise a 0-4 DTE engine at all, and that is invisible in a
+        # plain row count.
+        exp_rows = self._q(
+            "SELECT trading_date, expiry, COUNT(*) AS rows, "
+            "COUNT(DISTINCT capture_time) AS cycles, "
+            "MIN(capture_time) AS first_ct, MAX(capture_time) AS last_ct "
+            "FROM option_chain_snapshot GROUP BY trading_date, expiry "
+            "ORDER BY trading_date, expiry"
+        )
+        by_day: Dict[str, List[dict]] = defaultdict(list)
+        for r in exp_rows:
+            by_day[str(r["trading_date"])].append({
+                "expiry": str(r["expiry"]),
+                "rows": int(r["rows"]),
+                "cycles": int(r["cycles"]),
+                "first": str(r["first_ct"] or "")[11:16],
+                "last": str(r["last_ct"] or "")[11:16],
+            })
         for d in chain_days:
             d["bars"] = candle_days.get(d["trading_date"], 0)
+            d["expiries"] = by_day.get(str(d["trading_date"]), [])
         return {"days": chain_days, "candle_days": candle_days}
 
     def tradable_dates(self, d_from: Optional[str], d_to: Optional[str]) -> List[str]:
@@ -258,11 +278,21 @@ class DaySlice:
 
         self.cycles: List[str] = []
         self.by_time: Dict[str, List[dict]] = defaultdict(list)
+        # A single capture_time routinely holds MORE THAN ONE expiry - the
+        # live engine records whatever series it fetched, and on an expiry
+        # day that is both the expiring weekly and the next one. Indexing
+        # only by capture_time merges them into one chain, so the same strike
+        # appears twice and whichever row happens to be last silently wins.
+        # Every snapshot is therefore keyed by expiry as well.
+        self.by_time_exp: Dict[str, Dict[str, List[dict]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         for r in chain_rows:
             ct = str(r["capture_time"])
             if ct not in self.by_time:
                 self.cycles.append(ct)
             self.by_time[ct].append(r)
+            self.by_time_exp[ct][str(r["expiry"])].append(r)
         self.cycles.sort()
 
     def cycle_dt(self, capture_time: str) -> datetime:
@@ -273,8 +303,11 @@ class DaySlice:
                 date.fromisoformat(self.trading_date), dtime(9, 15)
             )
 
-    def snapshot(self, capture_time: str) -> List[dict]:
-        return self.by_time.get(capture_time, [])
+    def snapshot(self, capture_time: str,
+                 expiry: Optional[str] = None) -> List[dict]:
+        if expiry is None:
+            return self.by_time.get(capture_time, [])
+        return self.by_time_exp.get(capture_time, {}).get(str(expiry), [])
 
     def spot_vix(self, capture_time: str) -> Tuple[Optional[float], Optional[float]]:
         rows = self.by_time.get(capture_time) or []
@@ -287,9 +320,14 @@ class DaySlice:
             float(vix) if vix else None,
         )
 
+    def expiries(self, capture_time: str) -> List[str]:
+        """Every expiry recorded at this timestamp, nearest first."""
+        return sorted(self.by_time_exp.get(capture_time, {}).keys())
+
     def expiry(self, capture_time: str) -> Optional[str]:
-        rows = self.by_time.get(capture_time) or []
-        return str(rows[0]["expiry"]) if rows else None
+        """The nearest recorded expiry. Kept for callers that want one."""
+        e = self.expiries(capture_time)
+        return e[0] if e else None
 
     def bars_until(self, cutoff: datetime) -> List[list]:
         """1-minute candles up to the simulated clock, in Upstox list shape."""
@@ -351,14 +389,28 @@ class ReplayClient:
         return []
 
     def get_option_contracts(self, instrument_key: str, expiry_date=None) -> list:
-        exp = self.day.expiry(self.cycle) if self.day else None
-        return [{"expiry": exp}] if exp else []
+        """
+        Every expiry recorded at this instant, exactly as the broker would
+        list them. Returning only one denies _get_active_expiry the choice
+        it makes live - on an expiry Tuesday it could not see the 0-DTE
+        series and fell through to the next weekly, so the engine priced a
+        7-day contract with 0DTE parameters.
+        """
+        if not self.day:
+            return []
+        return [{"expiry": e} for e in self.day.expiries(self.cycle)]
 
     def get_option_chain(self, instrument_key: str, expiry_date: str) -> list:
         if not self.day:
             return []
         by_strike: Dict[float, dict] = {}
-        for r in self.day.snapshot(self.cycle):
+        # expiry_date is a REQUEST, not a hint: serving a different series
+        # than the one asked for silently mixes two chains together.
+        want = str(expiry_date)[:10] if expiry_date else None
+        rows = self.day.snapshot(self.cycle, want)
+        if not rows and want:
+            return []
+        for r in rows:
             k = float(r["strike"])
             side = "call_options" if str(r["option_type"]).lower().startswith("c") else "put_options"
             entry = by_strike.setdefault(k, {"strike_price": k})
@@ -1003,6 +1055,41 @@ def print_audit(store: HistoricalStore) -> int:
               f"{d['bars']:>8}  {'usable' if ok else 'THIN'}")
     print(f"  {hr('-', 62)}")
     print(f"  {len(days)} session(s) recorded, {usable} usable.")
+
+    # Expiry coverage. Row counts alone hide the thing that actually decides
+    # whether a session can exercise the engine: which series were recorded.
+    print()
+    print("  EXPIRIES RECORDED PER SESSION")
+    print(f"  {hr('-', 62)}")
+    print(f"  {'date':<12} {'expiry':<12} {'DTE':>4} {'cycles':>7} "
+          f"{'from':>6} {'to':>6}   tradeable")
+    for d in days:
+        td = str(d["trading_date"])
+        exps = d.get("expiries", [])
+        near_cycles = 0
+        for e in exps:
+            try:
+                dte = (date.fromisoformat(e["expiry"][:10])
+                       - date.fromisoformat(td)).days
+                dte_s, ok = f"{dte:>4}", 0 <= dte <= 6
+            except Exception:
+                dte_s, ok = "   ?", False
+            if ok:
+                near_cycles += e["cycles"]
+            print(f"  {td:<12} {e['expiry'][:10]:<12} {dte_s} {e['cycles']:>7} "
+                  f"{e['first']:>6} {e['last']:>6}   "
+                  f"{'yes' if ok else 'NO - outside 0-4 DTE'}")
+        total_cycles = d["cycles"]
+        if exps and near_cycles < total_cycles:
+            print(f"  {'':<12} -> {total_cycles - near_cycles} of {total_cycles} "
+                  f"capture times have NO near-dated series recorded; those "
+                  f"cycles can never trade")
+    print()
+    print("  'cycles' counts capture times carrying that expiry, with the time")
+    print("  span they cover. Two expiries listed over the SAME span means the")
+    print("  engine could choose; expiries covering DIFFERENT spans means the")
+    print("  live engine switched series mid-session and the far-dated stretch")
+    print("  is unusable, whatever the gates say about it.")
     print()
     if usable < 20:
         print(f"  NOT ENOUGH DATA. {usable} usable session(s) is far below the ~20")
@@ -1040,6 +1127,10 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
     ("position limits", (
         "max_concurrent", "max_entries", "position_already_open",
         "cooldown", "consecutive")),
+    # compute_params checks the contract before it builds anything: the DTE
+    # of the expiry actually discovered from the chain is validated at the
+    # top of the function, ahead of credit_risk_ratio and the EV gate.
+    ("contract / DTE", ("dte", "expiry", "no_expiry")),
     ("structure build", (
         "no_strategy", "strike", "lots", "net_credit", "credit_ratio",
         "credit_risk", "wing_cost", "condor_weak_side", "friction",
@@ -1049,13 +1140,25 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
 ]
 
 
+UNCLASSIFIED = len(STAGE_ORDER)
+
+
 def _stage_of(bucket: str) -> int:
+    """
+    Map a gate to its position in the chain.
+
+    An unrecognised gate returns UNCLASSIFIED rather than being folded into
+    the last stage. Silently defaulting to the end is actively harmful: it
+    once attributed 83 DTE rejections to the EV gate and reported the EV
+    gate as terminal, which was simply false. An unknown gate must announce
+    itself, not borrow another gate's name.
+    """
     b = bucket.lower()
     for i, (_, keys) in enumerate(STAGE_ORDER):
         for k in keys:
             if k.lower() in b:
                 return i
-    return len(STAGE_ORDER) - 1
+    return UNCLASSIFIED
 
 
 _NUM = re.compile(r"(-?\d+\.?\d*)")
@@ -1121,6 +1224,16 @@ def print_funnel(res: "Results") -> None:
 
     print(f"  {hr('-', 88)}")
     print(f"  {'ENTERED':<20} {'':>8} {'':>8} {len(res.trades):>8}")
+
+    unknown = blocked_by_stage.get(UNCLASSIFIED)
+    if unknown:
+        print()
+        print(f"  !! {sum(unknown.values())} rejection(s) from gates this tool "
+              f"cannot place in the chain:")
+        for g, c in unknown.most_common(6):
+            print(f"       {g}  ({c})")
+        print("     Their position in the funnel above is therefore unknown,")
+        print("     and the stage totals exclude them. Add them to STAGE_ORDER.")
 
     if terminal:
         name, blocked = terminal

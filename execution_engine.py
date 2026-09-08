@@ -716,7 +716,17 @@ class ExecutionEngine:
             )
 
         # Check projected daily loss
-        trade_max_loss  = float(params.get("total_max_risk", 0) or 0)
+        # v3.2: total_max_risk is the stop-efficacy BLEND the strategy
+        # engine sizes with - it already assumes the stop works most of
+        # the time, so it is roughly half the real maximum loss. Asking
+        # "could this trade breach the daily cap" with a number that
+        # presumes the stop holds defeats the purpose of the question;
+        # the daily loss limit exists for the days when it does not.
+        trade_max_loss  = float(
+            params.get("total_structural_risk")
+            or params.get("total_max_risk", 0)
+            or 0
+        )
         projected_pct   = (daily_loss + trade_max_loss) / current_cap
         max_projected   = self.config.max_daily_loss_pct * 1.25
 
@@ -1193,12 +1203,14 @@ class ExecutionEngine:
             {"position_id": position["position_id"]},
         )
 
+        # v3.2: actual_dte is read by the priority-1 delta gate below, so
+        # it is resolved before the exit ladder rather than half way down.
+        actual_dte = int(position.get("actual_dte") or 0)
         entry_credit = float(position.get("entry_credit") or 0)
         gross_credit = float(position.get("gross_credit") or entry_credit)
         stop_premium = float(position.get("stop_premium") or 0)
         target_premium = float(position.get("target_premium") or 0)
         opening_straddle = float(position.get("opening_straddle_at_entry") or 0)
-        actual_dte = int(position.get("actual_dte") or 0)
         profit_lock_activated = bool(position.get("profit_lock_activated"))
         profit_lock_stop_level = position.get("profit_lock_stop_level")
 
@@ -1213,7 +1225,23 @@ class ExecutionEngine:
             cur_delta = abs(float(opt.get("delta", leg.get("entry_delta", 0)) or 0))
 
             strategy_name_p1 = position.get("strategy_name", "")
-            delta_thresh_p1 = 0.72 if "BUTTERFLY" in strategy_name_p1 else self.config.delta_close_threshold
+            # v3.2: a single flat 0.28 delta exit for every DTE is barely
+            # above the 0.15-0.22 delta the engine sells at, so ordinary
+            # drift - not a threat to the structure - closes winners at a
+            # scratch and pays the round trip for nothing. Expiry day
+            # needs the widest band precisely because delta moves fastest
+            # there and mean-reverts just as fast; the premium stop and
+            # the spot backstop remain the real risk controls.
+            if "BUTTERFLY" in strategy_name_p1:
+                delta_thresh_p1 = 0.72
+            elif actual_dte == 0:
+                delta_thresh_p1 = float(
+                    getattr(self.config, "delta_close_dte0", 0.35)
+                )
+            else:
+                delta_thresh_p1 = float(
+                    getattr(self.config, "delta_close_dte1p", 0.30)
+                )
             if cur_delta > delta_thresh_p1:
                 self.logger.warning(
                     f"PRIORITY 1 DELTA BREACH: {leg['action']} {opt_type} "
@@ -1244,15 +1272,28 @@ class ExecutionEngine:
             if "BUTTERFLY" in strategy_name_p2
             else _prox_scaled
         )
+        # ── v3.2: proximity to a short strike is the wrong test for an ─
+        # at-the-money structure. An iron butterfly is SOLD at the money:
+        # spot sits on the short strike from the first tick, so
+        # abs(spot - strike) was ~0 against a proximity band of
+        # 0.55 x wing and the position was closed for "structural risk"
+        # on its own entry cycle - every time, before it could earn a
+        # rupee of the theta it was opened to collect. What actually
+        # threatens a fly is spot reaching the LONG wings, where the
+        # structure is at max loss, so that is what is measured.
         if spot > 0:
+            _prox_action = "SELL"
+            if "BUTTERFLY" in strategy_name_p2:
+                _prox_action = "BUY"
             for leg in open_legs:
-                if leg["action"] != "SELL":
+                if leg["action"] != _prox_action:
                     continue
                 strike = float(leg.get("strike", 0))
                 if abs(spot - strike) <= proximity_pts:
                     self.logger.warning(
                         f"PRIORITY 2 SPOT PROXIMITY: spot={spot:.0f} "
-                        f"within {proximity_pts}pts of short {leg['option_type']} {strike:.0f}"
+                        f"within {proximity_pts}pts of {_prox_action} "
+                        f"{leg['option_type']} {strike:.0f}"
                     )
                     return "CLOSE_STOP", EXIT_PRIORITY_SPOT_PROXIMITY, {
                         "reason_detail": f"spot_proximity_{abs(spot - strike):.0f}pts",
@@ -1379,27 +1420,55 @@ class ExecutionEngine:
         cheap_thresh = self.config.cheap_buyback_pts  # default 2.0
         cheap_after  = self.config.cheap_buyback_after_time  # default 13:00
 
+        # ── v3.2: cheap buyback must not liquidate the TESTED side ────
+        # v3.1 closed the ENTIRE position the moment any one short leg
+        # printed below the threshold. On a condor that leg is cheap for
+        # exactly one reason - the other side is being tested - so the
+        # rule fired precisely when the remaining short was at its most
+        # expensive, and crystallised the worst available price on the
+        # side that mattered. It converted a manageable one-sided test
+        # into a realised loss, repeatedly, and logged it as a target.
+        #
+        # A full close is now taken only when it is genuinely protective:
+        # a single-short structure (vertical), or a multi-leg structure
+        # where EVERY short is cheap, or where the whole position can be
+        # liquidated at a small fraction of the credit taken in - i.e.
+        # the trade has already made essentially all of its money.
         if current_time >= cheap_after:
-            for leg in open_legs:
-                if leg["action"] != "SELL":
-                    continue
+            short_legs_cb = [l for l in open_legs if l["action"] == "SELL"]
+            cheap_marks = []
+            for leg in short_legs_cb:
                 strike   = float(leg.get("strike", 0))
                 opt_type = str(leg.get("option_type", ""))
                 opt      = chain.get(strike, {}).get(opt_type, {}) if chain else {}
                 bid      = float(opt.get("bid", 0) or 0)
                 ask      = float(opt.get("ask", 0) or 0)
                 mark     = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else bid
+                cheap_marks.append((strike, opt_type, mark))
 
-                if 0 < mark <= cheap_thresh:
-                    self.logger.info(
-                        f"PRIORITY 5 CHEAP BUYBACK: {leg['action']} {opt_type} "
-                        f"{strike:.0f} mark={mark:.2f}pts <= {cheap_thresh}pts"
-                    )
-                    return "CLOSE_TARGET", EXIT_PRIORITY_CHEAP_BUYBACK, {
-                        "reason_detail": f"cheap_buyback_{opt_type}_{strike:.0f}_{mark:.2f}pts",
-                        "strike": strike,
-                        "mark": mark,
-                    }
+            _priced = [m for m in cheap_marks if m[2] > 0]
+            _all_cheap = bool(_priced) and all(
+                m[2] <= cheap_thresh for m in _priced
+            ) and len(_priced) == len(short_legs_cb)
+            _single_short = len(short_legs_cb) <= 1 and bool(_priced) and (
+                _priced[0][2] <= cheap_thresh
+            )
+            _near_max_profit = (
+                gross_credit > 0 and 0 <= liq_premium <= gross_credit * 0.20
+            )
+
+            if _all_cheap or _single_short or _near_max_profit:
+                _detail = ",".join(
+                    f"{t}{s:.0f}={m:.2f}" for s, t, m in cheap_marks
+                )
+                self.logger.info(
+                    f"PRIORITY 5 CHEAP BUYBACK: shorts [{_detail}] "
+                    f"liq={liq_premium:.2f} credit={gross_credit:.2f}"
+                )
+                return "CLOSE_TARGET", EXIT_PRIORITY_CHEAP_BUYBACK, {
+                    "reason_detail": f"cheap_buyback[{_detail}]",
+                    "liquidation_premium": liq_premium,
+                }
 
         # ── Priority 6: Time-based target ─────────────────────────────────
         if entry_credit > 0:
