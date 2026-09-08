@@ -1348,6 +1348,19 @@ class MarketDataEngine:
     # IV BEHAVIOR
     # ─────────────────────────────────────────────────────────────────────
 
+    def _session_rem_frac(self) -> float:
+        """
+        Fraction of the 09:15-15:30 session still to run, floored at 0.04.
+
+        v3.5: hoisted out of _compute_iv_behavior so the IV baseline and the
+        live reading are normalised by the same clock.
+        """
+        _elapsed = max(0.0, (
+            datetime.combine(today_ist(), now_ist().time()) -
+            datetime.combine(today_ist(), dtime(9, 15))
+        ).total_seconds() / 60.0)
+        return max((375.0 - _elapsed) / 375.0, 0.04)
+
     def _compute_iv_behavior(
         self,
         atm_iv: Optional[float],
@@ -1373,28 +1386,62 @@ class MarketDataEngine:
         if bars is None or len(bars) < 6:
             return "UNKNOWN", 0.0
 
-        atm_iv_pct    = atm_iv * 100.0 if atm_iv < 2.0 else atm_iv
+        # v3.5: a baseline taken on a different expiry series is not a
+        # baseline. On 2026-09-08 the engine opened on the 15-Sep chain,
+        # latched 10.13%, then switched to the 0DTE chain at 12:03 and read
+        # the change of contract as a volatility spike for the rest of the
+        # day. Re-take it, and say so in the log.
+        _cur_exp  = self.state.get("actual_expiry")
+        _base_exp = self.state.get("opening_iv_expiry")
+        if _cur_exp and _base_exp and _cur_exp != _base_exp:
+            self.state["opening_iv"]          = atm_iv
+            self.state["opening_iv_expiry"]   = _cur_exp
+            self.state["opening_iv_rem_frac"] = self._session_rem_frac()
+            self.logger.info(
+                f"IV baseline re-taken on expiry change {_base_exp} -> "
+                f"{_cur_exp}: opening_iv={atm_iv * 100.0:.2f}%"
+            )
+            return "UNKNOWN", 0.0
+
+        atm_iv_pct     = atm_iv * 100.0 if atm_iv < 2.0 else atm_iv
         opening_iv_pct = opening_iv * 100.0 if opening_iv < 2.0 else opening_iv
 
-        iv_change_pct = (atm_iv_pct - opening_iv_pct) / opening_iv_pct * 100.0
-
-        # v3.1: on expiry day the MEASURED ATM IV drifts upward through the
-        # afternoon even in a dead-flat market, because the sqrt(T) in the
-        # denominator collapses faster than the residual premium does. With
-        # fixed bands, EXPANDING — a hard entry block — fires on quiet 0DTE
-        # afternoons and kills the highest-theta window of the week. The
-        # bands are therefore inflated by the same sqrt(T) factor on 0DTE,
-        # which neutralises the artefact while leaving a genuine volatility
-        # expansion (which is far larger) fully detected.
-        _dte_iv = self.state.get("actual_dte", 0)
+        # ── v3.5 ──────────────────────────────────────────────────────────
+        # Raw ATM IV cannot be compared against itself across an expiry
+        # session. As T collapses the annualisation factor blows up: the
+        # measured 0DTE series ran 21.9% at 12:05 to 64.4% at 15:20 on a day
+        # whose whole range was 90 points, a +536% drift that the v3.1
+        # sqrt(T) band widening could not absorb because it caps at 3.2x.
+        # 556 of 562 afternoon cycles were hard-blocked as SPIKING - the
+        # entire 0DTE window, which is the only part of the day worth
+        # trading.
+        #
+        # IV * sqrt(T_remaining) is proportional to the expected move in
+        # points, which is the thing a premium seller is short, and it does
+        # not depend on T. On the measured session it decays 16.17 -> 10.52,
+        # a 35% crush read correctly as DECLINING. A real expansion still
+        # registers because it moves the expected move itself.
+        #
+        # The normalised path needs a baseline taken at a known point in the
+        # session. Where that is absent - a caller that sets opening_iv by
+        # hand, including this module's own self test - behaviour falls back
+        # to v3.1 exactly, sqrt(T) tolerance widening included.
+        _dte_iv   = self.state.get("actual_dte", 0)
+        _rem_base = self.state.get("opening_iv_rem_frac")
         _tol = 1.0
-        if _dte_iv == 0:
-            _elapsed = max(0.0, (
-                datetime.combine(today_ist(), now_ist().time()) -
-                datetime.combine(today_ist(), dtime(9, 15))
-            ).total_seconds() / 60.0)
-            _rem_frac = max((375.0 - _elapsed) / 375.0, 0.04)
-            _tol = min(max(_rem_frac ** -0.5, 1.0), 3.2)
+
+        if _dte_iv == 0 and _rem_base:
+            _rem_now   = self._session_rem_frac()
+            _cur_norm  = atm_iv_pct * math.sqrt(max(_rem_now, 1e-6))
+            _base_norm = opening_iv_pct * math.sqrt(max(float(_rem_base), 1e-6))
+            if _base_norm <= 0.0:
+                return "UNKNOWN", 0.0
+            iv_change_pct = (_cur_norm - _base_norm) / _base_norm * 100.0
+        else:
+            iv_change_pct = (atm_iv_pct - opening_iv_pct) / opening_iv_pct * 100.0
+            if _dte_iv == 0:
+                _rem_frac = self._session_rem_frac()
+                _tol = min(max(_rem_frac ** -0.5, 1.0), 3.2)
 
         if iv_change_pct < -10.0 * _tol:
             return "CRUSHING", round(iv_change_pct, 2)
@@ -2667,6 +2714,11 @@ class MarketDataEngine:
                 atm_iv and not chain_stale):
             self.state["opening_iv"]          = atm_iv
             self.state["session_initialized"] = True
+            # v3.5: record which series the baseline came from and how much
+            # of the session was left when it was taken. Without both, the
+            # baseline cannot be compared against anything later on.
+            self.state["opening_iv_expiry"]   = self.state.get("actual_expiry")
+            self.state["opening_iv_rem_frac"] = self._session_rem_frac()
             self.logger.info(
                 f"Session initialized: opening_iv={atm_iv*100:.2f}%"
             )
@@ -3456,6 +3508,15 @@ def _self_test() -> None:
     print_section("IV Behavior Test")
     engine.state["opening_iv"] = 0.125  # 12.5%
     engine.state["session_initialized"] = True
+    # v3.5: pin the series away from expiry so the band assertions below are
+    # deterministic. They were not: v3.1's sqrt(T) tolerance widening reads
+    # the wall clock, so out of hours _tol reached its 3.2 cap, the STABLE
+    # band opened to +/-16%, and "IV 13.8% vs open 12.5%" (+10.4%) returned
+    # STABLE instead of EXPANDING. This test therefore passed during market
+    # hours and failed outside them, on the tree as it stood before v3.5.
+    # The 0DTE path it used to exercise by accident is now covered on
+    # purpose, with the clock pinned, at the end of this block.
+    engine.state["actual_dte"] = 5
 
     # Test STABLE
     beh, chg = engine._compute_iv_behavior(0.127, test_bars)
@@ -3474,6 +3535,29 @@ def _self_test() -> None:
     beh3, chg3 = engine._compute_iv_behavior(0.115, test_bars)
     print(f"  IV 11.5% vs open 12.5%: {beh3} ({chg3:.1f}%)")
     assert beh3 == "DECLINING", f"Expected DECLINING, got {beh3}"
+
+    # v3.5: the measured 2026-09-08 afternoon, with the session clock
+    # pinned so the result does not depend on when the test is run. The
+    # baseline is the 0DTE reading at 12:05 (22.0% with 205 of 375 minutes
+    # left) and the live reading is 15:20 (64.4% with 10 minutes left).
+    # Raw, that is +193% and a hard SPIKING block. Normalised it is a 35%
+    # collapse in the expected move, which is what actually happened.
+    engine.state["actual_dte"]          = 0
+    engine.state["opening_iv"]          = 0.22
+    engine.state["opening_iv_rem_frac"] = 205.0 / 375.0
+    engine.state["opening_iv_expiry"]   = "2026-09-08"
+    engine.state["actual_expiry"]       = "2026-09-08"
+    _saved_rem_frac = engine._session_rem_frac
+    engine._session_rem_frac = lambda: 10.0 / 375.0
+    try:
+        beh0, chg0 = engine._compute_iv_behavior(0.6443, test_bars)
+    finally:
+        engine._session_rem_frac = _saved_rem_frac
+    print(f"  0DTE IV 64.4% vs open 22.0% into the close: {beh0} ({chg0:.1f}%)")
+    assert beh0 in ("CRUSHING", "DECLINING"), (
+        f"A quiet expiry afternoon must read as a vol crush, got {beh0} {chg0}"
+    )
+    assert chg0 < -20.0, f"Expected a large negative normalised change, got {chg0}"
 
     print("  [OK] IV behavior test passed")
 
