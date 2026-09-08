@@ -160,15 +160,15 @@ NIFTY_2026_DEFAULTS = CalibrationState(
     n_tuesday_expiries=0,
     vix_p25=11.0,
     vix_p50=12.5,
-    vix_p75=15.0,
-    vix_p90=20.0,
-    vrp_sell_threshold=2.5,
-    vrp_fair_threshold=1.5,
-    day_size_monday=0.55,
-    day_size_tuesday=0.80,
-    day_size_wednesday=0.70,
-    day_size_thursday=0.70,
-    day_size_friday=0.60,
+    vix_p75=14.5,
+    vix_p90=18.0,
+    vrp_sell_threshold=2.0,
+    vrp_fair_threshold=1.2,
+    day_size_monday=0.50,
+    day_size_tuesday=0.75,
+    day_size_wednesday=0.60,
+    day_size_thursday=0.60,
+    day_size_friday=0.50,
     oi_buildup_threshold=0.08,
     oi_unwind_threshold=-0.08,
     oi_wall_strong_cal=2.5,
@@ -188,7 +188,7 @@ NIFTY_2026_DEFAULTS = CalibrationState(
     wednesday_avg_range=150.0,
     thursday_avg_range=150.0,
     friday_avg_range=150.0,
-    notes="NIFTY 2026 defaults — VIX 11 suppressed environment",
+    notes="NIFTY 2026 defaults — VIX 11-13 suppressed intraday only",
 )
 
 
@@ -251,16 +251,16 @@ class CalibrationEngine:
     PRIOR_WEIGHT = 30
 
     # Minimum sample sizes for each calibration component
-    MIN_SAMPLES_VIX         = 20
-    MIN_SAMPLES_VRP         = 5
-    MIN_SAMPLES_DAY_SIZE    = 3
-    MIN_SAMPLES_OI          = 20
-    MIN_SAMPLES_PCR         = 50
-    MIN_SAMPLES_SKEW        = 30
-    MIN_SAMPLES_RANGES      = 3
-    MIN_SAMPLES_WEIGHTS     = 20
-    MIN_SAMPLES_PHANTOM     = 5
-    MIN_SAMPLES_EXIT        = 10
+    MIN_SAMPLES_VIX         = 5
+    MIN_SAMPLES_VRP         = 3
+    MIN_SAMPLES_DAY_SIZE    = 2
+    MIN_SAMPLES_OI          = 10
+    MIN_SAMPLES_PCR         = 20
+    MIN_SAMPLES_SKEW        = 15
+    MIN_SAMPLES_RANGES      = 2
+    MIN_SAMPLES_WEIGHTS     = 10
+    MIN_SAMPLES_PHANTOM     = 3
+    MIN_SAMPLES_EXIT        = 5
 
     def __init__(self, db: Database, config: Config, logger):
         self.db     = db
@@ -461,11 +461,11 @@ class CalibrationEngine:
         )
 
         # Determine calibration tier
-        tier1 = n_days >= 5
-        tier2 = n_days >= self.config.min_trading_days_for_calibration  # default 20
-        tier3 = n_days >= 60
+        tier1 = n_days >= 1
+        tier2 = n_days >= max(self.config.min_trading_days_for_calibration, 5)
+        tier3 = n_days >= 30
         cal_tier  = 3 if tier3 else (2 if tier2 else (1 if tier1 else 0))
-        is_valid  = tier2
+        is_valid  = tier1
 
         # Start from current state (preserve what we know)
         new_state = CalibrationState(
