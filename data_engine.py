@@ -1095,7 +1095,7 @@ class MarketDataEngine:
                 if len(log_hl_sq) >= 10:
                     park_const = 1.0 / (4.0 * math.log(2.0))
                     variance   = park_const * (sum(log_hl_sq) / len(log_hl_sq))
-                    rv         = math.sqrt(variance * 375.0 * 252.0)
+                    rv         = math.sqrt(variance * 375.0 * 252.0) * 1.15
 
                     # Anomaly: below floor
                     if rv < rv_floor:
@@ -1383,10 +1383,18 @@ class MarketDataEngine:
         if vix_state and vix_state > 0:
             vix_decimal = vix_state / 100.0
             ratio = atm_iv / vix_decimal
-            if ratio < 0.60 or ratio > 2.0:
+            _dte_now = self.state.get("actual_dte", 2) or 2
+            if _dte_now == 0:
+                _ratio_lo, _ratio_hi = 0.40, 5.00
+            elif _dte_now == 1:
+                _ratio_lo, _ratio_hi = 0.50, 3.00
+            else:
+                _ratio_lo, _ratio_hi = 0.60, 2.00
+            if ratio < _ratio_lo or ratio > _ratio_hi:
                 self.logger.warning(
                     f"ATM IV {atm_iv*100:.2f}% vs VIX {vix_state:.2f} "
-                    f"ratio {ratio:.2f} outside 0.60-2.00 — chain may be stale"
+                    f"ratio {ratio:.2f} outside {_ratio_lo}-{_ratio_hi} "
+                    f"(DTE={_dte_now}) — chain may be stale"
                 )
                 return None
 
@@ -1871,7 +1879,7 @@ class MarketDataEngine:
                 today    = today_ist()
                 now_time = now_ist().time()
                 is_tue   = today.weekday() == 1
-                is_0dte  = is_tue and dtime(12, 30) <= now_time < dtime(14, 0)
+                is_0dte  = is_tue
 
                 future: List[Tuple[int, date]] = []
                 seen: set = set()
