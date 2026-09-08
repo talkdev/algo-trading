@@ -946,6 +946,14 @@ class CalibrationEngine:
 # REGIME CLASSIFIER
 # ─────────────────────────────────────────────────────────────────────────────
 
+# NIFTY_ENGINE_PROFIT_PATCH_V34: bounds for the VRP data-error guard. The expiry series gets a
+# looser ratio because a low realised-to-implied ratio is its normal state,
+# and an absolute floor carries the burden of catching a genuinely dead feed.
+VRP_DATA_ERROR_FRAC = 0.7
+VRP_DATA_ERROR_FRAC_DTE0 = 0.92
+VRP_RV_DEAD_PCT = 0.5
+
+
 class RegimeClassifier:
     """
     Classifies the four regime dimensions from market signals.
@@ -1067,14 +1075,66 @@ class RegimeClassifier:
                     _atm_iv_pct *= 100.0
             except (TypeError, ValueError):
                 _atm_iv_pct = None
-        _vrp_limit = max(8.0, 0.70 * _atm_iv_pct) if _atm_iv_pct else 8.0
+        # ── v3.4 ──────────────────────────────────────────────────────────
+        # Measured over the 2026-09-08 0DTE session: this guard was the
+        # terminal gate on 544 of 768 market-hours cycles, 70.8% of the day.
+        # Broker ATM IV on the expiry series ran 27-29% against a Parkinson
+        # RV near 6% and a VIX of 11.2, so vrp_raw sat around 22pp and
+        # cleared the 0.70 x IV bound of 20.2pp. Every one of those cycles
+        # was discarded as corrupt input.
+        #
+        # None of it was corrupt. The 28.8% median ATM IV is the broker's
+        # own figure in the stored chain and the ~6% realised vol is right
+        # for a session with a 90-point total range. VIX prices roughly 30
+        # calendar days; a contract with hours left prices pin risk and
+        # gamma, and two to three times VIX is its ordinary state on expiry
+        # day. Realised vol at a fifth of implied is not a broken feed — it
+        # is the variance risk premium this engine exists to sell.
+        #
+        # A real Parkinson failure does not look like a low ratio. It looks
+        # like realised vol collapsing to nothing because the bar feed is
+        # empty, flat or degenerate. So the test is split: an absolute floor
+        # catches the true failure, and the ratio bound is relaxed on the
+        # expiry series where a low ratio is the expected reading.
+        _rv_pct = None
+        _rv_raw = signals.get("parkinson_rv")
+        if _rv_raw is not None:
+            try:
+                _rv_pct = float(_rv_raw)
+                if _rv_pct <= 2.0:          # stored as a decimal, not a pct
+                    _rv_pct *= 100.0
+            except (TypeError, ValueError):
+                _rv_pct = None
 
-        if vrp_raw is not None and vrp_raw > _vrp_limit:
+        try:
+            _dte_vrp = int(dte) if dte is not None else None
+        except (TypeError, ValueError):
+            _dte_vrp = None
+
+        # 0.92 on the expiry series admits realised vol down to 8% of
+        # implied before the reading is called impossible; 0.70 elsewhere,
+        # unchanged from v3.1.
+        _vrp_frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte_vrp == 0 else VRP_DATA_ERROR_FRAC
+        _vrp_limit = max(8.0, _vrp_frac * _atm_iv_pct) if _atm_iv_pct else 8.0
+
+        _rv_dead = _rv_pct is not None and _rv_pct <= VRP_RV_DEAD_PCT
+        _vrp_over = vrp_raw is not None and vrp_raw > _vrp_limit
+
+        if _rv_dead or _vrp_over:
             details["trigger"] = "VRP_DATA_ERROR_NEUTRAL"
+            details["vrp_limit"] = _vrp_limit
+            details["vrp_reason"] = "rv_dead" if _rv_dead else "ratio"
+            _why = (
+                f"realised vol {_rv_pct:.2f}% at or below the "
+                f"{VRP_RV_DEAD_PCT:.2f}% floor — bar feed looks empty"
+                if _rv_dead else
+                f"VRP={vrp_raw:.2f}pp > limit {_vrp_limit:.2f}pp"
+            )
             self.logger.warning(
-                f"VRP={vrp_raw:.2f}pp > limit {_vrp_limit:.2f}pp "
-                f"(ATM IV {_atm_iv_pct if _atm_iv_pct else float('nan'):.2f}%) — "
-                f"likely Parkinson RV error. Treating as NEUTRAL."
+                f"{_why} (ATM IV "
+                f"{_atm_iv_pct if _atm_iv_pct else float('nan'):.2f}%, "
+                f"dte={_dte_vrp}) — likely Parkinson RV error. "
+                f"Treating as NEUTRAL."
             )
             return VolatilityRegime.NEUTRAL, details
 
@@ -2865,12 +2925,39 @@ def _self_test() -> None:
     print(f"  VIX=25 (extreme) → {vol5.value} (expect ABORT)")
     assert vol5 == VolatilityRegime.ABORT, f"Expected ABORT, got {vol5}"
 
-    # VRP data error → NEUTRAL. At the default 12.5% ATM IV the v3.1 bound is
-    # max(8, 0.70 x 12.5) = 8.75pp, so 9.5pp is still treated as bad data.
-    s6 = make_signals(vrp_raw=9.5, vrp_smoothed=9.5)
+    # v3.4 replaces the old s6 fixture. It asserted that 9.5pp of VRP at
+    # 12.5% ATM IV on the expiry series is bad data; under the corrected
+    # contract that is an ordinary 0DTE reading and must pass. The guard is
+    # now pinned by the three cases that actually define it.
+
+    # (a) a dead bar feed is still a data error, whatever the ratio says
+    s6 = make_signals(vrp_raw=9.5, vrp_smoothed=9.5, parkinson_rv=0.0)
     vol6, d6 = classifier.classify_volatility(s6, 0, 11.0)
-    print(f"  VRP=9.5pp @ IV 12.5% → {vol6.value} (expect NEUTRAL - bad data)")
-    assert vol6 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL for data error, got {vol6}"
+    print(f"  RV=0% (dead feed)    -> {vol6.value} (expect NEUTRAL - bad data)")
+    assert vol6 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL for dead feed, got {vol6}"
+    assert d6.get("trigger") == "VRP_DATA_ERROR_NEUTRAL", (
+        f"A dead bar feed must trip the data-error guard, got {d6}"
+    )
+    assert d6.get("vrp_reason") == "rv_dead", f"Expected the absolute floor to fire, got {d6}"
+
+    # (b) the measured 2026-09-08 condition: 28% ATM IV against 6% realised
+    #     on the expiry series is a real variance premium, not a broken feed
+    s6c = make_signals(vrp_raw=22.0, vrp_smoothed=22.0, atm_iv=0.28,
+                       parkinson_rv=0.06, actual_dte=0)
+    vol6c, d6c = classifier.classify_volatility(s6c, 0, 11.0)
+    print(f"  VRP=22pp @ IV 28% 0DTE -> {vol6c.value} (expect NOT bad data)")
+    assert d6c.get("trigger") != "VRP_DATA_ERROR_NEUTRAL", (
+        f"A genuine 0DTE variance premium must not be called a data error, got {d6c}"
+    )
+
+    # (c) away from the expiry series the v3.1 ratio still applies
+    s6d = make_signals(vrp_raw=11.0, vrp_smoothed=11.0, atm_iv=0.125,
+                       parkinson_rv=0.015, actual_dte=2)
+    vol6d, d6d = classifier.classify_volatility(s6d, 0, 11.0)
+    print(f"  VRP=11pp @ IV 12.5% dte2 -> {vol6d.value} (expect NEUTRAL - bad data)")
+    assert d6d.get("trigger") == "VRP_DATA_ERROR_NEUTRAL", (
+        f"An impossible ratio off the expiry series is still a data error, got {d6d}"
+    )
 
     # v3.1: the same 9.5pp VRP against a 22% ATM IV is a genuine, rich
     # variance risk premium (bound = 15.4pp), not a data error. Under the old

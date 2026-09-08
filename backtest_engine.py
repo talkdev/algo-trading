@@ -219,9 +219,29 @@ class HistoricalStore:
                 "first": str(r["first_ct"] or "")[11:16],
                 "last": str(r["last_ct"] or "")[11:16],
             })
+        # Liveness. A row count says nothing about whether the market was
+        # open: a recorder left running after the close polls the same frozen
+        # book for hours. The only reliable tell is that spot never moves.
+        live = {}
+        for r in self._q(
+            "SELECT trading_date, "
+            "COUNT(DISTINCT capture_time) AS mkt_cycles, "
+            "COUNT(DISTINCT spot_at_capture) AS spots, "
+            "MIN(spot_at_capture) AS lo, MAX(spot_at_capture) AS hi "
+            "FROM option_chain_snapshot "
+            "WHERE substr(capture_time,12,5) BETWEEN '09:15' AND '15:30' "
+            "GROUP BY trading_date"
+        ):
+            live[str(r["trading_date"])] = {
+                "mkt_cycles": int(r["mkt_cycles"] or 0),
+                "spots": int(r["spots"] or 0),
+                "range": float((r["hi"] or 0) - (r["lo"] or 0)),
+            }
         for d in chain_days:
-            d["bars"] = candle_days.get(d["trading_date"], 0)
-            d["expiries"] = by_day.get(str(d["trading_date"]), [])
+            td = str(d["trading_date"])
+            d["bars"] = candle_days.get(td, 0)
+            d["expiries"] = by_day.get(td, [])
+            d.update(live.get(td, {"mkt_cycles": 0, "spots": 0, "range": 0.0}))
         return {"days": chain_days, "candle_days": candle_days}
 
     def tradable_dates(self, d_from: Optional[str], d_to: Optional[str]) -> List[str]:
@@ -240,12 +260,25 @@ class HistoricalStore:
         return [r["trading_date"] for r in self._q(sql, tuple(params))]
 
     # -- per-day payload --------------------------------------------------
-    def load_day(self, trading_date: str) -> "DaySlice":
+    # NSE equity-derivatives session. Snapshots outside it are the broker
+    # replaying its last frozen book: the engine polls happily and records
+    # thousands of identical rows, which look like cycles and are not.
+    MARKET_OPEN = "09:15"
+    MARKET_CLOSE = "15:30"
+
+    def load_day(self, trading_date: str,
+                 market_hours_only: bool = True) -> "DaySlice":
         rows = self._q(
             "SELECT * FROM option_chain_snapshot WHERE trading_date=? "
             "ORDER BY capture_time",
             (trading_date,),
         )
+        if market_hours_only:
+            rows = [
+                r for r in rows
+                if self.MARKET_OPEN <= str(r["capture_time"])[11:16]
+                <= self.MARKET_CLOSE
+            ]
         candles = self._q(
             "SELECT candle_time, open, high, low, close, volume "
             "FROM intraday_candles WHERE trading_date=? AND interval_min=1 "
@@ -1045,15 +1078,30 @@ def print_audit(store: HistoricalStore) -> int:
 """)
         return 1
 
-    print(f"  {'date':<12} {'cycles':>7} {'strikes':>8} {'1m bars':>8}  quality")
-    print(f"  {hr('-', 62)}")
+    print(f"  {'date':<12} {'cycles':>7} {'in mkt':>7} {'spots':>6} "
+          f"{'range':>7} {'1m bars':>8}  quality")
+    print(f"  {hr('-', 74)}")
     usable = 0
     for d in days:
-        ok = d["cycles"] >= 30 and d["bars"] >= 200 and d["strikes"] >= 15
-        usable += 1 if ok else 0
-        print(f"  {d['trading_date']:<12} {d['cycles']:>7} {d['strikes']:>8} "
-              f"{d['bars']:>8}  {'usable' if ok else 'THIN'}")
-    print(f"  {hr('-', 62)}")
+        mkt = d.get("mkt_cycles", 0)
+        spots = d.get("spots", 0)
+        if mkt == 0:
+            verdict = "DEAD - no market-hours data"
+        elif spots <= 1:
+            verdict = "DEAD - spot never moved"
+        elif mkt < 30 or d["bars"] < 200 or d["strikes"] < 15:
+            verdict = "THIN"
+        else:
+            verdict = "usable"
+            usable += 1
+        print(f"  {d['trading_date']:<12} {d['cycles']:>7} {mkt:>7} {spots:>6} "
+              f"{d.get('range', 0.0):>7.0f} {d['bars']:>8}  {verdict}")
+    print(f"  {hr('-', 74)}")
+    print("  'cycles' is every recorded snapshot; 'in mkt' counts only 09:15-15:30.")
+    print("  'spots' is how many DISTINCT spot values appear inside those hours -")
+    print("  if it is 1, the recorder was polling a frozen book and the session")
+    print("  contains no price path to replay, however many rows it holds.")
+    print()
     print(f"  {len(days)} session(s) recorded, {usable} usable.")
 
     # Expiry coverage. Row counts alone hide the thing that actually decides
