@@ -363,6 +363,16 @@ class MarketDataEngine:
             ("session_state", "last_stop_signal_combo",     "TEXT"),
             ("session_state", "_straddle_open_for_regime",  "REAL DEFAULT 0"),
             ("session_state", "_straddle_open_for_summary", "REAL DEFAULT 0"),
+            # v3.1: these keys are written by _load_or_init_session_state on
+            # every cycle but were never present in the schema, which made
+            # MarketDataEngine() raise sqlite3.OperationalError on startup —
+            # the engine could not run at all.
+            ("session_state", "_last_valid_atm_iv",         "REAL"),
+            ("session_state", "_atm_iv_none_cycles",        "INTEGER DEFAULT 0"),
+            ("session_state", "_vrp_none_cycles",           "INTEGER DEFAULT 0"),
+            ("session_state", "_stale_count",               "INTEGER DEFAULT 0"),
+            # Liquidation mark, used by the honest mark-to-exit logic.
+            ("positions",     "last_liquidation_premium",   "REAL"),
             ("positions",     "profit_lock_activated",      "INTEGER DEFAULT 0"),
             ("positions",     "profit_lock_stop_level",     "REAL"),
             ("positions",     "exit_priority",              "INTEGER"),
@@ -491,10 +501,30 @@ class MarketDataEngine:
             "updated_at":                  now_ist().isoformat(),
         }
 
-        insert_row = {
-            k: (int(v) if isinstance(v, bool) else v)
-            for k, v in defaults.items()
-        }
+        # v3.1: persist only scalar values that actually exist as columns.
+        # Previously every default was written blindly, so any key without a
+        # column, or a non-scalar value, raised sqlite3 errors during
+        # MarketDataEngine construction. `_straddle_hist` in particular is a
+        # list of (timestamp, straddle) tuples feeding the straddle-expansion
+        # entry block; SQLite cannot bind a list, and the 10-minute window
+        # rebuilds within minutes of a restart, so it is intentionally kept
+        # in-memory only.
+        try:
+            _cols = {
+                r[1] for r in self.db.get_connection()
+                .execute("PRAGMA table_info(session_state)").fetchall()
+            }
+        except Exception:
+            _cols = set()
+        insert_row = {}
+        for _k, _v in defaults.items():
+            if _cols and _k not in _cols:
+                continue
+            if isinstance(_v, bool):
+                _v = int(_v)
+            elif isinstance(_v, (list, tuple, dict, set)):
+                continue
+            insert_row[_k] = _v
         self.db.insert("session_state", insert_row)
         self.logger.info(f"Fresh session state initialised for {today_str}")
         return defaults
@@ -893,17 +923,71 @@ class MarketDataEngine:
         if or_width <= 0:
             return None
 
-        # Classify OR width
-        if or_width < 50:
-            or_condition, or_score = "VERY_NARROW", 2
-        elif or_width < 100:
-            or_condition, or_score = "NARROW", 1
-        elif or_width < 150:
-            or_condition, or_score = "MODERATE", 0
-        elif or_width < 200:
-            or_condition, or_score = "WIDE", -1
-        else:
-            or_condition, or_score = "VERY_WIDE", -2
+        # ── Classify OR width (v3.1: scale-invariant) ─────────────────
+        # The old absolute 50/100/150/200pt buckets were calibrated for an
+        # ~18,000 NIFTY. or_condition drives the p_win table, the size
+        # multiplier, the VRP sell threshold and the hard "wide OR" no-trade
+        # gate, so absolute buckets make the engine progressively refuse to
+        # trade as the index rises — a silent, compounding loss of
+        # opportunity that looks like nothing at all in the logs.
+        #
+        # Two normalisations are computed and the MORE CONSERVATIVE (wider)
+        # of the two is used:
+        #   1. OR width as a fraction of spot.
+        #   2. OR width against the opening ATM straddle, i.e. against the
+        #      market's own priced expectation for the day's range. This is
+        #      the measure a professional actually uses: an 80pt opening
+        #      range is narrow when the straddle is 300pts and wide when the
+        #      straddle is 120pts.
+        _bands = ["VERY_NARROW", "NARROW", "MODERATE", "WIDE", "VERY_WIDE"]
+        _scores = {"VERY_NARROW": 2, "NARROW": 1, "MODERATE": 0,
+                   "WIDE": -1, "VERY_WIDE": -2}
+
+        _ref_spot = (or_high + or_low) / 2.0
+        try:
+            _ps = float(self.state.get("prev_spot") or 0)
+            if _ps > 0:
+                _ref_spot = _ps
+        except Exception:
+            pass
+
+        _idx_pct = 4
+        if _ref_spot > 0:
+            _frac = or_width / _ref_spot
+            if _frac < self.config.or_pct_very_narrow:
+                _idx_pct = 0
+            elif _frac < self.config.or_pct_narrow:
+                _idx_pct = 1
+            elif _frac < self.config.or_pct_moderate:
+                _idx_pct = 2
+            elif _frac < self.config.or_pct_wide:
+                _idx_pct = 3
+
+        _idx_str = _idx_pct
+        try:
+            _straddle = float(
+                self.state.get("opening_straddle_pts")
+                or self.state.get("_straddle_open_for_regime")
+                or self.state.get("_last_atm_straddle")
+                or 0.0
+            )
+        except Exception:
+            _straddle = 0.0
+        if _straddle > 20:
+            _sr = or_width / _straddle
+            if _sr < self.config.or_straddle_very_narrow:
+                _idx_str = 0
+            elif _sr < self.config.or_straddle_narrow:
+                _idx_str = 1
+            elif _sr < self.config.or_straddle_moderate:
+                _idx_str = 2
+            elif _sr < self.config.or_straddle_wide:
+                _idx_str = 3
+            else:
+                _idx_str = 4
+
+        or_condition = _bands[max(_idx_pct, _idx_str)]
+        or_score     = _scores[or_condition]
 
         return {
             "or_high":      or_high,
@@ -1110,7 +1194,24 @@ class MarketDataEngine:
 
                 if len(log_hl_sq) >= 10:
                     park_const = 1.0 / (4.0 * math.log(2.0))
-                    variance   = park_const * (sum(log_hl_sq) / len(log_hl_sq))
+                    # v3.1: this RV is used as a FORECAST of the volatility
+                    # that will be realized over the remaining holding period
+                    # — it is differenced against a forward-looking ATM IV to
+                    # produce VRP, the engine's core edge measure. An
+                    # equal-weighted session mean lets a violent 09:15-10:00
+                    # dominate the estimate for a quiet 13:00-15:00 hold,
+                    # which understates VRP exactly when selling premium is
+                    # most attractive. Exponential recency weighting is the
+                    # standard short-horizon estimator.
+                    _n_hl = len(log_hl_sq)
+                    _half_life = max(_n_hl / 3.0, 10.0)
+                    _decay = 0.5 ** (1.0 / _half_life)
+                    _w = [_decay ** (_n_hl - 1 - _i) for _i in range(_n_hl)]
+                    _wsum = sum(_w) or 1.0
+                    _mean_hl = sum(v * w for v, w in zip(log_hl_sq, _w)) / _wsum
+                    variance   = park_const * _mean_hl
+                    # 1.05 corrects the well-known downward discretisation
+                    # bias of a Parkinson estimator run on 1-minute index bars.
                     rv         = math.sqrt(variance * 375.0 * 252.0) * 1.05
 
                     # Anomaly: below floor
@@ -1199,10 +1300,20 @@ class MarketDataEngine:
         rv_pct     = parkinson_rv * 100.0 if parkinson_rv < 2.0 else parkinson_rv
         vrp_raw    = atm_iv_pct - rv_pct
 
-        # Anomaly: VRP > 8pp is almost certainly a Parkinson RV data error
-        if vrp_raw > 8.0:
+        # v3.1 anomaly bound. The old rule ("VRP > 8pp must be a data
+        # error") threw away the richest and most profitable readings: on
+        # NIFTY 0DTE a genuine 8-15pp variance risk premium is routine on a
+        # quiet expiry morning, and because regime_engine turns this into a
+        # NEUTRAL hard block the engine stood aside precisely on its best
+        # days. A real Parkinson failure does not present as an absolute
+        # number of points — it presents as RV collapsing to a small fraction
+        # of IV — so the bound is now relative to ATM IV, with the old 8pp
+        # retained as a floor so genuinely low-IV regimes stay protected.
+        _vrp_anomaly_limit = max(8.0, atm_iv_pct * 0.70)
+        if vrp_raw > _vrp_anomaly_limit:
             self.logger.warning(
-                f"VRP spike {vrp_raw:.2f}pp — likely Parkinson RV error. "
+                f"VRP spike {vrp_raw:.2f}pp > limit {_vrp_anomaly_limit:.2f}pp "
+                f"(ATM IV {atm_iv_pct:.2f}%) — likely Parkinson RV error. "
                 f"Capping at previous smoothed value."
             )
             vrp_raw_capped = self._vrp_buffer[-1] if self._vrp_buffer else 3.0
@@ -1267,13 +1378,31 @@ class MarketDataEngine:
 
         iv_change_pct = (atm_iv_pct - opening_iv_pct) / opening_iv_pct * 100.0
 
-        if iv_change_pct < -10.0:
+        # v3.1: on expiry day the MEASURED ATM IV drifts upward through the
+        # afternoon even in a dead-flat market, because the sqrt(T) in the
+        # denominator collapses faster than the residual premium does. With
+        # fixed bands, EXPANDING — a hard entry block — fires on quiet 0DTE
+        # afternoons and kills the highest-theta window of the week. The
+        # bands are therefore inflated by the same sqrt(T) factor on 0DTE,
+        # which neutralises the artefact while leaving a genuine volatility
+        # expansion (which is far larger) fully detected.
+        _dte_iv = self.state.get("actual_dte", 0)
+        _tol = 1.0
+        if _dte_iv == 0:
+            _elapsed = max(0.0, (
+                datetime.combine(today_ist(), now_ist().time()) -
+                datetime.combine(today_ist(), dtime(9, 15))
+            ).total_seconds() / 60.0)
+            _rem_frac = max((375.0 - _elapsed) / 375.0, 0.04)
+            _tol = min(max(_rem_frac ** -0.5, 1.0), 3.2)
+
+        if iv_change_pct < -10.0 * _tol:
             return "CRUSHING", round(iv_change_pct, 2)
-        if iv_change_pct < -3.0:
+        if iv_change_pct < -3.0 * _tol:
             return "DECLINING", round(iv_change_pct, 2)
-        if iv_change_pct <= 5.0:
+        if iv_change_pct <= 5.0 * _tol:
             return "STABLE", round(iv_change_pct, 2)
-        if iv_change_pct <= 18.0:
+        if iv_change_pct <= 18.0 * _tol:
             return "EXPANDING", round(iv_change_pct, 2)
         return "SPIKING", round(iv_change_pct, 2)
 
@@ -2744,14 +2873,72 @@ class MarketDataEngine:
                     f"hard exit {tue_exit}"
                 )
 
+        # v3.1: a flat 35pt/3min abort is 0.19% at an 18,000 index but only
+        # 0.13% at 26,000 — ordinary noise, so the gate fires constantly and
+        # blocks entries all day. Scaled to spot so it keeps the same economic
+        # meaning as NIFTY rises, and widened a little in high-VIX regimes
+        # where 3-minute noise is genuinely larger (and the premium collected
+        # is correspondingly larger too).
         _spot_velocity_block = False
         _sv = 0.0
         if not bars.empty and len(bars) >= 3:
             _recent3 = bars.tail(3)
             if len(_recent3) >= 2:
                 _sv = abs(float(_recent3["close"].iloc[-1]) - float(_recent3["close"].iloc[0]))
-                if _sv > 35:
+                try:
+                    _sv_ref = float(spot or self.state.get("prev_spot") or 0.0)
+                except Exception:
+                    _sv_ref = 0.0
+                try:
+                    _vix_ref = float(vix or self.state.get("prev_vix") or 12.0)
+                except Exception:
+                    _vix_ref = 12.0
+                _vix_adj = 1.0 + max(0.0, (_vix_ref - 12.0)) / 24.0
+                _sv_limit = max(
+                    (_sv_ref * self.config.spot_velocity_pct * _vix_adj)
+                    if _sv_ref > 0 else 35.0,
+                    25.0,
+                )
+                if _sv > _sv_limit:
                     _spot_velocity_block = True
+
+        # ── 26b. Adaptive protective wing width (v3.1) ────────────────────
+        # wing_width was a literal 150 written once into session state and
+        # never touched again, so every spread got the same 150-point wing
+        # regardless of volatility, DTE or index level. The wing sets BOTH the
+        # maximum loss and how much of the short premium is handed back to the
+        # long, so a frozen wing makes the engine's own credit/wing ratio gate
+        # behave arbitrarily: on a quiet 0DTE afternoon a far-OTM condor with
+        # 150pt wings simply cannot reach the 0.13 credit ratio the engine
+        # demands, so it structurally stops trading and logs nothing but
+        # "credit_ratio_below_min". The wing is now scaled off the opening
+        # straddle (the market's own expected move) and tightened on 0DTE,
+        # where credits are small and the max loss must be small to match.
+        try:
+            _aw_straddle = float(
+                self.state.get("opening_straddle_pts")
+                or self.state.get("_last_atm_straddle")
+                or 0.0
+            )
+            _aw_spot = float(spot or self.state.get("prev_spot") or 0.0)
+            _aw_step = int(self.config.nifty_strike_step or 50)
+            _aw_dte  = actual_dte if actual_dte is not None else 1
+            if _aw_straddle <= 20 and _aw_spot > 0:
+                _aw_straddle = _aw_spot * 0.009
+            if _aw_straddle > 20:
+                _aw_factor = 0.55 if _aw_dte == 0 else (
+                    0.70 if _aw_dte == 1 else 0.85
+                )
+                _aw_raw = _aw_straddle * _aw_factor
+            else:
+                _aw_raw = 150.0
+            _aw = int(round(_aw_raw / _aw_step + 0.001) * _aw_step)
+            _aw_min = max(2 * _aw_step, 100)
+            _aw_max = 250 if _aw_dte == 0 else (350 if _aw_dte == 1 else 450)
+            _adaptive_wing_width = int(max(_aw_min, min(_aw, _aw_max)))
+        except Exception:
+            _adaptive_wing_width = int(self.state.get("wing_width", 150) or 150)
+        self.state["wing_width"] = _adaptive_wing_width
 
         # ── 27. Build signals dict ────────────────────────────────────────
         signals: dict = {
@@ -2868,7 +3055,7 @@ class MarketDataEngine:
             "daily_pnl":                self.state.get("daily_pnl", 0.0),
             "current_capital":          self.state.get("current_capital",
                                                         self.config.starting_capital),
-            "wing_width":               self.state.get("wing_width", 150),
+            "wing_width":               _adaptive_wing_width,
 
             # Regime outputs (filled by regime_engine.py — None here)
             "vol_regime":               None,

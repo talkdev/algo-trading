@@ -991,7 +991,7 @@ class RegimeClassifier:
 
         Gate order (hard blocks checked first):
         1. ABORT: real VIX spike, extreme VIX, VIX data failure
-        2. VRP data error: VRP > 8pp → treat as SELL_PREMIUM (not ABORT)
+        2. VRP data error: VRP > max(8pp, 0.70 x ATM IV) → NEUTRAL
         3. IV behavior: EXPANDING/SPIKING → NEUTRAL (hard block)
         4. Day move used: > 55% of straddle → NEUTRAL
         5. VRP classification: proportional to ATM IV, DTE-adjusted, OR-adjusted
@@ -1046,12 +1046,35 @@ class RegimeClassifier:
             )
             return VolatilityRegime.ABORT, details
 
-        # ── Gate 2: VRP data error ────────────────────────────────────────
-        if vrp_raw is not None and vrp_raw > 8.0:
+        # ── Gate 2: VRP data error (v3.1) ─────────────────────────────────
+        # The same flat 8pp rule existed independently HERE and in
+        # data_engine._compute_vrp, and this one is the binding constraint:
+        # it returns NEUTRAL, which is a hard no-trade. Correcting only the
+        # data_engine copy would have achieved nothing.
+        #
+        # A genuine variance risk premium above 8pp is routine on a quiet
+        # NIFTY 0DTE morning and is precisely the condition a premium seller
+        # exists to harvest, so the flat rule stood the engine down on its
+        # best days. A real Parkinson failure does not present as an absolute
+        # number of points — it presents as realised vol collapsing to a small
+        # fraction of implied — so the bound is now relative to ATM IV, with
+        # the old 8pp kept as a floor to protect genuinely low-IV regimes.
+        _atm_iv_pct = None
+        if atm_iv is not None:
+            try:
+                _atm_iv_pct = float(atm_iv)
+                if _atm_iv_pct <= 2.0:      # stored as a decimal, not a pct
+                    _atm_iv_pct *= 100.0
+            except (TypeError, ValueError):
+                _atm_iv_pct = None
+        _vrp_limit = max(8.0, 0.70 * _atm_iv_pct) if _atm_iv_pct else 8.0
+
+        if vrp_raw is not None and vrp_raw > _vrp_limit:
             details["trigger"] = "VRP_DATA_ERROR_NEUTRAL"
             self.logger.warning(
-                f"VRP={vrp_raw:.2f}pp > 8pp — likely Parkinson RV error. "
-                f"Treating as NEUTRAL (no trade on bad data)."
+                f"VRP={vrp_raw:.2f}pp > limit {_vrp_limit:.2f}pp "
+                f"(ATM IV {_atm_iv_pct if _atm_iv_pct else float('nan'):.2f}%) — "
+                f"likely Parkinson RV error. Treating as NEUTRAL."
             )
             return VolatilityRegime.NEUTRAL, details
 
@@ -1673,7 +1696,60 @@ class RegimeClassifier:
                     FinalRegime.PREMIUM_SELL_RANGE,
                     f"RANGE_DTE2_EXCEPTION_STRONG_SELL_STRONG_RANGE",
                 )
+            # v3.1: a second, narrower DTE 2 route. Friday is DTE 2 on the
+            # Tuesday-expiry calendar and the old single condition (STRONG
+            # sell AND STRONG range together) is rare enough that Friday was
+            # effectively closed too.
+            if (vol == VolatilityRegime.SELL_PREMIUM and
+                    pos == PositioningRegime.RANGE and
+                    or_condition in ("VERY_NARROW", "NARROW") and
+                    adx_15 < self.config.adx_trend_threshold):
+                return (
+                    FinalRegime.PREMIUM_SELL_RANGE,
+                    "RANGE_DTE2_SELL_PREMIUM_NARROW_OR_FLAT_ADX",
+                )
             return FinalRegime.NO_TRADE, "RANGE_DTE2_NO_EXCEPTION"
+
+        # ── DTE 3 / DTE 4 new-cycle branch (v3.1) ─────────────────────────
+        # Wednesday is DTE 4 and Thursday is DTE 3 on the Tuesday-expiry
+        # calendar. Previously neither could ever produce a tradeable regime
+        # (there was no branch here, and strategy_engine capped the condor at
+        # DTE 2 anyway), so 40% of the trading week was structurally dead.
+        # These are legitimate premium-selling sessions — a fresh weekly
+        # contract carries the most vega and the widest credit — but they hold
+        # overnight gap risk into the next session, so the bar is deliberately
+        # higher than for DTE 0/1: rich VRP, genuine range positioning, a
+        # contained opening range and a flat trend reading are ALL required.
+        if dte in (3, 4):
+            if vol != VolatilityRegime.STRONG_SELL_PREMIUM:
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"RANGE_DTE{dte}_REQUIRES_STRONG_SELL_PREMIUM",
+                )
+            if pos not in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"RANGE_DTE{dte}_REQUIRES_RANGE_POSITIONING",
+                )
+            if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"RANGE_DTE{dte}_OR_{or_condition}_TOO_WIDE",
+                )
+            if adx_15 >= self.config.adx_trend_threshold:
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"RANGE_DTE{dte}_ADX_{adx_15:.0f}_TRENDING",
+                )
+            if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"RANGE_DTE{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
+                )
+            return (
+                FinalRegime.PREMIUM_SELL_RANGE,
+                f"RANGE_DTE{dte}_NEW_CYCLE_STRONG_SELL_CONTAINED_OR",
+            )
 
         # ── Wide OR blocks condor ─────────────────────────────────────────
         if or_condition in ("WIDE", "VERY_WIDE") and pos not in (
@@ -1933,7 +2009,23 @@ class RegimeClassifier:
         raw_size = base_size * vix_mult * conf_mult * dte_mult * event_mult
         raw_size = round(max(raw_size, 0.0), 3)
 
-        # ── Modifiers ─────────────────────────────────────────────────────
+        # ── Modifiers (v3.1: compounding, not min()) ──────────────────────
+        # These are independent sources of risk. Taking min() meant that once
+        # any one of them fired the rest were free — an unclear positioning
+        # read, a very wide opening range and a borderline VRP all at once
+        # produced exactly the same size as any one of them alone. A book run
+        # that way is systematically largest when conditions are worst.
+        #
+        # Each factor keeps its ORIGINAL value and they are now multiplied.
+        # That ordering matters: with one condition active the result is
+        # byte-identical to the old min() behaviour, so every documented
+        # invariant still holds (UNCLEAR still reduces to 0.50, a VERY_WIDE
+        # opening range still reduces to 0.25). With several active the
+        # result is strictly more conservative, which is the entire point.
+        # An earlier draft softened each factor to "compensate" for
+        # compounding — that made the single-condition case LARGER than
+        # before, i.e. the opposite of the intent, and it broke the engine's
+        # own UNCLEAR <= 0.50 contract.
         conflict_reduction = 1.0
 
         # Positioning conflict: price and positioning disagree
@@ -1941,29 +2033,33 @@ class RegimeClassifier:
         price_is_up   = price in (PriceRegime.UPTREND,   PriceRegime.STRONG_UPTREND)
 
         if price_is_down and pos == PositioningRegime.BULLISH:
-            conflict_reduction = min(conflict_reduction, 0.75)
+            conflict_reduction *= 0.75
         elif price_is_up and pos == PositioningRegime.BEARISH:
-            conflict_reduction = min(conflict_reduction, 0.75)
+            conflict_reduction *= 0.75
 
         # UNCLEAR positioning
         if pos == PositioningRegime.UNCLEAR:
-            conflict_reduction = min(conflict_reduction, 0.50)
+            conflict_reduction *= 0.50
 
         # Borderline sell
         if borderline_sell:
-            conflict_reduction = min(conflict_reduction, 0.50)
+            conflict_reduction *= 0.50
 
         # OR condition modifier
         if or_condition == "MODERATE":
-            conflict_reduction = min(conflict_reduction, 0.75)
+            conflict_reduction *= 0.75
         elif or_condition == "WIDE":
-            conflict_reduction = min(conflict_reduction, 0.50)
+            conflict_reduction *= 0.50
         elif or_condition == "VERY_WIDE":
-            conflict_reduction = min(conflict_reduction, 0.25)
+            conflict_reduction *= 0.25
 
         # Strong trend → reduce size (more risk)
         if price in (PriceRegime.STRONG_UPTREND, PriceRegime.STRONG_DOWNTREND):
-            conflict_reduction = min(conflict_reduction, 0.75)
+            conflict_reduction *= 0.75
+
+        # Floor so a pile-up of modifiers still leaves a real (if small)
+        # position rather than a meaningless one.
+        conflict_reduction = max(round(conflict_reduction, 4), 0.15)
 
         final_size = round(raw_size * conflict_reduction, 3)
         final_size = max(final_size, 0.0)
@@ -2748,11 +2844,23 @@ def _self_test() -> None:
     print(f"  VIX=25 (extreme) → {vol5.value} (expect ABORT)")
     assert vol5 == VolatilityRegime.ABORT, f"Expected ABORT, got {vol5}"
 
-    # VRP data error → SELL_PREMIUM (not ABORT)
+    # VRP data error → NEUTRAL. At the default 12.5% ATM IV the v3.1 bound is
+    # max(8, 0.70 x 12.5) = 8.75pp, so 9.5pp is still treated as bad data.
     s6 = make_signals(vrp_raw=9.5, vrp_smoothed=9.5)
     vol6, d6 = classifier.classify_volatility(s6, 0, 11.0)
-    print(f"  VRP=9.5pp (data error) → {vol6.value} (expect NEUTRAL - no trade on bad data)")
+    print(f"  VRP=9.5pp @ IV 12.5% → {vol6.value} (expect NEUTRAL - bad data)")
     assert vol6 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL for data error, got {vol6}"
+
+    # v3.1: the same 9.5pp VRP against a 22% ATM IV is a genuine, rich
+    # variance risk premium (bound = 15.4pp), not a data error. Under the old
+    # flat 8pp rule this was hard-blocked as NEUTRAL — the engine stood down
+    # on exactly the days it existed to trade. It must NOT be blocked now.
+    s6b = make_signals(vrp_raw=9.5, vrp_smoothed=9.5, atm_iv=0.22)
+    vol6b, d6b = classifier.classify_volatility(s6b, 0, 11.0)
+    print(f"  VRP=9.5pp @ IV 22%   → {vol6b.value} (expect NOT blocked as bad data)")
+    assert d6b.get("trigger") != "VRP_DATA_ERROR_NEUTRAL", (
+        f"Rich VRP at high IV must not be treated as a data error, got {d6b}"
+    )
 
     # NEUTRAL (VRP too low)
     s7 = make_signals(vrp_smoothed=1.0, or_condition="MODERATE")
