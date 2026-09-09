@@ -323,6 +323,9 @@ class StrategyEngine:
                 f"regime:{final_regime}:conf={confidence}:"
                 f"dte={dte}:or={or_condition}:adx={adx_15:.0f}"
             )
+            if strategy == BEAR_CALL_SPREAD:
+                _, _lean_why = self._range_day_bearish_lean(signals)
+                reason += f":{_lean_why}"
             return strategy, reason
 
         if final_regime == "PREMIUM_SELL_BULL":
@@ -343,6 +346,56 @@ class StrategyEngine:
 
         return "NO_TRADE", f"no_strategy_for_regime:{final_regime}"
 
+    def _range_day_bearish_lean(self, signals: dict) -> Tuple[bool, str]:
+        """Day-structure lean: heavy tape inside a range regime.
+
+        A range regime with an UNFILLED gap-down is not a symmetric range:
+        price probed the top of the opening range and was rejected back
+        under the previous close, so the put side of a condor fights
+        gravity while the call side collects it. Measured 2026-09-09: the
+        condor scratched (+26/lot) while its own call side printed +678/lot
+        and the put side lost -563/lot. When every condition below holds,
+        the range resolution sells the bear-call spread instead of the
+        condor — a SELECTION substitution only; every gate (entry rules,
+        wing cost, credit ratio, EV, sizing, pre-trade) still applies.
+
+        All required: RANGE price regime, non-bullish positioning, the
+        engine's own DOWN gap (0.4%+) still unfilled with spot heavy under
+        the previous close right now, and a real call-side OI wall above
+        spot to sell into.
+        """
+        if signals.get("price_regime") != "RANGE":
+            return False, "lean_needs_range_price"
+        if signals.get("positioning_regime") not in ("RANGE", "BEARISH"):
+            return False, "lean_blocked_by_bullish_positioning"
+        if signals.get("gap_direction") != "DOWN":
+            return False, "lean_needs_down_gap"
+        try:
+            _pc = float(signals.get("prev_close") or 0.0)
+            _dh = float(signals.get("day_high") or 0.0)
+            _sp = float(signals.get("spot") or 0.0)
+        except (TypeError, ValueError):
+            return False, "lean_day_structure_unknown"
+        if _pc <= 0 or _dh <= 0 or _sp <= 0:
+            return False, "lean_day_structure_unknown"
+        if _dh >= _pc:
+            return False, "lean_gap_filled"
+        if _sp >= _pc:
+            return False, "lean_spot_reclaimed_prev_close"
+        try:
+            _rw = float(signals.get("resistance_strike") or 0.0)
+            _rs = float(signals.get("resistance_strength") or 0.0)
+        except (TypeError, ValueError):
+            return False, "lean_no_call_wall"
+        if _rw <= _sp:
+            return False, "lean_call_wall_not_above_spot"
+        if _rs < 2.0:
+            return False, "lean_call_wall_too_weak"
+        return True, (
+            f"day_structure_lean_bearish:gap_down_unfilled_"
+            f"dh={_dh:.0f}_pc={_pc:.0f}_wall={_rw:.0f}x{_rs:.1f}"
+        )
+
     def _resolve_range_strategy(
         self,
         dte:           Optional[int],
@@ -354,6 +407,10 @@ class StrategyEngine:
         signals:       dict,
     ) -> str:
         if dte != 0:
+            _lean, _lean_reason = self._range_day_bearish_lean(signals)
+            if _lean:
+                self.logger.info(f"Range resolution: {_lean_reason}")
+                return BEAR_CALL_SPREAD
             return IRON_CONDOR
         if (or_condition in ("VERY_NARROW", "NARROW") and
                 adx_15 < 20 and
@@ -362,6 +419,10 @@ class StrategyEngine:
             atm_strike = int(signals.get("atm_strike") or 0)
             if atm_strike > 0 and abs(spot - atm_strike) < 50:
                 return IRON_BUTTERFLY
+        _lean0, _lean_reason0 = self._range_day_bearish_lean(signals)
+        if _lean0:
+            self.logger.info(f"Range resolution: {_lean_reason0}")
+            return BEAR_CALL_SPREAD
         return IRON_CONDOR
 
     def _validate_entry_rules(
@@ -429,7 +490,19 @@ class StrategyEngine:
         elif strategy_name == BEAR_CALL_SPREAD:
             or_high = float(signals.get("or_high") or 0)
             or_low  = float(signals.get("or_low") or 0)
-            if or_high > 0 and or_low > 0:
+            # The OR-mid veto is counter-trend-bounce protection: in a
+            # DOWNTREND regime, spot bouncing back above mid-range means
+            # wait for the bounce to fail. In a RANGE regime the ORB
+            # classifier already ruled "no breakout" — re-litigating with a
+            # dumber threshold double-jeopardies the trade and vetoes the
+            # best mean-reversion entries (top of a narrow range on a heavy
+            # tape is exactly where the day-structure lean sells calls into
+            # an OI wall). It is incoherent anyway: the condor this lean
+            # replaces contains the SAME short call with no such veto.
+            # Behaviour on the trend path (PREMIUM_SELL_BEAR) is unchanged.
+            _px_regime = signals.get("price_regime", "")
+            if (_px_regime in ("DOWNTREND", "STRONG_DOWNTREND")
+                    and or_high > 0 and or_low > 0):
                 or_mid    = (or_high + or_low) / 2.0
                 or_buffer = 30 if dte == 0 else 15
                 if spot > or_mid + or_buffer:
@@ -947,10 +1020,16 @@ class StrategyEngine:
             return None
 
     def _risk_fraction_for_dte(self, dte: Optional[int]) -> float:
-        """Fraction of the configured per-trade risk budget, by DTE."""
-        table = {0: 1.00, 1: 0.80, 2: 0.65, 3: 0.50, 4: 0.40,
-                 5: 0.32, 6: 0.25}
-        return table.get(min(dte if dte is not None else 1, 6), 0.25)
+        """Fraction of the configured per-trade risk budget, by DTE.
+
+        Always 1.0: the DTE discount lives in exactly ONE place — the
+        regime layer's dte_mult. Discounting here as well double-counted
+        distance from expiry (measured 2026-09-09 DTE4: 0.40 here x 0.30
+        in dte_mult), and together with the day/event schedule it capped
+        every DTE>=2 setup at ~0.03-0.06 lots against a 0.6 minimum —
+        structurally untradable, however good the edge.
+        """
+        return 1.0
 
     def _estimate_lots(
         self,
@@ -1450,6 +1529,7 @@ class StrategyEngine:
             self.config, "prox_gap_frac_dte0", 0.70
         ))
         _barriers: List[float] = []
+        _spot_distanced_ev = False
         if legs and _spot_ev > 0:
             _dists = [
                 abs(float(l["strike"]) - _spot_ev)
@@ -1470,10 +1550,67 @@ class StrategyEngine:
                 _pull_d = max(
                     float(barrier_pull_pts or 0.0), _prox_pull_d
                 )
-                _barriers.append(
-                    max(d - _pull_d, 12.0) if d > _pull_d else _atm_floor
-                )
+                if d > _pull_d:
+                    _spot_distanced_ev = True
+                    _barriers.append(max(d - _pull_d, 12.0))
+                else:
+                    _barriers.append(_atm_floor)
         _barrier = min(_barriers) if _barriers else 0.0
+
+        # ── Severity/probability consistency of the stop leg ──────────
+        # p_stop is the touch probability of the defence line above (the
+        # spot backstop / proximity exit, which fires FIRST by
+        # construction), but stop_loss_pts was always the PREMIUM-stop
+        # severity. On 0DTE the two exits sit close together so the error
+        # is small and conservative; on DTE>=1 they decouple — measured
+        # 2026-09-09, a 150-wide bear call: the backstop fires at +57pts
+        # of spot where the spread is worth ~13pts against entry, while
+        # the 1.7x premium stop needs ~+200pts of spot to fill. Charging
+        # the 200pt loss at the 57pt probability vetoed the trade.
+        # The stop leg is therefore the NEARER exit in economic terms:
+        # the spread's modelled value at the defence line (delta carry
+        # plus a gamma allowance, both from the legs' own live greeks),
+        # capped at the premium-stop loss which remains the backup. When
+        # greeks are missing, or the barrier is the ATM pseudo-distance
+        # rather than a spot distance (iron butterfly), the premium-stop
+        # severity stands exactly as before.
+        if legs and _barrier > 0 and _spot_distanced_ev:
+            try:
+                _net_d_ev = _net_g_ev = 0.0
+                _greeks_ok_ev = False
+                for _l in legs:
+                    _dd = float(_l.get("delta") or 0.0)
+                    _gg = float(_l.get("gamma") or 0.0)
+                    if _dd or _gg:
+                        _greeks_ok_ev = True
+                    _sgn = (
+                        -1.0 if str(_l.get("action")) == "SELL" else 1.0
+                    )
+                    _net_d_ev += _sgn * _dd
+                    _net_g_ev += _sgn * _gg
+                if _greeks_ok_ev and (
+                    abs(_net_d_ev) >= 0.02 or abs(_net_g_ev) >= 0.0002
+                ):
+                    _carry_ev = (
+                        abs(_net_d_ev) * _barrier * 1.25
+                        + 0.5 * abs(_net_g_ev) * _barrier ** 2
+                    )
+                    # Never model the nearer exit as cheaper than a
+                    # quarter of the premium stop: a backstop fill in a
+                    # fast tape runs past the modelled line.
+                    _carry_ev = max(
+                        _carry_ev, 0.25 * float(stop_loss_pts)
+                    )
+                    if _carry_ev < stop_loss_pts:
+                        stop_loss_pts = _carry_ev
+                        tail_loss_pts = max(
+                            stop_loss_pts,
+                            stop_loss_pts + 0.30 * max(
+                                wing_loss_pts - stop_loss_pts, 0.0
+                            ),
+                        )
+            except Exception:
+                pass
 
         p_win_model = None
         if _sigma_pts > 0 and _barriers and _spot_ev > 0:
@@ -2042,13 +2179,10 @@ class StrategyEngine:
         # arithmetic the clamp was protecting did not hold. The table is now
         # expressed as a FRACTION of the configured budget.
         _budget = float(self.config.max_risk_per_trade_pct or 0.006)
-        risk_frac_map = {
-            0: 1.00, 1: 0.80, 2: 0.65,
-            3: 0.50, 4: 0.40, 5: 0.32, 6: 0.25,
-        }
-        risk_pct  = _budget * risk_frac_map.get(
-            min(actual_dte if actual_dte is not None else 1, 6), 0.25
-        )
+        # Single-sourced with _risk_fraction_for_dte (always 1.0 now): the
+        # DTE discount lives only in the regime layer's dte_mult. An inline
+        # copy of the old table here double-counted it.
+        risk_pct  = _budget * self._risk_fraction_for_dte(actual_dte)
         max_risk  = current_capital * risk_pct
         raw_lots  = max_risk / structural_loss_per_lot
         # ── v3.2 [G5] minimum economic size ───────────────────────────
@@ -2060,16 +2194,43 @@ class StrategyEngine:
         # a lot the correct professional action is not to trade.
         _sized = raw_lots * max(float(size_mult), 0.0)
         _min_frac = float(getattr(self.config, "min_lots_fraction", 0.60))
+        _clipped_to_minimum = False
         if _sized < _min_frac:
-            return {
-                "valid": False,
-                "reason": (
-                    f"risk_budget_allows_only_{_sized:.2f}_lots_below_"
-                    f"min_{_min_frac:.2f}_forcing_1_lot_would_be_"
-                    f"{(1.0 / max(_sized, 0.01)):.1f}x_intended_risk"
-                ),
-            }
-        final_lots = max(1, int(round(_sized)))
+            # Minimum-ticket affordability. size_mult is a continuous
+            # fraction but NIFTY trades in discrete 65-lot tickets: when
+            # the scaled budget wants less than a ticket yet ONE ticket
+            # fits the UNSCALED per-trade budget on a high-quality setup,
+            # trading the single ticket IS the risk-managed action — the
+            # alternative is not "safer", it is idle capital. Without
+            # this, any stack of day/dte/event schedule discounts below
+            # ~0.42 lots permanently bans trading (measured 2026-09-09:
+            # 0.65 x 0.30 x 0.25 = 0.049 on a HIGH-confidence setup whose
+            # 1-lot blended risk was ~0.42% of capital, inside the 0.6%
+            # budget). Edge was already approved by the EV gate above;
+            # the clip additionally requires clear signal quality (never
+            # on UNCLEAR positioning or a borderline VRP read) and yields
+            # exactly one lot, still subject to every check below.
+            _pos_clip = signals.get("positioning_regime", "")
+            _bl_clip  = bool(signals.get("borderline_sell", False))
+            if (raw_lots >= 1.0 and _pos_clip != "UNCLEAR"
+                    and not _bl_clip):
+                _clipped_to_minimum = True
+                self.logger.info(
+                    f"Minimum-ticket clip: scaled {_sized:.3f} lots below "
+                    f"min {_min_frac:.2f}, but 1 lot fits the per-trade "
+                    f"budget (raw {raw_lots:.2f}) on a clear setup "
+                    f"(pos={_pos_clip}) — trading 1 lot"
+                )
+            else:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"risk_budget_allows_only_{_sized:.2f}_lots_below_"
+                        f"min_{_min_frac:.2f}_forcing_1_lot_would_be_"
+                        f"{(1.0 / max(_sized, 0.01)):.1f}x_intended_risk"
+                    ),
+                }
+        final_lots = 1 if _clipped_to_minimum else max(1, int(round(_sized)))
 
         # ── [G2] Day cap ──────────────────────────────────────────────────
         # int(capital / starting_capital) is a step function: the cap doubles
@@ -2745,12 +2906,24 @@ def _self_test() -> None:
     )
     assert not ok4, "Expected False for bull put spot below OR midpoint"
 
+    # The OR-mid veto is counter-trend-bounce protection: it binds in a
+    # DOWNTREND regime and stands down in a RANGE regime (the ORB layer
+    # already ruled "no breakout" there).
     ok5, _ = engine._validate_entry_rules(
         BEAR_CALL_SPREAD,
-        make_signals(spot=24110.0, or_high=24100.0, or_low=24040.0),
+        make_signals(spot=24110.0, or_high=24100.0, or_low=24040.0,
+                     price_regime="DOWNTREND"),
         _test_time=dtime(11, 0),
     )
-    assert not ok5, "Expected False for bear call spot above OR midpoint"
+    assert not ok5, "Expected False for bear call spot above OR midpoint in DOWNTREND"
+
+    ok5b, r5b = engine._validate_entry_rules(
+        BEAR_CALL_SPREAD,
+        make_signals(spot=24110.0, or_high=24100.0, or_low=24040.0,
+                     price_regime="RANGE"),
+        _test_time=dtime(11, 0),
+    )
+    assert ok5b, f"Expected True for bear call above OR mid in RANGE, got {r5b}"
 
     print("  [OK] Entry rules validation tests passed")
 

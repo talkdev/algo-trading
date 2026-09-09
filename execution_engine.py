@@ -1232,16 +1232,46 @@ class ExecutionEngine:
             # needs the widest band precisely because delta moves fastest
             # there and mean-reverts just as fast; the premium stop and
             # the spot backstop remain the real risk controls.
+            #
+            # Entry-relative breach: the absolute thresholds below are
+            # FLOORS, and the live threshold is the short's own entry
+            # delta plus a buffer. A flat 0.30 exit against a 0.43 entry
+            # is a stop-loss placed through the entry price — measured
+            # 2026-09-09, three bear-call spreads stopped out 15 seconds
+            # after entry with no adverse move at all. EM-clamped DTE>=1
+            # shorts legitimately carry higher delta (delta prices days
+            # of risk; the hold is hours), so the exit must adapt to what
+            # was sold: entry + 0.15 is roughly the same adverse spot
+            # move the backstop defends, which is exactly when this
+            # ladder rung should fire. 0DTE behaviour is unchanged in
+            # practice (0.22 + 0.15 = 0.37 against the old 0.35).
             if "BUTTERFLY" in strategy_name_p1:
                 delta_thresh_p1 = 0.72
-            elif actual_dte == 0:
-                delta_thresh_p1 = float(
-                    getattr(self.config, "delta_close_dte0", 0.35)
-                )
             else:
-                delta_thresh_p1 = float(
-                    getattr(self.config, "delta_close_dte1p", 0.30)
-                )
+                if actual_dte == 0:
+                    _abs_p1 = float(
+                        getattr(self.config, "delta_close_dte0", 0.35)
+                    )
+                else:
+                    _abs_p1 = float(
+                        getattr(self.config, "delta_close_dte1p", 0.30)
+                    )
+                try:
+                    _entry_d_p1 = abs(float(leg.get("entry_delta", 0) or 0))
+                except (TypeError, ValueError):
+                    _entry_d_p1 = 0.0
+                if _entry_d_p1 > 0:
+                    _buf_p1 = float(getattr(
+                        self.config, "delta_breach_buffer", 0.15
+                    ))
+                    _cap_p1 = float(getattr(
+                        self.config, "delta_breach_cap", 0.65
+                    ))
+                    delta_thresh_p1 = min(
+                        max(_entry_d_p1 + _buf_p1, _abs_p1), _cap_p1
+                    )
+                else:
+                    delta_thresh_p1 = _abs_p1
             if cur_delta > delta_thresh_p1:
                 self.logger.warning(
                     f"PRIORITY 1 DELTA BREACH: {leg['action']} {opt_type} "

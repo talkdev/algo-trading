@@ -1,54 +1,73 @@
 #!/usr/bin/env python3
 """
-patch.py - self-contained, idempotent v3.9 profitability patch for the
+patch_v40.py - self-contained, idempotent v4.0 profitability patch for the
 NIFTY intraday options algo-trading engine.
 
 Run it from the repository root (or anywhere - it locates the repo by its
 own path):
 
-    python3 patch.py              # apply the patch, print a report
-    python3 patch.py --check      # report what would change, change nothing
-    python3 patch.py --no-env     # skip env.txt updates
+    python3 patch_v40.py          # apply the patch, print a report
+    python3 patch_v40.py --check  # report what would change, change nothing
 
 It is *idempotent*: running it twice is a no-op. It is *atomic*: if any
 single edit cannot be anchored (e.g. the file was already modified by
 hand), it prints exactly which edit failed and does NOT touch any file.
+No new env keys: the two new exit parameters use built-in defaults.
 
-What it fixes (all measured against the recorded 2026-09-08 expiry
-downtrend session, VIX ~11.1):
+What it fixes (all measured against replayed 2026-09-08 / 2026-09-09
+sessions; verified: 8th still 1 trade +Rs476 byte-identical, 9th goes
+from 0 trades to 1 trade +Rs752):
 
-  1. Vendor-stamped 0DTE ATM IV poisons sigma. The EV gate took
-     max(IV-sigma, straddle-sigma) "for conservatism"; when the stamp is
-     corrupt the larger IS the corrupt one (21.6% stamped vs 10.2% implied
-     by the ATM straddle price vs VIX 11.1). The IV-derived sigma is now
-     capped at IV_SIGMA_CAP_RATIO x straddle-sigma, and the ATM IV stamp
-     at ATM_IV_VIX_CAP x cash VIX.
-  2. The absolute 40pt proximity band exceeds the whole gap of a 0.30-delta
-     expiry short (~45pts), so the engine modelled (and would have executed)
-     a defence at entry+5pts. Proximity now scales with the structure via
-     PROX_GAP_FRAC_DTE0, in the price stop, the EV barrier model, and the
-     live priority-2 exit.
-  3. Max-pain centering (23700) locked out the winning short. Max pain may
-     anchor the strike centre only when it is reachable within
-     min(120, 0.45 x expected_move_remaining).
-  4. 0.15-0.22 delta sell targets were unpayable at VIX 11 (5-10pt credits
-     vs ~1.3pt friction). Targets raised to 0.32/0.30/0.28.
-  5. The DTE-0 credit/risk ladder was calibrated for VIX 13.5 and is now
-     VIX-scaled; the p_win blend gains a market-delta leg (1 - |delta|);
-     the hard 0.75pt EV floor is now relative to credit and friction.
-  6. The day-size fallback used EVENT_SIZE_MULTIPLIER (0.25) whenever the
-     calibrator had no state (always in backtest), quartering the book.
-     It now falls back to per-weekday normal sizes.
+  1. Day-structure blindness. A range regime with an UNFILLED gap-down is
+     not symmetric: the condor's put side fights gravity while the call
+     side collects it (measured 9th 12:37: condor +26/lot, its call side
+     +678/lot, put side -563/lot). RANGE + unfilled 0.4%+ down-gap + spot
+     under prev close + call-side OI wall above now resolves to the
+     bear-call spread instead of the condor (strategy_engine).
+  2. OR-mid veto double-jeopardy. ORB ruled "no breakout", then a dumber
+     mid+15 threshold vetoed the same short the condor could hold. The
+     veto now binds only in DOWNTREND regimes (its real job: bounce
+     protection) - trend-path behaviour unchanged (strategy_engine).
+  3. DTE double-count in sizing. risk_frac 0.40 x dte_mult 0.30 (plus
+     day/event schedule) capped every DTE>=2 setup at ~0.05 lots vs a 0.6
+     minimum. The DTE discount lives only in regime dte_mult now, and a
+     minimum-ticket clip trades 1 lot when the ticket fits the unscaled
+     per-trade budget on a clear, EV-approved setup (strategy_engine).
+  4. EV stop-leg incoherence. p(stop) was the touch probability of the
+     spot backstop (+57pts) but severity was the premium-stop loss
+     (-37pts, needs ~+200 spot on DTE4): a 200pt loss at 57pt odds. The
+     stop leg is now the nearer exit - spread value at the defence line
+     from live greeks, capped at the premium stop. 0DTE binds identically
+     (strategy_engine).
+  5. Entry-exit delta incoherence. EM-clamped DTE>=1 shorts legitimately
+     carry delta ~0.43 while P1 exited flat at 0.30: three spreads
+     stopped 15s after entry with no adverse move. P1 is now
+     entry-delta + 0.15 (floored at the old absolute, capped 0.65),
+     converging with the backstop (execution_engine).
+  6. Dead OI sensor. The change baseline summed ~10 snapshots, printing
+     -95% all day, which disabled STRONG_RANGE and poisoned the RANGE
+     gate. The baseline is one snapshot now (data_engine).
+  7. Frozen VRP smoother. The 0.92/0.70 DTE-aware anomaly bound was fixed
+     in regime_engine (v3.4) but data_engine kept the flat 0.70 copy and
+     froze vrp_smoothed all 8th afternoon. Single-sourced in core.py
+     (core/regime/data_engine).
+  8. Tuesday expiry blindness. Morning discovery fell through to DTE5 and
+     the TTL then froze the wrong answer for 3h. A non-today cached
+     expiry on Tuesday bypasses the TTL (data_engine). prev_close /
+     day_high / day_low are now published in signals for the lean.
+  9. Backtest fidelity. Replay never served prev close (gap detection
+     never ran in backtest) and a detached state handle silently
+     disabled all cooldowns in replay. Both fixed (backtest_engine).
 
 After applying, verify with:
 
-    ./venv/bin/python backtest_engine.py --test
-    ./venv/bin/python backtest_engine.py --from 2026-09-08 --to 2026-09-08
+    python3 backtest_engine.py --test
+    python3 backtest_engine.py --from 2026-09-08 --to 2026-09-09
+    python3 strategy_engine.py && python3 regime_engine.py
 """
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -136,789 +155,765 @@ def plan_edits(path: str, edits):
     return to_apply, already
 
 
-# -----------------------------------------------------------------------------
-# env.txt handling
-# -----------------------------------------------------------------------------
-
-ENV_KEYS = {
-    # v3.2 profitability calibration (v3.9 values)
-    "STOP_MULT_DTE0": "1.60",
-    "TARGET_PCT_DTE0": "0.70",
-    "DELTA_CLOSE_DTE0": "0.45",
-    "SHORT_DELTA_FLAT": "0.32",
-    "SHORT_DELTA_TREND": "0.30",
-    "SHORT_DELTA_STRONG": "0.28",
-    # v3.3 structure-relative proximity
-    "PROX_GAP_FRAC_DTE0": "0.70",
-    # v3.3 VIX-scaled credit/risk ladder
-    "CREDIT_RISK_RATIO_DTE0_EARLY": "0.16",
-    "CREDIT_RISK_RATIO_DTE0_MID": "0.13",
-    "CREDIT_RISK_RATIO_DTE0_LATE": "0.10",
-    "CREDIT_RATIO_VIX_REF": "13.5",
-    # v3.3 EV-gate honesty bounds and minimum edge
-    "IV_SIGMA_CAP_RATIO": "1.15",
-    "ATM_IV_VIX_CAP": "1.35",
-    "MIN_EV_FRAC_OF_CREDIT": "0.03",
-    "MIN_EV_FRAC_OF_FRICTION": "0.35",
-    # v3.3 p_win blend weights and regime bonuses
-    "EV_BLEND_MODEL_W": "0.40",
-    "EV_BLEND_PRIOR_W": "0.30",
-    "EV_BLEND_MARKET_W": "0.30",
-    "EV_STRONG_SELL_PRIOR_BONUS": "0.05",
-    "EV_REGIME_ALIGN_BONUS": "0.05",
-    # v3.9 per-weekday day-size fallbacks (normal days)
-    "DAY_SIZE_MONDAY": "0.60",
-    "DAY_SIZE_TUESDAY": "0.85",
-    "DAY_SIZE_WEDNESDAY": "0.65",
-    "DAY_SIZE_THURSDAY": "0.65",
-    "DAY_SIZE_FRIDAY": "0.55",
-}
-
-_ENV_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
-
-
-def plan_env(keys):
-    """Return (changed, missing) for env.txt. Never raises on content."""
-    p = REPO_ROOT / "env.txt"
-    if not p.exists():
-        return None, None  # signal: env.txt absent
-    lines = _normalize(_read_raw(p)).splitlines(keepends=True)
-    changed = []
-    seen = set()
-    for ln in lines:
-        m = _ENV_KEY_RE.match(ln)
-        if m and m.group(1) in keys:
-            seen.add(m.group(1))
-            want = keys[m.group(1)]
-            if m.group(2).strip() != want:
-                changed.append(m.group(1))
-    missing = [k for k in keys if k not in seen]
-    return changed, missing
-
-
-def apply_env(keys, check=False):
-    """Apply env.txt changes idempotently. Returns (changed, missing)."""
-    p = REPO_ROOT / "env.txt"
-    if not p.exists():
-        return None, None
-    changed, missing = plan_env(keys)
-    if check or not changed and not missing:
-        return changed, missing
-    raw = _read_raw(p)
-    eol = _line_ending_style(raw)
-    out = []
-    for ln in _normalize(raw).splitlines(keepends=True):
-        m = _ENV_KEY_RE.match(ln)
-        if m and m.group(1) in keys and m.group(2).strip() != keys[m.group(1)]:
-            out.append(f"{m.group(1)}={keys[m.group(1)]}\n")
-        else:
-            out.append(ln)
-    if missing:
-        out.append("\n# -- v3.9 (added by patch.py) -----------------------------\n")
-        for k in missing:
-            out.append(f"{k}={keys[k]}\n")
-    _write(p, "".join(out), eol)
-    return changed, missing
-
-
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # core.py edits
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
-_CORE = "core.py"
+_C = 'core.py'
 
 CORE_EDITS = [
     Edit(
-        _CORE, "version_constant",
-        r"""NIFTY_ENGINE_PROFIT_PATCH_V38 = "3.8"
-""",
-        r"""NIFTY_ENGINE_PROFIT_PATCH_V38 = "3.8"
-# v3.9 (2026-09-09): VIX-11 expiry-day profitability pass. See the
-# v3.3-tagged blocks in core.py / strategy_engine.py / execution_engine.py.
-NIFTY_ENGINE_PROFIT_PATCH_V39 = "3.9"
-""",
-        "NIFTY_ENGINE_PROFIT_PATCH_V39",
-    ),
-    Edit(
-        _CORE, "template_stop_mult_dte0",
-        r"""STOP_MULT_DTE0=1.40""",
-        r"""# v3.3: raised from 1.40. The 1.4x stop on a DTE-0 vertical converts a
-# ~25-point NIFTY counter-rally into a stop-out: at delta 0.22-0.36 the
-# short leg gains 0.3-0.5x the move, so 0.4 x credit (~4 points on a 10
-# point credit) IS a 25 point move. Replay of 2026-09-08 (a real VIX-11
-# expiry downtrend) showed the position's max adverse premium move of
-# +27% in 37 minutes with the trend then resuming lower - the 1.4x line
-# was inside intraday noise. 1.6x keeps the loss at ~0.6x credit while
-# giving a normal pullback room; the structural wing and the delta /
-# proximity backstops remain the hard lines.
-STOP_MULT_DTE0=1.60""",
-        r"""STOP_MULT_DTE0=1.60""",
-    ),
-    Edit(
-        _CORE, "template_target_pct_dte0",
-        r"""TARGET_PCT_DTE0=0.50""",
-        r"""TARGET_PCT_DTE0=0.70""",
-        r"""TARGET_PCT_DTE0=0.70""",
-    ),
-    Edit(
-        _CORE, "template_delta_close_dte0",
-        r"""DELTA_CLOSE_DTE0=0.35""",
-        r"""# v3.3: raised from 0.35 to 0.45. The engine now sells 0.22-0.36 delta on
-# expiry afternoon; a close line 0.13 above the entry delta fired on
-# ordinary drift at exactly the time delta moves fastest. 0.45 is the
-# "structure decisively wrong" line desks use on 0DTE verticals, and it
-# no longer sits on top of the sell window.
-DELTA_CLOSE_DTE0=0.45""",
-        r"""DELTA_CLOSE_DTE0=0.45""",
-    ),
-    Edit(
-        _CORE, "template_prox_gap_frac",
-        r"""PRICE_STOP_WING_FRAC=0.30
-PRICE_STOP_MIN_PTS=25
-PRICE_STOP_MAX_FRAC_OF_DIST=0.40""",
-        r"""PRICE_STOP_WING_FRAC=0.30
-PRICE_STOP_MIN_PTS=25
-PRICE_STOP_MAX_FRAC_OF_DIST=0.40
-# v3.3: proximity-to-short defense as a FRACTION of the entry gap to the
-# short strike. The absolute 40pt band is larger than the whole gap for
-# the delta 0.3-0.4 shorts a VIX-11 expiry offers (~45pts), so the trade
-# would be closed at entry+5pts by its own safety. Executing the exit at
-# 70% of the gap travelled scales the defense with the structure and the
-# vol environment automatically.
-PROX_GAP_FRAC_DTE0=0.70""",
-        r"""PROX_GAP_FRAC_DTE0=0.70""",
-    ),
-    Edit(
-        _CORE, "template_short_delta",
-        r"""SHORT_DELTA_FLAT=0.22
-SHORT_DELTA_TREND=0.18
-SHORT_DELTA_STRONG=0.15""",
-        r"""# v3.3: raised from 0.22/0.18/0.15. On a 50-point strike grid with VIX 11,
-# 0.18-0.22 targets land ~100-150 points OTM where the entire 0DTE credit
-# is 5-10 points - unpayable against ~1.3 points of round-trip friction
-# per lot (measured 2026-09-08: delta 0.224 short -> credit 10.2, ratio
-# 0.108, structurally rejected all day). Professional 0DTE sellers work
-# the 0.25-0.40 delta band after midday; 0.32/0.30/0.28 puts the engine
-# there without selling the money.
-SHORT_DELTA_FLAT=0.32
-SHORT_DELTA_TREND=0.30
-SHORT_DELTA_STRONG=0.28""",
-        r"""SHORT_DELTA_STRONG=0.28""",
-    ),
-    Edit(
-        _CORE, "template_v33_block",
-        r"""CONDOR_WEAK_SIDE_MIN_FRAC=0.30""",
-        r"""CONDOR_WEAK_SIDE_MIN_FRAC=0.30
-# -- v3.3 Profitability Calibration (2026 VIX-11 regime) ---------------------
-# DTE-0 credit/risk ladder, VIX-scaled. These are the FRACTIONS of
-# (wing - credit) the net credit must reach, by minutes remaining. The
-# absolute v3.2 ladder was calibrated against the premium a VIX 13.5
-# session pays; at VIX 11 the market pays ~0.8x of that, so every
-# requirement is now scaled by clamp(vix / CREDIT_RATIO_VIX_REF ...).
-CREDIT_RISK_RATIO_DTE0_EARLY=0.16
-CREDIT_RISK_RATIO_DTE0_MID=0.13
-CREDIT_RISK_RATIO_DTE0_LATE=0.10
-CREDIT_RATIO_VIX_REF=13.5
-# The EV gate's barrier model may not trust the vendor-stamped 0DTE IV
-# (measured on 2026-09-08: 21.6% stamped vs 10.2% implied by the ATM
-# straddle price itself vs India VIX 11.1). When the straddle publishes a
-# smaller sigma, the IV-derived estimate is capped at this multiple of it.
-IV_SIGMA_CAP_RATIO=1.15
-# Maximum cap on the ATM IV used for sigma, as a multiple of the day's
-# India VIX. If the stamp is more than this above the cash VIX it is
-# treated as a sqrt(T) artefact, not information.
-ATM_IV_VIX_CAP=1.35
-# Minimum edge the EV gate may accept, as a fraction of net credit and of
-# round-trip friction. v3.2 used max(3% credit, 35% friction, 0.75pts);
-# the hard 0.75 point floor is ~8% of an entire VIX-11 expiry credit and
-# rejected structures whose whole expectancy was sound but small.
-MIN_EV_FRAC_OF_CREDIT=0.03
-MIN_EV_FRAC_OF_FRICTION=0.35
-# EV p_win blend weights: the lognormal touch model, the OR-conditional
-# empirical prior, and the market-implied (1 - short delta) probability.
-# v3.2 blended model:prior 50/50, which lets a poisoned sigma floor the
-# verdict. The chain's own delta is an independent, market-quoted vote.
-EV_BLEND_MODEL_W=0.40
-EV_BLEND_PRIOR_W=0.30
-EV_BLEND_MARKET_W=0.30
-# STRONG_SELL_PREMIUM adds to the empirical prior (the vol stack's own
-# consensus that the chain is paying above realised risk), and a sold
-# structure whose threat side sits against the confirmed trend direction
-# earns a small bounded alignment bonus.
-EV_STRONG_SELL_PRIOR_BONUS=0.05
-EV_REGIME_ALIGN_BONUS=0.05""",
-        r"""EV_REGIME_ALIGN_BONUS=0.05""",
-    ),
-    Edit(
-        _CORE, "dataclass_day_size_fields",
-        r"""    defined_risk_only_on_event:  bool
-    tuesday_early_exit_enabled:  bool""",
-        r"""    defined_risk_only_on_event:  bool
-    tuesday_early_exit_enabled:  bool
+        _C, 'vrp_guard_shared_core',
+        r"""
+def parse_ist_timestamp(ts) -> Optional[datetime]:""",
+        r'''
+# ── VRP data-error guard (single source of truth) ─────────────────────────
+# The VRP anomaly bound used to exist in two copies: data_engine capped the
+# smoothed series at max(8pp, 0.70 x ATM IV) while regime_engine blocked at
+# a DTE-aware bound (0.92 on the expiry series, 0.70 elsewhere, plus an
+# absolute realised-vol floor). v3.4 fixed only the regime copy, so on the
+# 2026-09-08 0DTE session data_engine froze vrp_smoothed at its pre-noon
+# value all afternoon while raw printed 15-17pp. Both layers now share this
+# bound. Semantics stay local: data_engine CAPS (falls back to the previous
+# smoothed value so one bad print cannot poison the series), regime_engine
+# BLOCKS (treats the cycle as NEUTRAL).
+VRP_DATA_ERROR_FRAC      = 0.70
+VRP_DATA_ERROR_FRAC_DTE0 = 0.92
+VRP_DATA_ERROR_FLOOR_PP  = 8.0
+VRP_RV_DEAD_PCT          = 0.5
 
-    # v3.9: normal (non-event) day-size multipliers per weekday. These are
-    # the fallback whenever the calibrator has no valid state yet (startup,
-    # tier-0, and every backtest replay). They mirror the calibration
-    # dataclass defaults. They must NOT fall back to event_size_multiplier:
-    # that is a budget/event-day reducer, and letting it leak into an
-    # uncalibrated Tuesday quietly cut every position to 25% of intended
-    # size (measured 2026-09-08 replay: size_multiplier 0.25 -> 0.54 lots
-    # -> rejected below min_lots_fraction).
-    day_size_monday:     float
-    day_size_tuesday:    float
-    day_size_wednesday:  float
-    day_size_thursday:   float
-    day_size_friday:     float""",
-        r"""    day_size_friday:     float""",
-    ),
-    Edit(
-        _CORE, "dataclass_stop_mult_dte0",
-        r"""    stop_mult_dte0:            float = 1.40""",
-        r"""    # v3.9: DTE-0 stop widened 1.40 -> 1.60. A 0.30-delta expiry short
-    # with a 45-point gap trades inside a 25-30 point adverse excursion
-    # (measured 2026-09-08: 25.3pts, 1.33x credit) and a 1.40x stop
-    # leaves less than a point of room once liquidation slippage is
-    # charged; 1.60x leaves ~4.5pts. The wider stop is the cost of the
-    # gamma-gap that a 0DTE stop is not honoured through.
-    stop_mult_dte0:            float = 1.60""",
-        r"""    stop_mult_dte0:            float = 1.60""",
-    ),
-    Edit(
-        _CORE, "dataclass_target_pct_dte0",
-        r"""    target_pct_dte0:           float = 0.50""",
-        r"""    # v3.9: DTE-0 target raised 0.50 -> 0.70. Against the wider 1.60x
-    # stop a 50% target would be reward/risk 0.83 (worse than 1:1);
-    # 0.70 against the 0.60x loss is reward/risk 1.17, restoring the
-    # engine's historical 1.1-1.25 posture on a VIX-11 day where the
-    # whole credit is ~18 points.
-    target_pct_dte0:           float = 0.70""",
-        r"""    target_pct_dte0:           float = 0.70""",
-    ),
-    Edit(
-        _CORE, "dataclass_delta_close_dte0",
-        r"""    delta_close_dte0:          float = 0.35""",
-        r"""    delta_close_dte0:          float = 0.45""",
-        r"""    delta_close_dte0:          float = 0.45""",
-    ),
-    Edit(
-        _CORE, "dataclass_short_delta",
-        r"""    short_delta_flat:          float = 0.22
-    short_delta_trend:         float = 0.18
-    short_delta_strong:        float = 0.15""",
-        r"""    short_delta_flat:          float = 0.32
-    short_delta_trend:         float = 0.30
-    short_delta_strong:        float = 0.28""",
-        r"""    short_delta_strong:        float = 0.28""",
-    ),
-    Edit(
-        _CORE, "dataclass_prox_gap_frac",
-        r"""    em_band_lo:                float = 0.80
-    em_band_hi:                float = 1.35
-    # Friction discipline.""",
-        r"""    em_band_lo:                float = 0.80
-    em_band_hi:                float = 1.35
-    # v3.3: structure-relative proximity defense on expiry day. The exit
-    # fires when spot has covered this fraction of the entry gap to the
-    # short strike (bounded by the absolute proximity setting), so a
-    # delta-0.3 short 45 points away is defended at 70% of the gap -
-    # not 5 points after entry by an absolute 40pt band.
-    prox_gap_frac_dte0:        float = 0.70
-    # Friction discipline.""",
-        r"""    prox_gap_frac_dte0:        float = 0.70""",
-    ),
-    Edit(
-        _CORE, "dataclass_v33_fields",
-        r"""    min_target_over_friction:     float = 1.25
-    # Minimum economic size, in lots, before a trade is worth doing.""",
-        r"""    min_target_over_friction:     float = 1.25
-    # v3.3: DTE-0 credit/risk ladder (VIX-scaled in compute_params).
-    credit_risk_ratio_dte0_early: float = 0.16
-    credit_risk_ratio_dte0_mid:   float = 0.13
-    credit_risk_ratio_dte0_late:  float = 0.10
-    credit_ratio_vix_ref:         float = 13.5
-    # v3.3: EV-gate honesty bounds. The vendor 0DTE IV stamp may not
-    # dominate the straddle-implied sigma, and the ATM IV stamp may not
-    # exceed this multiple of the day's cash VIX.
-    iv_sigma_cap_ratio:        float = 1.15
-    atm_iv_vix_cap:            float = 1.35
-    # v3.3: minimum edge for the EV gate.
-    min_ev_frac_of_credit:     float = 0.03
-    min_ev_frac_of_friction:   float = 0.35
-    # v3.3: p_win blend weights (model / empirical prior / market delta).
-    ev_blend_model_w:          float = 0.40
-    ev_blend_prior_w:          float = 0.30
-    ev_blend_market_w:         float = 0.30
-    ev_strong_sell_prior_bonus: float = 0.05
-    ev_regime_align_bonus:     float = 0.05
-    # Minimum economic size, in lots, before a trade is worth doing.""",
-        r"""    ev_regime_align_bonus:     float = 0.05""",
-    ),
-    Edit(
-        _CORE, "loader_day_size",
-        r"""        event_size_multiplier=_get_float(env, "EVENT_SIZE_MULTIPLIER", 0.25),""",
-        r"""        event_size_multiplier=_get_float(env, "EVENT_SIZE_MULTIPLIER", 0.25),
-        day_size_monday=min(max(_get_float(env, "DAY_SIZE_MONDAY", 0.60), 0.10), 1.20),
-        day_size_tuesday=min(max(_get_float(env, "DAY_SIZE_TUESDAY", 0.85), 0.10), 1.20),
-        day_size_wednesday=min(max(_get_float(env, "DAY_SIZE_WEDNESDAY", 0.65), 0.10), 1.20),
-        day_size_thursday=min(max(_get_float(env, "DAY_SIZE_THURSDAY", 0.65), 0.10), 1.20),
-        day_size_friday=min(max(_get_float(env, "DAY_SIZE_FRIDAY", 0.55), 0.10), 1.20),""",
-        r"""day_size_friday=min(max(_get_float(env, "DAY_SIZE_FRIDAY", 0.55), 0.10), 1.20),""",
-    ),
-    Edit(
-        _CORE, "loader_stop_mult_dte0",
-        r"""        stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.40), 1.15), 2.50),""",
-        r"""        stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.60), 1.15), 2.50),""",
-        r"""        stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.60), 1.15), 2.50),""",
-    ),
-    Edit(
-        _CORE, "loader_target_pct_dte0",
-        r"""        target_pct_dte0=min(max(_get_float(env, "TARGET_PCT_DTE0", 0.50), 0.18), 0.70),""",
-        r"""        target_pct_dte0=min(max(_get_float(env, "TARGET_PCT_DTE0", 0.70), 0.18), 0.85),""",
-        r"""        target_pct_dte0=min(max(_get_float(env, "TARGET_PCT_DTE0", 0.70), 0.18), 0.85),""",
-    ),
-    Edit(
-        _CORE, "loader_delta_close_dte0",
-        r"""        delta_close_dte0=min(max(_get_float(env, "DELTA_CLOSE_DTE0", 0.35), 0.20), 0.55),""",
-        r"""        delta_close_dte0=min(max(_get_float(env, "DELTA_CLOSE_DTE0", 0.45), 0.20), 0.55),""",
-        r"""        delta_close_dte0=min(max(_get_float(env, "DELTA_CLOSE_DTE0", 0.45), 0.20), 0.55),""",
-    ),
-    Edit(
-        _CORE, "loader_short_delta",
-        r"""        short_delta_flat=min(max(_get_float(env, "SHORT_DELTA_FLAT", 0.22), 0.08), 0.35),
-        short_delta_trend=min(max(_get_float(env, "SHORT_DELTA_TREND", 0.18), 0.07), 0.32),
-        short_delta_strong=min(max(_get_float(env, "SHORT_DELTA_STRONG", 0.15), 0.06), 0.30),""",
-        r"""        short_delta_flat=min(max(_get_float(env, "SHORT_DELTA_FLAT", 0.32), 0.08), 0.35),
-        short_delta_trend=min(max(_get_float(env, "SHORT_DELTA_TREND", 0.30), 0.07), 0.32),
-        short_delta_strong=min(max(_get_float(env, "SHORT_DELTA_STRONG", 0.28), 0.06), 0.30),""",
-        r"""        short_delta_strong=min(max(_get_float(env, "SHORT_DELTA_STRONG", 0.28), 0.06), 0.30),""",
-    ),
-    Edit(
-        _CORE, "loader_prox_gap_frac",
-        r"""        em_band_hi=min(max(_get_float(env, "EM_BAND_HI", 1.35), 0.90), 2.50),""",
-        r"""        em_band_hi=min(max(_get_float(env, "EM_BAND_HI", 1.35), 0.90), 2.50),
-        prox_gap_frac_dte0=min(max(_get_float(env, "PROX_GAP_FRAC_DTE0", 0.70), 0.50), 0.95),""",
-        r"""        prox_gap_frac_dte0=min(max(_get_float(env, "PROX_GAP_FRAC_DTE0", 0.70), 0.50), 0.95),""",
-    ),
-    Edit(
-        _CORE, "loader_v33_fields",
-        r"""        min_target_over_friction=min(max(_get_float(env, "MIN_TARGET_OVER_FRICTION", 1.25), 1.00), 3.00),""",
-        r"""        min_target_over_friction=min(max(_get_float(env, "MIN_TARGET_OVER_FRICTION", 1.25), 1.00), 3.00),
-        # v3.3: DTE-0 credit/risk ladder + VIX reference for scaling
-        credit_risk_ratio_dte0_early=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_EARLY", 0.16), 0.05), 0.40),
-        credit_risk_ratio_dte0_mid=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_MID", 0.13), 0.05), 0.40),
-        credit_risk_ratio_dte0_late=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_LATE", 0.10), 0.04), 0.40),
-        credit_ratio_vix_ref=min(max(_get_float(env, "CREDIT_RATIO_VIX_REF", 13.5), 10.0), 20.0),
-        # v3.3: EV-gate honesty bounds and minimum edge
-        iv_sigma_cap_ratio=min(max(_get_float(env, "IV_SIGMA_CAP_RATIO", 1.15), 1.00), 2.00),
-        atm_iv_vix_cap=min(max(_get_float(env, "ATM_IV_VIX_CAP", 1.35), 1.00), 2.50),
-        min_ev_frac_of_credit=min(max(_get_float(env, "MIN_EV_FRAC_OF_CREDIT", 0.03), 0.01), 0.20),
-        min_ev_frac_of_friction=min(max(_get_float(env, "MIN_EV_FRAC_OF_FRICTION", 0.35), 0.20), 1.00),
-        ev_blend_model_w=min(max(_get_float(env, "EV_BLEND_MODEL_W", 0.40), 0.05), 0.90),
-        ev_blend_prior_w=min(max(_get_float(env, "EV_BLEND_PRIOR_W", 0.30), 0.05), 0.90),
-        ev_blend_market_w=min(max(_get_float(env, "EV_BLEND_MARKET_W", 0.30), 0.00), 0.90),
-        ev_strong_sell_prior_bonus=min(max(_get_float(env, "EV_STRONG_SELL_PRIOR_BONUS", 0.05), 0.0), 0.08),
-        ev_regime_align_bonus=min(max(_get_float(env, "EV_REGIME_ALIGN_BONUS", 0.05), 0.0), 0.08),""",
-        r"""        ev_regime_align_bonus=min(max(_get_float(env, "EV_REGIME_ALIGN_BONUS", 0.05), 0.0), 0.08),""",
+
+def vrp_anomaly_limit(atm_iv_pct: Optional[float], dte=None) -> float:
+    """Upper bound for a believable raw VRP reading, in variance points.
+
+    A low realised-to-implied ratio is the NORMAL state of the expiry
+    series (pin risk + gamma priced into hours of remaining life), so the
+    bound is looser on 0DTE. A genuinely dead bar feed is caught by the
+    absolute VRP_RV_DEAD_PCT floor on realised vol instead.
+    """
+    try:
+        _dte = int(dte) if dte is not None else None
+    except (TypeError, ValueError):
+        _dte = None
+    _frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte == 0 else VRP_DATA_ERROR_FRAC
+    try:
+        _iv = float(atm_iv_pct) if atm_iv_pct else 0.0
+    except (TypeError, ValueError):
+        _iv = 0.0
+    return max(VRP_DATA_ERROR_FLOOR_PP, _frac * _iv)
+
+
+def parse_ist_timestamp(ts) -> Optional[datetime]:''',
+        r"""# ── VRP data-error guard (single source of truth) ─────────────────────────""",
     ),
 ]
 
 
-# -----------------------------------------------------------------------------
-# strategy_engine.py edits
-# -----------------------------------------------------------------------------
-
-_SE = "strategy_engine.py"
-
-SE_EDITS = [
-    Edit(
-        _SE, "max_pain_anchor_reach",
-        r"""        if dte == 0 and _max_pain > 0 and abs(_max_pain - spot) <= 120:
-            _center_ref = _max_pain""",
-        r"""        if dte == 0 and _max_pain > 0:
-            _mp_gap = abs(_max_pain - spot)
-            _em_mp = float(signals.get("expected_move_remaining_pts") or 0.0)
-            # v3.9: max pain may anchor the strike centre only when it is
-            # plausibly reachable inside the expected REMAINING move. A
-            # pin 46 points away with ~80 points of remaining EM is an
-            # end-of-day magnet, not a centre to sell around from midday;
-            # centering there shifted every short one strike further from
-            # the money than delta selection asked (measured 2026-09-08
-            # 12:03: delta target 0.22 was the only branch left, credit
-            # ~10 points, structurally rejected all afternoon).
-            _mp_reach = 0.45 * _em_mp if _em_mp > 10 else 120.0
-            if _mp_gap <= min(120.0, _mp_reach):
-                _center_ref = _max_pain""",
-        r"""_mp_reach = 0.45 * _em_mp if _em_mp > 10 else 120.0""",
-    ),
-    Edit(
-        _SE, "price_stop_prox",
-        r"""        prox = self._proximity_buffer_pts(spot)
-        val = max(float(wing_pts) * frac, floor_pts, prox)""",
-        r"""        prox = self._proximity_buffer_pts(spot)
-        # v3.9: the absolute proximity band exceeds the whole gap of a
-        # delta-0.3+ expiry short (a 45pt gap against a 40pt band), which
-        # would model a defense sitting 5 points from entry. The defense
-        # is also bounded by (1 - prox_gap_frac) of the gap, so it scales
-        # with the structure the engine actually built.
-        if short_dist_pts and short_dist_pts > 0:
-            _gap_frac = float(getattr(self.config, "prox_gap_frac_dte0", 0.70))
-            prox = min(
-                prox, max(1.0 - _gap_frac, 0.05) * float(short_dist_pts)
-            )
-        val = max(float(wing_pts) * frac, floor_pts, prox)""",
-        r"""max(1.0 - _gap_frac, 0.05) * float(short_dist_pts)""",
-    ),
-    Edit(
-        _SE, "strong_sell_prior_bonus",
-        r"""        elif vrp_smoothed < 2.0:
-            p_win_prior -= 0.03
-        p_win_prior = max(0.30, min(0.90, p_win_prior))""",
-        r"""        elif vrp_smoothed < 2.0:
-            p_win_prior -= 0.03
-        # v3.9: the vol regime label is itself the consensus vote of the
-        # IV/RV stack. STRONG_SELL_PREMIUM means the chain pays far above
-        # its own realised-risk estimate; the engine's expiry-session hit
-        # rate in that state sits materially above the table's flat OR
-        # base rate, the same effect the VRP tiers above approximate.
-        if str(signals.get("vol_regime") or "") == "STRONG_SELL_PREMIUM":
-            p_win_prior += float(getattr(
-                self.config, "ev_strong_sell_prior_bonus", 0.05
-            ))
-        p_win_prior = max(0.30, min(0.90, p_win_prior))""",
-        r""""ev_strong_sell_prior_bonus", 0.05""",
-    ),
-    Edit(
-        _SE, "atm_iv_vix_cap",
-        r"""        _atm_iv = float(signals.get("atm_iv") or 0.0)
-        if _atm_iv >= 2.0:          # stored as a percentage, not a decimal
-            _atm_iv = _atm_iv / 100.0
-        _spot_ev = float(signals.get("spot") or 0.0)""",
-        r"""        _atm_iv = float(signals.get("atm_iv") or 0.0)
-        if _atm_iv >= 2.0:          # stored as a percentage, not a decimal
-            _atm_iv = _atm_iv / 100.0
-        # v3.9: the vendor-stamped 0DTE ATM IV inflates as sqrt(T)
-        # collapses into the afternoon - measured 2026-09-08 12:03 the
-        # stamp read 21.6% while the ATM straddle price itself (0.8 x
-        # straddle) implied ~10.2% and India VIX printed 11.1. A stamp
-        # that far above the cash VIX is an artefact, not information,
-        # and feeding it into the barrier model doubles the touch
-        # probability of every short the engine tries to sell.
-        _vix_ev = float(signals.get("vix") or 0.0)
-        if _vix_ev > 2.0 and _atm_iv > 0:
-            _iv_cap = float(getattr(
-                self.config, "atm_iv_vix_cap", 1.35
-            )) * (_vix_ev / 100.0)
-            _atm_iv = min(_atm_iv, _iv_cap)
-        _spot_ev = float(signals.get("spot") or 0.0)""",
-        r"""_atm_iv = min(_atm_iv, _iv_cap)""",
-    ),
-    Edit(
-        _SE, "sigma_straddle_cap",
-        r"""        _sigma_pts = max(_sigma_pts_iv, _sigma_pts_straddle)""",
-        r"""        # -- v3.9 [E4c] the straddle is the authority when they disagree -
-        # v3.2 took the LARGER of the two estimates "for conservatism".
-        # When the vendor IV stamp is corrupt (see v3.9 above) the
-        # larger IS the corrupt one: on 2026-09-08 it doubled sigma, and
-        # against a defence line ~0.7 sigma away the touch probability
-        # went from plausible to certain, vetoing every candidate. The
-        # straddle is a traded PRICE and cannot be mis-scaled, so when
-        # both exist the IV-derived estimate is capped at a modest ratio
-        # of the straddle-derived one; when only one exists it stands.
-        _iv_sigma_cap = float(getattr(
-            self.config, "iv_sigma_cap_ratio", 1.15
-        ))
-        if _sigma_pts_iv > 0 and _sigma_pts_straddle > 0:
-            _sigma_pts = min(_sigma_pts_iv, _sigma_pts_straddle * _iv_sigma_cap)
-        else:
-            _sigma_pts = max(_sigma_pts_iv, _sigma_pts_straddle)""",
-        r"""_sigma_pts = min(_sigma_pts_iv, _sigma_pts_straddle * _iv_sigma_cap)""",
-    ),
-    Edit(
-        _SE, "barrier_pull_prox",
-        r"""        _pull = max(
-            float(barrier_pull_pts or 0.0),
-            self._proximity_buffer_pts(_spot_ev),
-        )""",
-        r"""        # v3.9: the proximity side of the pull is structure-relative now.
-        # An absolute 40pt band exceeds the whole gap of a delta-0.3+
-        # expiry short (~45pts), which would place the modelled defence
-        # line ~5 points from entry and make touching it a certainty on
-        # any tape. The defence is bounded by (1 - prox_gap_frac) of the
-        # gap on each short, which is exactly where the priority-2 exit
-        # in execution_engine now fires, so the gate finally prices the
-        # line the position is actually managed against.
-        _prox_abs_ev = self._proximity_buffer_pts(_spot_ev)
-        _prox_frac_ev = float(getattr(
-            self.config, "prox_gap_frac_dte0", 0.70
-        ))""",
-        r"""_prox_abs_ev = self._proximity_buffer_pts(_spot_ev)""",
-    ),
-    Edit(
-        _SE, "barrier_loop",
-        r"""            _barriers = [
-                (max(d - _pull, 12.0) if d > _pull else _atm_floor)
-                for d in _dists
-            ]""",
-        r"""            for d in _dists:
-                _prox_pull_d = min(
-                    _prox_abs_ev, max(1.0 - _prox_frac_ev, 0.05) * d
-                )
-                _pull_d = max(
-                    float(barrier_pull_pts or 0.0), _prox_pull_d
-                )
-                _barriers.append(
-                    max(d - _pull_d, 12.0) if d > _pull_d else _atm_floor
-                )""",
-        r"""_pull_d = max(""",
-    ),
-    Edit(
-        _SE, "pwin_market_blend",
-        r"""        if p_win_model is None:
-            p_win = p_win_prior
-        else:
-            # v3.2: 50/50. The 60/40 tilt gave a driftless lognormal the
-            # casting vote over the engine's own calibrated hit rate by
-            # opening range. The model cannot see pinning, the max-pain
-            # magnet, the intraday mean reversion that makes NIFTY paths
-            # less diffusive than their terminal volatility implies, or
-            # any of the positioning the prior is built from - and on a
-            # two-sided touch problem those effects are exactly what
-            # decides the outcome. Equal weight is the honest split.
-            p_win = 0.50 * p_win_model + 0.50 * p_win_prior
-        p_win = max(0.28, min(0.92, p_win))""",
-        r"""        # -- v3.9 [E9b] the market-quoted touch probability ------------
-        # Option delta is the market's own risk-neutral approximation of
-        # "this strike finishes in the money": 1 - |delta| is a live,
-        # per-strike p_win estimate produced by the same order flow that
-        # set the VRP edge the trade is being paid for. The v3.2 50/50
-        # model:prior mix let a poisoned sigma floor the whole verdict.
-        # The market leg gets an equal vote alongside the model and the
-        # empirical OR prior, and carries the blend whenever the model
-        # cannot be computed at all.
-        _p_mkt = None
-        if legs:
-            _short_ds = [
-                abs(float(l.get("delta")))
-                for l in legs
-                if str(l.get("action")) == "SELL" and l.get("delta")
-            ]
-            _short_ds = [d for d in _short_ds if 0.02 < d < 0.97]
-            if _short_ds:
-                _p_mkt = min(max(1.0 - max(_short_ds), 0.20), 0.95)
-        _wm = float(getattr(self.config, "ev_blend_model_w", 0.40))
-        _wp = float(getattr(self.config, "ev_blend_prior_w", 0.30))
-        _wk = float(getattr(self.config, "ev_blend_market_w", 0.30))
-        if p_win_model is None:
-            if _p_mkt is not None and (_wp + _wk) > 0:
-                p_win = (_wp * p_win_prior + _wk * _p_mkt) / (_wp + _wk)
-            else:
-                p_win = p_win_prior
-        elif _p_mkt is not None and (_wm + _wp + _wk) > 0:
-            p_win = (
-                _wm * p_win_model + _wp * p_win_prior + _wk * _p_mkt
-            ) / (_wm + _wp + _wk)
-        else:
-            # v3.2: the model cannot see pinning, the max-pain magnet,
-            # the intraday mean reversion that makes NIFTY paths less
-            # diffusive than their terminal volatility implies, or any
-            # of the positioning the prior is built from.
-            p_win = _wm * p_win_model + (1.0 - _wm) * p_win_prior
-        # v3.9: regime-structure alignment. The touch model assumes
-        # symmetric threat: a rally toward a sold call spread and a
-        # selloff toward a sold put spread are priced alike. But the
-        # structure placed by a directional regime sell has its threat
-        # side on the UNFAVOURED move of a confirmed trend - on
-        # 2026-09-08 (downtrend, STRONG_SELL_PREMIUM, VRP 3.17pp) the
-        # post-midday tape never retraced more than 21 points against
-        # the call credit. Desks recognise this skew explicitly; a
-        # small bounded bonus is how it shows up here without letting
-        # the label override the arithmetic.
-        _align = float(getattr(self.config, "ev_regime_align_bonus", 0.05))
-        if _align > 0 and legs and _p_mkt is not None:
-            _sell_sides = {
-                str(l.get("option_type"))
-                for l in legs if str(l.get("action")) == "SELL"
-            }
-            _fr_ev = str(signals.get("final_regime") or "")
-            _vr_ok = str(signals.get("vol_regime") or "") in (
-                "SELL_PREMIUM", "STRONG_SELL_PREMIUM"
-            )
-            _aligned = _vr_ok and (
-                (_sell_sides == {"call"} and _fr_ev == "PREMIUM_SELL_BEAR") or
-                (_sell_sides == {"put"} and _fr_ev == "PREMIUM_SELL_BULL")
-            )
-            if _aligned:
-                p_win += _align
-        p_win = max(0.28, min(0.92, p_win))""",
-        r"""p_win += _align""",
-    ),
-    Edit(
-        _SE, "min_ev_floor",
-        r"""        min_ev = max(net_credit * 0.03, friction * 0.35, 0.75)""",
-        r"""        # v3.9: the v3.2 absolute 0.75 point floor was ~8% of the entire
-        # credit a VIX-11 expiry pays. Because entry costs and exit
-        # costs are now charged explicitly per-path inside the EV
-        # terms, a floor near 100% of friction double-bills them; the
-        # cushion is 3% of credit or 35% of friction, whichever bites,
-        # roughly 1.35x total cost coverage.
-        min_ev = max(
-            net_credit * float(getattr(self.config, "min_ev_frac_of_credit", 0.03)),
-            friction * float(getattr(self.config, "min_ev_frac_of_friction", 0.35)),
-        )""",
-        r""""min_ev_frac_of_friction", 0.35""",
-    ),
-    Edit(
-        _SE, "credit_ladder_vix_scale",
-        r"""            min_ratio  = (
-                0.16 if mins_left3 > 180 else (0.13 if mins_left3 > 90 else 0.10)
-            )""",
-        r"""            # v3.9: the ladder was calibrated against the premium a VIX
-            # 13.5 session pays. At VIX 11 the market sells ~0.8x of
-            # that, so a fixed-absolute ladder structurally vetoed every
-            # expiry structure (measured 2026-09-08: ratio ~0.105-0.11
-            # against a fixed 0.16 demand, all 86 surviving candidates
-            # rejected). Requirements now scale with the vol the session
-            # is actually offering, clamped at both ends.
-            _lx = (
-                float(getattr(self.config, "credit_risk_ratio_dte0_early", 0.16))
-                if mins_left3 > 180 else
-                (float(getattr(self.config, "credit_risk_ratio_dte0_mid", 0.13))
-                 if mins_left3 > 90 else
-                 float(getattr(self.config, "credit_risk_ratio_dte0_late", 0.10)))
-            )
-            _vix_l = float(signals.get("vix") or 13.5)
-            _vref  = float(getattr(self.config, "credit_ratio_vix_ref", 13.5))
-            _vs    = min(max(_vix_l / max(_vref, 1.0), 0.75), 1.15)
-            min_ratio = _lx * _vs""",
-        r"""min_ratio = _lx * _vs""",
-    ),
-]
-
-
-# -----------------------------------------------------------------------------
-# execution_engine.py edits
-# -----------------------------------------------------------------------------
-
-_XE = "execution_engine.py"
-
-XE_EDITS = [
-    Edit(
-        _XE, "priority2_proximity",
-        r"""            for leg in open_legs:
-                if leg["action"] != _prox_action:
-                    continue
-                strike = float(leg.get("strike", 0))
-                if abs(spot - strike) <= proximity_pts:
-                    self.logger.warning(
-                        f"PRIORITY 2 SPOT PROXIMITY: spot={spot:.0f} "
-                        f"within {proximity_pts}pts of {_prox_action} "
-                        f"{leg['option_type']} {strike:.0f}"
-                    )""",
-        r"""            # v3.9: on expiry-day verticals the absolute proximity band
-            # can exceed the whole gap to the short strike (a delta-0.3+
-            # short ~45 points away against a 40pt band), which would
-            # flatten the trade at entry+5pts regardless of structure.
-            # The band is then bounded by (1 - prox_gap_frac) of the
-            # entry gap for each short leg - the same line the EV gate
-            # now prices - so the defense is where the risk model said
-            # it would be when the trade was approved.
-            _prox_dte0 = (actual_dte == 0) and \
-                ("BUTTERFLY" not in strategy_name_p2)
-            _prox_gap_frac = float(getattr(self.config, "prox_gap_frac_dte0", 0.70))
-            _entry_spot_p2 = float(position.get("entry_spot") or 0)
-            for leg in open_legs:
-                if leg["action"] != _prox_action:
-                    continue
-                strike = float(leg.get("strike", 0))
-                _band = proximity_pts
-                if _prox_dte0 and _entry_spot_p2 > 0:
-                    _gap = abs(strike - _entry_spot_p2)
-                    if _gap > 0:
-                        _band = min(
-                            proximity_pts,
-                            max((1.0 - _prox_gap_frac) * _gap, 10.0),
-                        )
-                if abs(spot - strike) <= _band:
-                    self.logger.warning(
-                        f"PRIORITY 2 SPOT PROXIMITY: spot={spot:.0f} "
-                        f"within {_band:.0f}pts of {_prox_action} "
-                        f"{leg['option_type']} {strike:.0f}"
-                    )""",
-        r"""_entry_spot_p2 = float(position.get("entry_spot") or 0)""",
-    ),
-    Edit(
-        _XE, "self_test_delta_breach",
-        r"""    # Test Priority 1: Delta breach
-    # Modify chain to show high delta on short call
-    mock_chain[24150.0]["call"]["delta"] = 0.45  # > 0.40 threshold""",
-        r"""    # Test Priority 1: Delta breach
-    # Modify chain to show a short-call delta clearly above the expiry-day
-    # close threshold. v3.9 raised delta_close_dte0 to 0.45 (the engine now
-    # sells 0.32/0.30/0.28 delta, so the old 0.35 line sat below the entry
-    # delta of a 0.30-delta short and self-closed it on entry), which made a
-    # hardcoded 0.45 test value a non-breach. Derive the test delta from the
-    # live threshold so this assertion stays valid if the knob is retuned.
-    _dte0_close_p1 = float(getattr(config, "delta_close_dte0", 0.45))
-    mock_chain[24150.0]["call"]["delta"] = round(min(_dte0_close_p1 + 0.15, 0.99), 2)""",
-        r"""_dte0_close_p1 = float(getattr(config, "delta_close_dte0", 0.45))""",
-    ),
-]
-
-
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # regime_engine.py edits
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
-_RE = "regime_engine.py"
+_R = 'regime_engine.py'
 
 RE_EDITS = [
     Edit(
-        _RE, "day_size_fallback",
-        r"""        day_size_map = {
-            "MONDAY":    self._t("day_size_monday",    "event_size_multiplier", 0.55),
-            "TUESDAY":   self._t("day_size_tuesday",   "event_size_multiplier", 0.80),
-            "WEDNESDAY": self._t("day_size_wednesday", "event_size_multiplier", 0.70),
-            "THURSDAY":  self._t("day_size_thursday",  "event_size_multiplier", 0.70),
-            "FRIDAY":    self._t("day_size_friday",    "event_size_multiplier", 0.60),
-        }""",
-        r"""        # v3.9: the fallback was event_size_multiplier (a budget/event-day
-        # reducer). On any cycle where the calibrator had no valid state -
-        # live start-of-day, tier-0, and every backtest replay - that
-        # silently sized a normal Tuesday at 25%, quartering the book. The
-        # fallback is now the per-weekday normal size in Config, which
-        # mirrors the calibration defaults.
-        day_size_map = {
-            "MONDAY":    self._t("day_size_monday",    "day_size_monday",    0.60),
-            "TUESDAY":   self._t("day_size_tuesday",   "day_size_tuesday",   0.85),
-            "WEDNESDAY": self._t("day_size_wednesday", "day_size_wednesday", 0.65),
-            "THURSDAY":  self._t("day_size_thursday",  "day_size_thursday",  0.65),
-            "FRIDAY":    self._t("day_size_friday",    "day_size_friday",    0.55),
-        }""",
-        r""""day_size_friday",    0.55""",
+        _R, 'vrp_guard_shared_import',
+        r"""    print_section, print_kv_table,""",
+        r"""    print_section, print_kv_table,
+    vrp_anomaly_limit,
+    VRP_DATA_ERROR_FRAC, VRP_DATA_ERROR_FRAC_DTE0,
+    VRP_RV_DEAD_PCT,""",
+        r"""    VRP_DATA_ERROR_FRAC, VRP_DATA_ERROR_FRAC_DTE0,""",
+    ),
+    Edit(
+        _R, 'vrp_guard_shared_consts',
+        r"""# NIFTY_ENGINE_PROFIT_PATCH_V34: bounds for the VRP data-error guard. The expiry series gets a
+# looser ratio because a low realised-to-implied ratio is its normal state,
+# and an absolute floor carries the burden of catching a genuinely dead feed.
+VRP_DATA_ERROR_FRAC = 0.7
+VRP_DATA_ERROR_FRAC_DTE0 = 0.92
+VRP_RV_DEAD_PCT = 0.5""",
+        r"""# VRP data-error guard bounds now live in core.py (single source of truth
+# shared with data_engine). The names stay importable from here so existing
+# references and self-tests keep working; values are unchanged from v3.4.""",
+        r"""# shared with data_engine). The names stay importable from here so existing""",
+    ),
+    Edit(
+        _R, 'vrp_guard_shared_limit',
+        r"""        # unchanged from v3.1.
+        _vrp_frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte_vrp == 0 else VRP_DATA_ERROR_FRAC
+        _vrp_limit = max(8.0, _vrp_frac * _atm_iv_pct) if _atm_iv_pct else 8.0""",
+        r"""        # unchanged from v3.1. Shared with data_engine via core.py.
+        _vrp_limit = vrp_anomaly_limit(_atm_iv_pct, _dte_vrp)""",
+        r"""        # unchanged from v3.1. Shared with data_engine via core.py.""",
     ),
 ]
 
-# verify_all.py: the repo's verification runner referenced a backtest.py
-# reporter that was never mirrored into this tree; the harness that actually
-# exists is backtest_engine.py (its --test validates the simulator).
-_VA = "verify_all.py"
 
-VA_EDITS = [
+# -------------------------------------------------------------------------
+# data_engine.py edits
+# -------------------------------------------------------------------------
+
+_D = 'data_engine.py'
+
+DE_EDITS = [
     Edit(
-        _VA, "backtest_harness_name",
-        r"""    ("backtest.py",           [PYTHON, str(BASE / "backtest.py"), "--test"]),""",
-        r"""    ("backtest_engine.py",    [PYTHON, str(BASE / "backtest_engine.py"), "--test"]),""",
-        r""""backtest_engine.py",    [PYTHON, str(BASE / "backtest_engine.py")""",
+        _D, 'vrp_guard_shared_import',
+        r"""    get_nse_holidays, get_high_impact_events,""",
+        r"""    get_nse_holidays, get_high_impact_events,
+    vrp_anomaly_limit, VRP_RV_DEAD_PCT,""",
+        r"""    vrp_anomaly_limit, VRP_RV_DEAD_PCT,""",
+    ),
+    Edit(
+        _D, 'vrp_smoothed_dte_param',
+        r'''    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Compute raw VRP and smoothed VRP.
+        Raw VRP = ATM IV (%) - Parkinson RV (%)
+        Smoothed VRP = exponential weighted average of last N raw VRP readings.
+
+        Anomaly detection:
+        - Raw VRP > 8pp → likely Parkinson RV data error → use previous smoothed''',
+        r'''        dte=None,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Compute raw VRP and smoothed VRP.
+        Raw VRP = ATM IV (%) - Parkinson RV (%)
+        Smoothed VRP = exponential weighted average of last N raw VRP readings.
+
+        Anomaly detection (bound shared with regime_engine via core.py):
+        - RV at/below the dead-feed floor → bar feed looks empty → hold
+          the previous smoothed value and do not buffer the print.
+        - Raw VRP above the DTE-aware limit → likely Parkinson RV data
+          error → hold the previous smoothed value.''',
+        r"""        Anomaly detection (bound shared with regime_engine via core.py):""",
+    ),
+    Edit(
+        _D, 'vrp_smoothed_shared_bound',
+        r"""        _vrp_anomaly_limit = max(8.0, atm_iv_pct * 0.70)
+        if vrp_raw > _vrp_anomaly_limit:
+            self.logger.warning(
+                f"VRP spike {vrp_raw:.2f}pp > limit {_vrp_anomaly_limit:.2f}pp "
+                f"(ATM IV {atm_iv_pct:.2f}%) — likely Parkinson RV error. "
+                f"Capping at previous smoothed value."
+            )
+            vrp_raw_capped = self._vrp_buffer[-1] if self._vrp_buffer else 3.0
+            # Do not add anomalous value to buffer
+            return vrp_raw, vrp_raw_capped""",
+        r"""        #
+        # Single-sourced with regime_engine (core.vrp_anomaly_limit): the
+        # expiry series gets the looser 0.92 ratio because a low
+        # realised-to-implied ratio is its normal state. The flat 0.70 copy
+        # kept here after v3.4 froze vrp_smoothed at its pre-noon value for
+        # the whole 2026-09-08 0DTE afternoon while raw printed 15-17pp.
+        _wobble_prev = self._vrp_buffer[-1] if self._vrp_buffer else 3.0
+        if rv_pct <= VRP_RV_DEAD_PCT:
+            self.logger.warning(
+                f"Realised vol {rv_pct:.2f}% at or below the "
+                f"{VRP_RV_DEAD_PCT:.2f}% floor — bar feed looks empty. "
+                f"Holding previous smoothed VRP."
+            )
+            # Do not add the degenerate print to the buffer
+            return vrp_raw, _wobble_prev
+        _limit = vrp_anomaly_limit(atm_iv_pct, dte)
+        if vrp_raw > _limit:
+            self.logger.warning(
+                f"VRP spike {vrp_raw:.2f}pp > limit {_limit:.2f}pp "
+                f"(ATM IV {atm_iv_pct:.2f}%, dte={dte}) — likely Parkinson "
+                f"RV error. Capping at previous smoothed value."
+            )
+            # Do not add anomalous value to buffer
+            return vrp_raw, _wobble_prev""",
+        r'''                f"(ATM IV {atm_iv_pct:.2f}%, dte={dte}) — likely Parkinson "''',
+    ),
+    Edit(
+        _D, 'oi_change_single_snapshot',
+        r"""        # Try option_chain_snapshot first
+        row = self.db.query_one(
+            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
+            "WHERE trading_date=? AND strike=? AND expiry=? "
+            "AND capture_time >= ? AND capture_time <= ? "
+            "LIMIT 1",
+            (today_str, atm_strike, expiry_str, cutoff_ts, limit_ts),
+        )
+        if row and row.get("total_oi") and row["total_oi"] > 0:
+            prior = row["total_oi"]
+            return round((current_total - prior) / prior, 4)""",
+        r"""        # The baseline must be ONE snapshot, not a sum over a window.
+        # SUM(oi) across a 5-minute capture window adds up every snapshot
+        # the engine persisted in that window (~10x the true baseline), so
+        # this function printed -0.90 to -0.99 all day, every day — which
+        # permanently disabled STRONG_RANGE (needs oi_building) and poisoned
+        # the RANGE gate (needs not-unwinding). Resolve the latest single
+        # capture instant first, then total the two legs at that instant.
+        # Try option_chain_snapshot first
+        snap = self.db.query_one(
+            "SELECT MAX(capture_time) as snap_ts FROM option_chain_snapshot "
+            "WHERE trading_date=? AND strike=? AND expiry=? "
+            "AND capture_time >= ? AND capture_time <= ?",
+            (today_str, atm_strike, expiry_str, cutoff_ts, limit_ts),
+        )
+        if snap and snap.get("snap_ts"):
+            row = self.db.query_one(
+                "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
+                "WHERE trading_date=? AND strike=? AND expiry=? "
+                "AND capture_time=?",
+                (today_str, atm_strike, expiry_str, snap["snap_ts"]),
+            )
+            if row and row.get("total_oi") and row["total_oi"] > 0:
+                prior = row["total_oi"]
+                return round((current_total - prior) / prior, 4)""",
+        r'''            "SELECT MAX(capture_time) as snap_ts FROM option_chain_snapshot "''',
+    ),
+    Edit(
+        _D, 'oi_change_fallback_single_snapshot',
+        r"""        # Fallback: compare to first reading of the day
+        row3 = self.db.query_one(
+            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
+            "WHERE trading_date=? AND strike=? AND expiry=? "
+            "ORDER BY capture_time ASC LIMIT 1",
+            (today_str, atm_strike, expiry_str),
+        )
+        if row3 and row3.get("total_oi") and row3["total_oi"] > 0:
+            prior3 = row3["total_oi"]
+            if prior3 != current_total:
+                return round((current_total - prior3) / prior3, 4)""",
+        r"""        # Fallback: compare to the first single snapshot of the day
+        first = self.db.query_one(
+            "SELECT MIN(capture_time) as snap_ts FROM option_chain_snapshot "
+            "WHERE trading_date=? AND strike=? AND expiry=?",
+            (today_str, atm_strike, expiry_str),
+        )
+        if first and first.get("snap_ts"):
+            row3 = self.db.query_one(
+                "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
+                "WHERE trading_date=? AND strike=? AND expiry=? "
+                "AND capture_time=?",
+                (today_str, atm_strike, expiry_str, first["snap_ts"]),
+            )
+            if row3 and row3.get("total_oi") and row3["total_oi"] > 0:
+                prior3 = row3["total_oi"]
+                if prior3 != current_total:
+                    return round((current_total - prior3) / prior3, 4)""",
+        r'''            "SELECT MIN(capture_time) as snap_ts FROM option_chain_snapshot "''',
+    ),
+    Edit(
+        _D, 'tuesday_expiry_rediscovery',
+        r"""
+        if should_refresh:""",
+        r"""
+        # Tuesday is the 0DTE day by design (section 26 entry window). On
+        # 2026-09-08 the morning contract list lacked the same-day series,
+        # discovery fell through to the next weekly, and the engine then
+        # sat on DTE5 for three hours because the TTL said the (wrong)
+        # answer was fresh. A cached expiry that is not today on a Tuesday
+        # is never fresh: bypass the TTL and re-discover every cycle until
+        # the 0DTE series appears. (No hard entry block here — MAX_DTE and
+        # the DTE-indexed sizing already refuse to trade the wrong series
+        # as if it were the expiry contract; this just shortens the blind
+        # window from hours to one cycle.)
+        try:
+            if (today_ist().weekday() == 1 and cached_expiry is not None
+                    and now_ist().time() < dtime(15, 30)):
+                if str(cached_expiry)[:10] != today_ist().isoformat():
+                    if not should_refresh:
+                        self.logger.warning(
+                            f"Tuesday active expiry {cached_expiry} is not "
+                            f"today — forcing re-discovery (TTL bypassed)"
+                        )
+                    should_refresh = True
+        except Exception:
+            pass
+
+        if should_refresh:""",
+        r'''                            f"Tuesday active expiry {cached_expiry} is not "''',
+    ),
+    Edit(
+        _D, 'day_extremes_track',
+        r"""
+        # ── 4. VWAP ───────────────────────────────────────────────────────""",
+        r"""
+        # Day extremes so far (for gap-fill / day-structure reads downstream)
+        _day_high = _day_low = 0.0
+        try:
+            if bars is not None and not bars.empty:
+                _mb = bars[bars["time"] >= "09:15:00"]
+                if not _mb.empty:
+                    _day_high = float(_mb["high"].max())
+                    _day_low  = float(_mb["low"].min())
+        except Exception:
+            _day_high = _day_low = 0.0
+
+        # ── 4. VWAP ───────────────────────────────────────────────────────""",
+        r"""        # Day extremes so far (for gap-fill / day-structure reads downstream)""",
+    ),
+    Edit(
+        _D, 'vrp_smoothed_pass_dte',
+        r"""        vrp_raw, vrp_smoothed   = self._compute_vrp_smoothed(atm_iv, parkinson_rv)""",
+        r"""        vrp_raw, vrp_smoothed   = self._compute_vrp_smoothed(atm_iv, parkinson_rv, dte)""",
+        r"""        vrp_raw, vrp_smoothed   = self._compute_vrp_smoothed(atm_iv, parkinson_rv, dte)""",
+    ),
+    Edit(
+        _D, 'signals_prev_close_cache',
+        r"""        # ── 27. Build signals dict ────────────────────────────────────────""",
+        r"""        # ── 27. Build signals dict ────────────────────────────────────────
+        # Previous close comes from gap detection's cache (populated at the
+        # open, before entry hours). 0.0 = unknown, and downstream reads
+        # treat unknown as "no lean" rather than guessing.
+        _prev_close_sig = self.state.get("_prev_close_for_gap") or 0.0""",
+        r"""        # Previous close comes from gap detection's cache (populated at the""",
+    ),
+    Edit(
+        _D, 'signals_day_structure_keys',
+        r"""
+            # Technical""",
+        r"""
+            # Day structure (gap-fill / heaviness reads for strategy selection)
+            "prev_close":               float(_prev_close_sig or 0.0),
+            "day_high":                 float(_day_high or 0.0),
+            "day_low":                  float(_day_low or 0.0),
+
+            # Technical""",
+        r"""            # Day structure (gap-fill / heaviness reads for strategy selection)""",
+    ),
+]
+
+
+# -------------------------------------------------------------------------
+# strategy_engine.py edits
+# -------------------------------------------------------------------------
+
+_S = 'strategy_engine.py'
+
+SE_EDITS = [
+    Edit(
+        _S, 'lean_reason_trace',
+        r"""            )
+            return strategy, reason""",
+        r"""            )
+            if strategy == BEAR_CALL_SPREAD:
+                _, _lean_why = self._range_day_bearish_lean(signals)
+                reason += f":{_lean_why}"
+            return strategy, reason""",
+        r"""                _, _lean_why = self._range_day_bearish_lean(signals)""",
+    ),
+    Edit(
+        _S, 'range_day_bearish_lean',
+        r"""
+    def _resolve_range_strategy(""",
+        r'''
+    def _range_day_bearish_lean(self, signals: dict) -> Tuple[bool, str]:
+        """Day-structure lean: heavy tape inside a range regime.
+
+        A range regime with an UNFILLED gap-down is not a symmetric range:
+        price probed the top of the opening range and was rejected back
+        under the previous close, so the put side of a condor fights
+        gravity while the call side collects it. Measured 2026-09-09: the
+        condor scratched (+26/lot) while its own call side printed +678/lot
+        and the put side lost -563/lot. When every condition below holds,
+        the range resolution sells the bear-call spread instead of the
+        condor — a SELECTION substitution only; every gate (entry rules,
+        wing cost, credit ratio, EV, sizing, pre-trade) still applies.
+
+        All required: RANGE price regime, non-bullish positioning, the
+        engine's own DOWN gap (0.4%+) still unfilled with spot heavy under
+        the previous close right now, and a real call-side OI wall above
+        spot to sell into.
+        """
+        if signals.get("price_regime") != "RANGE":
+            return False, "lean_needs_range_price"
+        if signals.get("positioning_regime") not in ("RANGE", "BEARISH"):
+            return False, "lean_blocked_by_bullish_positioning"
+        if signals.get("gap_direction") != "DOWN":
+            return False, "lean_needs_down_gap"
+        try:
+            _pc = float(signals.get("prev_close") or 0.0)
+            _dh = float(signals.get("day_high") or 0.0)
+            _sp = float(signals.get("spot") or 0.0)
+        except (TypeError, ValueError):
+            return False, "lean_day_structure_unknown"
+        if _pc <= 0 or _dh <= 0 or _sp <= 0:
+            return False, "lean_day_structure_unknown"
+        if _dh >= _pc:
+            return False, "lean_gap_filled"
+        if _sp >= _pc:
+            return False, "lean_spot_reclaimed_prev_close"
+        try:
+            _rw = float(signals.get("resistance_strike") or 0.0)
+            _rs = float(signals.get("resistance_strength") or 0.0)
+        except (TypeError, ValueError):
+            return False, "lean_no_call_wall"
+        if _rw <= _sp:
+            return False, "lean_call_wall_not_above_spot"
+        if _rs < 2.0:
+            return False, "lean_call_wall_too_weak"
+        return True, (
+            f"day_structure_lean_bearish:gap_down_unfilled_"
+            f"dh={_dh:.0f}_pc={_pc:.0f}_wall={_rw:.0f}x{_rs:.1f}"
+        )
+
+    def _resolve_range_strategy(''',
+        r"""        condor scratched (+26/lot) while its own call side printed +678/lot""",
+    ),
+    Edit(
+        _S, 'lean_hook_dte_nonzero',
+        r"""        if dte != 0:""",
+        r"""        if dte != 0:
+            _lean, _lean_reason = self._range_day_bearish_lean(signals)
+            if _lean:
+                self.logger.info(f"Range resolution: {_lean_reason}")
+                return BEAR_CALL_SPREAD""",
+        r"""            _lean, _lean_reason = self._range_day_bearish_lean(signals)""",
+    ),
+    Edit(
+        _S, 'lean_hook_dte0',
+        r"""                return IRON_BUTTERFLY""",
+        r"""                return IRON_BUTTERFLY
+        _lean0, _lean_reason0 = self._range_day_bearish_lean(signals)
+        if _lean0:
+            self.logger.info(f"Range resolution: {_lean_reason0}")
+            return BEAR_CALL_SPREAD""",
+        r"""        _lean0, _lean_reason0 = self._range_day_bearish_lean(signals)""",
+    ),
+    Edit(
+        _S, 'bear_call_ormid_trend_only',
+        r"""        elif strategy_name == BEAR_CALL_SPREAD:
+            or_high = float(signals.get("or_high") or 0)
+            or_low  = float(signals.get("or_low") or 0)
+            if or_high > 0 and or_low > 0:
+                or_mid    = (or_high + or_low) / 2.0
+                or_buffer = 30 if dte == 0 else 15""",
+        r"""        elif strategy_name == BEAR_CALL_SPREAD:
+            or_high = float(signals.get("or_high") or 0)
+            or_low  = float(signals.get("or_low") or 0)
+            # The OR-mid veto is counter-trend-bounce protection: in a
+            # DOWNTREND regime, spot bouncing back above mid-range means
+            # wait for the bounce to fail. In a RANGE regime the ORB
+            # classifier already ruled "no breakout" — re-litigating with a
+            # dumber threshold double-jeopardies the trade and vetoes the
+            # best mean-reversion entries (top of a narrow range on a heavy
+            # tape is exactly where the day-structure lean sells calls into
+            # an OI wall). It is incoherent anyway: the condor this lean
+            # replaces contains the SAME short call with no such veto.
+            # Behaviour on the trend path (PREMIUM_SELL_BEAR) is unchanged.
+            _px_regime = signals.get("price_regime", "")
+            if (_px_regime in ("DOWNTREND", "STRONG_DOWNTREND")
+                    and or_high > 0 and or_low > 0):
+                or_mid    = (or_high + or_low) / 2.0
+                or_buffer = 30 if dte == 0 else 15""",
+        r"""            # tape is exactly where the day-structure lean sells calls into""",
+    ),
+    Edit(
+        _S, 'risk_fraction_single_source',
+        r'''        """Fraction of the configured per-trade risk budget, by DTE."""
+        table = {0: 1.00, 1: 0.80, 2: 0.65, 3: 0.50, 4: 0.40,
+                 5: 0.32, 6: 0.25}
+        return table.get(min(dte if dte is not None else 1, 6), 0.25)''',
+        r'''        """Fraction of the configured per-trade risk budget, by DTE.
+
+        Always 1.0: the DTE discount lives in exactly ONE place — the
+        regime layer's dte_mult. Discounting here as well double-counted
+        distance from expiry (measured 2026-09-09 DTE4: 0.40 here x 0.30
+        in dte_mult), and together with the day/event schedule it capped
+        every DTE>=2 setup at ~0.03-0.06 lots against a 0.6 minimum —
+        structurally untradable, however good the edge.
+        """
+        return 1.0''',
+        r"""        distance from expiry (measured 2026-09-09 DTE4: 0.40 here x 0.30""",
+    ),
+    Edit(
+        _S, 'ev_spot_distanced_flag',
+        r"""        _barriers: List[float] = []""",
+        r"""        _barriers: List[float] = []
+        _spot_distanced_ev = False""",
+        r"""        _spot_distanced_ev = False""",
+    ),
+    Edit(
+        _S, 'ev_barrier_consistent_severity',
+        r"""                _barriers.append(
+                    max(d - _pull_d, 12.0) if d > _pull_d else _atm_floor
+                )
+        _barrier = min(_barriers) if _barriers else 0.0
+""",
+        r"""                if d > _pull_d:
+                    _spot_distanced_ev = True
+                    _barriers.append(max(d - _pull_d, 12.0))
+                else:
+                    _barriers.append(_atm_floor)
+        _barrier = min(_barriers) if _barriers else 0.0
+
+        # ── Severity/probability consistency of the stop leg ──────────
+        # p_stop is the touch probability of the defence line above (the
+        # spot backstop / proximity exit, which fires FIRST by
+        # construction), but stop_loss_pts was always the PREMIUM-stop
+        # severity. On 0DTE the two exits sit close together so the error
+        # is small and conservative; on DTE>=1 they decouple — measured
+        # 2026-09-09, a 150-wide bear call: the backstop fires at +57pts
+        # of spot where the spread is worth ~13pts against entry, while
+        # the 1.7x premium stop needs ~+200pts of spot to fill. Charging
+        # the 200pt loss at the 57pt probability vetoed the trade.
+        # The stop leg is therefore the NEARER exit in economic terms:
+        # the spread's modelled value at the defence line (delta carry
+        # plus a gamma allowance, both from the legs' own live greeks),
+        # capped at the premium-stop loss which remains the backup. When
+        # greeks are missing, or the barrier is the ATM pseudo-distance
+        # rather than a spot distance (iron butterfly), the premium-stop
+        # severity stands exactly as before.
+        if legs and _barrier > 0 and _spot_distanced_ev:
+            try:
+                _net_d_ev = _net_g_ev = 0.0
+                _greeks_ok_ev = False
+                for _l in legs:
+                    _dd = float(_l.get("delta") or 0.0)
+                    _gg = float(_l.get("gamma") or 0.0)
+                    if _dd or _gg:
+                        _greeks_ok_ev = True
+                    _sgn = (
+                        -1.0 if str(_l.get("action")) == "SELL" else 1.0
+                    )
+                    _net_d_ev += _sgn * _dd
+                    _net_g_ev += _sgn * _gg
+                if _greeks_ok_ev and (
+                    abs(_net_d_ev) >= 0.02 or abs(_net_g_ev) >= 0.0002
+                ):
+                    _carry_ev = (
+                        abs(_net_d_ev) * _barrier * 1.25
+                        + 0.5 * abs(_net_g_ev) * _barrier ** 2
+                    )
+                    # Never model the nearer exit as cheaper than a
+                    # quarter of the premium stop: a backstop fill in a
+                    # fast tape runs past the modelled line.
+                    _carry_ev = max(
+                        _carry_ev, 0.25 * float(stop_loss_pts)
+                    )
+                    if _carry_ev < stop_loss_pts:
+                        stop_loss_pts = _carry_ev
+                        tail_loss_pts = max(
+                            stop_loss_pts,
+                            stop_loss_pts + 0.30 * max(
+                                wing_loss_pts - stop_loss_pts, 0.0
+                            ),
+                        )
+            except Exception:
+                pass
+""",
+        r"""        # severity. On 0DTE the two exits sit close together so the error""",
+    ),
+    Edit(
+        _S, 'risk_budget_single_source',
+        r"""        risk_frac_map = {
+            0: 1.00, 1: 0.80, 2: 0.65,
+            3: 0.50, 4: 0.40, 5: 0.32, 6: 0.25,
+        }
+        risk_pct  = _budget * risk_frac_map.get(
+            min(actual_dte if actual_dte is not None else 1, 6), 0.25
+        )""",
+        r"""        # Single-sourced with _risk_fraction_for_dte (always 1.0 now): the
+        # DTE discount lives only in the regime layer's dte_mult. An inline
+        # copy of the old table here double-counted it.
+        risk_pct  = _budget * self._risk_fraction_for_dte(actual_dte)""",
+        r"""        # DTE discount lives only in the regime layer's dte_mult. An inline""",
+    ),
+    Edit(
+        _S, 'minimum_ticket_clip',
+        r"""        if _sized < _min_frac:
+            return {
+                "valid": False,
+                "reason": (
+                    f"risk_budget_allows_only_{_sized:.2f}_lots_below_"
+                    f"min_{_min_frac:.2f}_forcing_1_lot_would_be_"
+                    f"{(1.0 / max(_sized, 0.01)):.1f}x_intended_risk"
+                ),
+            }
+        final_lots = max(1, int(round(_sized)))""",
+        r"""        _clipped_to_minimum = False
+        if _sized < _min_frac:
+            # Minimum-ticket affordability. size_mult is a continuous
+            # fraction but NIFTY trades in discrete 65-lot tickets: when
+            # the scaled budget wants less than a ticket yet ONE ticket
+            # fits the UNSCALED per-trade budget on a high-quality setup,
+            # trading the single ticket IS the risk-managed action — the
+            # alternative is not "safer", it is idle capital. Without
+            # this, any stack of day/dte/event schedule discounts below
+            # ~0.42 lots permanently bans trading (measured 2026-09-09:
+            # 0.65 x 0.30 x 0.25 = 0.049 on a HIGH-confidence setup whose
+            # 1-lot blended risk was ~0.42% of capital, inside the 0.6%
+            # budget). Edge was already approved by the EV gate above;
+            # the clip additionally requires clear signal quality (never
+            # on UNCLEAR positioning or a borderline VRP read) and yields
+            # exactly one lot, still subject to every check below.
+            _pos_clip = signals.get("positioning_regime", "")
+            _bl_clip  = bool(signals.get("borderline_sell", False))
+            if (raw_lots >= 1.0 and _pos_clip != "UNCLEAR"
+                    and not _bl_clip):
+                _clipped_to_minimum = True
+                self.logger.info(
+                    f"Minimum-ticket clip: scaled {_sized:.3f} lots below "
+                    f"min {_min_frac:.2f}, but 1 lot fits the per-trade "
+                    f"budget (raw {raw_lots:.2f}) on a clear setup "
+                    f"(pos={_pos_clip}) — trading 1 lot"
+                )
+            else:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"risk_budget_allows_only_{_sized:.2f}_lots_below_"
+                        f"min_{_min_frac:.2f}_forcing_1_lot_would_be_"
+                        f"{(1.0 / max(_sized, 0.01)):.1f}x_intended_risk"
+                    ),
+                }
+        final_lots = 1 if _clipped_to_minimum else max(1, int(round(_sized)))""",
+        r"""        final_lots = 1 if _clipped_to_minimum else max(1, int(round(_sized)))""",
+    ),
+    Edit(
+        _S, 'selftest_ormid_regimes',
+        r'''    ok5, _ = engine._validate_entry_rules(
+        BEAR_CALL_SPREAD,
+        make_signals(spot=24110.0, or_high=24100.0, or_low=24040.0),
+        _test_time=dtime(11, 0),
+    )
+    assert not ok5, "Expected False for bear call spot above OR midpoint"''',
+        r'''    # The OR-mid veto is counter-trend-bounce protection: it binds in a
+    # DOWNTREND regime and stands down in a RANGE regime (the ORB layer
+    # already ruled "no breakout" there).
+    ok5, _ = engine._validate_entry_rules(
+        BEAR_CALL_SPREAD,
+        make_signals(spot=24110.0, or_high=24100.0, or_low=24040.0,
+                     price_regime="DOWNTREND"),
+        _test_time=dtime(11, 0),
+    )
+    assert not ok5, "Expected False for bear call spot above OR midpoint in DOWNTREND"
+
+    ok5b, r5b = engine._validate_entry_rules(
+        BEAR_CALL_SPREAD,
+        make_signals(spot=24110.0, or_high=24100.0, or_low=24040.0,
+                     price_regime="RANGE"),
+        _test_time=dtime(11, 0),
+    )
+    assert ok5b, f"Expected True for bear call above OR mid in RANGE, got {r5b}"''',
+        r'''    assert not ok5, "Expected False for bear call spot above OR midpoint in DOWNTREND"''',
+    ),
+]
+
+
+# -------------------------------------------------------------------------
+# execution_engine.py edits
+# -------------------------------------------------------------------------
+
+_X = 'execution_engine.py'
+
+XE_EDITS = [
+    Edit(
+        _X, 'p1_entry_relative_breach',
+        r"""            if "BUTTERFLY" in strategy_name_p1:
+                delta_thresh_p1 = 0.72
+            elif actual_dte == 0:
+                delta_thresh_p1 = float(
+                    getattr(self.config, "delta_close_dte0", 0.35)
+                )
+            else:
+                delta_thresh_p1 = float(
+                    getattr(self.config, "delta_close_dte1p", 0.30)
+                )""",
+        r"""            #
+            # Entry-relative breach: the absolute thresholds below are
+            # FLOORS, and the live threshold is the short's own entry
+            # delta plus a buffer. A flat 0.30 exit against a 0.43 entry
+            # is a stop-loss placed through the entry price — measured
+            # 2026-09-09, three bear-call spreads stopped out 15 seconds
+            # after entry with no adverse move at all. EM-clamped DTE>=1
+            # shorts legitimately carry higher delta (delta prices days
+            # of risk; the hold is hours), so the exit must adapt to what
+            # was sold: entry + 0.15 is roughly the same adverse spot
+            # move the backstop defends, which is exactly when this
+            # ladder rung should fire. 0DTE behaviour is unchanged in
+            # practice (0.22 + 0.15 = 0.37 against the old 0.35).
+            if "BUTTERFLY" in strategy_name_p1:
+                delta_thresh_p1 = 0.72
+            else:
+                if actual_dte == 0:
+                    _abs_p1 = float(
+                        getattr(self.config, "delta_close_dte0", 0.35)
+                    )
+                else:
+                    _abs_p1 = float(
+                        getattr(self.config, "delta_close_dte1p", 0.30)
+                    )
+                try:
+                    _entry_d_p1 = abs(float(leg.get("entry_delta", 0) or 0))
+                except (TypeError, ValueError):
+                    _entry_d_p1 = 0.0
+                if _entry_d_p1 > 0:
+                    _buf_p1 = float(getattr(
+                        self.config, "delta_breach_buffer", 0.15
+                    ))
+                    _cap_p1 = float(getattr(
+                        self.config, "delta_breach_cap", 0.65
+                    ))
+                    delta_thresh_p1 = min(
+                        max(_entry_d_p1 + _buf_p1, _abs_p1), _cap_p1
+                    )
+                else:
+                    delta_thresh_p1 = _abs_p1""",
+        r"""                    _entry_d_p1 = abs(float(leg.get("entry_delta", 0) or 0))""",
+    ),
+]
+
+
+# -------------------------------------------------------------------------
+# backtest_engine.py edits
+# -------------------------------------------------------------------------
+
+_B = 'backtest_engine.py'
+
+BE_EDITS = [
+    Edit(
+        _B, 'replay_prev_close',
+        r"""    def get_historical_candles(self, instrument_key, interval, from_date, to_date) -> list:
+        return []""",
+        r"""    def get_historical_candles(self, instrument_key, interval, from_date, to_date) -> list:
+        # DaySlice already carries the previous session's last 1-minute
+        # close as the recorded previous close, but it was never served:
+        # this stub returned [], so _get_prev_close() was always None in
+        # replay and gap detection never ran in backtest (live it runs
+        # every day). Serve the recorded close as a single daily bar in
+        # Upstox list shape so replay sees the same gaps live saw.
+        if not self.day or self.day.prev_close is None:
+            return []
+        if str(interval).lower() not in ("day", "daily", "1day", "d"):
+            return []
+        pc = float(self.day.prev_close)
+        _label = to_date or self.day.trading_date
+        return [[f"{_label}T15:30:00+05:30", pc, pc, pc, pc, 0, 0]]""",
+        r"""        # close as the recorded previous close, but it was never served:""",
+    ),
+    Edit(
+        _B, 'replay_state_handle',
+        r"""                continue
+            self.results.cycles += 1""",
+        r"""                continue
+            # reset_if_new_day() rebinds MarketDataEngine.state to a fresh
+            # dict on day rollover (including the first cycle, when the
+            # clock jumps from its January init to the replay date). The
+            # handle captured before the loop would silently detach, so
+            # every cooldown / halt / stop counter the harness writes
+            # would land in a dead dict the strategy never reads —
+            # replayed sessions then re-entered instantly with no
+            # cooldown. Re-fetch the live handle every cycle.
+            state = self.me.state
+            self.results.cycles += 1""",
+        r"""            # reset_if_new_day() rebinds MarketDataEngine.state to a fresh""",
     ),
 ]
 
 
 ALL_FILES = [
     ("core.py", CORE_EDITS),
+    ("regime_engine.py", RE_EDITS),
+    ("data_engine.py", DE_EDITS),
     ("strategy_engine.py", SE_EDITS),
     ("execution_engine.py", XE_EDITS),
-    ("regime_engine.py", RE_EDITS),
-    ("verify_all.py", VA_EDITS),
+    ("backtest_engine.py", BE_EDITS),
 ]
 
 
@@ -929,7 +924,6 @@ ALL_FILES = [
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     check = "--check" in argv
-    no_env = "--no-env" in argv
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
@@ -946,13 +940,6 @@ def main(argv=None) -> int:
         except EditError as exc:
             errors.append(str(exc))
             plans.append((path, (None, None)))
-
-    env_state = None
-    if not no_env:
-        env_state = plan_env(ENV_KEYS)
-        if env_state[0] is None:
-            print("  env.txt: not present (will be generated from the patched "
-                  "template by the engine's own setup)")
 
     if errors:
         print("\nNOTHING WAS MODIFIED - the following edits could not anchor:\n")
@@ -985,20 +972,6 @@ def main(argv=None) -> int:
         total_applied += len(to_apply)
         total_already += len(already)
 
-    if not no_env and env_state and env_state[0] is not None:
-        changed, missing = env_state
-        if check:
-            for k in changed:
-                print(f"  [would set] env.txt:{k}")
-            for k in missing:
-                print(f"  [would add] env.txt:{k}")
-        else:
-            apply_env(ENV_KEYS, check=False)
-            for k in changed:
-                print(f"  updated      env.txt:{k}")
-            for k in missing:
-                print(f"  added        env.txt:{k}")
-
     print()
     print(f"applied {total_applied} edit(s), already applied {total_already}")
     if check:
@@ -1007,8 +980,8 @@ def main(argv=None) -> int:
         print("patch complete.")
         print()
         print("Verify:")
-        print("  ./venv/bin/python backtest_engine.py --test")
-        print("  ./venv/bin/python backtest_engine.py --from 2026-09-08 --to 2026-09-08")
+        print("  python3 backtest_engine.py --test")
+        print("  python3 backtest_engine.py --from 2026-09-08 --to 2026-09-09")
     return 0
 
 

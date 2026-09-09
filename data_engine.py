@@ -23,6 +23,7 @@ from core import (
     print_section, print_kv_table,
     load_config, setup_logging,
     get_nse_holidays, get_high_impact_events,
+    vrp_anomaly_limit, VRP_RV_DEAD_PCT,
 )
 
 
@@ -1281,14 +1282,18 @@ class MarketDataEngine:
         self,
         atm_iv: Optional[float],
         parkinson_rv: Optional[float],
+        dte=None,
     ) -> Tuple[Optional[float], Optional[float]]:
         """
         Compute raw VRP and smoothed VRP.
         Raw VRP = ATM IV (%) - Parkinson RV (%)
         Smoothed VRP = exponential weighted average of last N raw VRP readings.
 
-        Anomaly detection:
-        - Raw VRP > 8pp → likely Parkinson RV data error → use previous smoothed
+        Anomaly detection (bound shared with regime_engine via core.py):
+        - RV at/below the dead-feed floor → bar feed looks empty → hold
+          the previous smoothed value and do not buffer the print.
+        - Raw VRP above the DTE-aware limit → likely Parkinson RV data
+          error → hold the previous smoothed value.
         - Raw VRP < -5pp → unusual, cap at -5pp
 
         Returns (vrp_raw, vrp_smoothed). Both can be None if data unavailable.
@@ -1309,16 +1314,30 @@ class MarketDataEngine:
         # number of points — it presents as RV collapsing to a small fraction
         # of IV — so the bound is now relative to ATM IV, with the old 8pp
         # retained as a floor so genuinely low-IV regimes stay protected.
-        _vrp_anomaly_limit = max(8.0, atm_iv_pct * 0.70)
-        if vrp_raw > _vrp_anomaly_limit:
+        #
+        # Single-sourced with regime_engine (core.vrp_anomaly_limit): the
+        # expiry series gets the looser 0.92 ratio because a low
+        # realised-to-implied ratio is its normal state. The flat 0.70 copy
+        # kept here after v3.4 froze vrp_smoothed at its pre-noon value for
+        # the whole 2026-09-08 0DTE afternoon while raw printed 15-17pp.
+        _wobble_prev = self._vrp_buffer[-1] if self._vrp_buffer else 3.0
+        if rv_pct <= VRP_RV_DEAD_PCT:
             self.logger.warning(
-                f"VRP spike {vrp_raw:.2f}pp > limit {_vrp_anomaly_limit:.2f}pp "
-                f"(ATM IV {atm_iv_pct:.2f}%) — likely Parkinson RV error. "
-                f"Capping at previous smoothed value."
+                f"Realised vol {rv_pct:.2f}% at or below the "
+                f"{VRP_RV_DEAD_PCT:.2f}% floor — bar feed looks empty. "
+                f"Holding previous smoothed VRP."
             )
-            vrp_raw_capped = self._vrp_buffer[-1] if self._vrp_buffer else 3.0
+            # Do not add the degenerate print to the buffer
+            return vrp_raw, _wobble_prev
+        _limit = vrp_anomaly_limit(atm_iv_pct, dte)
+        if vrp_raw > _limit:
+            self.logger.warning(
+                f"VRP spike {vrp_raw:.2f}pp > limit {_limit:.2f}pp "
+                f"(ATM IV {atm_iv_pct:.2f}%, dte={dte}) — likely Parkinson "
+                f"RV error. Capping at previous smoothed value."
+            )
             # Do not add anomalous value to buffer
-            return vrp_raw, vrp_raw_capped
+            return vrp_raw, _wobble_prev
 
         # Anomaly: VRP < -5pp is unusual, cap
         if vrp_raw < -5.0:
@@ -1909,17 +1928,30 @@ class MarketDataEngine:
         cutoff_ts = (now_ist() - timedelta(minutes=lookback + 5)).isoformat()
         limit_ts  = (now_ist() - timedelta(minutes=lookback)).isoformat()
 
+        # The baseline must be ONE snapshot, not a sum over a window.
+        # SUM(oi) across a 5-minute capture window adds up every snapshot
+        # the engine persisted in that window (~10x the true baseline), so
+        # this function printed -0.90 to -0.99 all day, every day — which
+        # permanently disabled STRONG_RANGE (needs oi_building) and poisoned
+        # the RANGE gate (needs not-unwinding). Resolve the latest single
+        # capture instant first, then total the two legs at that instant.
         # Try option_chain_snapshot first
-        row = self.db.query_one(
-            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
+        snap = self.db.query_one(
+            "SELECT MAX(capture_time) as snap_ts FROM option_chain_snapshot "
             "WHERE trading_date=? AND strike=? AND expiry=? "
-            "AND capture_time >= ? AND capture_time <= ? "
-            "LIMIT 1",
+            "AND capture_time >= ? AND capture_time <= ?",
             (today_str, atm_strike, expiry_str, cutoff_ts, limit_ts),
         )
-        if row and row.get("total_oi") and row["total_oi"] > 0:
-            prior = row["total_oi"]
-            return round((current_total - prior) / prior, 4)
+        if snap and snap.get("snap_ts"):
+            row = self.db.query_one(
+                "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
+                "WHERE trading_date=? AND strike=? AND expiry=? "
+                "AND capture_time=?",
+                (today_str, atm_strike, expiry_str, snap["snap_ts"]),
+            )
+            if row and row.get("total_oi") and row["total_oi"] > 0:
+                prior = row["total_oi"]
+                return round((current_total - prior) / prior, 4)
 
         # Try options_chain table
         row2 = self.db.query_one(
@@ -1934,17 +1966,23 @@ class MarketDataEngine:
             if prior2 > 0:
                 return round((current_total - prior2) / prior2, 4)
 
-        # Fallback: compare to first reading of the day
-        row3 = self.db.query_one(
-            "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
-            "WHERE trading_date=? AND strike=? AND expiry=? "
-            "ORDER BY capture_time ASC LIMIT 1",
+        # Fallback: compare to the first single snapshot of the day
+        first = self.db.query_one(
+            "SELECT MIN(capture_time) as snap_ts FROM option_chain_snapshot "
+            "WHERE trading_date=? AND strike=? AND expiry=?",
             (today_str, atm_strike, expiry_str),
         )
-        if row3 and row3.get("total_oi") and row3["total_oi"] > 0:
-            prior3 = row3["total_oi"]
-            if prior3 != current_total:
-                return round((current_total - prior3) / prior3, 4)
+        if first and first.get("snap_ts"):
+            row3 = self.db.query_one(
+                "SELECT SUM(oi) as total_oi FROM option_chain_snapshot "
+                "WHERE trading_date=? AND strike=? AND expiry=? "
+                "AND capture_time=?",
+                (today_str, atm_strike, expiry_str, first["snap_ts"]),
+            )
+            if row3 and row3.get("total_oi") and row3["total_oi"] > 0:
+                prior3 = row3["total_oi"]
+                if prior3 != current_total:
+                    return round((current_total - prior3) / prior3, 4)
 
         return 0.0
 
@@ -2101,6 +2139,29 @@ class MarketDataEngine:
                 should_refresh = elapsed > ttl
             except Exception:
                 should_refresh = True
+
+        # Tuesday is the 0DTE day by design (section 26 entry window). On
+        # 2026-09-08 the morning contract list lacked the same-day series,
+        # discovery fell through to the next weekly, and the engine then
+        # sat on DTE5 for three hours because the TTL said the (wrong)
+        # answer was fresh. A cached expiry that is not today on a Tuesday
+        # is never fresh: bypass the TTL and re-discover every cycle until
+        # the 0DTE series appears. (No hard entry block here — MAX_DTE and
+        # the DTE-indexed sizing already refuse to trade the wrong series
+        # as if it were the expiry contract; this just shortens the blind
+        # window from hours to one cycle.)
+        try:
+            if (today_ist().weekday() == 1 and cached_expiry is not None
+                    and now_ist().time() < dtime(15, 30)):
+                if str(cached_expiry)[:10] != today_ist().isoformat():
+                    if not should_refresh:
+                        self.logger.warning(
+                            f"Tuesday active expiry {cached_expiry} is not "
+                            f"today — forcing re-discovery (TTL bypassed)"
+                        )
+                    should_refresh = True
+        except Exception:
+            pass
 
         if should_refresh:
             try:
@@ -2615,6 +2676,17 @@ class MarketDataEngine:
                 self._first_bar_close_today = float(market_bars["close"].iloc[0])
                 self.state["first_bar_close"] = self._first_bar_close_today
 
+        # Day extremes so far (for gap-fill / day-structure reads downstream)
+        _day_high = _day_low = 0.0
+        try:
+            if bars is not None and not bars.empty:
+                _mb = bars[bars["time"] >= "09:15:00"]
+                if not _mb.empty:
+                    _day_high = float(_mb["high"].max())
+                    _day_low  = float(_mb["low"].min())
+        except Exception:
+            _day_high = _day_low = 0.0
+
         # ── 4. VWAP ───────────────────────────────────────────────────────
         vwap, vwap_valid = self.compute_vwap(bars)
         self.state["vwap_valid"] = vwap_valid
@@ -2754,7 +2826,7 @@ class MarketDataEngine:
 
         # ── 13. Parkinson RV and VRP ──────────────────────────────────────
         parkinson_rv, rv_source = self.compute_parkinson_rv(vix, bars)
-        vrp_raw, vrp_smoothed   = self._compute_vrp_smoothed(atm_iv, parkinson_rv)
+        vrp_raw, vrp_smoothed   = self._compute_vrp_smoothed(atm_iv, parkinson_rv, dte)
         if vrp_smoothed is None:
             self.state["_vrp_none_cycles"] = self.state.get("_vrp_none_cycles", 0) + 1
             if self.state["_vrp_none_cycles"] >= 3:
@@ -3176,6 +3248,10 @@ class MarketDataEngine:
             _expected_range_so_far = 0.0
 
         # ── 27. Build signals dict ────────────────────────────────────────
+        # Previous close comes from gap detection's cache (populated at the
+        # open, before entry hours). 0.0 = unknown, and downstream reads
+        # treat unknown as "no lean" rather than guessing.
+        _prev_close_sig = self.state.get("_prev_close_for_gap") or 0.0
         signals: dict = {
             # Identity
             "trading_date":             trading_date,
@@ -3219,6 +3295,11 @@ class MarketDataEngine:
             "gap_direction":            self.state.get("gap_direction", "FLAT"),
             "gap_size_pts":             self.state.get("gap_size_pts", 0.0),
             "gap_fade_opportunity":     bool(self.state.get("gap_fade_opportunity", False)),
+
+            # Day structure (gap-fill / heaviness reads for strategy selection)
+            "prev_close":               float(_prev_close_sig or 0.0),
+            "day_high":                 float(_day_high or 0.0),
+            "day_low":                  float(_day_low or 0.0),
 
             # Technical
             "adx_15":                   adx_15,

@@ -419,7 +419,19 @@ class ReplayClient:
         return self.day.bars_until(self.clock.now())
 
     def get_historical_candles(self, instrument_key, interval, from_date, to_date) -> list:
-        return []
+        # DaySlice already carries the previous session's last 1-minute
+        # close as the recorded previous close, but it was never served:
+        # this stub returned [], so _get_prev_close() was always None in
+        # replay and gap detection never ran in backtest (live it runs
+        # every day). Serve the recorded close as a single daily bar in
+        # Upstox list shape so replay sees the same gaps live saw.
+        if not self.day or self.day.prev_close is None:
+            return []
+        if str(interval).lower() not in ("day", "daily", "1day", "d"):
+            return []
+        pc = float(self.day.prev_close)
+        _label = to_date or self.day.trading_date
+        return [[f"{_label}T15:30:00+05:30", pc, pc, pc, pc, 0, 0]]
 
     def get_option_contracts(self, instrument_key: str, expiry_date=None) -> list:
         """
@@ -936,6 +948,15 @@ class BacktestRunner:
                 if self.verbose:
                     print(f"  {trading_date} {dt:%H:%M}: run_cycle failed: {exc}")
                 continue
+            # reset_if_new_day() rebinds MarketDataEngine.state to a fresh
+            # dict on day rollover (including the first cycle, when the
+            # clock jumps from its January init to the replay date). The
+            # handle captured before the loop would silently detach, so
+            # every cooldown / halt / stop counter the harness writes
+            # would land in a dead dict the strategy never reads —
+            # replayed sessions then re-entered instantly with no
+            # cooldown. Re-fetch the live handle every cycle.
+            state = self.me.state
             self.results.cycles += 1
 
             signals = self._classify(signals)
