@@ -24,6 +24,9 @@ from core import (
     load_config, setup_logging,
     get_high_impact_events,
     print_section, print_kv_table,
+    vrp_anomaly_limit,
+    VRP_DATA_ERROR_FRAC, VRP_DATA_ERROR_FRAC_DTE0,
+    VRP_RV_DEAD_PCT,
 )
 from data_engine import MarketDataEngine
 
@@ -946,12 +949,9 @@ class CalibrationEngine:
 # REGIME CLASSIFIER
 # ─────────────────────────────────────────────────────────────────────────────
 
-# NIFTY_ENGINE_PROFIT_PATCH_V34: bounds for the VRP data-error guard. The expiry series gets a
-# looser ratio because a low realised-to-implied ratio is its normal state,
-# and an absolute floor carries the burden of catching a genuinely dead feed.
-VRP_DATA_ERROR_FRAC = 0.7
-VRP_DATA_ERROR_FRAC_DTE0 = 0.92
-VRP_RV_DEAD_PCT = 0.5
+# VRP data-error guard bounds now live in core.py (single source of truth
+# shared with data_engine). The names stay importable from here so existing
+# references and self-tests keep working; values are unchanged from v3.4.
 
 
 class RegimeClassifier:
@@ -1113,9 +1113,8 @@ class RegimeClassifier:
 
         # 0.92 on the expiry series admits realised vol down to 8% of
         # implied before the reading is called impossible; 0.70 elsewhere,
-        # unchanged from v3.1.
-        _vrp_frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte_vrp == 0 else VRP_DATA_ERROR_FRAC
-        _vrp_limit = max(8.0, _vrp_frac * _atm_iv_pct) if _atm_iv_pct else 8.0
+        # unchanged from v3.1. Shared with data_engine via core.py.
+        _vrp_limit = vrp_anomaly_limit(_atm_iv_pct, _dte_vrp)
 
         _rv_dead = _rv_pct is not None and _rv_pct <= VRP_RV_DEAD_PCT
         _vrp_over = vrp_raw is not None and vrp_raw > _vrp_limit

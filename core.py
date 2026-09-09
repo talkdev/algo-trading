@@ -63,6 +63,42 @@ def today_ist() -> date:
     return now_ist().date()
 
 
+# ── VRP data-error guard (single source of truth) ─────────────────────────
+# The VRP anomaly bound used to exist in two copies: data_engine capped the
+# smoothed series at max(8pp, 0.70 x ATM IV) while regime_engine blocked at
+# a DTE-aware bound (0.92 on the expiry series, 0.70 elsewhere, plus an
+# absolute realised-vol floor). v3.4 fixed only the regime copy, so on the
+# 2026-09-08 0DTE session data_engine froze vrp_smoothed at its pre-noon
+# value all afternoon while raw printed 15-17pp. Both layers now share this
+# bound. Semantics stay local: data_engine CAPS (falls back to the previous
+# smoothed value so one bad print cannot poison the series), regime_engine
+# BLOCKS (treats the cycle as NEUTRAL).
+VRP_DATA_ERROR_FRAC      = 0.70
+VRP_DATA_ERROR_FRAC_DTE0 = 0.92
+VRP_DATA_ERROR_FLOOR_PP  = 8.0
+VRP_RV_DEAD_PCT          = 0.5
+
+
+def vrp_anomaly_limit(atm_iv_pct: Optional[float], dte=None) -> float:
+    """Upper bound for a believable raw VRP reading, in variance points.
+
+    A low realised-to-implied ratio is the NORMAL state of the expiry
+    series (pin risk + gamma priced into hours of remaining life), so the
+    bound is looser on 0DTE. A genuinely dead bar feed is caught by the
+    absolute VRP_RV_DEAD_PCT floor on realised vol instead.
+    """
+    try:
+        _dte = int(dte) if dte is not None else None
+    except (TypeError, ValueError):
+        _dte = None
+    _frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte == 0 else VRP_DATA_ERROR_FRAC
+    try:
+        _iv = float(atm_iv_pct) if atm_iv_pct else 0.0
+    except (TypeError, ValueError):
+        _iv = 0.0
+    return max(VRP_DATA_ERROR_FLOOR_PP, _frac * _iv)
+
+
 def parse_ist_timestamp(ts) -> Optional[datetime]:
     """Parse a timestamp string or epoch into an IST-aware datetime."""
     if ts is None:
