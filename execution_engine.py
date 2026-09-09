@@ -1285,14 +1285,34 @@ class ExecutionEngine:
             _prox_action = "SELL"
             if "BUTTERFLY" in strategy_name_p2:
                 _prox_action = "BUY"
+            # v3.9: on expiry-day verticals the absolute proximity band
+            # can exceed the whole gap to the short strike (a delta-0.3+
+            # short ~45 points away against a 40pt band), which would
+            # flatten the trade at entry+5pts regardless of structure.
+            # The band is then bounded by (1 - prox_gap_frac) of the
+            # entry gap for each short leg - the same line the EV gate
+            # now prices - so the defense is where the risk model said
+            # it would be when the trade was approved.
+            _prox_dte0 = (actual_dte == 0) and \
+                ("BUTTERFLY" not in strategy_name_p2)
+            _prox_gap_frac = float(getattr(self.config, "prox_gap_frac_dte0", 0.70))
+            _entry_spot_p2 = float(position.get("entry_spot") or 0)
             for leg in open_legs:
                 if leg["action"] != _prox_action:
                     continue
                 strike = float(leg.get("strike", 0))
-                if abs(spot - strike) <= proximity_pts:
+                _band = proximity_pts
+                if _prox_dte0 and _entry_spot_p2 > 0:
+                    _gap = abs(strike - _entry_spot_p2)
+                    if _gap > 0:
+                        _band = min(
+                            proximity_pts,
+                            max((1.0 - _prox_gap_frac) * _gap, 10.0),
+                        )
+                if abs(spot - strike) <= _band:
                     self.logger.warning(
                         f"PRIORITY 2 SPOT PROXIMITY: spot={spot:.0f} "
-                        f"within {proximity_pts}pts of {_prox_action} "
+                        f"within {_band:.0f}pts of {_prox_action} "
                         f"{leg['option_type']} {strike:.0f}"
                     )
                     return "CLOSE_STOP", EXIT_PRIORITY_SPOT_PROXIMITY, {
@@ -2158,8 +2178,14 @@ def _self_test() -> None:
         }
 
     # Test Priority 1: Delta breach
-    # Modify chain to show high delta on short call
-    mock_chain[24150.0]["call"]["delta"] = 0.45  # > 0.40 threshold
+    # Modify chain to show a short-call delta clearly above the expiry-day
+    # close threshold. v3.9 raised delta_close_dte0 to 0.45 (the engine now
+    # sells 0.32/0.30/0.28 delta, so the old 0.35 line sat below the entry
+    # delta of a 0.30-delta short and self-closed it on entry), which made a
+    # hardcoded 0.45 test value a non-breach. Derive the test delta from the
+    # live threshold so this assertion stays valid if the knob is retuned.
+    _dte0_close_p1 = float(getattr(config, "delta_close_dte0", 0.45))
+    mock_chain[24150.0]["call"]["delta"] = round(min(_dte0_close_p1 + 0.15, 0.99), 2)
 
     # We need to mock _get_position_legs
     original_get_legs = engine._get_position_legs

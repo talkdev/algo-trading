@@ -2011,12 +2011,18 @@ class RegimeClassifier:
         or_condition = signals.get("or_condition") or "MODERATE"
 
         # ── day_size from calibration ─────────────────────────────────────
+        # v3.9: the fallback was event_size_multiplier (a budget/event-day
+        # reducer). On any cycle where the calibrator had no valid state -
+        # live start-of-day, tier-0, and every backtest replay - that
+        # silently sized a normal Tuesday at 25%, quartering the book. The
+        # fallback is now the per-weekday normal size in Config, which
+        # mirrors the calibration defaults.
         day_size_map = {
-            "MONDAY":    self._t("day_size_monday",    "event_size_multiplier", 0.55),
-            "TUESDAY":   self._t("day_size_tuesday",   "event_size_multiplier", 0.80),
-            "WEDNESDAY": self._t("day_size_wednesday", "event_size_multiplier", 0.70),
-            "THURSDAY":  self._t("day_size_thursday",  "event_size_multiplier", 0.70),
-            "FRIDAY":    self._t("day_size_friday",    "event_size_multiplier", 0.60),
+            "MONDAY":    self._t("day_size_monday",    "day_size_monday",    0.60),
+            "TUESDAY":   self._t("day_size_tuesday",   "day_size_tuesday",   0.85),
+            "WEDNESDAY": self._t("day_size_wednesday", "day_size_wednesday", 0.65),
+            "THURSDAY":  self._t("day_size_thursday",  "day_size_thursday",  0.65),
+            "FRIDAY":    self._t("day_size_friday",    "day_size_friday",    0.55),
         }
         if self.cal:
             day_size_map = {
