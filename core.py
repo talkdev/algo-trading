@@ -44,6 +44,7 @@ NIFTY_ENGINE_PROFIT_PATCH_V34 = "3.4"
 NIFTY_ENGINE_PROFIT_PATCH_V35 = "3.5"
 NIFTY_ENGINE_PROFIT_PATCH_V36 = "3.6"
 NIFTY_ENGINE_PROFIT_PATCH_V37 = "3.7"
+NIFTY_ENGINE_PROFIT_PATCH_V38 = "3.8"
 
 
 def now_ist() -> datetime:
@@ -2879,7 +2880,14 @@ def _self_test() -> None:
 
     # ── Database ──────────────────────────────────────────────────────────
     print_section("DATABASE SCHEMA TEST")
-    db = Database(config.db_path)
+    # v3.8: run this self-test against an isolated scratch
+    # database, never the production book. The logging test
+    # writes audit_log rows; config is left untouched (it may be
+    # frozen), so only the scratch Database is handed in.
+    import tempfile as _scratch_tmp
+    db = Database(Path(_scratch_tmp.mkdtemp(
+        prefix="core_selftest_")) / "core_selftest.db")
+
     logger = setup_logging(
         db, config.log_dir,
         level=getattr(logging, config.log_level.upper(), logging.INFO)
@@ -2939,7 +2947,7 @@ def _self_test() -> None:
 
     db.close()
     print_section("SELF-TEST COMPLETE", char="#")
-    print(f"  Database: {config.db_path}")
+    print(f"  Database: {db.db_path}")
     print(f"  Log file: {config.log_dir / 'nifty_algo_audit.log'}")
     print()
 

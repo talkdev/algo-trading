@@ -174,7 +174,7 @@ class MainEngine:
             f"Lot size configured as {self.config.lot_size} units/lot. "
             f"MANUALLY VERIFY against current NSE NIFTY contract spec "
             f"and broker instrument master before live trading. "
-            f"As of 2026, NIFTY lot size = 75 units (verify current spec)."
+            f"As of the Jan-2026 series, NIFTY 50 lot size = 65 units."
         )
 
     def _validate_session_state_integrity(self) -> None:
