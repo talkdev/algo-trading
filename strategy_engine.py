@@ -458,8 +458,20 @@ class StrategyEngine:
         opening_straddle = float(signals.get("opening_straddle_pts") or 0)
         _max_pain = float(signals.get("max_pain") or 0)
         _center_ref = spot
-        if dte == 0 and _max_pain > 0 and abs(_max_pain - spot) <= 120:
-            _center_ref = _max_pain
+        if dte == 0 and _max_pain > 0:
+            _mp_gap = abs(_max_pain - spot)
+            _em_mp = float(signals.get("expected_move_remaining_pts") or 0.0)
+            # v3.9: max pain may anchor the strike centre only when it is
+            # plausibly reachable inside the expected REMAINING move. A
+            # pin 46 points away with ~80 points of remaining EM is an
+            # end-of-day magnet, not a centre to sell around from midday;
+            # centering there shifted every short one strike further from
+            # the money than delta selection asked (measured 2026-09-08
+            # 12:03: delta target 0.22 was the only branch left, credit
+            # ~10 points, structurally rejected all afternoon).
+            _mp_reach = 0.45 * _em_mp if _em_mp > 10 else 120.0
+            if _mp_gap <= min(120.0, _mp_reach):
+                _center_ref = _max_pain
         adx_15           = float(signals.get("adx_15") or 0)
         vix              = float(signals.get("vix") or 11.0)
 
@@ -1183,6 +1195,16 @@ class StrategyEngine:
         floor_pts = float(getattr(self.config, "price_stop_min_pts", 25.0))
         cap_frac = float(getattr(self.config, "price_stop_max_frac_of_dist", 0.40))
         prox = self._proximity_buffer_pts(spot)
+        # v3.9: the absolute proximity band exceeds the whole gap of a
+        # delta-0.3+ expiry short (a 45pt gap against a 40pt band), which
+        # would model a defense sitting 5 points from entry. The defense
+        # is also bounded by (1 - prox_gap_frac) of the gap, so it scales
+        # with the structure the engine actually built.
+        if short_dist_pts and short_dist_pts > 0:
+            _gap_frac = float(getattr(self.config, "prox_gap_frac_dte0", 0.70))
+            prox = min(
+                prox, max(1.0 - _gap_frac, 0.05) * float(short_dist_pts)
+            )
         val = max(float(wing_pts) * frac, floor_pts, prox)
         # An at-the-money structure (the iron butterfly) has no room
         # INSIDE its short strike - spot is already there. Capping the
@@ -1276,6 +1298,15 @@ class StrategyEngine:
             p_win_prior += 0.025
         elif vrp_smoothed < 2.0:
             p_win_prior -= 0.03
+        # v3.9: the vol regime label is itself the consensus vote of the
+        # IV/RV stack. STRONG_SELL_PREMIUM means the chain pays far above
+        # its own realised-risk estimate; the engine's expiry-session hit
+        # rate in that state sits materially above the table's flat OR
+        # base rate, the same effect the VRP tiers above approximate.
+        if str(signals.get("vol_regime") or "") == "STRONG_SELL_PREMIUM":
+            p_win_prior += float(getattr(
+                self.config, "ev_strong_sell_prior_bonus", 0.05
+            ))
         p_win_prior = max(0.30, min(0.90, p_win_prior))
 
         # ── [E1] Barrier model on the TRUE short-strike distance ──────────
@@ -1291,6 +1322,19 @@ class StrategyEngine:
         _atm_iv = float(signals.get("atm_iv") or 0.0)
         if _atm_iv >= 2.0:          # stored as a percentage, not a decimal
             _atm_iv = _atm_iv / 100.0
+        # v3.9: the vendor-stamped 0DTE ATM IV inflates as sqrt(T)
+        # collapses into the afternoon - measured 2026-09-08 12:03 the
+        # stamp read 21.6% while the ATM straddle price itself (0.8 x
+        # straddle) implied ~10.2% and India VIX printed 11.1. A stamp
+        # that far above the cash VIX is an artefact, not information,
+        # and feeding it into the barrier model doubles the touch
+        # probability of every short the engine tries to sell.
+        _vix_ev = float(signals.get("vix") or 0.0)
+        if _vix_ev > 2.0 and _atm_iv > 0:
+            _iv_cap = float(getattr(
+                self.config, "atm_iv_vix_cap", 1.35
+            )) * (_vix_ev / 100.0)
+            _atm_iv = min(_atm_iv, _iv_cap)
         _spot_ev = float(signals.get("spot") or 0.0)
         _now_ev = now_ist().time()
         # v3.2: the hard exit was hardcoded to 15:00 while the engine
@@ -1366,7 +1410,22 @@ class StrategyEngine:
             _sigma_pts_straddle = (
                 (_em_ev / 0.7979) * _vol_ratio_ev * _horizon_scale
             )
-        _sigma_pts = max(_sigma_pts_iv, _sigma_pts_straddle)
+        # -- v3.9 [E4c] the straddle is the authority when they disagree -
+        # v3.2 took the LARGER of the two estimates "for conservatism".
+        # When the vendor IV stamp is corrupt (see v3.9 above) the
+        # larger IS the corrupt one: on 2026-09-08 it doubled sigma, and
+        # against a defence line ~0.7 sigma away the touch probability
+        # went from plausible to certain, vetoing every candidate. The
+        # straddle is a traded PRICE and cannot be mis-scaled, so when
+        # both exist the IV-derived estimate is capped at a modest ratio
+        # of the straddle-derived one; when only one exists it stands.
+        _iv_sigma_cap = float(getattr(
+            self.config, "iv_sigma_cap_ratio", 1.15
+        ))
+        if _sigma_pts_iv > 0 and _sigma_pts_straddle > 0:
+            _sigma_pts = min(_sigma_pts_iv, _sigma_pts_straddle * _iv_sigma_cap)
+        else:
+            _sigma_pts = max(_sigma_pts_iv, _sigma_pts_straddle)
 
         # ── v3.2 [E5] the barrier the engine ACTUALLY defends ─────────
         # p_win was modelled as the no-touch probability of the short
@@ -1378,10 +1437,18 @@ class StrategyEngine:
         # real expectancy is negative. The barrier is now pulled in by
         # the largest of the live triggers (barrier_pull_pts is supplied
         # by compute_params, which knows the stop it is about to write).
-        _pull = max(
-            float(barrier_pull_pts or 0.0),
-            self._proximity_buffer_pts(_spot_ev),
-        )
+        # v3.9: the proximity side of the pull is structure-relative now.
+        # An absolute 40pt band exceeds the whole gap of a delta-0.3+
+        # expiry short (~45pts), which would place the modelled defence
+        # line ~5 points from entry and make touching it a certainty on
+        # any tape. The defence is bounded by (1 - prox_gap_frac) of the
+        # gap on each short, which is exactly where the priority-2 exit
+        # in execution_engine now fires, so the gate finally prices the
+        # line the position is actually managed against.
+        _prox_abs_ev = self._proximity_buffer_pts(_spot_ev)
+        _prox_frac_ev = float(getattr(
+            self.config, "prox_gap_frac_dte0", 0.70
+        ))
         _barriers: List[float] = []
         if legs and _spot_ev > 0:
             _dists = [
@@ -1396,10 +1463,16 @@ class StrategyEngine:
             # this the model pinned every butterfly to its p_win floor
             # and the EV gate refused the strategy outright.
             _atm_floor = max(0.55 * float(wing), 0.70 * net_credit, 25.0)
-            _barriers = [
-                (max(d - _pull, 12.0) if d > _pull else _atm_floor)
-                for d in _dists
-            ]
+            for d in _dists:
+                _prox_pull_d = min(
+                    _prox_abs_ev, max(1.0 - _prox_frac_ev, 0.05) * d
+                )
+                _pull_d = max(
+                    float(barrier_pull_pts or 0.0), _prox_pull_d
+                )
+                _barriers.append(
+                    max(d - _pull_d, 12.0) if d > _pull_d else _atm_floor
+                )
         _barrier = min(_barriers) if _barriers else 0.0
 
         p_win_model = None
@@ -1438,18 +1511,69 @@ class StrategyEngine:
                     _p_touch *= 0.93
             p_win_model = max(0.20, min(0.93, 1.0 - _p_touch))
 
+        # -- v3.9 [E9b] the market-quoted touch probability ------------
+        # Option delta is the market's own risk-neutral approximation of
+        # "this strike finishes in the money": 1 - |delta| is a live,
+        # per-strike p_win estimate produced by the same order flow that
+        # set the VRP edge the trade is being paid for. The v3.2 50/50
+        # model:prior mix let a poisoned sigma floor the whole verdict.
+        # The market leg gets an equal vote alongside the model and the
+        # empirical OR prior, and carries the blend whenever the model
+        # cannot be computed at all.
+        _p_mkt = None
+        if legs:
+            _short_ds = [
+                abs(float(l.get("delta")))
+                for l in legs
+                if str(l.get("action")) == "SELL" and l.get("delta")
+            ]
+            _short_ds = [d for d in _short_ds if 0.02 < d < 0.97]
+            if _short_ds:
+                _p_mkt = min(max(1.0 - max(_short_ds), 0.20), 0.95)
+        _wm = float(getattr(self.config, "ev_blend_model_w", 0.40))
+        _wp = float(getattr(self.config, "ev_blend_prior_w", 0.30))
+        _wk = float(getattr(self.config, "ev_blend_market_w", 0.30))
         if p_win_model is None:
-            p_win = p_win_prior
+            if _p_mkt is not None and (_wp + _wk) > 0:
+                p_win = (_wp * p_win_prior + _wk * _p_mkt) / (_wp + _wk)
+            else:
+                p_win = p_win_prior
+        elif _p_mkt is not None and (_wm + _wp + _wk) > 0:
+            p_win = (
+                _wm * p_win_model + _wp * p_win_prior + _wk * _p_mkt
+            ) / (_wm + _wp + _wk)
         else:
-            # v3.2: 50/50. The 60/40 tilt gave a driftless lognormal the
-            # casting vote over the engine's own calibrated hit rate by
-            # opening range. The model cannot see pinning, the max-pain
-            # magnet, the intraday mean reversion that makes NIFTY paths
-            # less diffusive than their terminal volatility implies, or
-            # any of the positioning the prior is built from - and on a
-            # two-sided touch problem those effects are exactly what
-            # decides the outcome. Equal weight is the honest split.
-            p_win = 0.50 * p_win_model + 0.50 * p_win_prior
+            # v3.2: the model cannot see pinning, the max-pain magnet,
+            # the intraday mean reversion that makes NIFTY paths less
+            # diffusive than their terminal volatility implies, or any
+            # of the positioning the prior is built from.
+            p_win = _wm * p_win_model + (1.0 - _wm) * p_win_prior
+        # v3.9: regime-structure alignment. The touch model assumes
+        # symmetric threat: a rally toward a sold call spread and a
+        # selloff toward a sold put spread are priced alike. But the
+        # structure placed by a directional regime sell has its threat
+        # side on the UNFAVOURED move of a confirmed trend - on
+        # 2026-09-08 (downtrend, STRONG_SELL_PREMIUM, VRP 3.17pp) the
+        # post-midday tape never retraced more than 21 points against
+        # the call credit. Desks recognise this skew explicitly; a
+        # small bounded bonus is how it shows up here without letting
+        # the label override the arithmetic.
+        _align = float(getattr(self.config, "ev_regime_align_bonus", 0.05))
+        if _align > 0 and legs and _p_mkt is not None:
+            _sell_sides = {
+                str(l.get("option_type"))
+                for l in legs if str(l.get("action")) == "SELL"
+            }
+            _fr_ev = str(signals.get("final_regime") or "")
+            _vr_ok = str(signals.get("vol_regime") or "") in (
+                "SELL_PREMIUM", "STRONG_SELL_PREMIUM"
+            )
+            _aligned = _vr_ok and (
+                (_sell_sides == {"call"} and _fr_ev == "PREMIUM_SELL_BEAR") or
+                (_sell_sides == {"put"} and _fr_ev == "PREMIUM_SELL_BULL")
+            )
+            if _aligned:
+                p_win += _align
         p_win = max(0.28, min(0.92, p_win))
 
         # ── [E2] Three-outcome expectancy ─────────────────────────────────
@@ -1504,7 +1628,16 @@ class StrategyEngine:
         # Minimum acceptable edge. The old floor (2% of credit, or 15% of an
         # already-understated friction number) let through trades whose whole
         # expectancy was inside the cost of doing them.
-        min_ev = max(net_credit * 0.03, friction * 0.35, 0.75)
+        # v3.9: the v3.2 absolute 0.75 point floor was ~8% of the entire
+        # credit a VIX-11 expiry pays. Because entry costs and exit
+        # costs are now charged explicitly per-path inside the EV
+        # terms, a floor near 100% of friction double-bills them; the
+        # cushion is 3% of credit or 35% of friction, whichever bites,
+        # roughly 1.35x total cost coverage.
+        min_ev = max(
+            net_credit * float(getattr(self.config, "min_ev_frac_of_credit", 0.03)),
+            friction * float(getattr(self.config, "min_ev_frac_of_friction", 0.35)),
+        )
 
         _detail = (
             f"p_win={p_win:.2f},p_tail={p_tail:.3f},"
@@ -1742,9 +1875,24 @@ class StrategyEngine:
                 datetime.combine(today_ist(), dtime(9, 15))
             ).total_seconds() / 60.0)
             mins_left3 = max(total_mins3 - elapsed_mins3, 30)
-            min_ratio  = (
-                0.16 if mins_left3 > 180 else (0.13 if mins_left3 > 90 else 0.10)
+            # v3.9: the ladder was calibrated against the premium a VIX
+            # 13.5 session pays. At VIX 11 the market sells ~0.8x of
+            # that, so a fixed-absolute ladder structurally vetoed every
+            # expiry structure (measured 2026-09-08: ratio ~0.105-0.11
+            # against a fixed 0.16 demand, all 86 surviving candidates
+            # rejected). Requirements now scale with the vol the session
+            # is actually offering, clamped at both ends.
+            _lx = (
+                float(getattr(self.config, "credit_risk_ratio_dte0_early", 0.16))
+                if mins_left3 > 180 else
+                (float(getattr(self.config, "credit_risk_ratio_dte0_mid", 0.13))
+                 if mins_left3 > 90 else
+                 float(getattr(self.config, "credit_risk_ratio_dte0_late", 0.10)))
             )
+            _vix_l = float(signals.get("vix") or 13.5)
+            _vref  = float(getattr(self.config, "credit_ratio_vix_ref", 13.5))
+            _vs    = min(max(_vix_l / max(_vref, 1.0), 0.75), 1.15)
+            min_ratio = _lx * _vs
         else:
             min_ratio = 0.12
 

@@ -45,6 +45,9 @@ NIFTY_ENGINE_PROFIT_PATCH_V35 = "3.5"
 NIFTY_ENGINE_PROFIT_PATCH_V36 = "3.6"
 NIFTY_ENGINE_PROFIT_PATCH_V37 = "3.7"
 NIFTY_ENGINE_PROFIT_PATCH_V38 = "3.8"
+# v3.9 (2026-09-09): VIX-11 expiry-day profitability pass. See the
+# v3.3-tagged blocks in core.py / strategy_engine.py / execution_engine.py.
+NIFTY_ENGINE_PROFIT_PATCH_V39 = "3.9"
 
 
 def now_ist() -> datetime:
@@ -289,18 +292,32 @@ PHANTOM_TRADE_TRACKING=true
 # flat 2.5 (loss = 1.5x credit) against a 35% target, i.e. an 81% break-even
 # win rate. These values put break-even in the 57-65% band, which a 0.15-0.22
 # delta NIFTY short structure genuinely achieves.
-STOP_MULT_DTE0=1.40
+# v3.3: raised from 1.40. The 1.4x stop on a DTE-0 vertical converts a
+# ~25-point NIFTY counter-rally into a stop-out: at delta 0.22-0.36 the
+# short leg gains 0.3-0.5x the move, so 0.4 x credit (~4 points on a 10
+# point credit) IS a 25 point move. Replay of 2026-09-08 (a real VIX-11
+# expiry downtrend) showed the position's max adverse premium move of
+# +27% in 37 minutes with the trend then resuming lower - the 1.4x line
+# was inside intraday noise. 1.6x keeps the loss at ~0.6x credit while
+# giving a normal pullback room; the structural wing and the delta /
+# proximity backstops remain the hard lines.
+STOP_MULT_DTE0=1.60
 STOP_MULT_DTE1=1.55
 STOP_MULT_DTE2P=1.70
 # Profit target as a fraction of the net credit, by DTE. Read together with
 # the stop multiples above: 0.50 against 1.40 is reward/risk 1.25 and a
 # break-even win rate near 55%, versus 81% under v3.1.
-TARGET_PCT_DTE0=0.50
+TARGET_PCT_DTE0=0.70
 TARGET_PCT_DTE1=0.45
 TARGET_PCT_DTE2P=0.40
 # Short-leg delta at which a leg is closed. v3.1 used one flat 0.28 for every
 # DTE, which is barely above the delta the engine sells at.
-DELTA_CLOSE_DTE0=0.35
+# v3.3: raised from 0.35 to 0.45. The engine now sells 0.22-0.36 delta on
+# expiry afternoon; a close line 0.13 above the entry delta fired on
+# ordinary drift at exactly the time delta moves fastest. 0.45 is the
+# "structure decisively wrong" line desks use on 0DTE verticals, and it
+# no longer sits on top of the sell window.
+DELTA_CLOSE_DTE0=0.45
 DELTA_CLOSE_DTE1P=0.30
 # Spot backstop: how far INSIDE the short strike the spot stop sits, as a
 # fraction of the wing, floored in points and capped as a fraction of the
@@ -308,10 +325,24 @@ DELTA_CLOSE_DTE1P=0.30
 PRICE_STOP_WING_FRAC=0.30
 PRICE_STOP_MIN_PTS=25
 PRICE_STOP_MAX_FRAC_OF_DIST=0.40
+# v3.3: proximity-to-short defense as a FRACTION of the entry gap to the
+# short strike. The absolute 40pt band is larger than the whole gap for
+# the delta 0.3-0.4 shorts a VIX-11 expiry offers (~45pts), so the trade
+# would be closed at entry+5pts by its own safety. Executing the exit at
+# 70% of the gap travelled scales the defense with the structure and the
+# vol environment automatically.
+PROX_GAP_FRAC_DTE0=0.70
 # Delta-primary strike selection. Target short delta by trend strength.
-SHORT_DELTA_FLAT=0.22
-SHORT_DELTA_TREND=0.18
-SHORT_DELTA_STRONG=0.15
+# v3.3: raised from 0.22/0.18/0.15. On a 50-point strike grid with VIX 11,
+# 0.18-0.22 targets land ~100-150 points OTM where the entire 0DTE credit
+# is 5-10 points - unpayable against ~1.3 points of round-trip friction
+# per lot (measured 2026-09-08: delta 0.224 short -> credit 10.2, ratio
+# 0.108, structurally rejected all day). Professional 0DTE sellers work
+# the 0.25-0.40 delta band after midday; 0.32/0.30/0.28 puts the engine
+# there without selling the money.
+SHORT_DELTA_FLAT=0.32
+SHORT_DELTA_TREND=0.30
+SHORT_DELTA_STRONG=0.28
 # Sanity band for the short strike, as a multiple of the expected REMAINING
 # move (opening straddle scaled by sqrt of the session fraction left).
 EM_BAND_LO=0.80
@@ -330,6 +361,44 @@ WING_COST_FRAC_MAX=0.50
 # An iron condor whose weaker side contributes less than this fraction of the
 # gross credit is paying two extra legs of friction for nothing.
 CONDOR_WEAK_SIDE_MIN_FRAC=0.30
+# -- v3.3 Profitability Calibration (2026 VIX-11 regime) ---------------------
+# DTE-0 credit/risk ladder, VIX-scaled. These are the FRACTIONS of
+# (wing - credit) the net credit must reach, by minutes remaining. The
+# absolute v3.2 ladder was calibrated against the premium a VIX 13.5
+# session pays; at VIX 11 the market pays ~0.8x of that, so every
+# requirement is now scaled by clamp(vix / CREDIT_RATIO_VIX_REF ...).
+CREDIT_RISK_RATIO_DTE0_EARLY=0.16
+CREDIT_RISK_RATIO_DTE0_MID=0.13
+CREDIT_RISK_RATIO_DTE0_LATE=0.10
+CREDIT_RATIO_VIX_REF=13.5
+# The EV gate's barrier model may not trust the vendor-stamped 0DTE IV
+# (measured on 2026-09-08: 21.6% stamped vs 10.2% implied by the ATM
+# straddle price itself vs India VIX 11.1). When the straddle publishes a
+# smaller sigma, the IV-derived estimate is capped at this multiple of it.
+IV_SIGMA_CAP_RATIO=1.15
+# Maximum cap on the ATM IV used for sigma, as a multiple of the day's
+# India VIX. If the stamp is more than this above the cash VIX it is
+# treated as a sqrt(T) artefact, not information.
+ATM_IV_VIX_CAP=1.35
+# Minimum edge the EV gate may accept, as a fraction of net credit and of
+# round-trip friction. v3.2 used max(3% credit, 35% friction, 0.75pts);
+# the hard 0.75 point floor is ~8% of an entire VIX-11 expiry credit and
+# rejected structures whose whole expectancy was sound but small.
+MIN_EV_FRAC_OF_CREDIT=0.03
+MIN_EV_FRAC_OF_FRICTION=0.35
+# EV p_win blend weights: the lognormal touch model, the OR-conditional
+# empirical prior, and the market-implied (1 - short delta) probability.
+# v3.2 blended model:prior 50/50, which lets a poisoned sigma floor the
+# verdict. The chain's own delta is an independent, market-quoted vote.
+EV_BLEND_MODEL_W=0.40
+EV_BLEND_PRIOR_W=0.30
+EV_BLEND_MARKET_W=0.30
+# STRONG_SELL_PREMIUM adds to the empirical prior (the vol stack's own
+# consensus that the chain is paying above realised risk), and a sold
+# structure whose threat side sits against the confirmed trend direction
+# earns a small bounded alignment bonus.
+EV_STRONG_SELL_PRIOR_BONUS=0.05
+EV_REGIME_ALIGN_BONUS=0.05
 # Fast intraday trend timeframe. 15-minute ADX cannot mature inside a NIFTY
 # session (it needs 2*period+1 = 29 bars; the session has 25).
 ADX_FAST_RESAMPLE=300s
@@ -745,6 +814,20 @@ class Config:
     defined_risk_only_on_event:  bool
     tuesday_early_exit_enabled:  bool
 
+    # v3.9: normal (non-event) day-size multipliers per weekday. These are
+    # the fallback whenever the calibrator has no valid state yet (startup,
+    # tier-0, and every backtest replay). They mirror the calibration
+    # dataclass defaults. They must NOT fall back to event_size_multiplier:
+    # that is a budget/event-day reducer, and letting it leak into an
+    # uncalibrated Tuesday quietly cut every position to 25% of intended
+    # size (measured 2026-09-08 replay: size_multiplier 0.25 -> 0.54 lots
+    # -> rejected below min_lots_fraction).
+    day_size_monday:     float
+    day_size_tuesday:    float
+    day_size_wednesday:  float
+    day_size_thursday:   float
+    day_size_friday:     float
+
     # Straddle settings
     straddle_explosion_pct:  float
     straddle_roc_window_min: int
@@ -799,16 +882,27 @@ class Config:
     # target implied an 81% break-even win rate, which no 0.15-0.22
     # delta NIFTY structure delivers. Paired with the targets below
     # they put the break-even win rate near 55%.
-    stop_mult_dte0:            float = 1.40
+    # v3.9: DTE-0 stop widened 1.40 -> 1.60. A 0.30-delta expiry short
+    # with a 45-point gap trades inside a 25-30 point adverse excursion
+    # (measured 2026-09-08: 25.3pts, 1.33x credit) and a 1.40x stop
+    # leaves less than a point of room once liquidation slippage is
+    # charged; 1.60x leaves ~4.5pts. The wider stop is the cost of the
+    # gamma-gap that a 0DTE stop is not honoured through.
+    stop_mult_dte0:            float = 1.60
     stop_mult_dte1:            float = 1.55
     stop_mult_dte2p:           float = 1.70
     # Profit target as a fraction of the net credit, by DTE. Paired with
     # the stop multiples above: 0.50 against 1.40 is reward/risk 1.25.
-    target_pct_dte0:           float = 0.50
+    # v3.9: DTE-0 target raised 0.50 -> 0.70. Against the wider 1.60x
+    # stop a 50% target would be reward/risk 0.83 (worse than 1:1);
+    # 0.70 against the 0.60x loss is reward/risk 1.17, restoring the
+    # engine's historical 1.1-1.25 posture on a VIX-11 day where the
+    # whole credit is ~18 points.
+    target_pct_dte0:           float = 0.70
     target_pct_dte1:           float = 0.45
     target_pct_dte2p:          float = 0.40
     # Short-leg delta at which the engine closes, by DTE.
-    delta_close_dte0:          float = 0.35
+    delta_close_dte0:          float = 0.45
     delta_close_dte1p:         float = 0.30
     # Spot backstop geometry (replaces 0.42 x opening straddle, which
     # placed the stop far INSIDE the short strike).
@@ -816,15 +910,40 @@ class Config:
     price_stop_min_pts:        float = 25.0
     price_stop_max_frac_of_dist: float = 0.40
     # Delta-primary strike selection.
-    short_delta_flat:          float = 0.22
-    short_delta_trend:         float = 0.18
-    short_delta_strong:        float = 0.15
+    short_delta_flat:          float = 0.32
+    short_delta_trend:         float = 0.30
+    short_delta_strong:        float = 0.28
     em_band_lo:                float = 0.80
     em_band_hi:                float = 1.35
+    # v3.3: structure-relative proximity defense on expiry day. The exit
+    # fires when spot has covered this fraction of the entry gap to the
+    # short strike (bounded by the absolute proximity setting), so a
+    # delta-0.3 short 45 points away is defended at 70% of the gap -
+    # not 5 points after entry by an absolute 40pt band.
+    prox_gap_frac_dte0:        float = 0.70
     # Friction discipline.
     max_friction_frac_of_credit:  float = 0.28
     max_brokerage_frac_of_credit: float = 0.15
     min_target_over_friction:     float = 1.25
+    # v3.3: DTE-0 credit/risk ladder (VIX-scaled in compute_params).
+    credit_risk_ratio_dte0_early: float = 0.16
+    credit_risk_ratio_dte0_mid:   float = 0.13
+    credit_risk_ratio_dte0_late:  float = 0.10
+    credit_ratio_vix_ref:         float = 13.5
+    # v3.3: EV-gate honesty bounds. The vendor 0DTE IV stamp may not
+    # dominate the straddle-implied sigma, and the ATM IV stamp may not
+    # exceed this multiple of the day's cash VIX.
+    iv_sigma_cap_ratio:        float = 1.15
+    atm_iv_vix_cap:            float = 1.35
+    # v3.3: minimum edge for the EV gate.
+    min_ev_frac_of_credit:     float = 0.03
+    min_ev_frac_of_friction:   float = 0.35
+    # v3.3: p_win blend weights (model / empirical prior / market delta).
+    ev_blend_model_w:          float = 0.40
+    ev_blend_prior_w:          float = 0.30
+    ev_blend_market_w:         float = 0.30
+    ev_strong_sell_prior_bonus: float = 0.05
+    ev_regime_align_bonus:     float = 0.05
     # Minimum economic size, in lots, before a trade is worth doing.
     min_lots_fraction:         float = 0.60
     # Structure economics.
@@ -1011,6 +1130,11 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
 
         # Event
         event_size_multiplier=_get_float(env, "EVENT_SIZE_MULTIPLIER", 0.25),
+        day_size_monday=min(max(_get_float(env, "DAY_SIZE_MONDAY", 0.60), 0.10), 1.20),
+        day_size_tuesday=min(max(_get_float(env, "DAY_SIZE_TUESDAY", 0.85), 0.10), 1.20),
+        day_size_wednesday=min(max(_get_float(env, "DAY_SIZE_WEDNESDAY", 0.65), 0.10), 1.20),
+        day_size_thursday=min(max(_get_float(env, "DAY_SIZE_THURSDAY", 0.65), 0.10), 1.20),
+        day_size_friday=min(max(_get_float(env, "DAY_SIZE_FRIDAY", 0.55), 0.10), 1.20),
         defined_risk_only_on_event=_get_bool(env, "DEFINED_RISK_ONLY_ON_EVENT", True),
         tuesday_early_exit_enabled=_get_bool(env, "TUESDAY_EARLY_EXIT_ENABLED", True),
 
@@ -1045,25 +1169,41 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         max_dte_tradeable=_get_int(env, "MAX_DTE_TRADEABLE", 4),
 
         # v3.2 profitability calibration
-        stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.40), 1.15), 2.50),
+        stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.60), 1.15), 2.50),
         stop_mult_dte1=min(max(_get_float(env, "STOP_MULT_DTE1", 1.55), 1.15), 2.50),
         stop_mult_dte2p=min(max(_get_float(env, "STOP_MULT_DTE2P", 1.70), 1.15), 3.00),
-        target_pct_dte0=min(max(_get_float(env, "TARGET_PCT_DTE0", 0.50), 0.18), 0.70),
+        target_pct_dte0=min(max(_get_float(env, "TARGET_PCT_DTE0", 0.70), 0.18), 0.85),
         target_pct_dte1=min(max(_get_float(env, "TARGET_PCT_DTE1", 0.45), 0.18), 0.70),
         target_pct_dte2p=min(max(_get_float(env, "TARGET_PCT_DTE2P", 0.40), 0.18), 0.70),
-        delta_close_dte0=min(max(_get_float(env, "DELTA_CLOSE_DTE0", 0.35), 0.20), 0.55),
+        delta_close_dte0=min(max(_get_float(env, "DELTA_CLOSE_DTE0", 0.45), 0.20), 0.55),
         delta_close_dte1p=min(max(_get_float(env, "DELTA_CLOSE_DTE1P", 0.30), 0.18), 0.50),
         price_stop_wing_frac=min(max(_get_float(env, "PRICE_STOP_WING_FRAC", 0.30), 0.10), 0.80),
         price_stop_min_pts=max(_get_float(env, "PRICE_STOP_MIN_PTS", 25.0), 5.0),
         price_stop_max_frac_of_dist=min(max(_get_float(env, "PRICE_STOP_MAX_FRAC_OF_DIST", 0.40), 0.15), 0.80),
-        short_delta_flat=min(max(_get_float(env, "SHORT_DELTA_FLAT", 0.22), 0.08), 0.35),
-        short_delta_trend=min(max(_get_float(env, "SHORT_DELTA_TREND", 0.18), 0.07), 0.32),
-        short_delta_strong=min(max(_get_float(env, "SHORT_DELTA_STRONG", 0.15), 0.06), 0.30),
+        short_delta_flat=min(max(_get_float(env, "SHORT_DELTA_FLAT", 0.32), 0.08), 0.35),
+        short_delta_trend=min(max(_get_float(env, "SHORT_DELTA_TREND", 0.30), 0.07), 0.32),
+        short_delta_strong=min(max(_get_float(env, "SHORT_DELTA_STRONG", 0.28), 0.06), 0.30),
         em_band_lo=min(max(_get_float(env, "EM_BAND_LO", 0.80), 0.40), 1.20),
         em_band_hi=min(max(_get_float(env, "EM_BAND_HI", 1.35), 0.90), 2.50),
+        prox_gap_frac_dte0=min(max(_get_float(env, "PROX_GAP_FRAC_DTE0", 0.70), 0.50), 0.95),
         max_friction_frac_of_credit=min(max(_get_float(env, "MAX_FRICTION_FRAC_OF_CREDIT", 0.28), 0.05), 0.60),
         max_brokerage_frac_of_credit=min(max(_get_float(env, "MAX_BROKERAGE_FRAC_OF_CREDIT", 0.15), 0.02), 0.40),
         min_target_over_friction=min(max(_get_float(env, "MIN_TARGET_OVER_FRICTION", 1.25), 1.00), 3.00),
+        # v3.3: DTE-0 credit/risk ladder + VIX reference for scaling
+        credit_risk_ratio_dte0_early=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_EARLY", 0.16), 0.05), 0.40),
+        credit_risk_ratio_dte0_mid=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_MID", 0.13), 0.05), 0.40),
+        credit_risk_ratio_dte0_late=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_LATE", 0.10), 0.04), 0.40),
+        credit_ratio_vix_ref=min(max(_get_float(env, "CREDIT_RATIO_VIX_REF", 13.5), 10.0), 20.0),
+        # v3.3: EV-gate honesty bounds and minimum edge
+        iv_sigma_cap_ratio=min(max(_get_float(env, "IV_SIGMA_CAP_RATIO", 1.15), 1.00), 2.00),
+        atm_iv_vix_cap=min(max(_get_float(env, "ATM_IV_VIX_CAP", 1.35), 1.00), 2.50),
+        min_ev_frac_of_credit=min(max(_get_float(env, "MIN_EV_FRAC_OF_CREDIT", 0.03), 0.01), 0.20),
+        min_ev_frac_of_friction=min(max(_get_float(env, "MIN_EV_FRAC_OF_FRICTION", 0.35), 0.20), 1.00),
+        ev_blend_model_w=min(max(_get_float(env, "EV_BLEND_MODEL_W", 0.40), 0.05), 0.90),
+        ev_blend_prior_w=min(max(_get_float(env, "EV_BLEND_PRIOR_W", 0.30), 0.05), 0.90),
+        ev_blend_market_w=min(max(_get_float(env, "EV_BLEND_MARKET_W", 0.30), 0.00), 0.90),
+        ev_strong_sell_prior_bonus=min(max(_get_float(env, "EV_STRONG_SELL_PRIOR_BONUS", 0.05), 0.0), 0.08),
+        ev_regime_align_bonus=min(max(_get_float(env, "EV_REGIME_ALIGN_BONUS", 0.05), 0.0), 0.08),
         min_lots_fraction=min(max(_get_float(env, "MIN_LOTS_FRACTION", 0.60), 0.10), 1.00),
         wing_cost_frac_max=min(max(_get_float(env, "WING_COST_FRAC_MAX", 0.50), 0.10), 0.70),
         condor_weak_side_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),
