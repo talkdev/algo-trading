@@ -163,284 +163,24 @@ API_ENDPOINTS = {
 # ENV TEMPLATE
 # ─────────────────────────────────────────────
 
-ENV_TEMPLATE = """\
-# NIFTY Intraday Options Engine v3.0 — Configuration
-# Fill in all values before running. Never commit this file to version control.
+ENV_TEMPLATE = """# ─────────────────────────────────────────────
+# NIFTY Algo Trading Engine v4.1 — env.txt
+# ─────────────────────────────────────────────
+# This file holds ONE thing: today's Upstox access token. Nothing else.
+#
+# v4.1 moved every engine tunable (windows, costs, thresholds, exits,
+# calibration, sizing) INTO the code — see the documented defaults in
+# `load_config()` in core.py. Those defaults reproduce the previously
+# shipped env.txt values exactly, so behaviour is unchanged.
+#
+# Extra/unknown keys in this file are ignored by the engine. Your API
+# key / secret / redirect URI are NOT needed here either: they are only
+# used on the Upstox login page when you generate the token below.
+#
+# Daily ritual: paste today's token after UPSTOX_ACCESS_TOKEN= and run.
+# ─────────────────────────────────────────────
 
-# ── Upstox API Credentials ──────────────────────────────────────────────────
-UPSTOX_API_KEY=
-UPSTOX_API_SECRET=
-UPSTOX_REDIRECT_URI=
 UPSTOX_ACCESS_TOKEN=
-
-# ── Trading Mode ─────────────────────────────────────────────────────────────
-PAPER_TRADE_MODE=true
-LIVE_RATES_VERIFIED=false
-
-# ── Capital & Risk ────────────────────────────────────────────────────────────
-STARTING_CAPITAL=1000000
-MAX_DAILY_LOSS_PCT=0.02
-MAX_RISK_PER_TRADE_PCT=0.006
-
-# ── NIFTY Contract Spec ───────────────────────────────────────────────────────
-# NSE revised the NIFTY 50 market lot from 75 to 65 for the January 2026
-# cycle (first weekly expiry 06-Jan-2026, first monthly 27-Jan-2026).
-NIFTY_LOT_SIZE=65
-NIFTY_STRIKE_STEP=50
-
-# ── Transaction Costs ─────────────────────────────────────────────────────────
-# STT on the SALE of an option is 0.10% of the premium (statutory,
-# w.e.f. 01-Oct-2024). v3.1 carried 0.15%, overstating the single
-# largest variable cost of a premium-selling book by 50% and
-# rejecting structurally sound trades on cost grounds.
-STT_OPTIONS_SELL=0.001
-# STT on EXERCISE is 0.125% of intrinsic value, payable by the buyer.
-STT_OPTIONS_EXERCISE=0.00125
-BROKERAGE_PER_ORDER=20.0
-# NSE options: Rs 3,503 per crore of premium + Rs 50/cr IPFT = 0.03553%.
-EXCHANGE_TXN_RATE=0.0003553
-SEBI_RATE=0.000001
-STAMP_DUTY_BUY_OPTIONS=0.00003
-
-# ── v3.1 Profitability Calibration ────────────────────────────────────────────
-# Opening range classified as a fraction of spot (scale-invariant) and against
-# the opening ATM straddle. The more conservative of the two wins.
-OR_PCT_VERY_NARROW=0.0020
-OR_PCT_NARROW=0.0036
-OR_PCT_MODERATE=0.0055
-OR_PCT_WIDE=0.0078
-OR_STRADDLE_VERY_NARROW=0.24
-OR_STRADDLE_NARROW=0.42
-OR_STRADDLE_MODERATE=0.62
-OR_STRADDLE_WIDE=0.86
-# Structural distances as a fraction of spot.
-SPOT_PROXIMITY_PCT=0.0016
-SPOT_VELOCITY_PCT=0.0014
-# Fraction of the structural (wing) loss a working stop is assumed to avoid.
-# 0.0 sizes on the full wing loss; hard-capped at 0.80 in code.
-STOP_EFFICACY=0.55
-# Probability the stop is jumped and the structure prints toward the wing.
-GAMMA_TAIL_PROB_DTE0=0.055
-GAMMA_TAIL_PROB_DTE1P=0.025
-# Slippage in multiples of the half-spread, per leg.
-ENTRY_SLIPPAGE_MULT=0.35
-EXIT_SLIPPAGE_MULT=2.25
-# Rupee tolerance added to the relative bid/ask gate (cheap wings).
-SPREAD_ABS_TOLERANCE=0.85
-MAX_DTE_TRADEABLE=4
-
-# ── Trading Windows ───────────────────────────────────────────────────────────
-TRADING_WINDOW_START=09:45
-TRADING_WINDOW_LAST_ENTRY=14:00
-HARD_EXIT_TIME=15:00
-TUESDAY_HARD_EXIT=15:00
-TUESDAY_LAST_ENTRY=12:30
-
-# ── Position Limits ───────────────────────────────────────────────────────────
-MAX_CONCURRENT_POSITIONS=1
-MAX_ENTRIES_PER_DAY=3
-
-# ── Paths ─────────────────────────────────────────────────────────────────────
-DB_PATH=data/nifty_algo_v3.db
-LOG_DIR=logs
-LOG_LEVEL=INFO
-
-# ── API Settings ──────────────────────────────────────────────────────────────
-REQUEST_TIMEOUT_SECONDS=10
-MAX_RETRIES=3
-
-# ── Technical Analysis ────────────────────────────────────────────────────────
-ADX_PERIOD=14
-ADX_TREND_THRESHOLD=20.0
-ADX_STRONG_THRESHOLD=28.0
-EMA_FAST=9
-EMA_SLOW=21
-MTF_RESAMPLE_15=900s
-MTF_RESAMPLE_60=3600s
-MIN_BARS_FOR_ADX=20
-MIN_BARS_FOR_EMA_SLOW=25
-
-# ── VIX Regime Thresholds ─────────────────────────────────────────────────────
-VIX_SUPPRESSED=12.5
-VIX_LOW=16.0
-VIX_NORMAL=22.0
-VIX_ELEVATED=28.0
-
-# ── ABORT Triggers ────────────────────────────────────────────────────────────
-ABORT_VIX_SPIKE_PCT=15.0
-ABORT_VIX_ABSOLUTE=24.0
-VIX_FAIL_LIMIT=5
-
-# ── VRP Thresholds (overridden by calibration) ────────────────────────────────
-VRP_SELL_THRESHOLD=2.0
-VRP_FAIR_THRESHOLD=1.0
-VRP_SMOOTHING_CYCLES=5
-
-# ── Regime Settings ───────────────────────────────────────────────────────────
-REGIME_CALC_INTERVAL_SEC=15
-REGIME_PERSISTENCE_CYCLES=3
-# v3.2: day_move_used_pct is now the realised range as a percentage of
-# the range the market PRICED for the elapsed part of the session
-# (opening straddle x sqrt(elapsed fraction)). 100 = exactly on plan.
-DAY_MOVE_USED_BLOCK_PCT=125.0
-
-# ── OI / Positioning Thresholds (overridden by calibration) ──────────────────
-OI_CHANGE_LOOKBACK_MIN=30
-OI_BUILDUP_THRESHOLD=0.08
-OI_UNWIND_THRESHOLD=-0.08
-OI_WALL_STRONG=2.5
-OI_WALL_MODERATE=1.7
-PCR_BULLISH_THRESHOLD=0.72
-PCR_BEARISH_THRESHOLD=1.28
-SKEW_BEARISH_THRESHOLD=3.0
-SKEW_BULLISH_THRESHOLD=0.95
-
-# ── Exit Rules ────────────────────────────────────────────────────────────────
-DELTA_CLOSE_THRESHOLD=0.28
-SPOT_PROXIMITY_PTS=40
-PRICE_STOP_STRADDLE_MULT=0.42
-PROFIT_LOCK_PCT_DTE0=0.40
-PROFIT_LOCK_PCT_DTE1PLUS=0.25
-CHEAP_BUYBACK_PTS=5.0
-CHEAP_BUYBACK_AFTER_TIME=13:00
-
-# ── Calibration ───────────────────────────────────────────────────────────────
-MIN_TRADING_DAYS_FOR_CALIBRATION=5
-CALIBRATION_INTERVAL_SEC=3600
-SPOT_BAR_INTERVAL_SEC=60
-HV_LOOKBACK_DAYS=20
-
-# ── Event / Special Day Settings ─────────────────────────────────────────────
-EVENT_SIZE_MULTIPLIER=0.25
-DEFINED_RISK_ONLY_ON_EVENT=true
-TUESDAY_EARLY_EXIT_ENABLED=true
-
-# ── Straddle Settings ─────────────────────────────────────────────────────────
-STRADDLE_EXPLOSION_PCT=18.0
-STRADDLE_ROC_WINDOW_MIN=15
-STRADDLE_ROC_ALERT_PCT=12.0
-
-# ── Phantom Trade Tracking ────────────────────────────────────────────────────
-PHANTOM_TRADE_TRACKING=true
-
-# ── v3.2 Profitability Calibration ────────────────────────────────────────────
-# Premium stop as a multiple of the NET credit received, by DTE. v3.1 used a
-# flat 2.5 (loss = 1.5x credit) against a 35% target, i.e. an 81% break-even
-# win rate. These values put break-even in the 57-65% band, which a 0.15-0.22
-# delta NIFTY short structure genuinely achieves.
-# v3.3: raised from 1.40. The 1.4x stop on a DTE-0 vertical converts a
-# ~25-point NIFTY counter-rally into a stop-out: at delta 0.22-0.36 the
-# short leg gains 0.3-0.5x the move, so 0.4 x credit (~4 points on a 10
-# point credit) IS a 25 point move. Replay of 2026-09-08 (a real VIX-11
-# expiry downtrend) showed the position's max adverse premium move of
-# +27% in 37 minutes with the trend then resuming lower - the 1.4x line
-# was inside intraday noise. 1.6x keeps the loss at ~0.6x credit while
-# giving a normal pullback room; the structural wing and the delta /
-# proximity backstops remain the hard lines.
-STOP_MULT_DTE0=1.60
-STOP_MULT_DTE1=1.55
-STOP_MULT_DTE2P=1.70
-# Profit target as a fraction of the net credit, by DTE. Read together with
-# the stop multiples above: 0.50 against 1.40 is reward/risk 1.25 and a
-# break-even win rate near 55%, versus 81% under v3.1.
-TARGET_PCT_DTE0=0.70
-TARGET_PCT_DTE1=0.45
-TARGET_PCT_DTE2P=0.40
-# Short-leg delta at which a leg is closed. v3.1 used one flat 0.28 for every
-# DTE, which is barely above the delta the engine sells at.
-# v3.3: raised from 0.35 to 0.45. The engine now sells 0.22-0.36 delta on
-# expiry afternoon; a close line 0.13 above the entry delta fired on
-# ordinary drift at exactly the time delta moves fastest. 0.45 is the
-# "structure decisively wrong" line desks use on 0DTE verticals, and it
-# no longer sits on top of the sell window.
-DELTA_CLOSE_DTE0=0.45
-DELTA_CLOSE_DTE1P=0.30
-# Spot backstop: how far INSIDE the short strike the spot stop sits, as a
-# fraction of the wing, floored in points and capped as a fraction of the
-# short-strike distance. Replaces 0.42 x opening straddle.
-PRICE_STOP_WING_FRAC=0.30
-PRICE_STOP_MIN_PTS=25
-PRICE_STOP_MAX_FRAC_OF_DIST=0.40
-# v3.3: proximity-to-short defense as a FRACTION of the entry gap to the
-# short strike. The absolute 40pt band is larger than the whole gap for
-# the delta 0.3-0.4 shorts a VIX-11 expiry offers (~45pts), so the trade
-# would be closed at entry+5pts by its own safety. Executing the exit at
-# 70% of the gap travelled scales the defense with the structure and the
-# vol environment automatically.
-PROX_GAP_FRAC_DTE0=0.70
-# Delta-primary strike selection. Target short delta by trend strength.
-# v3.3: raised from 0.22/0.18/0.15. On a 50-point strike grid with VIX 11,
-# 0.18-0.22 targets land ~100-150 points OTM where the entire 0DTE credit
-# is 5-10 points - unpayable against ~1.3 points of round-trip friction
-# per lot (measured 2026-09-08: delta 0.224 short -> credit 10.2, ratio
-# 0.108, structurally rejected all day). Professional 0DTE sellers work
-# the 0.25-0.40 delta band after midday; 0.32/0.30/0.28 puts the engine
-# there without selling the money.
-SHORT_DELTA_FLAT=0.32
-SHORT_DELTA_TREND=0.30
-SHORT_DELTA_STRONG=0.28
-# Sanity band for the short strike, as a multiple of the expected REMAINING
-# move (opening straddle scaled by sqrt of the session fraction left).
-EM_BAND_LO=0.80
-EM_BAND_HI=1.35
-# Round-trip friction must not exceed this fraction of the net credit, and
-# brokerage alone must not exceed this fraction of it.
-MAX_FRICTION_FRAC_OF_CREDIT=0.28
-MAX_BROKERAGE_FRAC_OF_CREDIT=0.15
-# The profit target must clear the whole round trip by this factor.
-MIN_TARGET_OVER_FRICTION=1.25
-# Below this many lots the trade is skipped rather than rounded up to one lot.
-MIN_LOTS_FRACTION=0.60
-# A long wing costing more than this fraction of the short it protects hands
-# back too much of the premium to be worth buying at that strike.
-WING_COST_FRAC_MAX=0.50
-# An iron condor whose weaker side contributes less than this fraction of the
-# gross credit is paying two extra legs of friction for nothing.
-CONDOR_WEAK_SIDE_MIN_FRAC=0.30
-# -- v3.3 Profitability Calibration (2026 VIX-11 regime) ---------------------
-# DTE-0 credit/risk ladder, VIX-scaled. These are the FRACTIONS of
-# (wing - credit) the net credit must reach, by minutes remaining. The
-# absolute v3.2 ladder was calibrated against the premium a VIX 13.5
-# session pays; at VIX 11 the market pays ~0.8x of that, so every
-# requirement is now scaled by clamp(vix / CREDIT_RATIO_VIX_REF ...).
-CREDIT_RISK_RATIO_DTE0_EARLY=0.16
-CREDIT_RISK_RATIO_DTE0_MID=0.13
-CREDIT_RISK_RATIO_DTE0_LATE=0.10
-CREDIT_RATIO_VIX_REF=13.5
-# The EV gate's barrier model may not trust the vendor-stamped 0DTE IV
-# (measured on 2026-09-08: 21.6% stamped vs 10.2% implied by the ATM
-# straddle price itself vs India VIX 11.1). When the straddle publishes a
-# smaller sigma, the IV-derived estimate is capped at this multiple of it.
-IV_SIGMA_CAP_RATIO=1.15
-# Maximum cap on the ATM IV used for sigma, as a multiple of the day's
-# India VIX. If the stamp is more than this above the cash VIX it is
-# treated as a sqrt(T) artefact, not information.
-ATM_IV_VIX_CAP=1.35
-# Minimum edge the EV gate may accept, as a fraction of net credit and of
-# round-trip friction. v3.2 used max(3% credit, 35% friction, 0.75pts);
-# the hard 0.75 point floor is ~8% of an entire VIX-11 expiry credit and
-# rejected structures whose whole expectancy was sound but small.
-MIN_EV_FRAC_OF_CREDIT=0.03
-MIN_EV_FRAC_OF_FRICTION=0.35
-# EV p_win blend weights: the lognormal touch model, the OR-conditional
-# empirical prior, and the market-implied (1 - short delta) probability.
-# v3.2 blended model:prior 50/50, which lets a poisoned sigma floor the
-# verdict. The chain's own delta is an independent, market-quoted vote.
-EV_BLEND_MODEL_W=0.40
-EV_BLEND_PRIOR_W=0.30
-EV_BLEND_MARKET_W=0.30
-# STRONG_SELL_PREMIUM adds to the empirical prior (the vol stack's own
-# consensus that the chain is paying above realised risk), and a sold
-# structure whose threat side sits against the confirmed trend direction
-# earns a small bounded alignment bonus.
-EV_STRONG_SELL_PRIOR_BONUS=0.05
-EV_REGIME_ALIGN_BONUS=0.05
-# Fast intraday trend timeframe. 15-minute ADX cannot mature inside a NIFTY
-# session (it needs 2*period+1 = 29 bars; the session has 25).
-ADX_FAST_RESAMPLE=300s
-
-# ── Misc ──────────────────────────────────────────────────────────────────────
-GIFT_NIFTY_INSTRUMENT_KEY=
 """
 
 
@@ -1010,6 +750,12 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
     """
     Load Config from env.txt (file values override OS environment).
     Applies safety checks and clamps dangerous values.
+
+    v4.1: every default below is the authoritative engine tuning — it
+    reproduces the previously shipped env.txt values exactly, so a
+    token-only env.txt behaves identically to the old full file. Any key
+    still present in env.txt (or OS env) overrides its default, so
+    deliberate tuning keeps working; unknown keys are ignored.
     """
     ensure_env_file(env_file)
     file_env = load_env_file(env_file)
