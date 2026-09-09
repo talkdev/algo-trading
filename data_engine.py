@@ -3428,7 +3428,16 @@ def _self_test() -> None:
     from core import load_config, Database, RateLimiter, UpstoxClient, setup_logging
 
     config       = load_config()
-    db           = Database(config.db_path)
+    # v3.8: isolate this self-test from the live production
+    # database. run_cycle persists session_state, cycle_log,
+    # options_chain, market_snapshots and vix_history when the
+    # live-API branch fires; a self-test must never write to the
+    # production book. config is left untouched; only the scratch
+    # Database is handed in.
+    from pathlib import Path as _scratch_path
+    db = Database(_scratch_path(_tf5.mkdtemp(
+        prefix="data_selftest_")) / "data_selftest.db")
+
     logger       = setup_logging(db, config.log_dir)
     rate_limiter = RateLimiter(config.rate_limits)
     client       = UpstoxClient(config, rate_limiter, db, logger)
@@ -3633,7 +3642,7 @@ def _self_test() -> None:
 
     db.close()
     print_section("DATA ENGINE SELF-TEST COMPLETE", char="#")
-    print(f"  Database: {config.db_path}")
+    print(f"  Database: {db.db_path}")
     print()
 
 

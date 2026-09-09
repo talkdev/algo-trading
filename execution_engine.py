@@ -1952,7 +1952,21 @@ def _self_test() -> None:
     from core import load_config, Database, RateLimiter, UpstoxClient, setup_logging
 
     config        = load_config()
-    db            = Database(config.db_path)
+    # v3.8: isolate this self-test from the live production
+    # database. The State Update Tests below drive
+    # _update_state_after_close through a win then two stops, and
+    # that method PERSISTS daily_pnl, consecutive_stops and
+    # daily_halted into session_state; its "reset" block at the
+    # end only clears the in-memory dict. Pointing those writes at
+    # config.db_path left the live book with a fabricated halt
+    # (daily_halted=1, consecutive_stops=2, daily_pnl=-1000,
+    # last_stop_reason=CLOSE_STOP) and zero matching trades. A
+    # test must never write to production. config is left as it
+    # is; only the scratch Database is handed in.
+    from pathlib import Path as _scratch_path
+    db = Database(_scratch_path(_tf3.mkdtemp(
+        prefix="exec_selftest_")) / "exec_selftest.db")
+
     logger        = setup_logging(db, config.log_dir)
     rate_limiter  = RateLimiter(config.rate_limits)
     client        = UpstoxClient(config, rate_limiter, db, logger)
@@ -2415,7 +2429,7 @@ def _self_test() -> None:
     db.close()
     print_section("EXECUTION ENGINE SELF-TEST COMPLETE", char="#")
     print("  All tests passed")
-    print(f"  Database: {config.db_path}")
+    print(f"  Database: {db.db_path}")
     print()
 
 

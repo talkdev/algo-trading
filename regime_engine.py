@@ -2798,7 +2798,14 @@ def _self_test() -> None:
     from core import load_config, Database, RateLimiter, UpstoxClient, setup_logging
 
     config       = load_config()
-    db           = Database(config.db_path)
+    # v3.8: isolate this self-test from the live production
+    # database. CalibrationEngine.run() persists calibration_state;
+    # a self-test must never write to the production book. config
+    # is left untouched; only the scratch Database is handed in.
+    from pathlib import Path as _scratch_path
+    db = Database(_scratch_path(_tf4.mkdtemp(
+        prefix="regime_selftest_")) / "regime_selftest.db")
+
     logger       = setup_logging(db, config.log_dir)
     rate_limiter = RateLimiter(config.rate_limits)
     client       = UpstoxClient(config, rate_limiter, db, logger)
@@ -3347,7 +3354,7 @@ def _self_test() -> None:
     db.close()
     print_section("REGIME ENGINE SELF-TEST COMPLETE", char="#")
     print(f"  All unit tests passed")
-    print(f"  Database: {config.db_path}")
+    print(f"  Database: {db.db_path}")
     print()
 
 
