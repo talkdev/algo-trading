@@ -725,6 +725,48 @@ class Config:
     # Structure economics.
     wing_cost_frac_max:        float = 0.50
     condor_weak_side_min_frac: float = 0.30
+    # ── v4.2: fresh-weekly (DTE >= 2) intraday premium selling ──────────
+    # A weekly option with 3-4 sessions left carries overnight gap vega,
+    # so the professional short-delta is ~16-20, NOT the 0.30 an 0DTE
+    # short uses. Measured 2026-09-09/10 (DTE4/DTE3): the intraday-EM
+    # strike clamp was forcing the condor shorts to 0.31-0.42 delta on
+    # those days, which (a) made the long wing 55-80% of the short and
+    # tripped wing_cost_frac_max on every candidate and (b) put the
+    # threat line ~100 points out on a day that only moved 100. The
+    # wide ~0.18-delta condor cleared its round trip on every tested
+    # entry of both sessions, including the CPI two-way chop.
+    short_delta_flat_weekly:   float = 0.24
+    short_delta_trend_weekly:  float = 0.22
+    short_delta_strong_weekly: float = 0.18
+    em_band_lo_weekly:         float = 0.55
+    em_band_hi_weekly:         float = 2.10
+    # Weekly CONDOR shorts are sanity-banded in the weekly chain's own
+    # ATM straddle (expiry horizon), not the shrinking intraday EM.
+    em_band_hi_condor_weekly:  float = 1.35
+    # Weekly wings (multi-day vega) are inherently pricier relative to
+    # their shorts than 0DTE wings; 0.50 was calibrated for expiry day.
+    wing_cost_frac_max_weekly: float = 0.58
+    # On DTE3/4 RANGE sessions with ADX in [trend, strong) the price
+    # classifier still says RANGE (mean-reverting, not trending); allow
+    # a WIDE condor (shorts forced to the strong-delta target below) up
+    # to the strong-ADX cutoff, at a size discount.
+    range_adx_wide_max:        float = 28.0
+    range_adx_wide_size:       float = 0.80
+    # UNCLEAR OI positioning on an otherwise textbook range day
+    # (rich VRP, narrow OR, flat ADX, price = RANGE) previously banned
+    # the symmetric condor outright on DTE3/4. OI positioning is a
+    # confirmation, not a prerequisite, for a delta-neutral structure;
+    # trade it at this size discount.
+    unclear_range_size_weekly: float = 0.75
+    # EV-gate adverse-excursion calibration for fresh weeklies: the
+    # greeks-carry "stop severity" assumed an instantaneous move at
+    # entry delta with a 1.25 stress factor and ZERO theta credit. The
+    # real exit ladder (spot proximity ~40pts inside the short)
+    # realised 4-8pt losses on 28-60pt credits across the 08-10 Sep
+    # replays, i.e. ~2.5-3x less than the 18-35pt the model charged.
+    # Apply this discount to the carry on DTE >= 2 (theta over the
+    # intended multi-hour hold). 0DTE keeps the old conservative value.
+    ev_carry_discount_dte2p:   float = 0.62
     # Fast intraday trend timeframe (15m ADX cannot mature intraday).
     adx_fast_resample:         str   = "300s"
 
@@ -996,6 +1038,18 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         min_lots_fraction=min(max(_get_float(env, "MIN_LOTS_FRACTION", 0.60), 0.10), 1.00),
         wing_cost_frac_max=min(max(_get_float(env, "WING_COST_FRAC_MAX", 0.50), 0.10), 0.70),
         condor_weak_side_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),
+        # v4.2 fresh-weekly (DTE >= 2) intraday premium selling
+        short_delta_flat_weekly=min(max(_get_float(env, "SHORT_DELTA_FLAT_WEEKLY", 0.24), 0.08), 0.35),
+        short_delta_trend_weekly=min(max(_get_float(env, "SHORT_DELTA_TREND_WEEKLY", 0.22), 0.07), 0.30),
+        short_delta_strong_weekly=min(max(_get_float(env, "SHORT_DELTA_STRONG_WEEKLY", 0.18), 0.06), 0.25),
+        em_band_lo_weekly=min(max(_get_float(env, "EM_BAND_LO_WEEKLY", 0.55), 0.30), 1.20),
+        em_band_hi_weekly=min(max(_get_float(env, "EM_BAND_HI_WEEKLY", 2.10), 1.20), 3.00),
+        em_band_hi_condor_weekly=min(max(_get_float(env, "EM_BAND_HI_CONDOR_WEEKLY", 1.35), 0.80), 2.00),
+        wing_cost_frac_max_weekly=min(max(_get_float(env, "WING_COST_FRAC_MAX_WEEKLY", 0.58), 0.30), 0.80),
+        range_adx_wide_max=min(max(_get_float(env, "RANGE_ADX_WIDE_MAX", 28.0), 20.0), 40.0),
+        range_adx_wide_size=min(max(_get_float(env, "RANGE_ADX_WIDE_SIZE", 0.80), 0.40), 1.00),
+        unclear_range_size_weekly=min(max(_get_float(env, "UNCLEAR_RANGE_SIZE_WEEKLY", 0.75), 0.40), 1.00),
+        ev_carry_discount_dte2p=min(max(_get_float(env, "EV_CARRY_DISCOUNT_DTE2P", 0.62), 0.40), 1.00),
         adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "300s",
     )
 

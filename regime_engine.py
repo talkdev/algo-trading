@@ -1801,29 +1801,73 @@ class RegimeClassifier:
             # override), exactly as DTE 0/1 already does: the directional
             # read IS the confirmation, so the condor-specific containment
             # gates do not apply to a single exposed side.
-            if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):
+            if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE,
+                       PositioningRegime.UNCLEAR):
                 if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):
                     return (
                         FinalRegime.NO_TRADE,
                         f"RANGE_DTE{dte}_OR_{or_condition}_TOO_WIDE",
                     )
-                if adx_15 >= self.config.adx_trend_threshold:
+                # v4.2: the symmetric condor is delta-neutral by
+                # construction, so the rich-VRP / price=RANGE / narrow-OR
+                # stack is the edge and OI positioning is only a
+                # confirmation. UNCLEAR positioning previously banned it
+                # outright on DTE3/4 (measured 2026-09-10: STRONG_SELL,
+                # ADX 10-13, HIGH confidence, spot pinned all afternoon,
+                # yet no trade after 12:51).
+                if (pos == PositioningRegime.UNCLEAR and
+                        vol not in (VolatilityRegime.SELL_PREMIUM,
+                                    VolatilityRegime.STRONG_SELL_PREMIUM)):
                     return (
                         FinalRegime.NO_TRADE,
-                        f"RANGE_DTE{dte}_ADX_{adx_15:.0f}_TRENDING",
+                        "RANGE_DTE" + str(dte)
+                        + "_UNCLEAR_REQUIRES_SELL_PREMIUM",
                     )
                 if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
                     return (
                         FinalRegime.NO_TRADE,
                         f"RANGE_DTE{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
                     )
+                # v4.2: ADX is non-directional and lagging. The hard veto at
+                # the 20 trend threshold fired on mean-reverting RANGE tapes
+                # (measured 2026-09-09 13:10-14:10, CPI day: price=RANGE,
+                # ADX 21-24 inherited from the morning whipsaw; spot topped
+                # and faded 136 points into the close). Only a genuine
+                # STRONG reading blocks the symmetric condor; readings in
+                # between force the wide ~0.15-delta condor at a size
+                # discount.
+                _adx_wide = (
+                    float(self.config.adx_trend_threshold) <= adx_15
+                    < float(getattr(self.config, "range_adx_wide_max", 28.0))
+                )
+                if adx_15 >= float(getattr(self.config, "range_adx_wide_max", 28.0)):
+                    return (
+                        FinalRegime.NO_TRADE,
+                        f"RANGE_DTE{dte}_ADX_{adx_15:.0f}_STRONG_TREND",
+                    )
+                if _adx_wide:
+                    signals["weekly_wide_condor"] = True
+                    signals["weekly_range_size_discount"] = float(
+                        getattr(self.config, "range_adx_wide_size", 0.80)
+                    )
+                    return (
+                        FinalRegime.PREMIUM_SELL_RANGE,
+                        f"RANGE_DTE{dte}_WIDE_CONDOR_ADX_{adx_15:.0f}",
+                    )
+                if pos == PositioningRegime.UNCLEAR:
+                    signals["weekly_range_size_discount"] = float(
+                        getattr(self.config, "unclear_range_size_weekly", 0.75)
+                    )
+                    return (
+                        FinalRegime.PREMIUM_SELL_RANGE,
+                        f"RANGE_DTE{dte}_UNCLEAR_RICH_VRP_CONDOR",
+                    )
                 return (
                     FinalRegime.PREMIUM_SELL_RANGE,
                     f"RANGE_DTE{dte}_NEW_CYCLE_STRONG_SELL_CONTAINED_OR",
                 )
-            # BULLISH / BEARISH / UNCLEAR fall through to the matching
-            # branches below (UNCLEAR still NO_TRADEs there unless it is a
-            # STRONG_SELL 0/1 DTE session).
+            # BULLISH / BEARISH fall through to the matching branches
+            # below; UNCLEAR is handled above.
 
         # ── Wide OR blocks condor ─────────────────────────────────────────
         if or_condition in ("WIDE", "VERY_WIDE") and pos not in (
