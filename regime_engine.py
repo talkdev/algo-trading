@@ -1661,7 +1661,21 @@ class RegimeClassifier:
             return FinalRegime.NO_TRADE, "NO_TRADE:CHOPPY_MARKET", False
 
         # ── Hard Block 3: Volatility blocks ───────────────────────────────
-        if vol in (VolatilityRegime.NEUTRAL, VolatilityRegime.BUY_OPTIONS):
+        # Rich variance premium is the prerequisite ONLY for delta-neutral
+        # premium selling (condor / iron fly): a condor harvests the vol
+        # risk premium itself, so without rich vol it has no edge to clear
+        # its round-trip costs. A DIRECTIONAL vertical (bear call in a
+        # downtrend, bull put in an uptrend, or the single-sided vertical a
+        # bullish/bearish positioning read selects on a range day) is a
+        # different trade: its edge is the drift plus theta on the side the
+        # market is moving away from, and it needs trend/positioning
+        # confirmation — not rich vol. NEUTRAL vol therefore no longer
+        # blanket-blocks the decision; the delta-neutral structures are
+        # re-gated by vol inside _classify_range. BUY_OPTIONS still blocks
+        # all selling (realised vol already exceeds implied — selling into
+        # it is paying the market to be right, and the debit side this
+        # engine does not trade).
+        if vol == VolatilityRegime.BUY_OPTIONS:
             return FinalRegime.NO_TRADE, f"NO_TRADE:VOL_{vol.value}", False
 
         # ── Hard Block 4: Confidence block ────────────────────────────────
@@ -1681,26 +1695,10 @@ class RegimeClassifier:
             return FinalRegime.NO_TRADE, f"NO_TRADE:DTE_{dte}_ABOVE_MAX_6", False
 
         if dte is not None and dte >= 4:
-            if vol not in (VolatilityRegime.STRONG_SELL_PREMIUM,
-                           VolatilityRegime.SELL_PREMIUM):
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"NO_TRADE:DTE_{dte}_REQUIRES_SELL_PREMIUM",
-                    False,
-                )
             if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
                 return (
                     FinalRegime.NO_TRADE,
                     f"NO_TRADE:DTE_{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
-                    False,
-                )
-
-        if dte is not None and dte in (2, 3):
-            if vol not in (VolatilityRegime.STRONG_SELL_PREMIUM,
-                           VolatilityRegime.SELL_PREMIUM):
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"NO_TRADE:DTE_{dte}_REQUIRES_SELL_PREMIUM",
                     False,
                 )
 
@@ -1791,35 +1789,41 @@ class RegimeClassifier:
         # higher than for DTE 0/1: rich VRP, genuine range positioning, a
         # contained opening range and a flat trend reading are ALL required.
         if dte in (3, 4):
-            if vol != VolatilityRegime.STRONG_SELL_PREMIUM:
+            if vol == VolatilityRegime.BUY_OPTIONS:
                 return (
                     FinalRegime.NO_TRADE,
-                    f"RANGE_DTE{dte}_REQUIRES_STRONG_SELL_PREMIUM",
+                    f"RANGE_DTE{dte}_REQUIRES_NO_BUY_OPTIONS",
                 )
-            if pos not in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):
+            # Range positioning → condor (both wings), which on a fresh
+            # weekly needs a contained opening range and a flat trend.
+            # BULLISH/BEARISH positioning → fall through to the single-sided
+            # vertical below (bull put / bear call with the OR-midpoint
+            # override), exactly as DTE 0/1 already does: the directional
+            # read IS the confirmation, so the condor-specific containment
+            # gates do not apply to a single exposed side.
+            if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):
+                if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):
+                    return (
+                        FinalRegime.NO_TRADE,
+                        f"RANGE_DTE{dte}_OR_{or_condition}_TOO_WIDE",
+                    )
+                if adx_15 >= self.config.adx_trend_threshold:
+                    return (
+                        FinalRegime.NO_TRADE,
+                        f"RANGE_DTE{dte}_ADX_{adx_15:.0f}_TRENDING",
+                    )
+                if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
+                    return (
+                        FinalRegime.NO_TRADE,
+                        f"RANGE_DTE{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
+                    )
                 return (
-                    FinalRegime.NO_TRADE,
-                    f"RANGE_DTE{dte}_REQUIRES_RANGE_POSITIONING",
+                    FinalRegime.PREMIUM_SELL_RANGE,
+                    f"RANGE_DTE{dte}_NEW_CYCLE_STRONG_SELL_CONTAINED_OR",
                 )
-            if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"RANGE_DTE{dte}_OR_{or_condition}_TOO_WIDE",
-                )
-            if adx_15 >= self.config.adx_trend_threshold:
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"RANGE_DTE{dte}_ADX_{adx_15:.0f}_TRENDING",
-                )
-            if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"RANGE_DTE{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
-                )
-            return (
-                FinalRegime.PREMIUM_SELL_RANGE,
-                f"RANGE_DTE{dte}_NEW_CYCLE_STRONG_SELL_CONTAINED_OR",
-            )
+            # BULLISH / BEARISH / UNCLEAR fall through to the matching
+            # branches below (UNCLEAR still NO_TRADEs there unless it is a
+            # STRONG_SELL 0/1 DTE session).
 
         # ── Wide OR blocks condor ─────────────────────────────────────────
         if or_condition in ("WIDE", "VERY_WIDE") and pos not in (
@@ -2061,16 +2065,24 @@ class RegimeClassifier:
         }.get(conf, 0.0)
 
         # ── dte_mult ──────────────────────────────────────────────────────
+        # v3.10: the swing-era DTE discount assumed a position held toward
+        # expiry, where a farther DTE really does carry more time risk. This
+        # book is flat by the 15:00 hard exit, so DTE 1-4 all share the same
+        # intraday holding window; discounting them (0.75/0.50/0.40/0.30)
+        # compounded with the day and opening-range modifiers to crush every
+        # non-Tuesday trade to a single lot — below the size at which fixed
+        # brokerage can be amortised. DTE 1-4 now size at full; the genuinely
+        # far-dated 5-6 stay discounted.
         if dte == 0:
             dte_mult = 1.0
         elif dte == 1:
-            dte_mult = 0.75
+            dte_mult = 1.0
         elif dte == 2:
-            dte_mult = 0.50
+            dte_mult = 1.0
         elif dte == 3:
-            dte_mult = 0.40
+            dte_mult = 1.0
         elif dte == 4:
-            dte_mult = 0.30
+            dte_mult = 1.0
         elif dte == 5:
             dte_mult = 0.25
         elif dte == 6:

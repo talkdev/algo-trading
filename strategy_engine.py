@@ -251,22 +251,12 @@ class StrategyEngine:
             return "NO_TRADE", f"confidence_{confidence}_insufficient_edge_after_costs"
 
         actual_dte = signals.get("actual_dte")
-        vol_regime = signals.get("vol_regime", "NEUTRAL")
         if actual_dte is not None and actual_dte > 6:
             return "NO_TRADE", f"dte_{actual_dte}_above_max_6_intraday_only"
         if actual_dte is not None and actual_dte >= 4:
-            if vol_regime not in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM"):
-                return "NO_TRADE", (
-                    f"dte_{actual_dte}_requires_sell_premium_not_{vol_regime}"
-                )
             if confidence not in ("HIGH", "MEDIUM"):
                 return "NO_TRADE", (
                     f"dte_{actual_dte}_requires_medium_high_confidence"
-                )
-        if actual_dte is not None and actual_dte in (2, 3):
-            if vol_regime not in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM"):
-                return "NO_TRADE", (
-                    f"dte_{actual_dte}_requires_sell_premium_not_{vol_regime}"
                 )
 
         day_move_used = float(signals.get("day_move_used_pct") or 0.0)
@@ -1938,7 +1928,16 @@ class StrategyEngine:
         # always cost a large share of the shorts - that is the structure,
         # not a defect in it. The fly is governed by its credit/wing ratio
         # instead, which is already checked above.
-        for _side in (() if strategy_name == IRON_BUTTERFLY else ("call", "put")):
+        # v3.10: the "wing costs > 50% of the short" check is a 4-leg condor
+        # concept — two wings each eating premium. A single-sided vertical's
+        # one long leg IS the risk definition, and its cost relative to the
+        # short is just the spread geometry; the credit/wing ratio below is
+        # the correct gate for it. Apply the wing-cost check to condors only.
+        for _side in (
+            ("call", "put")
+            if strategy_name == IRON_CONDOR
+            else ()
+        ):
             _s_prem = sum(
                 float(l.get("exec_price") or 0) for l in validated_legs
                 if l["action"] == "SELL" and l["option_type"] == _side
@@ -2252,6 +2251,41 @@ class StrategyEngine:
         # lot" override is gone - the minimum-economic-size gate above
         # already decided whether this trade is worth doing at all.
         final_lots = max(1, int(final_lots))
+
+        # ── v3.10 [G6] fixed-cost amortization floor ─────────────────
+        # Brokerage is charged PER ORDER, not per lot: a two-leg spread pays
+        # ~Rs 94 of fixed brokerage round trip (4 orders x Rs 20 x 1.18 GST)
+        # whether it trades one lot or three. Every structure this engine
+        # trades is DEFINED-RISK - the per-lot loss is capped by the wing, so
+        # raw_lots (the per-trade budget divided by the structural loss per
+        # lot) is already the risk-correct size. On a near-weekly structure
+        # (DTE 3/4) the per-lot gross capture is thin (~1-2 premium points of
+        # decay over the session), so a HIGH-confidence setup that the size
+        # schedule (day/OR discounts) shrinks to a single lot can lose money
+        # purely to the ticket: measured 2026-09-09 gross +1.06 pts vs Rs 109
+        # fixed costs = Rs -40 on a directionally-correct bear call. The EV
+        # gate above has already certified the per-lot edge; the only open
+        # question is scale, and the second lot doubles the edge at near-zero
+        # marginal cost while the loss stays capped. So: when a clear
+        # (HIGH-confidence, non-borderline) defined-risk setup would trade at
+        # one lot even though the risk budget supports 1.5+ full lots, trade
+        # round(raw_lots) lots instead - never above the day cap. Low/MEDIUM
+        # conviction and borderline-VRP reads are untouched: their size
+        # reduction is a conviction signal, not a calendar artifact.
+        if (
+            final_lots == 1
+            and raw_lots >= 1.5
+            and signals.get("confidence_level") == "HIGH"
+            and not bool(signals.get("borderline_sell", False))
+        ):
+            _floor_lots = min(int(round(raw_lots)), day_cap)
+            if _floor_lots >= 2:
+                self.logger.info(
+                    f"Fixed-cost floor: budget supports {raw_lots:.2f} "
+                    f"risk-correct lots but size schedule left 1 lot; "
+                    f"sizing to {_floor_lots} lots (day cap {day_cap})"
+                )
+                final_lots = _floor_lots
 
         # ── v3.2 [F3] re-validate the economics at the FINAL size ─────
         # The gates above were priced at the provisional lot count. If

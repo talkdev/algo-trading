@@ -763,8 +763,15 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
     env = {**os.environ, **file_env}
 
     # ── Risk parameter safety ────────────────────────────────────────────────
-    max_daily_loss_pct = _get_float(env, "MAX_DAILY_LOSS_PCT", 0.02)
-    max_risk_per_trade_pct = _get_float(env, "MAX_RISK_PER_TRADE_PCT", 0.006)
+    # v3.10 (patch_v1): 0.6% per trade capped every defined-risk near-weekly
+    # structure at a single lot, below the size where fixed brokerage (per
+    # order, not per lot) can be amortised against the slow DTE-3/4 theta —
+    # so directionally-correct near-weekly trades still lost to costs. A
+    # defined-risk (capped-loss) intraday structure can carry a larger per-
+    # trade budget than naked selling; 1.2% per trade / 4.0% daily lets it
+    # size to a cost-viable 2+ lots while keeping the daily stop intact.
+    max_daily_loss_pct = _get_float(env, "MAX_DAILY_LOSS_PCT", 0.04)
+    max_risk_per_trade_pct = _get_float(env, "MAX_RISK_PER_TRADE_PCT", 0.012)
 
     # Clamp: max risk per trade must be < max daily loss / 3
     safe_max = round(max_daily_loss_pct / 3.0 - 0.001, 4)
