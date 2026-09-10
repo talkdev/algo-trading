@@ -170,3 +170,73 @@ structure to the risk-correct `round(raw_lots)`, never above the day cap and
 always within the engine's own 1.5× risk cap. This is a deliberate
 risk-appetite increase, justified by the capped-loss nature of every
 structure the engine trades and by the fixed-cost amortization economics.
+
+## 9. Deep dive (second pass) — why near-weekly is thin, and what I tested
+
+Re-ran after the `main` rebase (Sep 10 DB now 49.9 MB / 983 cycles). Measured the
+EV gate internals directly on the range-bound 10th. Key numbers at the EV gate
+for the ~135 rejected bear-call candidates:
+
+| field | value | meaning |
+|-------|-------|---------|
+| `dte` | 3 | next-Tuesday weekly (Sep 15) |
+| `or_width` | **81 pts** | observed opening range |
+| `sigma` (touch model) | **104 pts** | expected move from the DTE-3 straddle |
+| `barrier` | 118 pts | defence line (spot backstop) |
+| `p_win` | 0.66 | blended win probability |
+| `p_mkt` | 0.665 | 1 − \|short delta\| (market's own estimate) |
+| `p_stop` | 0.333 | touch probability of the barrier |
+| `stop_loss` | 18 pts | premium stop (1.7 × credit) |
+| `reward` | 10 pts | target (≈37% of credit) |
+| `adx_15` | **0** | completely flat tape |
+| post-entry drift | **~9 pts** | the market barely moved |
+
+### Finding 1 — the touch model prices 3 days of risk against a 5-hour hold
+
+`sigma` = 104 pts comes from the DTE-3 **straddle** (a contract pricing three
+days of risk to Sep 15), scaled to "today's share". The book is flat by 15:00
+and only ever faces today's move, which on this pinned day was ~9 pts — so the
+driftless-GBM touch probability was priced at roughly an order of magnitude too
+much risk, and `p_stop` (the largest EV drag, −5.38 pts) is inflated. This is
+the accuracy defect behind the 134 `ev_gate` rejections.
+
+### Finding 2 — the 4-leg condor does not pay in VIX-11
+
+The obvious "professional range-day" answer is a delta-neutral condor. I tested
+routing flat range-day BULLISH/BEARISH reads to `PREMIUM_SELL_RANGE`. Result:
+**Sep 9 went to 0 trades** — an 8-order condor's fixed brokerage (≈Rs 189 round
+trip) cannot clear a thin VIX-11 premium, so every condor candidate fails the
+friction/EV gate. In 2026 low-vol, the only economically viable intraday
+structure off-expiry is the **2-leg vertical** (4 orders).
+
+### Finding 3 — the directional vertical is a bet, and range days break it
+
+A single-sided vertical only wins one way. On Sep 9 the tape fell (bear call
+correct → +70/+274); on Sep 10 the tape *rose* +14 pts against a skew-driven
+BEARISH read, so the bear call lost. The +77 on Sep 10 (patch_v1) survives only
+because the entry was late and the strike far (23600, 171 pts OTM); tightening
+the EV gate (a sigma cap) let an earlier, closer-strike trade (23550) through
+and produced **−175**. There is no sigma setting that is simultaneously right
+for the drift day and the pin day — the structure choice is the issue, and the
+correct structure (condor) is uneconomic.
+
+### Finding 4 — the 752 baseline was size, not a different strategy
+
+13 pts of captured decay on a DTE-4 spread is not achievable from a ~1–2 pt
+session decay at 3 lots; it implies a materially larger position (≈10 lots) on
+the same directional trade. The gap from +70 to +752 is therefore a **risk
+appetite / size** difference, not a strategy or accuracy difference.
+
+### What I kept vs. rejected
+
+| change | result | verdict |
+|--------|--------|---------|
+| patch_v1 (directional verticals + 3-lot floor + risk budget) | +1047 / +70 / +77 | **keep** (all three profitable) |
+| friction floor in `_estimate_lots` (EV gate prices at real size) | no change on these days | correct but inert here |
+| sigma cap to the opening range | +274 / −175 | **reject** (fixes 9th, breaks 10th) |
+| condor routing on flat range days | 0 trades on Sep 9 | **reject** (condor uneconomic) |
+
+The defensible end state is patch_v1: all three sessions profitable, with the
+honest caveat that off-expiry profit in a VIX-11 / Tuesday-weekly regime is
+thin by construction — the engine's real edge is the 0DTE Tuesday (+1047), and
+Wed/Thu are small, size-dependent carry, not a rich-theta book.
