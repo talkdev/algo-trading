@@ -56,3 +56,23 @@ dist/
 *.tmp
 *.bak
 *.orig
+
+
+# ============================================================
+# DATABASES
+# ============================================================
+
+# Ignore database files directly inside /data/
+# Example: data/nifty_algo_v3.db
+/data/*.db
+
+# Ignore SQLite temporary/locking files everywhere
+*.db-wal
+*.db-shm
+*.db-journal
+
+# IMPORTANT:
+# Keep the smaller daily databases under /data/per_day/
+# even though /data/*.db is ignored.
+!/data/per_day/
+!/data/per_day/*.db
