@@ -895,7 +895,12 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         # Windows
         trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 45)),
         trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),
-        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 0)),
+        # Defined-risk, non-expiry NIFTY positions may remain open until
+        # 15:20 IST, leaving a small but tradeable final-theta window while
+        # deliberately flattening before the end-of-session liquidity taper.
+        # Tuesday / 0DTE continues to use its separate 15:00 hard exit
+        # (data_engine overrides the window on Tuesday 0DTE sessions).
+        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 20)),
         tuesday_hard_exit=_get_time(env, "TUESDAY_HARD_EXIT", dtime(15, 0)),
         tuesday_last_entry=_get_time(env, "TUESDAY_LAST_ENTRY", dtime(12, 30)),
 
