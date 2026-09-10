@@ -507,7 +507,11 @@ https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/eod_repor
 https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/data_engine.py
 https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/core.py
 https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/calibration_engine.py
-https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/backtest.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/backtest_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/nifty_algo_core.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/market_data_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/split_db_per_day.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/verify_all.py
 go deeper and analyze again all the files only regarding proftability and accuracy not for errors or bugs.
 
 
@@ -559,11 +563,12 @@ go deeper and analyze again all the algorithm only regarding proftability ,accur
 After your analysis just tell me count nothing else  how many issues identified including the previous ones.
 
 
-
+Rebase your branch with main to get latest DB with 10th updated data and the latest patched code.
 Do not hallucinate.
 You can run backtest_engine.py against the DB (python backtest_engine.py --db data/per_day/nifty_algo_2026-09-08.db --from 2026-09-08 --to 2026-09-08) to replay the trades against the modified code and get clear picture of trade.
 on 8th and 9th some how you created one trade but that logic did not work for a range bound day of 10th. 
-your goal is to modify the code in a way that it gives a profitable trade on 8th 9th and 10th.
+your goal is to modify the code in a way that it gives a profitable trade on 8th 9th and 10th both.
+Your last patch reduced profit of 9th.
 I want you to analyze the NIFTY options intraday algo trade engine from scratch again in a more deeper way regarding profitability and accuracy not for errors or bugs.
 Your goal is to dive deep and figure out all the changes that would make this nifty options intraday algo trading engine profitable in real market conditions specifically for nifty intraday options trading.
 do not hallucinate.
@@ -579,3 +584,30 @@ https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/data_engi
 https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/core.py
 https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/calibration_engine.py
 https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/backtest_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/nifty_algo_core.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/market_data_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/split_db_per_day.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/verify_all.py
+
+
+Do not hallucinate.
+Read Readme.md file to understand project architecture
+There are n number of options trading methods and your goal is to modify the code, test the code by replaying against the real data in db and figure out an optimal code change in a way that it gives a maximum profitable trade on 8th 9th and 10th which is more than current 1047,70 and 869 (Specially for 9th and 10th.
+Long Call, Long Put, Bull Call Spread, Bear Put Spread, Covered Call, Protective Put, Long Straddle, Long Strangle, Short Straddle, Short Strangle, Bull Put Spread, Bear Call Spread, Iron Condor, Iron Butterfly, Calendar Spread, Diagonal Spread, Ratio Spread, Backspread, Butterfly Spread, Broken-Wing Butterfly, Credit Spread, Debit Spread, 0DTE Short Straddle, 0DTE Short Strangle, Delta-Neutral Straddle, Gamma Scalping, Delta Hedging, Theta Harvesting, Vega Trading, IV Crush Trading, IV Expansion Trading, Volatility Arbitrage, Variance/Volatility Risk Premium (VRP) Trading, IV Rank Trading, IV Percentile Trading, Volatility Skew Trading, Term-Structure Trading, Gamma-Theta Optimization, Event-Driven Options Trading, Expiry-Day Gamma Trading, Expiry-Day Premium Selling, Opening-Range Breakout Options, VWAP-Based Options Trading, Momentum Options Trading, Mean-Reversion Options Trading, Breakout Options Trading, Trend-Following Options Trading, Statistical Arbitrage, Pairs Trading with Options, Regime-Based Options Trading, Options Market-Making, Order-Flow-Based Options Trading, Options Surface Arbitrage, Machine-Learning-Based Options Trading
+You can run backtest_engine.py against the DB (python backtest_engine.py --db data/per_day/nifty_algo_2026-09-08.db --from 2026-09-08 --to 2026-09-08) to replay the trades against the modified code and get clear picture of trade.
+Use approach of how professional and established nifty options intraday algo trader use.
+It is year 2026 so use NIFTY options rules and NIFTY intraday options behaviour accordingly.
+below are the public repository links of the nifty intraday options algo trade engine python files
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/strategy_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/regime_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/main.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/execution_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/eod_report.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/data_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/core.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/calibration_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/backtest_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/nifty_algo_core.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/market_data_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/split_db_per_day.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/verify_all.py
