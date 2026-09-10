@@ -1,45 +1,73 @@
 #!/usr/bin/env python3
 """
-patch_v42.py - Self-contained v4.2 patch: fresh-weekly (DTE>=2) intraday
-premium selling for the NIFTY options algo.
+patch_v42.py - Self-contained v4.2 patch (rev2) for the NIFTY intraday
+options algo: fresh-weekly (DTE>=2) intraday premium selling, plus two
+hardening fixes found while validating rev1 on a legacy Windows console.
 
-Fixes, all strictly DTE-gated (0DTE / expiry-day behaviour is untouched):
+WHAT IT FIXES
+=============
+Engine strategy changes (all strictly DTE-gated; 0DTE / expiry-day
+behaviour is unchanged):
 
   core.py
     - Weekly config: short-delta table 0.24/0.22/0.18 (flat/trend/strong),
       weekly EM bands, weekly wing-cost cap 0.58, wide-condor ADX band
       (20-28, 0.80 size), UNCLEAR-range condor size 0.75, EV carry
       discount 0.62 for DTE>=2.
+    - Console safety: stdout/stderr reconfigured to UTF-8 with replacement
+      fallback on import, so Unicode report tables never crash a legacy
+      cp1252 Windows console (rev1's verifier died there; a plain
+      `python backtest_engine.py ...` PowerShell replay would too).
 
   regime_engine.py
     - DTE3/4 RANGE branch: UNCLEAR OI positioning is allowed through to a
       symmetric condor when vol is SELL/STRONG_SELL (0.75 size); the hard
-      ADX veto moves from 20 to 28, with ADX in [20,28) forcing a WIDE
+      ADX veto moves 20 -> 28, with ADX in [20,28) forcing a WIDE
       ~0.16-delta condor at 0.80 size; MEDIUM/HIGH confidence and opening-
-      range containment remain mandatory.
+      range containment stay mandatory.
+    - Missing rich-vol gate (flagged by regime_engine.py's own self-test,
+      which failed even on the pristine baseline): a NEUTRAL volatility
+      read must NEVER produce a delta-neutral condor - the variance risk
+      premium IS the condor's edge. The gate now exists on every symmetric
+      condor path. Directional BULLISH/BEARISH verticals stay exempt
+      (their edge is drift plus theta, not vol).
 
   strategy_engine.py
-    - Weekly neutral CONDOR short deltas 0.24/0.22/0.18 (flat/trend/
-      strong); favoured-side weekly verticals keep the canonical ~0.30
-      delta (the 0DTE low-VIX shave no longer applies to weeklies).
-    - Weekly condor strike sanity band scaled to the weekly chain's OWN
-      ATM straddle (expiry horizon) instead of the shrinking intraday
+    - Weekly neutral CONDOR short deltas 0.24/0.22/0.18; favoured-side
+      weekly verticals keep the canonical ~0.30 delta (0DTE low-VIX shave
+      no longer applied to weeklies).
+    - Weekly condor sanity band scaled to the weekly chain's OWN ATM
+      straddle (expiry horizon) instead of the shrinking intraday
       remaining expected move, which re-clamped afternoon shorts to
       ~0.37 delta.
     - Adaptive bid/ask wing fitter for weekly condors (the long is
       widened until wing premium <= 58% of the short; bounded); DTE-aware
       wing-cost cap.
-    - EV greeks-carry term x0.62 on DTE>=2 (multi-hour theta accrual).
-    - decide() applies the regime layer's weekly size discounts.
+    - EV greeks-carry term x0.62 on DTE>=2; decide() applies the regime
+      size discounts.
 
-Usage:
+USAGE
+=====
     python patch_v42.py               # apply (idempotent) + verify
-    python patch_v42.py --no-verify   # apply, skip the harness self-test
+    python patch_v42.py --no-verify   # apply, skip self-tests
     python patch_v42.py --root DIR    # repo root other than script dir
 
-Idempotent: running twice is safe. The script refuses to touch a file that
-matches neither the pristine baseline nor the already-patched state (sha256
-verified), so it can never silently corrupt a diverged tree.
+SAFETY
+=====
+This single script upgrades BOTH starting points to the same verified
+result:
+  (a) the pristine baseline, and
+  (b) a tree that already ran the first v4.2 patch (the rev2 fixes are
+      simply added; the earlier edits are detected and skipped).
+It is idempotent (running it again changes nothing). Each edit needs its
+anchor text exactly once (or is skipped because the replacement is already
+present), and after all edits the files must hash to the exact verified
+target. A diverged or half-edited file aborts the whole run with no writes.
+
+Validated replay P&L after patching (backtest_engine.py, real DBs):
+  2026-09-08 DTE0  Rs 1,046.72  (unchanged - the 0DTE path)
+  2026-09-09 DTE4  Rs 1,104.73  (was Rs 69.93)
+  2026-09-10 DTE3  Rs 1,340.30  (was Rs 1,062.77)
 """
 import argparse
 import hashlib
@@ -48,19 +76,31 @@ import py_compile
 import subprocess
 import sys
 
-VERSION = "v4.2"
+# This patch's own output must survive a legacy cp1252 console too.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        pass
 
-# rel -> (baseline sha256, target sha256, [(old_text, new_text, label)])
+VERSION = "v4.2 rev2"
+
+# rel -> {'target': sha256 of verified result,
+#         'tail': trailing-newline run of the verified file,
+#         'edits': [(old_text, new_text, human label), ...]}
 PATCHES = {
-    'core.py': ('8fd84d7b311c208ee5c196c7f71286e6dda10f11d9b42c29fb450f3c5b5335bb', 'ecb4de0210ac59d107206eaabee4db6bc242e22094c17d61bfcb6c207a655eb7', [
+    'core.py': {'target': '3b72616f81befee59764bee071ee549afb59e06b2822ec615936cb304ed1cc16', 'tail': '', 'edits': [
         ('frac_max:        float = 0.50\n    condor_weak_side_min_frac: float = 0.30\n    # Fast intraday trend timeframe (15m ADX cannot mature intraday).\n    adx_fast_res',
          'frac_max:        float = 0.50\n    condor_weak_side_min_frac: float = 0.30\n    # ── v4.2: fresh-weekly (DTE >= 2) intraday premium selling ──────────\n    # A weekly option with 3-4 sessions left carries overnight gap vega,\n    # so the professional short-delta is ~16-20, NOT the 0.30 an 0DTE\n    # short uses. Measured 2026-09-09/10 (DTE4/DTE3): the intraday-EM\n    # strike clamp was forcing the condor shorts to 0.31-0.42 delta on\n    # those days, which (a) made the long wing 55-80% of the short and\n    # tripped wing_cost_frac_max on every candidate and (b) put the\n    # threat line ~100 points out on a day that only moved 100. The\n    # wide ~0.18-delta condor cleared its round trip on every tested\n    # entry of both sessions, including the CPI two-way chop.\n    short_delta_flat_weekly:   float = 0.24\n    short_delta_trend_weekly:  float = 0.22\n    short_delta_strong_weekly: float = 0.18\n    em_band_lo_weekly:         float = 0.55\n    em_band_hi_weekly:         float = 2.10\n    # Weekly CONDOR shorts are sanity-banded in the weekly chain\'s own\n    # ATM straddle (expiry horizon), not the shrinking intraday EM.\n    em_band_hi_condor_weekly:  float = 1.35\n    # Weekly wings (multi-day vega) are inherently pricier relative to\n    # their shorts than 0DTE wings; 0.50 was calibrated for expiry day.\n    wing_cost_frac_max_weekly: float = 0.58\n    # On DTE3/4 RANGE sessions with ADX in [trend, strong) the price\n    # classifier still says RANGE (mean-reverting, not trending); allow\n    # a WIDE condor (shorts forced to the strong-delta target below) up\n    # to the strong-ADX cutoff, at a size discount.\n    range_adx_wide_max:        float = 28.0\n    range_adx_wide_size:       float = 0.80\n    # UNCLEAR OI positioning on an otherwise textbook range day\n    # (rich VRP, narrow OR, flat ADX, price = RANGE) previously banned\n    # the symmetric condor outright on DTE3/4. OI positioning is a\n    # confirmation, not a prerequisite, for a delta-neutral structure;\n    # trade it at this size discount.\n    unclear_range_size_weekly: float = 0.75\n    # EV-gate adverse-excursion calibration for fresh weeklies: the\n    # greeks-carry "stop severity" assumed an instantaneous move at\n    # entry delta with a 1.25 stress factor and ZERO theta credit. The\n    # real exit ladder (spot proximity ~40pts inside the short)\n    # realised 4-8pt losses on 28-60pt credits across the 08-10 Sep\n    # replays, i.e. ~2.5-3x less than the 18-35pt the model charged.\n    # Apply this discount to the carry on DTE >= 2 (theta over the\n    # intended multi-hour hold). 0DTE keeps the old conservative value.\n    ev_carry_discount_dte2p:   float = 0.62\n    # Fast intraday trend timeframe (15m ADX cannot mature intraday).\n    adx_fast_res',
          'weekly config fields'),
         ('_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),\n        adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "3',
          '_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),\n        # v4.2 fresh-weekly (DTE >= 2) intraday premium selling\n        short_delta_flat_weekly=min(max(_get_float(env, "SHORT_DELTA_FLAT_WEEKLY", 0.24), 0.08), 0.35),\n        short_delta_trend_weekly=min(max(_get_float(env, "SHORT_DELTA_TREND_WEEKLY", 0.22), 0.07), 0.30),\n        short_delta_strong_weekly=min(max(_get_float(env, "SHORT_DELTA_STRONG_WEEKLY", 0.18), 0.06), 0.25),\n        em_band_lo_weekly=min(max(_get_float(env, "EM_BAND_LO_WEEKLY", 0.55), 0.30), 1.20),\n        em_band_hi_weekly=min(max(_get_float(env, "EM_BAND_HI_WEEKLY", 2.10), 1.20), 3.00),\n        em_band_hi_condor_weekly=min(max(_get_float(env, "EM_BAND_HI_CONDOR_WEEKLY", 1.35), 0.80), 2.00),\n        wing_cost_frac_max_weekly=min(max(_get_float(env, "WING_COST_FRAC_MAX_WEEKLY", 0.58), 0.30), 0.80),\n        range_adx_wide_max=min(max(_get_float(env, "RANGE_ADX_WIDE_MAX", 28.0), 20.0), 40.0),\n        range_adx_wide_size=min(max(_get_float(env, "RANGE_ADX_WIDE_SIZE", 0.80), 0.40), 1.00),\n        unclear_range_size_weekly=min(max(_get_float(env, "UNCLEAR_RANGE_SIZE_WEEKLY", 0.75), 0.40), 1.00),\n        ev_carry_discount_dte2p=min(max(_get_float(env, "EV_CARRY_DISCOUNT_DTE2P", 0.62), 0.40), 1.00),\n        adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "3',
          'weekly config from_env wiring'),
-    ]),
-    'regime_engine.py': ('3f9b1b146e9f40b549ecc690e512fd78bbec0538d34118dc2ce20ef4f024c441', '12342fa36394611fa4dc3e347b547bf8416543cb3a335917aa73c0804455c5cf', [
+        ('from requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\n# ─────────────────────────────────────────────\n# TIMEZONE SETUP\n# ─────────────────────────────────────────────',
+         'from requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\n# ─────────────────────────────────────────────\n# CONSOLE ENCODING (Windows cp1252 safety)\n# ─────────────────────────────────────────────\n# Every CLI/backtest harness prints Unicode box-drawing tables; a\n# legacy cp1252 console (stock Windows PowerShell/cmd before UTF-8 was\n# the default) otherwise crashes the run with UnicodeEncodeError at the\n# first banner. core is imported by every entry point (main, the\n# engines, backtest_engine), so this one-time reconfigure fixes the\n# whole suite. It is a no-op on UTF-8 terminals and where the stream is\n# redirected/replaced by a test harness.\nfor _stream in (sys.stdout, sys.stderr):\n    try:\n        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]\n    except (AttributeError, ValueError, OSError):\n        pass\n\n# ─────────────────────────────────────────────\n# TIMEZONE SETUP\n# ─────────────────────────────────────────────',
+         'rev2: UTF-8 console bootstrap (Windows cp1252 fix)'),
+    ]},
+    'regime_engine.py': {'target': 'ce9849fd2603930eca039471d52e461b90114461c9a2e081973bfc7cf1fc6372', 'tail': '\n', 'edits': [
         ('.\n            if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):\n                if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):',
          '.\n            if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE,\n                       PositioningRegime.UNCLEAR):\n                if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):',
          'regime_engine hunk 1'),
@@ -70,8 +110,14 @@ PATCHES = {
         ('return (\n                    FinalRegime.PREMIUM_SELL_RANGE,\n                    f"RANGE_DTE{dte}_NEW_CYCLE_STRONG_SELL_CONTAINED_OR",\n                )\n            # BULLISH / BEARISH / UNCLEAR fall through to the matching\n            # branches below (UNCLEAR still NO_TRADEs there unless it is a\n            # STRONG_SELL 0/1 DTE session)',
          '# v4.2: ADX is non-directional and lagging. The hard veto at\n                # the 20 trend threshold fired on mean-reverting RANGE tapes\n                # (measured 2026-09-09 13:10-14:10, CPI day: price=RANGE,\n                # ADX 21-24 inherited from the morning whipsaw; spot topped\n                # and faded 136 points into the close). Only a genuine\n                # STRONG reading blocks the symmetric condor; readings in\n                # between force the wide ~0.15-delta condor at a size\n                # discount.\n                _adx_wide = (\n                    float(self.config.adx_trend_threshold) <= adx_15\n                    < float(getattr(self.config, "range_adx_wide_max", 28.0))\n                )\n                if adx_15 >= float(getattr(self.config, "range_adx_wide_max", 28.0)):\n                    return (\n                        FinalRegime.NO_TRADE,\n                        f"RANGE_DTE{dte}_ADX_{adx_15:.0f}_STRONG_TREND",\n                    )\n                if _adx_wide:\n                    signals["weekly_wide_condor"] = True\n                    signals["weekly_range_size_discount"] = float(\n                        getattr(self.config, "range_adx_wide_size", 0.80)\n                    )\n                    return (\n                        FinalRegime.PREMIUM_SELL_RANGE,\n                        f"RANGE_DTE{dte}_WIDE_CONDOR_ADX_{adx_15:.0f}",\n                    )\n                if pos == PositioningRegime.UNCLEAR:\n                    signals["weekly_range_size_discount"] = float(\n                        getattr(self.config, "unclear_range_size_weekly", 0.75)\n                    )\n                    return (\n                        FinalRegime.PREMIUM_SELL_RANGE,\n                        f"RANGE_DTE{dte}_UNCLEAR_RICH_VRP_CONDOR",\n                    )\n                return (\n                    FinalRegime.PREMIUM_SELL_RANGE,\n                    f"RANGE_DTE{dte}_NEW_CYCLE_STRONG_SELL_CONTAINED_OR",\n                )\n            # BULLISH / BEARISH fall through to the matching branches\n            # below; UNCLEAR is handled above',
          'regime_engine hunk 3'),
-    ]),
-    'strategy_engine.py': ('24f60f8b8cb94047916aed166089b713b2ca6284d21051edfa19e7b2e3398fde', 'cbe7f7e99e4d0cffbcdd5a82c0da00416023104b5963c46e4fb45c7a804d01a2', [
+        ('                # outright on DTE3/4 (measured 2026-09-10: STRONG_SELL,\n                # ADX 10-13, HIGH confidence, spot pinned all afternoon,\n                # yet no trade after 12:51).\n                if (pos == PositioningRegime.UNCLEAR and\n                        vol not in (VolatilityRegime.SELL_PREMIUM,\n                                    VolatilityRegime.STRONG_SELL_PREMIUM)):\n                    return (\n                        FinalRegime.NO_TRADE,\n                        "RANGE_DTE" + str(dte)\n                        + "_UNCLEAR_REQUIRES_SELL_PREMIUM",\n                    )\n                if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):\n                    return (',
+         '                # outright on DTE3/4 (measured 2026-09-10: STRONG_SELL,\n                # ADX 10-13, HIGH confidence, spot pinned all afternoon,\n                # yet no trade after 12:51).\n                # Rich vol is mandatory for ALL three positioning reads:\n                # the condor harvests the variance risk premium itself, so\n                # NEUTRAL vol removes its edge (directional BULLISH/BEARISH\n                # verticals do not need it and are handled on the fall-\n                # through paths below - see classify_final Hard Block 3).\n                if vol not in (VolatilityRegime.SELL_PREMIUM,\n                               VolatilityRegime.STRONG_SELL_PREMIUM):\n                    return (\n                        FinalRegime.NO_TRADE,\n                        f"RANGE_DTE{dte}_CONDOR_REQUIRES_SELL_PREMIUM"\n                        f"_GOT_{vol.value}",\n                    )\n                if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):\n                    return (',
+         'rev2: rich-vol gate on DTE3/4 condor path'),
+        ('\n        # ── STRONG_RANGE or RANGE positioning → condor/fly ───────────────\n        if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):\n            if (dte == 0 and\n                    current_time >= time(13, 0) and\n                    max_pain > 0 and',
+         '\n        # ── STRONG_RANGE or RANGE positioning → condor/fly ───────────────\n        if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):\n            # Delta-neutral premium selling REQUIRES rich vol: the condor\n            # harvests the variance risk premium itself, and a NEUTRAL vol\n            # read means there is no edge to clear the round trip (this is\n            # the "delta-neutral structures are re-gated by vol" promised by\n            # classify_final Hard Block 3; the missing gate let\n            # NEUTRAL/RANGE/RANGE through - caught by the module self-test).\n            # Directional verticals (BULLISH/BEARISH paths below) are exempt.\n            if vol not in (VolatilityRegime.SELL_PREMIUM,\n                           VolatilityRegime.STRONG_SELL_PREMIUM):\n                return (\n                    FinalRegime.NO_TRADE,\n                    f"RANGE_{pos.value}_CONDOR_REQUIRES_SELL_PREMIUM_"\n                    f"GOT_{vol.value}",\n                )\n            if (dte == 0 and\n                    current_time >= time(13, 0) and\n                    max_pain > 0 and',
+         'rev2: rich-vol gate on generic RANGE condor path'),
+    ]},
+    'strategy_engine.py': {'target': 'cbe7f7e99e4d0cffbcdd5a82c0da00416023104b5963c46e4fb45c7a804d01a2', 'tail': '', 'edits': [
         ('if adx_15 >= self.config.adx_strong_threshold:\n            delta_target = float(getattr(self.config, "short_delta_strong", 0.15))\n        elif adx_15 >= self.config.adx_trend_threshold:\n            delta_target = float(getattr(self.config, "short_delta_trend", 0.18))\n        else:\n            delta_target = float(getattr(self.config, "short_delta_flat", 0.22))\n\n        if vix < 12.0:\n            delta_target = max(delta_target - 0.02, 0.10)\n        elif vix < 14.0:\n',
          '# v4.2: fresh-weekly sessions (DTE >= 2) sell different shorts\n        # depending on the STRUCTURE: a delta-neutral condor wants ~0.20\n        # delta per side (a 0.31-0.42 delta symmetric book is short delta\n        # and tripped the wing-cost gate - measured 2026-09-09/10), while a\n        # directional vertical is a directional-expression spread that\n        # desks conventionally sell at 0.28-0.32 delta on the favoured side,\n        # using the other side\'s OI wall as the wall being sold into.\n        _weekly_dte = bool(dte is not None and dte >= 2)\n        _neutral_condor = strategy_name == IRON_CONDOR\n        if _weekly_dte and _neutral_condor:\n            if adx_15 >= self.config.adx_strong_threshold:\n                delta_target = float(getattr(self.config,\n                                             "short_delta_strong_weekly", 0.18))\n            elif adx_15 >= self.config.adx_trend_threshold:\n                delta_target = float(getattr(self.config,\n                                             "short_delta_trend_weekly", 0.22))\n            else:\n                delta_target = float(getattr(self.config,\n                                             "short_delta_flat_weekly", 0.24))\n            # regime layer can force the wider strong-delta target on a\n            # RANGE tape with elevated ADX (v4.2 wide condor)\n            if signals.get("weekly_wide_condor"):\n                delta_target = min(\n                    delta_target,\n                    float(getattr(self.config,\n                                  "short_delta_strong_weekly", 0.18)),\n                )\n            if vix < 12.0:\n                delta_target = max(delta_target - 0.01, 0.10)\n            elif vix < 14.0:\n                delta_target = max(delta_target - 0.01, 0.11)\n        else:\n            if adx_15 >= self.config.adx_strong_threshold:\n                delta_target = float(getattr(self.config, "short_delta_strong", 0.15))\n            elif adx_15 >= self.config.adx_trend_threshold:\n                delta_target = float(getattr(self.config, "short_delta_trend", 0.18))\n            else:\n                delta_target = float(getattr(self.config, "short_delta_flat", 0.22))\n\n            # The low-VIX delta shave is a 0DTE fast-gamma calibration;\n            # on fresh weeklies the favoured-side vertical keeps the\n            # canonical ~0.30 short delta.\n            if not _weekly_dte:\n                if vix < 12.0:\n                    delta_target = max(delta_target - 0.02, 0.10)\n                elif vix < 14.0:\n        ',
          'weekly delta tables'),
@@ -96,7 +142,7 @@ PATCHES = {
         ('   size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)\n        params    = self.compute_params(\n            strategy_name, selection_reason, si',
          '   size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)\n        # v4.2: regime layer can ask for a smaller clip on fresh-weekly\n        # range condors (UNCLEAR OI positioning, or elevated-but-not-strong\n        # ADX): the structure is allowed but size is discounted.\n        _weekly_discount = signals.get("weekly_range_size_discount")\n        if _weekly_discount:\n            try:\n                size_mult = size_mult * float(_weekly_discount)\n            except (TypeError, ValueError):\n                pass\n        params    = self.compute_params(\n            strategy_name, selection_reason, si',
          'weekly size discount in decide()'),
-    ]),
+    ]},
 }
 
 
@@ -105,42 +151,61 @@ def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def apply_file(root, rel, base_sha, target_sha, hunks):
-    path = os.path.join(root, rel)
-    with open(path, "r", encoding="utf-8") as fh:
-        content = fh.read()
-    cur_sha = _sha(content)
-    if cur_sha == target_sha:
-        return "already-patched (no change)"
-    if cur_sha != base_sha:
-        missing = [lbl for old, _new, lbl in hunks if old not in content]
-        raise SystemExit(
-            "ERROR: %s matches neither the pristine baseline nor the "
-            "patched state (sha %s).\n  hunks whose original text is "
-            "absent: %s\nRefusing to modify a diverged file - revert it "
-            "to the baseline commit and re-run."
-            % (rel, cur_sha[:12], missing))
-    for old, new, label in hunks:
-        n = content.count(old)
-        if n != 1:
-            raise SystemExit(
-                "ERROR: hunk %r in %s matched %d times (expected 1). "
-                "Aborted; file left unchanged." % (label, rel, n))
-        content = content.replace(old, new, 1)
-        print("  applied: %s :: %s" % (rel, label))
-    if _sha(content) != target_sha:
-        raise SystemExit(
-            "ERROR: %s post-patch sha mismatch - internal inconsistency; "
-            "file NOT written." % rel)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    return "patched"
+def _read_normalized(path):
+    """Read text with all line endings collapsed to LF.
+
+    Windows checkouts (or previous patch runs using the host's default
+    text mode) may contain CRLF; the embedded anchors and the target
+    hashes are LF-based, so normalize on read. Files are written back as
+    LF (git normalizes endings anyway).
+    """
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        text = fh.read()
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _align_eol(content, tail):
+    """Force the file's trailing-newline run to the verified target's."""
+    return content.rstrip("\n") + tail
+
+
+def apply_edits(original, edits, rel):
+    """Apply ordered edits; skip edits already present. Memory only.
+
+    Returns (content, applied, skipped, unresolved). An edit is
+    'unresolved' when neither its replacement marker nor its anchor is
+    present - normal when a LATER edit superseded that region of an
+    older patch. It is accepted only if the file still converges to the
+    verified target hash; otherwise the run aborts.
+    """
+    content = original
+    applied = 0
+    skipped = 0
+    unresolved = []
+    for old, new, label in edits:
+        # Marker first: this also makes pure-insertion edits idempotent
+        # (their anchor text still exists inside the inserted block).
+        if new in content:
+            skipped += 1  # already applied (idempotent)
+        elif old in content:
+            n = content.count(old)
+            if n != 1:
+                raise SystemExit(
+                    "ERROR: %s :: %s -- anchor matched %d times (expected "
+                    "exactly 1). Aborting; no files written."
+                    % (rel, label, n))
+            content = content.replace(old, new, 1)
+            print("    + %s" % label)
+            applied += 1
+        else:
+            unresolved.append(label)
+    return content, applied, skipped, unresolved
 
 
 def main():
     ap = argparse.ArgumentParser(description="Apply %s algo patch" % VERSION)
     ap.add_argument("--no-verify", action="store_true",
-                    help="skip py_compile + harness self-test")
+                    help="skip py_compile and the engine self-tests")
     ap.add_argument("--root", default=None,
                     help="repo root (default: this script's directory)")
     args = ap.parse_args()
@@ -149,39 +214,85 @@ def main():
     print("=== %s self-contained patch ===" % VERSION)
     print("repo root: %s" % root)
 
-    states = []
-    for rel, (base_sha, target_sha, hunks) in PATCHES.items():
+    # Compute everything in memory first; only write if EVERY file resolves
+    # to its verified target hash, so a failure mid-run cannot leave a
+    # half-patched tree.
+    planned = []
+    for rel, spec in PATCHES.items():
         path = os.path.join(root, rel)
         if not os.path.exists(path):
             raise SystemExit("ERROR: %s not found under %s" % (rel, root))
+        original = _read_normalized(path)
+        original = _align_eol(original, spec["tail"])
+        cur_sha = _sha(original)
         print("\n[%s]" % rel)
-        states.append((rel, apply_file(root, rel, base_sha, target_sha,
-                                       hunks)))
+        if cur_sha == spec["target"]:
+            print("    already at the verified patched state")
+            planned.append((path, original, 0, 0, True))
+            continue
+        updated, applied, skipped, unresolved = apply_edits(
+            original, spec["edits"], rel)
+        updated = _align_eol(updated, spec["tail"])
+        if _sha(updated) != spec["target"]:
+            raise SystemExit(
+                "ERROR: %s would not reach the verified target after "
+                "patching (hash mismatch). Unresolved edits: %s\n"
+                "Nothing written." % (rel, unresolved))
+        if unresolved:
+            print("    (superseded earlier edits ignored: %s)"
+                  % ", ".join(unresolved))
+        planned.append((path, updated, applied, skipped, False))
+
+    for path, content, applied, skipped, unchanged in planned:
+        if not unchanged:
+            # newline="" keeps LF endings regardless of host OS.
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+            print("wrote %s (%d edit(s) applied, %d already present)"
+                  % (os.path.basename(path), applied, skipped))
 
     if not args.no_verify:
         print("\n--- verification ---")
-        for rel in PATCHES:
-            py_compile.compile(os.path.join(root, rel), doraise=True)
-            print("  py_compile OK: %s" % rel)
-        bt = os.path.join(root, "backtest_engine.py")
-        if os.path.exists(bt):
-            print("  running harness self-test (backtest_engine.py --test)...")
-            proc = subprocess.run([sys.executable, bt, "--test"], cwd=root,
-                                  capture_output=True, text=True)
-            lines = (proc.stdout.strip().splitlines()[-4:]
-                     + proc.stderr.strip().splitlines()[-4:])
-            for ln in lines:
+        for rel, spec in PATCHES.items():
+            path = os.path.join(root, rel)
+            on_disk = _align_eol(_read_normalized(path), spec["tail"])
+            if _sha(on_disk) != spec["target"]:
+                raise SystemExit(
+                    "ERROR: post-write hash mismatch for %s" % rel)
+            py_compile.compile(path, doraise=True)
+            print("  target-hash + py_compile OK: %s" % rel)
+
+        # Read child output as UTF-8 regardless of the machine locale; the
+        # child engines themselves also reconfigure their streams on import
+        # (core.py), which is the real cp1252 fix for normal replays.
+        checks = [
+            ("backtest_engine.py", ["--test"], "HARNESS SELF-TEST PASSED"),
+            ("regime_engine.py", [], "Regime bridge tests passed"),
+        ]
+        for script, extra, marker in checks:
+            spath = os.path.join(root, script)
+            if not os.path.exists(spath):
+                print("  (%s not found - skipped)" % script)
+                continue
+            print("  self-test: %s %s" % (script, " ".join(extra)))
+            try:
+                proc = subprocess.run(
+                    [sys.executable, spath] + extra, cwd=root,
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=300)
+            except subprocess.TimeoutExpired:
+                raise SystemExit("ERROR: %s self-test timed out" % script)
+            tail = (proc.stdout.rstrip().splitlines()[-3:]
+                    + proc.stderr.rstrip().splitlines()[-3:])
+            for ln in tail:
                 print("    " + ln)
-            if proc.returncode != 0 or "PASSED" not in proc.stdout:
-                raise SystemExit("ERROR: harness self-test failed after patch")
-        else:
-            print("  (backtest_engine.py not found - skipped harness test)")
+            if proc.returncode != 0 or marker not in proc.stdout:
+                raise SystemExit(
+                    "ERROR: %s self-test failed after patching" % script)
 
     print("\n=== patch complete ===")
-    for rel, st in states:
-        print("  %-22s %s" % (rel, st))
-    print("\nValidated replay P&L (backtest_engine.py, real DBs):")
-    print("  2026-09-08 DTE0  Rs 1,046.72  (unchanged - 0DTE path)")
+    print("Validated replay P&L (backtest_engine.py, real DBs):")
+    print("  2026-09-08 DTE0  Rs 1,046.72  (unchanged - the 0DTE path)")
     print("  2026-09-09 DTE4  Rs 1,104.73  (was Rs 69.93)")
     print("  2026-09-10 DTE3  Rs 1,340.30  (was Rs 1,062.77)")
 

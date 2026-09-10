@@ -23,6 +23,22 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─────────────────────────────────────────────
+# CONSOLE ENCODING (Windows cp1252 safety)
+# ─────────────────────────────────────────────
+# Every CLI/backtest harness prints Unicode box-drawing tables; a
+# legacy cp1252 console (stock Windows PowerShell/cmd before UTF-8 was
+# the default) otherwise crashes the run with UnicodeEncodeError at the
+# first banner. core is imported by every entry point (main, the
+# engines, backtest_engine), so this one-time reconfigure fixes the
+# whole suite. It is a no-op on UTF-8 terminals and where the stream is
+# redirected/replaced by a test harness.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        pass
+
+# ─────────────────────────────────────────────
 # TIMEZONE SETUP
 # ─────────────────────────────────────────────
 

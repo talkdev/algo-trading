@@ -1815,13 +1815,17 @@ class RegimeClassifier:
                 # outright on DTE3/4 (measured 2026-09-10: STRONG_SELL,
                 # ADX 10-13, HIGH confidence, spot pinned all afternoon,
                 # yet no trade after 12:51).
-                if (pos == PositioningRegime.UNCLEAR and
-                        vol not in (VolatilityRegime.SELL_PREMIUM,
-                                    VolatilityRegime.STRONG_SELL_PREMIUM)):
+                # Rich vol is mandatory for ALL three positioning reads:
+                # the condor harvests the variance risk premium itself, so
+                # NEUTRAL vol removes its edge (directional BULLISH/BEARISH
+                # verticals do not need it and are handled on the fall-
+                # through paths below - see classify_final Hard Block 3).
+                if vol not in (VolatilityRegime.SELL_PREMIUM,
+                               VolatilityRegime.STRONG_SELL_PREMIUM):
                     return (
                         FinalRegime.NO_TRADE,
-                        "RANGE_DTE" + str(dte)
-                        + "_UNCLEAR_REQUIRES_SELL_PREMIUM",
+                        f"RANGE_DTE{dte}_CONDOR_REQUIRES_SELL_PREMIUM"
+                        f"_GOT_{vol.value}",
                     )
                 if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
                     return (
@@ -1886,6 +1890,20 @@ class RegimeClassifier:
 
         # ── STRONG_RANGE or RANGE positioning → condor/fly ───────────────
         if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):
+            # Delta-neutral premium selling REQUIRES rich vol: the condor
+            # harvests the variance risk premium itself, and a NEUTRAL vol
+            # read means there is no edge to clear the round trip (this is
+            # the "delta-neutral structures are re-gated by vol" promised by
+            # classify_final Hard Block 3; the missing gate let
+            # NEUTRAL/RANGE/RANGE through - caught by the module self-test).
+            # Directional verticals (BULLISH/BEARISH paths below) are exempt.
+            if vol not in (VolatilityRegime.SELL_PREMIUM,
+                           VolatilityRegime.STRONG_SELL_PREMIUM):
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"RANGE_{pos.value}_CONDOR_REQUIRES_SELL_PREMIUM_"
+                    f"GOT_{vol.value}",
+                )
             if (dte == 0 and
                     current_time >= time(13, 0) and
                     max_pain > 0 and
