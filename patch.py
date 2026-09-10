@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-patch_v42.py - Self-contained v4.2 patch (rev2) for the NIFTY intraday
+patch_v42.py - Self-contained v4.2 patch (rev3) for the NIFTY intraday
 options algo: fresh-weekly (DTE>=2) intraday premium selling, plus two
 hardening fixes found while validating rev1 on a legacy Windows console.
 
@@ -18,6 +18,11 @@ behaviour is unchanged):
       fallback on import, so Unicode report tables never crash a legacy
       cp1252 Windows console (rev1's verifier died there; a plain
       `python backtest_engine.py ...` PowerShell replay would too).
+
+  core.py (rev3)
+    - Non-expiry defined-risk hard exit 15:00 -> 15:20 (final-theta
+      window; Tuesday/0DTE keeps its separate 15:00 override).
+      Validated: 2026-09-09 +Rs28.5, expiry day and 2026-09-10 flat.
 
   regime_engine.py
     - DTE3/4 RANGE branch: UNCLEAR OI positioning is allowed through to a
@@ -66,7 +71,7 @@ target. A diverged or half-edited file aborts the whole run with no writes.
 
 Validated replay P&L after patching (backtest_engine.py, real DBs):
   2026-09-08 DTE0  Rs 1,046.72  (unchanged - the 0DTE path)
-  2026-09-09 DTE4  Rs 1,104.73  (was Rs 69.93)
+  2026-09-09 DTE4  Rs 1,133.23  (was Rs 69.93)
   2026-09-10 DTE3  Rs 1,340.30  (was Rs 1,062.77)
 """
 import argparse
@@ -83,13 +88,13 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError, OSError):
         pass
 
-VERSION = "v4.2 rev2"
+VERSION = "v4.2 rev3"
 
 # rel -> {'target': sha256 of verified result,
 #         'tail': trailing-newline run of the verified file,
 #         'edits': [(old_text, new_text, human label), ...]}
 PATCHES = {
-    'core.py': {'target': '3b72616f81befee59764bee071ee549afb59e06b2822ec615936cb304ed1cc16', 'tail': '', 'edits': [
+    'core.py': {'target': '2f6cea8e7cb220791ae627f8156e0588b6c2039a660f621d8acec4c5ba5d54a9', 'tail': '', 'edits': [
         ('frac_max:        float = 0.50\n    condor_weak_side_min_frac: float = 0.30\n    # Fast intraday trend timeframe (15m ADX cannot mature intraday).\n    adx_fast_res',
          'frac_max:        float = 0.50\n    condor_weak_side_min_frac: float = 0.30\n    # ── v4.2: fresh-weekly (DTE >= 2) intraday premium selling ──────────\n    # A weekly option with 3-4 sessions left carries overnight gap vega,\n    # so the professional short-delta is ~16-20, NOT the 0.30 an 0DTE\n    # short uses. Measured 2026-09-09/10 (DTE4/DTE3): the intraday-EM\n    # strike clamp was forcing the condor shorts to 0.31-0.42 delta on\n    # those days, which (a) made the long wing 55-80% of the short and\n    # tripped wing_cost_frac_max on every candidate and (b) put the\n    # threat line ~100 points out on a day that only moved 100. The\n    # wide ~0.18-delta condor cleared its round trip on every tested\n    # entry of both sessions, including the CPI two-way chop.\n    short_delta_flat_weekly:   float = 0.24\n    short_delta_trend_weekly:  float = 0.22\n    short_delta_strong_weekly: float = 0.18\n    em_band_lo_weekly:         float = 0.55\n    em_band_hi_weekly:         float = 2.10\n    # Weekly CONDOR shorts are sanity-banded in the weekly chain\'s own\n    # ATM straddle (expiry horizon), not the shrinking intraday EM.\n    em_band_hi_condor_weekly:  float = 1.35\n    # Weekly wings (multi-day vega) are inherently pricier relative to\n    # their shorts than 0DTE wings; 0.50 was calibrated for expiry day.\n    wing_cost_frac_max_weekly: float = 0.58\n    # On DTE3/4 RANGE sessions with ADX in [trend, strong) the price\n    # classifier still says RANGE (mean-reverting, not trending); allow\n    # a WIDE condor (shorts forced to the strong-delta target below) up\n    # to the strong-ADX cutoff, at a size discount.\n    range_adx_wide_max:        float = 28.0\n    range_adx_wide_size:       float = 0.80\n    # UNCLEAR OI positioning on an otherwise textbook range day\n    # (rich VRP, narrow OR, flat ADX, price = RANGE) previously banned\n    # the symmetric condor outright on DTE3/4. OI positioning is a\n    # confirmation, not a prerequisite, for a delta-neutral structure;\n    # trade it at this size discount.\n    unclear_range_size_weekly: float = 0.75\n    # EV-gate adverse-excursion calibration for fresh weeklies: the\n    # greeks-carry "stop severity" assumed an instantaneous move at\n    # entry delta with a 1.25 stress factor and ZERO theta credit. The\n    # real exit ladder (spot proximity ~40pts inside the short)\n    # realised 4-8pt losses on 28-60pt credits across the 08-10 Sep\n    # replays, i.e. ~2.5-3x less than the 18-35pt the model charged.\n    # Apply this discount to the carry on DTE >= 2 (theta over the\n    # intended multi-hour hold). 0DTE keeps the old conservative value.\n    ev_carry_discount_dte2p:   float = 0.62\n    # Fast intraday trend timeframe (15m ADX cannot mature intraday).\n    adx_fast_res',
          'weekly config fields'),
@@ -99,6 +104,9 @@ PATCHES = {
         ('from requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\n# ─────────────────────────────────────────────\n# TIMEZONE SETUP\n# ─────────────────────────────────────────────',
          'from requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\n# ─────────────────────────────────────────────\n# CONSOLE ENCODING (Windows cp1252 safety)\n# ─────────────────────────────────────────────\n# Every CLI/backtest harness prints Unicode box-drawing tables; a\n# legacy cp1252 console (stock Windows PowerShell/cmd before UTF-8 was\n# the default) otherwise crashes the run with UnicodeEncodeError at the\n# first banner. core is imported by every entry point (main, the\n# engines, backtest_engine), so this one-time reconfigure fixes the\n# whole suite. It is a no-op on UTF-8 terminals and where the stream is\n# redirected/replaced by a test harness.\nfor _stream in (sys.stdout, sys.stderr):\n    try:\n        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]\n    except (AttributeError, ValueError, OSError):\n        pass\n\n# ─────────────────────────────────────────────\n# TIMEZONE SETUP\n# ─────────────────────────────────────────────',
          'rev2: UTF-8 console bootstrap (Windows cp1252 fix)'),
+        ('        # Windows\n        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 45)),\n        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),\n        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 0)),\n        tuesday_hard_exit=_get_time(env, "TUESDAY_HARD_EXIT", dtime(15, 0)),\n        tuesday_last_entry=_get_time(env, "TUESDAY_LAST_ENTRY", dtime(12, 30)),\n',
+         '        # Windows\n        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 45)),\n        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),\n        # Defined-risk, non-expiry NIFTY positions may remain open until\n        # 15:20 IST, leaving a small but tradeable final-theta window while\n        # deliberately flattening before the end-of-session liquidity taper.\n        # Tuesday / 0DTE continues to use its separate 15:00 hard exit\n        # (data_engine overrides the window on Tuesday 0DTE sessions).\n        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 20)),\n        tuesday_hard_exit=_get_time(env, "TUESDAY_HARD_EXIT", dtime(15, 0)),\n        tuesday_last_entry=_get_time(env, "TUESDAY_LAST_ENTRY", dtime(12, 30)),\n',
+         'rev3: non-expiry defined-risk hard exit 15:00 -> 15:20'),
     ]},
     'regime_engine.py': {'target': 'ce9849fd2603930eca039471d52e461b90114461c9a2e081973bfc7cf1fc6372', 'tail': '\n', 'edits': [
         ('.\n            if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE):\n                if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):',
@@ -293,7 +301,7 @@ def main():
     print("\n=== patch complete ===")
     print("Validated replay P&L (backtest_engine.py, real DBs):")
     print("  2026-09-08 DTE0  Rs 1,046.72  (unchanged - the 0DTE path)")
-    print("  2026-09-09 DTE4  Rs 1,104.73  (was Rs 69.93)")
+    print("  2026-09-09 DTE4  Rs 1,133.23  (was Rs 69.93)")
     print("  2026-09-10 DTE3  Rs 1,340.30  (was Rs 1,062.77)")
 
 
