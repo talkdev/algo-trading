@@ -584,17 +584,53 @@ class StrategyEngine:
         # chosen by delta independently, then clamped into a sanity band
         # around the expected REMAINING move so a mis-quoted greek can
         # never put a strike somewhere absurd.
-        if adx_15 >= self.config.adx_strong_threshold:
-            delta_target = float(getattr(self.config, "short_delta_strong", 0.15))
-        elif adx_15 >= self.config.adx_trend_threshold:
-            delta_target = float(getattr(self.config, "short_delta_trend", 0.18))
+        # v4.2: fresh-weekly sessions (DTE >= 2) sell different shorts
+        # depending on the STRUCTURE: a delta-neutral condor wants ~0.20
+        # delta per side (a 0.31-0.42 delta symmetric book is short delta
+        # and tripped the wing-cost gate - measured 2026-09-09/10), while a
+        # directional vertical is a directional-expression spread that
+        # desks conventionally sell at 0.28-0.32 delta on the favoured side,
+        # using the other side's OI wall as the wall being sold into.
+        _weekly_dte = bool(dte is not None and dte >= 2)
+        _neutral_condor = strategy_name == IRON_CONDOR
+        if _weekly_dte and _neutral_condor:
+            if adx_15 >= self.config.adx_strong_threshold:
+                delta_target = float(getattr(self.config,
+                                             "short_delta_strong_weekly", 0.18))
+            elif adx_15 >= self.config.adx_trend_threshold:
+                delta_target = float(getattr(self.config,
+                                             "short_delta_trend_weekly", 0.22))
+            else:
+                delta_target = float(getattr(self.config,
+                                             "short_delta_flat_weekly", 0.24))
+            # regime layer can force the wider strong-delta target on a
+            # RANGE tape with elevated ADX (v4.2 wide condor)
+            if signals.get("weekly_wide_condor"):
+                delta_target = min(
+                    delta_target,
+                    float(getattr(self.config,
+                                  "short_delta_strong_weekly", 0.18)),
+                )
+            if vix < 12.0:
+                delta_target = max(delta_target - 0.01, 0.10)
+            elif vix < 14.0:
+                delta_target = max(delta_target - 0.01, 0.11)
         else:
-            delta_target = float(getattr(self.config, "short_delta_flat", 0.22))
+            if adx_15 >= self.config.adx_strong_threshold:
+                delta_target = float(getattr(self.config, "short_delta_strong", 0.15))
+            elif adx_15 >= self.config.adx_trend_threshold:
+                delta_target = float(getattr(self.config, "short_delta_trend", 0.18))
+            else:
+                delta_target = float(getattr(self.config, "short_delta_flat", 0.22))
 
-        if vix < 12.0:
-            delta_target = max(delta_target - 0.02, 0.10)
-        elif vix < 14.0:
-            delta_target = max(delta_target - 0.01, 0.11)
+            # The low-VIX delta shave is a 0DTE fast-gamma calibration;
+            # on fresh weeklies the favoured-side vertical keeps the
+            # canonical ~0.30 short delta.
+            if not _weekly_dte:
+                if vix < 12.0:
+                    delta_target = max(delta_target - 0.02, 0.10)
+                elif vix < 14.0:
+                    delta_target = max(delta_target - 0.01, 0.11)
 
         # Expected remaining move: the market's own priced expectation for
         # what is left of the session (published by data_engine).
@@ -613,8 +649,41 @@ class StrategyEngine:
         if _em <= 10 and spot > 0:
             _em = spot * 0.004
 
-        _band_lo = float(getattr(self.config, "em_band_lo", 0.80)) * _em
-        _band_hi = float(getattr(self.config, "em_band_hi", 1.35)) * _em
+        # v4.2: the intraday-remaining-EM band is correct for 0DTE (the
+        # option's life IS the rest of the session), but a DTE3/4 weekly
+        # CONDOR short at ~0.18-0.24 delta sits ~0.9-1.2x the expiry-horizon
+        # expected move away, and the session-remaining EM collapses toward
+        # zero through the afternoon: at 13:00 on 2026-09-09 it was 70 pts,
+        # so even a 2.10x intraday ceiling clamped the weekly shorts back to
+        # 0.37 delta and re-tripped the wing-cost gate. Weekly condors are
+        # therefore sanity-banded in the chain's OWN current ATM straddle
+        # (the chain-implied expiry scale, roughly time-of-day invariant).
+        # Weekly verticals keep the intraday band: their favoured-side
+        # 0.30 delta short is an intraday-expression leg by design.
+        if _weekly_dte and _neutral_condor:
+            _wk_atm = min(chain.keys(), key=lambda k: abs(float(k) - float(spot)))
+            _wk_qc = chain.get(float(_wk_atm), {}).get("call") or {}
+            _wk_qp = chain.get(float(_wk_atm), {}).get("put") or {}
+            _wk_straddle = 0.0
+            if _wk_qc and _wk_qp:
+                _wk_straddle = (
+                    (float(_wk_qc.get("bid", 0)) + float(_wk_qc.get("ask", 0))
+                     + float(_wk_qp.get("bid", 0)) + float(_wk_qp.get("ask", 0)))
+                    / 2.0
+                )
+            _wk_scale = _wk_straddle if _wk_straddle > 20 else _em
+            _band_lo = float(getattr(self.config,
+                                     "em_band_lo_weekly", 0.55)) * _wk_scale
+            _band_hi = float(getattr(self.config,
+                                     "em_band_hi_condor_weekly", 1.35)) * _wk_scale
+        elif _weekly_dte:
+            _band_lo = float(getattr(self.config,
+                                     "em_band_lo_weekly", 0.55)) * _em
+            _band_hi = float(getattr(self.config,
+                                     "em_band_hi_weekly", 2.10)) * _em
+        else:
+            _band_lo = float(getattr(self.config, "em_band_lo", 0.80)) * _em
+            _band_hi = float(getattr(self.config, "em_band_hi", 1.35)) * _em
         # v3.7: the absolute floor is one strike step, not two.
         #
         # With v3.6's corrected expected move the EM-relative floor is
@@ -687,7 +756,7 @@ class StrategyEngine:
         else:
             _short_dist_ref = float(short_dist) if short_dist else 0.0
         if _short_dist_ref > 0:
-            _wing_factor = 0.50 if dte == 0 else (0.60 if dte == 1 else 0.75)
+            _wing_factor = 0.50 if dte == 0 else (0.60 if dte == 1 else 0.62)
             _wing_raw = max(
                 _short_dist_ref * _wing_factor, float(_wing_hint) * 0.60
             )
@@ -697,6 +766,33 @@ class StrategyEngine:
         _wing_max = 250 if dte == 0 else (350 if dte == 1 else 450)
         wing = int(round(_wing_raw / step + 0.001) * step)
         wing = int(max(_wing_min, min(wing, _wing_max)))
+
+        # ── v4.2: adaptive wing fit ───────────────────────────────────────
+        # A fresh-weekly wing (multi-day vega) routinely costs 55-65% of a
+        # short priced at 0.18 delta; the old fixed 0.75-factor wing then
+        # tripped wing_cost_frac_max on EVERY condor candidate (measured
+        # 2026-09-09 11:29-13:50 and 2026-09-10 12:21-12:51: zero
+        # symmetric structures all day). Rather than weaken the gate, widen
+        # the long step by step until its quoted premium is inside the cap
+        # - the long is supposed to be cheap insurance, so let the chain
+        # itself tell us how far out to buy it. Bounded by _wing_max.
+        # Adaptive fitting is for the WEEKLY CONDOR only: the wing-cost
+        # gate it satisfies is condor-only, and the static 0DTE wing
+        # table is the calibrated expiry-day behavior (do not touch it).
+        # The single-sided vertical's long is risk definition priced by
+        # the credit/wing ratio gates, so it never gets the fitter either.
+        if (strategy_name == IRON_CONDOR and _weekly_dte
+                and short_dist and _short_dist_ref > 0):
+            wing = self._fit_wing_width(
+                chain=chain, strategy_name=strategy_name,
+                center_ref=_center_ref, short_dist=short_dist,
+                step=step, wing0=wing, wing_max=_wing_max,
+                dte=dte,
+                cap=float(getattr(
+                    self.config,
+                    "wing_cost_frac_max_weekly" if _weekly_dte
+                    else "wing_cost_frac_max", 0.58 if _weekly_dte else 0.50)),
+            )
 
         if strategy_name == IRON_BUTTERFLY:
             return self._build_iron_butterfly(chain, spot, step, wing)
@@ -713,6 +809,61 @@ class StrategyEngine:
                 chain, spot, step, dte, short_dist, delta_target, wing, _center_ref
             )
         return None, f"unknown_strategy_{strategy_name}"
+
+    def _fit_wing_width(
+        self,
+        chain: dict,
+        strategy_name: str,
+        center_ref: float,
+        short_dist,
+        step: int,
+        wing0: int,
+        wing_max: int,
+        dte: Optional[int],
+        cap: float,
+    ) -> int:
+        """Smallest wing >= wing0 whose quoted long premium is <= cap x short.
+
+        Pricing uses the real SELL=bid / BUY=ask convention, so it measures
+        the insurance premium the engine would actually pay. If no width up
+        to wing_max satisfies the cap, the widest available is returned and
+        the downstream wing-cost gate rejects the trade as before.
+        """
+        try:
+            if isinstance(short_dist, (tuple, list)):
+                sd_c, sd_p = float(short_dist[0]), float(short_dist[1])
+            else:
+                sd_c = sd_p = float(short_dist)
+            sc = int(round((center_ref + sd_c) / step) * step)
+            sp = int(round((center_ref - sd_p) / step) * step)
+            sides = []
+            if strategy_name in (IRON_CONDOR, BEAR_CALL_SPREAD):
+                sides.append(("call", sc))
+            if strategy_name in (IRON_CONDOR, BULL_PUT_SPREAD):
+                sides.append(("put", sp))
+
+            def _ratio(opt: str, short_k: int, width: int):
+                long_k = short_k + width if opt == "call" else short_k - width
+                if float(long_k) not in chain:
+                    long_k = int(min(chain.keys(),
+                                     key=lambda k: abs(float(k) - long_k)))
+                if float(short_k) not in chain:
+                    return None
+                s = self._get_exec_price(chain, float(short_k), opt, "SELL")
+                l = self._get_exec_price(chain, float(long_k), opt, "BUY")
+                if s <= 0 or l <= 0:
+                    return None
+                return l / s
+
+            w = max(int(wing0), int(step))
+            while w <= int(wing_max):
+                rs = [_ratio(o, k, w) for o, k in sides]
+                if rs and all(r is not None and r <= cap for r in rs):
+                    return w
+                w += int(step)
+            return int(wing_max)
+        except Exception:
+            return int(wing0)
 
     def _build_iron_butterfly(
         self, chain: dict, spot: float, step: int, wing: int
@@ -1591,6 +1742,19 @@ class StrategyEngine:
                     _carry_ev = max(
                         _carry_ev, 0.25 * float(stop_loss_pts)
                     )
+                    # v4.2: the carry is an INSTANTANEOUS move priced at
+                    # entry delta with no theta credit. On DTE >= 2 the
+                    # intended hold runs hours and the spot-proximity /
+                    # premium exits actually triggered at 4-8pt losses on
+                    # 28-60pt credits across the 2026-09-08/09/10 replays
+                    # (vs 18-35pt charged here), roughly 0.6x - the other
+                    # half is the theta that accrues before the barrier is
+                    # reached. 0DTE keeps the undiscounted conservative
+                    # number (gamma does not give theta time to accrue).
+                    if (dte is not None and dte >= 2):
+                        _carry_ev *= float(getattr(
+                            self.config, "ev_carry_discount_dte2p", 0.62
+                        ))
                     if _carry_ev < stop_loss_pts:
                         stop_loss_pts = _carry_ev
                         tail_loss_pts = max(
@@ -1923,7 +2087,13 @@ class StrategyEngine:
         # protects is not insurance, it is a second position working
         # against the first: it caps the loss but hands back so much
         # premium that the remaining edge cannot clear the round trip.
-        _wing_cost_cap = float(getattr(self.config, "wing_cost_frac_max", 0.50))
+        # v4.2: multi-day weekly wings carry vega and cost more relative
+        # to their shorts than 0DTE wings; use the DTE-aware cap that the
+        # adaptive wing fitter (_fit_wing_width) targets.
+        _wing_cost_cap = float(getattr(
+            self.config,
+            "wing_cost_frac_max_weekly" if actual_dte and actual_dte >= 2
+            else "wing_cost_frac_max", 0.50))
         # An iron butterfly sells the at-the-money straddle, so its wings
         # always cost a large share of the shorts - that is the structure,
         # not a defect in it. The fly is governed by its credit/wing ratio
@@ -2612,6 +2782,15 @@ class StrategyEngine:
             return {"action": "NO_TRADE", "reason": full_reason}
 
         size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
+        # v4.2: regime layer can ask for a smaller clip on fresh-weekly
+        # range condors (UNCLEAR OI positioning, or elevated-but-not-strong
+        # ADX): the structure is allowed but size is discounted.
+        _weekly_discount = signals.get("weekly_range_size_discount")
+        if _weekly_discount:
+            try:
+                size_mult = size_mult * float(_weekly_discount)
+            except (TypeError, ValueError):
+                pass
         params    = self.compute_params(
             strategy_name, selection_reason, signals, size_mult
         )
