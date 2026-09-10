@@ -557,3 +557,25 @@ It is year 2026 so use NIFTY options rules and NIFTY intraday options behaviour 
 go deeper and analyze again all the algorithm only regarding proftability ,accuracy ,errors or bugs.
 
 After your analysis just tell me count nothing else  how many issues identified including the previous ones.
+
+
+
+Do not hallucinate.
+You can run backtest_engine.py against the DB (python backtest_engine.py --db data/per_day/nifty_algo_2026-09-08.db --from 2026-09-08 --to 2026-09-08) to replay the trades against the modified code and get clear picture of trade.
+on 8th and 9th some how you created one trade but that logic did not work for a range bound day of 10th. 
+your goal is to modify the code in a way that it gives a profitable trade on 8th 9th and 10th.
+I want you to analyze the NIFTY options intraday algo trade engine from scratch again in a more deeper way regarding profitability and accuracy not for errors or bugs.
+Your goal is to dive deep and figure out all the changes that would make this nifty options intraday algo trading engine profitable in real market conditions specifically for nifty intraday options trading.
+do not hallucinate.
+Use approach of how professional and established nifty options intraday algo trader use.
+It is year 2026 so use NIFTY options rules and NIFTY intraday options behaviour accordingly.
+below are the public repository links of the nifty intraday options algo trade engine python files
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/strategy_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/regime_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/main.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/execution_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/eod_report.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/data_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/core.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/calibration_engine.py
+https://raw.githubusercontent.com/talkdev/algo-trading/refs/heads/main/backtest_engine.py
