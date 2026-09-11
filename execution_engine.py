@@ -1431,8 +1431,17 @@ class ExecutionEngine:
                 # scratch. The give-back is cut to a quarter and the lock is
                 # floored so a locked trade cannot finish worse than covering
                 # its own round trip.
+                # v1: a quarter give-back chokes weekly winners on normal
+                # afternoon retracements - the stop sits inside routine
+                # premium noise and converts it into stop-outs (measured
+                # 2026-09-10: locked win stopped at +873, held-to-close
+                # worth +1,500+). Widen to one HALF of achieved profit -
+                # the professional trail for intraday premium - while the
+                # v3.1 entry-minus-round-trip floor below still guarantees
+                # a locked trade cannot finish red. The time-target ladder
+                # (P6) and the 15:20 hard exit bound the ride.
                 _achieved = gross_credit - liq_premium
-                _keep = _achieved * 0.25
+                _keep = _achieved * 0.50
                 new_stop = liq_premium + _keep
                 _rt_cost = self._round_trip_cost_pts(open_legs, chain)
                 new_stop = min(new_stop, max(entry_credit - _rt_cost, 0.05))

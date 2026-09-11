@@ -1757,9 +1757,17 @@ class RegimeClassifier:
         r_str        = float(signals.get("resistance_strength") or 0.0)
 
         # ── DTE 2 exception ───────────────────────────────────────────────
+        # v1: the first route used to fire on STRONG_SELL + STRONG_RANGE
+        # alone, with no OR/ADX/confidence gates - it sold a condor into
+        # an elevated-ADX whipsaw dip (measured 2026-09-11 10:28-11:07:
+        # ADX 21-37, entered 10:35, lost Rs 142). Both Friday routes now
+        # require the same strict stack: rich VRP, range positioning, a
+        # contained opening range and a flat ADX.
         if dte == 2:
             if (vol == VolatilityRegime.STRONG_SELL_PREMIUM and
-                    pos == PositioningRegime.STRONG_RANGE):
+                    pos == PositioningRegime.STRONG_RANGE and
+                    or_condition in ("VERY_NARROW", "NARROW") and
+                    adx_15 < self.config.adx_trend_threshold):
                 return (
                     FinalRegime.PREMIUM_SELL_RANGE,
                     f"RANGE_DTE2_EXCEPTION_STRONG_SELL_STRONG_RANGE",
@@ -1768,7 +1776,16 @@ class RegimeClassifier:
             # Tuesday-expiry calendar and the old single condition (STRONG
             # sell AND STRONG range together) is rare enough that Friday was
             # effectively closed too.
-            if (vol == VolatilityRegime.SELL_PREMIUM and
+            # v1: the second route required SELL vol EXACTLY, so the
+            # stronger edge signal (STRONG_SELL + RANGE on a contained,
+            # flat-ADX tape) was blocked where the weaker one passed - an
+            # incoherence. STRONG_SELL joins the same strict stack; nothing
+            # else about Friday range caution changes (measured 2026-09-11:
+            # every broader Friday range route - elevated-ADX condor,
+            # UNCLEAR positioning, wide-ADX dip - lost money, so Friday
+            # stays a flat-ADX-or-nothing tape).
+            if (vol in (VolatilityRegime.SELL_PREMIUM,
+                        VolatilityRegime.STRONG_SELL_PREMIUM) and
                     pos == PositioningRegime.RANGE and
                     or_condition in ("VERY_NARROW", "NARROW") and
                     adx_15 < self.config.adx_trend_threshold):
@@ -1968,13 +1985,26 @@ class RegimeClassifier:
         dte    = signals.get("actual_dte")
         adx_15 = float(signals.get("adx_15") or 0.0)
 
-        # DTE 2 exception
+        # DTE 2 exception (v1: mature-ADX confirmation required). An
+        # immature fast-ADX print above 30 is drift noise, not a trend
+        # (measured 2026-09-11: period-6 Wilder on 13 five-minute bars
+        # printed 46 on a 24pt opening-range micro-break and the exception
+        # sold premium straight into an IV expansion). classify_price
+        # already treats immature ADX with suspicion (Step 3); the Friday
+        # trend exceptions must not trade what the price classifier doubts.
         if dte == 2:
+            if (vol == VolatilityRegime.STRONG_SELL_PREMIUM and
+                    adx_15 > 30 and
+                    signals.get("adx_15_mature")):
+                return (
+                    FinalRegime.PREMIUM_SELL_BEAR,
+                    f"DOWNTREND_DTE2_EXCEPTION_ADX_{adx_15:.0f}_MATURE",
+                )
             if (vol == VolatilityRegime.STRONG_SELL_PREMIUM and
                     adx_15 > 30):
                 return (
-                    FinalRegime.PREMIUM_SELL_BEAR,
-                    f"DOWNTREND_DTE2_EXCEPTION_ADX_{adx_15:.0f}",
+                    FinalRegime.NO_TRADE,
+                    f"DOWNTREND_DTE2_ADX_{adx_15:.0f}_IMMATURE",
                 )
             return FinalRegime.NO_TRADE, "DOWNTREND_DTE2_NO_EXCEPTION"
 
@@ -2013,13 +2043,26 @@ class RegimeClassifier:
         dte    = signals.get("actual_dte")
         adx_15 = float(signals.get("adx_15") or 0.0)
 
-        # DTE 2 exception
+        # DTE 2 exception (v1: mature-ADX confirmation required). An
+        # immature fast-ADX print above 30 is drift noise, not a trend
+        # (measured 2026-09-11: period-6 Wilder on 13 five-minute bars
+        # printed 46 on a 24pt opening-range micro-break and the exception
+        # sold premium straight into an IV expansion). classify_price
+        # already treats immature ADX with suspicion (Step 3); the Friday
+        # trend exceptions must not trade what the price classifier doubts.
         if dte == 2:
+            if (vol == VolatilityRegime.STRONG_SELL_PREMIUM and
+                    adx_15 > 30 and
+                    signals.get("adx_15_mature")):
+                return (
+                    FinalRegime.PREMIUM_SELL_BULL,
+                    f"UPTREND_DTE2_EXCEPTION_ADX_{adx_15:.0f}_MATURE",
+                )
             if (vol == VolatilityRegime.STRONG_SELL_PREMIUM and
                     adx_15 > 30):
                 return (
-                    FinalRegime.PREMIUM_SELL_BULL,
-                    f"UPTREND_DTE2_EXCEPTION_ADX_{adx_15:.0f}",
+                    FinalRegime.NO_TRADE,
+                    f"UPTREND_DTE2_ADX_{adx_15:.0f}_IMMATURE",
                 )
             return FinalRegime.NO_TRADE, "UPTREND_DTE2_NO_EXCEPTION"
 
