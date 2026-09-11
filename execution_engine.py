@@ -1151,6 +1151,143 @@ class ExecutionEngine:
     # POSITION MONITORING — 7-PRIORITY EXIT SYSTEM
     # ─────────────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────────────
+    # v5 — NET-DEBIT (LONG-PREMIUM) EXIT LADDER
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _monitor_debit_position(
+        self,
+        position:         dict,
+        open_legs:        List[dict],
+        chain:            dict,
+        current_time:     dtime,
+        spot:             float,
+        current_premium:  float,
+        liq_premium:      float,
+    ) -> Tuple[str, int, dict]:
+        """Exit ladder for a net-debit structure (the engine's own premium).
+
+        The 7-priority ladder in monitor_position is written for a SOLD
+        structure: it stops when the premium EXPANDS, targets when it DECAYS,
+        locks profit against a credit, and derives its spot backstop from a
+        short strike. A bought option inverts every one of those, and
+        leaving a debit position to fall through that ladder means it has no
+        stop at all — which is how a Rs 6,000 breakout ticket becomes a
+        lottery ticket. So a long position is managed on the value of what is
+        owned: liquidation value for decisions the engine can act on, mid
+        value for the ratchet, so one wide print cannot lock in a fake gain.
+
+        Priorities: premium stop (loss), ratcheted profit lock (free trade),
+        target (planned capture), late-window flatten (never carry a long
+        option into the close), hard exit.
+        """
+        cfg = self.config
+
+        # The credit ladder's marks are "cash needed to close". For a net
+        # debit position the position's own value is therefore their
+        # negative, and entry_credit is stored negative (the premium paid).
+        entry_value = abs(float(position.get("entry_credit") or 0.0))
+        value       = -float(liq_premium)
+        value_mid   = -float(current_premium)
+        if entry_value <= 0:
+            return "HOLD", 0, {"reason_detail": "debit_position_no_entry_value"}
+
+        raw = {}
+        try:
+            raw = json.loads(position.get("raw_params_json") or "{}")
+        except Exception:
+            raw = {}
+
+        stop   = float(position.get("stop_premium") or raw.get("stop_premium") or 0.0)
+        target = float(position.get("target_premium") or raw.get("target_premium") or 0.0)
+        lock   = float(raw.get("profit_lock_trigger") or
+                       (entry_value * (1.0 + float(getattr(cfg, "momentum_lock_trigger", 0.25)))))
+        rt_cost = self._round_trip_cost_pts(open_legs, chain)
+
+        # ── D1: premium stop ─────────────────────────────────────────────
+        if stop > 0 and value <= stop:
+            self.logger.warning(
+                f"DEBIT PREMIUM STOP: {position['strategy_name']} "
+                f"value={value:.2f} <= stop={stop:.2f} (entry {entry_value:.2f})"
+            )
+            return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                "reason_detail": f"momentum_premium_stop_{value:.2f}<={stop:.2f}",
+                "current_premium": current_premium,
+                "liquidation_premium": liq_premium,
+            }
+
+        # ── D2: profit lock, ratcheted upward on the mid ─────────────────
+        activated = bool(position.get("profit_lock_activated"))
+        locked    = position.get("profit_lock_stop_level")
+        if value_mid >= lock:
+            keep = float(getattr(cfg, "momentum_lock_keep_frac", 0.50))
+            new_level = max(
+                value_mid - max(value_mid - entry_value, 0.0) * keep,
+                entry_value + rt_cost,
+            )
+            cur_level = float(locked or 0.0)
+            if not activated or new_level > cur_level:
+                self.db.update(
+                    "positions",
+                    {
+                        "profit_lock_activated":  1,
+                        "profit_lock_stop_level": new_level,
+                        "stop_premium":           max(stop, new_level),
+                        "updated_at":             now_ist().isoformat(),
+                    },
+                    {"position_id": position["position_id"]},
+                )
+                return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, {
+                    "reason_detail": "momentum_profit_lock_ratchet",
+                    "new_level": new_level,
+                }
+            if value <= new_level:
+                return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+                    "reason_detail": "momentum_lock_given_back",
+                    "locked_level": new_level,
+                }
+
+        # ── D3: planned target ───────────────────────────────────────────
+        if target > 0 and value >= target:
+            self.logger.info(
+                f"DEBIT TARGET: {position['strategy_name']} value={value:.2f} "
+                f">= target={target:.2f}"
+            )
+            return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                "reason_detail": "momentum_target_reached",
+                "value": value,
+            }
+
+        # ── D4: never carry a long option into the closing bell ──────────
+        try:
+            hard_exit = datetime.strptime(
+                position.get("hard_exit_time") or "15:00", "%H:%M").time()
+        except Exception:
+            hard_exit = cfg.hard_exit_time
+        mins_left = (
+            datetime.combine(now_ist().date(), hard_exit)
+            - datetime.combine(now_ist().date(), current_time)
+        ).total_seconds() / 60.0
+        window = float(getattr(cfg, "momentum_final_window_min", 45))
+        if mins_left <= window:
+            if value >= entry_value + rt_cost:
+                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                    "reason_detail": "momentum_flat_before_close",
+                    "minutes_left": mins_left,
+                }
+        if current_time >= hard_exit:
+            return "HARD_EXIT_15:00", EXIT_PRIORITY_HARD_EXIT, {
+                "hard_exit_time": str(hard_exit),
+                "current_time": str(current_time),
+            }
+
+        return "HOLD", 0, {
+            "current_premium":     current_premium,
+            "liquidation_premium": liq_premium,
+            "debit_value":         value,
+            "entry_value":         entry_value,
+        }
+
     def monitor_position(
         self, position: dict, signals: dict
     ) -> Tuple[str, int, dict]:
@@ -1213,6 +1350,18 @@ class ExecutionEngine:
         opening_straddle = float(position.get("opening_straddle_at_entry") or 0)
         profit_lock_activated = bool(position.get("profit_lock_activated"))
         profit_lock_stop_level = position.get("profit_lock_stop_level")
+
+        # ── v5: a net-debit position runs its own ladder ─────────────────
+        # Everything below is written for a structure that was SOLD: premium
+        # stops on expansion, targets on decay, a spot backstop derived from a
+        # short strike, a cheap-buyback on the short legs. A bought option
+        # inverts all of it, and falling through would leave a long position
+        # with no stop at all until the hard exit.
+        if entry_credit < 0 or str(position.get("strategy_type") or "").upper() == "BUY":
+            return self._monitor_debit_position(
+                position, open_legs, chain, current_time, spot,
+                current_premium, liq_premium,
+            )
 
         # ── Priority 1: Delta breach ──────────────────────────────────────
         # Short leg delta > 0.40 → close immediately
