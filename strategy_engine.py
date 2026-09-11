@@ -353,7 +353,16 @@ class StrategyEngine:
         engine's own DOWN gap (0.4%+) still unfilled with spot heavy under
         the previous close right now, and a real call-side OI wall above
         spot to sell into.
+
+        v1: no single-sided gap fade on Fridays (DTE 2). The lean was
+        measured on a fresh-weekly (DTE 4) gap day; into the weekend the
+        gap-day tape is dominated by weekly expiry positioning and the
+        directional fade has no edge (measured 2026-09-11: forcing the
+        bear call off this lean loses ~Rs 1,000 into the data end).
+        Friday range premium is harvested delta-neutral only.
         """
+        if signals.get("actual_dte") == 2:
+            return False, "lean_skipped_friday_dte2_delta_neutral_only"
         if signals.get("price_regime") != "RANGE":
             return False, "lean_needs_range_price"
         if signals.get("positioning_regime") not in ("RANGE", "BEARISH"):
