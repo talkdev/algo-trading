@@ -26,6 +26,15 @@ IRON_CONDOR      = "IRON_CONDOR"
 IRON_BUTTERFLY   = "IRON_BUTTERFLY"
 BULL_PUT_SPREAD  = "BULL_PUT_SPREAD"
 BEAR_CALL_SPREAD = "BEAR_CALL_SPREAD"
+# v5: long-premium expressions of a confirmed intraday trend. These are the
+# only BUY-side structures in the engine and they exist because a
+# premium-selling book has no answer at all to a trending session on a
+# contract with two-plus sessions of remaining value: the vertical it would
+# sell decays by ~2 points a DAY, so an intraday hold earns less than the
+# round trip costs, while the move itself is worth 40+.
+LONG_CALL        = "LONG_CALL"
+LONG_PUT         = "LONG_PUT"
+MOMENTUM_STRATEGIES = (LONG_CALL, LONG_PUT)
 SELL = "SELL"
 BUY  = "BUY"
 
@@ -127,6 +136,28 @@ class StrategyEngine:
             (today_ist().isoformat(),),
         )
         return row["cnt"] if row else 0
+
+    def _count_momentum_entries(self) -> int:
+        """Momentum tickets booked today, read from the ledger not from memory.
+
+        state["momentum_entries"] is the live counter, but the daily cap has
+        to survive a mid-session restart, and a process that restarts at
+        11:30 with a long call already open has no memory of having taken it.
+        The positions table knows; the max of the two is the honest number.
+        """
+        names = tuple(MOMENTUM_STRATEGIES)
+        marks = ",".join("?" * len(names))
+        try:
+            row = self.db.query_one(
+                f"SELECT COUNT(*) AS cnt FROM positions "
+                f"WHERE trading_date=? AND strategy_name IN ({marks})",
+                (today_ist().isoformat(),) + names,
+            )
+        except Exception:
+            row = None
+        db_cnt = int(row["cnt"]) if row else 0
+        st_cnt = int(self.market_engine.state.get("momentum_entries", 0) or 0)
+        return max(db_cnt, st_cnt)
 
     def _minutes_to_time(self, t1: dtime, t2: dtime) -> float:
         dt1 = datetime.combine(today_ist(), t1)
@@ -2756,10 +2787,514 @@ class StrategyEngine:
         except Exception as e:
             self.logger.debug(f"Phantom trade logging error: {e}")
 
+    # ═════════════════════════════════════════════════════════════════
+    #  v5 — LONG-PREMIUM MOMENTUM EXPRESSION
+    # ═════════════════════════════════════════════════════════════════
+    #
+    # WHAT THIS IS
+    # A confirmed intraday trend on NIFTY is worth far more than a far-OTM
+    # weekly vertical pays for an intraday hold. When the sell side is
+    # refused — the DTE-2 (Friday) calendar branches, a wide opening range
+    # that is dangerous to sell into, or a vol regime the engine itself
+    # classifies as BUY_OPTIONS — the SAME directional read is expressed by
+    # buying the ATM-side option instead. It is not a new signal, it is a
+    # substitution of expression, and it is deliberately a fallback: the
+    # premium-selling routes keep priority whenever they are available.
+    #
+    # WHAT KEEPS IT SAFE
+    #   * trend regime + MEDIUM/HIGH confidence + fast-ADX confirmation
+    #   * structural breakout proof: spot beyond the OR extreme in the trend
+    #     direction AND beyond VWAP (the two things an intraday desk actually
+    #     uses to call a breakout, not a lagging ADX warm-up)
+    #   * never buys a vol top: IV EXPANDING/SPIKING, a straddle explosion or
+    #     a VIX gap-up over the previous close all veto it
+    #   * never chases an exhausted tape (day_move_used ceiling)
+    #   * never holds overnight, never trades expiry-day theta decay
+    #     (DTE >= 1), never enters inside the closing window
+    #   * maximum loss = premium paid, stop on the premium, profit lock and
+    #     trail on the way up, hard exit at the day's own exit bell
+    #   * one clip per day, sized on the stop distance inside the same
+    #     per-trade risk budget the credit book uses, same day cap
+    def _momentum_gate(
+        self,
+        signals:      dict,
+        block_reason: str = "",
+        _test_time:   Optional[dtime] = None,
+    ) -> Tuple[bool, str, int]:
+        """Decide whether a long-premium substitute may be considered.
+
+        Returns (allowed, why, direction) with direction +1 (calls) or
+        -1 (puts). Every refusal is explicit so the rejection census shows
+        exactly which condition the tape failed, the same way the sell-side
+        gates do.
+        """
+        cfg = self.config
+        if not bool(getattr(cfg, "momentum_enabled", True)):
+            return False, "momentum_disabled", 0
+
+        state = self.market_engine.state
+        cur   = _test_time if _test_time is not None else now_ist().time()
+
+        # ── substitution only: the sell side must have been refused ──────
+        reason = str(block_reason or "").lower()
+        markers = tuple(getattr(cfg, "momentum_block_markers", ())) or ()
+        if not any(str(m).lower() in reason for m in markers):
+            return False, f"momentum_sell_side_open({reason[:34]})", 0
+
+        # ── calendar: never 0DTE (theta cliff), never a stale far week ───
+        dte = signals.get("actual_dte")
+        if dte is None:
+            return False, "momentum_no_expiry_resolution", 0
+        try:
+            dte_i = int(dte)
+        except (TypeError, ValueError):
+            return False, "momentum_dte_unparseable", 0
+        if dte_i < int(getattr(cfg, "momentum_min_dte", 1)):
+            return False, f"momentum_dte_{dte_i}_below_min", 0
+        if dte_i > int(getattr(cfg, "momentum_max_dte", 4)):
+            return False, f"momentum_dte_{dte_i}_above_max", 0
+
+        # ── the read itself: a trend, not a range with drift ─────────────
+        price   = str(signals.get("price_regime") or "")
+        if price in ("UPTREND", "STRONG_UPTREND"):
+            direction = 1
+        elif price in ("DOWNTREND", "STRONG_DOWNTREND"):
+            direction = -1
+        else:
+            return False, f"momentum_needs_trend_got_{price or 'NONE'}", 0
+
+        if str(signals.get("confidence_level") or "") not in ("HIGH", "MEDIUM"):
+            return False, (
+                f"momentum_confidence_{signals.get('confidence_level')}_insufficient"
+            ), 0
+
+        try:
+            adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            adx = 0.0
+        if adx < float(getattr(cfg, "momentum_adx_min", 30.0)):
+            return False, f"momentum_adx_{adx:.0f}_below_min", 0
+
+        # ── breakout PROOF: through the opening range, in the trend side ─
+        spot = float(signals.get("spot") or 0.0)
+        if spot <= 0:
+            return False, "momentum_no_spot", 0
+        # The opening range is mandatory: it is the level the trend has to be
+        # measured against, and without it "momentum" is just a green candle.
+        or_high = float(signals.get("or_high") or 0.0)
+        or_low  = float(signals.get("or_low") or 0.0)
+        or_w    = float(signals.get("or_width") or 0.0)
+        if not signals.get("or_computed") or or_high <= 0 or or_low <= 0:
+            return False, "momentum_no_opening_range_to_confirm", 0
+        _need = max(5.0, or_w * float(getattr(cfg, "momentum_or_break_frac", 0.15)))
+        if direction > 0 and spot < or_high + _need:
+            return False, (
+                f"momentum_call_not_through_or_high_{spot:.0f}<{or_high + _need:.0f}"
+            ), 0
+        if direction < 0 and spot > or_low - _need:
+            return False, (
+                f"momentum_put_not_through_or_low_{spot:.0f}>{or_low - _need:.0f}"
+            ), 0
+        vwap = signals.get("vwap")
+        try:
+            vwap = float(vwap) if vwap else 0.0
+        except (TypeError, ValueError):
+            vwap = 0.0
+        if vwap > 0:
+            _vbuf = float(getattr(cfg, "momentum_vwap_buffer_pts", 8.0))
+            if direction > 0 and spot <= vwap + _vbuf:
+                return False, f"momentum_call_at_or_below_vwap_{vwap:.0f}", 0
+            if direction < 0 and spot >= vwap - _vbuf:
+                return False, f"momentum_put_at_or_above_vwap_{vwap:.0f}", 0
+
+        # ── do not buy a volatility top ─────────────────────────────────
+        if str(signals.get("iv_behavior") or "") in ("EXPANDING", "SPIKING"):
+            return False, "momentum_iv_expanding_no_chase", 0
+        if signals.get("straddle_expanding"):
+            return False, "momentum_straddle_expanding", 0
+        if signals.get("spot_velocity_block"):
+            return False, "momentum_spot_velocity_too_fast", 0
+        try:
+            _vx  = float(signals.get("vix") or 0.0)
+            _pvx = float(signals.get("prev_day_vix_close") or 0.0)
+        except (TypeError, ValueError):
+            _vx = _pvx = 0.0
+        if _vx > 0 and _pvx > 0:
+            _gap = (_vx / _pvx - 1.0) * 100.0
+            if _gap > float(getattr(cfg, "momentum_vix_gap_max_pct", 12.0)):
+                return False, f"momentum_vix_gap_{_gap:.0f}pct", 0
+
+        # ── freshness: a day that has already spent its priced range is
+        #    not a breakout, it is the trade everyone is already in ───────
+        try:
+            used = float(signals.get("day_move_used_pct") or 0.0)
+        except (TypeError, ValueError):
+            used = 0.0
+        if used >= float(getattr(cfg, "momentum_day_move_max_pct", 90.0)):
+            return False, f"momentum_day_move_used_{used:.0f}pct_exhausted", 0
+
+        # ── intraday-only timing ─────────────────────────────────────────
+        try:
+            entry_start = datetime.strptime(
+                state.get("entry_start", "09:45"), "%H:%M").time()
+            entry_end = datetime.strptime(
+                state.get("entry_end", "14:00"), "%H:%M").time()
+        except Exception:
+            entry_start = cfg.trading_window_start
+            entry_end   = cfg.trading_window_last_entry
+        try:
+            hard_exit = datetime.strptime(
+                state.get("hard_exit_time", "15:00"), "%H:%M").time()
+        except Exception:
+            hard_exit = cfg.hard_exit_time
+        if cur < entry_start:
+            return False, f"momentum_before_entry_window_{entry_start}", 0
+        if cur > entry_end:
+            return False, f"momentum_past_entry_window_{entry_end}", 0
+        mins_left = self._minutes_to_time(cur, hard_exit)
+        if mins_left < float(getattr(cfg, "momentum_min_minutes_left", 90)):
+            return False, (
+                f"momentum_only_{mins_left:.0f}min_before_hard_exit"
+            ), 0
+
+        # ── one clip a day, and never beside an open position ───────────
+        if self._count_momentum_entries() >= int(
+                getattr(cfg, "momentum_max_trades_per_day", 1)):
+            return False, "momentum_daily_limit_reached", 0
+        if self._count_open_positions() > 0:
+            return False, "momentum_position_open", 0
+        if state.get("daily_halted"):
+            return False, "momentum_daily_halt", 0
+        if signals.get("block_new_entries") or signals.get("circuit_breaker_suspected") \
+                or signals.get("vix_spike_detected"):
+            return False, "momentum_abort_active", 0
+        if signals.get("chain_stale"):
+            return False, "momentum_chain_stale", 0
+
+        return True, "momentum_gate_open", direction
+
+    def _momentum_pick_strike(
+        self,
+        chain:    dict,
+        spot:     float,
+        opt_type: str,
+    ) -> Tuple[Optional[float], Optional[str], float]:
+        """Pick the long strike: the trend-side option nearest 0.55 |delta|
+        whose premium is a sane fraction of spot. 0DTE-style far-OTM lottery
+        tickets and deep-ITM futures-substitutes are both out; this is the
+        strike a Nifty intraday desk actually buys on a breakout."""
+        step  = max(int(self.config.nifty_strike_step or 50), 1)
+        c02   = float(self.config.lot_size or 1)
+        cfg   = self.config
+        pmin  = spot * float(getattr(cfg, "momentum_prem_min_pct_of_spot", 0.0018))
+        pmax  = spot * float(getattr(cfg, "momentum_prem_max_pct_of_spot", 0.0090))
+        floor = float(getattr(cfg, "momentum_min_prem_pts", 20.0))
+        pmin  = max(pmin, floor)
+        atm   = int(round(spot / step) * step)
+        best_k, best_d, best_p = None, None, None
+        for strike, legs in chain.items():
+            try:
+                k = float(strike)
+            except (TypeError, ValueError):
+                continue
+            # A breakout ticket is ATM-or-further in the trend direction: a
+            # call below spot on an upside break is intrinsic, i.e. a futures
+            # substitute with theta, which is the worst of both.
+            if opt_type == "call" and k < atm - step:
+                continue
+            if opt_type == "put" and k > atm + step:
+                continue
+            opt = (legs or {}).get(opt_type) or {}
+            bid = float(opt.get("bid", 0) or 0)
+            ask = float(opt.get("ask", 0) or 0)
+            if bid <= 0 or ask <= 0:
+                continue
+            prem = ask
+            if prem < pmin or prem > pmax:
+                continue
+            try:
+                dlt = abs(float(opt.get("delta", 0) or 0))
+            except (TypeError, ValueError):
+                dlt = 0.0
+            if dlt < 0.35 or dlt > 0.75:
+                continue
+            score = abs(dlt - 0.55) * 1000.0 + abs(k - atm) / step
+            if best_d is None or score < best_d:
+                best_k, best_d, best_p = k, score, prem
+        if best_k is None:
+            return None, "momentum_no_strike_in_premium_and_delta_band", 0.0
+        return best_k, None, float(best_p)
+
+    def compute_momentum_params(
+        self,
+        direction:        int,
+        selection_reason: str,
+        signals:          dict,
+        size_mult:        float,
+    ) -> dict:
+        """Build a single-leg long-premium breakout position.
+
+        Deliberately separate from compute_params(): that function is a
+        credit-structure pipeline — it rejects non-positive net credit, gates
+        a wing against a short, prices a decay target and derives spot stop
+        levels from a short strike. None of that exists here. The economics
+        of a long option are premium, stop, target, and the same charge and
+        sizing discipline the rest of the engine pays.
+        """
+        cfg        = self.config
+        state      = self.market_engine.state
+        C02        = float(cfg.lot_size or 1)
+        expiry_str = signals.get("active_expiry")
+        actual_dte = signals.get("actual_dte")
+        if expiry_str is None or actual_dte is None:
+            return {"valid": False, "reason": "no_active_expiry"}
+
+        chain        = self.market_engine.last_chain
+        chain_expiry = self.market_engine.last_chain_expiry
+        if not chain:
+            return {"valid": False, "reason": "chain_unavailable"}
+        if chain_expiry is None or chain_expiry.isoformat() != expiry_str:
+            return {"valid": False, "reason": "chain_expiry_mismatch"}
+        if len(chain) < 10:
+            return {"valid": False, "reason": f"chain_only_{len(chain)}_strikes"}
+
+        spot = float(signals.get("spot") or 0.0)
+        if spot <= 0:
+            return {"valid": False, "reason": "spot_unavailable"}
+
+        opt_type   = "call" if direction > 0 else "put"
+        strat_name = LONG_CALL if direction > 0 else LONG_PUT
+        strike, err, _prem = self._momentum_pick_strike(chain, spot, opt_type)
+        if strike is None:
+            return {"valid": False, "reason": err}
+
+        ok, verr = self._validate_leg(chain, strike, opt_type, "BUY")
+        if not ok:
+            return {"valid": False, "reason": f"momentum_leg_invalid:{verr}"}
+        exec_price = self._get_exec_price(chain, strike, opt_type, "BUY")
+        if exec_price <= 0:
+            return {"valid": False, "reason": "momentum_no_exec_price"}
+
+        legs = [{
+            "strike":         strike,
+            "option_type":    opt_type,
+            "action":         "BUY",
+            "exec_price":     exec_price,
+            "bid":            float(chain[strike][opt_type].get("bid", 0) or 0),
+            "ask":            float(chain[strike][opt_type].get("ask", 0) or 0),
+            "ltp":            float(chain[strike][opt_type].get("ltp", 0) or 0),
+            "delta":          float(chain[strike][opt_type].get("delta", 0) or 0),
+            "gamma":          float(chain[strike][opt_type].get("gamma", 0) or 0),
+            "vega":           float(chain[strike][opt_type].get("vega", 0) or 0),
+            "theta":          float(chain[strike][opt_type].get("theta", 0) or 0),
+            "iv":             float(chain[strike][opt_type].get("iv", 0) or 0),
+            "oi":             int(chain[strike][opt_type].get("oi", 0) or 0),
+            "instrument_key": chain[strike][opt_type].get("instrument_key"),
+        }]
+
+        # ── economics, all of it in premium points per lot ──────────────
+        entry_slip   = self._compute_slippage(legs, is_exit=False)
+        _costs0      = self._compute_costs(legs, 1, "ENTRY")
+        entry_costs0 = _costs0["total_rupees"] / max(C02, 1.0)
+        friction_pts = self._round_trip_friction(legs, entry_costs0)
+
+        stop_frac = float(getattr(cfg, "momentum_stop_frac", 0.35))
+        stop_pts  = exec_price * stop_frac
+        # The real per-lot loss when the stop is taken: the premium
+        # give-back plus the round trip that had to be paid to find out.
+        risk_pts  = stop_pts + friction_pts
+        if risk_pts <= 0:
+            return {"valid": False, "reason": "momentum_non_positive_risk"}
+
+        # ── edge test: the planned capture must beat the ticket ─────────
+        target_frac = float(getattr(cfg, "momentum_target_frac", 0.60))
+        expected_pts = exec_price * target_frac
+        _min_over = float(getattr(cfg, "min_target_over_friction", 1.25))
+        if expected_pts < friction_pts * max(_min_over, 1.0):
+            return {
+                "valid": False,
+                "reason": (
+                    f"momentum_expected_capture_{expected_pts:.2f}pts_below_"
+                    f"{_min_over:.2f}x_friction_{friction_pts:.2f}pts"
+                ),
+            }
+
+        # ── size on the stop, inside the engine's per-trade budget ──────
+        current_capital = float(
+            state.get("current_capital", cfg.starting_capital) or cfg.starting_capital
+        )
+        budget  = float(cfg.max_risk_per_trade_pct or 0.006)
+        max_risk = (
+            current_capital * budget
+            * float(getattr(cfg, "momentum_risk_frac_of_budget", 1.0))
+        )
+        risk_per_lot  = risk_pts * C02
+        structural_risk_per_lot = exec_price * C02          # premium paid, all of it
+        raw_lots = max_risk / max(risk_per_lot, 1.0)
+        sched = max(float(size_mult or 1.0),
+                    float(getattr(cfg, "momentum_size_floor", 0.80)))
+        sized = raw_lots * sched
+        min_lots = float(getattr(cfg, "momentum_min_lots", 0.60))
+        if sized < min_lots:
+            if raw_lots >= 1.0:
+                sized = 1.0
+            else:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"momentum_risk_budget_allows_{sized:.2f}_lots_below_"
+                        f"min_{min_lots:.2f}"
+                    ),
+                }
+        day_label = state.get("day_label", "TUESDAY")
+        _eq = max((current_capital / float(cfg.starting_capital or 1.0)) ** 0.5, 0.35)
+        day_cap = max(1, int(LOT_CAPS_BY_DAY.get(day_label, 3) * _eq))
+        final_lots = max(1, min(int(round(sized)), day_cap))
+        # The sell side caps a position's STRUCTURAL loss (the margin that
+        # could actually be called if the stop never filled) at 1.5x the
+        # per-trade budget. A long option cannot lose more than the premium
+        # paid, and that premium is only fully lost if the contract is still
+        # open at expiry — which the hard exit forbids — so the tolerance is
+        # wider here, but it is a real cap: it is what stops a Rs 20 far-OTM
+        # ticket from being sized into 20 lots because each lot risks pence.
+        _struct_cap_mult = float(getattr(cfg, "momentum_structural_risk_cap_mult", 2.5))
+        if structural_risk_per_lot * final_lots > max_risk * _struct_cap_mult:
+            final_lots = max(
+                1, int(max_risk * _struct_cap_mult / max(structural_risk_per_lot, 1.0))
+            )
+        # capital outlay: a long option is paid for in full, in cash
+        debit_per_lot = structural_risk_per_lot + entry_costs0 * C02
+        if debit_per_lot * final_lots > current_capital * 0.80:
+            final_lots = max(1, int(current_capital * 0.80 / max(debit_per_lot, 1.0)))
+        if final_lots < 1:
+            return {"valid": False, "reason": "momentum_no_capital_for_one_lot"}
+
+        entry_costs_dict = self._compute_costs(legs, final_lots, "ENTRY")
+        entry_costs_pts  = entry_costs_dict["total_rupees"] / max(C02 * final_lots, 1.0)
+        net_debit        = exec_price + entry_costs_pts + entry_slip
+        target_premium   = net_debit * (1.0 + target_frac)
+        stop_premium     = net_debit * (1.0 - stop_frac)
+        lock_trigger     = net_debit * (
+            1.0 + float(getattr(cfg, "momentum_lock_trigger", 0.25))
+        )
+
+        try:
+            hard_exit_str = state.get(
+                "hard_exit_time", cfg.hard_exit_time.strftime("%H:%M"))
+        except Exception:
+            hard_exit_str = cfg.hard_exit_time.strftime("%H:%M")
+
+        cal = self._get_calibration()
+        return {
+            "valid":                  True,
+            "strategy_name":          strat_name,
+            "strategy_type":          BUY,
+            "selection_reason":       selection_reason,
+            "target_expiry":          expiry_str,
+            "actual_dte":             actual_dte,
+            "legs":                   legs,
+            "num_legs":               1,
+            "gross_credit":           round(-net_debit, 3),
+            "entry_credit":           round(-net_debit, 3),
+            "total_slippage":         round(entry_slip, 3),
+            "total_costs_pts":        round(entry_costs_pts, 4),
+            "total_costs_rupees_per_lot": round(entry_costs_pts * C02, 2),
+            "total_fixed_costs_rupees":   0.0,
+            "entry_costs_rupees":     round(entry_costs_dict["total_rupees"], 2),
+            "round_trip_friction_pts": round(friction_pts, 3),
+            "stop_multiple":          round(1.0 - stop_frac, 3),
+            "stop_premium":           round(stop_premium, 3),
+            "target_premium":         round(target_premium, 3),
+            "profit_lock_trigger":    round(lock_trigger, 3),
+            "price_stop_pts":         None,
+            "price_stop_level_call":  None,
+            "price_stop_level_put":   None,
+            "hard_exit_time":         hard_exit_str,
+            "target_pct":             round(target_frac, 3),
+            "final_lots":             final_lots,
+            "max_loss_per_lot":       round(risk_per_lot, 2),
+            "total_max_risk":         round(risk_per_lot * final_lots, 2),
+            "structural_max_loss_per_lot": round(structural_risk_per_lot, 2),
+            "total_structural_risk":  round(structural_risk_per_lot * final_lots, 2),
+            "estimated_margin":       round(debit_per_lot * final_lots, 2),
+            "wing_width":             None,
+            "last_known_premium":     round(-net_debit, 3),
+            "entry_spot":             spot,
+            "entry_vix":              signals.get("vix"),
+            "entry_vrp":              signals.get("vrp_smoothed"),
+            "entry_vrp_smoothed":     signals.get("vrp_smoothed"),
+            "opening_straddle_at_entry": float(
+                signals.get("opening_straddle_pts") or 0.0),
+            "vol_regime_at_entry":    signals.get("vol_regime"),
+            "price_regime_at_entry":  signals.get("price_regime"),
+            "positioning_at_entry":   signals.get("positioning_regime"),
+            "confidence_level_at_entry": signals.get("confidence_level"),
+            "confidence_score_at_entry": signals.get("confidence_score"),
+            "final_regime_at_entry":  signals.get("final_regime"),
+            "defined_risk_only":      True,
+            "event_day":              bool(signals.get("event_day", False)),
+            "event_name":             signals.get("event_name", ""),
+            "borderline_sell":        False,
+            "is_borderline_sell":     0,
+            "calibration_tier_at_entry": (
+                cal.calibration_tier if cal else 0
+            ),
+            "profit_lock_activated":  False,
+            "profit_lock_stop_level": None,
+            "stop_at_breakeven":      False,
+            "momentum":               True,
+            "momentum_direction":     int(direction),
+        }
+
+    def _momentum_decision(self, signals: dict, block_reason: str) -> Optional[dict]:
+        """Long-premium substitute for a refused sell-side structure.
+
+        Returns a complete ENTER decision, or None when the substitute is not
+        allowed or does not price up — in which case the caller keeps the
+        original refusal, unaltered, as the logged reason.
+        """
+        try:
+            ok, why, direction = self._momentum_gate(signals, block_reason)
+        except Exception as exc:                      # never lose the day to
+            self.logger.warning(f"momentum gate failed: {exc}")  # a new code path
+            return None
+        if not ok:
+            return None
+
+        size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
+        reason = (
+            f"momentum_trend_expression:{'LONG_CALL' if direction > 0 else 'LONG_PUT'}"
+            f":dte={signals.get('actual_dte')}:adx={float(signals.get('adx_15') or 0.0):.0f}"
+            f":conf={signals.get('confidence_level')}:replacing={block_reason}"
+        )
+        params = self.compute_momentum_params(direction, reason, signals, size_mult)
+        if not params.get("valid"):
+            self.logger.info(f"momentum substitute rejected: {params.get('reason')}")
+            return None
+
+        strat_name = params["strategy_name"]
+        self._log_decision(signals, "STRATEGY_SELECTED", reason, strat_name, params)
+        self._persist_decision(signals, strat_name, reason, params, "STRATEGY_SELECTED")
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{strat_name}", None, self._count_open_positions()
+        )
+        state = self.market_engine.state
+        state["momentum_entries"] = int(state.get("momentum_entries", 0) or 0) + 1
+        return {
+            "action":        "ENTER",
+            "strategy_name": strat_name,
+            "reason":        reason,
+            "params":        params,
+        }
+
     def decide(self, signals: dict) -> dict:
         gate = self._check_hard_gates(signals)
         if gate:
             action, reason = gate
+            if action == "NO_TRADE":
+                alt = self._momentum_decision(signals, reason)
+                if alt is not None:
+                    return alt
             self._log_decision(signals, action, reason)
             self._persist_decision(signals, "NONE", reason, None, action)
             self.market_engine.finalize_cycle_log(
@@ -2769,6 +3304,9 @@ class StrategyEngine:
 
         strategy_name, selection_reason = self._map_regime_to_strategy(signals)
         if strategy_name == "NO_TRADE":
+            alt = self._momentum_decision(signals, selection_reason)
+            if alt is not None:
+                return alt
             self._log_decision(signals, "NO_TRADE", selection_reason)
             self._persist_decision(
                 signals, "NO_TRADE", selection_reason, None, "NO_TRADE"
@@ -2806,6 +3344,9 @@ class StrategyEngine:
 
         if not params.get("valid"):
             full_reason = f"params_invalid:{params.get('reason', 'unknown')}"
+            alt = self._momentum_decision(signals, full_reason)
+            if alt is not None:
+                return alt
             if "neutral" in full_reason.lower() or "vrp" in full_reason.lower():
                 self._log_phantom_if_neutral(signals, full_reason)
             self._log_decision(signals, "NO_TRADE", full_reason)

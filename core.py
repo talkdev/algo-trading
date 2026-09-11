@@ -786,6 +786,67 @@ class Config:
     # Fast intraday trend timeframe (15m ADX cannot mature intraday).
     adx_fast_resample:         str   = "300s"
 
+    # ── v5: long-premium momentum expression of a confirmed trend ─────
+    # The engine could only ever express a view by SELLING a structure
+    # (condor / butterfly / bull put / bear call). On the DTE-2 session
+    # (Friday, Tuesday-expiry calendar) a far-OTM weekly vertical carries
+    # ~2 points of net theta per DAY, so an intraday hold harvests under a
+    # point - less than the round trip costs - while the day's own move is
+    # worth 40+. Measured 2026-09-11: the single trade the engine could
+    # build printed +0.87 gross points against Rs 114 of costs (net Rs 6)
+    # while the same session's confirmed uptrend was worth +43 pts/lot on
+    # the ATM call. A Nifty desk does not watch a 100-point trend day from
+    # the sideline because its order book happens to be a premium-selling
+    # one: it flips the EXPRESSION and buys the move. These knobs enable
+    # that route; every gate below keeps it inside intraday, defined-risk
+    # (max loss = premium paid) and out of the vol-spike tops.
+    momentum_enabled:              bool  = True
+    momentum_min_dte:              int   = 1
+    momentum_max_dte:              int   = 4
+    # Trend confirmation: the fast (5m) ADX the strategy layer actually
+    # consumes, and the OR/VWAP structure that proves it is a breakout and
+    # not a drift inside a range.
+    momentum_adx_min:              float = 30.0
+    momentum_or_break_frac:        float = 0.15
+    momentum_vwap_buffer_pts:      float = 8.0
+    # Do not chase a move that has already spent the day's priced range.
+    momentum_day_move_max_pct:     float = 90.0
+    # Buy option, not a vol-spike top: India VIX must not be gapping up.
+    momentum_vix_gap_max_pct:      float = 12.0
+    # Premium paid, as a fraction of spot, for a strike that is neither a
+    # lottery ticket nor a futures substitute.
+    momentum_prem_min_pct_of_spot: float = 0.0018
+    momentum_prem_max_pct_of_spot: float = 0.0090
+    momentum_min_prem_pts:         float = 20.0
+    # Risk ladder on the long premium itself.
+    momentum_stop_frac:            float = 0.35
+    momentum_lock_trigger:         float = 0.25
+    momentum_lock_keep_frac:       float = 0.50
+    momentum_target_frac:          float = 0.60
+    momentum_final_window_min:     int   = 45
+    # Sizing: the debit route risks the stop, not the notional, and the
+    # weekday/VRP size schedule that disciplines short-premium books is
+    # floored here so a high-conviction breakout is not sized into the
+    # ground by multipliers calibrated for naked gamma.
+    momentum_size_floor:           float = 0.80
+    momentum_risk_frac_of_budget:  float = 1.00
+    momentum_min_lots:             float = 0.60
+    momentum_max_trades_per_day:   int   = 1
+    momentum_min_minutes_left:     int   = 90
+    # Cap on the cash actually committed, as a multiple of the per-trade
+    # risk budget: a long option's worst case is its premium, and that is
+    # only realised if it is carried to expiry, which the hard exit forbids.
+    momentum_structural_risk_cap_mult: float = 2.5
+    # The route substitutes for the sell side ONLY where the sell side was
+    # refused; these markers identify the refusal families it may answer.
+    # "day_move_used_..._no_edge" (>=125% of the opening straddle spent) is
+    # deliberately NOT one of them: the momentum gate caps day_move_used
+    # below that, so the two can never agree on the same tape.
+    momentum_block_markers:        tuple = (
+        "dte2", "no_exception", "immature", "buy_options",
+        "wide_or", "dangerous_to_sell",
+    )
+
     def __repr__(self) -> str:
         def mask(s: str) -> str:
             if not s:
@@ -1072,6 +1133,38 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         unclear_range_size_weekly=min(max(_get_float(env, "UNCLEAR_RANGE_SIZE_WEEKLY", 0.75), 0.40), 1.00),
         ev_carry_discount_dte2p=min(max(_get_float(env, "EV_CARRY_DISCOUNT_DTE2P", 0.62), 0.40), 1.00),
         adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "300s",
+        # ── v5 long-premium momentum expression ───────────────────────────
+        momentum_enabled=_get_bool(env, "MOMENTUM_ENABLED", True),
+        momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 1),
+        momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 4),
+        momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 30.0), 15.0), 60.0),
+        momentum_or_break_frac=min(max(_get_float(env, "MOMENTUM_OR_BREAK_FRAC", 0.15), 0.0), 1.00),
+        momentum_vwap_buffer_pts=min(max(_get_float(env, "MOMENTUM_VWAP_BUFFER_PTS", 8.0), 0.0), 60.0),
+        momentum_day_move_max_pct=min(max(_get_float(env, "MOMENTUM_DAY_MOVE_MAX_PCT", 90.0), 10.0), 400.0),
+        momentum_vix_gap_max_pct=min(max(_get_float(env, "MOMENTUM_VIX_GAP_MAX_PCT", 12.0), 0.5), 100.0),
+        momentum_prem_min_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MIN_PCT_OF_SPOT", 0.0018), 0.0002), 0.01),
+        momentum_prem_max_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MAX_PCT_OF_SPOT", 0.0090), 0.001), 0.03),
+        momentum_min_prem_pts=min(max(_get_float(env, "MOMENTUM_MIN_PREM_PTS", 20.0), 1.0), 200.0),
+        momentum_stop_frac=min(max(_get_float(env, "MOMENTUM_STOP_FRAC", 0.35), 0.10), 0.70),
+        momentum_lock_trigger=min(max(_get_float(env, "MOMENTUM_LOCK_TRIGGER", 0.25), 0.05), 1.00),
+        momentum_lock_keep_frac=min(max(_get_float(env, "MOMENTUM_LOCK_KEEP_FRAC", 0.50), 0.10), 0.95),
+        momentum_target_frac=min(max(_get_float(env, "MOMENTUM_TARGET_FRAC", 0.60), 0.10), 3.00),
+        momentum_final_window_min=_get_int(env, "MOMENTUM_FINAL_WINDOW_MIN", 45),
+        momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
+        momentum_risk_frac_of_budget=min(max(_get_float(env, "MOMENTUM_RISK_FRAC_OF_BUDGET", 1.00), 0.10), 1.00),
+        momentum_min_lots=min(max(_get_float(env, "MOMENTUM_MIN_LOTS", 0.60), 0.10), 1.00),
+        momentum_max_trades_per_day=_get_int(env, "MOMENTUM_MAX_TRADES_PER_DAY", 1),
+        momentum_min_minutes_left=_get_int(env, "MOMENTUM_MIN_MINUTES_LEFT", 90),
+        momentum_structural_risk_cap_mult=min(
+            max(_get_float(env, "MOMENTUM_STRUCTURAL_RISK_CAP_MULT", 2.5), 1.0), 5.0
+        ),
+        momentum_block_markers=(
+            tuple(
+                s.strip().lower()
+                for s in env.get("MOMENTUM_BLOCK_MARKERS", "").split(",")
+                if s.strip()
+            ) or Config.momentum_block_markers
+        ),
     )
 
 
