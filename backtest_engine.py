@@ -662,6 +662,7 @@ class BacktestRunner:
         config: Config,
         fills: FillModel,
         verbose: bool = False,
+        trade_report: Optional[str] = None,
     ):
         self.store = store
         self.config = config
@@ -671,6 +672,13 @@ class BacktestRunner:
         self.results = Results(float(config.starting_capital))
         self._scratch: Optional[str] = None
         self._sink = io.StringIO()
+        # ── v7: per-trade console report ──────────────────────────────────
+        # trade_report overrides TRADE_REPORT_MODE from the config
+        # (each_cycle | on_change | off); None keeps the configured mode.
+        # The reporter itself is built in _build(), where the scratch book it
+        # reads exists.
+        self.trade_report_mode = trade_report
+        self.reporter = None
 
     @contextlib.contextmanager
     def _quiet(self):
@@ -686,6 +694,32 @@ class BacktestRunner:
         self._sink.truncate(0)
         with contextlib.redirect_stdout(self._sink):
             yield
+
+    # -- v7: per-trade console report -------------------------------------
+    def _report_trades(self, day: "DaySlice") -> int:
+        """Print the lifecycle block for every trade of the replayed session.
+
+        Called once per replayed cycle - including the cycles that end in a
+        `continue`, so the console shows the book on every cycle and not only
+        on the cycles that reached the entry decision. It is called OUTSIDE
+        _quiet(): the engine's own per-cycle narration is muted during a
+        replay because it buries the report, but this IS the report.
+
+        Returns how many blocks were printed. It cannot raise into the replay:
+        a rendering problem must never cost a session's results.
+        """
+        if self.reporter is None:
+            return 0
+        try:
+            return self.reporter.report_cycle(
+                trading_date=day.trading_date,
+                chain=(self.me.last_chain or {}),
+                as_of=self.clock.now(),
+            )
+        except Exception as exc:
+            if self.verbose:
+                print(f"  trade report failed: {exc}")
+            return 0
 
     # -- engine wiring ----------------------------------------------------
     def _build(self):
@@ -724,6 +758,17 @@ class BacktestRunner:
         self.db, self.client, self.me, self.se, self.xe = db, client, me, se, xe
         self.regime = rg
         self.merge_regime = getattr(regime_engine, "merge_regime_into_signals", None)
+
+        # v7: the same per-trade console block the live engine prints, driven
+        # off the scratch book this runner writes. It reads positions /
+        # position_legs, which is why _open() and _close() now persist the
+        # exit the way the live execute_close() does: without it a closed
+        # replay trade had no exit time, no exit price and no P&L anywhere in
+        # the database, and the block could only have been a reconstruction.
+        self.reporter = core.TradeConsoleReporter(
+            db, self.config, logger, source="BACKTEST"
+        )
+        self.reporter.set_mode(self.trade_report_mode)
 
     def _teardown(self):
         try:
@@ -814,6 +859,10 @@ class BacktestRunner:
             "final_lots": lots,
             "max_loss_per_lot": params.get("max_loss_per_lot"),
             "total_max_risk": params.get("total_max_risk"),
+            # v7: the live execute_entry() persists this and the console
+            # report needs it to say what a credit structure commits; without
+            # it the replay book could only fall back to total_max_risk.
+            "estimated_margin": params.get("estimated_margin"),
             "status": "OPEN",
             "last_known_premium": credit,
             "profit_lock_activated": 0,
@@ -872,10 +921,18 @@ class BacktestRunner:
             px = self.fills.price(q, close_action, urgent=urgent)
             if px is None or px <= 0:
                 px = f["exec_price"]
+            _bid = float(q.get("bid") or 0)
+            _ask = float(q.get("ask") or 0)
             exit_legs.append({
                 "action": close_action,
                 "option_type": f["option_type"],
+                "strike": f["strike"],
                 "exec_price": px,
+                # recorded for the same reason the live book records
+                # quoted_mid_at_exit: slippage against the touch is only
+                # measurable if the touch at exit was written down.
+                "quoted_mid": ((_bid + _ask) / 2.0)
+                              if (_bid > 0 and _ask > 0) else px,
             })
             debit += px if close_action == "BUY" else -px
 
@@ -886,13 +943,40 @@ class BacktestRunner:
         pnl = gross_pts * self.config.lot_size * lots - costs
 
         now = self.clock.now()
-        self.db.update("positions", {"status": "CLOSED",
-                                     "updated_at": now.isoformat()},
-                       {"position_id": live["position_id"]})
-        self.db.execute(
-            "UPDATE position_legs SET leg_status='CLOSED' WHERE position_id=?",
-            (live["position_id"],),
+        # v7: write the exit into the book the way the live execute_close()
+        # does. The replay used to flip two status flags and discard the rest,
+        # so a closed trade in the scratch database had no exit time, no exit
+        # reason, no P&L and no exit price on any leg - nothing that reads the
+        # book (the per-trade console report, an audit of a replay, any future
+        # reporter pointed at a saved run) could tell how the trade ended or
+        # what it made. Results/Trade still carries exactly the same numbers,
+        # so no replayed P&L moves: this is bookkeeping parity, not a change
+        # to the simulation.
+        _gross_rs = gross_pts * self.config.lot_size * lots
+        self.db.update(
+            "positions",
+            {
+                "status":            "CLOSED",
+                "exit_time":         now.isoformat(),
+                "exit_reason":       reason,
+                "exit_priority":     priority,
+                "exit_premium":      round(debit, 4),
+                "gross_pnl_rupees":  round(_gross_rs, 2),
+                "exit_costs_rupees": exit_costs,
+                "net_pnl_rupees":    round(pnl, 2),
+                "last_known_premium": round(debit, 4),
+                "updated_at":        now.isoformat(),
+            },
+            {"position_id": live["position_id"]},
         )
+        for f, xl in zip(live["filled"], exit_legs):
+            self.db.execute(
+                "UPDATE position_legs SET leg_status='CLOSED', exit_price=?, "
+                "quoted_mid_at_exit=? WHERE position_id=? AND strike=? AND "
+                "option_type=?",
+                (xl["exec_price"], xl["quoted_mid"], live["position_id"],
+                 f["strike"], f["option_type"]),
+            )
 
         strikes = "/".join(
             f"{f['action'][0]}{f['option_type'][0].upper()}{f['strike']:.0f}"
@@ -947,6 +1031,7 @@ class BacktestRunner:
             except Exception as exc:
                 if self.verbose:
                     print(f"  {trading_date} {dt:%H:%M}: run_cycle failed: {exc}")
+                self._report_trades(day)   # v7: a cycle is a cycle
                 continue
             # reset_if_new_day() rebinds MarketDataEngine.state to a fresh
             # dict on day rollover (including the first cycle, when the
@@ -996,6 +1081,9 @@ class BacktestRunner:
                     if self.verbose:
                         print(f"  {trading_date} {dt:%H:%M} EXIT  "
                               f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")
+                    # v7: the block for the trade that just closed is printed
+                    # on the cycle that closed it, in its final state.
+                    self._report_trades(day)
                     continue
 
             # ── daily loss halt ──────────────────────────────────────────
@@ -1014,6 +1102,7 @@ class BacktestRunner:
                               f"({day_pnl:,.0f}) — no further entries")
             if state.get("daily_halted") and live is None:
                 self.results.add_rejection("daily_loss_halt")
+                self._report_trades(day)   # v7
                 continue
 
             # ── otherwise consider a new entry ────────────────────────────
@@ -1024,6 +1113,7 @@ class BacktestRunner:
                 except Exception as exc:
                     if self.verbose:
                         print(f"  decide() failed: {exc}")
+                    self._report_trades(day)   # v7
                     continue
 
                 if decision.get("action") == "ENTER":
@@ -1042,6 +1132,11 @@ class BacktestRunner:
                 else:
                     self.results.add_rejection(decision.get("reason", "unknown"))
 
+            # ── v7: end of the cycle ───────────────────────────────────────
+            # The book as it now stands: every trade of this session, the ones
+            # already performed and the one in progress, on every cycle.
+            self._report_trades(day)
+
         # ── forced flat at the last snapshot of the session ──────────────
         if live is not None:
             self.clock.set(day.cycle_dt(day.cycles[-1]))
@@ -1053,6 +1148,9 @@ class BacktestRunner:
                 signals = {"spot": live["entry_spot"]}
             t = self._close(live, signals, "END_OF_DATA_FORCED_FLAT", 7, day)
             self.results.add_trade(t)
+            # v7: the session's last trade gets its final block too - the loop
+            # above ended before this close happened.
+            self._report_trades(day)
 
     # -- driver -----------------------------------------------------------
     def run(self, dates: List[str]) -> Results:
@@ -1679,7 +1777,10 @@ def _forced_round_trip(store: "HistoricalStore", cfg: Config,
     identity all get executed at least once per self-test run.
     """
     day = store.load_day(dates[0])
-    runner = BacktestRunner(store, cfg, FillModel(0.25, 0.5), verbose=False)
+    # trade_report is forced on so this coverage does not depend on what
+    # TRADE_REPORT_MODE / TRADE_REPORT_ENABLED say in env.txt.
+    runner = BacktestRunner(store, cfg, FillModel(0.25, 0.5), verbose=False,
+                            trade_report="each_cycle")
     runner._build()
     try:
         entry_ct = day.cycles[len(day.cycles) // 4]
@@ -1740,6 +1841,35 @@ def _forced_round_trip(store: "HistoricalStore", cfg: Config,
             signals = runner.me.run_cycle()
             runner.xe.monitor_position(dict(row), signals)
 
+        # ── v7: the per-trade console block, while the trade is open ──────
+        # The report is part of what this harness promises an operator, so the
+        # self-test renders it and asserts on its shape rather than trusting
+        # that it still works. This is the in-progress state: no exit fills
+        # yet, so the legs are marked at what closing them now would cost.
+        import contextlib as _ctxlib
+        import io as _io
+
+        def _render_blocks() -> Tuple[int, str]:
+            _buf = _io.StringIO()
+            with _ctxlib.redirect_stdout(_buf):
+                _n = runner._report_trades(day)
+            return _n, _buf.getvalue()
+
+        _n_open, _open_block = _render_blocks()
+        assert _n_open == 1, f"open trade rendered {_n_open} block(s), expected 1"
+        for _frag in ("Trade-1", "Strategy: HARNESS_FORCED_CONDOR",
+                      "Trade Start Data: time:", "Trade End Data: time:",
+                      "Position Status: Open", "Total Investment: Rs",
+                      "Total Profit: Rs"):
+            assert _frag in _open_block, f"open block missing {_frag!r}"
+        assert "\nOpen\n" in _open_block, "open block is missing the 'Open' line"
+        assert "unrealised" in _open_block, \
+            "an open trade must be marked, not reported as realised"
+        assert _open_block.count("=" * 84) == 2, "block must be ruled top and bottom"
+        assert _open_block.count("-" * 76) == 3, "block must have three sub-rules"
+        assert _open_block.count(" lot of ") == 8, \
+            "4 legs must be printed twice: once at entry, once at the exit"
+
         trade = runner._close(live, signals, "HARNESS_FORCED_EXIT", 7, day)
 
         row = runner.db.query_one(
@@ -1751,6 +1881,46 @@ def _forced_round_trip(store: "HistoricalStore", cfg: Config,
             "WHERE position_id=? AND leg_status!='CLOSED'",
             (live["position_id"],))
         assert open_legs["n"] == 0, "leg rows left open after close"
+
+        # ── v7: the exit is persisted, not just flagged ───────────────────
+        # A closed replay trade used to leave exit_time, exit_reason,
+        # exit_premium, the P&L columns and every leg's exit_price empty, so
+        # nothing that reads the book could say how it ended.
+        exit_row = runner.db.query_one(
+            "SELECT exit_time, exit_reason, exit_priority, exit_premium, "
+            "gross_pnl_rupees, exit_costs_rupees, net_pnl_rupees "
+            "FROM positions WHERE position_id=?", (live["position_id"],))
+        assert exit_row["exit_time"], "exit_time not persisted"
+        assert exit_row["exit_reason"] == "HARNESS_FORCED_EXIT", \
+            f"exit_reason not persisted: {exit_row['exit_reason']}"
+        assert exit_row["exit_priority"] == 7, "exit_priority not persisted"
+        assert abs(float(exit_row["net_pnl_rupees"]) - trade.pnl_rs) < 0.01, \
+            f"book net P&L {exit_row['net_pnl_rupees']} != trade {trade.pnl_rs}"
+        assert abs(float(exit_row["gross_pnl_rupees"])
+                   - trade.gross_pts * cfg.lot_size * trade.lots) < 0.01, \
+            "book gross P&L disagrees with the trade"
+        assert abs(float(exit_row["exit_costs_rupees"])
+                   - (trade.costs_rs - live["entry_costs"])) < 0.01, \
+            "book exit costs disagree with the trade"
+        priced_legs = runner.db.query_one(
+            "SELECT COUNT(*) AS n FROM position_legs WHERE position_id=? "
+            "AND exit_price IS NOT NULL AND quoted_mid_at_exit IS NOT NULL",
+            (live["position_id"],))
+        assert priced_legs["n"] == 4, \
+            f"exit fill persisted on {priced_legs['n']}/4 legs"
+
+        # ── v7: and the console block now reports the closed trade ────────
+        _n_closed, _closed_block = _render_blocks()
+        assert _n_closed == 1, \
+            f"closed trade rendered {_n_closed} block(s), expected 1"
+        for _frag in ("Closed - HARNESS_FORCED_EXIT", "Position Status: Close",
+                      "Total Profit: Rs"):
+            assert _frag in _closed_block, f"closed block missing {_frag!r}"
+        assert "unrealised" not in _closed_block, \
+            "a closed trade must not be reported as unrealised"
+        assert f"Rs {trade.pnl_rs:+,.2f} realised" in _closed_block, (
+            f"the console block does not report the P&L the harness computed "
+            f"({trade.pnl_rs:+,.2f})")
 
         expect = round(
             trade.gross_pts * cfg.lot_size * trade.lots - trade.costs_rs, 2)
@@ -1768,6 +1938,8 @@ def _forced_round_trip(store: "HistoricalStore", cfg: Config,
             "gross_pts": trade.gross_pts,
             "pnl_rs": trade.pnl_rs,
             "held_min": trade.held_min,
+            "report_open": _open_block,
+            "report_closed": _closed_block,
         }
     finally:
         runner._teardown()
@@ -1845,7 +2017,14 @@ def self_test() -> int:
     print(f"    closed after {fr['held_min']} min, "
           f"gross {fr['gross_pts']:+.2f} pts, net Rs {fr['pnl_rs']:+,.0f}  [OK]")
     print(f"    positions/position_legs rows written and closed  [OK]")
+    print(f"    exit time, reason, P&L and every leg's exit price persisted  [OK]")
     print(f"    P&L identity reconciles to the paisa  [OK]")
+    print(f"    console block rendered open and closed, and the closed block")
+    print(f"    reports the P&L the harness computed  [OK]")
+    print()
+    print("    the per-trade console block, as it appears every cycle:")
+    for _line in fr["report_closed"].rstrip().splitlines():
+        print(f"      {_line}" if _line.strip() else "")
 
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
@@ -1912,6 +2091,15 @@ def main() -> int:
     ap.add_argument("--audit", action="store_true", help="report data coverage only")
     ap.add_argument("--test", action="store_true", help="run the harness self-test")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--trade-report", dest="trade_report", default=None,
+        choices=("each_cycle", "on_change", "off"),
+        help="v7 per-trade console block. each_cycle (the default, and the "
+             "loudest) prints every trade of the session on every cycle; "
+             "on_change prints a trade only when it opens, closes, or its "
+             "unrealised P&L moves by TRADE_REPORT_MARK_EPS; off suppresses "
+             "it. Overrides TRADE_REPORT_MODE from the config.",
+    )
     args = ap.parse_args()
 
     if args.test:
@@ -1943,8 +2131,23 @@ def main() -> int:
     print(f"REPLAYING {len(dates)} SESSION(S): {dates[0]} .. {dates[-1]}")
     print(hr("═"))
 
+    # v7: say what the console is about to do, because each_cycle mode prints
+    # a block per trade per cycle and the final summary ends up a long way
+    # above the bottom of the scrollback.
+    _tr_mode = str(
+        args.trade_report
+        or getattr(config, "trade_report_mode", "each_cycle")
+        or "each_cycle"
+    ).lower()
+    if getattr(config, "trade_report_enabled", True) and _tr_mode != "off":
+        print(f"  per-trade console report : {_tr_mode}"
+              + ("  (--trade-report=on_change for a quiet run)"
+                 if _tr_mode == "each_cycle" else ""))
+        print()
+
     runner = BacktestRunner(
-        store, config, FillModel(args.fill_edge, args.stress_exit), args.verbose
+        store, config, FillModel(args.fill_edge, args.stress_exit), args.verbose,
+        trade_report=args.trade_report,
     )
     res = runner.run(dates)
     print_report(res, config, args)

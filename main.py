@@ -20,6 +20,8 @@ from core import (
     ExpiryCalendar, now_ist, today_ist,
     print_section, print_kv_table,
     load_config, setup_logging,
+    # v7: per-trade console report + the fill-based entry credit
+    TradeConsoleReporter, realised_entry_credit,
 )
 from data_engine import MarketDataEngine
 from regime_engine import RegimeEngine, merge_regime_into_signals
@@ -57,6 +59,8 @@ class MainEngine:
     8. If entry possible: run strategy engine → execute entry
     9. Update cycle log with P&L
     10. Print cycle summary
+    11. Print the per-trade console report (v7: every trade of the session,
+        performed or in progress, in the operator's fixed block format)
 
     Separate timers:
     - Spot bar collection: every spot_bar_interval_sec (60s)
@@ -97,6 +101,17 @@ class MainEngine:
         self.execution_engine = ExecutionEngine(
             self.config, self.db, self.market_engine, self.cal_engine,
             self.client, self.logger
+        )
+
+        # ── v7: per-trade console report ─────────────────────────────────
+        # Prints the lifecycle block for every trade of the session, on every
+        # cycle: entry legs and fills, exit legs (or the current mark while
+        # the trade is still in progress), status, investment and profit. It
+        # reads the persisted book, so it can only report what the engine
+        # actually did. Config: TRADE_REPORT_ENABLED / TRADE_REPORT_MODE
+        # (each_cycle | on_change | off) / TRADE_REPORT_MAX_PER_CYCLE.
+        self.trade_reporter = TradeConsoleReporter(
+            self.db, self.config, self.logger, source="TRADE ENGINE"
         )
 
         # ── Loop state ────────────────────────────────────────────────────
@@ -479,7 +494,39 @@ class MainEngine:
         state["last_stop_reason"] = ""
         state["last_stop_signal_combo"] = ""
         self.market_engine._save_session_state()
-        self.logger.info(f"Daily state reset for new day: {today_str}")
+
+        # ── v7: clear the per-session latches on the day roll ─────────────
+        # The session counters above were reset; the flags on this instance
+        # were not, and every one of them is a "do this once per day" latch:
+        #   _halt_action_done   the daily-loss halt would set daily_halted on
+        #                       the new day but never cancel orders or
+        #                       flatten again, because the action is guarded
+        #                       by "once per session" - the engine would sit
+        #                       through a breach it is configured to act on
+        #   _soft_halt_alerted  the soft threshold would never page again
+        #   _eod_done           EOD tasks (calibration, daily summary, the
+        #                       final flatten) would never run again
+        #   _feed_stale*        yesterday's stale feed would still be blocking
+        #                       entries at today's open
+        # The main loop normally exits after 15:35, so this only matters for a
+        # process deliberately left running across sessions - which is exactly
+        # the process nobody is watching.
+        self._halt_action_done      = False
+        self._soft_halt_alerted     = False
+        self._eod_done              = False
+        self._feed_stale            = False
+        self._feed_stale_alerted    = False
+        self._watchdog_next_flatten = 0.0
+        self._watchdog_last_alert   = 0.0
+        self._watchdog_failures     = 0
+        self._last_cycle_ok_mono    = time_module.monotonic()
+        self._last_cycle_ok_at      = now_ist()
+        self.loop_count             = 0
+
+        self.logger.info(
+            f"Daily state reset for new day: {today_str} "
+            f"(halt/EOD/feed latches cleared, cycle counter restarted)"
+        )
 
     def _market_open(self) -> bool:
         if ExpiryCalendar.is_holiday(today_ist()):
@@ -512,7 +559,23 @@ class MainEngine:
                 current_prem = pos.get("last_known_premium")
             if current_prem is None:
                 continue
-            entry_credit = float(pos.get("entry_credit") or 0)
+            # v7: the same basis execute_close() now settles on.
+            # positions.entry_credit is the PLANNED net credit - gross credit
+            # minus an estimated slippage and the entry charges expressed in
+            # points - and the entry charges are subtracted again in rupees
+            # two lines below. The unrealised number that gates the daily
+            # loss halt therefore carried a double charge plus a modelled
+            # slippage the fills may never have produced (Rs 61 on the
+            # 2026-09-11 book), and it jumped by exactly that amount at the
+            # moment the position closed and was settled on its own prices.
+            # A risk limit must not move when a position is closed.
+            try:
+                _legs = self.execution_engine._get_position_legs(
+                    pos["position_id"]
+                )
+            except Exception:
+                _legs = []
+            entry_credit, _basis = realised_entry_credit(pos, _legs)
             lots         = int(pos.get("final_lots", 1) or 1)
             gross = (entry_credit - float(current_prem)) * C02 * lots
 
@@ -897,6 +960,14 @@ class MainEngine:
                 f"vol regime defaulting to NEUTRAL"
             )
         self._print_cycle_footer(signals, total_pnl)
+
+        # ── Step 11: Per-trade console report (v7) ────────────────────────
+        # Every trade of the session - the ones already performed and the one
+        # in progress - in the operator's fixed format. Printed after the
+        # cycle summary so the bottom of the screen always holds the newest
+        # state of the book.
+        self._print_trade_report()
+
         self.loop_count += 1
 
     def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:
@@ -928,6 +999,28 @@ class MainEngine:
             "Cal Tier":           signals.get("calibration_tier", 0),
         })
         print()
+
+    def _print_trade_report(self, title: Optional[str] = None) -> None:
+        """v7: print the lifecycle block for every trade of the session.
+
+        One block per trade, in the operator's fixed format: entry legs and
+        their fills, exit legs (or the current liquidation mark while the
+        trade is still in progress), position status, cash committed and net
+        profit. The numbers are read out of the book, so the console and the
+        database cannot tell two different stories about the same trade.
+
+        Reporting is never allowed to become a trading failure: anything that
+        goes wrong is logged and the cycle carries on.
+        """
+        try:
+            self.trade_reporter.report_cycle(
+                trading_date=today_ist().isoformat(),
+                chain=self.market_engine.last_chain,
+                as_of=now_ist(),
+                title=title,
+            )
+        except Exception as e:
+            self.logger.debug(f"trade report error: {e}")
 
     # ─────────────────────────────────────────────────────────────────────
     # DAILY SUMMARY
@@ -1253,6 +1346,12 @@ class MainEngine:
             )
             self.execution_engine.close_all_positions("EOD_CLOSE", force=True)
 
+        # ── v7: every trade of the day, one last time, in its final state ──
+        # The per-cycle report ends when the loop ends; this is the copy that
+        # stays on the screen next to the EOD summary, so the day can be read
+        # trade by trade without opening the database.
+        self._print_trade_report(title=f"END OF DAY TRADES - {trading_date}")
+
         # ── Run EOD calibration tasks ─────────────────────────────────────
         try:
             self.cal_engine.run_eod_tasks(trading_date)
@@ -1465,7 +1564,20 @@ class MainEngine:
                 self._feed_stale = False
             return
 
+        # v7: the liveness clock starts at TODAY'S session open, not at
+        # process start. A process left up since yesterday reports an idle of
+        # fourteen hours at 09:15:00, which trips feed_degrade_sec and then
+        # feed_force_exit_sec before the first cycle of the new session has had
+        # any chance to run - in live mode that is a forced flatten at the open
+        # caused by nothing but the calendar. _last_cycle_ok_at existed for
+        # exactly this and was never read; it is now maintained in run().
         idle     = time_module.monotonic() - self._last_cycle_ok_mono
+        last_ok  = self._last_cycle_ok_at
+        if last_ok is None or last_ok.date() != now_dt.date():
+            session_open = now_dt.replace(
+                hour=9, minute=15, second=0, microsecond=0
+            )
+            idle = max(0.0, (now_dt - session_open).total_seconds())
         degrade  = self._watchdog_sec("feed_degrade_sec", 45.0)
         force    = self._watchdog_sec("feed_force_exit_sec", 120.0)
         live     = not self.config.paper_trade_mode
@@ -1661,6 +1773,11 @@ class MainEngine:
                     try:
                         self.run_one_cycle()
                         self._last_cycle_ok_mono = time_module.monotonic()
+                        # v7: feeds the watchdog's day-aware liveness clock in
+                        # _watchdog_once(). The field was initialised in
+                        # __init__ and never updated, so a process that spanned
+                        # midnight measured its idle from the previous session.
+                        self._last_cycle_ok_at   = now_ist()
                     except Exception as e:
                         self.logger.error(
                             f"UNHANDLED ERROR in run_one_cycle: {e}"

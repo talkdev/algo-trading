@@ -45,12 +45,22 @@ LOG_DIR          = Path(_ENV.get("LOG_DIR", "logs"))
 if not LOG_DIR.is_absolute():
     LOG_DIR = BASE_DIR / LOG_DIR
 
-LOT_SIZE              = int(_ENV.get("NIFTY_LOT_SIZE", "75") or 75)
+# v7: these defaults must agree with the ones core.load_config() ships, or
+# this report describes a different engine from the one that traded. They did
+# not: LOT_SIZE defaulted to 75 (the pre-January-2026 NIFTY lot; the engine
+# has used 65 since the January 2026 series and core.py defaults to 65),
+# EXCHANGE_TXN_RATE to 0.0003552 against the engine's 0.0003553, STT to the
+# superseded 0.10% against the 0.15% that applies from 1 April 2026, and the
+# daily loss limit to 2% against the engine's 4%. env.txt holds only the
+# Upstox token by design, so in practice these defaults were the values in
+# force - which made cost_per_lot_rupees wrong by 15% before the metric
+# itself was even computed correctly.
+LOT_SIZE              = int(_ENV.get("NIFTY_LOT_SIZE", "65") or 65)
 STARTING_CAPITAL      = float(_ENV.get("STARTING_CAPITAL", "1000000") or 1_000_000)
-MAX_DAILY_LOSS_PCT    = float(_ENV.get("MAX_DAILY_LOSS_PCT", "0.02") or 0.02)
+MAX_DAILY_LOSS_PCT    = float(_ENV.get("MAX_DAILY_LOSS_PCT", "0.04") or 0.04)
 BROKERAGE_PER_ORDER   = float(_ENV.get("BROKERAGE_PER_ORDER", "20.0") or 20.0)
-EXCHANGE_TXN_RATE     = float(_ENV.get("EXCHANGE_TXN_RATE", "0.0003552") or 0.0003552)
-STT_OPTIONS_SELL      = float(_ENV.get("STT_OPTIONS_SELL", "0.001") or 0.001)
+EXCHANGE_TXN_RATE     = float(_ENV.get("EXCHANGE_TXN_RATE", "0.0003553") or 0.0003553)
+STT_OPTIONS_SELL      = float(_ENV.get("STT_OPTIONS_SELL", "0.0015") or 0.0015)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -693,11 +703,37 @@ def compute_slippage_analysis(
 
     total_costs = sum(float(e.get("total_costs_rupees") or 0) for e in trade_exits)
 
+    # v7: "per lot" has to mean per LOT TRADED. The old expression divided by
+    # (number of trades x lot size), which is neither: it halved on every
+    # 2-lot trade, so the metric moved with position size instead of with
+    # cost, and it was computed on a 75-unit lot the engine has not traded
+    # since January 2026. Lots are summed over the entries that actually have
+    # an exit, because total_costs above is summed over the exits.
+    exited_ids = {
+        str(e.get("trade_id") or e.get("position_id") or "") for e in trade_exits
+    }
+    total_lots = 0
+    for entry in trade_entries:
+        key = str(entry.get("trade_id") or entry.get("position_id") or "")
+        if exited_ids and key not in exited_ids:
+            continue
+        try:
+            total_lots += int(float(entry.get("final_lots") or 0))
+        except (TypeError, ValueError):
+            pass
+    if total_lots <= 0:
+        total_lots = n
+    total_units = total_lots * LOT_SIZE
+
     return {
         "total_trades":                n,
+        "total_lots_traded":           total_lots,
         "total_actual_costs_rupees":   round(total_costs, 2),
         "avg_actual_costs_rupees":     round(total_costs / n, 2) if n else 0,
-        "cost_per_lot_rupees":         round(total_costs / (n * LOT_SIZE), 2) if n else 0,
+        "cost_per_lot_rupees":         round(total_costs / total_lots, 2)
+                                       if total_lots else 0,
+        "cost_per_unit_rupees":        round(total_costs / total_units, 2)
+                                       if total_units else 0,
         "avg_actual_slippage_pts":     round(statistics.mean(actual_slips), 3)
                                        if actual_slips else None,
         "max_actual_slippage_pts":     round(max(actual_slips), 3)
