@@ -19,11 +19,20 @@ from core import (
     print_section, print_kv_table,
     load_config, setup_logging,
     RateLimiter, UpstoxClient,
-    UpstoxAPIError,
+    UpstoxAPIError, AlertNotifier,
 )
 from data_engine import MarketDataEngine
 from calibration_engine import CalibrationEngine
 
+
+
+class OrderNotPlaced(RuntimeError):
+    """The broker confirmed that the request never became an order.
+
+    Distinct from a plain failure because it is safe to try again with a new
+    tag: nothing is resting at the exchange. Anything else - a timeout whose
+    fate is unknown - must never be re-sent.
+    """
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXIT PRIORITY CONSTANTS
@@ -148,14 +157,17 @@ class LiveOrderExecutor:
     Fetches actual fill price after order placement.
     """
 
-    def __init__(self, config: Config, client: UpstoxClient, logger):
+    def __init__(self, config: Config, client: UpstoxClient, logger,
+                 db=None, notifier=None):
         if config.paper_trade_mode:
             raise RuntimeError(
                 "LiveOrderExecutor instantiated while PAPER_TRADE_MODE=True. Refusing."
             )
-        self.config = config
-        self.client = client
-        self.logger = logger
+        self.config   = config
+        self.client   = client
+        self.logger   = logger
+        self.db       = db
+        self.notifier = notifier
 
     def _resolve_instrument_key(self, leg: dict, chain: dict) -> Optional[str]:
         """Get instrument key from leg or chain."""
@@ -281,6 +293,285 @@ class LiveOrderExecutor:
             f"phantom fill at {fallback:.2f}"
         )
 
+    # ── v6: dispatch ledger, reconcile-on-lost-response, exit escalation ───
+
+    def _alert(self, level: str, text: str) -> None:
+        notifier = getattr(self, "notifier", None)
+        try:
+            if notifier is not None:
+                notifier.send(text, level)
+        except Exception:
+            pass
+
+    def _new_tag(self, leg: dict, transaction_type: str, phase: str) -> str:
+        """Unique, pre-assigned order tag: the only client-side handle that
+        survives a lost response, and short enough for UDAPI1119 (40 chars)."""
+        prefix = str(getattr(self.config, "order_tag_prefix", "nav6") or "nav6")[:12]
+        try:
+            strike = int(round(float(leg.get("strike", 0) or 0)))
+        except (TypeError, ValueError):
+            strike = 0
+        try:
+            idx = int(leg.get("leg_idx", leg.get("leg_id", 0)) or 0) % 99
+        except (TypeError, ValueError):
+            idx = 0
+        side = "B" if transaction_type == "BUY" else "S"
+        ph   = "E" if str(phase).upper().startswith("ENT") else "X"
+        return f"{prefix}-{ph}{idx}-{side}{strike}-{uuid.uuid4().hex[:8]}"[:40]
+
+    def _dispatch_write(self, tag, leg, transaction_type, qty, price, phase,
+                        order_id=None, state="DISPATCHED", error=None):
+        db = getattr(self, "db", None)
+        if db is None or not tag:
+            return
+        try:
+            existing = db.query_one("SELECT id FROM order_dispatch WHERE tag=?", (tag,))
+            fields = {
+                "position_id":      leg.get("position_id"),
+                "leg_idx":          leg.get("leg_idx", leg.get("leg_id")),
+                "phase":            phase,
+                "action":           leg.get("action"),
+                "transaction_type": transaction_type,
+                "instrument_token": leg.get("instrument_key"),
+                "quantity":         qty,
+                "limit_price":      price,
+                "state":            state,
+                "updated_at":       now_ist().isoformat(),
+            }
+            if order_id is not None:
+                fields["order_id"] = order_id
+            if error is not None:
+                fields["error"] = str(error)[:400]
+            if existing:
+                db.update("order_dispatch", fields, {"tag": tag})
+                db.execute(
+                    "UPDATE order_dispatch SET attempts = attempts + 1 WHERE tag=?",
+                    (tag,),
+                )
+            else:
+                fields["tag"] = tag
+                fields["created_at"] = now_ist().isoformat()
+                db.insert("order_dispatch", fields)
+        except Exception as e:
+            self.logger.warning(f"order dispatch ledger write failed ({tag}): {e}")
+
+    def _reconcile_by_tag(self, tag: str, leg: dict):
+        """Answer 'did that order reach the exchange?' from the broker's side.
+
+        Returns a dict describing the found order, or None when nothing
+        carries the tag - in which case the request genuinely did not land.
+        Raises only when the broker says the order is dead.
+        """
+        try:
+            rows = self.client.get_order_history_by_tag(tag)
+        except Exception as e:
+            self.logger.warning(
+                f"cannot reconcile order tag {tag}: {e} — treating as unresolved"
+            )
+            return {"state": "UNKNOWN", "order_id": None, "tag": tag}
+        if not rows:
+            return None
+        by_id: dict = {}
+        for row in rows:
+            oid = str(row.get("order_id") or "")
+            if oid:
+                by_id[oid] = row          # history is chronological: last wins
+        if not by_id:
+            return None
+        if len(by_id) > 1:
+            self._alert(
+                "CRITICAL",
+                f"{len(by_id)} orders share tag {tag} on "
+                f"{leg.get('strike')}{str(leg.get('option_type', '')).upper()}; "
+                f"cancelling every extra before anything is booked",
+            )
+            newest = max(by_id)
+            for oid, row in by_id.items():
+                if oid == newest:
+                    continue
+                state = str(row.get("status") or "").strip().lower()
+                if state in self._TERMINAL_OK or state in self._TERMINAL_BAD:
+                    continue
+                try:
+                    self.client.cancel_order(oid)
+                except Exception as e:
+                    self.logger.critical(
+                        f"orphan order {oid} (tag {tag}) could not be cancelled: {e}"
+                    )
+        order_id, row = max(by_id.items(), key=lambda kv: str(kv[1].get("order_timestamp") or ""))
+        status = str(row.get("status") or "").strip().lower()
+        price  = float(row.get("average_price") or 0.0)
+        filled = float(row.get("filled_quantity") or 0.0)
+        self._dispatch_write(tag, leg, str(row.get("transaction_type") or ""),
+                             int(row.get("quantity") or 0), price,
+                             "RECONCILED", order_id=order_id, state="PLACED")
+        if status in self._TERMINAL_OK and price > 0:
+            return {"state": "FILLED", "order_id": order_id, "tag": tag,
+                    "fill_price": price, "reconciled": True}
+        if status in self._TERMINAL_BAD:
+            raise RuntimeError(
+                f"order {order_id} (tag {tag}) terminated as '{status}' after an "
+                f"unconfirmed request"
+            )
+        return {"state": "OPEN", "order_id": order_id, "tag": tag, "status": status}
+
+    def _place_order_reconciled(
+        self, *, instrument_key: str, leg: dict, transaction_type: str,
+        qty: int, limit_price: float, phase: str,
+    ) -> dict:
+        """Place one order exactly once, and resolve an unanswered response.
+
+        The v2 place-order API has no client order id, so a request whose
+        response is lost is neither failed nor successful. The session that
+        carries order traffic therefore never re-sends; instead the tag that
+        went with the request is looked up in /order/history. That turns a
+        duplicate-position risk into a query.
+        """
+        tag = self._new_tag(leg, transaction_type, phase)
+        self._dispatch_write(tag, leg, transaction_type, qty, limit_price, phase)
+        settled = False
+        try:
+            try:
+                result = self.client.place_order(
+                    instrument_token=instrument_key,
+                    quantity=qty,
+                    transaction_type=transaction_type,
+                    order_type="LIMIT",
+                    price=limit_price,
+                    product="I",
+                    tag=tag,
+                )
+            except UpstoxAPIError as e:
+                if getattr(e, "maybe_delivered", False) and bool(
+                    getattr(self.config, "reconcile_after_timeout", True)
+                ):
+                    found = self._reconcile_by_tag(tag, leg)
+                    if found is not None:
+                        settled = True
+                        return found
+                    settled = True
+                    self._dispatch_write(tag, leg, transaction_type, qty,
+                                        limit_price, phase, state="NOT_PLACED",
+                                        error=e)
+                    raise OrderNotPlaced(
+                        f"{e} — reconciled by tag {tag}: no order at broker, "
+                        f"nothing was placed"
+                    ) from e
+                settled = True
+                self._dispatch_write(tag, leg, transaction_type, qty,
+                                    limit_price, phase, state="FAILED", error=e)
+                raise
+            settled = True
+            order_id = str((result or {}).get("order_id") or "")
+            self._dispatch_write(tag, leg, transaction_type, qty, limit_price,
+                                phase, order_id=order_id, state="PLACED")
+            placed = (result or {}).get("state")
+            out = {"order_id": order_id, "tag": tag}
+            if isinstance(placed, str):
+                out["state"] = placed
+            return out
+        except BaseException as e:
+            # Ctrl-C or a hard failure in the gap between sending the request
+            # and recording the answer is the one way the engine can lose a
+            # live order completely. The row stays UNRESOLVED so the next
+            # start looks it up by tag instead of guessing.
+            if not settled:
+                self._dispatch_write(tag, leg, transaction_type, qty,
+                                    limit_price, phase, state="UNRESOLVED",
+                                    error=f"{type(e).__name__}: {e}")
+            raise
+
+    def _await_fill(
+        self, order_id: str, fallback: float, wait_sec: float
+    ) -> dict:
+        """Short, non-raising version of _get_fill_price for the exit ladder."""
+        deadline = time_module.monotonic() + max(1.0, float(wait_sec))
+        last_status = ""
+        while True:
+            try:
+                details = self.client.get_order_details(order_id) or {}
+                status  = str(
+                    details.get("status") or details.get("order_status") or ""
+                ).strip().lower()
+                last_status = status or last_status
+                price  = float(details.get("average_price") or 0.0)
+                filled = float(details.get("filled_quantity") or 0.0)
+                pending = details.get("pending_quantity")
+                if status in self._TERMINAL_OK and price > 0:
+                    if pending is None or float(pending or 0) == 0:
+                        return {"state": "FILLED", "price": price, "status": status}
+                if status in self._TERMINAL_BAD:
+                    return {"state": "BAD", "price": 0.0, "status": status}
+                if filled > 0 and price > 0 and (pending is None or float(pending or 0) == 0):
+                    return {"state": "FILLED", "price": price, "status": status}
+            except Exception as e:
+                self.logger.debug(f"fill poll failed for {order_id}: {e}")
+            if time_module.monotonic() >= deadline:
+                return {"state": "OPEN", "price": 0.0,
+                        "status": last_status or "unknown"}
+            time_module.sleep(0.5)
+
+    def _cancel_and_confirm(self, order_id: str, leg: dict) -> dict:
+        """Cancel a resting exit order and prove what happened.
+
+        Returns {"state": "CANCELLED"}, {"state": "FILLED", "price": p} when the
+        order filled in the gap, or {"state": "UNKNOWN"}. Only the first may be
+        followed by a re-quote: escalating on top of a live order would double
+        the exit, and treating an unresolved cancel as a failure while the
+        exchange filled the leg would leave a closed leg recorded as open.
+        """
+        try:
+            self.client.cancel_order(order_id)
+        except UpstoxAPIError as e:
+            status = str((getattr(e, "response_body", "") or ""))[:160]
+            details = {}
+            try:
+                details = self.client.get_order_details(order_id) or {}
+            except Exception:
+                pass
+            st = str(details.get("status") or "").strip().lower()
+            price = float(details.get("average_price") or 0.0)
+            if st in self._TERMINAL_OK and price > 0:
+                return {"state": "FILLED", "price": price}
+            if st == "cancelled" or "UDAPI1109" in status:
+                return {"state": "CANCELLED"}
+            return {"state": "UNKNOWN", "status": st or status or "unknown"}
+        for _ in range(4):
+            try:
+                details = self.client.get_order_details(order_id) or {}
+            except Exception:
+                details = {}
+            st    = str(details.get("status") or "").strip().lower()
+            price = float(details.get("average_price") or 0.0)
+            if st == "cancelled":
+                return {"state": "CANCELLED"}
+            if st in self._TERMINAL_OK and price > 0:
+                return {"state": "FILLED", "price": price}
+            time_module.sleep(0.5)
+        return {"state": "UNKNOWN", "status": "cancel not confirmed"}
+
+    def _escalate_exit_price(
+        self, chain: dict, leg: dict, transaction_type: str, fallback: float,
+        attempt: int,
+    ) -> float:
+        """Re-quote a stuck exit through the market-protection price.
+
+        MARKET orders are not processed from the API, so the only way to force
+        an exit is a LIMIT far enough through the book to cross it, priced
+        against LTP rather than against a bid that stopped answering.
+        """
+        strike   = float(leg.get("strike", 0))
+        opt_type = str(leg.get("option_type", ""))
+        opt      = chain.get(strike, {}).get(opt_type, {}) if chain else {}
+        ltp = float(opt.get("ltp", 0) or 0) or float(opt.get("bid", 0) or 0) \
+            or float(opt.get("ask", 0) or 0) or fallback
+        pct = float(getattr(self.config, "market_protection_pct", 2.0))
+        pct = pct * (1.0 + 0.5 * max(0, attempt - 1))
+        price = self.client.synthetic_market_price(ltp, transaction_type, pct)
+        return price if price > 0 else self._aggressive_limit_price(
+            chain, strike, opt_type, transaction_type, fallback
+        )
+
     def execute_leg_entry(
         self, leg: dict, lots: int, chain: dict
     ) -> dict:
@@ -298,25 +589,25 @@ class LiveOrderExecutor:
             transaction_type, float(leg.get("exec_price", 0) or 0)
         )
 
-        result   = self.client.place_order(
-            instrument_token=instrument_key,
-            quantity=qty,
-            transaction_type=transaction_type,
-            order_type="LIMIT",
-            price=limit_price,
-            product="I",
+        placed = self._place_order_reconciled(
+            instrument_key=instrument_key, leg=leg,
+            transaction_type=transaction_type, qty=qty,
+            limit_price=limit_price, phase="ENTRY",
         )
-        order_id = result.get("order_id", "")
+        order_id = placed.get("order_id", "")
 
         self.logger.info(
             f"[LIVE] ENTRY ORDER: {transaction_type} {leg['option_type'].upper()} "
             f"{leg['strike']:.0f} ×{lots} @ limit={limit_price:.2f} "
-            f"order_id={order_id}"
+            f"order_id={order_id} tag={placed.get('tag')}"
+            + (" (reconciled after lost response)" if placed.get("reconciled") else "")
         )
 
-        fill_price = self._get_fill_price(
-            order_id, fallback=float(leg.get("exec_price", 0) or 0)
-        )
+        fill_price = float(placed.get("fill_price") or 0.0)
+        if fill_price <= 0:
+            fill_price = self._get_fill_price(
+                order_id, fallback=float(leg.get("exec_price", 0) or 0)
+            )
         return {
             "order_id":   order_id,
             "fill_price": fill_price,
@@ -326,7 +617,13 @@ class LiveOrderExecutor:
     def execute_leg_exit(
         self, leg: dict, chain: dict, lots: int
     ) -> dict:
-        """Place a live exit order."""
+        """Place a live exit order, escalating if the book stops answering.
+
+        A resting exit order is never simply abandoned: the ladder cancels it,
+        confirms the cancellation, and only then re-quotes deeper. Two live
+        orders on one leg would exit twice, which at this size is worse than
+        exiting a cycle late.
+        """
         instrument_key = self._resolve_instrument_key(leg, chain)
         if not instrument_key:
             raise RuntimeError(
@@ -342,28 +639,129 @@ class LiveOrderExecutor:
             transaction_type, fallback
         )
 
-        result   = self.client.place_order(
-            instrument_token=instrument_key,
-            quantity=qty,
-            transaction_type=transaction_type,
-            order_type="LIMIT",
-            price=limit_price,
-            product="I",
+        try:
+            escalate = int(getattr(self.config, "exit_escalation_attempts", 1))
+        except (TypeError, ValueError):
+            escalate = 1
+        attempts   = 1 + max(0, min(escalate, 3))
+        try:
+            wait_sec = float(getattr(self.config, "exit_escalate_after_sec", 6.0))
+        except (TypeError, ValueError):
+            wait_sec = 6.0
+        if not bool(getattr(self.config, "exit_escalation_enabled", True)):
+            attempts = 1
+        describe = (
+            f"{transaction_type} {str(leg.get('option_type', '')).upper()} "
+            f"{float(leg.get('strike', 0) or 0):.0f} ×{lots}"
         )
-        order_id = result.get("order_id", "")
 
-        self.logger.info(
-            f"[LIVE] EXIT ORDER: {transaction_type} {leg['option_type'].upper()} "
-            f"{leg['strike']:.0f} ×{lots} @ limit={limit_price:.2f} "
-            f"order_id={order_id}"
+        last_state = ""
+        for attempt in range(attempts):
+            try:
+                placed = self._place_order_reconciled(
+                    instrument_key=instrument_key, leg=leg,
+                    transaction_type=transaction_type, qty=qty,
+                    limit_price=limit_price, phase="EXIT",
+                )
+            except (UpstoxAPIError, OrderNotPlaced) as e:
+                # A rejected price or an order the broker confirms does not
+                # exist can both be re-tried safely at a deeper price; an
+                # unknown-fate error cannot, so it is left to the caller.
+                fatal = isinstance(e, UpstoxAPIError) and e.status_code != 400
+                if fatal or attempt + 1 >= attempts:
+                    raise
+                limit_price = self._escalate_exit_price(
+                    chain, leg, transaction_type, fallback, attempt + 2
+                )
+                self.logger.warning(
+                    f"[LIVE] EXIT ESCALATION: {describe} rejected "
+                    f"({str(e)[:90]}); re-quoting {limit_price:.2f}"
+                )
+                self._alert(
+                    "WARNING",
+                    f"exit {describe} rejected ({str(e)[:90]}); re-quoting "
+                    f"{limit_price:.2f}",
+                )
+                continue
+            order_id = placed.get("order_id", "")
+            self.logger.info(
+                f"[LIVE] EXIT ORDER: {describe} @ limit={limit_price:.2f} "
+                f"order_id={order_id} tag={placed.get('tag')}"
+                + (" (reconciled after lost response)" if placed.get("reconciled") else "")
+            )
+
+            fill_price = float(placed.get("fill_price") or 0.0)
+            if fill_price <= 0:
+                outcome    = self._await_fill(order_id, fallback, wait_sec)
+                fill_price = float(outcome.get("price") or 0.0)
+                last_state = str(outcome.get("status") or outcome.get("state") or "")
+                if outcome.get("state") == "FILLED":
+                    fill_price = float(outcome.get("price") or 0.0)
+
+            if fill_price > 0:
+                return {
+                    "order_id":   order_id,
+                    "fill_price": fill_price,
+                    "status":     "FILLED",
+                }
+
+            # Nothing may be left resting at the broker: an order that fills
+            # after this method returns would make the next cycle's exit a
+            # double exit. So every unfilled attempt is cancelled and the
+            # cancellation confirmed, including the last one.
+            final_try = attempt + 1 >= attempts
+            if str(placed.get("state") or "") == "BAD":
+                confirmed = {"state": "CANCELLED"}
+            else:
+                confirmed = self._cancel_and_confirm(order_id, leg)
+            if confirmed.get("state") == "FILLED":
+                price = float(confirmed.get("price") or 0.0)
+                if price > 0:
+                    self.logger.warning(
+                        f"exit order {order_id} filled while being cancelled at "
+                        f"{price:.2f} — booking that fill rather than re-quoting"
+                    )
+                    return {
+                        "order_id":   order_id,
+                        "fill_price": price,
+                        "status":     "FILLED",
+                    }
+            if confirmed.get("state") != "CANCELLED":
+                raise RuntimeError(
+                    f"exit order {order_id} for {describe} is unaccounted for "
+                    f"(status={last_state or 'unknown'}, "
+                    f"cancel={confirmed.get('state')}); leg left OPEN so no "
+                    f"second exit is sent - resolve at the broker before the "
+                    f"next cycle"
+                )
+            if final_try:
+                raise RuntimeError(
+                    f"exit for {describe} not filled after {attempts} attempt(s) "
+                    f"and cancelled (last status={last_state or 'unknown'}); "
+                    f"leg left OPEN for the next cycle"
+                )
+
+
+            attempt_no   = attempt + 2
+            new_price    = self._escalate_exit_price(
+                chain, leg, transaction_type, fallback, attempt_no
+            )
+            self._alert(
+                "WARNING",
+                f"exit {describe} unfilled after {wait_sec:.0f}s "
+                f"(status={last_state or 'unknown'}); cancelled and re-quoting "
+                f"{new_price:.2f} (was {limit_price:.2f})",
+            )
+            self.logger.warning(
+                f"[LIVE] EXIT ESCALATION: {describe} cancelled at "
+                f"{limit_price:.2f}, re-quoting {new_price:.2f}"
+            )
+            limit_price = new_price
+
+        raise RuntimeError(
+            f"exit for {describe} not filled after {attempts} attempt(s) "
+            f"(last status={last_state or 'unknown'})"
         )
-
-        fill_price = self._get_fill_price(order_id, fallback=fallback)
-        return {
-            "order_id":   order_id,
-            "fill_price": fill_price,
-            "status":     "FILLED",
-        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +811,13 @@ class ExecutionEngine:
         self.market_engine = market_engine
         self.cal_engine    = cal_engine
         self.logger        = logger
+        # Held here as well as in the executor: the safety paths on this class
+        # (margin pre-flight, flatten verification, cancel-all) must be able to
+        # ask the broker directly instead of trusting local bookkeeping.
+        self.client        = client
+        self.notifier      = (
+            AlertNotifier(config) if not config.paper_trade_mode else None
+        )
 
         self._ensure_extra_columns()
 
@@ -420,10 +825,34 @@ class ExecutionEngine:
             self.executor = PaperOrderExecutor(config, logger)
             logger.info("ExecutionEngine: PAPER TRADE mode.")
         else:
-            self.executor = LiveOrderExecutor(config, client, logger)
+            self.executor = LiveOrderExecutor(
+                config, client, logger, db=db, notifier=self.notifier
+            )
             logger.warning(
                 "ExecutionEngine: LIVE TRADING mode — REAL ORDERS WILL BE PLACED."
             )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # ALERTING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _alert(self, level: str, text: str) -> None:
+        """Page a human when the engine can no longer help itself.
+
+        Never allowed to raise: an alerting failure must not become a trading
+        failure, and must not abort a flatten that is already in progress.
+        """
+        try:
+            getattr(self.logger, {"CRITICAL": "critical",
+                                 "WARNING": "warning"}.get(level, "info"))(text)
+        except Exception:
+            pass
+        try:
+            if self.notifier is not None:
+                self.notifier.send(text, level)
+        except Exception:
+            pass
+
 
     # ─────────────────────────────────────────────────────────────────────
     # SCHEMA
@@ -864,7 +1293,70 @@ class ExecutionEngine:
         params["final_lots"]    = final_lots
         params["total_max_risk"] = float(params.get("max_loss_per_lot", 0) or 0) * final_lots
 
+        # ── Check 7: broker margin (live only, advisory by default) ───────
+        # The engine's own estimate is a wing-based approximation, so this is
+        # a warning lane, not a gate: blocking entries on a guess would strand
+        # positions that have no other way out. gate mode refuses the entry.
+        mode = str(getattr(self.config, "margin_preflight_mode", "warn") or "warn")
+        if (
+            mode != "off"
+            and not self.config.paper_trade_mode
+            and float(params.get("estimated_margin", 0) or 0) > 0
+        ):
+            available = self._broker_available_margin()
+            if available is not None:
+                need = float(params["estimated_margin"]) * 1.15
+                if available < need:
+                    msg = (
+                        f"broker available margin Rs{available:,.0f} below the "
+                        f"Rs{need:,.0f} this {final_lots}-lot entry needs "
+                        f"({'gating' if mode == 'gate' else 'advisory'})"
+                    )
+                    if mode == "gate":
+                        return "NO_GO", {"reason": f"margin_{msg}"}
+                    self._alert("WARNING", msg)
+                    params["margin_preflight_warning"] = round(need - available, 2)
+                else:
+                    params["margin_headroom_rupees"] = round(available - need, 2)
+
         return "GO", params
+
+    def _broker_available_margin(self) -> Optional[float]:
+        """Live available margin, or None when it cannot be determined.
+
+        v2 reports F&O margin under data.equity.available_margin; v3 renamed
+        the field to available_to_trade.cash_available_to_trade.total. Both
+        shapes are read so the check survives an endpoint upgrade in either
+        direction. An API failure returns None: unknown headroom must never
+        become a reason to stop unwinding a position.
+        """
+        try:
+            data = self.client.get_funds_and_margin() or {}
+        except Exception as e:
+            self.logger.debug(f"margin pre-flight unavailable: {e}")
+            return None
+        candidates: List[float] = []
+        equity = data.get("equity") if isinstance(data.get("equity"), dict) else {}
+        for src in (equity, data):
+            try:
+                val = float(src.get("available_margin") or 0.0)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val > 0:
+                candidates.append(val)
+        try:
+            at = (
+                data.get("available_to_trade", {})
+                .get("cash_available_to_trade", {})
+                .get("total")
+            )
+            val = float(at or 0.0)
+            if val > 0:
+                candidates.append(val)
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return min(candidates) if candidates else None
+
 
     # ─────────────────────────────────────────────────────────────────────
     # ENTRY EXECUTION
@@ -2113,37 +2605,207 @@ class ExecutionEngine:
         )
         self.market_engine._save_session_state()
 
-    def close_all_positions(self, reason: str) -> None:
-        """Close all open positions with the given reason."""
+    def close_all_positions(self, reason: str, force: bool = False) -> None:
+        """Close all open positions with the given reason.
+
+        force=True is the kill-switch contract: a position that is still open
+        after the first pass is retried, because every live path that lands
+        here (hard-exit sweep, EOD, watchdog, risk halt) is a path where being
+        flat matters more than the price. Without it the behaviour is exactly
+        what it always was.
+        """
         open_positions = self._get_open_positions()
         if not open_positions:
             return
 
+        ids = [p["position_id"] for p in open_positions]
         self.logger.info(
             f"Closing all {len(open_positions)} open position(s): {reason}"
         )
         for position in open_positions:
-            self.execute_close(position, reason, 0, {})
+            try:
+                self.execute_close(position, reason, 0, {})
+            except Exception as e:
+                # One row whose bookkeeping failed must not strand the rest of
+                # the book: the sweep exists to get everything flat.
+                self.logger.critical(
+                    f"close failed for {position['position_id']} ({reason}): {e}"
+                )
 
-    # ─────────────────────────────────────────────────────────────────────
-    # HARD EXIT SWEEP
-    # ─────────────────────────────────────────────────────────────────────
+        if not force or self.config.paper_trade_mode:
+            return
+
+        remaining = self._still_open_positions(ids)
+        attempts  = 1
+        while remaining and attempts < 3:
+            attempts += 1
+            self._alert(
+                "CRITICAL",
+                f"{len(remaining)} position(s) still open after {reason} "
+                f"(pass {attempts - 1}): {', '.join(p['position_id'] for p in remaining)}"
+                f" — retrying with escalated exit pricing",
+            )
+            for position in remaining:
+                try:
+                    self.execute_close(position, f"{reason}_RETRY{attempts - 1}", 7, {})
+                except Exception as e:
+                    self.logger.critical(
+                        f"flatten pass {attempts} failed for "
+                        f"{position['position_id']}: {e}"
+                    )
+            remaining = self._still_open_positions(ids)
+
+        if not remaining:
+            self.logger.info(f"flatten confirmed: {len(ids)} position(s) closed")
+            return
+
+        self._report_unflattened(remaining, reason)
+
+    def _still_open_positions(self, position_ids: List[str]) -> List[dict]:
+        if not position_ids:
+            return []
+        marks = ",".join("?" * len(position_ids))
+        try:
+            return self.db.query(
+                f"SELECT * FROM positions WHERE status='OPEN' "
+                f"AND position_id IN ({marks})",
+                tuple(position_ids),
+            )
+        except Exception as e:
+            self.logger.warning(f"flatten verification query failed: {e}")
+            return []
+
+    def _report_unflattened(self, positions: List[dict], reason: str) -> None:
+        """Tell the operator what the broker still holds, and what it costs.
+
+        The rows are deliberately left OPEN: closing them locally would book a
+        fabricated P&L and hide a live exposure. The next cycle retries, and
+        Upstox squares the position off itself at 15:20 with the intraday
+        penalty, so the alert is the only thing standing between a stuck order
+        and an unplanned overnight-ish risk.
+        """
+        # position_legs carries no instrument key, so the broker side is
+        # reported as a count rather than matched leg by leg: enough for the
+        # operator to tell "still held" from "already flat, bookkeeping stale".
+        broker_open: Optional[int] = None
+        try:
+            rows = self.client.get_positions() or []
+            broker_open = 0
+            for row in rows:
+                try:
+                    if float(row.get("quantity") or 0.0) != 0.0:
+                        broker_open += 1
+                except (TypeError, ValueError):
+                    broker_open += 1
+        except Exception as e:
+            self.logger.warning(f"broker position reconcile failed: {e}")
+
+        detail = []
+        for position in positions:
+            legs = [
+                l for l in self._get_position_legs(position["position_id"])
+                if l.get("leg_status") == "OPEN"
+            ]
+            leg_txt = ",".join(
+                f"{l.get('action')} {l.get('strike')}{str(l.get('option_type', '')).upper()}"
+                for l in legs
+            )
+            detail.append(f"{position['position_id']} [{leg_txt}]")
+
+        broker_txt = (
+            f"; broker reports {broker_open} non-zero F&O position(s)"
+            if broker_open is not None else "; broker state unavailable"
+        )
+        msg = (
+            f"{len(positions)} position(s) NOT flattened by '{reason}': "
+            + "; ".join(detail)
+            + broker_txt
+            + " — rows left OPEN so P&L is not fabricated; MANUAL FLATTEN"
+            " REQUIRED (Upstox auto-squares-off intraday F&O at 15:20 with a"
+            " per-order penalty)"
+        )
+        if broker_open == 0:
+            msg = (
+                f"{len(positions)} position(s) still OPEN locally after "
+                f"'{reason}' while the broker reports none: "
+                + "; ".join(detail)
+                + " — exits likely filled after their order query failed; "
+                "reconcile the book by hand (no automatic close, so P&L stays "
+                "truthful)"
+            )
+        self._alert("CRITICAL", msg)
+
+        if bool(getattr(self.config, "exit_all_positions_fallback", False)):
+            self._exit_all_positions_fallback(reason)
+
+    def _exit_all_positions_fallback(self, reason: str) -> None:
+        """Last resort: the broker's own flatten.
+
+        Exit-All-Positions sweeps the whole NSE_FO segment, so it is opt-in and
+        only ever reached after the engine's own priced exits failed.
+        """
+        self._alert(
+            "CRITICAL",
+            f"invoking broker Exit-All-Positions for NSE_FO after '{reason}' — "
+            "this flattens every intraday F&O order in the account, not just "
+            "this strategy's",
+        )
+        try:
+            self.client.exit_all_positions(segment="NSE_FO")
+        except Exception as e:
+            self._alert(
+                "CRITICAL",
+                f"broker Exit-All-Positions failed after '{reason}': {e} — "
+                "flatten by hand immediately",
+            )
+            return
+        time_module.sleep(2.0)
+        self.logger.critical(
+            "broker Exit-All-Positions dispatched; open rows stay OPEN until a "
+            "cycle reconciles them"
+        )
 
     def perform_hard_exit_sweep(self) -> None:
         """
         Perform hard exit sweep at 15:00.
         Closes all open positions regardless of P&L.
         Called from main.py every cycle.
+
+        The trigger is the earlier of 15:00 and HARD_EXIT_TIME so tightening
+        the configured time cannot silently arrive after the broker's own
+        square-off; the sweep forces confirmation because a LIMIT that did not
+        fill at 15:00 must not be left sitting there.
         """
         current_time = now_ist().time()
-        if current_time >= dtime(15, 0):
+        trigger      = dtime(15, 0)
+        try:
+            configured = self.config.hard_exit_time
+            if isinstance(configured, dtime):
+                trigger = min(trigger, configured)
+        except Exception:
+            pass
+        if current_time >= trigger:
             open_positions = self._get_open_positions()
             if open_positions:
                 self.logger.info(
-                    f"HARD EXIT SWEEP @ 15:00 — "
+                    f"HARD EXIT SWEEP @ {trigger.strftime('%H:%M')} — "
                     f"closing {len(open_positions)} position(s)"
                 )
-                self.close_all_positions("HARD_EXIT_15:00")
+                self.close_all_positions("HARD_EXIT_15:00", force=True)
+
+    def flatten_now(self, reason: str) -> None:
+        """Kill-switch entry point: cancel resting orders, then flatten."""
+        if not self.config.paper_trade_mode:
+            try:
+                result = self.client.cancel_all_open_orders()
+                state = str((result or {}).get("status") or "cancelled")
+                self.logger.warning(f"cancel-all before flatten: {state}")
+            except Exception as e:
+                self.logger.warning(
+                    f"cancel-all before flatten failed (continuing): {e}"
+                )
+        self.close_all_positions(reason, force=True)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

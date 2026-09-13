@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import signal
+import threading
 import time as time_module
 import traceback
 from datetime import datetime, date, time as dtime, timedelta
 from pathlib import Path
+from typing import Optional
 
 from core import (
     Config, Database, RateLimiter, UpstoxClient,
@@ -105,6 +108,26 @@ class MainEngine:
         self._last_status_print_time = 0.0
         self._eod_done               = False
 
+        # ── v6 safety state ───────────────────────────────────────────────
+        # Written by the main loop, read by the watchdog. Kept on the
+        # instance rather than in session_state so a crash cannot leave a
+        # stale flag that blocks entries on the next day.
+        self._last_cycle_ok_mono   = time_module.monotonic()
+        self._last_cycle_ok_at     = now_ist()
+        self._feed_stale           = False
+        self._feed_stale_alerted   = False
+        # RLock so the same thread can nest a halt flatten inside a guarded
+        # cycle; other threads (the watchdog) are still excluded.
+        self._flatten_lock         = threading.RLock()
+        self._halt_action_done     = False
+        self._soft_halt_alerted    = False
+        self._watchdog_stop        = threading.Event()
+        self._watchdog_thread      = None
+        self._watchdog_next_flatten = 0.0
+        self._watchdog_last_alert   = 0.0
+        self._watchdog_failures     = 0
+        self._signal_received       = None
+
         # ── Signal handlers ───────────────────────────────────────────────
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -115,6 +138,7 @@ class MainEngine:
 
     def _handle_signal(self, signum, frame) -> None:
         """Handle OS signals (Ctrl+C, SIGTERM) for graceful shutdown."""
+        self._signal_received = signum
         self.logger.info(f"Received signal {signum} — initiating graceful shutdown.")
         self.running = False
         raise KeyboardInterrupt()
@@ -202,13 +226,24 @@ class MainEngine:
             (today_str,),
         )
         actual_pnl = float(actual_pnl_row["total"] if actual_pnl_row else 0)
+        durable_halt = self._load_risk_halt(today_str)
         if actual_pnl > -self.config.starting_capital * self.config.max_daily_loss_pct:
-            if state.get("daily_halted") and real_stops < 2:
+            if state.get("daily_halted") and real_stops < 2 and not durable_halt:
                 self.logger.warning(
-                    "Session state integrity: daily_halted=True but losses within limit. "
-                    "Clearing halt flag."
+                    "Session state integrity: daily_halted=True but losses within "
+                    "limit. Clearing halt flag."
                 )
                 state["daily_halted"] = False
+            elif durable_halt and not state.get("daily_halted"):
+                self.logger.warning(
+                    f"Session state integrity: risk halt recorded for {today_str} "
+                    f"({str(durable_halt.get('reason') or '')[:80]}) — the halt "
+                    f"stands despite P&L looking recoverable"
+                )
+                state["daily_halted"] = True
+        if durable_halt:
+            self._halt_action_done  = True
+            self._soft_halt_alerted = True
         state["daily_pnl"] = actual_pnl
         self.market_engine._save_session_state()
         self.logger.info(
@@ -216,6 +251,142 @@ class MainEngine:
             f"halted={state.get('daily_halted')} "
             f"pnl=Rs{actual_pnl:.0f}"
         )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # v6: DURABLE RISK HALT, DISPATCH RECONCILIATION, ALERTING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _alert(self, level: str, text: str) -> None:
+        notifier = getattr(self.execution_engine, "notifier", None)
+        try:
+            if notifier is not None:
+                notifier.send(text, level)
+        except Exception:
+            pass
+
+    def _load_risk_halt(self, trading_date: str) -> Optional[dict]:
+        try:
+            row = self.db.query_one(
+                "SELECT * FROM risk_halt WHERE trading_date=?", (trading_date,)
+            )
+        except Exception as e:
+            self.logger.warning(f"risk_halt read failed (assuming no halt): {e}")
+            return None
+        if row and int(row.get("halted") or 0) == 1:
+            return row
+        return None
+
+    def _write_risk_halt(
+        self, trading_date: str, halted: int, reason: str,
+        total_pnl: float, loss_pct: float, action_taken: str,
+    ) -> None:
+        """Persist the halt so a restart cannot quietly resume trading."""
+        try:
+            now_iso = now_ist().isoformat()
+            self.db.execute(
+                "INSERT INTO risk_halt (trading_date, halted, reason, "
+                "total_pnl_rupees, loss_pct, action_taken, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(trading_date) DO UPDATE SET halted=excluded.halted, "
+                "reason=excluded.reason, "
+                "total_pnl_rupees=excluded.total_pnl_rupees, "
+                "loss_pct=excluded.loss_pct, "
+                "action_taken=excluded.action_taken, "
+                "updated_at=excluded.updated_at",
+                (trading_date, int(halted), reason[:200], round(float(total_pnl), 2),
+                 round(float(loss_pct), 6), action_taken[:120], now_iso, now_iso),
+            )
+        except Exception as e:
+            self.logger.warning(f"risk_halt write failed (halt still in memory): {e}")
+
+    def _reconcile_unresolved_dispatches(self) -> None:
+        """Resolve orders the ledger never saw answered.
+
+        A dispatch row left in DISPATCHED means the process died (or was
+        interrupted) between sending an order and recording the outcome, which
+        is the one state where the engine and the broker can disagree about
+        whether a position exists. Ask the broker, then act on the answer:
+        report it always, flatten it only if that was explicitly opted into.
+        """
+        if self.config.paper_trade_mode:
+            return
+        try:
+            rows = self.db.query(
+                "SELECT * FROM order_dispatch WHERE state IN "
+                "('DISPATCHED','UNRESOLVED') ORDER BY id DESC LIMIT 50"
+            )
+        except Exception as e:
+            self.logger.warning(f"dispatch ledger unreadable, skipping reconcile: {e}")
+            return
+        if not rows:
+            return
+        horizon = (now_ist() - timedelta(days=7)).strftime("%Y-%m-%d")
+        today_str = today_ist().isoformat()
+        for row in rows:
+            tag = str(row.get("tag") or "")
+            created = str(row.get("created_at") or "")[:10]
+            if not tag or (created and created < horizon):
+                continue
+            try:
+                found = self.client.get_order_history_by_tag(tag)
+            except Exception as e:
+                self.logger.warning(f"cannot reconcile tag {tag}: {e}")
+                continue
+            status = ""
+            if found:
+                latest = max(
+                    found, key=lambda r: str(r.get("order_timestamp") or "")
+                )
+                status = str(latest.get("status") or "").strip().lower()
+            if status in ("complete", "completed", "filled", "traded", "executed"):
+                price  = float(latest.get("average_price") or 0.0)
+                qty    = int(latest.get("filled_quantity") or latest.get("quantity") or 0)
+                action = str(latest.get("transaction_type") or row.get("transaction_type") or "")
+                msg = (
+                    f"unresolved order (tag {tag}) is FILLED at the broker: "
+                    f"{action} {qty} for position "
+                    f"{row.get('position_id') or 'none'} at {price:.2f} "
+                    f"({row.get('phase')}) — the engine has no book for it"
+                )
+                self.logger.critical(msg)
+                self._alert("CRITICAL", msg)
+                if bool(getattr(self.config, "orphan_flatten_at_broker", False)) and \
+                        not row.get("position_id"):
+                    try:
+                        self.client.exit_all_positions(segment="NSE_FO", tag=tag)
+                        self._alert(
+                            "CRITICAL",
+                            f"broker Exit-All-Positions dispatched for orphan "
+                            f"tag {tag}",
+                        )
+                    except Exception as e:
+                        self.logger.critical(
+                            f"orphan flatten for tag {tag} failed: {e} — flatten "
+                            f"by hand"
+                        )
+                new_state = "BROKER_FILLED_UNBOOKED"
+            elif not found:
+                new_state = "NOT_PLACED"
+                self.logger.warning(
+                    f"unresolved dispatch tag {tag} never reached the broker; "
+                    f"nothing to unwind"
+                )
+            else:
+                new_state = f"BROKER_{(status or 'UNKNOWN').upper()[:24]}"
+            try:
+                self.db.execute(
+                    "UPDATE order_dispatch SET state=?, error=?, updated_at=? "
+                    "WHERE tag=?",
+                    (
+                        new_state,
+                        f"startup reconcile {today_str}",
+                        now_ist().isoformat(),
+                        tag,
+                    ),
+                )
+            except Exception as e:
+                self.logger.debug(f"dispatch state update failed: {e}")
+
 
     def _carry_forward_capital(self) -> None:
         """
@@ -360,6 +531,14 @@ class MainEngine:
         """
         Check if total daily P&L (realized + unrealized) exceeds daily loss limit.
         Halts trading if limit is exceeded.
+
+        Two tiers, because the informative threshold is the earlier one: at
+        soft_halt_frac of the limit nothing is blocked (sizing already tightens
+        inside validate_pre_trade) but a human is paged while the book can still
+        be closed on the engine's own prices. At the limit the day is over —
+        resting orders go out, and with daily_halt_action=flatten the positions
+        go flat too. The halt is recorded in risk_halt so a restart in the
+        middle of the day cannot come back with a cleared flag.
         """
         state       = self.market_engine.state
         current_cap = float(state.get("current_capital", self.config.starting_capital) or 0)
@@ -374,14 +553,112 @@ class MainEngine:
 
         total_pnl = self.compute_total_daily_pnl()
         loss_pct  = max(0.0, -total_pnl) / day_start_cap
+        limit     = float(self.config.max_daily_loss_pct or 0.0)
+        if limit <= 0:
+            return
 
-        if loss_pct >= self.config.max_daily_loss_pct and not state.get("daily_halted"):
-            state["daily_halted"] = True
-            self.logger.warning(
-                f"DAILY LOSS LIMIT (incl. unrealized): {loss_pct*100:.2f}% "
-                f">= {self.config.max_daily_loss_pct*100:.1f}% — halting trading"
+        try:
+            soft_frac = float(getattr(self.config, "soft_halt_frac", 0.5))
+        except (TypeError, ValueError):
+            soft_frac = 0.5
+
+        # ── Soft tier: page only, change nothing ────────────────────────────
+        if (
+            0.0 < soft_frac < 1.0
+            and loss_pct >= limit * soft_frac
+            and not state.get("daily_halted")
+            and not self._soft_halt_alerted
+        ):
+            self._soft_halt_alerted = True
+            msg = (
+                f"SOFT DAILY LOSS THRESHOLD: {loss_pct*100:.2f}% of "
+                f"Rs{day_start_cap:,.0f} against a {limit*100:.1f}% hard limit — "
+                f"entries still allowed at reduced size, be ready to step in"
             )
-            self.market_engine._save_session_state()
+            self.logger.warning(msg)
+            self._alert("WARNING", msg)
+
+        # ── Hard tier: halt, and flatten when configured ───────────────────
+        if loss_pct >= limit:
+            if not state.get("daily_halted"):
+                state["daily_halted"] = True
+                self.logger.warning(
+                    f"DAILY LOSS LIMIT (incl. unrealized): {loss_pct*100:.2f}% "
+                    f">= {limit*100:.1f}% — halting trading"
+                )
+                self.market_engine._save_session_state()
+                self._write_risk_halt(
+                    today_ist().isoformat(), 1,
+                    f"daily_loss_{loss_pct*100:.2f}pct", total_pnl, loss_pct,
+                    str(getattr(self.config, "daily_halt_action", "flatten")),
+                )
+            if not self._halt_action_done:
+                # resumed mid-halt: the flag may be set with no actions run yet
+                self._run_halt_actions()
+
+    def _run_halt_actions(self) -> None:
+        """Carry out the configured halt action, exactly once per session."""
+        if self._halt_action_done:
+            return
+        self._halt_action_done = True
+        action = str(getattr(self.config, "daily_halt_action", "flatten") or "flatten")
+        action = action.strip().lower()
+        if action in ("", "block", "block_only", "warn", "none"):
+            self._alert(
+                "CRITICAL",
+                "DAILY LOSS HALT: entries blocked for the rest of the day; "
+                "positions left alone because daily_halt_action=block",
+            )
+            return
+        if self.config.paper_trade_mode:
+            self.logger.info(
+                "DAILY LOSS HALT: paper mode — cancel/flatten actions skipped."
+            )
+            self._alert(
+                "CRITICAL", "DAILY LOSS HALT (paper mode): entries blocked only."
+            )
+            return
+        if not self._flatten_lock.acquire(blocking=False):
+            self.logger.warning(
+                "halt flatten deferred: another flatten is already running"
+            )
+            self._halt_action_done = False
+            return
+        try:
+            if action in ("cancel", "cancel_only"):
+                try:
+                    result = self.client.cancel_all_open_orders()
+                    self.logger.warning(
+                        f"halt: cancel-all-open-orders -> "
+                        f"{(result or {}).get('status', 'sent')}"
+                    )
+                except Exception as e:
+                    self.logger.critical(f"halt cancel-all failed: {e}")
+                self._alert(
+                    "CRITICAL",
+                    "DAILY LOSS HALT: entries blocked and resting orders "
+                    "cancelled; positions left open by configuration",
+                )
+            else:
+                self._alert(
+                    "CRITICAL",
+                    "DAILY LOSS HALT: entries blocked, cancelling resting "
+                    "orders and flattening all positions",
+                )
+                try:
+                    self.execution_engine.flatten_now("RISK_HALT_DAILY_LOSS")
+                except Exception as e:
+                    self.logger.critical(
+                        f"flatten after halt failed ({e}); entries stay blocked "
+                        f"and the hard-exit sweep remains the backstop"
+                    )
+                    self._alert(
+                        "CRITICAL",
+                        f"DAILY LOSS HALT FLATTEN FAILED: {e} — flatten by hand now",
+                    )
+        finally:
+            self._flatten_lock.release()
+
 
     def _get_capital_at_day_start(self) -> float:
         """Return capital at the start of today's session."""
@@ -544,34 +821,50 @@ class MainEngine:
         except Exception as _cle:
             self.logger.debug(f"Cycle log regime update error: {_cle}")
 
-        # ── Step 5: Monitor open positions ────────────────────────────────
-        # IMPORTANT: positions are ALWAYS monitored regardless of regime
-        # ABORT only blocks new entries — never closes existing positions
-        self.execution_engine.monitor_all_positions(signals)
+        # ── Step 5-8: guarded against the watchdog's flatten ──────────────
+        # Monitoring, the hard-exit sweep and any new entry run under the
+        # flatten lock, so the watchdog can never be exiting the same leg at
+        # the same moment: two live orders on one leg is the failure mode
+        # every other part of this path exists to prevent.
+        with self._flatten_gate() as acting:
+            # ── Step 5: Monitor open positions ──────────────────────────────
+            # IMPORTANT: positions are ALWAYS monitored regardless of regime
+            # ABORT only blocks new entries - never closes existing positions
+            if acting:
+                self.execution_engine.monitor_all_positions(signals)
 
-        # ── Step 6: Hard exit sweep ───────────────────────────────────────
-        self.execution_engine.perform_hard_exit_sweep()
+                # ── Step 6: Hard exit sweep ─────────────────────────────────
+                self.execution_engine.perform_hard_exit_sweep()
 
-        # ── Step 7: Daily loss halt check ─────────────────────────────────
-        self.check_daily_loss_halt()
+            # ── Step 7: Daily loss halt check ───────────────────────────────
+            # The halt action takes the flatten lock re-entrantly, so a flatten
+            # started here is serialised with the cycle exactly like the sweep.
+            self.check_daily_loss_halt()
 
-        # ── Step 8: Strategy decision and entry ───────────────────────────
-        entry_possible = (
-            current_time >= dtime(9, 30) and
-            current_time <= dtime(14, 30) and
-            not self.market_engine.state.get("daily_halted") and
-            not signals.get("block_new_entries") and
-            bool(signals.get("or_computed", False)) and
-            signals.get("final_regime") not in ("NO_TRADE", "ABORT", None)
-        )
+            # ── Step 8: Strategy decision and entry ─────────────────────────
+            entry_possible = (
+                acting and
+                current_time >= dtime(9, 30) and
+                current_time <= dtime(14, 30) and
+                not self.market_engine.state.get("daily_halted") and
+                not signals.get("block_new_entries") and
+                bool(signals.get("or_computed", False)) and
+                signals.get("final_regime") not in ("NO_TRADE", "ABORT", None) and
+                not self._feed_stale
+            )
 
-        if entry_possible:
-            try:
-                decision = self.strategy_engine.decide(signals)
-                if decision.get("action") == "ENTER":
-                    self.execution_engine.process_entry_decision(decision, signals)
-            except Exception as e:
-                self.logger.error(f"Strategy/entry error: {e}", exc_info=True)
+            if entry_possible:
+                try:
+                    decision = self.strategy_engine.decide(signals)
+                    if decision.get("action") == "ENTER":
+                        self.execution_engine.process_entry_decision(decision, signals)
+                except Exception as e:
+                    self.logger.error(f"Strategy/entry error: {e}", exc_info=True)
+            elif acting and current_time >= dtime(9, 30) and \
+                    current_time <= dtime(14, 30) and self._feed_stale:
+                self.logger.info(
+                    "entries blocked this cycle: trading feed is stale (watchdog)"
+                )
 
         # ── Step 9: Update cycle log with P&L ────────────────────────────
         total_pnl = self.compute_total_daily_pnl()
@@ -958,7 +1251,7 @@ class MainEngine:
             self.logger.info(
                 f"EOD: closing {len(open_positions)} remaining position(s)"
             )
-            self.execution_engine.close_all_positions("EOD_CLOSE")
+            self.execution_engine.close_all_positions("EOD_CLOSE", force=True)
 
         # ── Run EOD calibration tasks ─────────────────────────────────────
         try:
@@ -996,10 +1289,48 @@ class MainEngine:
 
         open_positions = self.execution_engine._get_open_positions()
         if open_positions:
-            self.logger.info(
-                f"Shutdown: {len(open_positions)} open position(s) will remain open. "
-                f"Engine will resume monitoring on next start."
+            deadline = getattr(self.config, "square_off_deadline", None)
+            past_deadline = (
+                isinstance(deadline, dtime)
+                and now_ist().time() >= deadline
+                and now_ist().time() <= dtime(15, 30)
             )
+            if past_deadline and not self.config.paper_trade_mode:
+                # A restart cannot resume in time to manage these, so leaving
+                # them for "the next start" means handing them to the broker's
+                # own 15:20 square-off at a penalty. Flatten instead.
+                self.logger.critical(
+                    f"Shutdown past {deadline:%H:%M} with "
+                    f"{len(open_positions)} open position(s): flattening before exit."
+                )
+                self._alert(
+                    "CRITICAL",
+                    f"shutdown past the square-off deadline with "
+                    f"{len(open_positions)} open position(s) — flattening now",
+                )
+                try:
+                    self.execution_engine.flatten_now("SHUTDOWN_AFTER_DEADLINE")
+                except Exception as e:
+                    self.logger.critical(
+                        f"shutdown flatten failed: {e} — positions remain at the "
+                        f"broker, flatten by hand"
+                    )
+                    self._alert(
+                        "CRITICAL",
+                        f"SHUTDOWN FLATTEN FAILED: {e} — flatten by hand now",
+                    )
+            else:
+                self.logger.info(
+                    f"Shutdown: {len(open_positions)} open position(s) will remain "
+                    f"open. Engine will resume monitoring on next start."
+                )
+                if not self.config.paper_trade_mode:
+                    self._alert(
+                        "WARNING",
+                        f"engine stopped holding {len(open_positions)} open "
+                        f"position(s); restart before the square-off deadline or "
+                        f"flatten manually",
+                    )
 
         self.market_engine._save_session_state()
         self.logger.info(
@@ -1023,6 +1354,176 @@ class MainEngine:
     def _sleep(self, seconds: float) -> None:
         """Sleep for the given number of seconds."""
         time_module.sleep(max(0.0, seconds))
+
+    @contextlib.contextmanager
+    def _flatten_gate(self):
+        """Yield True when the flatten lock was acquired, False when it was not.
+
+        Paper mode never takes the lock (the watchdog cannot act there), so the
+        gate is a no-op and the trading path is byte-for-byte the behaviour it
+        always had.
+        """
+        if self.config.paper_trade_mode:
+            yield True
+            return
+        held = False
+        try:
+            held = self._flatten_lock.acquire(timeout=45)
+        except Exception as e:
+            self.logger.warning(f"flatten lock unavailable, proceeding: {e}")
+            held = True
+        if not held:
+            self.logger.warning(
+                "cycle skipped monitoring/sweep/entry: a flatten holds the lock"
+            )
+        try:
+            yield bool(held)
+        finally:
+            if held:
+                try:
+                    self._flatten_lock.release()
+                except Exception:
+                    pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    # v6: WATCHDOG — cycle liveness, feed degradation, square-off deadline
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _start_watchdog(self) -> None:
+        if not bool(getattr(self.config, "watchdog_enabled", True)):
+            self.logger.info("watchdog disabled (WATCHDOG_ENABLED=False)")
+            return
+        if self._watchdog_thread is not None:
+            return
+        thread = threading.Thread(
+            target=self._watchdog_loop, name="v6-watchdog", daemon=True
+        )
+        self._watchdog_thread = thread
+        thread.start()
+        self.logger.info(
+            f"watchdog armed: poll={self._watchdog_poll():.0f}s "
+            f"square_off_deadline={self.config.square_off_deadline:%H:%M} "
+            f"feed_degrade={self._watchdog_sec('feed_degrade_sec', 45):.0f}s "
+            f"feed_force_exit={self._watchdog_sec('feed_force_exit_sec', 120):.0f}s"
+            + (" [paper mode: logs only]" if self.config.paper_trade_mode else "")
+        )
+
+    def _stop_watchdog(self) -> None:
+        try:
+            self._watchdog_stop.set()
+        except Exception:
+            pass
+
+    def _watchdog_poll(self) -> float:
+        return min(max(float(getattr(self.config, "watchdog_poll_sec", 5.0) or 5.0), 1.0), 60.0)
+
+    def _watchdog_sec(self, key: str, default: float) -> float:
+        try:
+            return float(getattr(self.config, key, default) or 0.0)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _watchdog_flatten(self, reason: str, min_gap_sec: float = 60.0) -> None:
+        """Flatten from the watchdog, at most once per min_gap_sec.
+
+        Skipped when the main loop already holds the flatten lock: two
+        concurrent exit ladders on the same leg is exactly the double-order
+        failure this whole path exists to avoid.
+        """
+        now_mono = time_module.monotonic()
+        if now_mono < self._watchdog_next_flatten:
+            return
+        if not self._flatten_lock.acquire(blocking=False):
+            self.logger.warning("watchdog flatten skipped: a flatten is running")
+            return
+        try:
+            self._watchdog_next_flatten = now_mono + min_gap_sec
+            self.logger.critical(f"watchdog flatten: {reason}")
+            self._alert("CRITICAL", f"watchdog forced flatten — {reason}")
+            self.execution_engine.flatten_now(reason)
+        except Exception as e:
+            self.logger.critical(
+                f"watchdog flatten failed ({e}); positions stay open and will "
+                f"be retried on the next watchdog tick"
+            )
+        finally:
+            self._flatten_lock.release()
+
+    def _watchdog_once(self) -> None:
+        if self._watchdog_stop.is_set():
+            return
+        now_dt  = now_ist()
+        now_t   = now_dt.time()
+        try:
+            if ExpiryCalendar.is_holiday(now_dt.date()):
+                return
+        except Exception:
+            pass
+        in_session = dtime(9, 15) <= now_t <= dtime(15, 30)
+        if not in_session:
+            if self._feed_stale:
+                self._feed_stale = False
+            return
+
+        idle     = time_module.monotonic() - self._last_cycle_ok_mono
+        degrade  = self._watchdog_sec("feed_degrade_sec", 45.0)
+        force    = self._watchdog_sec("feed_force_exit_sec", 120.0)
+        live     = not self.config.paper_trade_mode
+
+        # ── Feed / loop liveness ──────────────────────────────────────────
+        if degrade > 0 and idle >= degrade:
+            if not self._feed_stale:
+                self._feed_stale = True
+                msg = (
+                    f"no completed trading cycle for {idle:.0f}s (threshold "
+                    f"{degrade:.0f}s)"
+                    + (" — new entries blocked" if live else
+                       " — paper mode, logging only")
+                )
+                self.logger.critical(f"WATCHDOG: {msg}")
+                self._alert("WARNING", msg)
+            if force > 0 and idle >= force:
+                if live:
+                    self._watchdog_flatten(
+                        f"FEED_STALE_{idle:.0f}s: no completed cycle for "
+                        f"{force:.0f}s while positions were open"
+                    )
+                elif self._watchdog_failures == 0:
+                    self.logger.critical(
+                        f"WATCHDOG: stale {idle:.0f}s past the force-exit "
+                        f"threshold — paper mode, not acting"
+                    )
+        elif self._feed_stale and idle < degrade:
+            self._feed_stale = False
+            self.logger.info(f"WATCHDOG: cycle cadence recovered ({idle:.0f}s)")
+
+        # ── Square-off deadline ───────────────────────────────────────────
+        # The in-loop sweep needs a healthy cycle to run. This does not, so a
+        # wedged loop cannot quietly slide past the broker's own square-off.
+        deadline = getattr(self.config, "square_off_deadline", None)
+        if live and isinstance(deadline, dtime) and now_t >= deadline:
+            try:
+                if self.execution_engine._get_open_positions():
+                    self._watchdog_flatten(
+                        f"SQUARE_OFF_DEADLINE_{deadline:%H:%M}: positions still "
+                        f"open at {now_t:%H:%M:%S}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"watchdog square-off check failed: {e}")
+
+    def _watchdog_loop(self) -> None:
+        poll = self._watchdog_poll()
+        while not self._watchdog_stop.wait(poll):
+            try:
+                self._watchdog_once()
+                self._watchdog_failures = 0
+            except Exception as e:
+                self._watchdog_failures += 1
+                if self._watchdog_failures in (1, 20, 100):
+                    try:
+                        self.logger.warning(f"watchdog iteration failed: {e}")
+                    except Exception:
+                        pass
 
     # ─────────────────────────────────────────────────────────────────────
     # MAIN RUN LOOP
@@ -1071,6 +1572,7 @@ class MainEngine:
         self._reconcile_open_positions_on_startup()
         self._validate_session_state_integrity()
         self._carry_forward_capital()
+        self._reconcile_unresolved_dispatches()
 
         # Startup calibration
         self._run_calibration_cycle(force=True, schedule="startup")
@@ -1115,6 +1617,7 @@ class MainEngine:
             self.logger.info(
                 "Post-market: Engine ready. Next session starts at 09:15."
             )
+        self._start_watchdog()
         self.logger.info("Press Ctrl+C to stop.")
 
         # ── Main loop ─────────────────────────────────────────────────────
@@ -1157,6 +1660,7 @@ class MainEngine:
                     self._last_cycle_time = now_mono
                     try:
                         self.run_one_cycle()
+                        self._last_cycle_ok_mono = time_module.monotonic()
                     except Exception as e:
                         self.logger.error(
                             f"UNHANDLED ERROR in run_one_cycle: {e}"
@@ -1190,6 +1694,9 @@ class MainEngine:
             self.logger.error(traceback.format_exc())
             self.perform_graceful_shutdown()
             return
+
+        finally:
+            self._stop_watchdog()
 
         self.db.close()
 
