@@ -173,6 +173,18 @@ API_ENDPOINTS = {
     "order_details":     "/order/details",
     "positions":         "/portfolio/short-term-positions",
     "funds_margin":      "/user/get-funds-and-margin",
+    # v6 order-lifecycle endpoints. Paths and query parameters are as
+    # published in the Upstox v2 developer documentation (Sep 2026):
+    #   GET    /v2/order/history          ?order_id= | ?tag=
+    #   GET    /v2/order/retrieve-all     (day order book)
+    #   DELETE /v2/order/multi/cancel     ?segment= | ?tag=   (max 10/req)
+    #   POST   /v2/order/positions/exit   ?segment= | ?tag=
+    #   POST   /v2/order/multi/place      (max 10 orders/req, beta)
+    "order_history":      "/order/history",
+    "order_book":         "/order/retrieve-all",
+    "cancel_all_orders":  "/order/multi/cancel",
+    "exit_all_positions": "/order/positions/exit",
+    "place_multi_order":  "/order/multi/place",
 }
 
 # ─────────────────────────────────────────────
@@ -261,6 +273,25 @@ def _get_time(env: dict, key: str, default: dtime) -> dtime:
         return dtime(int(parts[0]), int(parts[1]))
     except Exception:
         return default
+
+
+def _get_choice(env: dict, key: str, default: str, choices: tuple) -> str:
+    """Environment value restricted to a known set.
+
+    A typo in an operational switch must not silently arm a different
+    behaviour (e.g. DAILY_HALT_ACTION=flaten doing nothing at all): an
+    unrecognised value falls back to the documented default and says so.
+    """
+    val = (env.get(key) or "").strip().lower()
+    if not val:
+        return default
+    if val not in choices:
+        print(
+            f"[WARNING] {key}={val!r} is not one of {choices} — "
+            f"using {default!r}"
+        )
+        return default
+    return val
 
 
 # ─────────────────────────────────────────────
@@ -847,6 +878,51 @@ class Config:
         "wide_or", "dangerous_to_sell",
     )
 
+    # ── v6: live execution hardening ──────────────────────────────────
+    # The replay harness has its own fill model, so nothing below can move
+    # a backtested number: these knobs govern the live order path
+    # (UpstoxClient / LiveOrderExecutor / validate_pre_trade), the kill
+    # switch and the square-off watchdog, none of which the backtest calls.
+    # order_max_retries: 0 is deliberate. Upstox's v2 place-order API has no
+    # client order id, and urllib3 retries a POST that timed out after it
+    # reached the exchange - which produces a second, untracked fill on the
+    # same leg. An order is placed once and then RECONCILED (by tag, against
+    # /order/history), never re-sent blindly.
+    order_max_retries:             int   = 0
+    reconcile_after_timeout:       bool  = True
+    exit_escalate_after_sec:       float = 6.0
+    exit_escalation_attempts:      int   = 1
+    exit_escalation_enabled:       bool  = True
+    # MARKET orders are not processed from the API (UDAPI1158, and SL-M is
+    # blocked for options by the exchanges), so an exit that must happen is
+    # sent as a LIMIT through the order's own market-protection price.
+    market_as_limit:               bool  = True
+    market_protection_pct:         float = 2.0
+    order_tag_prefix:              str   = "nav6"
+    margin_preflight_mode:         str   = "warn"
+    # Kill switch: soft tier alerts, hard tier acts. "block" reproduces the
+    # engine's historic behaviour (stop opening trades, ride the exits).
+    daily_halt_action:             str   = "flatten"
+    soft_halt_frac:                float = 0.50
+    flatten_on_daily_halt:         bool  = True
+    # Square-off watchdog. Deliberately later than the in-loop 15:00 sweep
+    # and well before Upstox's 15:20 intraday F&O RMS sweep.
+    watchdog_enabled:              bool  = True
+    watchdog_poll_sec:             float = 5.0
+    square_off_deadline:           dtime = dtime(15, 8)
+    feed_degrade_sec:              int   = 45
+    feed_force_exit_sec:           int   = 120
+    # Broker-side sweeps. Off by default: /order/positions/exit exits EVERY
+    # open position in the segment, not only this engine's book, and the
+    # tag filter only covers positions opened with tagged orders.
+    exit_all_positions_fallback:   bool  = False
+    orphan_flatten_at_broker:      bool  = False
+    alert_telegram_bot_token:      str   = ""
+    alert_telegram_chat_id:        str   = ""
+    alert_webhook_url:             str   = ""
+    alert_min_interval_sec:        float = 3.0
+    alert_timeout_sec:             float = 5.0
+
     def __repr__(self) -> str:
         def mask(s: str) -> str:
             if not s:
@@ -1164,6 +1240,51 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
                 for s in env.get("MOMENTUM_BLOCK_MARKERS", "").split(",")
                 if s.strip()
             ) or Config.momentum_block_markers
+        ),
+        # ── v6 live execution hardening ───────────────────────────────────
+        order_max_retries=min(max(_get_int(env, "ORDER_MAX_RETRIES", 0), 0), 2),
+        reconcile_after_timeout=_get_bool(env, "RECONCILE_AFTER_TIMEOUT", True),
+        exit_escalate_after_sec=min(
+            max(_get_float(env, "EXIT_ESCALATE_AFTER_SEC", 6.0), 2.0), 60.0
+        ),
+        exit_escalation_attempts=min(
+            max(_get_int(env, "EXIT_ESCALATION_ATTEMPTS", 1), 0), 3
+        ),
+        exit_escalation_enabled=_get_bool(env, "EXIT_ESCALATION_ENABLED", True),
+        market_as_limit=_get_bool(env, "MARKET_AS_LIMIT", True),
+        market_protection_pct=min(
+            max(_get_float(env, "MARKET_PROTECTION_PCT", 2.0), 1.0), 25.0
+        ),
+        order_tag_prefix=(env.get("ORDER_TAG_PREFIX", "nav6").strip() or "nav6")[:12],
+        margin_preflight_mode=_get_choice(
+            env, "MARGIN_PREFLIGHT_MODE", "warn", ("off", "warn", "block")
+        ),
+        daily_halt_action=_get_choice(
+            env, "DAILY_HALT_ACTION", "flatten", ("block", "flatten", "terminate")
+        ),
+        soft_halt_frac=min(max(_get_float(env, "SOFT_HALT_FRAC", 0.50), 0.10), 1.00),
+        flatten_on_daily_halt=_get_bool(env, "FLATTEN_ON_DAILY_HALT", True),
+        watchdog_enabled=_get_bool(env, "WATCHDOG_ENABLED", True),
+        watchdog_poll_sec=min(
+            max(_get_float(env, "WATCHDOG_POLL_SEC", 5.0), 1.0), 60.0
+        ),
+        square_off_deadline=_get_time(env, "SQUARE_OFF_DEADLINE", dtime(15, 8)),
+        feed_degrade_sec=min(max(_get_int(env, "FEED_DEGRADE_SEC", 45), 15), 600),
+        feed_force_exit_sec=min(
+            max(_get_int(env, "FEED_FORCE_EXIT_SEC", 120), 30), 1800
+        ),
+        exit_all_positions_fallback=_get_bool(
+            env, "EXIT_ALL_POSITIONS_FALLBACK", False
+        ),
+        orphan_flatten_at_broker=_get_bool(env, "ORPHAN_FLATTEN_AT_BROKER", False),
+        alert_telegram_bot_token=env.get("TELEGRAM_BOT_TOKEN", "").strip(),
+        alert_telegram_chat_id=env.get("TELEGRAM_CHAT_ID", "").strip(),
+        alert_webhook_url=env.get("ALERT_WEBHOOK_URL", "").strip(),
+        alert_min_interval_sec=min(
+            max(_get_float(env, "ALERT_MIN_INTERVAL_SEC", 3.0), 0.0), 60.0
+        ),
+        alert_timeout_sec=min(
+            max(_get_float(env, "ALERT_TIMEOUT_SEC", 5.0), 1.0), 30.0
         ),
     )
 
@@ -1929,6 +2050,48 @@ CREATE TABLE IF NOT EXISTS expiry_results (
     regime_at_open      TEXT,
     created_at          TEXT DEFAULT (datetime('now','localtime'))
 );
+
+-- ── v6: durable risk halt ───────────────────────────────────────────────────
+-- The daily loss breaker used to live only in process memory, so restarting
+-- the engine on a halted day quietly re-armed it. This row is the day's
+-- verdict; clearing it is an operator action, not a restart side effect.
+CREATE TABLE IF NOT EXISTS risk_halt (
+    trading_date            TEXT PRIMARY KEY,
+    halted                  INTEGER NOT NULL DEFAULT 1,
+    reason                  TEXT,
+    total_pnl_rupees        REAL,
+    loss_pct                REAL,
+    action_taken            TEXT,
+    created_at              TEXT DEFAULT (datetime('now','localtime')),
+    updated_at              TEXT
+);
+
+-- ── v6: order dispatch ledger (write-ahead intent) ─────────────────────────
+-- The API has no client order id on /order/place, so a POST that times out
+-- cannot be told apart from one that never arrived. The tag is generated and
+-- written BEFORE the request goes out; the response is written after. That
+-- turns "did my order reach the exchange?" into a query instead of a guess.
+CREATE TABLE IF NOT EXISTS order_dispatch (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag                     TEXT NOT NULL UNIQUE,
+    position_id             TEXT,
+    leg_idx                 INTEGER,
+    phase                   TEXT,
+    action                  TEXT,
+    transaction_type        TEXT,
+    instrument_token        TEXT,
+    quantity                INTEGER,
+    limit_price             REAL,
+    order_id                TEXT,
+    state                   TEXT NOT NULL,
+    attempts                INTEGER NOT NULL DEFAULT 1,
+    error                   TEXT,
+    created_at              TEXT DEFAULT (datetime('now','localtime')),
+    updated_at              TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_od_position ON order_dispatch(position_id);
+CREATE INDEX IF NOT EXISTS idx_od_state    ON order_dispatch(state, created_at);
 """
 
 # ─────────────────────────────────────────────
@@ -2589,15 +2752,24 @@ def setup_logging(
 # ─────────────────────────────────────────────
 
 class UpstoxAPIError(Exception):
-    """Raised when the Upstox API returns an error."""
+    """Raised when the Upstox API returns an error.
+
+    `maybe_delivered` is the field that makes order handling safe: it is True
+    when the request can no longer be assumed absent from the exchange (a
+    timeout, a connection reset after send, or a 5xx from the gateway). Every
+    order call that sees it must reconcile by tag before considering a retry,
+    because a blind retry of a POST that landed is a duplicate position.
+    """
     def __init__(
         self, message: str,
         status_code: Optional[int] = None,
-        response_body: Optional[str] = None
+        response_body: Optional[str] = None,
+        maybe_delivered: bool = False,
     ):
         super().__init__(message)
         self.status_code  = status_code
         self.response_body = response_body
+        self.maybe_delivered = bool(maybe_delivered)
 
 
 class UpstoxClient:
@@ -2623,13 +2795,22 @@ class UpstoxClient:
 
         self.session = requests.Session()
 
-        # Retry strategy: 3 retries on 5xx and 429
+        # Data/session endpoints are safe to retry: every one of them is a
+        # read. Order endpoints are not, so they get their own session with
+        # its own (by default zero) retry budget.
+        #
+        # The historic single session retried POST /order/place on 429/5xx.
+        # A retry of a POST that the exchange had already accepted is a
+        # second, untracked fill on the same leg - and Upstox's v2 place
+        # order API has no client order id with which to spot it. Order
+        # placement now never re-sends: it fails, and the caller reconciles
+        # by tag against /order/history before deciding anything.
         try:
             retry_strategy = Retry(
                 total=config.max_retries,
                 backoff_factor=0.5,
                 status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["GET", "POST", "DELETE"],
+                allowed_methods=["GET"],
                 respect_retry_after_header=True,
             )
         except TypeError:
@@ -2638,11 +2819,37 @@ class UpstoxClient:
                 total=config.max_retries,
                 backoff_factor=0.5,
                 status_forcelist=[429, 500, 502, 503, 504],
-                method_whitelist=["GET", "POST", "DELETE"],
+                method_whitelist=["GET"],
             )
 
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("https://", adapter)
+
+        order_retries = max(0, int(getattr(config, "order_max_retries", 0) or 0))
+        self.order_session = requests.Session()
+        if order_retries:
+            try:
+                order_retry = Retry(
+                    total=order_retries,
+                    backoff_factor=0.5,
+                    status_forcelist=[500, 502, 503, 504],
+                    allowed_methods=["GET", "DELETE"],
+                    respect_retry_after_header=True,
+                )
+            except TypeError:
+                order_retry = Retry(
+                    total=order_retries,
+                    backoff_factor=0.5,
+                    status_forcelist=[500, 502, 503, 504],
+                    method_whitelist=["GET", "DELETE"],
+                )
+            self.order_session.mount(
+                "https://", HTTPAdapter(max_retries=order_retry)
+            )
+        self.order_session.headers.update({
+            "Accept":        "application/json",
+            "Authorization": f"Bearer {config.upstox_access_token}",
+        })
         self.session.headers.update({
             "Accept":        "application/json",
             "Authorization": f"Bearer {config.upstox_access_token}",
@@ -2672,11 +2879,18 @@ class UpstoxClient:
                 f"Rate limiter: waited {wait_time:.2f}s for {endpoint_key}"
             )
 
+        # Order traffic uses its own session: no automatic retry of a POST,
+        # and the combined order-API bucket (place/modify/cancel/multi, which
+        # Upstox limits together) is the one being metered.
+        session = (
+            self.order_session if category == "order" else self.session
+        )
+
         start       = time.monotonic()
         status_code = None
 
         try:
-            resp = self.session.request(
+            resp = session.request(
                 method, url,
                 params=params,
                 json=json_body,
@@ -2693,7 +2907,13 @@ class UpstoxClient:
                     status_code, elapsed_ms,
                     rate_limited=True, error_message=msg
                 )
-                raise UpstoxAPIError(msg, status_code=429, response_body=resp.text)
+                # A 429 is raised by the gateway before the exchange sees the
+                # order, but it is not worth betting the book on that: order
+                # calls flag it as maybe-delivered so the caller reconciles.
+                raise UpstoxAPIError(
+                    msg, status_code=429, response_body=resp.text,
+                    maybe_delivered=(category == "order"),
+                )
 
             resp.raise_for_status()
             data = resp.json()
@@ -2705,13 +2925,37 @@ class UpstoxClient:
         except requests.exceptions.RequestException as e:
             elapsed_ms    = (time.monotonic() - start) * 1000
             error_message = str(e)
+            if status_code is None:
+                _resp = getattr(e, "response", None)
+                if _resp is not None:
+                    try:
+                        status_code = int(_resp.status_code)
+                    except (TypeError, ValueError):
+                        status_code = None
+            # A timeout or a connection reset on an order call tells you the
+            # request may have been delivered and the answer merely lost.
+            # Reads are free to be re-asked; writes are not.
+            maybe_delivered = category == "order" and (
+                isinstance(
+                    e,
+                    (
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                    ),
+                )
+                or (status_code in (429, 500, 502, 503, 504))
+            )
             self.logger.error(f"API call failed: {endpoint_key} — {error_message}")
             self.db.log_api_call(
                 category, endpoint_key, method,
                 status_code, elapsed_ms,
                 error_message=error_message
             )
-            raise UpstoxAPIError(error_message, status_code=status_code) from e
+            raise UpstoxAPIError(
+                error_message,
+                status_code=status_code,
+                maybe_delivered=maybe_delivered,
+            ) from e
 
     # ── Market Data ───────────────────────────────────────────────────────
 
@@ -2829,6 +3073,23 @@ class UpstoxClient:
 
     # ── Order Placement ───────────────────────────────────────────────────
 
+    # Exchange-legitimate stand-in for a market order. NSE/BSE/MCX do not
+    # process MARKET orders sent over the API (Upstox rejects them with
+    # UDAPI1158) and SL-M is blocked for options outright, so an exit that
+    # simply must happen is a LIMIT through the order's market-protection
+    # price instead. Callers pass `reference_price` = LTP.
+    def synthetic_market_price(
+        self, reference_price: float, transaction_type: str, protection_pct: float
+    ) -> float:
+        ref = float(reference_price or 0.0)
+        if ref <= 0:
+            return 0.0
+        pct = min(max(float(protection_pct or 2.0), 1.0), 25.0) / 100.0
+        tick = float(getattr(self.config, "tick_size", 0.05) or 0.05)
+        raw  = ref * (1.0 + pct) if transaction_type == "BUY" else ref * (1.0 - pct)
+        raw  = max(raw, tick)
+        return round(round(raw / tick) * tick, 2)
+
     def place_order(
         self,
         instrument_token: str,
@@ -2840,36 +3101,77 @@ class UpstoxClient:
         trigger_price: float = 0.0,
         validity: str = "DAY",
         tag: str = "nifty_algo_v3",
+        disclosed_quantity: int = 0,
+        reference_price: float = 0.0,
     ) -> dict:
         """
         Place a live order. Raises RuntimeError in paper trade mode.
         transaction_type: 'BUY' or 'SELL'
         order_type: 'LIMIT', 'MARKET', 'SL', 'SL-M'
         product: 'I' (intraday), 'D' (delivery)
+
+        Request fields follow the v2 place-order contract as published in
+        September 2026: quantity (in units for F&O, a multiple of the tick
+        size), product I/D/MTF, validity DAY/IOC only, disclosed_quantity and
+        trigger_price required, tag optional and capped at 40 characters
+        (UDAPI1119). MARKET is accepted here only to be converted: the
+        exchange path for it is closed for API traffic.
         """
         if self.config.paper_trade_mode:
             raise RuntimeError(
                 "place_order() called while PAPER_TRADE_MODE=True. "
                 "Refusing to place a real order."
             )
+        order_type = str(order_type or "LIMIT").upper()
+        if order_type in ("MARKET", "SL-M"):
+            ref = float(reference_price or price or 0.0)
+            if bool(getattr(self.config, "market_as_limit", True)) and ref > 0:
+                price = self.synthetic_market_price(
+                    ref, transaction_type,
+                    float(getattr(self.config, "market_protection_pct", 2.0)),
+                )
+                order_type = "LIMIT"
+                trigger_price = 0.0
+            else:
+                raise UpstoxAPIError(
+                    "MARKET/SL-M orders are not processed from the Upstox API "
+                    "(UDAPI1158); pass reference_price to send a limit at the "
+                    "market-protection price instead",
+                    status_code=400,
+                )
+        # v2 validity is DAY or IOC: anything else (GFD, GTD) is a silent
+        # rejection waiting to happen, so it is normalised here.
+        if str(validity or "DAY").upper() not in ("DAY", "IOC"):
+            validity = "DAY"
+        # The tag is the only client-side handle on an order until an id
+        # comes back, so it is both unique (reconciliation key) and short
+        # enough for the API to accept.
+        clean_tag = str(tag or "")[:40]
         body = {
-            "quantity":         quantity,
-            "product":          product,
+            "quantity":           int(quantity),
+            "product":            product,
             "validity":         validity,
-            "price":            price,
+            "price":            float(price or 0.0),
             "instrument_token": instrument_token,
             "order_type":       order_type,
             "transaction_type": transaction_type,
-            "trigger_price":    trigger_price,
+            "disclosed_quantity": int(disclosed_quantity or 0),
+            "trigger_price":    float(trigger_price or 0.0),
             "is_amo":           False,
-            "tag":              tag,
+            "tag":              clean_tag,
         }
         data = self._request(
             "POST", "place_order",
             category="order",
             json_body=body,
         )
-        return data.get("data", {})
+        payload = data.get("data", {}) or {}
+        if not payload.get("order_id"):
+            ids = payload.get("order_ids") or []
+            if ids:
+                payload = {**payload, "order_id": str(ids[0])}
+        payload["tag"] = clean_tag
+        return payload
 
     def cancel_order(self, order_id: str) -> dict:
         """Cancel a live order. Raises RuntimeError in paper trade mode."""
@@ -2884,6 +3186,212 @@ class UpstoxClient:
             params=params,
         )
         return data.get("data", {})
+
+    # ── v6: order lifecycle queries and sweeps ─────────────────────────────
+    # These are the endpoints that make the order path verifiable rather than
+    # hopeful: /order/history by tag (the reconciliation read), the day's
+    # order book, cancel-all and exit-all.
+
+    _OPEN_ORDER_STATES = (
+        "open", "open pending", "validation pending", "put order req received",
+        "user risk management in progress", "risk management done init pending",
+        "exchange pending", "pending", "modify pending", "cancel pending",
+        "transaction pending", "discharge",
+    )
+
+    def get_order_history_by_tag(self, tag: str) -> list:
+        """All order records carrying this tag, newest state last.
+
+        GET /v2/order/history?tag=... is documented to return the history of
+        every order matching the tag, so a single entry in the list is the
+        usual case and more than one means the caller must reconcile an
+        unintended duplicate rather than pretend it did not happen.
+        """
+        tag = str(tag or "")[:40]
+        if not tag:
+            return []
+        try:
+            data = self._request(
+                "GET", "order_history", category="default", params={"tag": tag}
+            )
+        except UpstoxAPIError as e:
+            if e.status_code in (404, 422):
+                return []
+            raise
+        rows = data.get("data") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        return list(rows)
+
+    def get_day_orders(self) -> list:
+        """Today's order book (GET /v2/order/retrieve-all)."""
+        try:
+            data = self._request("GET", "order_book", category="default")
+        except UpstoxAPIError:
+            return []
+        rows = data.get("data") or []
+        if isinstance(rows, dict):
+            rows = [rows.get("orders") or []]
+        return list(rows)
+
+    def get_open_orders(self) -> list:
+        """Orders still live at the exchange, best-effort."""
+        out = []
+        for row in self.get_day_orders():
+            state = str(row.get("status") or "").strip().lower()
+            if state in self._OPEN_ORDER_STATES:
+                out.append(row)
+        return out
+
+    def cancel_all_open_orders(self, segment: str = "NSE_FO", tag: str = "") -> dict:
+        """Cancel the day's open orders (DELETE /v2/order/multi/cancel).
+
+        Upstox answers UDAPI1109 "No open or pending order available" as an
+        error-shaped body; that is the healthy nothing-to-do case and is
+        reported as such instead of an exception.
+        """
+        params = {}
+        if segment:
+            params["segment"] = segment
+        if tag:
+            params["tag"] = str(tag)[:40]
+        try:
+            data = self._request(
+                "DELETE", "cancel_all_orders", category="order", params=params
+            )
+        except UpstoxAPIError as e:
+            if "UDAPI1109" in str(e.response_body or "") or "No open or pending" in str(e):
+                return {"status": "noop", "order_ids": [], "errors": []}
+            raise
+        body = data or {}
+        order_ids = ((body.get("data") or {}).get("order_ids")) or []
+        errors = body.get("errors") or []
+        clean_errors = [
+            err for err in errors
+            if "UDAPI1109" not in str(err.get("error_code") or "")
+        ]
+        return {
+            "status":    body.get("status") or "success",
+            "order_ids": list(order_ids),
+            "errors":    clean_errors,
+            "summary":   body.get("summary") or {},
+        }
+
+    def exit_all_positions(self, segment: str = "NSE_FO", tag: str = "") -> dict:
+        """POST /v2/order/positions/exit.
+
+        This exits EVERY position in the segment, not only this engine's
+        book, so it is never called unless the operator has enabled
+        EXIT_ALL_POSITIONS_FALLBACK. Upstox squares off through MARKET orders
+        with market price protection applied by default, which is the one
+        documented path on which a market order still works.
+        """
+        params = {}
+        if segment:
+            params["segment"] = segment
+        if tag:
+            params["tag"] = str(tag)[:40]
+        data = self._request(
+            "POST", "exit_all_positions", category="order", params=params
+        )
+        body = data or {}
+        return {
+            "status":    body.get("status") or "success",
+            "order_ids": ((body.get("data") or {}).get("order_ids")) or [],
+            "errors":    body.get("errors") or [],
+            "summary":   body.get("summary") or {},
+        }
+
+
+# ─────────────────────────────────────────────
+# OPERATOR ALERTS
+# ─────────────────────────────────────────────
+
+class AlertNotifier:
+    """Operator alerts for the failure paths that have no other witness.
+
+    A dead broker call at 15:1x, an order the engine cannot account for, a
+    feed that stopped mid-position: these are the moments where a log line is
+    not enough, because nobody is reading the log at that second.
+
+    Deliberately unable to hurt trading: no exceptions escape, the request
+    timeout is short, and repeats are throttled per level so an outage cannot
+    turn into an alert storm that itself slows the loop down. Disabled unless
+    a channel is configured, and disabled channels cost nothing.
+    """
+
+    _CRITICAL_FLOOR_SEC = 1.0
+
+    def __init__(self, config: Config, logger=None):
+        self.config  = config
+        self.logger  = logger
+        self.token   = str(getattr(config, "alert_telegram_bot_token", "") or "").strip()
+        self.chat_id = str(getattr(config, "alert_telegram_chat_id", "") or "").strip()
+        self.webhook = str(getattr(config, "alert_webhook_url", "") or "").strip()
+        try:
+            self.min_interval = float(getattr(config, "alert_min_interval_sec", 3.0))
+        except (TypeError, ValueError):
+            self.min_interval = 3.0
+        try:
+            self.timeout = float(getattr(config, "alert_timeout_sec", 5.0))
+        except (TypeError, ValueError):
+            self.timeout = 5.0
+        self._last_sent: dict = {}
+        self._sent_count = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool((self.token and self.chat_id) or self.webhook)
+
+    def _suppressed(self, level: str) -> bool:
+        now  = time.monotonic()
+        last = float(self._last_sent.get(level, 0.0) or 0.0)
+        floor = (
+            self._CRITICAL_FLOOR_SEC if level == "CRITICAL"
+            else max(0.0, self.min_interval)
+        )
+        return (now - last) < floor
+
+    def send(self, text: str, level: str = "INFO") -> bool:
+        """Deliver an alert if a channel is configured. Never raises."""
+        if not self.enabled:
+            return False
+        level = str(level or "INFO").upper()
+        if self._suppressed(level):
+            return False
+        self._last_sent[level] = time.monotonic()
+        message = f"[{level}] {str(text)[:1800]}"
+        delivered = False
+        if self.token and self.chat_id:
+            try:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": message[:4000]},
+                    timeout=self.timeout,
+                )
+                delivered = delivered or bool(
+                    resp.ok and str(resp.json().get("ok")).lower() in ("true", "1")
+                )
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"Telegram alert delivery failed: {e}")
+        if self.webhook:
+            try:
+                resp = requests.post(
+                    self.webhook,
+                    json={
+                        "level": level,
+                        "text":  message,
+                        "ts":    now_ist().isoformat(),
+                    },
+                    timeout=self.timeout,
+                )
+                delivered = delivered or bool(resp.ok)
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"Webhook alert delivery failed: {e}")
+        self._sent_count += 1
+        return delivered
 
 
 # ─────────────────────────────────────────────
