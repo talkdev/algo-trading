@@ -923,6 +923,27 @@ class Config:
     alert_min_interval_sec:        float = 3.0
     alert_timeout_sec:             float = 5.0
 
+    # ── v7: per-trade console lifecycle report ──────────────────────
+    # One block per trade, on the console, every cycle, from BOTH the
+    # live/paper engine and the replay harness: what was bought and sold
+    # at entry, what the position is worth now (or was closed at), and
+    # the money. The block is rendered from the persisted book
+    # (positions / position_legs) plus the current chain, never from a
+    # parallel calculation, so it cannot drift from what the engine
+    # actually did.
+    trade_report_enabled:          bool  = True
+    # each_cycle -> every trade of the session, every cycle. This is the
+    #               requested behaviour and the loudest one: a trade that
+    #               closed at 11:00 is still reprinted at 15:00.
+    # on_change  -> a trade is reprinted only when it opened, closed, or
+    #               its unrealised P&L moved by trade_report_mark_eps.
+    # off        -> nothing is printed.
+    trade_report_mode:             str   = "each_cycle"
+    trade_report_mark_eps:         float = 25.0
+    # 0 = no cap. A cap keeps a many-trade session readable; the newest
+    # trades are the ones printed when the cap bites.
+    trade_report_max_per_cycle:    int   = 0
+
     def __repr__(self) -> str:
         def mask(s: str) -> str:
             if not s:
@@ -1022,8 +1043,19 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),
 
         # Costs
-        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.001),
-        stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.00125),
+        # v7: STT on the SALE of an option in securities is 0.15% of the
+        # premium for transactions on/after 1 April 2026 (Budget 2026,
+        # clause 143 of the Finance Bill 2026: 0.10% -> 0.15% on premium,
+        # 0.125% -> 0.15% on exercise; futures went 0.02% -> 0.05%). The
+        # engine had been costing every 2026 trade at the superseded rate,
+        # so the single largest statutory charge on a short-premium book
+        # was understated by a third. That is not a rounding difference:
+        # it feeds _round_trip_friction, the minimum-credit gate, the EV
+        # gate, lot sizing and net P&L, so trades were being approved
+        # against a tax that no longer exists. Override STT_OPTIONS_SELL
+        # in env.txt when replaying a session that settled under 0.10%.
+        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),
+        stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),
         brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),
         exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003553),
         sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),
@@ -1285,6 +1317,18 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         ),
         alert_timeout_sec=min(
             max(_get_float(env, "ALERT_TIMEOUT_SEC", 5.0), 1.0), 30.0
+        ),
+        # ── v7 per-trade console report ───────────────────────────────────
+        trade_report_enabled=_get_bool(env, "TRADE_REPORT_ENABLED", True),
+        trade_report_mode=_get_choice(
+            env, "TRADE_REPORT_MODE", "each_cycle",
+            ("each_cycle", "on_change", "off"),
+        ),
+        trade_report_mark_eps=min(
+            max(_get_float(env, "TRADE_REPORT_MARK_EPS", 25.0), 0.0), 100000.0
+        ),
+        trade_report_max_per_cycle=min(
+            max(_get_int(env, "TRADE_REPORT_MAX_PER_CYCLE", 0), 0), 500
         ),
     )
 
@@ -1702,6 +1746,14 @@ CREATE TABLE IF NOT EXISTS trade_exits (
     exit_priority_name      TEXT,
     exit_spot               REAL,
     exit_vix                REAL,
+    -- v7: ExecutionEngine.execute_close() has written these two since it was
+    -- first drafted, but no schema declared them, so the whole INSERT failed
+    -- with "table trade_exits has no column named exit_adx" and was swallowed
+    -- as a warning. The exit audit table stayed permanently empty (the
+    -- 2026-09-11 paper book: 2 CLOSED positions, 0 trade_exits rows), which
+    -- also blanked every query that joins trade_exits.
+    exit_adx                REAL,
+    exit_vwap_dist          REAL,
     exit_legs_json          TEXT,
     exit_premium            REAL,
     gross_pnl_pts           REAL,
@@ -2144,6 +2196,10 @@ MIGRATION_SQL: List[str] = [
     "ALTER TABLE trade_exits ADD COLUMN exit_priority INTEGER",
     "ALTER TABLE trade_exits ADD COLUMN exit_priority_name TEXT",
     "ALTER TABLE trade_exits ADD COLUMN pnl_15min_after_exit REAL",
+    # v7: the two columns execute_close() has always written but no schema
+    # ever declared - their absence made every trade_exits INSERT fail.
+    "ALTER TABLE trade_exits ADD COLUMN exit_adx REAL",
+    "ALTER TABLE trade_exits ADD COLUMN exit_vwap_dist REAL",
     "ALTER TABLE session_state ADD COLUMN opening_straddle_pts REAL DEFAULT 0",
     "ALTER TABLE session_state ADD COLUMN prev_day_vix_close REAL",
     "ALTER TABLE session_state ADD COLUMN gap_direction TEXT DEFAULT 'FLAT'",
@@ -3424,6 +3480,626 @@ def print_kv_table(
 
 
 # ─────────────────────────────────────────────
+# v7 — PER-TRADE CONSOLE REPORT
+# ─────────────────────────────────────────────
+#
+# One block per trade, on the console, every cycle, from BOTH engines
+# (main.py for live/paper, backtest_engine.py for replay). The layout is
+# the operator's, fixed:
+#
+#   ====================================================================
+#   Trade-<n>
+#   Strategy: <name>
+#   --------------------------------------------------------------------
+#   Trade Start Data: time: <HH:MM>
+#   Bought/Sold: <n> lot of CE with premium: <n> at strike: <n>
+#   --------------------------------------------------------------------
+#   Trade End Data: time: <HH:MM>
+#   Bought/Sold: <n> lot of CE with premium: <n> at strike: <n>
+#   Open
+#   --------------------------------------------------------------------
+#   Position Status: Open/Close
+#   Total Investment:
+#   Total Profit:
+#   ====================================================================
+#
+# The numbers are read out of the persisted book (positions /
+# position_legs) and marked with the same chain the engine is trading on,
+# so the block is an audit of what happened rather than a second opinion
+# about it. Where a value has to be derived, its basis is printed next to
+# it - a rupee figure with no stated basis is how accounting arguments
+# start.
+#
+#   Total Investment = cash the trade had to put up, plus the entry
+#       charges already paid. A net-debit structure pays premium, so the
+#       basis is the premium paid. A net-credit structure RECEIVES
+#       premium and posts margin instead, so the basis is the margin the
+#       broker blocks (the engine's own estimate where it has one, the
+#       structure's maximum loss where it does not).
+#
+#   Total Profit = net P&L, on realised fills both sides.
+#       Closed: (realised entry credit - realised exit debit) x lot size
+#           x lots, minus every charge actually booked.
+#       Open: the same identity marked at LIQUIDATION value - shorts at
+#           the ask, longs at the bid, i.e. what closing now would cost -
+#           less the entry charges already paid and an estimate of the
+#           charges still to pay. Conservative by construction, and the
+#           same convention MainEngine.compute_unrealized_pnl uses, so the
+#           open figure and the figure the close eventually books cannot
+#           disagree by a change of mark.
+
+TRADE_REPORT_RULE = "=" * 84
+TRADE_REPORT_SUB  = "-" * 76
+
+
+def _tr_num(value, default: float = 0.0) -> float:
+    """float(value) that cannot raise on a NULL column."""
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _tr_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _tr_money(value) -> str:
+    return f"Rs {_tr_num(value):,.2f}"
+
+
+def _tr_signed(value) -> str:
+    return f"Rs {_tr_num(value):+,.2f}"
+
+
+def _tr_price(value) -> str:
+    """A premium: 2 decimals, and 'n/a' rather than 0.00 for a missing fill."""
+    if value is None or value == "":
+        return "n/a"
+    return f"{_tr_num(value):.2f}"
+
+
+def _tr_strike(value) -> str:
+    """25600.0 -> '25600'; 25612.5 -> '25612.50'."""
+    if value is None or value == "":
+        return "n/a"
+    k = _tr_num(value)
+    return f"{k:.0f}" if abs(k - round(k)) < 1e-9 else f"{k:.2f}"
+
+
+def _tr_side(action) -> str:
+    """SELL -> 'Sold', BUY -> 'Bought'. Past tense: the fill happened."""
+    a = str(action or "").strip().upper()
+    if a.startswith("B"):
+        return "Bought"
+    if a.startswith("S"):
+        return "Sold"
+    return a.title() or "Traded"
+
+
+def _tr_closing_side(action) -> str:
+    """The side that CLOSES a leg: a short is bought back, a long is sold."""
+    a = str(action or "").strip().upper()
+    if a.startswith("S"):
+        return "Bought"
+    if a.startswith("B"):
+        return "Sold"
+    return _tr_side(action)
+
+
+def _tr_symbol(option_type) -> str:
+    t = str(option_type or "").strip().upper()
+    if t.startswith("C"):
+        return "CE"
+    if t.startswith("P"):
+        return "PE"
+    return t or "OPT"
+
+
+def _tr_hhmm(value) -> str:
+    """Anything the book stores as a time -> 'HH:MM'."""
+    if value is None or value == "":
+        return "n/a"
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M")
+    if isinstance(value, dtime):
+        return value.strftime("%H:%M")
+    parsed = parse_ist_timestamp(value)
+    if parsed is not None:
+        return parsed.strftime("%H:%M")
+    tail = str(value).strip().split("T")[-1]
+    parts = tail.split(":")
+    if len(parts) >= 2 and parts[0].isdigit():
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    return str(value)[:5]
+
+
+def realised_entry_credit(position: dict, legs: List[dict]) -> Tuple[float, str]:
+    """The premium the ENTRY FILLS actually booked, in points, plus its basis.
+
+    positions.entry_credit is the strategy engine's PLANNED net credit:
+    gross credit minus an ESTIMATED slippage and the entry charges
+    expressed in points (StrategyEngine: net_credit = gross_credit -
+    total_slippage - entry_costs_pts). positions.gross_credit is the same
+    figure before those deductions. Neither one is what the fills did.
+
+    Settling a trade against the planned figure does two wrong things at
+    once: it books a modelled slippage as though it had happened, and it
+    removes the entry charges in points before execute_close() removes
+    them again in rupees. On the 2026-09-11 paper book a BULL_PUT_SPREAD
+    was booked at +Rs 286.68 whose own fills say +Rs 347.78 - Rs 57.67 of
+    entry charges counted twice and Rs 3.38 of estimated slippage counted
+    as real, i.e. the day was reported Rs 125 (10%) worse than it was.
+
+    The fills are ground truth and they are already persisted leg by leg,
+    so the realised credit is sum(SELL entry_price) - sum(BUY entry_price).
+    It is only used when EVERY leg carries a price: a partially priced
+    book would silently omit a leg, which is worse than either stored
+    number. The basis string is returned so the caller can log which of
+    the three was used.
+    """
+    rows = list(legs or [])
+    if not rows:
+        for key in ("gross_credit", "entry_credit"):
+            value = (position or {}).get(key)
+            if value is not None and value != "":
+                return _tr_num(value), key
+        return 0.0, "none"
+
+    filled = 0.0
+    priced = 0
+    for leg in rows:
+        price = leg.get("entry_price")
+        if price is None or price == "":
+            continue
+        px = _tr_num(price)
+        if px <= 0:
+            continue
+        filled += px if str(leg.get("action") or "").upper().startswith("S") else -px
+        priced += 1
+
+    if priced == len(rows):
+        return filled, "fills"
+    for key in ("gross_credit", "entry_credit"):
+        value = (position or {}).get(key)
+        if value is not None and value != "":
+            return _tr_num(value), f"{key}_legs_unpriced"
+    return filled, "partial_fills"
+
+
+def realised_exit_debit(position: dict, legs: List[dict]) -> Tuple[float, str]:
+    """The points it actually cost to close: shorts bought back (+), longs
+    sold (-). Same rule as realised_entry_credit - the leg fills are the
+    record, positions.exit_premium is the fallback."""
+    rows = list(legs or [])
+    if rows:
+        total = 0.0
+        priced = 0
+        for leg in rows:
+            price = leg.get("exit_price")
+            if price is None or price == "":
+                continue
+            px = _tr_num(price)
+            total += px if str(leg.get("action") or "").upper().startswith("S") else -px
+            priced += 1
+        if priced == len(rows):
+            return total, "fills"
+    value = (position or {}).get("exit_premium")
+    if value is not None and value != "":
+        return _tr_num(value), "positions.exit_premium"
+    return 0.0, "none"
+
+
+class TradeConsoleReporter:
+    """Renders the per-trade lifecycle block for one engine, live or replay.
+
+    Deliberately dumb about trading and strict about arithmetic: it reads
+    the book, marks it with the chain it is handed, and prints. It owns no
+    state except what it printed last (for the quiet mode) and it is not
+    allowed to raise into a trading loop - every query and every render is
+    guarded, because a reporting bug must never become a trading failure.
+    """
+
+    MODES = ("each_cycle", "on_change", "off")
+
+    def __init__(self, db: "Database", config: Config, logger=None,
+                 source: str = "LIVE"):
+        self.db      = db
+        self.config  = config
+        self.logger  = logger
+        self.source  = str(source or "LIVE")
+        # position_id -> (state, last printed profit); on_change only
+        self._last: Dict[str, Tuple[str, float]] = {}
+        self._day: Optional[str] = None
+        self._mode_override: Optional[str] = None
+
+    # ── configuration ────────────────────────────────────────────────
+
+    @property
+    def mode(self) -> str:
+        # An explicit override wins over the configuration, including over
+        # TRADE_REPORT_ENABLED: it is the operator asking for this particular
+        # run (backtest --trade-report), and the harness self-test relies on
+        # it to be deterministic whatever env.txt happens to say.
+        if self._mode_override in self.MODES:
+            return self._mode_override
+        if not bool(getattr(self.config, "trade_report_enabled", True)):
+            return "off"
+        chosen = getattr(self.config, "trade_report_mode", "each_cycle")
+        chosen = str(chosen or "each_cycle").strip().lower()
+        return chosen if chosen in self.MODES else "each_cycle"
+
+    def set_mode(self, mode: Optional[str]) -> None:
+        """CLI override (backtest --trade-report). Config is frozen, so the
+        override lives here; None restores the configured behaviour."""
+        if mode is None:
+            self._mode_override = None
+            return
+        mode = str(mode).strip().lower()
+        self._mode_override = mode if mode in self.MODES else None
+
+    def _debug(self, message: str) -> None:
+        try:
+            if self.logger is not None:
+                self.logger.debug(f"trade report: {message}")
+        except Exception:
+            pass
+
+    # ── book access ──────────────────────────────────────────────────
+
+    def positions_for(self, trading_date: str) -> List[dict]:
+        try:
+            rows = self.db.query(
+                "SELECT * FROM positions WHERE trading_date=? "
+                "ORDER BY entry_time ASC, created_at ASC, rowid ASC",
+                (trading_date,),
+            ) or []
+        except Exception as exc:
+            self._debug(f"positions query failed: {exc}")
+            return []
+        return list(rows)
+
+    def legs_for(self, position_id: str) -> List[dict]:
+        try:
+            rows = self.db.query(
+                "SELECT * FROM position_legs WHERE position_id=? "
+                "ORDER BY leg_id ASC",
+                (str(position_id),),
+            ) or []
+        except Exception as exc:
+            self._debug(f"legs query failed for {position_id}: {exc}")
+            return []
+        # Display order: calls then puts, strike ascending - the same order
+        # the structures are described in everywhere else in the engine.
+        def _key(leg: dict):
+            opt = str(leg.get("option_type") or "").upper()
+            return (0 if opt.startswith("C") else 1, _tr_num(leg.get("strike")))
+        return sorted(rows, key=_key)
+
+    # ── marks ────────────────────────────────────────────────────────
+
+    def _quote(self, leg: dict, chain: dict) -> dict:
+        if not chain:
+            return {}
+        node = chain.get(_tr_num(leg.get("strike"))) or {}
+        return node.get(str(leg.get("option_type") or "")) or {}
+
+    def _mark_leg(self, leg: dict, chain: dict, closing: bool = True):
+        """Price of one leg now. closing=True gives the honest liquidation
+        price - a short is bought back at the ASK, a long is sold at the
+        BID - which is the only mark a profit or an exit decision should
+        ever be made on. Returns None when the chain has nothing."""
+        quote = self._quote(leg, chain)
+        bid = _tr_num(quote.get("bid"))
+        ask = _tr_num(quote.get("ask"))
+        ltp = _tr_num(quote.get("ltp"))
+        if closing:
+            wants_ask = str(leg.get("action") or "").upper().startswith("S")
+            if wants_ask and ask > 0:
+                return ask
+            if not wants_ask and bid > 0:
+                return bid
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        if ltp > 0:
+            return ltp
+        if bid > 0:
+            return bid
+        if ask > 0:
+            return ask
+        return None
+
+    # ── size and money ───────────────────────────────────────────────
+
+    def _lot_size(self) -> float:
+        return float(getattr(self.config, "lot_size", 0) or 0)
+
+    def _lots(self, position: dict, legs: List[dict]) -> int:
+        lots = _tr_int(position.get("final_lots"))
+        if lots > 0:
+            return lots
+        lot_size = self._lot_size()
+        derived = 0
+        if lot_size > 0:
+            for leg in legs:
+                qty = _tr_int(leg.get("qty"))
+                if qty > 0:
+                    derived = max(derived, int(round(qty / lot_size)))
+        return max(derived, 1)
+
+    def investment(self, position: dict, legs: List[dict]) -> Tuple[float, List[str]]:
+        """(rupees committed, basis lines) - see the block comment above."""
+        lot_size = self._lot_size()
+        lots     = self._lots(position, legs)
+        entry_costs = _tr_num(position.get("entry_costs_rupees"))
+
+        paid = received = 0.0
+        for leg in legs:
+            px  = _tr_num(leg.get("entry_price"))
+            qty = _tr_int(leg.get("qty")) or int(round(lot_size * lots))
+            if str(leg.get("action") or "").upper().startswith("S"):
+                received += px * qty
+            else:
+                paid += px * qty
+
+        if paid > received:
+            net_cash = paid - received
+            return net_cash + entry_costs, [
+                f"premium paid {_tr_money(net_cash)} "
+                f"+ entry charges {_tr_money(entry_costs)}",
+            ]
+
+        margin = _tr_num(position.get("estimated_margin"))
+        basis  = "margin blocked"
+        if margin <= 0:
+            margin = _tr_num(position.get("total_max_risk"))
+            basis  = "max structural risk"
+        if margin <= 0:
+            margin = abs(_tr_num(position.get("entry_credit"))) * lot_size * lots
+            basis  = "credit received"
+
+        lines = [
+            f"{basis} {_tr_money(margin)} + entry charges "
+            f"{_tr_money(entry_costs)}",
+        ]
+        if received > paid and basis != "credit received":
+            lines.append(
+                f"premium received {_tr_money(received - paid)} - a credit "
+                f"structure commits margin, not cash premium"
+            )
+        return margin + entry_costs, lines
+
+    def profit(self, position: dict, legs: List[dict],
+               chain: dict) -> Tuple[float, bool, List[str]]:
+        """(net rupees, realised?, basis lines).
+
+        Closed trades are recomputed from the persisted fills rather than
+        quoted from net_pnl_rupees, and the booked figure is named when the
+        two disagree. That is the point of the block: it shows what the
+        fills say next to what the book said.
+        """
+        lot_size = self._lot_size()
+        lots     = self._lots(position, legs)
+        units    = lot_size * lots
+        entry_costs = _tr_num(position.get("entry_costs_rupees"))
+        status   = str(position.get("status") or "OPEN").upper()
+        closed   = status.startswith("CLOSE")
+
+        entry_credit, entry_basis = realised_entry_credit(position, legs)
+
+        if closed:
+            exit_debit, exit_basis = realised_exit_debit(position, legs)
+            exit_costs = _tr_num(position.get("exit_costs_rupees"))
+            gross_pts  = entry_credit - exit_debit
+            gross_rs   = gross_pts * units
+            charges    = entry_costs + exit_costs
+            net        = gross_rs - charges
+            basis = [
+                f"gross {gross_pts:+.2f} pts x {units:,.0f} units = "
+                f"{_tr_money(gross_rs)}, charges {_tr_money(charges)}",
+                f"entry credit {entry_credit:+.2f} pts ({entry_basis}), "
+                f"exit debit {exit_debit:+.2f} pts ({exit_basis})",
+            ]
+            booked = position.get("net_pnl_rupees")
+            if booked is not None and booked != "" and \
+                    abs(_tr_num(booked) - net) > 0.01:
+                basis.append(
+                    f"the book says {_tr_signed(booked)} - the fills above "
+                    f"are what this block reports"
+                )
+            return net, True, basis
+
+        # Open: mark every leg at what closing it now would cost.
+        liq      = position.get("last_liquidation_premium")
+        liq_src  = "positions.last_liquidation_premium"
+        if liq is None or liq == "":
+            liq = 0.0
+            for leg in legs:
+                if str(leg.get("leg_status") or "").upper() == "CLOSED":
+                    continue
+                mark = self._mark_leg(leg, chain, closing=True)
+                if mark is None:
+                    mark = _tr_num(leg.get("entry_price"))
+                if str(leg.get("action") or "").upper().startswith("S"):
+                    liq += mark
+                else:
+                    liq -= mark
+            liq_src = "chain marks" if chain else "entry prices (chain empty)"
+        liq = _tr_num(liq)
+
+        gross_pts = entry_credit - liq
+        gross_rs  = gross_pts * units
+        # The charge still to pay to get out, on the same convention
+        # MainEngine.compute_unrealized_pnl uses.
+        to_pay    = entry_costs * 0.95
+        net       = gross_rs - entry_costs - to_pay
+        basis = [
+            f"marked to exit {liq:+.2f} pts ({liq_src}) -> gross "
+            f"{gross_pts:+.2f} pts x {units:,.0f} units = {_tr_money(gross_rs)}",
+            f"charges paid {_tr_money(entry_costs)}, still to pay "
+            f"~{_tr_money(to_pay)}, entry credit {entry_credit:+.2f} pts "
+            f"({entry_basis})",
+        ]
+        return net, False, basis
+
+    # ── rendering ────────────────────────────────────────────────────
+
+    def render(self, index: int, position: dict, legs: List[dict],
+               chain: dict, as_of) -> List[str]:
+        lots   = self._lots(position, legs)
+        status = str(position.get("status") or "OPEN").upper()
+        closed = status.startswith("CLOSE")
+
+        out = [TRADE_REPORT_RULE]
+        out.append(f"Trade-{index}")
+        out.append(f"Strategy: {position.get('strategy_name') or 'UNKNOWN'}")
+        out.append(TRADE_REPORT_SUB)
+        out.append(f"Trade Start Data: time: {_tr_hhmm(position.get('entry_time'))}")
+        for leg in legs:
+            out.append(
+                f"{_tr_side(leg.get('action'))}: {lots} lot of "
+                f"{_tr_symbol(leg.get('option_type'))} with premium: "
+                f"{_tr_price(leg.get('entry_price'))} at strike: "
+                f"{_tr_strike(leg.get('strike'))}"
+            )
+        if not legs:
+            out.append("no leg rows persisted for this position")
+
+        out.append(TRADE_REPORT_SUB)
+        end_time = position.get("exit_time") if closed else as_of
+        out.append(f"Trade End Data: time: {_tr_hhmm(end_time)}")
+        for leg in legs:
+            leg_closed = str(leg.get("leg_status") or "").upper() == "CLOSED"
+            if closed and leg_closed and leg.get("exit_price") not in (None, ""):
+                price, suffix = leg.get("exit_price"), ""
+            else:
+                # Not closed yet: what closing this leg now would cost.
+                price = self._mark_leg(leg, chain)
+                if price is None:
+                    price = leg.get("entry_price")
+                if closed:
+                    suffix = ("  [no exit fill]" if not leg_closed
+                              else "  [exit price not persisted]")
+                else:
+                    suffix = ""
+            out.append(
+                f"{_tr_closing_side(leg.get('action'))}: {lots} lot of "
+                f"{_tr_symbol(leg.get('option_type'))} with premium: "
+                f"{_tr_price(price)} at strike: "
+                f"{_tr_strike(leg.get('strike'))}{suffix}"
+            )
+        if not legs:
+            out.append("no leg rows persisted for this position")
+        if closed:
+            out.append(f"Closed - {position.get('exit_reason') or 'unknown'}")
+        else:
+            out.append("Open")
+
+        out.append(TRADE_REPORT_SUB)
+        out.append(f"Position Status: {'Close' if closed else 'Open'}")
+        committed, committed_basis = self.investment(position, legs)
+        net, realised, profit_basis = self.profit(position, legs, chain)
+        out.append(f"Total Investment: {_tr_money(committed)}")
+        for line in committed_basis:
+            out.append(f"    {line}")
+        out.append(
+            f"Total Profit: {_tr_signed(net)} "
+            f"{'realised' if realised else 'unrealised'}"
+        )
+        for line in profit_basis:
+            out.append(f"    {line}")
+        out.append(TRADE_REPORT_RULE)
+        return out
+
+    def _header(self, trading_date: str, rows: List[dict], as_of,
+                title: Optional[str]) -> str:
+        n_open = sum(
+            1 for r in rows
+            if str(r.get("status") or "").upper().startswith("OPEN")
+        )
+        stamp = as_of.strftime("%H:%M:%S") if isinstance(as_of, datetime) \
+            else _tr_hhmm(as_of)
+        label = title or f"TRADE REPORT [{self.source}]"
+        return (
+            f"\n---- {label} | {trading_date} {stamp} | "
+            f"{len(rows)} trade(s), {n_open} open | mode={self.mode} ----"
+        )
+
+    # ── entry point ──────────────────────────────────────────────────
+
+    def report_cycle(self, trading_date: Optional[str] = None,
+                     chain: Optional[dict] = None,
+                     as_of=None,
+                     title: Optional[str] = None) -> int:
+        """Print the block for every trade of the session. Returns how many.
+
+        Called once per cycle by both engines. In each_cycle mode that is
+        every trade, open and closed, on every cycle - the operator asked
+        for exactly that, and the cost is console volume, not accuracy.
+        """
+        if self.mode == "off":
+            return 0
+        if trading_date is None:
+            trading_date = today_ist().isoformat()
+        if as_of is None:
+            as_of = now_ist()
+        chain = chain or {}
+
+        rows = self.positions_for(trading_date)
+        if not rows:
+            return 0
+
+        if self._day != trading_date:
+            self._day = trading_date
+            self._last.clear()
+
+        eps = _tr_num(getattr(self.config, "trade_report_mark_eps", 25.0), 25.0)
+        cap = _tr_int(getattr(self.config, "trade_report_max_per_cycle", 0))
+        quiet = self.mode == "on_change"
+
+        printed = 0
+        header_done = False
+        for index, position in enumerate(rows, start=1):
+            position_id = str(position.get("position_id") or f"#{index}")
+            legs = self.legs_for(position_id)
+            try:
+                net, realised, _note = self.profit(position, legs, chain)
+                if quiet:
+                    state = "closed" if realised else "open"
+                    previous = self._last.get(position_id)
+                    if previous is not None and previous[0] == state and \
+                            abs(previous[1] - net) < eps:
+                        continue
+                    self._last[position_id] = (state, net)
+                if cap and printed >= cap:
+                    break
+                lines = self.render(index, position, legs, chain, as_of)
+            except Exception as exc:
+                self._debug(f"render failed for {position_id}: {exc}")
+                continue
+            if not header_done:
+                print(self._header(trading_date, rows, as_of, title))
+                header_done = True
+            for line in lines:
+                print(line)
+            printed += 1
+
+        if printed:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+        return printed
+
+
+# ─────────────────────────────────────────────
 # SELF TEST
 # ─────────────────────────────────────────────
 
@@ -3549,6 +4225,84 @@ def _self_test() -> None:
     print(f"  today_ist():            {today_ist()}")
     print(f"  parse_ist_timestamp():  {parsed}")
     print(f"  IST timezone:           {IST}")
+
+    # ── Trade Console Report (v7) ────────────────────────────────────
+    # One closed and one open trade, written straight into the scratch
+    # book, then rendered. This is the block both engines print on every
+    # cycle, so its shape is asserted rather than eyeballed.
+    print_section("TRADE CONSOLE REPORT TEST")
+    import contextlib as _ctxlib
+    import io as _io
+
+    _td = today_ist().isoformat()
+    _chain = {
+        25600.0: {"call": {"bid": 11.90, "ask": 12.10, "ltp": 12.00},
+                  "put":  {"bid": 4.00,  "ask": 4.20,  "ltp": 4.10}},
+        25750.0: {"call": {"bid": 2.90,  "ask": 3.10,  "ltp": 3.00},
+                  "put":  {"bid": 1.00,  "ask": 1.20,  "ltp": 1.10}},
+    }
+    db.insert("positions", {
+        "position_id": "selftest-closed", "trading_date": _td,
+        "strategy_name": "BEAR_CALL_SPREAD", "strategy_type": "SELL",
+        "entry_time": f"{_td}T12:03:00", "exit_time": f"{_td}T13:32:00",
+        "entry_credit": 14.05, "gross_credit": 14.05,
+        "entry_costs_rupees": 55.0, "exit_costs_rupees": 52.0,
+        "exit_premium": 9.00, "exit_reason": "gamma_window_derisk_1330",
+        "gross_pnl_rupees": 1306.5, "net_pnl_rupees": 1199.5,
+        "final_lots": 4, "estimated_margin": 19000.0, "total_max_risk": 8000.0,
+        "status": "CLOSED",
+    })
+    db.insert("positions", {
+        "position_id": "selftest-open", "trading_date": _td,
+        "strategy_name": "IRON_CONDOR", "strategy_type": "SELL",
+        "entry_time": f"{_td}T13:40:00",
+        "entry_credit": 5.00, "gross_credit": 5.20,
+        "entry_costs_rupees": 60.0, "final_lots": 2,
+        "estimated_margin": 15000.0, "total_max_risk": 6000.0,
+        "status": "OPEN",
+    })
+    for _row in (
+        ("selftest-closed", 25600.0, "call", "SELL", 4, 19.07, 12.00, "CLOSED"),
+        ("selftest-closed", 25750.0, "call", "BUY",  4, 5.02,  3.00, "CLOSED"),
+        ("selftest-open",   25600.0, "call", "SELL", 2, 11.00, None,  "OPEN"),
+        ("selftest-open",   25750.0, "put",  "BUY",  2, 1.10,  None,  "OPEN"),
+    ):
+        db.insert("position_legs", {
+            "position_id": _row[0], "strike": _row[1], "option_type": _row[2],
+            "action": _row[3], "qty": _row[4] * config.lot_size,
+            "entry_price": _row[5], "exit_price": _row[6], "leg_status": _row[7],
+        })
+
+    reporter = TradeConsoleReporter(db, config, logger, source="SELFTEST")
+    _buf = _io.StringIO()
+    with _ctxlib.redirect_stdout(_buf):
+        _printed = reporter.report_cycle(
+            trading_date=_td, chain=_chain, as_of=now_ist()
+        )
+    _text = _buf.getvalue()
+    assert _printed == 2, f"expected 2 trade blocks, got {_printed}"
+    for _frag in (
+        TRADE_REPORT_RULE, TRADE_REPORT_SUB, "Trade-1", "Trade-2",
+        "Strategy: BEAR_CALL_SPREAD", "Strategy: IRON_CONDOR",
+        "Trade Start Data: time: 12:03",
+        "Sold: 4 lot of CE with premium: 19.07 at strike: 25600",
+        "Bought: 4 lot of CE with premium: 5.02 at strike: 25750",
+        "Trade End Data: time: 13:32",
+        "Bought: 4 lot of CE with premium: 12.00 at strike: 25600",
+        "Closed - gamma_window_derisk_1330",
+        "Position Status: Close", "Position Status: Open",
+        "Bought: 2 lot of PE with premium: 1.10 at strike: 25750",
+        "Sold: 2 lot of PE with premium: 1.00 at strike: 25750",
+        "Total Investment: Rs", "Total Profit: Rs",
+    ):
+        assert _frag in _text, f"trade report is missing {_frag!r}"
+    # the open trade is marked to what closing it would cost, not to the mid
+    _open_block = _text.split("Trade-2", 1)[1]
+    assert "Bought: 2 lot of CE with premium: 12.10" in _open_block, \
+        "open trade must be marked at the ask (liquidation), not the mid"
+    assert "unrealised" in _open_block and "realised" in _text
+    print(_text.rstrip())
+    print("  [OK] Trade console report renders an open and a closed trade")
 
     db.close()
     print_section("SELF-TEST COMPLETE", char="#")

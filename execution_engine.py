@@ -20,6 +20,11 @@ from core import (
     load_config, setup_logging,
     RateLimiter, UpstoxClient,
     UpstoxAPIError, AlertNotifier,
+    # v7: the entry credit the FILLS booked, as against the one the strategy
+    # engine planned. Used by execute_close() to settle a trade on its own
+    # prices; the same function feeds the per-trade console report.
+    realised_entry_credit,
+    TradeConsoleReporter,
 )
 from data_engine import MarketDataEngine
 from calibration_engine import CalibrationEngine
@@ -861,6 +866,22 @@ class ExecutionEngine:
     def _ensure_extra_columns(self) -> None:
         """Add any columns that may be missing from older database versions."""
         extra = [
+            # v7: monitor_position() writes the liquidation mark on every
+            # cycle and MainEngine.compute_unrealized_pnl() reads it, but the
+            # column exists in neither SCHEMA_SQL nor MIGRATION_SQL - it was
+            # only ever created by MarketDataEngine._ensure_extra_columns().
+            # That made the exit ladder depend on another engine having been
+            # constructed first: build an ExecutionEngine against a fresh book
+            # on its own (a tool, a test, a refactor) and the first
+            # monitor_position() raises sqlite3.OperationalError, which the
+            # main loop catches as "UNHANDLED ERROR in run_one_cycle" - so
+            # every cycle fails and no position is ever monitored or exited.
+            # Ensure it here too; ensure_column is a no-op when it exists.
+            ("positions", "last_liquidation_premium", "REAL"),
+            # v7: the credit the FILLS booked, written at close next to the
+            # planned credit the strategy engine priced the trade with, so
+            # the two can always be compared after the fact.
+            ("positions", "entry_credit_realised",   "REAL"),
             ("positions", "profit_lock_activated",   "INTEGER DEFAULT 0"),
             ("positions", "profit_lock_stop_level",  "REAL"),
             ("positions", "exit_priority",           "INTEGER"),
@@ -876,6 +897,17 @@ class ExecutionEngine:
             ("trade_exits", "exit_priority",         "INTEGER"),
             ("trade_exits", "exit_priority_name",    "TEXT"),
             ("trade_exits", "pnl_15min_after_exit",  "REAL"),
+            # v7: execute_close() has written these two into trade_exits since
+            # it was first drafted, but neither SCHEMA_SQL nor MIGRATION_SQL
+            # declared them, so the INSERT raised "no column named exit_adx"
+            # on every single close and the row was dropped (caught and logged
+            # as a warning). The exit audit table was therefore always empty -
+            # the 2026-09-11 paper book holds 2 CLOSED positions and 0
+            # trade_exits rows - and every query that joins trade_exits
+            # silently returned nothing. Declared in core.py too; ensured here
+            # so an existing book is repaired on the next engine start.
+            ("trade_exits", "exit_adx",              "REAL"),
+            ("trade_exits", "exit_vwap_dist",        "REAL"),
         ]
         for table, col, coltype in extra:
             self.db.ensure_column(table, col, coltype)
@@ -912,13 +944,27 @@ class ExecutionEngine:
         Compute all transaction costs for a set of legs.
 
         For ENTRY: STT on sell side, stamp on buy side
-        For EXIT:  STT on the side that was originally bought (now being sold)
+        For EXIT:  the sides are the MIRROR IMAGE - a leg that was sold at
+                   entry is bought back, and a leg that was bought is sold -
+                   and STT is levied on the SALE of an option, so on exit it
+                   belongs to the legs that were originally BOUGHT.
 
         Returns dict with total_rupees and detailed breakdown.
         """
         C02        = self.config.lot_size
         sell_value = buy_value = 0.0
         num_orders = len(legs)
+        # v7: `action` used to be accepted and ignored, and the classification
+        # below read leg["action"] - the ENTRY side - for both phases. On an
+        # exit that charges STT to the buy-backs (which pay no STT) and stamp
+        # duty to the sales (which pay no stamp), while the turnover-based
+        # charges stay right, so the error is invisible in the total's
+        # magnitude and only shows up when the live book is reconciled
+        # against the replay: StrategyEngine._compute_costs() and
+        # BacktestRunner._close() both pass the CLOSING side, so the same
+        # trade cost Rs 2.27 more live than in replay on a 4-lot bear call
+        # spread (STT Rs 3.12 charged where Rs 0.78 was due).
+        closing = str(action or "").strip().upper() == "EXIT"
 
         for leg in legs:
             # Use fill price for cost computation
@@ -934,7 +980,11 @@ class ExecutionEngine:
             qty           = lots * C02
             premium_value = price * qty
 
-            if leg["action"] == "SELL":
+            side = str(leg.get("action") or "").strip().upper()
+            if closing:
+                side = "BUY" if side.startswith("S") else "SELL"
+
+            if side == "SELL":
                 sell_value += premium_value
             else:
                 buy_value += premium_value
@@ -1054,7 +1104,12 @@ class ExecutionEngine:
         C02 = float(self.config.lot_size or 1)
         live = [l for l in legs if l.get("leg_status") != "CLOSED"]
         n_legs = max(len(live), 1)
-        brokerage_pts = (self.config.brokerage_per_order * n_legs) / C02
+        # v7: brokerage carries 18% GST like every other charge in this
+        # repository (_compute_transaction_costs and
+        # StrategyEngine._compute_costs both compute GST on
+        # brokerage + exchange + sebi). It was the only cost line here that
+        # was added net of GST.
+        brokerage_pts = (self.config.brokerage_per_order * 1.18 * n_legs) / C02
         pct_pts = 0.0
         spread_pts = 0.0
         for leg in live:
@@ -1072,9 +1127,17 @@ class ExecutionEngine:
             # On exit, STT applies to the legs being SOLD, i.e. the ones that
             # were originally bought.
             _stt = self.config.stt_options_sell if leg.get("action") == "BUY" else 0.0
+            # v7: GST is levied on the exchange and SEBI charges (and on
+            # brokerage, added separately below), never on STT - STT is a
+            # tax, not a service. The 1.18 used to be applied to the whole
+            # bracket, so the estimate charged 18% GST on a statutory tax,
+            # and it disagreed with _compute_transaction_costs() and
+            # StrategyEngine._compute_costs() in the same repository, both of
+            # which compute GST as (brokerage + exchange + sebi) * 0.18.
             pct_pts += mid * (
-                self.config.exchange_txn_rate + self.config.sebi_rate + _stt
-            ) * 1.18
+                (self.config.exchange_txn_rate + self.config.sebi_rate) * 1.18
+                + _stt
+            )
         return round(brokerage_pts + pct_pts + spread_pts, 3)
 
     def _compute_current_premium(
@@ -2396,7 +2459,20 @@ class ExecutionEngine:
                     {"leg_id": leg["leg_id"]},
                 )
 
-                exit_legs_info.append({**leg, "exit_price": exit_price, "fill": fill})
+                # v7: the fill alone is not an audit. quoted_mid_exit is
+                # already computed above and written to position_legs, but it
+                # never made it into this dict, so the exit_slippage sum below
+                # filtered every leg out and trade_exits booked 0.0 slippage
+                # for every close the system ever made - the one number that
+                # says whether the exits are being taken at fair value was
+                # permanently zero.
+                exit_legs_info.append({
+                    **leg,
+                    "exit_price":         exit_price,
+                    "quoted_mid_at_exit": quoted_mid_exit,
+                    "exit_delta":         float(opt.get("delta", 0) or 0),
+                    "fill":               fill,
+                })
 
                 # Accumulate exit premium
                 # For SELL legs: we pay to close (cost)
@@ -2417,8 +2493,45 @@ class ExecutionEngine:
         C02          = self.config.lot_size
         entry_credit = float(position.get("entry_credit") or 0)
 
-        # Gross P&L = entry_credit - exit_premium (for credit spreads)
-        gross_pnl_pts = entry_credit - exit_premium
+        # v7: settle on the FILLS, not on the plan.
+        #
+        # positions.entry_credit is the strategy engine's planned NET credit:
+        # gross credit minus an ESTIMATED slippage and the entry charges
+        # converted to points (StrategyEngine: net_credit = gross_credit -
+        # total_slippage - entry_costs_pts). Using it here did two wrong
+        # things at once - it booked a modelled slippage as though it had
+        # happened, and it removed the entry charges in points before the
+        # lines below removed them again in rupees, because total_costs_rs
+        # includes entry_costs_rupees.
+        #
+        # Measured on the 2026-09-11 paper book: BULL_PUT_SPREAD 2 lots,
+        # planned credit 18.58 pts, fills 47.65 / 28.60 = 19.05 pts, exit
+        # 15.50 pts, entry charges Rs 57.67, exit charges Rs 56.05.
+        #   booked : (18.58 - 15.50) x 130 - 113.72 = Rs 286.68
+        #   correct: (19.05 - 15.50) x 130 - 113.72 = Rs 347.78
+        # Rs 61.10 of a real profit never existed - Rs 57.67 charged twice
+        # and Rs 3.38 of estimated slippage charged as real. The day was
+        # reported Rs 125 (10%) worse than the fills say, and since the
+        # replay harness settles on filled prices, the live book and the
+        # backtest could never be reconciled on the same trade.
+        #
+        # The exit ladder is untouched: stop_premium, target_premium and the
+        # profit lock keep comparing against the stored entry_credit exactly
+        # as before, so no exit decision changes. Only the money that is
+        # booked, reported and fed to calibration becomes the money that was
+        # actually made.
+        realised_credit, credit_basis = realised_entry_credit(position, legs)
+        if abs(realised_credit - entry_credit) > 1e-9:
+            self.logger.info(
+                f"entry credit settled on {credit_basis}: "
+                f"planned {entry_credit:+.3f} pts vs realised "
+                f"{realised_credit:+.3f} pts "
+                f"({(realised_credit - entry_credit) * C02 * lots:+,.2f} Rs "
+                f"on {lots} lot(s))"
+            )
+
+        # Gross P&L = realised entry credit - what it cost to close
+        gross_pnl_pts = realised_credit - exit_premium
         gross_pnl_rs  = gross_pnl_pts * C02 * lots
 
         # Costs
@@ -2443,21 +2556,37 @@ class ExecutionEngine:
         hold_minutes = (now - entry_time).total_seconds() / 60.0
 
         # ── Update position ───────────────────────────────────────────────
-        self.db.update(
-            "positions",
-            {
-                "status":            "CLOSED",
-                "exit_time":         now.isoformat(),
-                "exit_reason":       reason,
-                "exit_priority":     priority,
-                "exit_premium":      exit_premium,
-                "gross_pnl_rupees":  gross_pnl_rs,
-                "exit_costs_rupees": exit_costs_rs,
-                "net_pnl_rupees":    net_pnl_rs,
-                "updated_at":        now.isoformat(),
-            },
-            {"position_id": position["position_id"]},
-        )
+        _close_update = {
+            "status":            "CLOSED",
+            "exit_time":         now.isoformat(),
+            "exit_reason":       reason,
+            "exit_priority":     priority,
+            "exit_premium":      exit_premium,
+            "gross_pnl_rupees":  gross_pnl_rs,
+            "exit_costs_rupees": exit_costs_rs,
+            "net_pnl_rupees":    net_pnl_rs,
+            # v7: kept next to the planned figure in entry_credit so the two
+            # can be compared on any closed trade, forever.
+            "entry_credit_realised": realised_credit,
+            "updated_at":        now.isoformat(),
+        }
+        try:
+            self.db.update(
+                "positions", _close_update,
+                {"position_id": position["position_id"]},
+            )
+        except Exception as _cue:
+            # An audit column that could not be added must never cost the
+            # close itself: retry without it and say so.
+            self.logger.warning(
+                f"positions close update failed ({_cue}); retrying without "
+                f"entry_credit_realised"
+            )
+            _close_update.pop("entry_credit_realised", None)
+            self.db.update(
+                "positions", _close_update,
+                {"position_id": position["position_id"]},
+            )
 
         # ── Persist trade exit ────────────────────────────────────────────
         priority_name = EXIT_PRIORITY_NAMES.get(priority, reason)
@@ -2520,6 +2649,9 @@ class ExecutionEngine:
             "Exit Reason":     reason,
             "Exit Priority":   f"{priority} ({priority_name})",
             "Exit Premium":    f"{exit_premium:.2f}pts",
+            "Entry Credit":    f"{realised_credit:.2f}pts realised "
+                               f"({credit_basis}) vs {entry_credit:.2f}pts "
+                               f"planned",
             "Gross P&L (Rs)":  f"{gross_pnl_rs:,.0f}",
             "Total Costs (Rs)":f"{total_costs_rs:,.0f}",
             "Net P&L (Rs)":    f"{net_pnl_rs:,.0f}",
@@ -2583,9 +2715,21 @@ class ExecutionEngine:
                 state["consecutive_stops"] = 0
 
         # Daily loss limit check
+        # v7: measured against capital AT THE START OF THE DAY, the basis
+        # main.check_daily_loss_halt() and the replay harness both use. The
+        # denominator here was the post-loss capital, which made one
+        # configured limit mean two different things inside a single process:
+        # the deeper the loss, the smaller this denominator, so this copy of
+        # the check tripped earlier than the one that pages the operator and
+        # flattens the book - and it tripped silently, with no alert and no
+        # risk_halt row to explain why entries had stopped.
         current_cap = float(state.get("current_capital", self.config.starting_capital) or 0)
-        if current_cap > 0:
-            daily_loss_pct = max(0.0, -float(state.get("daily_pnl", 0.0) or 0.0)) / current_cap
+        daily_pnl   = float(state.get("daily_pnl", 0.0) or 0.0)
+        day_start_cap = current_cap - daily_pnl
+        if day_start_cap <= 0:
+            day_start_cap = current_cap
+        if day_start_cap > 0:
+            daily_loss_pct = max(0.0, -daily_pnl) / day_start_cap
             if daily_loss_pct >= self.config.max_daily_loss_pct:
                 state["daily_halted"] = True
                 self.logger.warning(
@@ -3301,6 +3445,185 @@ def _self_test() -> None:
     engine.perform_hard_exit_sweep()
     print("  Hard exit sweep ran without error")
     print("  [OK] Hard exit sweep test passed")
+
+    # ── Test 11: v7 close settlement — the fills, not the plan ─────────
+    # Reproduces the 2026-09-11 BULL_PUT_SPREAD that exposed the bug: the
+    # strategy engine books entry_credit as the PLANNED net credit (gross
+    # minus an estimated slippage minus the entry charges in points), and
+    # execute_close used to settle against that figure while subtracting the
+    # same entry charges again in rupees. The leg rows carry what the fills
+    # actually did, so they are the basis now.
+    print_section("Close Settlement Tests (v7)")
+    import contextlib as _ctxlib11
+    import io as _io11
+
+    _pid11 = "selftest-close-v7"
+    _lots11 = 2
+    _units11 = config.lot_size * _lots11
+    db.insert("positions", {
+        "position_id": _pid11, "trading_date": today_ist().isoformat(),
+        "strategy_name": "BULL_PUT_SPREAD", "strategy_type": "SELL",
+        "entry_time": now_ist().isoformat(),
+        # planned: 19.05 gross - 0.026 estimated slippage - 0.4436 costs
+        "entry_credit": 18.58,
+        "gross_credit": 19.05,
+        "entry_costs_rupees": 57.67,
+        "final_lots": _lots11, "estimated_margin": 15730.0,
+        "total_max_risk": 5693.0, "status": "OPEN",
+    })
+    for _k11, _a11, _px11 in ((23150.0, "SELL", 47.65), (23050.0, "BUY", 28.60)):
+        db.insert("position_legs", {
+            "position_id": _pid11, "strike": _k11, "option_type": "put",
+            "action": _a11, "qty": _units11, "entry_price": _px11,
+            "leg_status": "OPEN",
+        })
+
+    # The paper executor fills a buy-back at the ask and a sale at the bid,
+    # so this chain IS the fill: 40.10 and 24.60, as on 2026-09-11.
+    _chain11 = {
+        23150.0: {"put": {"bid": 40.00, "ask": 40.10, "ltp": 40.05,
+                          "delta": -0.30}},
+        23050.0: {"put": {"bid": 24.60, "ask": 24.70, "ltp": 24.65,
+                          "delta": -0.22}},
+    }
+    _saved_chain11 = market_engine.last_chain
+    market_engine.last_chain = _chain11
+
+    _pos11 = db.query_one(
+        "SELECT * FROM positions WHERE position_id=?", (_pid11,))
+    _legs11 = engine._get_position_legs(_pid11)
+
+    # (a) the realised credit is the fills, and it is not the planned figure
+    _rc11, _basis11 = realised_entry_credit(_pos11, _legs11)
+    print(f"  entry credit: planned {float(_pos11['entry_credit']):.3f} pts, "
+          f"realised {_rc11:.3f} pts (basis={_basis11})")
+    assert _basis11 == "fills", \
+        f"expected the fills to be the basis, got {_basis11}"
+    assert abs(_rc11 - (47.65 - 28.60)) < 1e-9, \
+        f"realised credit should be 19.05, got {_rc11}"
+    assert abs(_rc11 - float(_pos11["entry_credit"])) > 0.01, \
+        "this test is pointless if the planned and realised credit agree"
+
+    # (b) exit charges land on the leg SOLD at exit, not on the buy-back
+    _exit_costs11 = engine._compute_transaction_costs(
+        [{"action": "SELL", "exit_price": 40.10},
+         {"action": "BUY",  "exit_price": 24.60}], _lots11, "EXIT")
+    _expect_stt11 = 24.60 * _units11 * config.stt_options_sell
+    print(f"  exit STT: Rs{_exit_costs11['breakdown']['stt']:.2f} "
+          f"(due Rs{_expect_stt11:.2f}, on the leg sold at exit)")
+    assert abs(_exit_costs11["breakdown"]["stt"] - _expect_stt11) < 0.01, \
+        f"exit STT should be {_expect_stt11:.2f}, got " \
+        f"{_exit_costs11['breakdown']['stt']:.2f}"
+    # ...and the entry side is untouched by the exit-side fix
+    _entry_costs11 = engine._compute_transaction_costs(
+        [{"action": "SELL", "exec_price": 47.65},
+         {"action": "BUY",  "exec_price": 28.60}], _lots11, "ENTRY")
+    assert abs(_entry_costs11["breakdown"]["stt"]
+               - 47.65 * _units11 * config.stt_options_sell) < 0.01, \
+        "entry STT must still be charged on the leg sold at entry"
+
+    # (c) close through the real path and read the book back
+    _state11 = dict(market_engine.state)
+    try:
+        engine.execute_close(
+            _pos11, "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {})
+    finally:
+        market_engine.last_chain = _saved_chain11
+
+    _row11 = db.query_one(
+        "SELECT * FROM positions WHERE position_id=?", (_pid11,))
+    _expect_gross11 = ((47.65 - 28.60) - (40.10 - 24.60)) * _units11
+    _expect_net11 = _expect_gross11 - 57.67 - float(_row11["exit_costs_rupees"])
+    # What the pre-v7 code booked for the very same trade: it settled on the
+    # PLANNED credit and charged the exit STT/stamp on the entry-side legs
+    # (the old call passed no side, so the entry rules applied at exit too).
+    _old_exit_costs11 = engine._compute_transaction_costs(
+        [{"action": "SELL", "exit_price": 40.10},
+         {"action": "BUY",  "exit_price": 24.60}],
+        _lots11, "ENTRY")["total_rupees"]
+    _old_net11 = (18.58 - 15.50) * _units11 - 57.67 - _old_exit_costs11
+    print(f"  gross P&L: Rs{float(_row11['gross_pnl_rupees']):,.2f} "
+          f"(the fills say Rs{_expect_gross11:,.2f}; the planned credit "
+          f"would have said Rs{(18.58 - 15.50) * _units11:,.2f})")
+    print(f"  net P&L:   Rs{float(_row11['net_pnl_rupees']):,.2f} "
+          f"(pre-v7 booked Rs{_old_net11:,.2f} for this trade), charges "
+          f"Rs{57.67 + float(_row11['exit_costs_rupees']):,.2f}")
+    assert _row11["status"] == "CLOSED", "position not closed"
+    assert abs(float(_row11["exit_premium"]) - 15.50) < 1e-9, \
+        f"exit premium should be 15.50, got {_row11['exit_premium']}"
+    assert abs(float(_row11["gross_pnl_rupees"]) - _expect_gross11) < 0.01, \
+        f"gross P&L must settle on the fills: {_expect_gross11:.2f}"
+    assert abs(float(_row11["net_pnl_rupees"]) - _expect_net11) < 0.01, \
+        "net P&L is not gross minus the charges actually booked"
+    assert abs(float(_row11["entry_credit_realised"]) - 19.05) < 1e-9, \
+        "entry_credit_realised not persisted"
+    assert abs(float(_row11["net_pnl_rupees"]) - _old_net11) > 1.0, \
+        "still settling on the planned credit and the wrong exit leg"
+
+    _exit_row11 = db.query_one(
+        "SELECT * FROM trade_exits WHERE position_id=?", (_pid11,))
+    # v7: this row used never to exist. execute_close() writes exit_adx and
+    # exit_vwap_dist, no schema declared them, the INSERT raised, and the
+    # warning was swallowed - so the whole exit audit table stayed empty
+    # (2026-09-11 book: 2 CLOSED positions, 0 trade_exits rows).
+    assert _exit_row11 is not None, (
+        "trade_exits row missing - the exit INSERT is failing again; check "
+        "that every column execute_close() writes is declared in core.py")
+    for _col11 in ("exit_adx", "exit_vwap_dist", "exit_priority",
+                   "exit_priority_name", "exit_slippage"):
+        assert _col11 in _exit_row11.keys(), \
+            f"trade_exits is missing the {_col11} column"
+    assert abs(float(_exit_row11["gross_pnl_pts"]) - 3.55) < 1e-9, \
+        f"trade_exits.gross_pnl_pts should be 3.55, got " \
+        f"{_exit_row11['gross_pnl_pts']}"
+    assert abs(float(_exit_row11["net_pnl_rupees"])
+               - float(_row11["net_pnl_rupees"])) < 0.01, \
+        "trade_exits and positions disagree on what the trade made"
+    assert _exit_row11["exit_priority_name"] == "TIME_TARGET", \
+        f"exit priority name wrong: {_exit_row11['exit_priority_name']!r}"
+    _legs_back11 = json.loads(_exit_row11["exit_legs_json"] or "[]")
+    assert len(_legs_back11) == 2, "both exit legs must be in exit_legs_json"
+    assert all(_l.get("exit_price") and _l.get("quoted_mid_at_exit")
+               for _l in _legs_back11), \
+        "exit legs must carry the fill and the quoted mid it was taken against"
+    # v7: exit_slippage was 0.0 on every close the system ever made, because
+    # the quoted mid never reached the audit dict the sum is built from. Both
+    # legs here fill one tick away from the mid, so it must now be measured.
+    _expect_slip11 = sum(
+        abs(float(_l["exit_price"]) - float(_l["quoted_mid_at_exit"]))
+        for _l in _legs_back11)
+    assert _expect_slip11 > 0, "the test chain should not fill exactly on the mid"
+    assert abs(float(_exit_row11["exit_slippage"]) - _expect_slip11) < 0.01, \
+        f"exit_slippage should be {_expect_slip11:.3f}, got " \
+        f"{_exit_row11['exit_slippage']}"
+    print(f"  exit slippage measured: {_expect_slip11:.3f} pts "
+          f"(booked {float(_exit_row11['exit_slippage']):.3f}; pre-v7 always 0.000)")
+    print(f"  trade_exits row written: gross {float(_exit_row11['gross_pnl_pts']):.2f}pts "
+          f"net Rs{float(_exit_row11['net_pnl_rupees']):,.2f} "
+          f"({_exit_row11['result']})")
+
+    # (d) and the console block reports the same money
+    _rep11 = TradeConsoleReporter(db, config, logger, source="SELFTEST")
+    _buf11 = _io11.StringIO()
+    with _ctxlib11.redirect_stdout(_buf11):
+        _n11 = _rep11.report_cycle(
+            trading_date=today_ist().isoformat(), chain={}, as_of=now_ist())
+    _text11 = _buf11.getvalue()
+    assert _n11 == 1, f"expected 1 trade block, got {_n11}"
+    for _frag11 in (
+        "Trade-1", "Strategy: BULL_PUT_SPREAD",
+        "Sold: 2 lot of PE with premium: 47.65 at strike: 23150",
+        "Bought: 2 lot of PE with premium: 28.60 at strike: 23050",
+        "Closed - CLOSE_TARGET", "Position Status: Close",
+        f"Rs {float(_row11['net_pnl_rupees']):+,.2f} realised",
+    ):
+        assert _frag11 in _text11, f"trade block is missing {_frag11!r}"
+    assert "the book says" not in _text11, \
+        "the block and the book must agree on a freshly closed trade"
+
+    market_engine.state.clear()
+    market_engine.state.update(_state11)
+    print("  [OK] Close settlement tests passed (v7)")
 
     db.close()
     print_section("EXECUTION ENGINE SELF-TEST COMPLETE", char="#")
