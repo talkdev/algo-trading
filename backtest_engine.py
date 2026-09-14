@@ -679,6 +679,18 @@ class BacktestRunner:
         # reads exists.
         self.trade_report_mode = trade_report
         self.reporter = None
+        # ── v9: the final per-day trade report ────────────────────────────
+        # The per-cycle blocks are exact but unreadable as a DAY summary:
+        # over a multi-session replay each day's FINAL state is buried under
+        # thousands of scrolling blocks. At the end of every replayed day,
+        # run_day() pins that session's closing clock time and last chain
+        # here, and _render_final_day_reports() turns the book of every
+        # replayed day into one end-of-day block per session, printed by
+        # main() as the very last thing on the console - after the
+        # statistics. Open legs are marked against the day's OWN last chain,
+        # never against the next session's.
+        self._day_finals: Dict[str, Tuple[datetime, dict]] = {}
+        self.final_report_lines: List[str] = []
 
     @contextlib.contextmanager
     def _quiet(self):
@@ -1152,12 +1164,68 @@ class BacktestRunner:
             # above ended before this close happened.
             self._report_trades(day)
 
+        # ── v9: pin the session's closing state for the end-of-run report ──
+        # The last simulated clock time and the session's own last chain: the
+        # final per-day report marks a still-open leg against the same day it
+        # traded, never against the next session's (or a missing) chain.
+        self._day_finals[trading_date] = (
+            self.clock.now(), dict(self.me.last_chain or {})
+        )
+
+    # -- v9: final per-day trade report -------------------------------------
+    def _render_final_day_reports(self, dates: List[str]) -> None:
+        """Render each replayed day's trade book in its FINAL end-of-day state.
+
+        Called by run() after the last replayed session and BEFORE
+        _teardown() removes the scratch book and uninstalls the SimClock.
+        The blocks are captured as text rather than printed here: main()
+        puts them after the aggregate statistics, so the very last thing on
+        the console is the per-day report the operator asked for - for every
+        session, one header per session, every trade of that session in the
+        state its day ended in (realised P&L and exit fills for closed
+        trades, the day's own liquidation marks for anything still open).
+
+        A FRESH reporter per session: its per-position change memory is
+        empty, so every position of the day prints exactly once even when
+        the per-cycle reporter already showed the identical final block, and
+        the mode= in the header is the mode the run actually used. The
+        configured mode is honoured end-to-end: --trade-report=off (or
+        TRADE_REPORT_ENABLED=false) silences this report as well. A
+        rendering failure degrades to silence, never to a lost session
+        result - this is reporting, not trading.
+        """
+        replayed = set(self.results.days)
+        for trading_date in dates:
+            if trading_date not in replayed:
+                continue
+            try:
+                as_of, chain = self._day_finals.get(trading_date) or (None, {})
+                reporter = core.TradeConsoleReporter(
+                    self.db, self.config,
+                    getattr(self.reporter, "logger", None), source="BACKTEST",
+                )
+                reporter.set_mode(self.trade_report_mode)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    reporter.report_cycle(
+                        trading_date=trading_date,
+                        chain=chain,
+                        as_of=(as_of or self.clock.now()),
+                    )
+                block = buf.getvalue().strip("\n")
+                if block:
+                    self.final_report_lines.append(block)
+            except Exception as exc:
+                if self.verbose:
+                    print(f"  final day report failed for {trading_date}: {exc}")
+
     # -- driver -----------------------------------------------------------
     def run(self, dates: List[str]) -> Results:
         self._build()
         try:
             for d in dates:
                 self.run_day(d)
+            self._render_final_day_reports(dates)
         finally:
             self._teardown()
         return self.results
@@ -2153,6 +2221,23 @@ def main() -> int:
     print_report(res, config, args)
     if args.csv:
         write_csv(res, args.csv)
+
+    # ── v9: the final per-day trade report is the very last output ─────────
+    # One block per replayed session in its end-of-day state, printed after
+    # the aggregate statistics - the operator asked to see the day's final
+    # book at the bottom of the terminal, not 13,000 lines up the
+    # scrollback. --trade-report=off (or TRADE_REPORT_ENABLED=false) leaves
+    # this list empty, so a silenced run stays silenced here too.
+    if runner.final_report_lines:
+        print()
+        print(hr("═"))
+        n_sessions = len(runner.final_report_lines)
+        print(f"FINAL PER-DAY TRADE REPORT — {n_sessions} replayed "
+              f"{'session' if n_sessions == 1 else 'sessions'}, each in its "
+              f"end-of-day state")
+        print(hr("═"))
+        for block in runner.final_report_lines:
+            print(block)
     return 0
 
 
