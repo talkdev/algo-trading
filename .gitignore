@@ -66,6 +66,8 @@ dist/
 # Example: data/nifty_algo_v3.db
 /data/*.db
 
+*.pid
+
 # Ignore SQLite temporary/locking files everywhere
 *.db-wal
 *.db-shm
