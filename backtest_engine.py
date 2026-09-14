@@ -64,7 +64,7 @@
 #  USAGE
 #  -----
 #     python backtest_engine.py --audit
-#     python backtest_engine.py --from 2026-08-01 --to 2026-09-05
+#     python backtest_engine.py --from 2026-09-08 --to 2026-09-11
 #     python backtest_engine.py --from 2026-08-01 --to 2026-09-05 \
 #            --capital 1000000 --fill-edge 0.25 --csv runs/aug.csv
 #     python backtest_engine.py --test          # harness self-test, synthetic
