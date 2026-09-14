@@ -1018,8 +1018,36 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
     # defined-risk (capped-loss) intraday structure can carry a larger per-
     # trade budget than naked selling; 1.2% per trade / 4.0% daily lets it
     # size to a cost-viable 2+ lots while keeping the daily stop intact.
-    max_daily_loss_pct = _get_float(env, "MAX_DAILY_LOSS_PCT", 0.04)
-    max_risk_per_trade_pct = _get_float(env, "MAX_RISK_PER_TRADE_PCT", 0.012)
+    #
+    # ── v11 (patch_v11): 2.0% per trade / 8.0% daily ─────────────────────
+    # THIS IS LEVERAGE, NOT ALPHA. Nothing about the edge changes - the same
+    # five setups on the same four sessions, at a larger ticket. It is here
+    # because the book was committing only 1.2-3.3% of capital per trade
+    # against a 1.0 lakh account while its realised risk ran far below its
+    # structural risk, and the operator asked for CAGR specifically.
+    #
+    # Measured on 2026-09-08..11 replayed in one process (v10 exit ladder
+    # applied), against the 1.2% / 4.0% baseline:
+    #
+    #   per-trade / daily    4-day net    worst single-trade    worst observed
+    #                                          structural loss   unrealised P&L
+    #   1.2% /  4.0%          +12,494.66     32,925 (3.29%)        -3,795
+    #   2.0% /  8.0%  <- here +18,596.09     41,321 (4.13%)        -4,744
+    #   3.0% / 10.0%          +21,774.72     54,628 (5.46%)        -4,744
+    #
+    # Profit scales SUB-linearly (1.67x the budget buys 1.49x the profit)
+    # because LOT_CAPS_BY_DAY binds first - Friday caps at 5 lots - while the
+    # tail scales linearly. The daily stop is raised to 8.0% alongside it
+    # because the clamp below requires per-trade < daily/3, and because a
+    # 2.0% per-trade budget inside a 4.0% daily stop would halt the book
+    # after two losers. Three consecutive structural losses at 2.0% still fit
+    # inside the 8.0% stop, which is the arithmetic the clamp protects.
+    #
+    # Revert with MAX_RISK_PER_TRADE_PCT=0.012 and MAX_DAILY_LOSS_PCT=0.04 in
+    # env.txt - env.txt overrides these defaults, no code change needed. For
+    # the more aggressive row use 0.030 / 0.10 the same way.
+    max_daily_loss_pct = _get_float(env, "MAX_DAILY_LOSS_PCT", 0.08)
+    max_risk_per_trade_pct = _get_float(env, "MAX_RISK_PER_TRADE_PCT", 0.020)
 
     # Clamp: max risk per trade must be < max daily loss / 3
     safe_max = round(max_daily_loss_pct / 3.0 - 0.001, 4)

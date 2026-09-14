@@ -2112,6 +2112,10 @@ class ExecutionEngine:
 
         # ── Priority 4: Profit lock ───────────────────────────────────────
         # Move stop to breakeven when profit reaches threshold
+        # v10 [T2]: set when the trail is armed/ratcheted on THIS cycle; the
+        # TIGHTEN_STOP it implies is returned at the bottom of the ladder, so
+        # that an available target below is still taken in the same cycle.
+        _lock_armed_ctx: Optional[dict] = None
         if entry_credit > 0 and gross_credit > 0:
             # v3.1: measured on the liquidation mark — profit you cannot
             # actually take is not profit, and locking against a mid you
@@ -2124,6 +2128,55 @@ class ExecutionEngine:
                 if actual_dte == 0
                 else self.config.profit_lock_pct_dte1plus
             )
+
+            # ── v10 [T1]: the give-back is now DTE-aware and RATCHETS ──────
+            # Two defects, both measured on the recorded sessions.
+            #
+            # (a) NO RATCHET. The lock armed exactly once — the first cycle
+            #     on which profit crossed the threshold — and the stop it set
+            #     then never moved again, however much further the trade ran.
+            #     A trailing stop that does not trail is a breakeven stop with
+            #     extra steps: everything earned after the arming cycle was
+            #     unprotected and was routinely handed back on the afternoon
+            #     retracement. The lock now re-evaluates every cycle and RAISES
+            #     (never lowers) the stop as achieved profit grows. The peak is
+            #     recovered from the stored stop itself — stop == credit -
+            #     keep_frac x achieved — so no schema change is needed and the
+            #     arithmetic is exact as long as keep_frac is fixed per DTE.
+            #
+            # (b) FLAT 0.50 GIVE-BACK ON EXPIRY DAY. Half of achieved profit is
+            #     a sane trail for a weekly whose premium moves slowly. On 0DTE
+            #     the last two hours are pure gamma: the 2026-09-08 bear call
+            #     printed +8.37 pts (44% of credit) at 13:52 and was worth
+            #     +0.42 pts by 14:29 — a 95% give-back inside 37 minutes, with
+            #     no adverse spot move at all (spot moved 29 points). Expiry-day
+            #     winners therefore keep 0.65 of what they achieved; weeklies
+            #     keep the existing 0.50, which the 2026-09-10 measurement
+            #     below already justified.
+            #
+            # The v3.1 floor is retained unchanged: a locked trade can never be
+            # stopped for worse than covering its own round trip.
+            _keep_frac = float(getattr(
+                self.config,
+                "profit_lock_keep_frac_dte0" if actual_dte == 0
+                else "profit_lock_keep_frac_dte1plus",
+                0.65 if actual_dte == 0 else 0.50,
+            ))
+            _keep_frac = min(max(_keep_frac, 0.05), 0.90)
+            _rt_cost = self._round_trip_cost_pts(open_legs, chain)
+            _stop_floor = max(entry_credit - _rt_cost, 0.05)
+
+            def _persist_lock(_lvl: float) -> None:
+                self.db.update(
+                    "positions",
+                    {
+                        "stop_premium":           _lvl,
+                        "profit_lock_activated":  1,
+                        "profit_lock_stop_level": _lvl,
+                        "updated_at":             now_ist().isoformat(),
+                    },
+                    {"position_id": position["position_id"]},
+                )
 
             if profit_pct >= lock_thresh and not profit_lock_activated:
                 # v3.1: the old lock gave back HALF of everything achieved and
@@ -2144,30 +2197,59 @@ class ExecutionEngine:
                 # v3.1 entry-minus-round-trip floor below still guarantees
                 # a locked trade cannot finish red. The time-target ladder
                 # (P6) and the 15:20 hard exit bound the ride.
-                _achieved = gross_credit - liq_premium
-                _keep = _achieved * 0.50
-                new_stop = liq_premium + _keep
-                _rt_cost = self._round_trip_cost_pts(open_legs, chain)
-                new_stop = min(new_stop, max(entry_credit - _rt_cost, 0.05))
-                self.db.update(
-                    "positions",
-                    {
-                        "stop_premium":          new_stop,
-                        "profit_lock_activated": 1,
-                        "profit_lock_stop_level": new_stop,
-                        "updated_at":            now_ist().isoformat(),
-                    },
-                    {"position_id": position["position_id"]},
-                )
+                _achieved = entry_credit - liq_premium
+                new_stop = liq_premium + (1.0 - _keep_frac) * _achieved
+                new_stop = min(new_stop, _stop_floor)
+                _persist_lock(new_stop)
                 self.logger.info(
                     f"PRIORITY 4 PROFIT LOCK: {position['strategy_name']} "
                     f"profit={profit_pct*100:.0f}% >= {lock_thresh*100:.0f}% — "
-                    f"stop moved to breakeven {new_stop:.2f}pts"
+                    f"stop moved to {new_stop:.2f}pts "
+                    f"(keep {_keep_frac*100:.0f}% of achieved)"
                 )
-                return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, {
+                # ── v10 [T2]: arming the trail must not SKIP the ladder ─────
+                # This branch used to `return "TIGHTEN_STOP"` immediately, which
+                # abandoned the rest of the exit ladder for that cycle. Priority
+                # 6's time target is evaluated on the SAME liquidation mark, so
+                # on the very cycle a trade became lock-worthy it was also very
+                # often already inside its take-profit target — and the engine
+                # tightened a stop instead of taking the money that was on the
+                # screen. One monitoring cycle later the mark had moved and the
+                # target was gone. Measured 2026-09-08: the spread reached
+                # +8.37 pts (44% of credit) at 13:52, armed the lock, and the
+                # 13:30 ladder rung (take 35% of credit) never got to fire.
+                # Arming is now recorded and returned only if no lower rung
+                # fires first — a stop tighten is a no-op, a target is cash.
+                _lock_armed_ctx = {
                     "profit_pct": profit_pct,
                     "new_stop": new_stop,
                 }
+
+            elif profit_lock_activated and profit_lock_stop_level:
+                # ── v10 [T1]: ratchet the trail as profit grows ────────────
+                try:
+                    _stop_now = float(profit_lock_stop_level)
+                except (TypeError, ValueError):
+                    _stop_now = 0.0
+                _achieved_now = entry_credit - liq_premium
+                # profit locked in by the current stop, inverted from its own
+                # definition: stop = credit - keep_frac x achieved
+                _locked_now = (
+                    (entry_credit - _stop_now) / _keep_frac
+                    if _keep_frac > 0 else 0.0
+                )
+                if _achieved_now > _locked_now + 1e-9:
+                    _cand = liq_premium + (1.0 - _keep_frac) * _achieved_now
+                    _cand = min(_cand, _stop_floor)
+                    # monotone: a trail only ever moves in our favour
+                    if _cand > _stop_now + 1e-9:
+                        _persist_lock(_cand)
+                        self.logger.info(
+                            f"PRIORITY 4 PROFIT LOCK RATCHET: "
+                            f"{position['strategy_name']} achieved "
+                            f"{_achieved_now:.2f}pts > locked {_locked_now:.2f}"
+                            f"pts — stop {_stop_now:.2f} -> {_cand:.2f}pts"
+                        )
 
             # If profit lock is active, check if we've given back too much
             if profit_lock_activated and profit_lock_stop_level:
@@ -2309,6 +2391,31 @@ class ExecutionEngine:
             # that window. From 13:30 any meaningful profit is taken; from
             # 14:15 anything better than covering the round trip is taken.
             # Losing positions remain governed by the stop logic above.
+            #
+            # ── v10 [T3]: the 13:30 rung was looser than the ladder it ─────
+            #      lives inside, and it fired first.
+            # `entry_credit * 0.88` means "close once 12% of the credit has
+            # been captured". But the time-target ladder immediately above —
+            # the engine's own, deliberate schedule — asks for 35% of the
+            # credit from 13:30 onwards (target = credit x 0.65). So the
+            # de-risk rung, sitting a few lines below it, was pre-empting the
+            # ladder with a bar almost three times weaker, and it did exactly
+            # that on every expiry-day winner.
+            #
+            # Measured 2026-09-08 (bear call 23700/23800, credit 19.07, spot
+            # pinned 40-70 points BELOW the short strike all afternoon): the
+            # rung closed the position at 13:32 for +4.45 pts (23% of credit).
+            # The same structure printed +8.37 pts (44% of credit) at 13:52 —
+            # inside the ladder's own 35% target — and the engine was no longer
+            # in the trade to see it. Spot never threatened the short strike;
+            # the give-up was pure exit-rule miscalibration, worth about
+            # Rs 1,000 on a single four-lot position.
+            #
+            # The rung is therefore re-anchored on the ladder's own 13:30
+            # number: it must never accept a smaller profit than the schedule
+            # it is part of. It stays as an explicit gamma-window flatten (and
+            # still costs the round trip off the top), but it can no longer
+            # undercut the target the engine already set for itself.
             if actual_dte == 0 and entry_credit > 0:
                 _rt = self._round_trip_cost_pts(open_legs, chain)
                 if current_time >= dtime(14, 15):
@@ -2319,7 +2426,12 @@ class ExecutionEngine:
                             "reason_detail": "gamma_window_scratch_or_better_1415",
                         }
                 elif current_time >= dtime(13, 30):
-                    if liq_premium <= entry_credit * 0.88 - _rt:
+                    _derisk_keep = float(getattr(
+                        self.config, "gamma_derisk_credit_kept_frac", 0.65
+                    ))
+                    # never ask for less than the 13:30 ladder rung above
+                    _derisk_keep = max(_derisk_keep, 0.65)
+                    if liq_premium <= entry_credit * _derisk_keep - _rt:
                         return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
                             "current_premium": current_premium,
                             "liquidation_premium": liq_premium,
@@ -2343,6 +2455,15 @@ class ExecutionEngine:
                 "hard_exit_time": str(hard_exit),
                 "current_time": str(current_time),
             }
+
+        # ── v10 [T2]: deferred stop tighten ───────────────────────────────
+        # The trail was armed or ratcheted on this cycle (Priority 4) but no
+        # rung below it found a target or a stop. Report the tighten now,
+        # exactly as before — the only change is that it no longer pre-empts
+        # the rungs underneath it. A forced flatten at the bell still wins,
+        # because closing the position supersedes protecting it.
+        if _lock_armed_ctx is not None:
+            return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, _lock_armed_ctx
 
         return "HOLD", 0, {"current_premium": current_premium}
 
