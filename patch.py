@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""v7: the per-trade console report, and the money bugs found building it.
+"""v8: Telegram lifecycle updates - and the two schema columns they exposed.
 
-    python3 patch_v7.py                 # applies to the directory it lives in
-    python3 patch_v7.py /path/to/repo   # or to an explicit checkout
+    python3 patch_v8.py                 # applies to the directory it lives in
+    python3 patch_v8.py /path/to/repo   # or to an explicit checkout
 
-Expects the tree patch_v6.py leaves behind (its MD5 table is the gate) and
-lands it on the tested v7 content. All-or-nothing: every hunk is staged in
+Expects the tree patch_v7.py leaves behind (its MD5 table is the gate) and
+lands it on the tested v8 content. All-or-nothing: every hunk is staged in
 memory, the result is hash-checked per file and compiled, and the tree is
 reverted if anything fails. Re-running is a no-op.
 
@@ -13,169 +13,200 @@ Exit codes: 0 applied or already up to date, 2 wrong directory,
 3 unrecognised content / anchor drift (nothing modified),
 4 compile failure (reverted).
 
-────────────────────────────────────────────────────────────────────────────
-WHAT IT ADDS: one console block per trade, per cycle, from BOTH engines
-────────────────────────────────────────────────────────────────────────────
-The live/paper engine prints it at the end of every cycle (after the cycle
-footer) and the replay harness prints it at the end of every replayed cycle,
-for every trade of the session - open or closed:
+Files: core.py, main.py and verify_all.py are patched in place;
+telegram_reporter.py (2,303 lines, self-test included) is created
+new.
+No engine decision changes - the four recorded replay days come out at
+exactly the v7 numbers (see REPLAY PROOF below).
 
+------------------------------------------------------------------------------
+WHAT IT ADDS: five Telegram messages, and only five
+------------------------------------------------------------------------------
+  1. the engine STARTED - and whether a human typed it or a supervisor did,
+  2. a HEARTBEAT every TELEGRAM_HEARTBEAT_MIN minutes (default 15) for as
+     long as the process runs, market open or not,
+  3. a trade order was PLACED,
+  4. a trade order was CLOSED, with the realised money and the reason,
+  5. the engine STOPPED, and why: end of day, Ctrl+C, SIGTERM, a fatal
+     error, or a start that never got off the ground (no Upstox token).
+
+These are real messages composed by the module's own self-test from a real
+book (the 2026-09-11 paper trade), as the phone shows them (transcribed here
+with ASCII separators; the real messages use a middle dot, HTML markup and
+monospaced <pre> blocks):
+
+1 ---------------------------------------------------------------------
+Nifty options trade engine started at 09:02:11 IST
+2026-09-15 - PAPER TRADE - manual (interactive terminal) - pid 2161
+
+Nifty opened at: 24,380.50
+Current Nifty Spot at: 24,412.35  +0.24% vs prev close
+Nifty closed at: 24,353.20 (previous day)
+Current nifty regime: vol VOL_SELL | price TREND_UP | positioning PCR_BULL | final TREND_SELL
+Overall nifty regime: TREND_SELL (dominant of 3 cycle(s))
+Total cycles completed: 0
+
+open trades 0 - closed today 0 - daily halt OFF
+VIX 12.40 - day range 24,361.05 - 24,430.10 - lot size 65
+
+2 ---------------------------------------------------------------------
+Nifty options trade engine update at 11:00:00 IST
+15-minute heartbeat - 2026-09-15 - PAPER TRADE
+
+Nifty opened at: 24,380.50
+Current Nifty Spot at: 24,412.35  +0.24% vs prev close
+Nifty closed at: 24,353.20 (previous day)
+Current nifty regime: vol VOL_SELL | price TREND_UP | positioning PCR_BULL | final TREND_SELL
+Overall nifty regime: TREND_SELL (dominant of 42 cycle(s))
+Total cycles completed: 57
+
+Day P&L: unrealised Rs +227.50 - total Rs +227.50
+open trades 1 - closed today 0 - daily halt OFF
+VIX 12.40 - day range 24,361.05 - 24,430.10 - lot size 65
 ====================================================================================
 Trade-1
 Strategy: BULL_PUT_SPREAD
 ----------------------------------------------------------------------------
-Trade Start Data: time: 09:20
-Sold: 2 lot of PE with premium: 47.65 at strike: 23150
+Trade Start Data: time: 12:13
 Bought: 2 lot of PE with premium: 28.60 at strike: 23050
+Sold: 2 lot of PE with premium: 47.65 at strike: 23150
 ----------------------------------------------------------------------------
-Trade End Data: time: 11:05
-Bought: 2 lot of PE with premium: 40.10 at strike: 23150
+Trade End Data: time: 11:00
 Sold: 2 lot of PE with premium: 24.60 at strike: 23050
-Closed - CLOSE_TARGET
-----------------------------------------------------------------------------
-Position Status: Close
-Total Investment: Rs 15,730.00 margin held (credit received Rs 2,476.50)
-Total Profit: Rs +348.14 realised (gross Rs +461.50 - charges Rs 113.36)
-====================================================================================
-
-While the trade is open the same block ends with the live mark instead:
-
-Trade End Data: time: 10:15
-Bought: 2 lot of PE with premium: 43.20 at strike: 23150
-Sold: 2 lot of PE with premium: 26.10 at strike: 23050
+Bought: 2 lot of PE with premium: 40.10 at strike: 23150
 Open
 ----------------------------------------------------------------------------
 Position Status: Open
-Total Investment: Rs 15,730.00 margin held (credit received Rs 2,476.50)
-Total Profit: Rs +227.50 unrealised (gross Rs +285.10 - charges Rs 57.67 paid)
+Total Investment: Rs 15,787.67
+    margin blocked Rs 15,730.00 + entry charges Rs 57.67
+    premium received Rs 2,476.50 - a credit structure commits margin, not cash premium
+Total Profit: Rs +349.04 unrealised
+    marked to exit +15.50 pts (chain marks) -> gross +3.55 pts x 130 units = Rs 461.50
+    charges paid Rs 57.67, still to pay ~Rs 54.79, entry credit +19.05 pts (fills)
 ====================================================================================
 
-Rules the block obeys, all of them enforced by a self-test in each engine:
+3 ---------------------------------------------------------------------
+Trade order placed - Trade-1 BULL_PUT_SPREAD at 12:13
+spot 24,412.35 - regime TREND_SELL - cycle 42 - day P&L Rs +0.00
+<the same Trade-1 block, open, as above>
 
-  * It is rendered from the persisted book (positions / position_legs) plus
-    the current option chain - never from a parallel calculation - so it
-    cannot disagree with what the engine actually did. When a freshly closed
-    trade's own numbers cannot be reproduced from the book, the block says
-    so on the Total Profit line instead of printing a confident wrong figure.
-  * "Sold"/"Bought" is the action at ENTRY for the start block and the
-    action at EXIT for the end block (a leg sold at entry is bought back).
-  * Premiums are the fills. Quoted mid is what they are measured against.
-  * Total Investment is the capital the trade actually ties up: the margin
-    held for a seller, the premium paid for a buyer, plus the credit or
-    debit received/paid, stated on its own line.
-  * Total Profit is gross minus the charges actually booked, labelled
-    realised once the position is closed and unrealised while it is open.
-  * Open positions are reprinted every cycle in "each_cycle" mode (the
-    default); "on_change" reprints only when a trade opens, closes or its
-    mark moves by TRADE_REPORT_MARK_EPS; "off" prints nothing. Config:
-    TRADE_REPORT_ENABLED / TRADE_REPORT_MODE / TRADE_REPORT_MARK_EPS /
-    TRADE_REPORT_MAX_PER_CYCLE, and `backtest_engine.py --trade-report=`.
+4 ---------------------------------------------------------------------
+Trade order closed - Trade-1 BULL_PUT_SPREAD at 14:02
+reason CLOSE_TARGET - spot 24,412.35 - regime TREND_SELL - cycle 58 - day P&L Rs +348.14
+Net Rs +348.14 realised - charges Rs 113.36
+====================================================================================
+Trade-1
+Strategy: BULL_PUT_SPREAD
+----------------------------------------------------------------------------
+Trade Start Data: time: 12:13
+Bought: 2 lot of PE with premium: 28.60 at strike: 23050
+Sold: 2 lot of PE with premium: 47.65 at strike: 23150
+----------------------------------------------------------------------------
+Trade End Data: time: 14:02
+Sold: 2 lot of PE with premium: 24.60 at strike: 23050
+Bought: 2 lot of PE with premium: 40.10 at strike: 23150
+Closed - CLOSE_TARGET
+----------------------------------------------------------------------------
+Position Status: Close
+Total Investment: Rs 15,787.67
+    margin blocked Rs 15,730.00 + entry charges Rs 57.67
+    premium received Rs 2,476.50 - a credit structure commits margin, not cash premium
+Total Profit: Rs +348.14 realised
+    gross +3.55 pts x 130 units = Rs 461.50, charges Rs 113.36
+    entry credit +19.05 pts (fills), exit debit +15.50 pts (fills)
+====================================================================================
 
-────────────────────────────────────────────────────────────────────────────
-WHAT IT FIXES
-────────────────────────────────────────────────────────────────────────────
-1. A trade was settled on the PLAN, not on the FILLS, and its entry charges
-   were taken twice. StrategyEngine books entry_credit as the planned net
-   credit (gross minus an estimated slippage minus the entry charges in
-   points); execute_close() settled gross P&L against that figure and then
-   subtracted the same entry charges again in rupees. It now settles on
-   realised_entry_credit() - the legs' own fills - and keeps the planned
-   figure beside it for comparison (positions.entry_credit_realised).
-   Measured on the 2026-09-11 paper book, using this patch's own code:
-       trade a99b921f  net Rs   286.68 -> Rs   348.14
-       trade a3fcdf68  net Rs   804.26 -> Rs   868.64
-       day             net Rs 1,090.94 -> Rs 1,216.78   (+Rs 125.84, +11.5%)
-   The day's profit was understated by an eighth, and the same error fed the
-   daily loss breaker, the equity curve and the EOD report.
+5 ---------------------------------------------------------------------
+Nifty options trade engine stopped at 15:31:00 IST
+end of day - 2026-09-15 - PAPER TRADE - uptime 6h28m - pid 2156
 
-2. Exit charges were computed with the ENTRY side of each leg.
-   _compute_transaction_costs() accepted `action` and ignored it, so on exit
-   it charged STT to the buy-backs (which pay no STT) and stamp duty to the
-   sales (which pay no stamp). An exit is the mirror image of the entry, and
-   it is now treated as one. StrategyEngine._compute_costs() and the replay
-   harness already did this, so the live book and the replay disagreed on the
-   same trade (Rs 2.27 on a 4-lot bear call spread: STT Rs 3.12 charged where
-   Rs 0.78 was due).
+Nifty opened at: 24,380.50
+Current Nifty Spot at: 24,412.35  +0.24% vs prev close
+Nifty closed at: 24,412.35 (today)
+Current nifty regime: vol VOL_SELL | price TREND_UP | positioning PCR_BULL | final TREND_SELL
+Overall nifty regime: TREND_SELL (dominant of 42 cycle(s))
+Total cycles completed: 180
 
-3. GST was levied on STT and on stamp duty. The 18% goods-and-services tax
-   applies to brokerage, exchange transaction charges and the SEBI turnover
-   fee - not to statutory levies the broker merely collects. Both the
-   per-side computation and _round_trip_cost_pts() are corrected, which
-   lowers the friction the minimum-credit and EV gates demand.
+Day P&L: realised Rs +348.14 - total Rs +348.14
+open trades 0 - closed today 1 - daily halt OFF
+VIX 12.40 - day range 24,361.05 - 24,430.10 - lot size 65
+<every trade of the session, in its final state>
 
-4. trade_exits was permanently empty. execute_close() has written exit_adx
-   and exit_vwap_dist since it was first drafted; no schema declared either
-   column, so the INSERT raised "table trade_exits has no column named
-   exit_adx" on every close and the exception was swallowed as a warning.
-   The 2026-09-11 book holds 2 CLOSED positions and 0 trade_exits rows, and
-   every query that joins trade_exits (EOD stats, exit-quality analysis,
-   pnl_15min_after_exit) silently returned nothing. The columns are declared
-   in SCHEMA_SQL, added by MIGRATION_SQL and ensured at engine start, so an
-   existing book is repaired on the next run.
+------------------------------------------------------------------------------
+HOW IT STAYS OUT OF THE WAY OF TRADING
+------------------------------------------------------------------------------
+  * Its own daemon thread does the sending. The trading loop enqueues and
+    moves on; a dead network costs one warning line in the log, never a
+    stalled cycle. Every public method is fenced - nothing raises into
+    main.py, and if the sender thread dies it is restarted on the next send
+    instead of degrading the loop to blocking inline HTTP.
+  * Telegram allows roughly 20 messages a minute into one group chat. Sends
+    are spaced TELEGRAM_MIN_GAP_SEC apart (default 3.5s), a 429 is obeyed
+    through its retry_after, and when the bounded queue overflows the oldest
+    HEARTBEAT is dropped first - a trade event is never thrown away to make
+    room for a status update.
+  * The numbers come from the persisted book and the engine's own state,
+    never from a parallel calculation, and the trade block is v7's console
+    block rendered by the same TradeConsoleReporter - so Telegram and the
+    terminal cannot tell two different stories about the same trade.
+    TELEGRAM_TRADE_BLOCK_STYLE=compact re-flows the same fields to 44
+    columns for a phone screen.
+  * Trade events are read out of the positions table rather than hooked
+    into the order path, so a trade closed by the hard-exit sweep, the
+    watchdog flatten or the EOD square-off is reported exactly once too.
+  * HTML parse mode, escaped, chunked at Telegram's 4096-character limit on
+    block boundaries so a <pre> section is never cut in half.
+  * Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (or
+    TELEGRAM_UPDATES_ENABLED=false) disables it quietly: one line in the
+    startup banner, zero cost per cycle. The bot token and chat id already
+    in env.txt for the v6 failure alerts are reused.
 
-5. exit_slippage was always 0.000. The quoted mid at exit was computed and
-   written to position_legs but never added to the audit dict the slippage
-   sum is built from, so the filter dropped every leg. The one number that
-   says whether exits are being taken at fair value was permanently zero; it
-   is now measured (0.100 pts on the reproduced 2026-09-11 trade).
+------------------------------------------------------------------------------
+THE BUG IT FIXED ON THE WAY: two columns no schema declared
+------------------------------------------------------------------------------
+positions.entry_credit_realised and positions.last_liquidation_premium were
+being written by the engines (the first since v7, the second before it) but
+appeared in no CREATE TABLE and no migration - they existed only because
+MarketDataEngine._ensure_extra_columns() / ExecutionEngine._ensure_extra_
+columns() happened to run first. Any code path that opened the book without
+constructing one of those engines - a tool, a test, eod_report.py, and now
+the Telegram reporter - got "no such column". Both are declared in
+SCHEMA_SQL and added to MIGRATION_SQL, so a fresh book has them and an
+existing book is repaired on the next run. No behaviour change, no data
+change: the columns were already there in every live database.
 
-6. The replay harness threw its exit audit away. _close() flagged a position
-   closed and kept the money in memory, but never persisted exit_time,
-   exit_reason, exit_priority, exit_premium, gross/exit-cost/net P&L, the
-   liquidation mark, or the legs' exit_price and quoted_mid_at_exit - and
-   _open() never persisted estimated_margin. A replayed session therefore
-   could not answer "what did this trade do", which is exactly what the
-   console block needs; both engines now read the same persisted shape.
+------------------------------------------------------------------------------
+CONFIGURATION (env.txt; every key optional, defaults in brackets)
+------------------------------------------------------------------------------
+    TELEGRAM_BOT_TOKEN            = "123456:ABC-..."   (required, v6 key)
+    TELEGRAM_CHAT_ID              = "-1001234567890"   (required, v6 key)
+    TELEGRAM_REPORT_CHAT_ID       = ""        [reports to a different chat]
+    TELEGRAM_UPDATES_ENABLED      = true
+    TELEGRAM_HEARTBEAT_MIN        = 15        [1..240]
+    TELEGRAM_MIN_GAP_SEC          = 3.5       [0..60]
+    TELEGRAM_TIMEOUT_SEC          = 8         [1..30]
+    TELEGRAM_MAX_QUEUE            = 60        [4..1000]
+    TELEGRAM_PARSE_MODE           = HTML      [HTML | MARKDOWN | "" = plain]
+    TELEGRAM_TRADE_BLOCK_STYLE    = console   [console | compact]
+    TELEGRAM_INCLUDE_OPEN_BLOCKS  = true      [open trades in status messages]
 
-7. Live-engine day handling. The per-cycle report needed a session latch
-   that survives the day roll and dies with it, the unrealised-P&L and
-   daily-loss-halt denominators were being taken after the day's own losses
-   had already reduced them (measuring the breaker against a moving base),
-   and the square-off watchdog judged feed staleness against a clock that
-   did not start at today's session open - so an engine started after hours
-   or left running overnight could act on yesterday's liveness.
+------------------------------------------------------------------------------
+REPLAY PROOF: no engine decision moved
+------------------------------------------------------------------------------
+The four recorded days, replayed on the committed databases, before and
+after this patch (v6 = HEAD, v7 = HEAD + patch_v7.py):
 
-8. eod_report.py had drifted from the engine it reports on: LOT_SIZE 75
-   against a configured 65, exchange transaction 0.0003552 against
-   0.0003553, STT 0.10% against 0.15%, a 5% daily-loss line against the
-   configured 4% - and "cost per lot" divided the day's charges by the lot
-   size rather than by the number of lots actually traded.
+    day          v6        v7        v8 (this patch)
+    2026-09-08   1,047     1,042     1,042
+    2026-09-09     693       684       684
+    2026-09-10   1,800     1,791     1,791
+    2026-09-11   6,753     6,731     6,731
 
-9. STT: Budget 2026 raised securities-transaction tax on the sale of an
-   option from 0.10% to 0.15% of premium (and on exercise from 0.125% to
-   0.15%) for transactions on or after 1 April 2026. The engine was costing
-   every 2026 trade at the superseded rate, understating the single largest
-   statutory charge on a short-premium book by a third. That is not a
-   rounding difference: it feeds _round_trip_friction, the minimum-credit
-   gate, the EV gate, lot sizing and net P&L, so trades were being approved
-   against a tax that no longer exists. STT_OPTIONS_SELL / STT_OPTIONS_EXERCISE
-   in env.txt override it when replaying a session that settled under 0.10%.
-
-────────────────────────────────────────────────────────────────────────────
-WHAT IT DOES NOT TOUCH
-────────────────────────────────────────────────────────────────────────────
-strategy_engine.py is in the target list only so the patch can prove the
-file is the tested v6 content - it carries no hunks. No signal, threshold,
-gate, window or tuned constant moves anywhere, and the replay harness's fill
-model is unchanged, so the same trades are taken on the same data. The only
-replay number that moves is the cost line, and only because of item 9:
-
-    2026-09-08   Rs 1,047 -> Rs 1,042
-    2026-09-09   Rs 1,133 -> Rs 1,121
-    2026-09-10   Rs 1,800 -> Rs 1,791
-    2026-09-11   Rs 6,753 -> Rs 6,731
-    total       Rs 10,733 -> Rs 10,685     (-Rs 48, -0.45%)
-
-Verified after applying: `python3 verify_all.py` passes 7/7, including
-`backtest_engine.py --test` (which now renders the block for a forced round
-trip in both states and asserts the printed money equals the booked money)
-and the execution engine's self-test (which reproduces the 2026-09-11
-BULL_PUT_SPREAD through the real paper executor and asserts the settlement,
-the exit charges, the trade_exits row and the slippage measurement).
-
-Every changed file compiles; nothing here needs a new dependency, a schema
-rebuild or a config migration - missing columns are added on start.
+v8 is identical to v7 on all four days, as it must be: this patch adds a
+reporter, not a decision. The v6 -> v7 deltas are v7's cost model (STT on
+option sales 0.10% -> 0.15%, Budget 2026).
 """
+
 import hashlib
 import os
 import py_compile
@@ -184,429 +215,2472 @@ import tempfile
 
 TARGETS = (
     'core.py',
-    'strategy_engine.py',
-    'execution_engine.py',
     'main.py',
-    'backtest_engine.py',
-    'eod_report.py',
+    'verify_all.py',
+)
+
+CREATED = (
+    'telegram_reporter.py',
 )
 
 MD5 = {
     'core.py': {
-        "v6":    'facc185b6578de82347a4a5be944469d',
-        "final": '67028da3ba47d852ef623100b1e39837',
-    },
-    'strategy_engine.py': {
-        "v6":    '0d1e6a929d9a8e9510495d4e6616add4',
-        "final": '0d1e6a929d9a8e9510495d4e6616add4',
-    },
-    'execution_engine.py': {
-        "v6":    '261f782dbc1ec1831e84728c34446846',
-        "final": '698975365c48d31ff9743bb3c8d54156',
+        "v7":    '67028da3ba47d852ef623100b1e39837',
+        "v8":    '0bd8fd489fb67de64cb14896166acc79',
     },
     'main.py': {
-        "v6":    'b30fed6a955941d066944ceb4f695218',
-        "final": '4a7da00110beaba57b19ab55ef5397f8',
+        "v7":    '4a7da00110beaba57b19ab55ef5397f8',
+        "v8":    '3c914b9fb549911a0ff1166724e87af4',
     },
-    'backtest_engine.py': {
-        "v6":    'f87c4135a9fda63363f9591e4f2d9202',
-        "final": 'b89eecce9d247f9d09e793232c67cd18',
+    'verify_all.py': {
+        "v7":    '4964fb2bcbec93461864f58afb922cac',
+        "v8":    'dcd2a729249389c8e2459b9b428c8c18',
     },
-    'eod_report.py': {
-        "v6":    '7b85d79a579a5284cb7f0e4e537c2418',
-        "final": '971154b9ea813e185a792c8bea560f5a',
+    'telegram_reporter.py': {
+        "v7":    None,
+        "v8":    '010d1043d58fa6a4731fbef3a7f97495',
     },
 }
 
 # Printed after a successful run: what the tree now does that it did not.
 CHANGES = (
-    "per-trade console block, every cycle, from the live AND the replay engine",
-    "trades settle on the fills, not the plan; entry charges no longer doubled",
-    "exit charges computed on the exit side of each leg (STT/stamp were swapped)",
-    "GST no longer levied on STT and stamp duty",
-    "trade_exits rows are written again (exit_adx / exit_vwap_dist declared)",
-    "exit_slippage measured instead of permanently 0.000",
-    "replay harness persists its exit audit and its estimated margin",
-    "live day-roll latches, halt denominator and watchdog clock corrected",
-    "eod_report.py constants and per-lot cost aligned with the engine",
-    "STT on option sales 0.10% -> 0.15% (Budget 2026, from 1 April 2026)",
+    "telegram_reporter.py: the five lifecycle updates on their own daemon thread",
+    "main.py: start / heartbeat / trade placed / trade closed / stop wired in",
+    "core.py: 10 TELEGRAM_* settings, all optional, all clamped to sane ranges",
+    "core.py: positions.entry_credit_realised declared in the schema + migration",
+    "core.py: positions.last_liquidation_premium declared in the schema + migration",
+    "verify_all.py: telegram_reporter.py --test is now target 8 of 8",
+    "trade events come from the book, so watchdog/EOD/hard-exit closes report too",
+    "queue overflow drops the oldest heartbeat, never a trade event",
+    "429 retry_after honoured; sends spaced inside Telegram's per-chat limit",
+    "HTML escaped and chunked at 4096 chars on block boundaries",
+    "disabled quietly, with one banner line, when the token/chat id are absent",
+    "no engine decision changed: the four replay days are byte-identical to v7",
 )
 
-PLAN_V6 = [
+# (file, [anchor candidates], replacement) - anchored whole-block edits.
+PLAN_V8 = [
     (
         'core.py',
         [
-            '    alert_min_interval_sec:        float = 3.0\n    alert_timeout_sec:             float = 5.0\n\n    def __repr__(self) -> str:\n        def mask(s: str) -> str:\n            if not s:\n',
+            '    trade_report_mode:             str   = "each_cycle"\n    trade_report_mark_eps:         float = 25.0\n    # 0 = no cap. A cap keeps a many-trade session readable; the newest\n    # trades are the ones printed when the cap bites.\n    trade_report_max_per_cycle:    int   = 0\n\n    def __repr__(self) -> str:\n        def mask(s: str) -> str:\n            if not s:\n                return "<empty>"\n            return (s[:4] + "..." + s[-2:]) if len(s) > 8 else "***"\n        return (\n',
         ],
-        '    alert_min_interval_sec:        float = 3.0\n    alert_timeout_sec:             float = 5.0\n\n    # ── v7: per-trade console lifecycle report ──────────────────────\n    # One block per trade, on the console, every cycle, from BOTH the\n    # live/paper engine and the replay harness: what was bought and sold\n    # at entry, what the position is worth now (or was closed at), and\n    # the money. The block is rendered from the persisted book\n    # (positions / position_legs) plus the current chain, never from a\n    # parallel calculation, so it cannot drift from what the engine\n    # actually did.\n    trade_report_enabled:          bool  = True\n    # each_cycle -> every trade of the session, every cycle. This is the\n    #               requested behaviour and the loudest one: a trade that\n    #               closed at 11:00 is still reprinted at 15:00.\n    # on_change  -> a trade is reprinted only when it opened, closed, or\n    #               its unrealised P&L moved by trade_report_mark_eps.\n    # off        -> nothing is printed.\n    trade_report_mode:             str   = "each_cycle"\n    trade_report_mark_eps:         float = 25.0\n    # 0 = no cap. A cap keeps a many-trade session readable; the newest\n    # trades are the ones printed when the cap bites.\n    trade_report_max_per_cycle:    int   = 0\n\n    def __repr__(self) -> str:\n        def mask(s: str) -> str:\n            if not s:\n',
-    ),
-    (
-        'core.py',
-        [
-            '        nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),\n\n        # Costs\n        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.001),\n        stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.00125),\n        brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),\n        exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003553),\n        sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),\n',
-        ],
-        '        nifty_strike_step=_get_int(env, "NIFTY_STRIKE_STEP", 50),\n\n        # Costs\n        # v7: STT on the SALE of an option in securities is 0.15% of the\n        # premium for transactions on/after 1 April 2026 (Budget 2026,\n        # clause 143 of the Finance Bill 2026: 0.10% -> 0.15% on premium,\n        # 0.125% -> 0.15% on exercise; futures went 0.02% -> 0.05%). The\n        # engine had been costing every 2026 trade at the superseded rate,\n        # so the single largest statutory charge on a short-premium book\n        # was understated by a third. That is not a rounding difference:\n        # it feeds _round_trip_friction, the minimum-credit gate, the EV\n        # gate, lot sizing and net P&L, so trades were being approved\n        # against a tax that no longer exists. Override STT_OPTIONS_SELL\n        # in env.txt when replaying a session that settled under 0.10%.\n        stt_options_sell=_get_float(env, "STT_OPTIONS_SELL", 0.0015),\n        stt_options_exercise=_get_float(env, "STT_OPTIONS_EXERCISE", 0.0015),\n        brokerage_per_order=_get_float(env, "BROKERAGE_PER_ORDER", 20.0),\n        exchange_txn_rate=_get_float(env, "EXCHANGE_TXN_RATE", 0.0003553),\n        sebi_rate=_get_float(env, "SEBI_RATE", 0.000001),\n',
+        '    trade_report_mode:             str   = "each_cycle"\n    trade_report_mark_eps:         float = 25.0\n    # 0 = no cap. A cap keeps a many-trade session readable; the newest\n    # trades are the ones printed when the cap bites.\n    trade_report_max_per_cycle:    int   = 0\n\n    # ── v8: Telegram lifecycle updates ────────────────────────────────\n    # Five messages and no more: the engine started, a heartbeat every\n    # telegram_heartbeat_min minutes while it runs, a trade order placed, a\n    # trade order closed, and the engine stopped (with the reason). They are\n    # sent by telegram_reporter.TelegramReporter on its own daemon thread, so\n    # a slow or dead network can never stall a trading cycle.\n    # The bot token and chat id are the v6 alert ones (TELEGRAM_BOT_TOKEN /\n    # TELEGRAM_CHAT_ID); telegram_report_chat_id optionally sends these\n    # reports to a different chat than the failure alerts.\n    telegram_updates_enabled:      bool  = True\n    telegram_report_chat_id:       str   = ""\n    # 15 minutes is what the operator asked for. The floor is 1 minute:\n    # Telegram allows roughly 20 messages a minute into one group chat, and\n    # a heartbeat faster than that would compete with the trade events for\n    # the same budget.\n    telegram_heartbeat_min:        float = 15.0\n    # Minimum spacing between two sends, default 3.5s = ~17/minute, inside\n    # Telegram\'s per-chat flood limit, so a burst of closes queues rather\n    # than 429s.\n    telegram_min_gap_sec:          float = 3.5\n    telegram_timeout_sec:          float = 8.0\n    telegram_max_queue:            int   = 60\n    # HTML keeps the trade block monospaced with <pre>; "" sends plain text.\n    telegram_parse_mode:           str   = "HTML"\n    # console -> the exact 84-column block the terminal prints.\n    # compact -> the same fields at 44 columns, for a phone screen that\n    #            would otherwise wrap every rule and every leg line.\n    telegram_trade_block_style:    str   = "console"\n    # A heartbeat carries the trades still in progress; a stop carries the\n    # whole day. Switch this off for status lines only.\n    telegram_include_open_blocks:  bool  = True\n\n    def __repr__(self) -> str:\n        def mask(s: str) -> str:\n            if not s:\n                return "<empty>"\n            return (s[:4] + "..." + s[-2:]) if len(s) > 8 else "***"\n        return (\n',
     ),
     (
         'core.py',
         [
-            '        ),\n        alert_timeout_sec=min(\n            max(_get_float(env, "ALERT_TIMEOUT_SEC", 5.0), 1.0), 30.0\n        ),\n    )\n\n',
+            '        trade_report_mark_eps=min(\n            max(_get_float(env, "TRADE_REPORT_MARK_EPS", 25.0), 0.0), 100000.0\n        ),\n        trade_report_max_per_cycle=min(\n            max(_get_int(env, "TRADE_REPORT_MAX_PER_CYCLE", 0), 0), 500\n        ),\n    )\n\n\n# ─────────────────────────────────────────────\n# RATE LIMITER\n# ─────────────────────────────────────────────\n',
         ],
-        '        ),\n        alert_timeout_sec=min(\n            max(_get_float(env, "ALERT_TIMEOUT_SEC", 5.0), 1.0), 30.0\n        ),\n        # ── v7 per-trade console report ───────────────────────────────────\n        trade_report_enabled=_get_bool(env, "TRADE_REPORT_ENABLED", True),\n        trade_report_mode=_get_choice(\n            env, "TRADE_REPORT_MODE", "each_cycle",\n            ("each_cycle", "on_change", "off"),\n        ),\n        trade_report_mark_eps=min(\n            max(_get_float(env, "TRADE_REPORT_MARK_EPS", 25.0), 0.0), 100000.0\n        ),\n        trade_report_max_per_cycle=min(\n            max(_get_int(env, "TRADE_REPORT_MAX_PER_CYCLE", 0), 0), 500\n        ),\n    )\n\n',
+        '        trade_report_mark_eps=min(\n            max(_get_float(env, "TRADE_REPORT_MARK_EPS", 25.0), 0.0), 100000.0\n        ),\n        trade_report_max_per_cycle=min(\n            max(_get_int(env, "TRADE_REPORT_MAX_PER_CYCLE", 0), 0), 500\n        ),\n        # ── v8 Telegram lifecycle updates ─────────────────────────────────\n        # The token and chat id are read above with the v6 alert settings\n        # (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), so one env.txt entry feeds\n        # both the failure alerts and these lifecycle updates.\n        telegram_updates_enabled=_get_bool(env, "TELEGRAM_UPDATES_ENABLED", True),\n        telegram_report_chat_id=env.get("TELEGRAM_REPORT_CHAT_ID", "").strip(),\n        telegram_heartbeat_min=min(\n            max(_get_float(env, "TELEGRAM_HEARTBEAT_MIN", 15.0), 1.0), 240.0\n        ),\n        telegram_min_gap_sec=min(\n            max(_get_float(env, "TELEGRAM_MIN_GAP_SEC", 3.5), 0.0), 60.0\n        ),\n        telegram_timeout_sec=min(\n            max(_get_float(env, "TELEGRAM_TIMEOUT_SEC", 8.0), 1.0), 30.0\n        ),\n        telegram_max_queue=min(\n            max(_get_int(env, "TELEGRAM_MAX_QUEUE", 60), 4), 1000\n        ),\n        # Not _get_choice(): Telegram\'s parse_mode is case-sensitive, and\n        # _get_choice lowercases what it returns. The reporter canonicalises\n        # whatever is written here ("html" -> "HTML", "plain"/"none" -> "").\n        telegram_parse_mode=env.get("TELEGRAM_PARSE_MODE", "HTML").strip(),\n        telegram_trade_block_style=_get_choice(\n            env, "TELEGRAM_TRADE_BLOCK_STYLE", "console", ("console", "compact")\n        ),\n        telegram_include_open_blocks=_get_bool(\n            env, "TELEGRAM_INCLUDE_OPEN_BLOCKS", True\n        ),\n    )\n\n\n# ─────────────────────────────────────────────\n# RATE LIMITER\n# ─────────────────────────────────────────────\n',
     ),
     (
         'core.py',
         [
-            '    exit_priority_name      TEXT,\n    exit_spot               REAL,\n    exit_vix                REAL,\n    exit_legs_json          TEXT,\n    exit_premium            REAL,\n    gross_pnl_pts           REAL,\n',
+            '    entry_time              TEXT,\n    entry_spot              REAL,\n    entry_vix               REAL,\n    entry_vrp               REAL,\n    entry_vrp_smoothed      REAL,\n    entry_credit            REAL,\n    gross_credit            REAL,\n    opening_straddle_at_entry REAL,\n    total_slippage          REAL,\n    entry_costs_rupees      REAL,\n    stop_premium            REAL,\n    target_premium          REAL,\n',
         ],
-        '    exit_priority_name      TEXT,\n    exit_spot               REAL,\n    exit_vix                REAL,\n    -- v7: ExecutionEngine.execute_close() has written these two since it was\n    -- first drafted, but no schema declared them, so the whole INSERT failed\n    -- with "table trade_exits has no column named exit_adx" and was swallowed\n    -- as a warning. The exit audit table stayed permanently empty (the\n    -- 2026-09-11 paper book: 2 CLOSED positions, 0 trade_exits rows), which\n    -- also blanked every query that joins trade_exits.\n    exit_adx                REAL,\n    exit_vwap_dist          REAL,\n    exit_legs_json          TEXT,\n    exit_premium            REAL,\n    gross_pnl_pts           REAL,\n',
+        "    entry_time              TEXT,\n    entry_spot              REAL,\n    entry_vix               REAL,\n    entry_vrp               REAL,\n    entry_vrp_smoothed      REAL,\n    entry_credit            REAL,\n    -- v8: the credit the FILLS booked, written beside the planned credit by\n    -- the live close path since v7 - but declared in no schema, so a book\n    -- created by Database() alone (a tool, a test, eod_report.py) never had\n    -- the column. Same class of gap as v7's trade_exits columns: declared\n    -- here, migrated below, and still ensured at engine start so an existing\n    -- book is repaired on the next run.\n    entry_credit_realised   REAL,\n    gross_credit            REAL,\n    opening_straddle_at_entry REAL,\n    total_slippage          REAL,\n    entry_costs_rupees      REAL,\n    stop_premium            REAL,\n    target_premium          REAL,\n",
     ),
     (
         'core.py',
         [
-            '    "ALTER TABLE trade_exits ADD COLUMN exit_priority INTEGER",\n    "ALTER TABLE trade_exits ADD COLUMN exit_priority_name TEXT",\n    "ALTER TABLE trade_exits ADD COLUMN pnl_15min_after_exit REAL",\n    "ALTER TABLE session_state ADD COLUMN opening_straddle_pts REAL DEFAULT 0",\n    "ALTER TABLE session_state ADD COLUMN prev_day_vix_close REAL",\n    "ALTER TABLE session_state ADD COLUMN gap_direction TEXT DEFAULT \'FLAT\'",\n',
+            '    exit_priority           INTEGER,\n    exit_premium            REAL,\n    gross_pnl_rupees        REAL,\n    exit_costs_rupees       REAL,\n    net_pnl_rupees          REAL,\n    last_known_premium      REAL,\n    profit_lock_activated   INTEGER DEFAULT 0,\n    profit_lock_stop_level  REAL,\n    paper_trade             INTEGER DEFAULT 1,\n    raw_params_json         TEXT,\n    vol_regime_at_entry     TEXT,\n    price_regime_at_entry   TEXT,\n',
         ],
-        '    "ALTER TABLE trade_exits ADD COLUMN exit_priority INTEGER",\n    "ALTER TABLE trade_exits ADD COLUMN exit_priority_name TEXT",\n    "ALTER TABLE trade_exits ADD COLUMN pnl_15min_after_exit REAL",\n    # v7: the two columns execute_close() has always written but no schema\n    # ever declared - their absence made every trade_exits INSERT fail.\n    "ALTER TABLE trade_exits ADD COLUMN exit_adx REAL",\n    "ALTER TABLE trade_exits ADD COLUMN exit_vwap_dist REAL",\n    "ALTER TABLE session_state ADD COLUMN opening_straddle_pts REAL DEFAULT 0",\n    "ALTER TABLE session_state ADD COLUMN prev_day_vix_close REAL",\n    "ALTER TABLE session_state ADD COLUMN gap_direction TEXT DEFAULT \'FLAT\'",\n',
+        '    exit_priority           INTEGER,\n    exit_premium            REAL,\n    gross_pnl_rupees        REAL,\n    exit_costs_rupees       REAL,\n    net_pnl_rupees          REAL,\n    last_known_premium      REAL,\n    -- v8: the mark a forced liquidation would have got, written by\n    -- monitor_position() every cycle and read by the trade report. It was\n    -- created only by MarketDataEngine._ensure_extra_columns() and (since v7)\n    -- ExecutionEngine._ensure_extra_columns(), never by the schema itself, so\n    -- which engine happened to be constructed first decided whether the\n    -- column existed at all.\n    last_liquidation_premium REAL,\n    profit_lock_activated   INTEGER DEFAULT 0,\n    profit_lock_stop_level  REAL,\n    paper_trade             INTEGER DEFAULT 1,\n    raw_params_json         TEXT,\n    vol_regime_at_entry     TEXT,\n    price_regime_at_entry   TEXT,\n',
     ),
     (
         'core.py',
         [
-            '\n\n# ─────────────────────────────────────────────\n# SELF TEST\n# ─────────────────────────────────────────────\n\n',
+            '    "ALTER TABLE positions ADD COLUMN profit_lock_activated INTEGER DEFAULT 0",\n    "ALTER TABLE positions ADD COLUMN profit_lock_stop_level REAL",\n    "ALTER TABLE positions ADD COLUMN exit_priority INTEGER",\n    "ALTER TABLE positions ADD COLUMN price_stop_level_call REAL",\n    "ALTER TABLE positions ADD COLUMN price_stop_level_put REAL",\n    "ALTER TABLE positions ADD COLUMN is_borderline_sell INTEGER DEFAULT 0",\n    "ALTER TABLE trade_entries ADD COLUMN vol_regime_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN price_regime_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN positioning_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN confidence_level_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN confidence_score_at_entry REAL",\n    "ALTER TABLE trade_entries ADD COLUMN entry_vrp_raw REAL",\n',
         ],
-        '\n\n# ─────────────────────────────────────────────\n# v7 — PER-TRADE CONSOLE REPORT\n# ─────────────────────────────────────────────\n#\n# One block per trade, on the console, every cycle, from BOTH engines\n# (main.py for live/paper, backtest_engine.py for replay). The layout is\n# the operator\'s, fixed:\n#\n#   ====================================================================\n#   Trade-<n>\n#   Strategy: <name>\n#   --------------------------------------------------------------------\n#   Trade Start Data: time: <HH:MM>\n#   Bought/Sold: <n> lot of CE with premium: <n> at strike: <n>\n#   --------------------------------------------------------------------\n#   Trade End Data: time: <HH:MM>\n#   Bought/Sold: <n> lot of CE with premium: <n> at strike: <n>\n#   Open\n#   --------------------------------------------------------------------\n#   Position Status: Open/Close\n#   Total Investment:\n#   Total Profit:\n#   ====================================================================\n#\n# The numbers are read out of the persisted book (positions /\n# position_legs) and marked with the same chain the engine is trading on,\n# so the block is an audit of what happened rather than a second opinion\n# about it. Where a value has to be derived, its basis is printed next to\n# it - a rupee figure with no stated basis is how accounting arguments\n# start.\n#\n#   Total Investment = cash the trade had to put up, plus the entry\n#       charges already paid. A net-debit structure pays premium, so the\n#       basis is the premium paid. A net-credit structure RECEIVES\n#       premium and posts margin instead, so the basis is the margin the\n#       broker blocks (the engine\'s own estimate where it has one, the\n#       structure\'s maximum loss where it does not).\n#\n#   Total Profit = net P&L, on realised fills both sides.\n#       Closed: (realised entry credit - realised exit debit) x lot size\n#           x lots, minus every charge actually booked.\n#       Open: the same identity marked at LIQUIDATION value - shorts at\n#           the ask, longs at the bid, i.e. what closing now would cost -\n#           less the entry charges already paid and an estimate of the\n#           charges still to pay. Conservative by construction, and the\n#           same convention MainEngine.compute_unrealized_pnl uses, so the\n#           open figure and the figure the close eventually books cannot\n#           disagree by a change of mark.\n\nTRADE_REPORT_RULE = "=" * 84\nTRADE_REPORT_SUB  = "-" * 76\n\n\ndef _tr_num(value, default: float = 0.0) -> float:\n    """float(value) that cannot raise on a NULL column."""\n    try:\n        if value is None or value == "":\n            return float(default)\n        return float(value)\n    except (TypeError, ValueError):\n        return float(default)\n\n\ndef _tr_int(value, default: int = 0) -> int:\n    try:\n        if value is None or value == "":\n            return int(default)\n        return int(float(value))\n    except (TypeError, ValueError):\n        return int(default)\n\n\ndef _tr_money(value) -> str:\n    return f"Rs {_tr_num(value):,.2f}"\n\n\ndef _tr_signed(value) -> str:\n    return f"Rs {_tr_num(value):+,.2f}"\n\n\ndef _tr_price(value) -> str:\n    """A premium: 2 decimals, and \'n/a\' rather than 0.00 for a missing fill."""\n    if value is None or value == "":\n        return "n/a"\n    return f"{_tr_num(value):.2f}"\n\n\ndef _tr_strike(value) -> str:\n    """25600.0 -> \'25600\'; 25612.5 -> \'25612.50\'."""\n    if value is None or value == "":\n        return "n/a"\n    k = _tr_num(value)\n    return f"{k:.0f}" if abs(k - round(k)) < 1e-9 else f"{k:.2f}"\n\n\ndef _tr_side(action) -> str:\n    """SELL -> \'Sold\', BUY -> \'Bought\'. Past tense: the fill happened."""\n    a = str(action or "").strip().upper()\n    if a.startswith("B"):\n        return "Bought"\n    if a.startswith("S"):\n        return "Sold"\n    return a.title() or "Traded"\n\n\ndef _tr_closing_side(action) -> str:\n    """The side that CLOSES a leg: a short is bought back, a long is sold."""\n    a = str(action or "").strip().upper()\n    if a.startswith("S"):\n        return "Bought"\n    if a.startswith("B"):\n        return "Sold"\n    return _tr_side(action)\n\n\ndef _tr_symbol(option_type) -> str:\n    t = str(option_type or "").strip().upper()\n    if t.startswith("C"):\n        return "CE"\n    if t.startswith("P"):\n        return "PE"\n    return t or "OPT"\n\n\ndef _tr_hhmm(value) -> str:\n    """Anything the book stores as a time -> \'HH:MM\'."""\n    if value is None or value == "":\n        return "n/a"\n    if isinstance(value, datetime):\n        return value.strftime("%H:%M")\n    if isinstance(value, dtime):\n        return value.strftime("%H:%M")\n    parsed = parse_ist_timestamp(value)\n    if parsed is not None:\n        return parsed.strftime("%H:%M")\n    tail = str(value).strip().split("T")[-1]\n    parts = tail.split(":")\n    if len(parts) >= 2 and parts[0].isdigit():\n        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"\n    return str(value)[:5]\n\n\ndef realised_entry_credit(position: dict, legs: List[dict]) -> Tuple[float, str]:\n    """The premium the ENTRY FILLS actually booked, in points, plus its basis.\n\n    positions.entry_credit is the strategy engine\'s PLANNED net credit:\n    gross credit minus an ESTIMATED slippage and the entry charges\n    expressed in points (StrategyEngine: net_credit = gross_credit -\n    total_slippage - entry_costs_pts). positions.gross_credit is the same\n    figure before those deductions. Neither one is what the fills did.\n\n    Settling a trade against the planned figure does two wrong things at\n    once: it books a modelled slippage as though it had happened, and it\n    removes the entry charges in points before execute_close() removes\n    them again in rupees. On the 2026-09-11 paper book a BULL_PUT_SPREAD\n    was booked at +Rs 286.68 whose own fills say +Rs 347.78 - Rs 57.67 of\n    entry charges counted twice and Rs 3.38 of estimated slippage counted\n    as real, i.e. the day was reported Rs 125 (10%) worse than it was.\n\n    The fills are ground truth and they are already persisted leg by leg,\n    so the realised credit is sum(SELL entry_price) - sum(BUY entry_price).\n    It is only used when EVERY leg carries a price: a partially priced\n    book would silently omit a leg, which is worse than either stored\n    number. The basis string is returned so the caller can log which of\n    the three was used.\n    """\n    rows = list(legs or [])\n    if not rows:\n        for key in ("gross_credit", "entry_credit"):\n            value = (position or {}).get(key)\n            if value is not None and value != "":\n                return _tr_num(value), key\n        return 0.0, "none"\n\n    filled = 0.0\n    priced = 0\n    for leg in rows:\n        price = leg.get("entry_price")\n        if price is None or price == "":\n            continue\n        px = _tr_num(price)\n        if px <= 0:\n            continue\n        filled += px if str(leg.get("action") or "").upper().startswith("S") else -px\n        priced += 1\n\n    if priced == len(rows):\n        return filled, "fills"\n    for key in ("gross_credit", "entry_credit"):\n        value = (position or {}).get(key)\n        if value is not None and value != "":\n            return _tr_num(value), f"{key}_legs_unpriced"\n    return filled, "partial_fills"\n\n\ndef realised_exit_debit(position: dict, legs: List[dict]) -> Tuple[float, str]:\n    """The points it actually cost to close: shorts bought back (+), longs\n    sold (-). Same rule as realised_entry_credit - the leg fills are the\n    record, positions.exit_premium is the fallback."""\n    rows = list(legs or [])\n    if rows:\n        total = 0.0\n        priced = 0\n        for leg in rows:\n            price = leg.get("exit_price")\n            if price is None or price == "":\n                continue\n            px = _tr_num(price)\n            total += px if str(leg.get("action") or "").upper().startswith("S") else -px\n            priced += 1\n        if priced == len(rows):\n            return total, "fills"\n    value = (position or {}).get("exit_premium")\n    if value is not None and value != "":\n        return _tr_num(value), "positions.exit_premium"\n    return 0.0, "none"\n\n\nclass TradeConsoleReporter:\n    """Renders the per-trade lifecycle block for one engine, live or replay.\n\n    Deliberately dumb about trading and strict about arithmetic: it reads\n    the book, marks it with the chain it is handed, and prints. It owns no\n    state except what it printed last (for the quiet mode) and it is not\n    allowed to raise into a trading loop - every query and every render is\n    guarded, because a reporting bug must never become a trading failure.\n    """\n\n    MODES = ("each_cycle", "on_change", "off")\n\n    def __init__(self, db: "Database", config: Config, logger=None,\n                 source: str = "LIVE"):\n        self.db      = db\n        self.config  = config\n        self.logger  = logger\n        self.source  = str(source or "LIVE")\n        # position_id -> (state, last printed profit); on_change only\n        self._last: Dict[str, Tuple[str, float]] = {}\n        self._day: Optional[str] = None\n        self._mode_override: Optional[str] = None\n\n    # ── configuration ────────────────────────────────────────────────\n\n    @property\n    def mode(self) -> str:\n        # An explicit override wins over the configuration, including over\n        # TRADE_REPORT_ENABLED: it is the operator asking for this particular\n        # run (backtest --trade-report), and the harness self-test relies on\n        # it to be deterministic whatever env.txt happens to say.\n        if self._mode_override in self.MODES:\n            return self._mode_override\n        if not bool(getattr(self.config, "trade_report_enabled", True)):\n            return "off"\n        chosen = getattr(self.config, "trade_report_mode", "each_cycle")\n        chosen = str(chosen or "each_cycle").strip().lower()\n        return chosen if chosen in self.MODES else "each_cycle"\n\n    def set_mode(self, mode: Optional[str]) -> None:\n        """CLI override (backtest --trade-report). Config is frozen, so the\n        override lives here; None restores the configured behaviour."""\n        if mode is None:\n            self._mode_override = None\n            return\n        mode = str(mode).strip().lower()\n        self._mode_override = mode if mode in self.MODES else None\n\n    def _debug(self, message: str) -> None:\n        try:\n            if self.logger is not None:\n                self.logger.debug(f"trade report: {message}")\n        except Exception:\n            pass\n\n    # ── book access ──────────────────────────────────────────────────\n\n    def positions_for(self, trading_date: str) -> List[dict]:\n        try:\n            rows = self.db.query(\n                "SELECT * FROM positions WHERE trading_date=? "\n                "ORDER BY entry_time ASC, created_at ASC, rowid ASC",\n                (trading_date,),\n            ) or []\n        except Exception as exc:\n            self._debug(f"positions query failed: {exc}")\n            return []\n        return list(rows)\n\n    def legs_for(self, position_id: str) -> List[dict]:\n        try:\n            rows = self.db.query(\n                "SELECT * FROM position_legs WHERE position_id=? "\n                "ORDER BY leg_id ASC",\n                (str(position_id),),\n            ) or []\n        except Exception as exc:\n            self._debug(f"legs query failed for {position_id}: {exc}")\n            return []\n        # Display order: calls then puts, strike ascending - the same order\n        # the structures are described in everywhere else in the engine.\n        def _key(leg: dict):\n            opt = str(leg.get("option_type") or "").upper()\n            return (0 if opt.startswith("C") else 1, _tr_num(leg.get("strike")))\n        return sorted(rows, key=_key)\n\n    # ── marks ────────────────────────────────────────────────────────\n\n    def _quote(self, leg: dict, chain: dict) -> dict:\n        if not chain:\n            return {}\n        node = chain.get(_tr_num(leg.get("strike"))) or {}\n        return node.get(str(leg.get("option_type") or "")) or {}\n\n    def _mark_leg(self, leg: dict, chain: dict, closing: bool = True):\n        """Price of one leg now. closing=True gives the honest liquidation\n        price - a short is bought back at the ASK, a long is sold at the\n        BID - which is the only mark a profit or an exit decision should\n        ever be made on. Returns None when the chain has nothing."""\n        quote = self._quote(leg, chain)\n        bid = _tr_num(quote.get("bid"))\n        ask = _tr_num(quote.get("ask"))\n        ltp = _tr_num(quote.get("ltp"))\n        if closing:\n            wants_ask = str(leg.get("action") or "").upper().startswith("S")\n            if wants_ask and ask > 0:\n                return ask\n            if not wants_ask and bid > 0:\n                return bid\n        if bid > 0 and ask > 0:\n            return (bid + ask) / 2.0\n        if ltp > 0:\n            return ltp\n        if bid > 0:\n            return bid\n        if ask > 0:\n            return ask\n        return None\n\n    # ── size and money ───────────────────────────────────────────────\n\n    def _lot_size(self) -> float:\n        return float(getattr(self.config, "lot_size", 0) or 0)\n\n    def _lots(self, position: dict, legs: List[dict]) -> int:\n        lots = _tr_int(position.get("final_lots"))\n        if lots > 0:\n            return lots\n        lot_size = self._lot_size()\n        derived = 0\n        if lot_size > 0:\n            for leg in legs:\n                qty = _tr_int(leg.get("qty"))\n                if qty > 0:\n                    derived = max(derived, int(round(qty / lot_size)))\n        return max(derived, 1)\n\n    def investment(self, position: dict, legs: List[dict]) -> Tuple[float, List[str]]:\n        """(rupees committed, basis lines) - see the block comment above."""\n        lot_size = self._lot_size()\n        lots     = self._lots(position, legs)\n        entry_costs = _tr_num(position.get("entry_costs_rupees"))\n\n        paid = received = 0.0\n        for leg in legs:\n            px  = _tr_num(leg.get("entry_price"))\n            qty = _tr_int(leg.get("qty")) or int(round(lot_size * lots))\n            if str(leg.get("action") or "").upper().startswith("S"):\n                received += px * qty\n            else:\n                paid += px * qty\n\n        if paid > received:\n            net_cash = paid - received\n            return net_cash + entry_costs, [\n                f"premium paid {_tr_money(net_cash)} "\n                f"+ entry charges {_tr_money(entry_costs)}",\n            ]\n\n        margin = _tr_num(position.get("estimated_margin"))\n        basis  = "margin blocked"\n        if margin <= 0:\n            margin = _tr_num(position.get("total_max_risk"))\n            basis  = "max structural risk"\n        if margin <= 0:\n            margin = abs(_tr_num(position.get("entry_credit"))) * lot_size * lots\n            basis  = "credit received"\n\n        lines = [\n            f"{basis} {_tr_money(margin)} + entry charges "\n            f"{_tr_money(entry_costs)}",\n        ]\n        if received > paid and basis != "credit received":\n            lines.append(\n                f"premium received {_tr_money(received - paid)} - a credit "\n                f"structure commits margin, not cash premium"\n            )\n        return margin + entry_costs, lines\n\n    def profit(self, position: dict, legs: List[dict],\n               chain: dict) -> Tuple[float, bool, List[str]]:\n        """(net rupees, realised?, basis lines).\n\n        Closed trades are recomputed from the persisted fills rather than\n        quoted from net_pnl_rupees, and the booked figure is named when the\n        two disagree. That is the point of the block: it shows what the\n        fills say next to what the book said.\n        """\n        lot_size = self._lot_size()\n        lots     = self._lots(position, legs)\n        units    = lot_size * lots\n        entry_costs = _tr_num(position.get("entry_costs_rupees"))\n        status   = str(position.get("status") or "OPEN").upper()\n        closed   = status.startswith("CLOSE")\n\n        entry_credit, entry_basis = realised_entry_credit(position, legs)\n\n        if closed:\n            exit_debit, exit_basis = realised_exit_debit(position, legs)\n            exit_costs = _tr_num(position.get("exit_costs_rupees"))\n            gross_pts  = entry_credit - exit_debit\n            gross_rs   = gross_pts * units\n            charges    = entry_costs + exit_costs\n            net        = gross_rs - charges\n            basis = [\n                f"gross {gross_pts:+.2f} pts x {units:,.0f} units = "\n                f"{_tr_money(gross_rs)}, charges {_tr_money(charges)}",\n                f"entry credit {entry_credit:+.2f} pts ({entry_basis}), "\n                f"exit debit {exit_debit:+.2f} pts ({exit_basis})",\n            ]\n            booked = position.get("net_pnl_rupees")\n            if booked is not None and booked != "" and \\\n                    abs(_tr_num(booked) - net) > 0.01:\n                basis.append(\n                    f"the book says {_tr_signed(booked)} - the fills above "\n                    f"are what this block reports"\n                )\n            return net, True, basis\n\n        # Open: mark every leg at what closing it now would cost.\n        liq      = position.get("last_liquidation_premium")\n        liq_src  = "positions.last_liquidation_premium"\n        if liq is None or liq == "":\n            liq = 0.0\n            for leg in legs:\n                if str(leg.get("leg_status") or "").upper() == "CLOSED":\n                    continue\n                mark = self._mark_leg(leg, chain, closing=True)\n                if mark is None:\n                    mark = _tr_num(leg.get("entry_price"))\n                if str(leg.get("action") or "").upper().startswith("S"):\n                    liq += mark\n                else:\n                    liq -= mark\n            liq_src = "chain marks" if chain else "entry prices (chain empty)"\n        liq = _tr_num(liq)\n\n        gross_pts = entry_credit - liq\n        gross_rs  = gross_pts * units\n        # The charge still to pay to get out, on the same convention\n        # MainEngine.compute_unrealized_pnl uses.\n        to_pay    = entry_costs * 0.95\n        net       = gross_rs - entry_costs - to_pay\n        basis = [\n            f"marked to exit {liq:+.2f} pts ({liq_src}) -> gross "\n            f"{gross_pts:+.2f} pts x {units:,.0f} units = {_tr_money(gross_rs)}",\n            f"charges paid {_tr_money(entry_costs)}, still to pay "\n            f"~{_tr_money(to_pay)}, entry credit {entry_credit:+.2f} pts "\n            f"({entry_basis})",\n        ]\n        return net, False, basis\n\n    # ── rendering ────────────────────────────────────────────────────\n\n    def render(self, index: int, position: dict, legs: List[dict],\n               chain: dict, as_of) -> List[str]:\n        lots   = self._lots(position, legs)\n        status = str(position.get("status") or "OPEN").upper()\n        closed = status.startswith("CLOSE")\n\n        out = [TRADE_REPORT_RULE]\n        out.append(f"Trade-{index}")\n        out.append(f"Strategy: {position.get(\'strategy_name\') or \'UNKNOWN\'}")\n        out.append(TRADE_REPORT_SUB)\n        out.append(f"Trade Start Data: time: {_tr_hhmm(position.get(\'entry_time\'))}")\n        for leg in legs:\n            out.append(\n                f"{_tr_side(leg.get(\'action\'))}: {lots} lot of "\n                f"{_tr_symbol(leg.get(\'option_type\'))} with premium: "\n                f"{_tr_price(leg.get(\'entry_price\'))} at strike: "\n                f"{_tr_strike(leg.get(\'strike\'))}"\n            )\n        if not legs:\n            out.append("no leg rows persisted for this position")\n\n        out.append(TRADE_REPORT_SUB)\n        end_time = position.get("exit_time") if closed else as_of\n        out.append(f"Trade End Data: time: {_tr_hhmm(end_time)}")\n        for leg in legs:\n            leg_closed = str(leg.get("leg_status") or "").upper() == "CLOSED"\n            if closed and leg_closed and leg.get("exit_price") not in (None, ""):\n                price, suffix = leg.get("exit_price"), ""\n            else:\n                # Not closed yet: what closing this leg now would cost.\n                price = self._mark_leg(leg, chain)\n                if price is None:\n                    price = leg.get("entry_price")\n                if closed:\n                    suffix = ("  [no exit fill]" if not leg_closed\n                              else "  [exit price not persisted]")\n                else:\n                    suffix = ""\n            out.append(\n                f"{_tr_closing_side(leg.get(\'action\'))}: {lots} lot of "\n                f"{_tr_symbol(leg.get(\'option_type\'))} with premium: "\n                f"{_tr_price(price)} at strike: "\n                f"{_tr_strike(leg.get(\'strike\'))}{suffix}"\n            )\n        if not legs:\n            out.append("no leg rows persisted for this position")\n        if closed:\n            out.append(f"Closed - {position.get(\'exit_reason\') or \'unknown\'}")\n        else:\n            out.append("Open")\n\n        out.append(TRADE_REPORT_SUB)\n        out.append(f"Position Status: {\'Close\' if closed else \'Open\'}")\n        committed, committed_basis = self.investment(position, legs)\n        net, realised, profit_basis = self.profit(position, legs, chain)\n        out.append(f"Total Investment: {_tr_money(committed)}")\n        for line in committed_basis:\n            out.append(f"    {line}")\n        out.append(\n            f"Total Profit: {_tr_signed(net)} "\n            f"{\'realised\' if realised else \'unrealised\'}"\n        )\n        for line in profit_basis:\n            out.append(f"    {line}")\n        out.append(TRADE_REPORT_RULE)\n        return out\n\n    def _header(self, trading_date: str, rows: List[dict], as_of,\n                title: Optional[str]) -> str:\n        n_open = sum(\n            1 for r in rows\n            if str(r.get("status") or "").upper().startswith("OPEN")\n        )\n        stamp = as_of.strftime("%H:%M:%S") if isinstance(as_of, datetime) \\\n            else _tr_hhmm(as_of)\n        label = title or f"TRADE REPORT [{self.source}]"\n        return (\n            f"\\n---- {label} | {trading_date} {stamp} | "\n            f"{len(rows)} trade(s), {n_open} open | mode={self.mode} ----"\n        )\n\n    # ── entry point ──────────────────────────────────────────────────\n\n    def report_cycle(self, trading_date: Optional[str] = None,\n                     chain: Optional[dict] = None,\n                     as_of=None,\n                     title: Optional[str] = None) -> int:\n        """Print the block for every trade of the session. Returns how many.\n\n        Called once per cycle by both engines. In each_cycle mode that is\n        every trade, open and closed, on every cycle - the operator asked\n        for exactly that, and the cost is console volume, not accuracy.\n        """\n        if self.mode == "off":\n            return 0\n        if trading_date is None:\n            trading_date = today_ist().isoformat()\n        if as_of is None:\n            as_of = now_ist()\n        chain = chain or {}\n\n        rows = self.positions_for(trading_date)\n        if not rows:\n            return 0\n\n        if self._day != trading_date:\n            self._day = trading_date\n            self._last.clear()\n\n        eps = _tr_num(getattr(self.config, "trade_report_mark_eps", 25.0), 25.0)\n        cap = _tr_int(getattr(self.config, "trade_report_max_per_cycle", 0))\n        quiet = self.mode == "on_change"\n\n        printed = 0\n        header_done = False\n        for index, position in enumerate(rows, start=1):\n            position_id = str(position.get("position_id") or f"#{index}")\n            legs = self.legs_for(position_id)\n            try:\n                net, realised, _note = self.profit(position, legs, chain)\n                if quiet:\n                    state = "closed" if realised else "open"\n                    previous = self._last.get(position_id)\n                    if previous is not None and previous[0] == state and \\\n                            abs(previous[1] - net) < eps:\n                        continue\n                    self._last[position_id] = (state, net)\n                if cap and printed >= cap:\n                    break\n                lines = self.render(index, position, legs, chain, as_of)\n            except Exception as exc:\n                self._debug(f"render failed for {position_id}: {exc}")\n                continue\n            if not header_done:\n                print(self._header(trading_date, rows, as_of, title))\n                header_done = True\n            for line in lines:\n                print(line)\n            printed += 1\n\n        if printed:\n            try:\n                sys.stdout.flush()\n            except Exception:\n                pass\n        return printed\n\n\n# ─────────────────────────────────────────────\n# SELF TEST\n# ─────────────────────────────────────────────\n\n',
-    ),
-    (
-        'core.py',
-        [
-            '    print(f"  parse_ist_timestamp():  {parsed}")\n    print(f"  IST timezone:           {IST}")\n\n    db.close()\n    print_section("SELF-TEST COMPLETE", char="#")\n    print(f"  Database: {db.db_path}")\n',
-        ],
-        '    print(f"  parse_ist_timestamp():  {parsed}")\n    print(f"  IST timezone:           {IST}")\n\n    # ── Trade Console Report (v7) ────────────────────────────────────\n    # One closed and one open trade, written straight into the scratch\n    # book, then rendered. This is the block both engines print on every\n    # cycle, so its shape is asserted rather than eyeballed.\n    print_section("TRADE CONSOLE REPORT TEST")\n    import contextlib as _ctxlib\n    import io as _io\n\n    _td = today_ist().isoformat()\n    _chain = {\n        25600.0: {"call": {"bid": 11.90, "ask": 12.10, "ltp": 12.00},\n                  "put":  {"bid": 4.00,  "ask": 4.20,  "ltp": 4.10}},\n        25750.0: {"call": {"bid": 2.90,  "ask": 3.10,  "ltp": 3.00},\n                  "put":  {"bid": 1.00,  "ask": 1.20,  "ltp": 1.10}},\n    }\n    db.insert("positions", {\n        "position_id": "selftest-closed", "trading_date": _td,\n        "strategy_name": "BEAR_CALL_SPREAD", "strategy_type": "SELL",\n        "entry_time": f"{_td}T12:03:00", "exit_time": f"{_td}T13:32:00",\n        "entry_credit": 14.05, "gross_credit": 14.05,\n        "entry_costs_rupees": 55.0, "exit_costs_rupees": 52.0,\n        "exit_premium": 9.00, "exit_reason": "gamma_window_derisk_1330",\n        "gross_pnl_rupees": 1306.5, "net_pnl_rupees": 1199.5,\n        "final_lots": 4, "estimated_margin": 19000.0, "total_max_risk": 8000.0,\n        "status": "CLOSED",\n    })\n    db.insert("positions", {\n        "position_id": "selftest-open", "trading_date": _td,\n        "strategy_name": "IRON_CONDOR", "strategy_type": "SELL",\n        "entry_time": f"{_td}T13:40:00",\n        "entry_credit": 5.00, "gross_credit": 5.20,\n        "entry_costs_rupees": 60.0, "final_lots": 2,\n        "estimated_margin": 15000.0, "total_max_risk": 6000.0,\n        "status": "OPEN",\n    })\n    for _row in (\n        ("selftest-closed", 25600.0, "call", "SELL", 4, 19.07, 12.00, "CLOSED"),\n        ("selftest-closed", 25750.0, "call", "BUY",  4, 5.02,  3.00, "CLOSED"),\n        ("selftest-open",   25600.0, "call", "SELL", 2, 11.00, None,  "OPEN"),\n        ("selftest-open",   25750.0, "put",  "BUY",  2, 1.10,  None,  "OPEN"),\n    ):\n        db.insert("position_legs", {\n            "position_id": _row[0], "strike": _row[1], "option_type": _row[2],\n            "action": _row[3], "qty": _row[4] * config.lot_size,\n            "entry_price": _row[5], "exit_price": _row[6], "leg_status": _row[7],\n        })\n\n    reporter = TradeConsoleReporter(db, config, logger, source="SELFTEST")\n    _buf = _io.StringIO()\n    with _ctxlib.redirect_stdout(_buf):\n        _printed = reporter.report_cycle(\n            trading_date=_td, chain=_chain, as_of=now_ist()\n        )\n    _text = _buf.getvalue()\n    assert _printed == 2, f"expected 2 trade blocks, got {_printed}"\n    for _frag in (\n        TRADE_REPORT_RULE, TRADE_REPORT_SUB, "Trade-1", "Trade-2",\n        "Strategy: BEAR_CALL_SPREAD", "Strategy: IRON_CONDOR",\n        "Trade Start Data: time: 12:03",\n        "Sold: 4 lot of CE with premium: 19.07 at strike: 25600",\n        "Bought: 4 lot of CE with premium: 5.02 at strike: 25750",\n        "Trade End Data: time: 13:32",\n        "Bought: 4 lot of CE with premium: 12.00 at strike: 25600",\n        "Closed - gamma_window_derisk_1330",\n        "Position Status: Close", "Position Status: Open",\n        "Bought: 2 lot of PE with premium: 1.10 at strike: 25750",\n        "Sold: 2 lot of PE with premium: 1.00 at strike: 25750",\n        "Total Investment: Rs", "Total Profit: Rs",\n    ):\n        assert _frag in _text, f"trade report is missing {_frag!r}"\n    # the open trade is marked to what closing it would cost, not to the mid\n    _open_block = _text.split("Trade-2", 1)[1]\n    assert "Bought: 2 lot of CE with premium: 12.10" in _open_block, \\\n        "open trade must be marked at the ask (liquidation), not the mid"\n    assert "unrealised" in _open_block and "realised" in _text\n    print(_text.rstrip())\n    print("  [OK] Trade console report renders an open and a closed trade")\n\n    db.close()\n    print_section("SELF-TEST COMPLETE", char="#")\n    print(f"  Database: {db.db_path}")\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '    load_config, setup_logging,\n    RateLimiter, UpstoxClient,\n    UpstoxAPIError, AlertNotifier,\n)\nfrom data_engine import MarketDataEngine\nfrom calibration_engine import CalibrationEngine\n',
-        ],
-        '    load_config, setup_logging,\n    RateLimiter, UpstoxClient,\n    UpstoxAPIError, AlertNotifier,\n    # v7: the entry credit the FILLS booked, as against the one the strategy\n    # engine planned. Used by execute_close() to settle a trade on its own\n    # prices; the same function feeds the per-trade console report.\n    realised_entry_credit,\n    TradeConsoleReporter,\n)\nfrom data_engine import MarketDataEngine\nfrom calibration_engine import CalibrationEngine\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '    def _ensure_extra_columns(self) -> None:\n        """Add any columns that may be missing from older database versions."""\n        extra = [\n            ("positions", "profit_lock_activated",   "INTEGER DEFAULT 0"),\n            ("positions", "profit_lock_stop_level",  "REAL"),\n            ("positions", "exit_priority",           "INTEGER"),\n',
-        ],
-        '    def _ensure_extra_columns(self) -> None:\n        """Add any columns that may be missing from older database versions."""\n        extra = [\n            # v7: monitor_position() writes the liquidation mark on every\n            # cycle and MainEngine.compute_unrealized_pnl() reads it, but the\n            # column exists in neither SCHEMA_SQL nor MIGRATION_SQL - it was\n            # only ever created by MarketDataEngine._ensure_extra_columns().\n            # That made the exit ladder depend on another engine having been\n            # constructed first: build an ExecutionEngine against a fresh book\n            # on its own (a tool, a test, a refactor) and the first\n            # monitor_position() raises sqlite3.OperationalError, which the\n            # main loop catches as "UNHANDLED ERROR in run_one_cycle" - so\n            # every cycle fails and no position is ever monitored or exited.\n            # Ensure it here too; ensure_column is a no-op when it exists.\n            ("positions", "last_liquidation_premium", "REAL"),\n            # v7: the credit the FILLS booked, written at close next to the\n            # planned credit the strategy engine priced the trade with, so\n            # the two can always be compared after the fact.\n            ("positions", "entry_credit_realised",   "REAL"),\n            ("positions", "profit_lock_activated",   "INTEGER DEFAULT 0"),\n            ("positions", "profit_lock_stop_level",  "REAL"),\n            ("positions", "exit_priority",           "INTEGER"),\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '            ("trade_exits", "exit_priority",         "INTEGER"),\n            ("trade_exits", "exit_priority_name",    "TEXT"),\n            ("trade_exits", "pnl_15min_after_exit",  "REAL"),\n        ]\n        for table, col, coltype in extra:\n            self.db.ensure_column(table, col, coltype)\n',
-        ],
-        '            ("trade_exits", "exit_priority",         "INTEGER"),\n            ("trade_exits", "exit_priority_name",    "TEXT"),\n            ("trade_exits", "pnl_15min_after_exit",  "REAL"),\n            # v7: execute_close() has written these two into trade_exits since\n            # it was first drafted, but neither SCHEMA_SQL nor MIGRATION_SQL\n            # declared them, so the INSERT raised "no column named exit_adx"\n            # on every single close and the row was dropped (caught and logged\n            # as a warning). The exit audit table was therefore always empty -\n            # the 2026-09-11 paper book holds 2 CLOSED positions and 0\n            # trade_exits rows - and every query that joins trade_exits\n            # silently returned nothing. Declared in core.py too; ensured here\n            # so an existing book is repaired on the next engine start.\n            ("trade_exits", "exit_adx",              "REAL"),\n            ("trade_exits", "exit_vwap_dist",        "REAL"),\n        ]\n        for table, col, coltype in extra:\n            self.db.ensure_column(table, col, coltype)\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '        Compute all transaction costs for a set of legs.\n\n        For ENTRY: STT on sell side, stamp on buy side\n        For EXIT:  STT on the side that was originally bought (now being sold)\n\n        Returns dict with total_rupees and detailed breakdown.\n        """\n',
-        ],
-        '        Compute all transaction costs for a set of legs.\n\n        For ENTRY: STT on sell side, stamp on buy side\n        For EXIT:  the sides are the MIRROR IMAGE - a leg that was sold at\n                   entry is bought back, and a leg that was bought is sold -\n                   and STT is levied on the SALE of an option, so on exit it\n                   belongs to the legs that were originally BOUGHT.\n\n        Returns dict with total_rupees and detailed breakdown.\n        """\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '        C02        = self.config.lot_size\n        sell_value = buy_value = 0.0\n        num_orders = len(legs)\n\n        for leg in legs:\n            # Use fill price for cost computation\n',
-        ],
-        '        C02        = self.config.lot_size\n        sell_value = buy_value = 0.0\n        num_orders = len(legs)\n        # v7: `action` used to be accepted and ignored, and the classification\n        # below read leg["action"] - the ENTRY side - for both phases. On an\n        # exit that charges STT to the buy-backs (which pay no STT) and stamp\n        # duty to the sales (which pay no stamp), while the turnover-based\n        # charges stay right, so the error is invisible in the total\'s\n        # magnitude and only shows up when the live book is reconciled\n        # against the replay: StrategyEngine._compute_costs() and\n        # BacktestRunner._close() both pass the CLOSING side, so the same\n        # trade cost Rs 2.27 more live than in replay on a 4-lot bear call\n        # spread (STT Rs 3.12 charged where Rs 0.78 was due).\n        closing = str(action or "").strip().upper() == "EXIT"\n\n        for leg in legs:\n            # Use fill price for cost computation\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '            qty           = lots * C02\n            premium_value = price * qty\n\n            if leg["action"] == "SELL":\n                sell_value += premium_value\n            else:\n                buy_value += premium_value\n',
-        ],
-        '            qty           = lots * C02\n            premium_value = price * qty\n\n            side = str(leg.get("action") or "").strip().upper()\n            if closing:\n                side = "BUY" if side.startswith("S") else "SELL"\n\n            if side == "SELL":\n                sell_value += premium_value\n            else:\n                buy_value += premium_value\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '        C02 = float(self.config.lot_size or 1)\n        live = [l for l in legs if l.get("leg_status") != "CLOSED"]\n        n_legs = max(len(live), 1)\n        brokerage_pts = (self.config.brokerage_per_order * n_legs) / C02\n        pct_pts = 0.0\n        spread_pts = 0.0\n        for leg in live:\n',
-        ],
-        '        C02 = float(self.config.lot_size or 1)\n        live = [l for l in legs if l.get("leg_status") != "CLOSED"]\n        n_legs = max(len(live), 1)\n        # v7: brokerage carries 18% GST like every other charge in this\n        # repository (_compute_transaction_costs and\n        # StrategyEngine._compute_costs both compute GST on\n        # brokerage + exchange + sebi). It was the only cost line here that\n        # was added net of GST.\n        brokerage_pts = (self.config.brokerage_per_order * 1.18 * n_legs) / C02\n        pct_pts = 0.0\n        spread_pts = 0.0\n        for leg in live:\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '            # On exit, STT applies to the legs being SOLD, i.e. the ones that\n            # were originally bought.\n            _stt = self.config.stt_options_sell if leg.get("action") == "BUY" else 0.0\n            pct_pts += mid * (\n                self.config.exchange_txn_rate + self.config.sebi_rate + _stt\n            ) * 1.18\n        return round(brokerage_pts + pct_pts + spread_pts, 3)\n\n    def _compute_current_premium(\n',
-        ],
-        '            # On exit, STT applies to the legs being SOLD, i.e. the ones that\n            # were originally bought.\n            _stt = self.config.stt_options_sell if leg.get("action") == "BUY" else 0.0\n            # v7: GST is levied on the exchange and SEBI charges (and on\n            # brokerage, added separately below), never on STT - STT is a\n            # tax, not a service. The 1.18 used to be applied to the whole\n            # bracket, so the estimate charged 18% GST on a statutory tax,\n            # and it disagreed with _compute_transaction_costs() and\n            # StrategyEngine._compute_costs() in the same repository, both of\n            # which compute GST as (brokerage + exchange + sebi) * 0.18.\n            pct_pts += mid * (\n                (self.config.exchange_txn_rate + self.config.sebi_rate) * 1.18\n                + _stt\n            )\n        return round(brokerage_pts + pct_pts + spread_pts, 3)\n\n    def _compute_current_premium(\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '                    {"leg_id": leg["leg_id"]},\n                )\n\n                exit_legs_info.append({**leg, "exit_price": exit_price, "fill": fill})\n\n                # Accumulate exit premium\n                # For SELL legs: we pay to close (cost)\n',
-        ],
-        '                    {"leg_id": leg["leg_id"]},\n                )\n\n                # v7: the fill alone is not an audit. quoted_mid_exit is\n                # already computed above and written to position_legs, but it\n                # never made it into this dict, so the exit_slippage sum below\n                # filtered every leg out and trade_exits booked 0.0 slippage\n                # for every close the system ever made - the one number that\n                # says whether the exits are being taken at fair value was\n                # permanently zero.\n                exit_legs_info.append({\n                    **leg,\n                    "exit_price":         exit_price,\n                    "quoted_mid_at_exit": quoted_mid_exit,\n                    "exit_delta":         float(opt.get("delta", 0) or 0),\n                    "fill":               fill,\n                })\n\n                # Accumulate exit premium\n                # For SELL legs: we pay to close (cost)\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '        C02          = self.config.lot_size\n        entry_credit = float(position.get("entry_credit") or 0)\n\n        # Gross P&L = entry_credit - exit_premium (for credit spreads)\n        gross_pnl_pts = entry_credit - exit_premium\n        gross_pnl_rs  = gross_pnl_pts * C02 * lots\n\n        # Costs\n',
-        ],
-        '        C02          = self.config.lot_size\n        entry_credit = float(position.get("entry_credit") or 0)\n\n        # v7: settle on the FILLS, not on the plan.\n        #\n        # positions.entry_credit is the strategy engine\'s planned NET credit:\n        # gross credit minus an ESTIMATED slippage and the entry charges\n        # converted to points (StrategyEngine: net_credit = gross_credit -\n        # total_slippage - entry_costs_pts). Using it here did two wrong\n        # things at once - it booked a modelled slippage as though it had\n        # happened, and it removed the entry charges in points before the\n        # lines below removed them again in rupees, because total_costs_rs\n        # includes entry_costs_rupees.\n        #\n        # Measured on the 2026-09-11 paper book: BULL_PUT_SPREAD 2 lots,\n        # planned credit 18.58 pts, fills 47.65 / 28.60 = 19.05 pts, exit\n        # 15.50 pts, entry charges Rs 57.67, exit charges Rs 56.05.\n        #   booked : (18.58 - 15.50) x 130 - 113.72 = Rs 286.68\n        #   correct: (19.05 - 15.50) x 130 - 113.72 = Rs 347.78\n        # Rs 61.10 of a real profit never existed - Rs 57.67 charged twice\n        # and Rs 3.38 of estimated slippage charged as real. The day was\n        # reported Rs 125 (10%) worse than the fills say, and since the\n        # replay harness settles on filled prices, the live book and the\n        # backtest could never be reconciled on the same trade.\n        #\n        # The exit ladder is untouched: stop_premium, target_premium and the\n        # profit lock keep comparing against the stored entry_credit exactly\n        # as before, so no exit decision changes. Only the money that is\n        # booked, reported and fed to calibration becomes the money that was\n        # actually made.\n        realised_credit, credit_basis = realised_entry_credit(position, legs)\n        if abs(realised_credit - entry_credit) > 1e-9:\n            self.logger.info(\n                f"entry credit settled on {credit_basis}: "\n                f"planned {entry_credit:+.3f} pts vs realised "\n                f"{realised_credit:+.3f} pts "\n                f"({(realised_credit - entry_credit) * C02 * lots:+,.2f} Rs "\n                f"on {lots} lot(s))"\n            )\n\n        # Gross P&L = realised entry credit - what it cost to close\n        gross_pnl_pts = realised_credit - exit_premium\n        gross_pnl_rs  = gross_pnl_pts * C02 * lots\n\n        # Costs\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '        hold_minutes = (now - entry_time).total_seconds() / 60.0\n\n        # ── Update position ───────────────────────────────────────────────\n        self.db.update(\n            "positions",\n            {\n                "status":            "CLOSED",\n                "exit_time":         now.isoformat(),\n                "exit_reason":       reason,\n                "exit_priority":     priority,\n                "exit_premium":      exit_premium,\n                "gross_pnl_rupees":  gross_pnl_rs,\n                "exit_costs_rupees": exit_costs_rs,\n                "net_pnl_rupees":    net_pnl_rs,\n                "updated_at":        now.isoformat(),\n            },\n            {"position_id": position["position_id"]},\n        )\n\n        # ── Persist trade exit ────────────────────────────────────────────\n        priority_name = EXIT_PRIORITY_NAMES.get(priority, reason)\n',
-        ],
-        '        hold_minutes = (now - entry_time).total_seconds() / 60.0\n\n        # ── Update position ───────────────────────────────────────────────\n        _close_update = {\n            "status":            "CLOSED",\n            "exit_time":         now.isoformat(),\n            "exit_reason":       reason,\n            "exit_priority":     priority,\n            "exit_premium":      exit_premium,\n            "gross_pnl_rupees":  gross_pnl_rs,\n            "exit_costs_rupees": exit_costs_rs,\n            "net_pnl_rupees":    net_pnl_rs,\n            # v7: kept next to the planned figure in entry_credit so the two\n            # can be compared on any closed trade, forever.\n            "entry_credit_realised": realised_credit,\n            "updated_at":        now.isoformat(),\n        }\n        try:\n            self.db.update(\n                "positions", _close_update,\n                {"position_id": position["position_id"]},\n            )\n        except Exception as _cue:\n            # An audit column that could not be added must never cost the\n            # close itself: retry without it and say so.\n            self.logger.warning(\n                f"positions close update failed ({_cue}); retrying without "\n                f"entry_credit_realised"\n            )\n            _close_update.pop("entry_credit_realised", None)\n            self.db.update(\n                "positions", _close_update,\n                {"position_id": position["position_id"]},\n            )\n\n        # ── Persist trade exit ────────────────────────────────────────────\n        priority_name = EXIT_PRIORITY_NAMES.get(priority, reason)\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '            "Exit Reason":     reason,\n            "Exit Priority":   f"{priority} ({priority_name})",\n            "Exit Premium":    f"{exit_premium:.2f}pts",\n            "Gross P&L (Rs)":  f"{gross_pnl_rs:,.0f}",\n            "Total Costs (Rs)":f"{total_costs_rs:,.0f}",\n            "Net P&L (Rs)":    f"{net_pnl_rs:,.0f}",\n',
-        ],
-        '            "Exit Reason":     reason,\n            "Exit Priority":   f"{priority} ({priority_name})",\n            "Exit Premium":    f"{exit_premium:.2f}pts",\n            "Entry Credit":    f"{realised_credit:.2f}pts realised "\n                               f"({credit_basis}) vs {entry_credit:.2f}pts "\n                               f"planned",\n            "Gross P&L (Rs)":  f"{gross_pnl_rs:,.0f}",\n            "Total Costs (Rs)":f"{total_costs_rs:,.0f}",\n            "Net P&L (Rs)":    f"{net_pnl_rs:,.0f}",\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '                state["consecutive_stops"] = 0\n\n        # Daily loss limit check\n        current_cap = float(state.get("current_capital", self.config.starting_capital) or 0)\n        if current_cap > 0:\n            daily_loss_pct = max(0.0, -float(state.get("daily_pnl", 0.0) or 0.0)) / current_cap\n            if daily_loss_pct >= self.config.max_daily_loss_pct:\n                state["daily_halted"] = True\n                self.logger.warning(\n',
-        ],
-        '                state["consecutive_stops"] = 0\n\n        # Daily loss limit check\n        # v7: measured against capital AT THE START OF THE DAY, the basis\n        # main.check_daily_loss_halt() and the replay harness both use. The\n        # denominator here was the post-loss capital, which made one\n        # configured limit mean two different things inside a single process:\n        # the deeper the loss, the smaller this denominator, so this copy of\n        # the check tripped earlier than the one that pages the operator and\n        # flattens the book - and it tripped silently, with no alert and no\n        # risk_halt row to explain why entries had stopped.\n        current_cap = float(state.get("current_capital", self.config.starting_capital) or 0)\n        daily_pnl   = float(state.get("daily_pnl", 0.0) or 0.0)\n        day_start_cap = current_cap - daily_pnl\n        if day_start_cap <= 0:\n            day_start_cap = current_cap\n        if day_start_cap > 0:\n            daily_loss_pct = max(0.0, -daily_pnl) / day_start_cap\n            if daily_loss_pct >= self.config.max_daily_loss_pct:\n                state["daily_halted"] = True\n                self.logger.warning(\n',
-    ),
-    (
-        'execution_engine.py',
-        [
-            '    print("  Hard exit sweep ran without error")\n    print("  [OK] Hard exit sweep test passed")\n\n    db.close()\n    print_section("EXECUTION ENGINE SELF-TEST COMPLETE", char="#")\n    print("  All tests passed")\n',
-        ],
-        '    print("  Hard exit sweep ran without error")\n    print("  [OK] Hard exit sweep test passed")\n\n    # ── Test 11: v7 close settlement — the fills, not the plan ─────────\n    # Reproduces the 2026-09-11 BULL_PUT_SPREAD that exposed the bug: the\n    # strategy engine books entry_credit as the PLANNED net credit (gross\n    # minus an estimated slippage minus the entry charges in points), and\n    # execute_close used to settle against that figure while subtracting the\n    # same entry charges again in rupees. The leg rows carry what the fills\n    # actually did, so they are the basis now.\n    print_section("Close Settlement Tests (v7)")\n    import contextlib as _ctxlib11\n    import io as _io11\n\n    _pid11 = "selftest-close-v7"\n    _lots11 = 2\n    _units11 = config.lot_size * _lots11\n    db.insert("positions", {\n        "position_id": _pid11, "trading_date": today_ist().isoformat(),\n        "strategy_name": "BULL_PUT_SPREAD", "strategy_type": "SELL",\n        "entry_time": now_ist().isoformat(),\n        # planned: 19.05 gross - 0.026 estimated slippage - 0.4436 costs\n        "entry_credit": 18.58,\n        "gross_credit": 19.05,\n        "entry_costs_rupees": 57.67,\n        "final_lots": _lots11, "estimated_margin": 15730.0,\n        "total_max_risk": 5693.0, "status": "OPEN",\n    })\n    for _k11, _a11, _px11 in ((23150.0, "SELL", 47.65), (23050.0, "BUY", 28.60)):\n        db.insert("position_legs", {\n            "position_id": _pid11, "strike": _k11, "option_type": "put",\n            "action": _a11, "qty": _units11, "entry_price": _px11,\n            "leg_status": "OPEN",\n        })\n\n    # The paper executor fills a buy-back at the ask and a sale at the bid,\n    # so this chain IS the fill: 40.10 and 24.60, as on 2026-09-11.\n    _chain11 = {\n        23150.0: {"put": {"bid": 40.00, "ask": 40.10, "ltp": 40.05,\n                          "delta": -0.30}},\n        23050.0: {"put": {"bid": 24.60, "ask": 24.70, "ltp": 24.65,\n                          "delta": -0.22}},\n    }\n    _saved_chain11 = market_engine.last_chain\n    market_engine.last_chain = _chain11\n\n    _pos11 = db.query_one(\n        "SELECT * FROM positions WHERE position_id=?", (_pid11,))\n    _legs11 = engine._get_position_legs(_pid11)\n\n    # (a) the realised credit is the fills, and it is not the planned figure\n    _rc11, _basis11 = realised_entry_credit(_pos11, _legs11)\n    print(f"  entry credit: planned {float(_pos11[\'entry_credit\']):.3f} pts, "\n          f"realised {_rc11:.3f} pts (basis={_basis11})")\n    assert _basis11 == "fills", \\\n        f"expected the fills to be the basis, got {_basis11}"\n    assert abs(_rc11 - (47.65 - 28.60)) < 1e-9, \\\n        f"realised credit should be 19.05, got {_rc11}"\n    assert abs(_rc11 - float(_pos11["entry_credit"])) > 0.01, \\\n        "this test is pointless if the planned and realised credit agree"\n\n    # (b) exit charges land on the leg SOLD at exit, not on the buy-back\n    _exit_costs11 = engine._compute_transaction_costs(\n        [{"action": "SELL", "exit_price": 40.10},\n         {"action": "BUY",  "exit_price": 24.60}], _lots11, "EXIT")\n    _expect_stt11 = 24.60 * _units11 * config.stt_options_sell\n    print(f"  exit STT: Rs{_exit_costs11[\'breakdown\'][\'stt\']:.2f} "\n          f"(due Rs{_expect_stt11:.2f}, on the leg sold at exit)")\n    assert abs(_exit_costs11["breakdown"]["stt"] - _expect_stt11) < 0.01, \\\n        f"exit STT should be {_expect_stt11:.2f}, got " \\\n        f"{_exit_costs11[\'breakdown\'][\'stt\']:.2f}"\n    # ...and the entry side is untouched by the exit-side fix\n    _entry_costs11 = engine._compute_transaction_costs(\n        [{"action": "SELL", "exec_price": 47.65},\n         {"action": "BUY",  "exec_price": 28.60}], _lots11, "ENTRY")\n    assert abs(_entry_costs11["breakdown"]["stt"]\n               - 47.65 * _units11 * config.stt_options_sell) < 0.01, \\\n        "entry STT must still be charged on the leg sold at entry"\n\n    # (c) close through the real path and read the book back\n    _state11 = dict(market_engine.state)\n    try:\n        engine.execute_close(\n            _pos11, "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {})\n    finally:\n        market_engine.last_chain = _saved_chain11\n\n    _row11 = db.query_one(\n        "SELECT * FROM positions WHERE position_id=?", (_pid11,))\n    _expect_gross11 = ((47.65 - 28.60) - (40.10 - 24.60)) * _units11\n    _expect_net11 = _expect_gross11 - 57.67 - float(_row11["exit_costs_rupees"])\n    # What the pre-v7 code booked for the very same trade: it settled on the\n    # PLANNED credit and charged the exit STT/stamp on the entry-side legs\n    # (the old call passed no side, so the entry rules applied at exit too).\n    _old_exit_costs11 = engine._compute_transaction_costs(\n        [{"action": "SELL", "exit_price": 40.10},\n         {"action": "BUY",  "exit_price": 24.60}],\n        _lots11, "ENTRY")["total_rupees"]\n    _old_net11 = (18.58 - 15.50) * _units11 - 57.67 - _old_exit_costs11\n    print(f"  gross P&L: Rs{float(_row11[\'gross_pnl_rupees\']):,.2f} "\n          f"(the fills say Rs{_expect_gross11:,.2f}; the planned credit "\n          f"would have said Rs{(18.58 - 15.50) * _units11:,.2f})")\n    print(f"  net P&L:   Rs{float(_row11[\'net_pnl_rupees\']):,.2f} "\n          f"(pre-v7 booked Rs{_old_net11:,.2f} for this trade), charges "\n          f"Rs{57.67 + float(_row11[\'exit_costs_rupees\']):,.2f}")\n    assert _row11["status"] == "CLOSED", "position not closed"\n    assert abs(float(_row11["exit_premium"]) - 15.50) < 1e-9, \\\n        f"exit premium should be 15.50, got {_row11[\'exit_premium\']}"\n    assert abs(float(_row11["gross_pnl_rupees"]) - _expect_gross11) < 0.01, \\\n        f"gross P&L must settle on the fills: {_expect_gross11:.2f}"\n    assert abs(float(_row11["net_pnl_rupees"]) - _expect_net11) < 0.01, \\\n        "net P&L is not gross minus the charges actually booked"\n    assert abs(float(_row11["entry_credit_realised"]) - 19.05) < 1e-9, \\\n        "entry_credit_realised not persisted"\n    assert abs(float(_row11["net_pnl_rupees"]) - _old_net11) > 1.0, \\\n        "still settling on the planned credit and the wrong exit leg"\n\n    _exit_row11 = db.query_one(\n        "SELECT * FROM trade_exits WHERE position_id=?", (_pid11,))\n    # v7: this row used never to exist. execute_close() writes exit_adx and\n    # exit_vwap_dist, no schema declared them, the INSERT raised, and the\n    # warning was swallowed - so the whole exit audit table stayed empty\n    # (2026-09-11 book: 2 CLOSED positions, 0 trade_exits rows).\n    assert _exit_row11 is not None, (\n        "trade_exits row missing - the exit INSERT is failing again; check "\n        "that every column execute_close() writes is declared in core.py")\n    for _col11 in ("exit_adx", "exit_vwap_dist", "exit_priority",\n                   "exit_priority_name", "exit_slippage"):\n        assert _col11 in _exit_row11.keys(), \\\n            f"trade_exits is missing the {_col11} column"\n    assert abs(float(_exit_row11["gross_pnl_pts"]) - 3.55) < 1e-9, \\\n        f"trade_exits.gross_pnl_pts should be 3.55, got " \\\n        f"{_exit_row11[\'gross_pnl_pts\']}"\n    assert abs(float(_exit_row11["net_pnl_rupees"])\n               - float(_row11["net_pnl_rupees"])) < 0.01, \\\n        "trade_exits and positions disagree on what the trade made"\n    assert _exit_row11["exit_priority_name"] == "TIME_TARGET", \\\n        f"exit priority name wrong: {_exit_row11[\'exit_priority_name\']!r}"\n    _legs_back11 = json.loads(_exit_row11["exit_legs_json"] or "[]")\n    assert len(_legs_back11) == 2, "both exit legs must be in exit_legs_json"\n    assert all(_l.get("exit_price") and _l.get("quoted_mid_at_exit")\n               for _l in _legs_back11), \\\n        "exit legs must carry the fill and the quoted mid it was taken against"\n    # v7: exit_slippage was 0.0 on every close the system ever made, because\n    # the quoted mid never reached the audit dict the sum is built from. Both\n    # legs here fill one tick away from the mid, so it must now be measured.\n    _expect_slip11 = sum(\n        abs(float(_l["exit_price"]) - float(_l["quoted_mid_at_exit"]))\n        for _l in _legs_back11)\n    assert _expect_slip11 > 0, "the test chain should not fill exactly on the mid"\n    assert abs(float(_exit_row11["exit_slippage"]) - _expect_slip11) < 0.01, \\\n        f"exit_slippage should be {_expect_slip11:.3f}, got " \\\n        f"{_exit_row11[\'exit_slippage\']}"\n    print(f"  exit slippage measured: {_expect_slip11:.3f} pts "\n          f"(booked {float(_exit_row11[\'exit_slippage\']):.3f}; pre-v7 always 0.000)")\n    print(f"  trade_exits row written: gross {float(_exit_row11[\'gross_pnl_pts\']):.2f}pts "\n          f"net Rs{float(_exit_row11[\'net_pnl_rupees\']):,.2f} "\n          f"({_exit_row11[\'result\']})")\n\n    # (d) and the console block reports the same money\n    _rep11 = TradeConsoleReporter(db, config, logger, source="SELFTEST")\n    _buf11 = _io11.StringIO()\n    with _ctxlib11.redirect_stdout(_buf11):\n        _n11 = _rep11.report_cycle(\n            trading_date=today_ist().isoformat(), chain={}, as_of=now_ist())\n    _text11 = _buf11.getvalue()\n    assert _n11 == 1, f"expected 1 trade block, got {_n11}"\n    for _frag11 in (\n        "Trade-1", "Strategy: BULL_PUT_SPREAD",\n        "Sold: 2 lot of PE with premium: 47.65 at strike: 23150",\n        "Bought: 2 lot of PE with premium: 28.60 at strike: 23050",\n        "Closed - CLOSE_TARGET", "Position Status: Close",\n        f"Rs {float(_row11[\'net_pnl_rupees\']):+,.2f} realised",\n    ):\n        assert _frag11 in _text11, f"trade block is missing {_frag11!r}"\n    assert "the book says" not in _text11, \\\n        "the block and the book must agree on a freshly closed trade"\n\n    market_engine.state.clear()\n    market_engine.state.update(_state11)\n    print("  [OK] Close settlement tests passed (v7)")\n\n    db.close()\n    print_section("EXECUTION ENGINE SELF-TEST COMPLETE", char="#")\n    print("  All tests passed")\n',
+        '    "ALTER TABLE positions ADD COLUMN profit_lock_activated INTEGER DEFAULT 0",\n    "ALTER TABLE positions ADD COLUMN profit_lock_stop_level REAL",\n    "ALTER TABLE positions ADD COLUMN exit_priority INTEGER",\n    "ALTER TABLE positions ADD COLUMN price_stop_level_call REAL",\n    "ALTER TABLE positions ADD COLUMN price_stop_level_put REAL",\n    "ALTER TABLE positions ADD COLUMN is_borderline_sell INTEGER DEFAULT 0",\n    # v8: the two positions columns the engines have been writing since v7\n    # (and, for the liquidation mark, before it) that no schema declared.\n    "ALTER TABLE positions ADD COLUMN entry_credit_realised REAL",\n    "ALTER TABLE positions ADD COLUMN last_liquidation_premium REAL",\n    "ALTER TABLE trade_entries ADD COLUMN vol_regime_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN price_regime_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN positioning_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN confidence_level_at_entry TEXT",\n    "ALTER TABLE trade_entries ADD COLUMN confidence_score_at_entry REAL",\n    "ALTER TABLE trade_entries ADD COLUMN entry_vrp_raw REAL",\n',
     ),
     (
         'main.py',
         [
-            '    ExpiryCalendar, now_ist, today_ist,\n    print_section, print_kv_table,\n    load_config, setup_logging,\n)\nfrom data_engine import MarketDataEngine\nfrom regime_engine import RegimeEngine, merge_regime_into_signals\n',
+            ')\nfrom data_engine import MarketDataEngine\nfrom regime_engine import RegimeEngine, merge_regime_into_signals\nfrom calibration_engine import CalibrationEngine\nfrom strategy_engine import StrategyEngine\nfrom execution_engine import ExecutionEngine\n\n\n# ─────────────────────────────────────────────────────────────────────────────\n# MAIN ENGINE\n# ─────────────────────────────────────────────────────────────────────────────\n\n',
         ],
-        '    ExpiryCalendar, now_ist, today_ist,\n    print_section, print_kv_table,\n    load_config, setup_logging,\n    # v7: per-trade console report + the fill-based entry credit\n    TradeConsoleReporter, realised_entry_credit,\n)\nfrom data_engine import MarketDataEngine\nfrom regime_engine import RegimeEngine, merge_regime_into_signals\n',
+        ')\nfrom data_engine import MarketDataEngine\nfrom regime_engine import RegimeEngine, merge_regime_into_signals\nfrom calibration_engine import CalibrationEngine\nfrom strategy_engine import StrategyEngine\nfrom execution_engine import ExecutionEngine\n# v8: the five Telegram lifecycle updates - engine started, a heartbeat every\n# TELEGRAM_HEARTBEAT_MIN minutes while it runs, a trade order placed, a trade\n# order closed, and the engine stopped with the reason. Its own module and its\n# own daemon sender thread, so the trading loop never waits on the network.\nfrom telegram_reporter import TelegramReporter, start_mode as telegram_start_mode\n\n\n# ─────────────────────────────────────────────────────────────────────────────\n# MAIN ENGINE\n# ─────────────────────────────────────────────────────────────────────────────\n\n',
     ),
     (
         'main.py',
         [
-            '    8. If entry possible: run strategy engine → execute entry\n    9. Update cycle log with P&L\n    10. Print cycle summary\n\n    Separate timers:\n    - Spot bar collection: every spot_bar_interval_sec (60s)\n',
+            '        # reads the persisted book, so it can only report what the engine\n        # actually did. Config: TRADE_REPORT_ENABLED / TRADE_REPORT_MODE\n        # (each_cycle | on_change | off) / TRADE_REPORT_MAX_PER_CYCLE.\n        self.trade_reporter = TradeConsoleReporter(\n            self.db, self.config, self.logger, source="TRADE ENGINE"\n        )\n\n        # ── Loop state ────────────────────────────────────────────────────\n        self.loop_count              = 0\n        self.running                 = True\n        self._last_cycle_time        = 0.0\n        self._last_spot_time         = 0.0\n',
         ],
-        "    8. If entry possible: run strategy engine → execute entry\n    9. Update cycle log with P&L\n    10. Print cycle summary\n    11. Print the per-trade console report (v7: every trade of the session,\n        performed or in progress, in the operator's fixed block format)\n\n    Separate timers:\n    - Spot bar collection: every spot_bar_interval_sec (60s)\n",
+        '        # reads the persisted book, so it can only report what the engine\n        # actually did. Config: TRADE_REPORT_ENABLED / TRADE_REPORT_MODE\n        # (each_cycle | on_change | off) / TRADE_REPORT_MAX_PER_CYCLE.\n        self.trade_reporter = TradeConsoleReporter(\n            self.db, self.config, self.logger, source="TRADE ENGINE"\n        )\n\n        # ── v8: Telegram lifecycle updates ───────────────────────────────\n        # Shares the console reporter, so Trade-<n> on a phone is the same\n        # trade as Trade-<n> on the screen, and the block is rendered by one\n        # piece of code from the persisted book. Disabled quietly when\n        # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not in env.txt.\n        self.telegram = TelegramReporter(\n            self.db, self.config, self.logger,\n            console=self.trade_reporter, source="TRADE ENGINE",\n        )\n        self._started_at    = now_ist()\n        self._start_mode    = telegram_start_mode()\n        # The last cycle\'s signals, so a heartbeat taken between cycles - or\n        # before the first one - can still name the current regime.\n        self._last_signals: dict = {}\n\n        # ── Loop state ────────────────────────────────────────────────────\n        self.loop_count              = 0\n        self.running                 = True\n        self._last_cycle_time        = 0.0\n        self._last_spot_time         = 0.0\n',
     ),
     (
         'main.py',
         [
-            '        self.execution_engine = ExecutionEngine(\n            self.config, self.db, self.market_engine, self.cal_engine,\n            self.client, self.logger\n        )\n\n        # ── Loop state ────────────────────────────────────────────────────\n',
+            '        }, title="STARTUP CONFIGURATION")\n\n        if not self.config.paper_trade_mode:\n            print("\\n  " + "!" * 70)\n            print("  !!! WARNING: LIVE TRADING MODE — REAL ORDERS WILL BE PLACED !!!")\n            print("  " + "!" * 70 + "\\n")\n        print()\n\n    def _verify_lot_size(self) -> None:\n        """Log lot size verification reminder."""\n        self.logger.info(\n            f"Lot size configured as {self.config.lot_size} units/lot. "\n',
         ],
-        '        self.execution_engine = ExecutionEngine(\n            self.config, self.db, self.market_engine, self.cal_engine,\n            self.client, self.logger\n        )\n\n        # ── v7: per-trade console report ─────────────────────────────────\n        # Prints the lifecycle block for every trade of the session, on every\n        # cycle: entry legs and fills, exit legs (or the current mark while\n        # the trade is still in progress), status, investment and profit. It\n        # reads the persisted book, so it can only report what the engine\n        # actually did. Config: TRADE_REPORT_ENABLED / TRADE_REPORT_MODE\n        # (each_cycle | on_change | off) / TRADE_REPORT_MAX_PER_CYCLE.\n        self.trade_reporter = TradeConsoleReporter(\n            self.db, self.config, self.logger, source="TRADE ENGINE"\n        )\n\n        # ── Loop state ────────────────────────────────────────────────────\n',
+        '        }, title="STARTUP CONFIGURATION")\n\n        if not self.config.paper_trade_mode:\n            print("\\n  " + "!" * 70)\n            print("  !!! WARNING: LIVE TRADING MODE — REAL ORDERS WILL BE PLACED !!!")\n            print("  " + "!" * 70 + "\\n")\n        # v8: say on the console whether the phone will ring, and why not.\n        print(f"  {self.telegram.describe()}")\n        print()\n\n    def _verify_lot_size(self) -> None:\n        """Log lot size verification reminder."""\n        self.logger.info(\n            f"Lot size configured as {self.config.lot_size} units/lot. "\n',
     ),
     (
         'main.py',
         [
-            '        state["last_stop_reason"] = ""\n        state["last_stop_signal_combo"] = ""\n        self.market_engine._save_session_state()\n        self.logger.info(f"Daily state reset for new day: {today_str}")\n\n    def _market_open(self) -> bool:\n        if ExpiryCalendar.is_holiday(today_ist()):\n',
+            '        self._watchdog_next_flatten = 0.0\n        self._watchdog_last_alert   = 0.0\n        self._watchdog_failures     = 0\n        self._last_cycle_ok_mono    = time_module.monotonic()\n        self._last_cycle_ok_at      = now_ist()\n        self.loop_count             = 0\n\n        self.logger.info(\n            f"Daily state reset for new day: {today_str} "\n            f"(halt/EOD/feed latches cleared, cycle counter restarted)"\n        )\n\n',
         ],
-        '        state["last_stop_reason"] = ""\n        state["last_stop_signal_combo"] = ""\n        self.market_engine._save_session_state()\n\n        # ── v7: clear the per-session latches on the day roll ─────────────\n        # The session counters above were reset; the flags on this instance\n        # were not, and every one of them is a "do this once per day" latch:\n        #   _halt_action_done   the daily-loss halt would set daily_halted on\n        #                       the new day but never cancel orders or\n        #                       flatten again, because the action is guarded\n        #                       by "once per session" - the engine would sit\n        #                       through a breach it is configured to act on\n        #   _soft_halt_alerted  the soft threshold would never page again\n        #   _eod_done           EOD tasks (calibration, daily summary, the\n        #                       final flatten) would never run again\n        #   _feed_stale*        yesterday\'s stale feed would still be blocking\n        #                       entries at today\'s open\n        # The main loop normally exits after 15:35, so this only matters for a\n        # process deliberately left running across sessions - which is exactly\n        # the process nobody is watching.\n        self._halt_action_done      = False\n        self._soft_halt_alerted     = False\n        self._eod_done              = False\n        self._feed_stale            = False\n        self._feed_stale_alerted    = False\n        self._watchdog_next_flatten = 0.0\n        self._watchdog_last_alert   = 0.0\n        self._watchdog_failures     = 0\n        self._last_cycle_ok_mono    = time_module.monotonic()\n        self._last_cycle_ok_at      = now_ist()\n        self.loop_count             = 0\n\n        self.logger.info(\n            f"Daily state reset for new day: {today_str} "\n            f"(halt/EOD/feed latches cleared, cycle counter restarted)"\n        )\n\n    def _market_open(self) -> bool:\n        if ExpiryCalendar.is_holiday(today_ist()):\n',
+        '        self._watchdog_next_flatten = 0.0\n        self._watchdog_last_alert   = 0.0\n        self._watchdog_failures     = 0\n        self._last_cycle_ok_mono    = time_module.monotonic()\n        self._last_cycle_ok_at      = now_ist()\n        self.loop_count             = 0\n\n        # ── v8: the Telegram trade latch is a per-session latch too ───────\n        # Without this, a process left running across sessions would treat\n        # today\'s positions as already announced if an id were ever reused,\n        # and would keep yesterday\'s trades in its "seen" set for good. The\n        # start/stop/heartbeat latches deliberately survive: they belong to\n        # the process, not to the session.\n        try:\n            self.telegram.reset_day(today_str)\n        except Exception as e:\n            self.logger.debug(f"telegram day reset error: {e}")\n\n        self.logger.info(\n            f"Daily state reset for new day: {today_str} "\n            f"(halt/EOD/feed latches cleared, cycle counter restarted)"\n        )\n\n',
     ),
     (
         'main.py',
         [
-            '                current_prem = pos.get("last_known_premium")\n            if current_prem is None:\n                continue\n            entry_credit = float(pos.get("entry_credit") or 0)\n            lots         = int(pos.get("final_lots", 1) or 1)\n            gross = (entry_credit - float(current_prem)) * C02 * lots\n\n',
+            '        # cycle summary so the bottom of the screen always holds the newest\n        # state of the book.\n        self._print_trade_report()\n\n        self.loop_count += 1\n\n    def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:\n        """Print concise cycle summary to console."""\n        open_positions = self.execution_engine._get_open_positions()\n        print_section("CYCLE SUMMARY")\n        print_kv_table({\n            "Cycle #":            self.loop_count,\n',
         ],
-        '                current_prem = pos.get("last_known_premium")\n            if current_prem is None:\n                continue\n            # v7: the same basis execute_close() now settles on.\n            # positions.entry_credit is the PLANNED net credit - gross credit\n            # minus an estimated slippage and the entry charges expressed in\n            # points - and the entry charges are subtracted again in rupees\n            # two lines below. The unrealised number that gates the daily\n            # loss halt therefore carried a double charge plus a modelled\n            # slippage the fills may never have produced (Rs 61 on the\n            # 2026-09-11 book), and it jumped by exactly that amount at the\n            # moment the position closed and was settled on its own prices.\n            # A risk limit must not move when a position is closed.\n            try:\n                _legs = self.execution_engine._get_position_legs(\n                    pos["position_id"]\n                )\n            except Exception:\n                _legs = []\n            entry_credit, _basis = realised_entry_credit(pos, _legs)\n            lots         = int(pos.get("final_lots", 1) or 1)\n            gross = (entry_credit - float(current_prem)) * C02 * lots\n\n',
+        '        # cycle summary so the bottom of the screen always holds the newest\n        # state of the book.\n        self._print_trade_report()\n\n        self.loop_count += 1\n\n        # ── Step 12: Telegram trade updates (v8) ──────────────────────────\n        # After the counter, so the message reports the cycle it belongs to.\n        self._telegram_after_cycle(signals, total_pnl)\n\n    def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:\n        """Print concise cycle summary to console."""\n        open_positions = self.execution_engine._get_open_positions()\n        print_section("CYCLE SUMMARY")\n        print_kv_table({\n            "Cycle #":            self.loop_count,\n',
     ),
     (
         'main.py',
         [
-            '                f"vol regime defaulting to NEUTRAL"\n            )\n        self._print_cycle_footer(signals, total_pnl)\n        self.loop_count += 1\n\n    def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:\n',
+            '                chain=self.market_engine.last_chain,\n                as_of=now_ist(),\n                title=title,\n            )\n        except Exception as e:\n            self.logger.debug(f"trade report error: {e}")\n\n    # ─────────────────────────────────────────────────────────────────────\n    # DAILY SUMMARY\n    # ─────────────────────────────────────────────────────────────────────\n\n    def generate_daily_summary(self) -> dict:\n',
         ],
-        '                f"vol regime defaulting to NEUTRAL"\n            )\n        self._print_cycle_footer(signals, total_pnl)\n\n        # ── Step 11: Per-trade console report (v7) ────────────────────────\n        # Every trade of the session - the ones already performed and the one\n        # in progress - in the operator\'s fixed format. Printed after the\n        # cycle summary so the bottom of the screen always holds the newest\n        # state of the book.\n        self._print_trade_report()\n\n        self.loop_count += 1\n\n    def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:\n',
+        '                chain=self.market_engine.last_chain,\n                as_of=now_ist(),\n                title=title,\n            )\n        except Exception as e:\n            self.logger.debug(f"trade report error: {e}")\n\n    # ─────────────────────────────────────────────────────────────────────\n    # v8: TELEGRAM LIFECYCLE UPDATES\n    # ─────────────────────────────────────────────────────────────────────\n\n    def _telegram_snapshot(self, signals: Optional[dict] = None,\n                           total_pnl: Optional[float] = None) -> dict:\n        """What an update may say, taken from the engine\'s own state.\n\n        Anything not supplied here is read back out of the book by the\n        reporter, so a message composed before the first cycle - or after the\n        database has been reopened by a tool - still says something true.\n        Building it costs queries, which is why every caller either needs it\n        (a start, a stop, an event) or hands the reporter a callable that is\n        only invoked when an update is actually due.\n        """\n        try:\n            sig = signals if signals is not None else self._last_signals\n            return self.telegram.session_snapshot(\n                state=self.market_engine.state,\n                signals=sig,\n                cycles=self.loop_count,\n                started_at=self._started_at,\n                start_mode=self._start_mode,\n                unrealized_pnl=self.compute_unrealized_pnl(),\n                total_pnl=(\n                    total_pnl if total_pnl is not None\n                    else self.compute_total_daily_pnl()\n                ),\n                chain=self.market_engine.last_chain,\n            )\n        except Exception as e:\n            self.logger.debug(f"telegram snapshot error: {e}")\n            return {}\n\n    def _telegram_after_cycle(self, signals: dict, total_pnl: float) -> None:\n        """Requirements 3 and 4: one message per trade placed, one per close.\n\n        The reporter reads the book and works out what changed, which is why\n        this is safe to call unconditionally at the end of a cycle: a trade\n        closed by the hard-exit sweep, by a halt flatten or by the watchdog is\n        in the same table as one closed by the normal exit ladder, and gets\n        reported exactly once either way.\n        """\n        try:\n            self._last_signals = dict(signals or {})\n            self.telegram.sync_trades(\n                lambda: self._telegram_snapshot(signals, total_pnl)\n            )\n        except Exception as e:\n            self.logger.debug(f"telegram trade update error: {e}")\n\n    def _telegram_heartbeat(self) -> None:\n        """Requirement 2: one message every TELEGRAM_HEARTBEAT_MIN minutes.\n\n        Called at the top of every loop iteration, including the holiday and\n        pre-market branches: the operator asked to hear from a running engine,\n        not only from a trading one. When it is not due this is a single\n        monotonic comparison - no snapshot, no query, no message.\n        """\n        try:\n            self.telegram.heartbeat_if_due(lambda: self._telegram_snapshot())\n        except Exception as e:\n            self.logger.debug(f"telegram heartbeat error: {e}")\n\n    def _telegram_stop_reason(self) -> str:\n        """Why the engine stopped, for the message that says it stopped."""\n        if self._eod_done:\n            return "end of day"\n        signum = self._signal_received\n        if signum is not None:\n            try:\n                name = signal.Signals(signum).name\n            except Exception:\n                name = str(signum)\n            return f"signal {name}" + (" (Ctrl+C)" if name == "SIGINT" else "")\n        if not self.running:\n            return "engine stopped"\n        return "main loop ended"\n\n    def _telegram_notify_stopped(self, reason: Optional[str] = None) -> None:\n        """Requirement 5: one message when the engine stops, at most once.\n\n        Every exit path funnels through here - the end-of-day break, Ctrl+C,\n        SIGTERM and a fatal error - and the reporter latches, so a stop that\n        was already announced is not announced twice.\n        """\n        try:\n            self.telegram.notify_stopped(\n                self._telegram_snapshot(),\n                reason=reason or self._telegram_stop_reason(),\n            )\n        except Exception as e:\n            self.logger.debug(f"telegram stop update error: {e}")\n\n    def _telegram_notify_start_failed(self, reason: str) -> None:\n        """A start that never reached the loop still gets one message.\n\n        These paths return before the loop\'s finally block, so they close the\n        sender thread themselves: without that, the process would exit with\n        the message still queued and the operator would see nothing at all.\n        """\n        try:\n            self.telegram.notify_start_failed(reason, self._telegram_snapshot())\n        except Exception as e:\n            self.logger.debug(f"telegram start-failure update error: {e}")\n        try:\n            self.telegram.close(timeout=5.0)\n        except Exception:\n            pass\n\n    # ─────────────────────────────────────────────────────────────────────\n    # DAILY SUMMARY\n    # ─────────────────────────────────────────────────────────────────────\n\n    def generate_daily_summary(self) -> dict:\n',
     ),
     (
         'main.py',
         [
-            '            "Cal Tier":           signals.get("calibration_tier", 0),\n        })\n        print()\n\n    # ─────────────────────────────────────────────────────────────────────\n    # DAILY SUMMARY\n',
+            '        except Exception as e:\n            self.logger.error(f"Daily summary error (non-fatal): {e}", exc_info=True)\n\n        self._eod_done = True\n        self.logger.info("End-of-day tasks complete.")\n\n    # ─────────────────────────────────────────────────────────────────────\n    # GRACEFUL SHUTDOWN\n    # ─────────────────────────────────────────────────────────────────────\n\n    def perform_graceful_shutdown(self) -> None:\n        """\n',
         ],
-        '            "Cal Tier":           signals.get("calibration_tier", 0),\n        })\n        print()\n\n    def _print_trade_report(self, title: Optional[str] = None) -> None:\n        """v7: print the lifecycle block for every trade of the session.\n\n        One block per trade, in the operator\'s fixed format: entry legs and\n        their fills, exit legs (or the current liquidation mark while the\n        trade is still in progress), position status, cash committed and net\n        profit. The numbers are read out of the book, so the console and the\n        database cannot tell two different stories about the same trade.\n\n        Reporting is never allowed to become a trading failure: anything that\n        goes wrong is logged and the cycle carries on.\n        """\n        try:\n            self.trade_reporter.report_cycle(\n                trading_date=today_ist().isoformat(),\n                chain=self.market_engine.last_chain,\n                as_of=now_ist(),\n                title=title,\n            )\n        except Exception as e:\n            self.logger.debug(f"trade report error: {e}")\n\n    # ─────────────────────────────────────────────────────────────────────\n    # DAILY SUMMARY\n',
+        '        except Exception as e:\n            self.logger.error(f"Daily summary error (non-fatal): {e}", exc_info=True)\n\n        self._eod_done = True\n        self.logger.info("End-of-day tasks complete.")\n\n        # ── v8 requirement 5, end-of-day path: the day\'s record ───────────\n        # Sent last, after the daily summary is written, so the message can\n        # carry today\'s close (labelled "today" rather than "previous day")\n        # and every trade of the session in its final state. The loop\'s\n        # finally block will find this latch already set and stay quiet.\n        # The queue is flushed by the main loop\'s finally block, which always\n        # runs after this one: stopping the sender thread here would leave the\n        # rest of the process sending inline.\n        self._telegram_notify_stopped(reason="end of day")\n\n    # ─────────────────────────────────────────────────────────────────────\n    # GRACEFUL SHUTDOWN\n    # ─────────────────────────────────────────────────────────────────────\n\n    def perform_graceful_shutdown(self) -> None:\n        """\n',
     ),
     (
         'main.py',
         [
-            '            )\n            self.execution_engine.close_all_positions("EOD_CLOSE", force=True)\n\n        # ── Run EOD calibration tasks ─────────────────────────────────────\n        try:\n            self.cal_engine.run_eod_tasks(trading_date)\n',
+            '\n        # ── Token validation ──────────────────────────────────────────────\n        if not self.config.upstox_access_token:\n            self.logger.error(\n                "FATAL: UPSTOX_ACCESS_TOKEN not set in env.txt. Cannot start."\n            )\n            self.db.close()\n            return\n\n        if not self.client.validate_token():\n            self.logger.error(\n                "FATAL: Upstox access token is invalid/expired. "\n                "Regenerate and update env.txt."\n            )\n            self.db.close()\n            return\n\n        # ── Startup tasks ─────────────────────────────────────────────────\n        self._verify_lot_size()\n',
         ],
-        '            )\n            self.execution_engine.close_all_positions("EOD_CLOSE", force=True)\n\n        # ── v7: every trade of the day, one last time, in its final state ──\n        # The per-cycle report ends when the loop ends; this is the copy that\n        # stays on the screen next to the EOD summary, so the day can be read\n        # trade by trade without opening the database.\n        self._print_trade_report(title=f"END OF DAY TRADES - {trading_date}")\n\n        # ── Run EOD calibration tasks ─────────────────────────────────────\n        try:\n            self.cal_engine.run_eod_tasks(trading_date)\n',
+        '\n        # ── Token validation ──────────────────────────────────────────────\n        if not self.config.upstox_access_token:\n            self.logger.error(\n                "FATAL: UPSTOX_ACCESS_TOKEN not set in env.txt. Cannot start."\n            )\n            # v8: a start that never reached the loop still has to be heard\n            # about - this is the failure nobody sees, because there is no\n            # console attached to a supervised restart.\n            self._telegram_notify_start_failed(\n                "UPSTOX_ACCESS_TOKEN is not set in env.txt"\n            )\n            self.db.close()\n            return\n\n        if not self.client.validate_token():\n            self.logger.error(\n                "FATAL: Upstox access token is invalid/expired. "\n                "Regenerate and update env.txt."\n            )\n            self._telegram_notify_start_failed(\n                "the Upstox access token is invalid or expired"\n            )\n            self.db.close()\n            return\n\n        # ── Startup tasks ─────────────────────────────────────────────────\n        self._verify_lot_size()\n',
     ),
     (
         'main.py',
         [
-            '                self._feed_stale = False\n            return\n\n        idle     = time_module.monotonic() - self._last_cycle_ok_mono\n        degrade  = self._watchdog_sec("feed_degrade_sec", 45.0)\n        force    = self._watchdog_sec("feed_force_exit_sec", 120.0)\n        live     = not self.config.paper_trade_mode\n',
+            '            )\n        elif now_t > dtime(15, 30):\n            self.logger.info(\n                "Post-market: Engine ready. Next session starts at 09:15."\n            )\n        self._start_watchdog()\n        self.logger.info("Press Ctrl+C to stop.")\n\n        # ── Main loop ─────────────────────────────────────────────────────\n        try:\n            while self.running:\n                loop_start   = now_ist()\n                current_time = loop_start.time()\n                now_mono     = time_module.monotonic()\n\n                # ── Holiday check ─────────────────────────────────────────\n                if ExpiryCalendar.is_holiday(today_ist()):\n                    next_day = ExpiryCalendar.get_next_trading_day(today_ist())\n                    self.logger.info(\n                        f"Non-trading day ({today_ist().strftime(\'%A %Y-%m-%d\')}). "\n',
         ],
-        '                self._feed_stale = False\n            return\n\n        # v7: the liveness clock starts at TODAY\'S session open, not at\n        # process start. A process left up since yesterday reports an idle of\n        # fourteen hours at 09:15:00, which trips feed_degrade_sec and then\n        # feed_force_exit_sec before the first cycle of the new session has had\n        # any chance to run - in live mode that is a forced flatten at the open\n        # caused by nothing but the calendar. _last_cycle_ok_at existed for\n        # exactly this and was never read; it is now maintained in run().\n        idle     = time_module.monotonic() - self._last_cycle_ok_mono\n        last_ok  = self._last_cycle_ok_at\n        if last_ok is None or last_ok.date() != now_dt.date():\n            session_open = now_dt.replace(\n                hour=9, minute=15, second=0, microsecond=0\n            )\n            idle = max(0.0, (now_dt - session_open).total_seconds())\n        degrade  = self._watchdog_sec("feed_degrade_sec", 45.0)\n        force    = self._watchdog_sec("feed_force_exit_sec", 120.0)\n        live     = not self.config.paper_trade_mode\n',
+        '            )\n        elif now_t > dtime(15, 30):\n            self.logger.info(\n                "Post-market: Engine ready. Next session starts at 09:15."\n            )\n        self._start_watchdog()\n\n        # ── v8 requirement 1: the engine has started ──────────────────────\n        # Sent here rather than at the top of run(): by now the token has\n        # been validated, the book reconciled and capital carried forward, so\n        # "started" is a true statement. Whether a human typed the command or\n        # a supervisor did is in the message.\n        try:\n            self.telegram.notify_started(self._telegram_snapshot())\n        except Exception as e:\n            self.logger.debug(f"telegram start update error: {e}")\n\n        self.logger.info("Press Ctrl+C to stop.")\n\n        # ── Main loop ─────────────────────────────────────────────────────\n        try:\n            while self.running:\n                loop_start   = now_ist()\n                current_time = loop_start.time()\n                now_mono     = time_module.monotonic()\n\n                # ── v8 requirement 2: the 15-minute heartbeat ─────────────\n                # Ahead of the holiday and pre-market branches on purpose, so\n                # the update keeps arriving while the engine is up and\n                # waiting. Not due -> one monotonic comparison and nothing\n                # else happens.\n                self._telegram_heartbeat()\n\n                # ── Holiday check ─────────────────────────────────────────\n                if ExpiryCalendar.is_holiday(today_ist()):\n                    next_day = ExpiryCalendar.get_next_trading_day(today_ist())\n                    self.logger.info(\n                        f"Non-trading day ({today_ist().strftime(\'%A %Y-%m-%d\')}). "\n',
     ),
     (
         'main.py',
         [
-            '                    try:\n                        self.run_one_cycle()\n                        self._last_cycle_ok_mono = time_module.monotonic()\n                    except Exception as e:\n                        self.logger.error(\n                            f"UNHANDLED ERROR in run_one_cycle: {e}"\n',
+            '            self.logger.error(traceback.format_exc())\n            self.perform_graceful_shutdown()\n            return\n\n        finally:\n            self._stop_watchdog()\n\n        self.db.close()\n\n\n# ─────────────────────────────────────────────────────────────────────────────\n# ENTRY POINT\n',
         ],
-        '                    try:\n                        self.run_one_cycle()\n                        self._last_cycle_ok_mono = time_module.monotonic()\n                        # v7: feeds the watchdog\'s day-aware liveness clock in\n                        # _watchdog_once(). The field was initialised in\n                        # __init__ and never updated, so a process that spanned\n                        # midnight measured its idle from the previous session.\n                        self._last_cycle_ok_at   = now_ist()\n                    except Exception as e:\n                        self.logger.error(\n                            f"UNHANDLED ERROR in run_one_cycle: {e}"\n',
+        '            self.logger.error(traceback.format_exc())\n            self.perform_graceful_shutdown()\n            return\n\n        finally:\n            self._stop_watchdog()\n            # ── v8 requirement 5: the engine has stopped ──────────────────\n            # Every exit path lands here - the end-of-day break, Ctrl+C,\n            # SIGTERM and a fatal error - and it runs after\n            # perform_graceful_shutdown(), so the message reports the book as\n            # it was actually left. notify_stopped() latches, so the\n            # end-of-day message sent from perform_end_of_day_tasks() and this\n            # one can never both go out.\n            self._telegram_notify_stopped()\n            try:\n                # Flush the sender thread before the process goes away: it is\n                # a daemon, so an unflushed queue would simply vanish.\n                self.telegram.close(timeout=8.0)\n            except Exception as e:\n                self.logger.debug(f"telegram shutdown error: {e}")\n\n        self.db.close()\n\n\n# ─────────────────────────────────────────────────────────────────────────────\n# ENTRY POINT\n',
     ),
     (
-        'backtest_engine.py',
+        'verify_all.py',
         [
-            '        config: Config,\n        fills: FillModel,\n        verbose: bool = False,\n    ):\n        self.store = store\n        self.config = config\n',
+            '    ("regime_engine.py",      [PYTHON, str(BASE / "regime_engine.py")]),\n    ("execution_engine.py",   [PYTHON, str(BASE / "execution_engine.py")]),\n    ("strategy_engine.py",    [PYTHON, str(BASE / "strategy_engine.py")]),\n    ("calibration_engine.py", [PYTHON, str(BASE / "calibration_engine.py")]),\n    ("backtest_engine.py",    [PYTHON, str(BASE / "backtest_engine.py"), "--test"]),\n    ("eod_report.py",         [PYTHON, str(BASE / "eod_report.py"), "--test"]),\n]\n\nenv = os.environ.copy()\nenv["PYTHONIOENCODING"] = "utf-8"\n\nprint("=" * 70)\n',
         ],
-        '        config: Config,\n        fills: FillModel,\n        verbose: bool = False,\n        trade_report: Optional[str] = None,\n    ):\n        self.store = store\n        self.config = config\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '        self.results = Results(float(config.starting_capital))\n        self._scratch: Optional[str] = None\n        self._sink = io.StringIO()\n\n    @contextlib.contextmanager\n    def _quiet(self):\n',
-        ],
-        '        self.results = Results(float(config.starting_capital))\n        self._scratch: Optional[str] = None\n        self._sink = io.StringIO()\n        # ── v7: per-trade console report ──────────────────────────────────\n        # trade_report overrides TRADE_REPORT_MODE from the config\n        # (each_cycle | on_change | off); None keeps the configured mode.\n        # The reporter itself is built in _build(), where the scratch book it\n        # reads exists.\n        self.trade_report_mode = trade_report\n        self.reporter = None\n\n    @contextlib.contextmanager\n    def _quiet(self):\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '        self._sink.truncate(0)\n        with contextlib.redirect_stdout(self._sink):\n            yield\n\n    # -- engine wiring ----------------------------------------------------\n    def _build(self):\n',
-        ],
-        '        self._sink.truncate(0)\n        with contextlib.redirect_stdout(self._sink):\n            yield\n\n    # -- v7: per-trade console report -------------------------------------\n    def _report_trades(self, day: "DaySlice") -> int:\n        """Print the lifecycle block for every trade of the replayed session.\n\n        Called once per replayed cycle - including the cycles that end in a\n        `continue`, so the console shows the book on every cycle and not only\n        on the cycles that reached the entry decision. It is called OUTSIDE\n        _quiet(): the engine\'s own per-cycle narration is muted during a\n        replay because it buries the report, but this IS the report.\n\n        Returns how many blocks were printed. It cannot raise into the replay:\n        a rendering problem must never cost a session\'s results.\n        """\n        if self.reporter is None:\n            return 0\n        try:\n            return self.reporter.report_cycle(\n                trading_date=day.trading_date,\n                chain=(self.me.last_chain or {}),\n                as_of=self.clock.now(),\n            )\n        except Exception as exc:\n            if self.verbose:\n                print(f"  trade report failed: {exc}")\n            return 0\n\n    # -- engine wiring ----------------------------------------------------\n    def _build(self):\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '        self.db, self.client, self.me, self.se, self.xe = db, client, me, se, xe\n        self.regime = rg\n        self.merge_regime = getattr(regime_engine, "merge_regime_into_signals", None)\n\n    def _teardown(self):\n        try:\n',
-        ],
-        '        self.db, self.client, self.me, self.se, self.xe = db, client, me, se, xe\n        self.regime = rg\n        self.merge_regime = getattr(regime_engine, "merge_regime_into_signals", None)\n\n        # v7: the same per-trade console block the live engine prints, driven\n        # off the scratch book this runner writes. It reads positions /\n        # position_legs, which is why _open() and _close() now persist the\n        # exit the way the live execute_close() does: without it a closed\n        # replay trade had no exit time, no exit price and no P&L anywhere in\n        # the database, and the block could only have been a reconstruction.\n        self.reporter = core.TradeConsoleReporter(\n            db, self.config, logger, source="BACKTEST"\n        )\n        self.reporter.set_mode(self.trade_report_mode)\n\n    def _teardown(self):\n        try:\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '            "final_lots": lots,\n            "max_loss_per_lot": params.get("max_loss_per_lot"),\n            "total_max_risk": params.get("total_max_risk"),\n            "status": "OPEN",\n            "last_known_premium": credit,\n            "profit_lock_activated": 0,\n',
-        ],
-        '            "final_lots": lots,\n            "max_loss_per_lot": params.get("max_loss_per_lot"),\n            "total_max_risk": params.get("total_max_risk"),\n            # v7: the live execute_entry() persists this and the console\n            # report needs it to say what a credit structure commits; without\n            # it the replay book could only fall back to total_max_risk.\n            "estimated_margin": params.get("estimated_margin"),\n            "status": "OPEN",\n            "last_known_premium": credit,\n            "profit_lock_activated": 0,\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '            px = self.fills.price(q, close_action, urgent=urgent)\n            if px is None or px <= 0:\n                px = f["exec_price"]\n            exit_legs.append({\n                "action": close_action,\n                "option_type": f["option_type"],\n                "exec_price": px,\n            })\n            debit += px if close_action == "BUY" else -px\n\n',
-        ],
-        '            px = self.fills.price(q, close_action, urgent=urgent)\n            if px is None or px <= 0:\n                px = f["exec_price"]\n            _bid = float(q.get("bid") or 0)\n            _ask = float(q.get("ask") or 0)\n            exit_legs.append({\n                "action": close_action,\n                "option_type": f["option_type"],\n                "strike": f["strike"],\n                "exec_price": px,\n                # recorded for the same reason the live book records\n                # quoted_mid_at_exit: slippage against the touch is only\n                # measurable if the touch at exit was written down.\n                "quoted_mid": ((_bid + _ask) / 2.0)\n                              if (_bid > 0 and _ask > 0) else px,\n            })\n            debit += px if close_action == "BUY" else -px\n\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '        pnl = gross_pts * self.config.lot_size * lots - costs\n\n        now = self.clock.now()\n        self.db.update("positions", {"status": "CLOSED",\n                                     "updated_at": now.isoformat()},\n                       {"position_id": live["position_id"]})\n        self.db.execute(\n            "UPDATE position_legs SET leg_status=\'CLOSED\' WHERE position_id=?",\n            (live["position_id"],),\n        )\n\n        strikes = "/".join(\n            f"{f[\'action\'][0]}{f[\'option_type\'][0].upper()}{f[\'strike\']:.0f}"\n',
-        ],
-        '        pnl = gross_pts * self.config.lot_size * lots - costs\n\n        now = self.clock.now()\n        # v7: write the exit into the book the way the live execute_close()\n        # does. The replay used to flip two status flags and discard the rest,\n        # so a closed trade in the scratch database had no exit time, no exit\n        # reason, no P&L and no exit price on any leg - nothing that reads the\n        # book (the per-trade console report, an audit of a replay, any future\n        # reporter pointed at a saved run) could tell how the trade ended or\n        # what it made. Results/Trade still carries exactly the same numbers,\n        # so no replayed P&L moves: this is bookkeeping parity, not a change\n        # to the simulation.\n        _gross_rs = gross_pts * self.config.lot_size * lots\n        self.db.update(\n            "positions",\n            {\n                "status":            "CLOSED",\n                "exit_time":         now.isoformat(),\n                "exit_reason":       reason,\n                "exit_priority":     priority,\n                "exit_premium":      round(debit, 4),\n                "gross_pnl_rupees":  round(_gross_rs, 2),\n                "exit_costs_rupees": exit_costs,\n                "net_pnl_rupees":    round(pnl, 2),\n                "last_known_premium": round(debit, 4),\n                "updated_at":        now.isoformat(),\n            },\n            {"position_id": live["position_id"]},\n        )\n        for f, xl in zip(live["filled"], exit_legs):\n            self.db.execute(\n                "UPDATE position_legs SET leg_status=\'CLOSED\', exit_price=?, "\n                "quoted_mid_at_exit=? WHERE position_id=? AND strike=? AND "\n                "option_type=?",\n                (xl["exec_price"], xl["quoted_mid"], live["position_id"],\n                 f["strike"], f["option_type"]),\n            )\n\n        strikes = "/".join(\n            f"{f[\'action\'][0]}{f[\'option_type\'][0].upper()}{f[\'strike\']:.0f}"\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '            except Exception as exc:\n                if self.verbose:\n                    print(f"  {trading_date} {dt:%H:%M}: run_cycle failed: {exc}")\n                continue\n            # reset_if_new_day() rebinds MarketDataEngine.state to a fresh\n            # dict on day rollover (including the first cycle, when the\n',
-        ],
-        '            except Exception as exc:\n                if self.verbose:\n                    print(f"  {trading_date} {dt:%H:%M}: run_cycle failed: {exc}")\n                self._report_trades(day)   # v7: a cycle is a cycle\n                continue\n            # reset_if_new_day() rebinds MarketDataEngine.state to a fresh\n            # dict on day rollover (including the first cycle, when the\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '                    if self.verbose:\n                        print(f"  {trading_date} {dt:%H:%M} EXIT  "\n                              f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")\n                    continue\n\n            # ── daily loss halt ──────────────────────────────────────────\n',
-        ],
-        '                    if self.verbose:\n                        print(f"  {trading_date} {dt:%H:%M} EXIT  "\n                              f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")\n                    # v7: the block for the trade that just closed is printed\n                    # on the cycle that closed it, in its final state.\n                    self._report_trades(day)\n                    continue\n\n            # ── daily loss halt ──────────────────────────────────────────\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '                              f"({day_pnl:,.0f}) — no further entries")\n            if state.get("daily_halted") and live is None:\n                self.results.add_rejection("daily_loss_halt")\n                continue\n\n            # ── otherwise consider a new entry ────────────────────────────\n',
-        ],
-        '                              f"({day_pnl:,.0f}) — no further entries")\n            if state.get("daily_halted") and live is None:\n                self.results.add_rejection("daily_loss_halt")\n                self._report_trades(day)   # v7\n                continue\n\n            # ── otherwise consider a new entry ────────────────────────────\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '                except Exception as exc:\n                    if self.verbose:\n                        print(f"  decide() failed: {exc}")\n                    continue\n\n                if decision.get("action") == "ENTER":\n',
-        ],
-        '                except Exception as exc:\n                    if self.verbose:\n                        print(f"  decide() failed: {exc}")\n                    self._report_trades(day)   # v7\n                    continue\n\n                if decision.get("action") == "ENTER":\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '                else:\n                    self.results.add_rejection(decision.get("reason", "unknown"))\n\n        # ── forced flat at the last snapshot of the session ──────────────\n        if live is not None:\n            self.clock.set(day.cycle_dt(day.cycles[-1]))\n',
-        ],
-        '                else:\n                    self.results.add_rejection(decision.get("reason", "unknown"))\n\n            # ── v7: end of the cycle ───────────────────────────────────────\n            # The book as it now stands: every trade of this session, the ones\n            # already performed and the one in progress, on every cycle.\n            self._report_trades(day)\n\n        # ── forced flat at the last snapshot of the session ──────────────\n        if live is not None:\n            self.clock.set(day.cycle_dt(day.cycles[-1]))\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '                signals = {"spot": live["entry_spot"]}\n            t = self._close(live, signals, "END_OF_DATA_FORCED_FLAT", 7, day)\n            self.results.add_trade(t)\n\n    # -- driver -----------------------------------------------------------\n    def run(self, dates: List[str]) -> Results:\n',
-        ],
-        '                signals = {"spot": live["entry_spot"]}\n            t = self._close(live, signals, "END_OF_DATA_FORCED_FLAT", 7, day)\n            self.results.add_trade(t)\n            # v7: the session\'s last trade gets its final block too - the loop\n            # above ended before this close happened.\n            self._report_trades(day)\n\n    # -- driver -----------------------------------------------------------\n    def run(self, dates: List[str]) -> Results:\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '    identity all get executed at least once per self-test run.\n    """\n    day = store.load_day(dates[0])\n    runner = BacktestRunner(store, cfg, FillModel(0.25, 0.5), verbose=False)\n    runner._build()\n    try:\n        entry_ct = day.cycles[len(day.cycles) // 4]\n',
-        ],
-        '    identity all get executed at least once per self-test run.\n    """\n    day = store.load_day(dates[0])\n    # trade_report is forced on so this coverage does not depend on what\n    # TRADE_REPORT_MODE / TRADE_REPORT_ENABLED say in env.txt.\n    runner = BacktestRunner(store, cfg, FillModel(0.25, 0.5), verbose=False,\n                            trade_report="each_cycle")\n    runner._build()\n    try:\n        entry_ct = day.cycles[len(day.cycles) // 4]\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '            signals = runner.me.run_cycle()\n            runner.xe.monitor_position(dict(row), signals)\n\n        trade = runner._close(live, signals, "HARNESS_FORCED_EXIT", 7, day)\n\n        row = runner.db.query_one(\n',
-        ],
-        '            signals = runner.me.run_cycle()\n            runner.xe.monitor_position(dict(row), signals)\n\n        # ── v7: the per-trade console block, while the trade is open ──────\n        # The report is part of what this harness promises an operator, so the\n        # self-test renders it and asserts on its shape rather than trusting\n        # that it still works. This is the in-progress state: no exit fills\n        # yet, so the legs are marked at what closing them now would cost.\n        import contextlib as _ctxlib\n        import io as _io\n\n        def _render_blocks() -> Tuple[int, str]:\n            _buf = _io.StringIO()\n            with _ctxlib.redirect_stdout(_buf):\n                _n = runner._report_trades(day)\n            return _n, _buf.getvalue()\n\n        _n_open, _open_block = _render_blocks()\n        assert _n_open == 1, f"open trade rendered {_n_open} block(s), expected 1"\n        for _frag in ("Trade-1", "Strategy: HARNESS_FORCED_CONDOR",\n                      "Trade Start Data: time:", "Trade End Data: time:",\n                      "Position Status: Open", "Total Investment: Rs",\n                      "Total Profit: Rs"):\n            assert _frag in _open_block, f"open block missing {_frag!r}"\n        assert "\\nOpen\\n" in _open_block, "open block is missing the \'Open\' line"\n        assert "unrealised" in _open_block, \\\n            "an open trade must be marked, not reported as realised"\n        assert _open_block.count("=" * 84) == 2, "block must be ruled top and bottom"\n        assert _open_block.count("-" * 76) == 3, "block must have three sub-rules"\n        assert _open_block.count(" lot of ") == 8, \\\n            "4 legs must be printed twice: once at entry, once at the exit"\n\n        trade = runner._close(live, signals, "HARNESS_FORCED_EXIT", 7, day)\n\n        row = runner.db.query_one(\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '            "WHERE position_id=? AND leg_status!=\'CLOSED\'",\n            (live["position_id"],))\n        assert open_legs["n"] == 0, "leg rows left open after close"\n\n        expect = round(\n            trade.gross_pts * cfg.lot_size * trade.lots - trade.costs_rs, 2)\n',
-        ],
-        '            "WHERE position_id=? AND leg_status!=\'CLOSED\'",\n            (live["position_id"],))\n        assert open_legs["n"] == 0, "leg rows left open after close"\n\n        # ── v7: the exit is persisted, not just flagged ───────────────────\n        # A closed replay trade used to leave exit_time, exit_reason,\n        # exit_premium, the P&L columns and every leg\'s exit_price empty, so\n        # nothing that reads the book could say how it ended.\n        exit_row = runner.db.query_one(\n            "SELECT exit_time, exit_reason, exit_priority, exit_premium, "\n            "gross_pnl_rupees, exit_costs_rupees, net_pnl_rupees "\n            "FROM positions WHERE position_id=?", (live["position_id"],))\n        assert exit_row["exit_time"], "exit_time not persisted"\n        assert exit_row["exit_reason"] == "HARNESS_FORCED_EXIT", \\\n            f"exit_reason not persisted: {exit_row[\'exit_reason\']}"\n        assert exit_row["exit_priority"] == 7, "exit_priority not persisted"\n        assert abs(float(exit_row["net_pnl_rupees"]) - trade.pnl_rs) < 0.01, \\\n            f"book net P&L {exit_row[\'net_pnl_rupees\']} != trade {trade.pnl_rs}"\n        assert abs(float(exit_row["gross_pnl_rupees"])\n                   - trade.gross_pts * cfg.lot_size * trade.lots) < 0.01, \\\n            "book gross P&L disagrees with the trade"\n        assert abs(float(exit_row["exit_costs_rupees"])\n                   - (trade.costs_rs - live["entry_costs"])) < 0.01, \\\n            "book exit costs disagree with the trade"\n        priced_legs = runner.db.query_one(\n            "SELECT COUNT(*) AS n FROM position_legs WHERE position_id=? "\n            "AND exit_price IS NOT NULL AND quoted_mid_at_exit IS NOT NULL",\n            (live["position_id"],))\n        assert priced_legs["n"] == 4, \\\n            f"exit fill persisted on {priced_legs[\'n\']}/4 legs"\n\n        # ── v7: and the console block now reports the closed trade ────────\n        _n_closed, _closed_block = _render_blocks()\n        assert _n_closed == 1, \\\n            f"closed trade rendered {_n_closed} block(s), expected 1"\n        for _frag in ("Closed - HARNESS_FORCED_EXIT", "Position Status: Close",\n                      "Total Profit: Rs"):\n            assert _frag in _closed_block, f"closed block missing {_frag!r}"\n        assert "unrealised" not in _closed_block, \\\n            "a closed trade must not be reported as unrealised"\n        assert f"Rs {trade.pnl_rs:+,.2f} realised" in _closed_block, (\n            f"the console block does not report the P&L the harness computed "\n            f"({trade.pnl_rs:+,.2f})")\n\n        expect = round(\n            trade.gross_pts * cfg.lot_size * trade.lots - trade.costs_rs, 2)\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '            "gross_pts": trade.gross_pts,\n            "pnl_rs": trade.pnl_rs,\n            "held_min": trade.held_min,\n        }\n    finally:\n        runner._teardown()\n',
-        ],
-        '            "gross_pts": trade.gross_pts,\n            "pnl_rs": trade.pnl_rs,\n            "held_min": trade.held_min,\n            "report_open": _open_block,\n            "report_closed": _closed_block,\n        }\n    finally:\n        runner._teardown()\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '    print(f"    closed after {fr[\'held_min\']} min, "\n          f"gross {fr[\'gross_pts\']:+.2f} pts, net Rs {fr[\'pnl_rs\']:+,.0f}  [OK]")\n    print(f"    positions/position_legs rows written and closed  [OK]")\n    print(f"    P&L identity reconciles to the paisa  [OK]")\n\n    import shutil\n    shutil.rmtree(tmp, ignore_errors=True)\n',
-        ],
-        '    print(f"    closed after {fr[\'held_min\']} min, "\n          f"gross {fr[\'gross_pts\']:+.2f} pts, net Rs {fr[\'pnl_rs\']:+,.0f}  [OK]")\n    print(f"    positions/position_legs rows written and closed  [OK]")\n    print(f"    exit time, reason, P&L and every leg\'s exit price persisted  [OK]")\n    print(f"    P&L identity reconciles to the paisa  [OK]")\n    print(f"    console block rendered open and closed, and the closed block")\n    print(f"    reports the P&L the harness computed  [OK]")\n    print()\n    print("    the per-trade console block, as it appears every cycle:")\n    for _line in fr["report_closed"].rstrip().splitlines():\n        print(f"      {_line}" if _line.strip() else "")\n\n    import shutil\n    shutil.rmtree(tmp, ignore_errors=True)\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '    ap.add_argument("--audit", action="store_true", help="report data coverage only")\n    ap.add_argument("--test", action="store_true", help="run the harness self-test")\n    ap.add_argument("--verbose", action="store_true")\n    args = ap.parse_args()\n\n    if args.test:\n',
-        ],
-        '    ap.add_argument("--audit", action="store_true", help="report data coverage only")\n    ap.add_argument("--test", action="store_true", help="run the harness self-test")\n    ap.add_argument("--verbose", action="store_true")\n    ap.add_argument(\n        "--trade-report", dest="trade_report", default=None,\n        choices=("each_cycle", "on_change", "off"),\n        help="v7 per-trade console block. each_cycle (the default, and the "\n             "loudest) prints every trade of the session on every cycle; "\n             "on_change prints a trade only when it opens, closes, or its "\n             "unrealised P&L moves by TRADE_REPORT_MARK_EPS; off suppresses "\n             "it. Overrides TRADE_REPORT_MODE from the config.",\n    )\n    args = ap.parse_args()\n\n    if args.test:\n',
-    ),
-    (
-        'backtest_engine.py',
-        [
-            '    print(f"REPLAYING {len(dates)} SESSION(S): {dates[0]} .. {dates[-1]}")\n    print(hr("═"))\n\n    runner = BacktestRunner(\n        store, config, FillModel(args.fill_edge, args.stress_exit), args.verbose\n    )\n    res = runner.run(dates)\n    print_report(res, config, args)\n',
-        ],
-        '    print(f"REPLAYING {len(dates)} SESSION(S): {dates[0]} .. {dates[-1]}")\n    print(hr("═"))\n\n    # v7: say what the console is about to do, because each_cycle mode prints\n    # a block per trade per cycle and the final summary ends up a long way\n    # above the bottom of the scrollback.\n    _tr_mode = str(\n        args.trade_report\n        or getattr(config, "trade_report_mode", "each_cycle")\n        or "each_cycle"\n    ).lower()\n    if getattr(config, "trade_report_enabled", True) and _tr_mode != "off":\n        print(f"  per-trade console report : {_tr_mode}"\n              + ("  (--trade-report=on_change for a quiet run)"\n                 if _tr_mode == "each_cycle" else ""))\n        print()\n\n    runner = BacktestRunner(\n        store, config, FillModel(args.fill_edge, args.stress_exit), args.verbose,\n        trade_report=args.trade_report,\n    )\n    res = runner.run(dates)\n    print_report(res, config, args)\n',
-    ),
-    (
-        'eod_report.py',
-        [
-            'if not LOG_DIR.is_absolute():\n    LOG_DIR = BASE_DIR / LOG_DIR\n\nLOT_SIZE              = int(_ENV.get("NIFTY_LOT_SIZE", "75") or 75)\nSTARTING_CAPITAL      = float(_ENV.get("STARTING_CAPITAL", "1000000") or 1_000_000)\nMAX_DAILY_LOSS_PCT    = float(_ENV.get("MAX_DAILY_LOSS_PCT", "0.02") or 0.02)\nBROKERAGE_PER_ORDER   = float(_ENV.get("BROKERAGE_PER_ORDER", "20.0") or 20.0)\nEXCHANGE_TXN_RATE     = float(_ENV.get("EXCHANGE_TXN_RATE", "0.0003552") or 0.0003552)\nSTT_OPTIONS_SELL      = float(_ENV.get("STT_OPTIONS_SELL", "0.001") or 0.001)\n\n\n# ─────────────────────────────────────────────────────────────────────────────\n',
-        ],
-        'if not LOG_DIR.is_absolute():\n    LOG_DIR = BASE_DIR / LOG_DIR\n\n# v7: these defaults must agree with the ones core.load_config() ships, or\n# this report describes a different engine from the one that traded. They did\n# not: LOT_SIZE defaulted to 75 (the pre-January-2026 NIFTY lot; the engine\n# has used 65 since the January 2026 series and core.py defaults to 65),\n# EXCHANGE_TXN_RATE to 0.0003552 against the engine\'s 0.0003553, STT to the\n# superseded 0.10% against the 0.15% that applies from 1 April 2026, and the\n# daily loss limit to 2% against the engine\'s 4%. env.txt holds only the\n# Upstox token by design, so in practice these defaults were the values in\n# force - which made cost_per_lot_rupees wrong by 15% before the metric\n# itself was even computed correctly.\nLOT_SIZE              = int(_ENV.get("NIFTY_LOT_SIZE", "65") or 65)\nSTARTING_CAPITAL      = float(_ENV.get("STARTING_CAPITAL", "1000000") or 1_000_000)\nMAX_DAILY_LOSS_PCT    = float(_ENV.get("MAX_DAILY_LOSS_PCT", "0.04") or 0.04)\nBROKERAGE_PER_ORDER   = float(_ENV.get("BROKERAGE_PER_ORDER", "20.0") or 20.0)\nEXCHANGE_TXN_RATE     = float(_ENV.get("EXCHANGE_TXN_RATE", "0.0003553") or 0.0003553)\nSTT_OPTIONS_SELL      = float(_ENV.get("STT_OPTIONS_SELL", "0.0015") or 0.0015)\n\n\n# ─────────────────────────────────────────────────────────────────────────────\n',
-    ),
-    (
-        'eod_report.py',
-        [
-            '\n    total_costs = sum(float(e.get("total_costs_rupees") or 0) for e in trade_exits)\n\n    return {\n        "total_trades":                n,\n        "total_actual_costs_rupees":   round(total_costs, 2),\n        "avg_actual_costs_rupees":     round(total_costs / n, 2) if n else 0,\n        "cost_per_lot_rupees":         round(total_costs / (n * LOT_SIZE), 2) if n else 0,\n        "avg_actual_slippage_pts":     round(statistics.mean(actual_slips), 3)\n                                       if actual_slips else None,\n        "max_actual_slippage_pts":     round(max(actual_slips), 3)\n',
-        ],
-        '\n    total_costs = sum(float(e.get("total_costs_rupees") or 0) for e in trade_exits)\n\n    # v7: "per lot" has to mean per LOT TRADED. The old expression divided by\n    # (number of trades x lot size), which is neither: it halved on every\n    # 2-lot trade, so the metric moved with position size instead of with\n    # cost, and it was computed on a 75-unit lot the engine has not traded\n    # since January 2026. Lots are summed over the entries that actually have\n    # an exit, because total_costs above is summed over the exits.\n    exited_ids = {\n        str(e.get("trade_id") or e.get("position_id") or "") for e in trade_exits\n    }\n    total_lots = 0\n    for entry in trade_entries:\n        key = str(entry.get("trade_id") or entry.get("position_id") or "")\n        if exited_ids and key not in exited_ids:\n            continue\n        try:\n            total_lots += int(float(entry.get("final_lots") or 0))\n        except (TypeError, ValueError):\n            pass\n    if total_lots <= 0:\n        total_lots = n\n    total_units = total_lots * LOT_SIZE\n\n    return {\n        "total_trades":                n,\n        "total_lots_traded":           total_lots,\n        "total_actual_costs_rupees":   round(total_costs, 2),\n        "avg_actual_costs_rupees":     round(total_costs / n, 2) if n else 0,\n        "cost_per_lot_rupees":         round(total_costs / total_lots, 2)\n                                       if total_lots else 0,\n        "cost_per_unit_rupees":        round(total_costs / total_units, 2)\n                                       if total_units else 0,\n        "avg_actual_slippage_pts":     round(statistics.mean(actual_slips), 3)\n                                       if actual_slips else None,\n        "max_actual_slippage_pts":     round(max(actual_slips), 3)\n',
+        '    ("regime_engine.py",      [PYTHON, str(BASE / "regime_engine.py")]),\n    ("execution_engine.py",   [PYTHON, str(BASE / "execution_engine.py")]),\n    ("strategy_engine.py",    [PYTHON, str(BASE / "strategy_engine.py")]),\n    ("calibration_engine.py", [PYTHON, str(BASE / "calibration_engine.py")]),\n    ("backtest_engine.py",    [PYTHON, str(BASE / "backtest_engine.py"), "--test"]),\n    ("eod_report.py",         [PYTHON, str(BASE / "eod_report.py"), "--test"]),\n    ("telegram_reporter.py",  [PYTHON, str(BASE / "telegram_reporter.py"), "--test"]),\n]\n\nenv = os.environ.copy()\nenv["PYTHONIOENCODING"] = "utf-8"\n\nprint("=" * 70)\n',
     ),
 ]
 
-PLANS = {"v6": PLAN_V6, "final": []}
+# Created verbatim; the MD5 above is the gate on this string.
+NEW_SOURCE = {
+    'telegram_reporter.py': r'''#!/usr/bin/env python3
+"""v8: Telegram updates for the NIFTY intraday options engine.
+
+Five things are worth a phone notification, and this module sends exactly
+those five:
+
+  1. the engine STARTED - manually from a terminal or automatically under a
+     supervisor, and the message says which,
+  2. a HEARTBEAT every TELEGRAM_HEARTBEAT_MIN minutes (default 15) for as
+     long as the process runs, market open or not,
+  3. a trade order was PLACED,
+  4. a trade order was CLOSED,
+  5. the engine STOPPED, and why: end of day, Ctrl+C, SIGTERM, a fatal
+     error, or a start that never got off the ground.
+
+Rules this module is built to obey, in the order they bite:
+
+  * It cannot hurt trading. Every public method is fenced: nothing raises
+    into the caller, a dead network costs one warning in the log, and the
+    trading loop never waits on Telegram - it enqueues and moves on.
+  * Telegram allows roughly 20 messages a minute into one group chat. So
+    sends are spaced by TELEGRAM_MIN_GAP_SEC (default 3.5s), a 429 is
+    obeyed via its retry_after, and when the bounded queue overflows the
+    oldest HEARTBEAT is dropped first - a trade event is never thrown away
+    to make room for a status update.
+  * The numbers come from the persisted book and the engine's own state,
+    never from a parallel calculation. The trade block is the v7 console
+    block rendered by the same TradeConsoleReporter, so Telegram and the
+    console cannot tell two different stories about the same trade.
+  * HTML parse mode, escaped, chunked at Telegram's 4096-character limit on
+    block boundaries so a <pre> section is never cut in half.
+  * Disabled quietly when TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are absent:
+    one log line at startup, zero cost per cycle.
+
+Configuration (env.txt; the bot token and chat id are the v6 alert ones):
+
+    TELEGRAM_BOT_TOKEN            = "123456:ABC-..."
+    TELEGRAM_CHAT_ID              = "-1001234567890"
+    TELEGRAM_REPORT_CHAT_ID       = ""        # optional: reports elsewhere
+    TELEGRAM_UPDATES_ENABLED      = true
+    TELEGRAM_HEARTBEAT_MIN        = 15
+    TELEGRAM_MIN_GAP_SEC          = 3.5
+    TELEGRAM_TIMEOUT_SEC          = 8
+    TELEGRAM_MAX_QUEUE            = 60
+    TELEGRAM_PARSE_MODE           = HTML      # HTML | MARKDOWN | "" (plain)
+    TELEGRAM_TRADE_BLOCK_STYLE    = console   # console | compact
+
+Self-test (no network, deterministic transport and clock):
+
+    python3 telegram_reporter.py --test
+"""
+import collections
+import os
+import sys
+import threading
+import time
+from datetime import datetime, date, time as dtime
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+try:
+    import requests
+except Exception:                                   # pragma: no cover
+    requests = None                                 # type: ignore
+
+from core import (
+    Config, Database, TradeConsoleReporter,
+    load_config, setup_logging, print_section,
+    now_ist, today_ist, parse_ist_timestamp,
+    # v7's own formatters, imported rather than reimplemented so a Telegram
+    # message and the console block cannot drift apart in how they round,
+    # sign or label the same number.
+    TRADE_REPORT_RULE, TRADE_REPORT_SUB,
+    _tr_num, _tr_money, _tr_signed, _tr_price, _tr_strike,
+    _tr_side, _tr_closing_side, _tr_symbol, _tr_hhmm,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+
+# Telegram rejects anything longer than this per message.
+MAX_MESSAGE_CHARS = 4096
+# Room for the "(part 2/3)" marker and the tags around a <pre> section.
+_CHUNK_RESERVE = 48
+
+DEFAULT_HEARTBEAT_MIN = 15.0
+DEFAULT_MIN_GAP_SEC = 3.5
+DEFAULT_TIMEOUT_SEC = 8.0
+DEFAULT_MAX_QUEUE = 60
+# Width of the compact trade block. A phone in Telegram's monospace face
+# fits roughly 40-48 characters before it wraps a line of its own accord.
+_COMPACT_WIDTH = 48
+# Telegram answers a flooded bot with 429 + retry_after; obey it, but never
+# park the sender thread for longer than this.
+RETRY_AFTER_CAP_SEC = 60.0
+MAX_SEND_ATTEMPTS = 3
+
+KIND_START       = "START"
+KIND_STOP        = "STOP"
+KIND_HEARTBEAT   = "HEARTBEAT"
+KIND_TRADE_OPEN  = "TRADE_OPEN"
+KIND_TRADE_CLOSE = "TRADE_CLOSE"
+KIND_INFO        = "INFO"
+
+# Lower is more worth keeping when the queue is full. Heartbeats are the only
+# messages that repeat themselves by design, so they are the ones sacrificed.
+_PRIORITY = {
+    KIND_TRADE_OPEN:  0,
+    KIND_TRADE_CLOSE: 0,
+    KIND_START:       1,
+    KIND_STOP:        1,
+    KIND_INFO:        2,
+    KIND_HEARTBEAT:   3,
+}
+
+_TITLE = {
+    KIND_START:       "started",
+    KIND_STOP:        "stopped",
+    KIND_HEARTBEAT:   "update",
+    KIND_TRADE_OPEN:  "trade order placed",
+    KIND_TRADE_CLOSE: "trade order closed",
+    KIND_INFO:        "update",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMALL HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _esc(text: Any) -> str:
+    """HTML-escape dynamic text. Telegram returns 400 on a stray '<'."""
+    return (
+        str("" if text is None else text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _b(text: Any) -> str:
+    return f"<b>{_esc(text)}</b>"
+
+
+def _opt(value: Any, suffix: str = "") -> str:
+    """'12.40' or 'n/a' - never a bare None on an operator's phone."""
+    if value is None or value == "":
+        return "n/a"
+    return f"{value}{suffix}"
+
+
+def _num_opt(value: Any, nd: int = 2) -> str:
+    try:
+        if value is None or value == "":
+            return "n/a"
+        return f"{float(value):,.{nd}f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _pct_opt(value: Any, nd: int = 2, sign: bool = True) -> str:
+    try:
+        if value is None or value == "":
+            return "n/a"
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{v:+.{nd}f}%" if sign else f"{v:.{nd}f}%"
+
+
+def _hhmmss(value: Any) -> str:
+    """Anything time-shaped -> 'HH:MM:SS'."""
+    if value is None or value == "":
+        return "n/a"
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M:%S")
+    if isinstance(value, dtime):
+        return value.strftime("%H:%M:%S")
+    parsed = parse_ist_timestamp(value)
+    if parsed is not None:
+        return parsed.strftime("%H:%M:%S")
+    return str(value)
+
+
+def _uptime(seconds: Any) -> str:
+    try:
+        s = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        return "n/a"
+    hours, rem = divmod(s, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def start_mode() -> str:
+    """Manual (a human at a terminal) or auto (supervisor, cron, nohup).
+
+    stdin being a tty is the only honest signal available without reading
+    /proc, and it is the one that matters to the operator: it says whether
+    somebody typed `python main.py` or whether a service manager did.
+    """
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return "manual (interactive terminal)"
+    except Exception:
+        pass
+    return "auto (no terminal - supervised or backgrounded)"
+
+
+def _first(*values: Any) -> Any:
+    """First value that is present and not zero-ish-empty."""
+    for v in values:
+        if v is None or v == "":
+            continue
+        return v
+    return None
+
+
+def _regime_line(vol: Any, price: Any, positioning: Any, final: Any) -> str:
+    parts = []
+    if vol:
+        parts.append(f"vol {vol}")
+    if price:
+        parts.append(f"price {price}")
+    if positioning:
+        parts.append(f"positioning {positioning}")
+    if final:
+        parts.append(f"final {final}")
+    return " | ".join(parts) if parts else "n/a"
+
+
+# Telegram's parse_mode is case-sensitive; an env.txt entry need not be.
+_PARSE_MODES = {
+    "":           "",
+    "none":       "",
+    "plain":      "",
+    "text":       "",
+    "html":       "HTML",
+    "markdown":   "Markdown",
+    "markdownv2": "MarkdownV2",
+}
+
+
+def _canonical_parse_mode(value: Any) -> str:
+    """'html' -> 'HTML', 'plain' -> '', and an unknown word -> 'HTML'.
+
+    Falling back to HTML rather than to the unknown word matters: every
+    dynamic string this module sends is escaped for HTML, so a mode it does
+    not escape for would turn a premium like '23100.5_2' into a 400.
+    """
+    key = str(value if value is not None else "HTML").strip().lower()
+    return _PARSE_MODES.get(key, "HTML")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPORTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TelegramReporter:
+    """Sends the five lifecycle updates, and nothing that can break a cycle.
+
+    Construction is cheap and side-effect free apart from starting the sender
+    thread when a channel is configured. `close()` flushes and joins; the
+    thread is a daemon, so a hard kill cannot hang the process on it.
+    """
+
+    def __init__(
+        self,
+        db: Optional[Database],
+        config: Config,
+        logger=None,
+        console: Optional[TradeConsoleReporter] = None,
+        transport: Optional[Callable[[dict], Tuple[bool, Optional[float], str]]] = None,
+        clock: Optional[Callable[[], float]] = None,
+        sleep: Optional[Callable[[float], None]] = None,
+        worker: Optional[bool] = None,
+        source: str = "TRADE ENGINE",
+    ):
+        self.db     = db
+        self.config = config
+        self.logger = logger
+        self.source = str(source or "TRADE ENGINE")
+
+        # The v7 console reporter renders the trade block. Sharing the
+        # engine's instance keeps Trade-<n> numbering identical on the
+        # console and on the phone.
+        try:
+            self.console = console or (
+                TradeConsoleReporter(db, config, logger, source=self.source)
+                if db is not None else None
+            )
+        except Exception:
+            self.console = None
+
+        self.token   = str(getattr(config, "alert_telegram_bot_token", "") or "").strip()
+        self.chat_id = str(
+            _first(getattr(config, "telegram_report_chat_id", ""),
+                   getattr(config, "alert_telegram_chat_id", "")) or ""
+        ).strip()
+        self.webhook = str(getattr(config, "alert_webhook_url", "") or "").strip()
+
+        self.updates_enabled = bool(getattr(config, "telegram_updates_enabled", True))
+        heartbeat_min = self._bounded(
+            getattr(config, "telegram_heartbeat_min", DEFAULT_HEARTBEAT_MIN),
+            DEFAULT_HEARTBEAT_MIN, 0.0,
+        )
+        if heartbeat_min <= 0:
+            # 0 would mean a heartbeat on every call, which is not a heartbeat
+            # but a flood; load_config() clamps env.txt to >= 1 minute and a
+            # non-positive Config value falls back to the documented default.
+            heartbeat_min = DEFAULT_HEARTBEAT_MIN
+        self.heartbeat_sec = heartbeat_min * 60.0
+        self.min_gap = self._bounded(
+            getattr(config, "telegram_min_gap_sec", DEFAULT_MIN_GAP_SEC),
+            DEFAULT_MIN_GAP_SEC, 0.0,
+        )
+        self.timeout = self._bounded(
+            getattr(config, "telegram_timeout_sec", DEFAULT_TIMEOUT_SEC),
+            DEFAULT_TIMEOUT_SEC, 1.0,
+        )
+        self.max_queue = int(self._bounded(
+            getattr(config, "telegram_max_queue", DEFAULT_MAX_QUEUE),
+            DEFAULT_MAX_QUEUE, 4.0,
+        ))
+        self.parse_mode = _canonical_parse_mode(
+            getattr(config, "telegram_parse_mode", "HTML")
+        )
+        if self.parse_mode not in ("", "HTML"):
+            # This reporter escapes for HTML. Markdown and MarkdownV2 have
+            # their own, much larger escape sets, and getting one wrong is a
+            # 400 from Telegram and a lost update - so anything that is not
+            # HTML is sent as plain text instead of being half-escaped.
+            self._log(
+                "info",
+                f"Telegram parse_mode {self.parse_mode!r} is not supported "
+                f"here (this reporter escapes for HTML); sending plain text",
+            )
+            self.parse_mode = ""
+        self.block_style = str(
+            getattr(config, "telegram_trade_block_style", "console") or "console"
+        ).strip().lower()
+        if self.block_style not in ("console", "compact"):
+            self.block_style = "console"
+        self.include_open_blocks = bool(
+            getattr(config, "telegram_include_open_blocks", True)
+        )
+
+        # Injectable for the self-test: the transport is the only thing that
+        # touches the network, and the clock/sleep pair makes throttling and
+        # the heartbeat schedule testable without waiting for either.
+        self.transport = transport or self._http_transport
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+
+        self._items: collections.deque = collections.deque()
+        self._cond = threading.Condition(threading.Lock())
+        self._stop_evt = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._last_send_mono = 0.0
+        self._last_heartbeat_mono = 0.0
+        self._started_sent = False
+        self._stopped_sent = False
+        self._day: Optional[str] = None
+        self._seen: Dict[str, str] = {}
+        self.stats: Dict[str, int] = {
+            "queued": 0, "sent": 0, "failed": 0, "dropped": 0,
+            "retries": 0, "throttled": 0,
+        }
+        self.last_error: str = ""
+
+        self._worker_wanted = (
+            self.enabled if worker is None else bool(worker)
+        )
+        if self._worker_wanted:
+            self._start_worker()
+
+    # ── enablement ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _bounded(value: Any, default: float, floor: float) -> float:
+        """float(value) clamped to a floor, or the default if it is not a
+        number. Zero is a legal value wherever the floor allows it: a
+        min_gap of 0 means 'do not space the sends', which is what a test
+        and a low-volume private chat both want."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = float(default)
+        if v != v:                      # NaN
+            v = float(default)
+        return max(float(floor), v)
+
+    @property
+    def enabled(self) -> bool:
+        """A channel is configured and updates were not switched off."""
+        return bool(self.updates_enabled and self.token and self.chat_id)
+
+    @property
+    def masked_token(self) -> str:
+        if not self.token:
+            return "(unset)"
+        head = self.token.split(":", 1)[0]
+        return f"{head[:6]}:...{self.token[-3:]}" if len(self.token) > 12 else "***"
+
+    def describe(self) -> str:
+        """One log line at startup, so silence is never a mystery."""
+        if not self.updates_enabled:
+            return "Telegram updates DISABLED (TELEGRAM_UPDATES_ENABLED=false)"
+        if not (self.token and self.chat_id):
+            return (
+                "Telegram updates DISABLED (set TELEGRAM_BOT_TOKEN and "
+                "TELEGRAM_CHAT_ID in env.txt)"
+            )
+        return (
+            f"Telegram updates ON -> chat {self.chat_id}, bot "
+            f"{self.masked_token}, heartbeat every "
+            f"{self.heartbeat_sec / 60.0:.0f} min, block style "
+            f"{self.block_style}"
+        )
+
+    def _log(self, level: str, message: str) -> None:
+        try:
+            if self.logger is None:
+                return
+            getattr(self.logger, level, self.logger.info)(message)
+        except Exception:
+            pass
+
+    def _delivery_word(self, ok: bool) -> str:
+        """What a True from send() actually means, in log wording.
+
+        With the daemon thread running it means the message is on the queue
+        and the trading loop is free again - delivery happens later, and a
+        failure is logged then ("... update not delivered: <reason>"). Saying
+        "sent" at enqueue time would tell the operator a message arrived when
+        all that happened is that it left the caller's hands. Inline (no
+        worker - the self-test, --send-test) True really does mean delivered.
+        """
+        if not ok:
+            return "not delivered"
+        return "queued for delivery" if self._worker_wanted else "sent"
+
+    # ── transport ─────────────────────────────────────────────────────
+
+    def _http_transport(self, payload: dict) -> Tuple[bool, Optional[float], str]:
+        """POST one message. Returns (ok, retry_after_seconds, error)."""
+        if requests is None:
+            return False, None, "the requests library is not installed"
+        url = TELEGRAM_API.format(token=self.token, method="sendMessage")
+        try:
+            resp = requests.post(url, json=payload, timeout=self.timeout)
+        except Exception as exc:
+            return False, None, f"{exc.__class__.__name__}: {exc}"
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        if resp.status_code == 429:
+            retry_after = None
+            try:
+                retry_after = float(
+                    (body or {}).get("parameters", {}).get("retry_after") or 0
+                ) or None
+            except Exception:
+                retry_after = None
+            return False, retry_after, f"HTTP 429 rate limited by Telegram"
+        ok = bool(resp.ok and str((body or {}).get("ok")).lower() in ("true", "1"))
+        if not ok:
+            desc = (body or {}).get("description") or resp.text[:160]
+            return False, None, f"HTTP {resp.status_code}: {desc}"
+        return True, None, ""
+
+    # ── queue and sender thread ───────────────────────────────────────
+
+    def _start_worker(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_evt.clear()
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name="telegram-reporter",
+            daemon=True,
+        )
+        try:
+            self._thread.start()
+        except Exception as exc:
+            # No thread, no async delivery: fall back to inline sends rather
+            # than silently dropping every update.
+            self._thread = None
+            self._worker_wanted = False
+            self._log("warning", f"Telegram sender thread not started ({exc}); "
+                                 f"sending inline instead")
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._cond:
+                while not self._items and not self._stop_evt.is_set():
+                    self._cond.wait(timeout=0.25)
+                if not self._items:
+                    if self._stop_evt.is_set():
+                        return
+                    continue
+                kind, text = self._items.popleft()
+            try:
+                self._deliver(kind, text)
+            except Exception as exc:                  # never die on a message
+                self.last_error = f"{exc.__class__.__name__}: {exc}"
+                self._log("warning", f"Telegram delivery error: {self.last_error}")
+            if self._stop_evt.is_set():
+                with self._cond:
+                    if not self._items:
+                        return
+
+    def send(self, text: str, kind: str = KIND_INFO) -> bool:
+        """Queue (or, with no worker, deliver) one message. Never raises."""
+        if not self.enabled:
+            return False
+        if not text or not str(text).strip():
+            return False
+        kind = str(kind or KIND_INFO).upper()
+        try:
+            if self._worker_wanted and not self._stop_evt.is_set():
+                if self._thread is None or not self._thread.is_alive():
+                    # Self-heal: a sender thread that is not running would
+                    # otherwise turn every later update into a blocking send
+                    # on the trading loop.
+                    self._start_worker()
+                if self._thread is not None and self._thread.is_alive():
+                    self._enqueue(kind, str(text))
+                    return True
+            return self._deliver(kind, str(text))
+        except Exception as exc:
+            self.last_error = f"{exc.__class__.__name__}: {exc}"
+            self._log("warning", f"Telegram send failed: {self.last_error}")
+            return False
+
+    def _enqueue(self, kind: str, text: str) -> None:
+        with self._cond:
+            if len(self._items) >= self.max_queue:
+                victim = None
+                for idx, item in enumerate(self._items):
+                    if _PRIORITY.get(item[0], 2) >= _PRIORITY[KIND_HEARTBEAT]:
+                        victim = idx
+                        break
+                if victim is None:
+                    victim = 0
+                dropped = self._items[victim]
+                del self._items[victim]
+                self.stats["dropped"] += 1
+                self._log(
+                    "warning",
+                    f"Telegram queue full ({self.max_queue}); dropped a "
+                    f"{dropped[0]} update to make room for a {kind} update",
+                )
+            self._items.append((kind, text))
+            self.stats["queued"] += 1
+            self._cond.notify()
+
+    def pending(self) -> int:
+        with self._cond:
+            return len(self._items)
+
+    def close(self, timeout: float = 8.0) -> int:
+        """Flush and stop the sender thread. Idempotent; never raises."""
+        remaining = self.pending()
+        try:
+            if self._thread is not None and self._thread.is_alive():
+                self._stop_evt.set()
+                with self._cond:
+                    self._cond.notify_all()
+                self._thread.join(timeout=max(0.5, float(timeout)))
+                if self._thread.is_alive():
+                    self._log(
+                        "warning",
+                        f"Telegram sender thread did not finish within "
+                        f"{timeout:.0f}s; {self.pending()} update(s) may be "
+                        f"unsent",
+                    )
+        except Exception as exc:
+            self._log("warning", f"Telegram close error: {exc}")
+        finally:
+            self._thread = None
+        return remaining
+
+    def _deliver(self, kind: str, text: str) -> bool:
+        """Throttle, chunk and POST. Returns True if every part went out."""
+        if not self.enabled:
+            return False
+        # Space the sends: Telegram's per-chat limit is about 20/minute, and
+        # a burst of trade events must not cost the channel for the next
+        # minute. The wait happens on the sender thread, never on the loop.
+        if self.min_gap > 0:
+            wait = self.min_gap - (self.clock() - self._last_send_mono)
+            if wait > 0:
+                self.stats["throttled"] += 1
+                try:
+                    self.sleep(wait)
+                except Exception:
+                    pass
+        parts = self._pack(text)
+        delivered = True
+        for part in parts:
+            delivered = self._post(part, kind) and delivered
+        self._last_send_mono = self.clock()
+        return delivered
+
+    def _post(self, text: str, kind: str) -> bool:
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text[:MAX_MESSAGE_CHARS],
+            "disable_web_page_preview": True,
+        }
+        if self.parse_mode:
+            payload["parse_mode"] = self.parse_mode
+        attempt = 0
+        while attempt < MAX_SEND_ATTEMPTS:
+            attempt += 1
+            try:
+                ok, retry_after, err = self.transport(payload)
+            except Exception as exc:
+                ok, retry_after, err = False, None, f"{exc.__class__.__name__}: {exc}"
+            if ok:
+                self.stats["sent"] += 1
+                return True
+            self.last_error = err or "unknown transport failure"
+            if retry_after and retry_after > 0:
+                self.stats["retries"] += 1
+                pause = min(float(retry_after), RETRY_AFTER_CAP_SEC)
+                self._log(
+                    "warning",
+                    f"Telegram rate limit ({kind}); waiting {pause:.0f}s",
+                )
+                try:
+                    self.sleep(pause)
+                except Exception:
+                    pass
+                continue
+            if attempt < MAX_SEND_ATTEMPTS:
+                self.stats["retries"] += 1
+                try:
+                    self.sleep(min(2.0 * attempt, 5.0))
+                except Exception:
+                    pass
+                continue
+            break
+        self.stats["failed"] += 1
+        self._log("warning", f"Telegram {kind} update not delivered: {self.last_error}")
+        return False
+
+    # ── chunking ──────────────────────────────────────────────────────
+
+    def _pack(self, text: str) -> List[str]:
+        """Split a composed message on line boundaries, tags kept balanced.
+
+        The composer marks monospace sections with a <pre> tag of its own, so
+        a section is closed before a split and reopened after it: Telegram
+        rejects unbalanced entities, and a half-cut block is unreadable.
+        """
+        limit = MAX_MESSAGE_CHARS - _CHUNK_RESERVE
+        raw_parts = self._split_long(text, limit)
+        if len(raw_parts) <= 1:
+            return raw_parts
+        return [
+            f"<b>(part {idx}/{len(raw_parts)})</b>\n{part}"
+            for idx, part in enumerate(raw_parts, start=1)
+        ]
+
+    def _split_long(self, text: str, limit: int) -> List[str]:
+        out: List[str] = []
+        cur: List[str] = []
+        cur_len = 0
+        in_pre = False
+        for line in text.split("\n"):
+            piece = line + "\n"
+            if len(piece) > limit:
+                # A single line longer than a whole message: hard-cut it.
+                if cur:
+                    out.append(self._close_pre("".join(cur), in_pre))
+                    cur, cur_len, in_pre = [], 0, False
+                for i in range(0, len(piece), limit):
+                    out.append(piece[i:i + limit])
+                continue
+            if cur_len + len(piece) > limit and cur:
+                out.append(self._close_pre("".join(cur), in_pre))
+                cur, cur_len = [], 0
+                if in_pre:
+                    cur.append("<pre>")
+                    cur_len += len("<pre>")
+            cur.append(piece)
+            cur_len += len(piece)
+            if "<pre>" in line:
+                in_pre = True
+            if "</pre>" in line:
+                in_pre = False
+        if cur:
+            out.append(self._close_pre("".join(cur), in_pre))
+        return [p.rstrip("\n") for p in out if p.strip()]
+
+    @staticmethod
+    def _close_pre(text: str, in_pre: bool) -> str:
+        return text + "\n</pre>" if in_pre else text
+
+    # ── session snapshot ──────────────────────────────────────────────
+
+    def _scalar(self, sql: str, params: tuple = (), default: Any = None) -> Any:
+        try:
+            if self.db is None:
+                return default
+            row = self.db.query_one(sql, params)
+            if not row:
+                return default
+            return list(row.values())[0]
+        except Exception:
+            return default
+
+    def _rows(self, sql: str, params: tuple = ()) -> List[dict]:
+        try:
+            if self.db is None:
+                return []
+            return list(self.db.query(sql, params) or [])
+        except Exception:
+            return []
+
+    def session_snapshot(
+        self,
+        state: Optional[dict] = None,
+        signals: Optional[dict] = None,
+        cycles: Optional[int] = None,
+        started_at: Any = None,
+        start_mode: Optional[str] = None,
+        realized_pnl: Optional[float] = None,
+        unrealized_pnl: Optional[float] = None,
+        total_pnl: Optional[float] = None,
+        capital: Optional[float] = None,
+        halted: Optional[bool] = None,
+        entries: Optional[int] = None,
+        consecutive_stops: Optional[int] = None,
+        open_positions: Optional[int] = None,
+        trading_date: Optional[str] = None,
+        as_of: Any = None,
+        reason: str = "",
+        uptime_sec: Optional[float] = None,
+        chain: Optional[dict] = None,
+    ) -> dict:
+        """Everything a message may say, in one dict.
+
+        Values handed in by the engine win; anything missing is read back out
+        of the book, so the same call works from a live loop (which has the
+        in-memory signals) and from the self-test (which has only a
+        database). Nothing here raises: an unavailable field is None and the
+        composer prints 'n/a'.
+        """
+        state = state or {}
+        signals = signals or {}
+        as_of = as_of or now_ist()
+        # The date follows the timestamp being described, not the wall clock:
+        # a message composed at 00:05 for the session that just ended belongs
+        # to that session, and every query below is keyed on it.
+        if trading_date is None:
+            trading_date = (
+                as_of.date().isoformat() if isinstance(as_of, datetime)
+                else today_ist().isoformat()
+            )
+        trading_date = str(trading_date)
+
+        def _sig(*keys):
+            for k in keys:
+                v = signals.get(k)
+                if v not in (None, ""):
+                    return v
+            return None
+
+        def _st(*keys):
+            for k in keys:
+                v = state.get(k)
+                if v not in (None, ""):
+                    return v
+            return None
+
+        day_open = _first(
+            _sig("day_open"),
+            _st("day_open"),
+            self._scalar(
+                "SELECT open FROM intraday_candles WHERE trading_date=? "
+                "ORDER BY candle_time ASC, candle_id ASC LIMIT 1",
+                (trading_date,),
+            ),
+            self._scalar(
+                "SELECT spot FROM cycle_log WHERE trading_date=? AND spot IS NOT NULL "
+                "ORDER BY cycle_id ASC LIMIT 1", (trading_date,),
+            ),
+            self._scalar(
+                "SELECT spot FROM market_snapshots WHERE date=? AND spot IS NOT NULL "
+                "ORDER BY id ASC LIMIT 1", (trading_date,),
+            ),
+            self._scalar(
+                "SELECT nifty_open FROM daily_summary WHERE trading_date=?",
+                (trading_date,),
+            ),
+        )
+
+        prev_close = _first(
+            _sig("prev_close") or None,
+            _st("prev_close"),
+            self._scalar(
+                "SELECT nifty_close FROM daily_summary WHERE trading_date<? "
+                "AND nifty_close IS NOT NULL ORDER BY trading_date DESC LIMIT 1",
+                (trading_date,),
+            ),
+            self._scalar(
+                "SELECT spot FROM cycle_log WHERE trading_date<? AND spot IS NOT NULL "
+                "ORDER BY trading_date DESC, cycle_id DESC LIMIT 1", (trading_date,),
+            ),
+        )
+        if _tr_num(prev_close, 0.0) <= 0:
+            prev_close = None
+
+        # "Nifty closed at" is today's close once the session is over, and
+        # yesterday's until then - labelled, because an unlabelled close on a
+        # phone screen at 11:00 is a lie waiting to happen.
+        today_close = _first(
+            self._scalar(
+                "SELECT nifty_close FROM daily_summary WHERE trading_date=?",
+                (trading_date,),
+            ),
+            self._scalar(
+                "SELECT spot FROM cycle_log WHERE trading_date=? AND spot IS NOT NULL "
+                "ORDER BY cycle_id DESC LIMIT 1", (trading_date,),
+            ),
+        )
+        session_over = False
+        try:
+            session_over = as_of.time() >= dtime(15, 30)
+        except Exception:
+            session_over = False
+        day_close = today_close if session_over else None
+        day_close_label = "today" if session_over else "previous day"
+        closed_value = _first(day_close, prev_close)
+
+        spot = _first(_sig("spot"), _st("prev_spot"), today_close)
+        vix = _first(_sig("vix"), _st("prev_vix"))
+        day_high = _first(
+            _sig("day_high") or None,
+            self._scalar(
+                "SELECT MAX(spot) FROM cycle_log WHERE trading_date=? "
+                "AND spot IS NOT NULL", (trading_date,),
+            ),
+        )
+        day_low = _first(
+            _sig("day_low") or None,
+            self._scalar(
+                "SELECT MIN(spot) FROM cycle_log WHERE trading_date=? "
+                "AND spot IS NOT NULL", (trading_date,),
+            ),
+        )
+        if _tr_num(day_high, 0.0) <= 0:
+            day_high = None
+        if _tr_num(day_low, 0.0) <= 0:
+            day_low = None
+
+        db_cycles = self._scalar(
+            "SELECT COUNT(*) FROM cycle_log WHERE trading_date=?", (trading_date,), 0
+        )
+        last_cycle = self._rows(
+            "SELECT vol_regime, price_regime, positioning_regime, final_regime, "
+            "spot, vix FROM cycle_log WHERE trading_date=? "
+            "ORDER BY cycle_id DESC LIMIT 1", (trading_date,),
+        )
+        last_cycle = last_cycle[0] if last_cycle else {}
+
+        dominant, regime_cycles = self._dominant_regime(trading_date)
+
+        db_realized = self._scalar(
+            "SELECT SUM(net_pnl_rupees) FROM positions "
+            "WHERE trading_date=? AND status='CLOSED'", (trading_date,), None,
+        )
+        closed_trades = self._scalar(
+            "SELECT COUNT(*) FROM positions WHERE trading_date=? "
+            "AND status='CLOSED'", (trading_date,), 0,
+        )
+        db_open = self._scalar(
+            "SELECT COUNT(*) FROM positions WHERE trading_date=? "
+            "AND status='OPEN'", (trading_date,), 0,
+        )
+
+        if uptime_sec is None and started_at is not None:
+            try:
+                started_dt = started_at if isinstance(started_at, datetime) \
+                    else parse_ist_timestamp(started_at)
+                if started_dt is not None:
+                    uptime_sec = max(0.0, (as_of - started_dt).total_seconds())
+            except Exception:
+                uptime_sec = None
+
+        spot_change_pct = None
+        try:
+            if spot is not None and prev_close:
+                spot_change_pct = (
+                    (float(spot) - float(prev_close)) / float(prev_close) * 100.0
+                )
+        except (TypeError, ValueError, ZeroDivisionError):
+            spot_change_pct = None
+
+        return {
+            "as_of":             as_of,
+            "trading_date":      trading_date,
+            "start_mode":        start_mode,
+            "started_at":        started_at,
+            "uptime_sec":        uptime_sec,
+            "reason":            reason or "",
+            "cycles":            int(_first(cycles, db_cycles) or 0),
+            "spot":              spot,
+            "day_open":          day_open,
+            "prev_close":        prev_close,
+            "day_close":         day_close,
+            "closed_value":      closed_value,
+            "day_close_label":   day_close_label,
+            "day_high":          day_high,
+            "day_low":           day_low,
+            "spot_change_pct":   spot_change_pct,
+            "vix":               vix,
+            "vol_regime":        _first(_sig("vol_regime"), last_cycle.get("vol_regime")),
+            "price_regime":      _first(_sig("price_regime"), last_cycle.get("price_regime")),
+            "positioning_regime": _first(
+                _sig("positioning_regime"), last_cycle.get("positioning_regime")),
+            "final_regime":      _first(_sig("final_regime"), last_cycle.get("final_regime")),
+            "dominant_regime":   dominant,
+            "regime_cycles":     regime_cycles,
+            "realized_pnl":      _first(realized_pnl, _st("daily_pnl"), db_realized),
+            "unrealized_pnl":    unrealized_pnl,
+            "total_pnl":         _first(total_pnl, _st("total_pnl")),
+            "capital":           _first(capital, _st("current_capital")),
+            "halted":            _first(halted, _st("daily_halted")),
+            "entries":           _first(entries, _st("entry_count")),
+            "consecutive_stops": _first(consecutive_stops, _st("consecutive_stops")),
+            "open_positions":    _first(open_positions, db_open),
+            "closed_trades":     closed_trades or 0,
+            "session_over":      session_over,
+            "chain":             chain or {},
+            "mode":              "PAPER TRADE" if getattr(
+                                     self.config, "paper_trade_mode", True)
+                                 else "LIVE TRADING",
+            "lot_size":          getattr(self.config, "lot_size", None),
+            "max_daily_loss_pct": getattr(self.config, "max_daily_loss_pct", None),
+            "pid":               os.getpid(),
+        }
+
+    def _dominant_regime(self, trading_date: str) -> Tuple[Optional[str], int]:
+        """The regime the day has spent most of its cycles in.
+
+        Mirrors MainEngine._get_dominant_regime(): the verdicts that describe
+        an action rather than a market (SIGNAL_ONLY, NO_TRADE) are not
+        regimes and are left out of the count.
+        """
+        rows = self._rows(
+            "SELECT final_regime, action_taken FROM cycle_log WHERE trading_date=?",
+            (trading_date,),
+        )
+        counts: Dict[str, int] = {}
+        for row in rows:
+            regime = row.get("final_regime") or row.get("action_taken") or "UNKNOWN"
+            if regime in ("SIGNAL_ONLY", "NO_TRADE", None, ""):
+                continue
+            counts[str(regime)] = counts.get(str(regime), 0) + 1
+        if not counts:
+            # Cycles ran but every one of them ended in a non-verdict: say
+            # so rather than naming a regime the day never had.
+            return ("NO_TRADE" if rows else None), 0
+        return max(counts, key=lambda k: counts[k]), sum(counts.values())
+
+    # ── message composition ───────────────────────────────────────────
+
+    def _status_units(self, kind: str, snap: dict) -> List[Tuple[str, str]]:
+        """(mode, text) units: 'html' is trusted markup, 'pre' is raw."""
+        as_of = snap.get("as_of") or now_ist()
+        when = _hhmmss(as_of)
+        title = f"Nifty options trade engine {_TITLE.get(kind, 'update')} at {when} IST"
+        head = [_b(title)]
+
+        subtitle: List[str] = []
+        if kind == KIND_HEARTBEAT:
+            subtitle.append(f"{self.heartbeat_sec / 60.0:.0f}-minute heartbeat")
+        if snap.get("reason"):
+            subtitle.append(str(snap["reason"]))
+        subtitle.append(str(snap.get("trading_date") or ""))
+        subtitle.append(str(snap.get("mode") or ""))
+        if kind == KIND_START:
+            subtitle.append(str(snap.get("start_mode") or start_mode()))
+            subtitle.append(f"pid {snap.get('pid')}")
+        if kind == KIND_STOP:
+            subtitle.append(f"uptime {_uptime(snap.get('uptime_sec'))}")
+            subtitle.append(f"pid {snap.get('pid')}")
+        head.append(_esc(" · ".join(p for p in subtitle if p)))
+        head.append("")
+
+        # The operator's own field list, in the operator's own order.
+        head.append(
+            _esc(f"Nifty opened at: {_num_opt(snap.get('day_open'))}")
+        )
+        spot_bits = [f"Current Nifty Spot at: {_num_opt(snap.get('spot'))}"]
+        if snap.get("spot_change_pct") is not None:
+            spot_bits.append(_pct_opt(snap["spot_change_pct"]) + " vs prev close")
+        head.append(_esc("  ".join(spot_bits)))
+        head.append(_esc(
+            f"Nifty closed at: {_num_opt(snap.get('closed_value'))} "
+            f"({snap.get('day_close_label') or 'previous day'})"
+        ))
+        head.append(_esc(
+            f"Current nifty regime: {_regime_line(snap.get('vol_regime'), snap.get('price_regime'), snap.get('positioning_regime'), snap.get('final_regime'))}"
+        ))
+        dominant = snap.get("dominant_regime") or "n/a"
+        regime_cycles = snap.get("regime_cycles") or 0
+        head.append(_esc(
+            f"Overall nifty regime: {dominant}"
+            + (f" (dominant of {regime_cycles} cycle(s))" if regime_cycles else "")
+        ))
+        head.append(_esc(f"Total cycles completed: {snap.get('cycles', 0)}"))
+        head.append("")
+
+        money: List[str] = []
+        if snap.get("realized_pnl") is not None:
+            money.append(f"realised {_tr_signed(snap['realized_pnl'])}")
+        if snap.get("unrealized_pnl") is not None:
+            money.append(f"unrealised {_tr_signed(snap['unrealized_pnl'])}")
+        if snap.get("total_pnl") is not None:
+            money.append(f"total {_tr_signed(snap['total_pnl'])}")
+        if money:
+            head.append(_b("Day P&L") + _esc(": " + " · ".join(money)))
+
+        book: List[str] = [
+            f"open trades {snap.get('open_positions') or 0}",
+            f"closed today {snap.get('closed_trades') or 0}",
+        ]
+        if snap.get("entries") is not None:
+            book.append(f"entries {snap['entries']}")
+        if snap.get("consecutive_stops") is not None:
+            book.append(f"consecutive stops {snap['consecutive_stops']}")
+        book.append(
+            "daily halt ON" if snap.get("halted") else "daily halt OFF"
+        )
+        head.append(_esc(" · ".join(book)))
+
+        market: List[str] = []
+        if snap.get("vix") is not None:
+            market.append(f"VIX {_num_opt(snap.get('vix'))}")
+        if snap.get("day_high") is not None or snap.get("day_low") is not None:
+            market.append(
+                f"day range {_num_opt(snap.get('day_low'))} - "
+                f"{_num_opt(snap.get('day_high'))}"
+            )
+        if snap.get("capital") is not None:
+            market.append(f"capital {_tr_money(snap['capital'])}")
+        if snap.get("lot_size"):
+            market.append(f"lot size {snap['lot_size']}")
+        if market:
+            head.append(_esc(" · ".join(market)))
+
+        units: List[Tuple[str, str]] = [("html", "\n".join(head))]
+        return units
+
+    def compose_status(self, kind: str, snap: dict) -> str:
+        """A start / heartbeat / stop message, trade blocks included."""
+        units = self._status_units(kind, snap)
+        blocks = self._status_blocks(kind, snap)
+        if blocks:
+            units.append(("pre", "\n\n".join(blocks)))
+        return self._compose(units)
+
+    def _status_blocks(self, kind: str, snap: dict) -> List[str]:
+        """Which trades belong in a status message.
+
+        A heartbeat carries the trades still in progress (a closed one has
+        already had its own message). A stop carries the whole day, in its
+        final state - that is the record the operator keeps.
+        """
+        try:
+            if kind == KIND_HEARTBEAT and not self.include_open_blocks:
+                return []
+            as_of_snap = snap.get("as_of")
+            trading_date = str(
+                snap.get("trading_date")
+                or (as_of_snap.date().isoformat()
+                    if isinstance(as_of_snap, datetime) else None)
+                or today_ist().isoformat()
+            )
+            chain = snap.get("chain") or {}
+            as_of = snap.get("as_of") or now_ist()
+            rows = self._positions(trading_date)
+            out: List[str] = []
+            for index, position in enumerate(rows, start=1):
+                closed = str(position.get("status") or "OPEN").upper().startswith("CLOSE")
+                if kind == KIND_HEARTBEAT and closed:
+                    continue
+                legs = self._legs(position)
+                lines = self.block_lines(index, position, legs, chain, as_of)
+                if lines:
+                    out.append("\n".join(lines))
+            return out
+        except Exception as exc:
+            self._log("debug", f"Telegram status blocks skipped: {exc}")
+            return []
+
+    def compose_trade(self, kind: str, index: int, position: dict,
+                      legs: List[dict], snap: dict) -> str:
+        """A placed / closed message: headline, context, then the block."""
+        as_of = snap.get("as_of") or now_ist()
+        chain = snap.get("chain") or {}
+        lines = self.block_lines(index, position, legs, chain, as_of)
+        name = position.get("strategy_name") or "UNKNOWN"
+        closed = str(position.get("status") or "OPEN").upper().startswith("CLOSE")
+        when = _tr_hhmm(position.get("exit_time") if closed
+                        else position.get("entry_time"))
+
+        head: List[str] = []
+        title = f"Trade order {'closed' if closed else 'placed'} - Trade-{index} {name} at {when}"
+        head.append(_b(title))
+        ctx: List[str] = []
+        if closed and position.get("exit_reason"):
+            ctx.append(f"reason {position['exit_reason']}")
+        if snap.get("spot") is not None:
+            ctx.append(f"spot {_num_opt(snap['spot'])}")
+        if snap.get("final_regime"):
+            ctx.append(f"regime {snap['final_regime']}")
+        ctx.append(f"cycle {snap.get('cycles', 0)}")
+        if snap.get("total_pnl") is not None:
+            ctx.append(f"day P&L {_tr_signed(snap['total_pnl'])}")
+        elif snap.get("realized_pnl") is not None:
+            ctx.append(f"day realised {_tr_signed(snap['realized_pnl'])}")
+        head.append(_esc(" · ".join(str(c) for c in ctx)))
+        net = position.get("net_pnl_rupees")
+        if closed and net not in (None, ""):
+            head.append(_esc(
+                f"Net {_tr_signed(net)} realised · charges "
+                f"{_tr_money(_tr_num(position.get('entry_costs_rupees')) + _tr_num(position.get('exit_costs_rupees')))}"
+            ))
+
+        units: List[Tuple[str, str]] = [("html", "\n".join(head))]
+        if lines:
+            units.append(("pre", "\n".join(lines)))
+        return self._compose(units)
+
+    def _compose(self, units: List[Tuple[str, str]]) -> str:
+        out: List[str] = []
+        for mode, text in units:
+            if not text:
+                continue
+            if mode == "pre":
+                if self.parse_mode.upper() == "HTML":
+                    out.append(f"<pre>{_esc(text)}</pre>")
+                else:
+                    out.append("```" + str(text) + "```")
+            else:
+                out.append(str(text))
+        return "\n".join(out)
+
+    # ── trade blocks ──────────────────────────────────────────────────
+
+    def _positions(self, trading_date: str) -> List[dict]:
+        if self.console is not None:
+            return self.console.positions_for(trading_date)
+        return self._rows(
+            "SELECT * FROM positions WHERE trading_date=? "
+            "ORDER BY entry_time ASC, created_at ASC, rowid ASC", (trading_date,),
+        )
+
+    def _legs(self, position: dict) -> List[dict]:
+        position_id = str(position.get("position_id") or "")
+        if self.console is not None:
+            return self.console.legs_for(position_id)
+        return self._rows(
+            "SELECT * FROM position_legs WHERE position_id=? ORDER BY leg_id ASC",
+            (position_id,),
+        )
+
+    def block_lines(self, index: int, position: dict, legs: List[dict],
+                    chain: Optional[dict], as_of: Any) -> List[str]:
+        """The trade block: the console's, or a narrow-screen variant of it."""
+        if self.block_style == "compact":
+            try:
+                return self._compact_block(index, position, legs, chain, as_of)
+            except Exception as exc:
+                self._log("debug", f"compact block failed ({exc}); using console")
+        if self.console is None:
+            return []
+        try:
+            return list(self.console.render(index, position, legs, chain or {}, as_of))
+        except Exception as exc:
+            self._log("debug", f"block render failed for {position.get('position_id')}: {exc}")
+            return []
+
+    def _compact_block(self, index: int, position: dict, legs: List[dict],
+                       chain: Optional[dict], as_of: Any) -> List[str]:
+        """Same fields as the console block, 44 columns wide.
+
+        Telegram on a phone wraps an 84-column block into unreadability, so
+        TELEGRAM_TRADE_BLOCK_STYLE=compact trades the rules for indentation
+        and drops the arithmetic footnotes. Nothing that identifies the trade
+        or its money is lost.
+        """
+        chain = chain or {}
+        status = str(position.get("status") or "OPEN").upper()
+        closed = status.startswith("CLOSE")
+        lots = 0
+        try:
+            lots = int(position.get("final_lots") or 0)
+        except (TypeError, ValueError):
+            lots = 0
+        if not lots and legs:
+            try:
+                lots = max(1, int(_tr_num(legs[0].get("qty")) //
+                                  max(1.0, _tr_num(getattr(self.config, "lot_size", 1), 1.0))))
+            except Exception:
+                lots = 1
+
+        out = [
+            f"Trade-{index} | {position.get('strategy_name') or 'UNKNOWN'}"
+            f" | {'Closed' if closed else 'Open'}",
+            f"  Start {_tr_hhmm(position.get('entry_time'))}",
+        ]
+        for leg in legs:
+            out.append(
+                f"   {_tr_side(leg.get('action'))} {lots} lot "
+                f"{_tr_symbol(leg.get('option_type'))} @ "
+                f"{_tr_price(leg.get('entry_price'))} "
+                f"(strike {_tr_strike(leg.get('strike'))})"
+            )
+        reason = position.get("exit_reason") if closed else None
+        out.append(
+            f"  End {_tr_hhmm(position.get('exit_time') if closed else as_of)}"
+            + (f" ({reason})" if reason else "")
+        )
+        for leg in legs:
+            leg_closed = str(leg.get("leg_status") or "").upper() == "CLOSED"
+            if closed and leg_closed and leg.get("exit_price") not in (None, ""):
+                price = leg.get("exit_price")
+            else:
+                price = self._mark(leg, chain)
+                if price is None:
+                    price = leg.get("entry_price")
+            out.append(
+                f"   {_tr_closing_side(leg.get('action'))} {lots} lot "
+                f"{_tr_symbol(leg.get('option_type'))} @ {_tr_price(price)} "
+                f"(strike {_tr_strike(leg.get('strike'))})"
+            )
+        if not legs:
+            out.append("   no leg rows persisted for this position")
+
+        committed, committed_basis = (0.0, [])
+        net, realised, profit_basis = (0.0, False, [])
+        if self.console is not None:
+            try:
+                committed, committed_basis = self.console.investment(position, legs)
+                net, realised, profit_basis = self.console.profit(
+                    position, legs, chain)
+            except Exception as exc:
+                self._log("debug", f"compact money failed: {exc}")
+        out.append(f"  Position Status: {'Close' if closed else 'Open'}")
+        out.append(f"  Total Investment: {_tr_money(committed)}")
+        out.append(f"  Total Profit: {_tr_signed(net)} "
+                   f"{'realised' if realised else 'unrealised'}")
+        # One footnote each, wrapped: they explain the arithmetic and are the
+        # only free-text lines in the block, so they are the only ones that
+        # need it.
+        import textwrap
+        for line in list(committed_basis or [])[:1] + list(profit_basis or [])[:1]:
+            out.append(textwrap.fill(
+                f"    {line}", width=_COMPACT_WIDTH, subsequent_indent="      "))
+        return out
+
+    def _mark(self, leg: dict, chain: dict) -> Optional[float]:
+        """What closing this leg now would cost, from the chain if possible."""
+        if self.console is not None:
+            try:
+                return self.console._mark_leg(leg, chain, True)
+            except Exception:
+                return None
+        return None
+
+    # ── the five events ───────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve(snap: Any) -> dict:
+        """A snapshot, or a callable that builds one only when needed."""
+        if snap is None:
+            return {}
+        if callable(snap):
+            try:
+                return dict(snap() or {})
+            except Exception:
+                return {}
+        try:
+            return dict(snap)
+        except Exception:
+            return {}
+
+    def notify_started(self, snap: Any = None) -> bool:
+        """Requirement 1: one message when the engine starts."""
+        if not self.enabled:
+            return False
+        if self._started_sent:
+            return False
+        try:
+            data = self._resolve(snap)
+            self._started_sent = True
+            self._stopped_sent = False
+            # Arm the heartbeat from the start message: the first periodic
+            # update is due one interval after the engine came up, not one
+            # interval after the process did.
+            self._last_heartbeat_mono = self.clock()
+            text = self.compose_status(KIND_START, data)
+            ok = self.send(text, KIND_START)
+            self._log("info", f"Telegram: engine start update "
+                              f"{self._delivery_word(ok)}")
+            return ok
+        except Exception as exc:
+            self._log("warning", f"Telegram start update failed: {exc}")
+            return False
+
+    def notify_start_failed(self, reason: str = "", snap: Any = None) -> bool:
+        """A start that never reached the loop still gets one message."""
+        if not self.enabled:
+            return False
+        try:
+            data = self._resolve(snap)
+            data["reason"] = f"start failed: {reason}" if reason else "start failed"
+            text = self.compose_status(KIND_STOP, data)
+            self._stopped_sent = True
+            return self.send(text, KIND_STOP)
+        except Exception as exc:
+            self._log("warning", f"Telegram start-failure update failed: {exc}")
+            return False
+
+    def heartbeat_if_due(self, snap: Any = None) -> bool:
+        """Requirement 2: one message every TELEGRAM_HEARTBEAT_MIN minutes.
+
+        Called from the top of the main loop, so it must be cheap when it is
+        not due: a monotonic comparison, and no snapshot, no query, no text.
+        """
+        if not self.enabled:
+            return False
+        try:
+            now = self.clock()
+            if self._last_heartbeat_mono and \
+                    (now - self._last_heartbeat_mono) < self.heartbeat_sec:
+                return False
+            self._last_heartbeat_mono = now
+            data = self._resolve(snap)
+            text = self.compose_status(KIND_HEARTBEAT, data)
+            return self.send(text, KIND_HEARTBEAT)
+        except Exception as exc:
+            self._log("warning", f"Telegram heartbeat failed: {exc}")
+            return False
+
+    def notify_stopped(self, snap: Any = None, reason: str = "") -> bool:
+        """Requirement 5: one message when the engine stops, once per run."""
+        if not self.enabled:
+            return False
+        if self._stopped_sent:
+            return False
+        try:
+            data = self._resolve(snap)
+            if reason:
+                data["reason"] = reason
+            self._stopped_sent = True
+            text = self.compose_status(KIND_STOP, data)
+            ok = self.send(text, KIND_STOP)
+            self._log("info", f"Telegram: engine stop update "
+                              f"{self._delivery_word(ok)} "
+                              f"({data.get('reason') or 'no reason given'})")
+            return ok
+        except Exception as exc:
+            self._log("warning", f"Telegram stop update failed: {exc}")
+            return False
+
+    def sync_trades(self, snap: Any = None, chain: Optional[dict] = None,
+                    as_of: Any = None, trading_date: Optional[str] = None,
+                    ) -> int:
+        """Requirements 3 and 4: one message per trade placed and per close.
+
+        The book is the source of events. A position the reporter has not
+        seen before was placed since the last call; one whose status turned
+        CLOSED was closed since the last call. Because the events come from
+        the persisted positions rather than from a hook inside the order
+        path, they also cover trades closed by the hard-exit sweep, by the
+        watchdog flatten and by the EOD square-off - paths that do not go
+        through the same call site.
+        """
+        if not self.enabled:
+            return 0
+        sent = 0
+        try:
+            # A caller may hand the date, the timestamp and the chain over as
+            # keyword arguments or inside the snapshot; both are honoured, and
+            # a snapshot given as a callable is still not called until there
+            # is an event worth reporting.
+            peek = snap if isinstance(snap, dict) else {}
+            as_of = as_of or peek.get("as_of") or now_ist()
+            if trading_date is None:
+                trading_date = peek.get("trading_date") or (
+                    as_of.date().isoformat() if isinstance(as_of, datetime)
+                    else today_ist().isoformat()
+                )
+            if chain is None:
+                chain = peek.get("chain")
+            trading_date = str(trading_date)
+            if self._day != trading_date:
+                self.reset_day(trading_date)
+            rows = self._positions(trading_date)
+            if not rows:
+                return 0
+
+            events: List[Tuple[int, dict, List[dict], str]] = []
+            for index, position in enumerate(rows, start=1):
+                position_id = str(position.get("position_id") or f"#{index}")
+                status = "CLOSED" if str(
+                    position.get("status") or "OPEN").upper().startswith("CLOSE") \
+                    else "OPEN"
+                previous = self._seen.get(position_id)
+                if previous == status:
+                    continue
+                self._seen[position_id] = status
+                if previous is None and status == "OPEN":
+                    events.append((index, position, self._legs(position), KIND_TRADE_OPEN))
+                elif status == "CLOSED":
+                    events.append((index, position, self._legs(position), KIND_TRADE_CLOSE))
+            if not events:
+                return 0
+
+            # One snapshot for the whole batch, and only now that there is
+            # something to say: a quiet cycle costs no query at all.
+            data = self._resolve(snap)
+            data.setdefault("as_of", as_of)
+            data.setdefault("trading_date", trading_date)
+            if chain is not None:
+                data["chain"] = chain
+            for index, position, legs, kind in events:
+                try:
+                    text = self.compose_trade(kind, index, position, legs, data)
+                    if self.send(text, kind):
+                        sent += 1
+                except Exception as exc:
+                    self._log(
+                        "warning",
+                        f"Telegram trade update failed for "
+                        f"{position.get('position_id')}: {exc}",
+                    )
+            return sent
+        except Exception as exc:
+            self._log("warning", f"Telegram trade sync failed: {exc}")
+            return sent
+
+    def reset_day(self, trading_date: Optional[str] = None) -> None:
+        """Drop the day's latches on the day roll, and only those.
+
+        The heartbeat clock and the started/stopped latches belong to the
+        process, not to the session: an engine left running overnight must
+        keep beating and must not announce a second start.
+        """
+        self._day = str(trading_date or today_ist().isoformat())
+        self._seen.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELF TEST
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# No network and no waiting: the transport records what would have been sent
+# and can be told to fail, to 429 or to explode, and the clock only moves when
+# the test moves it. That makes the heartbeat schedule, the send spacing and
+# the retry behaviour ordinary assertions instead of sleeps.
+
+class _FakeTransport:
+    """Stands in for the HTTPS call. Records payloads, fails on request."""
+
+    def __init__(self, fail_times: int = 0, retry_after: Optional[float] = None,
+                 explode: bool = False, hang: Optional[threading.Event] = None):
+        self.calls: List[dict] = []
+        self.fail_times = int(fail_times)
+        self.retry_after = retry_after
+        self.explode = bool(explode)
+        self.hang = hang
+
+    def __call__(self, payload: dict) -> Tuple[bool, Optional[float], str]:
+        self.calls.append(payload)
+        if self.hang is not None:
+            self.hang.wait(5.0)
+        if self.explode:
+            raise RuntimeError("transport exploded")
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            if self.retry_after:
+                return False, float(self.retry_after), \
+                    "HTTP 429 rate limited by Telegram"
+            return False, None, "HTTP 500: upstream boom"
+        return True, None, ""
+
+    @property
+    def texts(self) -> List[str]:
+        return [str(c.get("text") or "") for c in self.calls]
+
+
+class _FakeClock:
+    """A monotonic clock and a sleep the test drives by hand."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = float(start)
+        self.slept: List[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(float(seconds))
+        self.now += float(seconds)
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+class _StubLogger:
+    """Records every log call: a swallowed exception becomes an assertion."""
+
+    def __init__(self):
+        self.records: List[Tuple[str, str]] = []
+
+    def _rec(self, level: str, msg: Any) -> None:
+        self.records.append((level, str(msg)))
+
+    def debug(self, msg: Any, *a, **k) -> None:
+        self._rec("debug", msg)
+
+    def info(self, msg: Any, *a, **k) -> None:
+        self._rec("info", msg)
+
+    def warning(self, msg: Any, *a, **k) -> None:
+        self._rec("warning", msg)
+
+    def error(self, msg: Any, *a, **k) -> None:
+        self._rec("error", msg)
+
+    def critical(self, msg: Any, *a, **k) -> None:
+        self._rec("critical", msg)
+
+    @property
+    def problems(self) -> List[str]:
+        return [m for level, m in self.records if level in ("warning", "error")]
+
+
+def _unesc(text: str) -> str:
+    return (str(text).replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&amp;", "&"))
+
+
+def _pre_bodies(text: str) -> List[str]:
+    """The raw monospace sections of a sent message, unescaped."""
+    out = []
+    for chunk in str(text).split("<pre>")[1:]:
+        out.append(_unesc(chunk.split("</pre>")[0]))
+    return out
+
+
+def _scratch_db() -> Database:
+    import tempfile
+    from pathlib import Path
+    return Database(Path(tempfile.mkdtemp(prefix="tg_selftest_")) / "telegram.db")
+
+
+def _config(**overrides) -> Config:
+    import dataclasses
+    fields = dict(
+        alert_telegram_bot_token="123456789:AAH-selftest-token-xyz",
+        alert_telegram_chat_id="-1001234567890",
+        telegram_updates_enabled=True,
+        telegram_heartbeat_min=15.0,
+        telegram_min_gap_sec=0.0,
+        telegram_max_queue=8,
+        telegram_parse_mode="HTML",
+        telegram_trade_block_style="console",
+        telegram_include_open_blocks=True,
+    )
+    fields.update(overrides)
+    return dataclasses.replace(load_config(), **fields)
+
+
+_DAY = "2026-09-15"
+_ENTRY = "2026-09-15T12:13:00+05:30"
+_EXIT = "2026-09-15T14:02:00+05:30"
+# The 2026-09-11 paper trade, so the numbers in these assertions are numbers
+# the engine has already been seen to produce.
+_LEGS = ((23150.0, "put", "SELL", 47.65), (23050.0, "put", "BUY", 28.60))
+_CHAIN = {
+    23150.0: {"put": {"bid": 40.00, "ask": 40.10, "ltp": 40.05, "delta": -0.30}},
+    23050.0: {"put": {"bid": 24.60, "ask": 24.70, "ltp": 24.65, "delta": -0.22}},
+}
+
+
+def _add_position(db: Database, pid: str, entry: str = _ENTRY,
+                  strategy: str = "BULL_PUT_SPREAD", status: str = "OPEN",
+                  lots: int = 2, legs=_LEGS, day: str = _DAY,
+                  **extra) -> None:
+    row = {
+        "position_id": pid, "trading_date": day, "strategy_name": strategy,
+        "strategy_type": "SELL", "entry_time": entry, "final_lots": lots,
+        "status": status, "entry_credit": 18.58, "gross_credit": 19.05,
+        "total_slippage": 0.026, "entry_costs_rupees": 57.67,
+        "estimated_margin": 15730.0, "total_max_risk": 5693.0,
+    }
+    row.update(extra)
+    db.insert("positions", row)
+    for strike, opt, action, price in legs:
+        db.insert("position_legs", {
+            "position_id": pid, "strike": strike, "option_type": opt,
+            "action": action, "qty": lots * 65, "entry_price": price,
+            "leg_status": "OPEN",
+        })
+
+
+def _close_position(db: Database, pid: str, exit_time: str = _EXIT,
+                    reason: str = "CLOSE_TARGET",
+                    exit_prices=(40.10, 24.60)) -> None:
+    db.update("positions", {
+        "status": "CLOSED", "exit_time": exit_time, "exit_reason": reason,
+        "exit_priority": 6, "exit_premium": 15.50,
+        "gross_pnl_rupees": 461.50, "exit_costs_rupees": 55.69,
+        "net_pnl_rupees": 348.14, "entry_credit_realised": 19.05,
+        "last_known_premium": 15.50,
+    }, {"position_id": pid})
+    legs = db.query(
+        "SELECT * FROM position_legs WHERE position_id=? ORDER BY leg_id ASC",
+        (pid,),
+    )
+    for leg, price in zip(legs, exit_prices):
+        db.update("position_legs", {
+            "exit_price": price, "leg_status": "CLOSED",
+            "quoted_mid_at_exit": round(price - 0.05, 2),
+        }, {"leg_id": leg["leg_id"]})
+
+
+def _add_cycles(db: Database, day: str, regimes, first_spot=24380.50,
+                last_spot=24412.35) -> None:
+    for idx, regime in enumerate(regimes):
+        spot = first_spot if idx == 0 else (
+            last_spot if idx == len(regimes) - 1 else first_spot + idx * 0.5)
+        db.insert("cycle_log", {
+            "cycle_time": f"{day}T09:{15 + idx}:00+05:30", "trading_date": day,
+            "spot": spot, "vix": 12.40, "vol_regime": "VOL_SELL",
+            "price_regime": "TREND_UP", "positioning_regime": "PCR_BULL",
+            "final_regime": regime, "action_taken": "NO_TRADE",
+            "open_positions": 0, "daily_pnl_net": 0.0,
+        })
+
+
+def _reporter(db=None, config=None, transport=None, clock=None, worker=False,
+              **cfg_over):
+    cfg = config or _config(**cfg_over)
+    transport = transport or _FakeTransport()
+    clock = clock or _FakeClock()
+    rep = TelegramReporter(
+        db if db is not None else _scratch_db(), cfg, None,
+        transport=transport, clock=clock, sleep=clock.sleep, worker=worker,
+    )
+    return rep, transport, clock
+
+
+def _self_test() -> None:
+    print_section("TELEGRAM REPORTER SELF-TEST (v8)", char="#")
+    as_of = datetime(2026, 9, 15, 11, 0, 0)
+
+    # ── 1. Silence when there is no channel ───────────────────────────
+    for label, cfg in (
+        ("no bot token", _config(alert_telegram_bot_token="")),
+        ("no chat id", _config(alert_telegram_chat_id="")),
+        ("switched off", _config(telegram_updates_enabled=False)),
+    ):
+        transport = _FakeTransport()
+        rep = TelegramReporter(_scratch_db(), cfg, None, transport=transport,
+                               clock=_FakeClock(), sleep=lambda s: None,
+                               worker=False)
+        assert not rep.enabled, f"reporter should be disabled with {label}"
+        assert rep.notify_started({}) is False
+        assert rep.heartbeat_if_due({}) is False
+        assert rep.notify_stopped({}, reason="x") is False
+        assert rep.sync_trades({}) == 0
+        assert transport.calls == [], f"a disabled reporter sent with {label}"
+        assert "DISABLED" in rep.describe()
+    print("  [OK] disabled without a token/chat id, and when switched off")
+
+    # ── 2. The start message ──────────────────────────────────────────
+    db = _scratch_db()
+    _add_cycles(db, _DAY, ["TREND_SELL", "TREND_SELL", "CHOPPY"])
+    rep, transport, clock = _reporter(db=db)
+    started = datetime(2026, 9, 15, 9, 2, 11)
+    snap = rep.session_snapshot(
+        cycles=0, started_at=started, as_of=as_of,
+        start_mode="manual (interactive terminal)", chain=_CHAIN,
+        signals={"spot": 24412.35, "vix": 12.40, "prev_close": 24353.20,
+                 "final_regime": "TREND_SELL", "vol_regime": "VOL_SELL",
+                 "price_regime": "TREND_UP"},
+    )
+    assert rep.notify_started(snap) is True
+    assert len(transport.calls) == 1, "start must be exactly one message"
+    payload = transport.calls[0]
+    assert payload["chat_id"] == "-1001234567890"
+    assert payload["parse_mode"] == "HTML"
+    assert payload["disable_web_page_preview"] is True
+    text = payload["text"]
+    for frag in (
+        "Nifty options trade engine started at 11:00:00 IST",
+        "Nifty opened at: 24,380.50",
+        "Current Nifty Spot at: 24,412.35",
+        "Nifty closed at: 24,353.20 (previous day)",
+        "Current nifty regime: vol VOL_SELL | price TREND_UP | "
+        "positioning PCR_BULL | final TREND_SELL",
+        "Overall nifty regime: TREND_SELL (dominant of 3 cycle(s))",
+        "Total cycles completed: 0",
+        "PAPER TRADE",
+        "manual (interactive terminal)",
+    ):
+        assert frag in _unesc(text), f"start message is missing {frag!r}"
+    assert len(text) <= MAX_MESSAGE_CHARS
+    # ...and it does not repeat itself
+    assert rep.notify_started(snap) is False
+    assert len(transport.calls) == 1, "a second start message was sent"
+    print("  [OK] start message carries every requested field, exactly once")
+
+    # ── 3. Nothing dynamic can break the markup ───────────────────────
+    db3 = _scratch_db()
+    _add_position(db3, "p3", strategy="<script>&\"quote\"</script>",
+                  day=_DAY, entry=_ENTRY)
+    rep3, tr3, _c3 = _reporter(db=db3)
+    assert rep3.sync_trades({"as_of": as_of, "trading_date": _DAY,
+                             "chain": _CHAIN}) == 1
+    body = tr3.texts[-1]
+    assert "<script>" not in body, "raw markup reached Telegram"
+    assert "&lt;script&gt;" in body
+    assert "&amp;" in body
+    print("  [OK] HTML escaping: no dynamic text can break parse_mode")
+
+    # ── 4. The heartbeat is a schedule, not a hope ────────────────────
+    db4 = _scratch_db()
+    rep4, tr4, clk4 = _reporter(db=db4, telegram_heartbeat_min=15.0)
+    snap4 = {"as_of": as_of, "trading_date": _DAY, "cycles": 7, "chain": {}}
+    assert rep4.notify_started(snap4) is True
+    assert len(tr4.calls) == 1
+    clk4.advance(14 * 60 + 59)
+    assert rep4.heartbeat_if_due(snap4) is False, "fired before 15 minutes"
+    assert len(tr4.calls) == 1
+    clk4.advance(1)
+    assert rep4.heartbeat_if_due(snap4) is True, "did not fire at 15 minutes"
+    assert len(tr4.calls) == 2
+    assert "15-minute heartbeat" in _unesc(tr4.texts[-1])
+    assert rep4.heartbeat_if_due(snap4) is False, "fired twice in a row"
+    clk4.advance(15 * 60)
+    assert rep4.heartbeat_if_due(snap4) is True, "did not re-arm"
+    assert len(tr4.calls) == 3
+    rep4b, tr4b, clk4b = _reporter(db=_scratch_db(), telegram_heartbeat_min=0.5)
+    rep4b.notify_started(snap4)
+    clk4b.advance(29)
+    assert rep4b.heartbeat_if_due(snap4) is False
+    clk4b.advance(2)
+    assert rep4b.heartbeat_if_due(snap4) is True, "interval is not configurable"
+    print("  [OK] heartbeat every TELEGRAM_HEARTBEAT_MIN, armed by the start")
+
+    # ── 5. A trade order placed ───────────────────────────────────────
+    db5 = _scratch_db()
+    _add_position(db5, "p5", day=_DAY)
+    rep5, tr5, _c5 = _reporter(db=db5)
+    snap5 = {"as_of": as_of, "trading_date": _DAY, "chain": _CHAIN,
+             "cycles": 12, "spot": 24412.35, "final_regime": "TREND_SELL",
+             "total_pnl": 0.0}
+    assert rep5.sync_trades(snap5) == 1
+    sent = tr5.texts[-1]
+    assert "Trade order placed - Trade-1 BULL_PUT_SPREAD at 12:13" in _unesc(sent)
+    assert "Position Status: Open" in _unesc(sent)
+    assert "unrealised" in _unesc(sent)
+    # the block is the console's block, byte for byte
+    pos5 = db5.query_one("SELECT * FROM positions WHERE position_id='p5'")
+    legs5 = rep5.console.legs_for("p5")
+    expected = "\n".join(rep5.console.render(1, pos5, legs5, _CHAIN, as_of))
+    assert _pre_bodies(sent)[0] == expected, \
+        "the Telegram block is not the console block"
+    assert "Sold: 2 lot of PE with premium: 47.65 at strike: 23150" in expected
+    assert "Bought: 2 lot of PE with premium: 28.60 at strike: 23050" in expected
+    # latched: the same open trade is not announced again
+    assert rep5.sync_trades(snap5) == 0
+    assert len(tr5.calls) == 1
+    print("  [OK] trade placed: one message, the console block, no repeats")
+
+    # ── 6. A trade order closed ───────────────────────────────────────
+    _close_position(db5, "p5")
+    assert rep5.sync_trades(snap5) == 1
+    sent = _unesc(tr5.texts[-1])
+    assert "Trade order closed - Trade-1 BULL_PUT_SPREAD at 14:02" in sent
+    assert "reason CLOSE_TARGET" in sent
+    assert "Net Rs +348.14 realised" in sent
+    assert "Position Status: Close" in sent
+    assert "Total Profit: Rs +348.14 realised" in sent
+    assert "Closed - CLOSE_TARGET" in sent
+    assert rep5.sync_trades(snap5) == 0, "a closed trade was re-announced"
+    print("  [OK] trade closed: realised money, reason, no repeats")
+
+    # ── 7. Opened AND closed between two cycles ───────────────────────
+    db7 = _scratch_db()
+    rep7, tr7, _c7 = _reporter(db=db7)
+    snap7 = {"as_of": as_of, "trading_date": _DAY, "chain": _CHAIN}
+    assert rep7.sync_trades(snap7) == 0
+    _add_position(db7, "p7", day=_DAY)
+    _close_position(db7, "p7")
+    assert rep7.sync_trades(snap7) == 1, \
+        "a trade that opened and closed between cycles needs exactly one message"
+    assert "Trade order closed" in _unesc(tr7.texts[-1])
+    print("  [OK] a round trip inside one cycle is one message, not two")
+
+    # ── 8. The day roll clears the trade latch and nothing else ───────
+    db8 = _scratch_db()
+    _add_position(db8, "p8", day=_DAY)
+    rep8, tr8, clk8 = _reporter(db=db8)
+    day16 = "2026-09-16"
+    as_of16 = datetime(2026, 9, 16, 10, 0, 0)
+    assert rep8.notify_started({"as_of": as_of, "trading_date": _DAY,
+                                "chain": {}}) is True
+    after_start = len(tr8.calls)
+    assert rep8.sync_trades({"as_of": as_of, "trading_date": _DAY,
+                             "chain": {}}) == 1
+    _add_position(db8, "p8b", day=day16, entry="2026-09-16T09:20:00+05:30")
+    assert rep8.sync_trades({"as_of": as_of16, "trading_date": day16,
+                             "chain": {}}) == 1, "the new day's trade was missed"
+    assert rep8.sync_trades({"as_of": as_of16, "trading_date": day16,
+                             "chain": {}}) == 0
+    # the process-level latches belong to the process, not to the session
+    assert rep8._started_sent, "a day roll cleared the start latch"
+    assert rep8.notify_started({"as_of": as_of16}) is False
+    assert len(tr8.calls) == after_start + 2, \
+        "a day roll made the engine announce a second start"
+    assert not rep8._stopped_sent, "a day roll marked the engine stopped"
+    print("  [OK] day roll re-arms trade events but not start/stop/heartbeat")
+
+    # ── 9. Numbering agrees with the console ──────────────────────────
+    db9 = _scratch_db()
+    _add_position(db9, "p9a", day=_DAY, entry="2026-09-15T09:20:00+05:30",
+                  strategy="LONG_CALL",
+                  legs=((23300.0, "call", "BUY", 109.75),))
+    _add_position(db9, "p9b", day=_DAY, entry=_ENTRY)
+    rep9, tr9, _c9 = _reporter(db=db9)
+    assert rep9.sync_trades({"as_of": as_of, "trading_date": _DAY,
+                             "chain": _CHAIN}) == 2
+    titles = [_unesc(t).splitlines()[0] for t in tr9.texts]
+    assert "Trade-1 LONG_CALL" in titles[0], titles
+    assert "Trade-2 BULL_PUT_SPREAD" in titles[1], titles
+    rows9 = rep9.console.positions_for(_DAY)
+    assert [r["position_id"] for r in rows9] == ["p9a", "p9b"]
+    print("  [OK] Trade-<n> numbering is the console's, not the reporter's")
+
+    # ── 10. The narrow-screen block ───────────────────────────────────
+    db10 = _scratch_db()
+    _add_position(db10, "p10", day=_DAY)
+    _close_position(db10, "p10")
+    rep10, tr10, _c10 = _reporter(db=db10, telegram_trade_block_style="compact")
+    assert rep10.sync_trades({"as_of": as_of, "trading_date": _DAY,
+                              "chain": _CHAIN}) == 1
+    body10 = _pre_bodies(tr10.texts[-1])[0]
+    for frag in ("Trade-1 | BULL_PUT_SPREAD | Closed",
+                 "Start 12:13", "End 14:02 (CLOSE_TARGET)",
+                 "Sold 2 lot PE @ 47.65 (strike 23150)",
+                 "Bought 2 lot PE @ 28.60 (strike 23050)",
+                 "Bought 2 lot PE @ 40.10 (strike 23150)",
+                 "Sold 2 lot PE @ 24.60 (strike 23050)",
+                 "Position Status: Close",
+                 "Total Investment: Rs ",
+                 "Total Profit: Rs +348.14 realised"):
+        assert frag in body10, f"compact block is missing {frag!r}"
+    assert TRADE_REPORT_RULE not in body10, "compact block kept the 84-column rule"
+    assert max(len(line) for line in body10.splitlines()) < 60, \
+        "compact block is still too wide for a phone"
+    print("  [OK] compact style: same facts, 44 columns, no lost field")
+
+    # ── 11. A long day is split, never truncated ──────────────────────
+    db11 = _scratch_db()
+    for i in range(14):
+        _add_position(db11, f"p11-{i:02d}", day=_DAY,
+                      entry=f"2026-09-15T09:{20 + i}:00+05:30")
+    rep11, tr11, _c11 = _reporter(db=db11)
+    snap11 = rep11.session_snapshot(as_of=datetime(2026, 9, 15, 15, 31, 0),
+                                    trading_date=_DAY, chain=_CHAIN)
+    assert rep11.notify_stopped(snap11, reason="end of day") is True
+    parts = tr11.calls
+    assert len(parts) >= 2, f"a 14-trade day should need parts, got {len(parts)}"
+    joined = ""
+    for idx, payload in enumerate(parts, start=1):
+        text = payload["text"]
+        assert len(text) <= MAX_MESSAGE_CHARS, \
+            f"part {idx} is {len(text)} chars, over Telegram's limit"
+        assert f"(part {idx}/{len(parts)})" in _unesc(text)
+        assert text.count("<pre>") == text.count("</pre>"), \
+            f"part {idx} has unbalanced <pre> tags"
+        joined += "\n".join(_pre_bodies(text))
+    for i in range(14):
+        assert f"Trade-{i + 1}" in joined, f"Trade-{i + 1} was lost in the split"
+    print(f"  [OK] chunking: 14 trades -> {len(parts)} parts, all under 4096, "
+          f"tags balanced")
+
+    # ── 12. Sends are spaced inside Telegram's flood limit ────────────
+    rep12, tr12, clk12 = _reporter(db=_scratch_db(), telegram_min_gap_sec=3.5)
+    assert rep12.send("first", KIND_INFO) is True
+    assert clk12.slept == [], "the first send should not wait"
+    assert rep12.send("second", KIND_INFO) is True
+    assert len(clk12.slept) == 1 and abs(clk12.slept[0] - 3.5) < 1e-6, \
+        f"expected a 3.5s gap, slept {clk12.slept}"
+    assert rep12.stats["throttled"] == 1
+    print("  [OK] min gap between sends (Telegram allows ~20/min per chat)")
+
+    # ── 13. A 429 is obeyed, not fought ───────────────────────────────
+    tr13 = _FakeTransport(fail_times=1, retry_after=7.0)
+    rep13, _t, clk13 = _reporter(db=_scratch_db(), transport=tr13)
+    assert rep13.send("rate limited", KIND_INFO) is True
+    assert len(tr13.calls) == 2, "the message was not retried after the 429"
+    assert 7.0 in clk13.slept, f"retry_after was ignored: {clk13.slept}"
+    assert rep13.stats["retries"] == 1 and rep13.stats["sent"] == 1
+    print("  [OK] HTTP 429: waits retry_after, then delivers")
+
+    # ── 14/15. A dead network costs a log line, never a cycle ─────────
+    tr14 = _FakeTransport(fail_times=99)
+    rep14, _t14, clk14 = _reporter(db=_scratch_db(), transport=tr14)
+    assert rep14.send("doomed", KIND_INFO) is False
+    assert len(tr14.calls) == MAX_SEND_ATTEMPTS
+    assert rep14.stats["failed"] == 1 and rep14.stats["sent"] == 0
+    assert "HTTP 500" in rep14.last_error
+    tr15 = _FakeTransport(explode=True)
+    rep15, _t15, _c15 = _reporter(db=_scratch_db(), transport=tr15)
+    assert rep15.send("exploding", KIND_INFO) is False
+    assert rep15.notify_started({"as_of": as_of}) is False
+    assert rep15.sync_trades({"as_of": as_of, "trading_date": _DAY}) == 0
+    assert "exploded" in rep15.last_error
+    print("  [OK] failures and exceptions are contained: %d attempts, no raise"
+          % MAX_SEND_ATTEMPTS)
+
+    # ── 16. A full queue sacrifices heartbeats, never a trade ─────────
+    rep16, _t16, _c16 = _reporter(db=_scratch_db(), telegram_max_queue=4)
+    for _ in range(4):
+        rep16._enqueue(KIND_HEARTBEAT, "heartbeat")
+    rep16._enqueue(KIND_TRADE_CLOSE, "a trade closed")
+    kinds = [item[0] for item in rep16._items]
+    assert len(kinds) == 4, f"queue grew past its bound: {kinds}"
+    assert KIND_TRADE_CLOSE in kinds, "a trade event was dropped for a heartbeat"
+    assert kinds.count(KIND_HEARTBEAT) == 3, kinds
+    assert rep16.stats["dropped"] == 1
+    rep16b, _t, _c = _reporter(db=_scratch_db(), telegram_max_queue=4)
+    for kind in (KIND_TRADE_OPEN, KIND_HEARTBEAT, KIND_TRADE_CLOSE, KIND_HEARTBEAT):
+        rep16b._enqueue(kind, kind)
+    rep16b._enqueue(KIND_HEARTBEAT, "newest heartbeat")
+    kinds = [item[0] for item in rep16b._items]
+    assert kinds == [KIND_TRADE_OPEN, KIND_TRADE_CLOSE, KIND_HEARTBEAT,
+                     KIND_HEARTBEAT], kinds
+    print("  [OK] queue overflow drops the oldest heartbeat, keeps trade events")
+
+    # ── 17. The sender thread delivers, and close() drains it ─────────
+    tr17 = _FakeTransport()
+    rep17 = TelegramReporter(_scratch_db(), _config(), None, transport=tr17,
+                             worker=True)
+    assert rep17._thread is not None and rep17._thread.is_alive()
+    for i in range(3):
+        assert rep17.send(f"threaded {i}", KIND_INFO) is True
+    assert rep17.stats["queued"] == 3
+    rep17.close(timeout=5.0)
+    assert rep17.pending() == 0, "close() left updates in the queue"
+    assert tr17.texts == ["threaded 0", "threaded 1", "threaded 2"], tr17.texts
+    assert rep17.stats["sent"] == 3
+    assert not (rep17._thread is not None and rep17._thread.is_alive())
+    rep17.close(timeout=1.0)          # idempotent
+    print("  [OK] sender thread: in order, drained by close(), no network on "
+          "the loop")
+
+    # ── 18. What each status message carries ──────────────────────────
+    db18 = _scratch_db()
+    _add_position(db18, "p18-open", day=_DAY, entry="2026-09-15T09:20:00+05:30",
+                  strategy="LONG_CALL", legs=((23300.0, "call", "BUY", 109.75),))
+    _add_position(db18, "p18-closed", day=_DAY)
+    _close_position(db18, "p18-closed")
+    rep18, tr18, clk18 = _reporter(db=db18)
+    snap18 = {"as_of": as_of, "trading_date": _DAY, "chain": _CHAIN, "cycles": 40}
+    assert rep18.notify_started(snap18) is True
+    clk18.advance(15 * 60)
+    assert rep18.heartbeat_if_due(snap18) is True
+    hb = "\n".join(_pre_bodies(tr18.texts[-1]))
+    assert "Trade-1" in hb and "LONG_CALL" in hb, "the open trade is missing"
+    assert "Trade-2" not in hb, \
+        "a heartbeat re-sent a trade that already had its own close message"
+    assert "Position Status: Open" in hb
+    assert rep18.notify_stopped(snap18, reason="end of day") is True
+    stop = "\n".join(_pre_bodies(tr18.texts[-1]))
+    assert "Trade-1" in stop and "Trade-2" in stop, \
+        "the stop message must carry the whole day"
+    assert "stopped at" in _unesc(tr18.texts[-1])
+    assert "end of day" in _unesc(tr18.texts[-1])
+    assert rep18.notify_stopped(snap18, reason="again") is False
+    assert len([c for c in tr18.calls]) == 3, "the stop message repeated"
+    rep18b, tr18b, clk18b = _reporter(db=db18, telegram_include_open_blocks=False)
+    rep18b.notify_started(snap18)
+    clk18b.advance(15 * 60)
+    assert rep18b.heartbeat_if_due(snap18) is True
+    assert "<pre>" not in tr18b.texts[-1], \
+        "TELEGRAM_INCLUDE_OPEN_BLOCKS=false still attached trade blocks"
+    print("  [OK] heartbeat carries the open trades, stop carries the day")
+
+    # ── 19. The book alone is enough ──────────────────────────────────
+    db19 = _scratch_db()
+    db19.insert("intraday_candles", {
+        "trading_date": _DAY, "candle_time": f"{_DAY}T09:15:00+05:30",
+        "interval_min": 1, "open": 24380.50, "high": 24385.0,
+        "low": 24378.0, "close": 24383.0,
+    })
+    db19.insert("daily_summary", {
+        "trading_date": "2026-09-12", "nifty_open": 24300.0,
+        "nifty_close": 24353.20, "net_pnl_rupees": 0.0,
+    })
+    _add_cycles(db19, _DAY, ["TREND_SELL", "CHOPPY", "TREND_SELL",
+                             "SIGNAL_ONLY", "TREND_SELL"])
+    _add_position(db19, "p19", day=_DAY)
+    _close_position(db19, "p19")
+    rep19, _t19, _c19 = _reporter(db=db19)
+    snap19 = rep19.session_snapshot(as_of=datetime(2026, 9, 15, 11, 0, 0))
+    assert snap19["day_open"] == 24380.50, snap19["day_open"]
+    assert snap19["prev_close"] == 24353.20, snap19["prev_close"]
+    assert snap19["dominant_regime"] == "TREND_SELL", snap19["dominant_regime"]
+    assert snap19["regime_cycles"] == 4, \
+        f"SIGNAL_ONLY is not a regime: {snap19['regime_cycles']}"
+    assert snap19["cycles"] == 5, snap19["cycles"]
+    assert abs(snap19["realized_pnl"] - 348.14) < 1e-9, snap19["realized_pnl"]
+    assert snap19["closed_trades"] == 1 and snap19["open_positions"] == 0
+    assert snap19["day_high"] == 24412.35 and snap19["day_low"] == 24380.50
+    print("  [OK] snapshot rebuilds the day from the book with no engine state")
+
+    # ── 20. "Nifty closed at" says which close it means ───────────────
+    snap20a = rep19.session_snapshot(as_of=datetime(2026, 9, 15, 11, 0, 0))
+    assert snap20a["day_close"] is None
+    assert snap20a["day_close_label"] == "previous day"
+    assert snap20a["closed_value"] == 24353.20
+    snap20b = rep19.session_snapshot(as_of=datetime(2026, 9, 15, 15, 31, 0))
+    assert snap20b["day_close"] == 24412.35, snap20b["day_close"]
+    assert snap20b["day_close_label"] == "today"
+    assert snap20b["closed_value"] == 24412.35
+    rep20, tr20, _c20 = _reporter(db=db19)
+    rep20.notify_stopped(snap20b, reason="end of day")
+    assert "Nifty closed at: 24,412.35 (today)" in _unesc(tr20.texts[-1])
+    print("  [OK] the closing price is labelled today or previous day")
+
+    # ── 21. No database, no chain, no signals: still one message ──────
+    rep21, tr21, _c21 = _reporter(db=None)
+    rep21.db = None
+    rep21.console = None
+    assert rep21.notify_started({"as_of": as_of}) is True
+    text21 = _unesc(tr21.texts[-1])
+    assert "Nifty opened at: n/a" in text21
+    assert "Current Nifty Spot at: n/a" in text21
+    assert "Overall nifty regime: n/a" in text21
+    assert rep21.sync_trades({"as_of": as_of}) == 0
+    assert rep21.notify_stopped({"as_of": as_of}, reason="no book") is True
+    print("  [OK] with no database it still reports, and says n/a not nothing")
+
+    # ── 22. A start that never got off the ground ─────────────────────
+    rep22, tr22, _c22 = _reporter(db=_scratch_db())
+    assert rep22.notify_start_failed("Upstox access token is invalid/expired") is True
+    text22 = _unesc(tr22.texts[-1])
+    assert "stopped at" in text22
+    assert "start failed: Upstox access token is invalid/expired" in text22
+    assert rep22.notify_stopped({"as_of": as_of}, reason="late") is False, \
+        "a failed start must not be followed by a second stop message"
+    print("  [OK] a failed start is reported once, as a stop with the reason")
+
+    # ── 23. The token never leaves the process ────────────────────────
+    rep23, tr23, _c23 = _reporter(db=_scratch_db())
+    token = _config().alert_telegram_bot_token
+    assert token not in rep23.describe()
+    assert rep23.masked_token != token and token[-3:] in rep23.masked_token
+    rep23.notify_started({"as_of": as_of})
+    assert all(token not in c["text"] for c in tr23.calls)
+    assert all(token not in str(v) for c in tr23.calls for v in c.values())
+    assert rep23.describe().startswith("Telegram updates ON")
+    print("  [OK] the bot token is masked in every log line and message")
+
+    # ── 24. The five requirements, through main.py's own methods ──────
+    # Everything above tests this module. This drives the methods MainEngine
+    # actually calls - _telegram_snapshot(), _telegram_after_cycle(),
+    # _telegram_heartbeat(), _telegram_notify_stopped() - on a real
+    # MainEngine instance with the broker-facing engines stubbed, so the
+    # wiring is verified end to end without a broker or a Telegram account.
+    print_section("Main Engine Wiring (the five requirements)")
+    import signal as _signal24
+    try:
+        import main as _main24
+    except Exception as exc24:
+        print(f"  [SKIP] main.py could not be imported ({exc24})")
+        _main24 = None
+    if _main24 is not None:
+        # MainEngine's snapshot builder stamps a message with the real clock,
+        # so this section dates its fixtures today rather than on the fixed
+        # sample date the sections above use.
+        day24 = today_ist().isoformat()
+        db24 = _scratch_db()
+        _add_cycles(db24, day24, ["TREND_SELL", "TREND_SELL", "CHOPPY"])
+        cfg24 = _config()
+        tr24 = _FakeTransport()
+        clk24 = _FakeClock()
+        log24 = _StubLogger()
+
+        class _StubMarket:
+            def __init__(self, state, chain):
+                self.state = state
+                self.last_chain = chain
+
+        class _StubExecution:
+            def __init__(self, db, day):
+                self.db, self.day = db, day
+
+            def _get_open_positions(self):
+                return self.db.query(
+                    "SELECT * FROM positions WHERE trading_date=? "
+                    "AND status='OPEN'", (self.day,))
+
+            def _get_position_legs(self, position_id):
+                return self.db.query(
+                    "SELECT * FROM position_legs WHERE position_id=? "
+                    "ORDER BY leg_id ASC", (position_id,))
+
+        eng = _main24.MainEngine.__new__(_main24.MainEngine)
+        eng.config           = cfg24
+        eng.db               = db24
+        eng.logger           = log24
+        eng.market_engine    = _StubMarket(
+            {"trading_date": day24, "daily_pnl": 348.14,
+             "current_capital": 1000348.14, "daily_halted": False,
+             "entry_count": 1, "consecutive_stops": 0,
+             "prev_spot": 24412.35, "prev_vix": 12.40},
+            _CHAIN,
+        )
+        eng.execution_engine = _StubExecution(db24, day24)
+        eng.telegram = TelegramReporter(
+            db24, cfg24, log24,
+            console=TradeConsoleReporter(db24, cfg24, log24),
+            transport=tr24, clock=clk24, sleep=clk24.sleep, worker=False,
+        )
+        eng.loop_count       = 12
+        eng._started_at      = datetime(2026, 9, 15, 9, 2, 11)
+        eng._start_mode      = "manual (interactive terminal)"
+        eng._last_signals    = {}
+        eng._eod_done        = False
+        eng._signal_received = None
+        eng.running          = True
+
+        sig24 = {"spot": 24412.35, "vix": 12.40, "prev_close": 24353.20,
+                 "vol_regime": "VOL_SELL", "price_regime": "TREND_UP",
+                 "final_regime": "TREND_SELL"}
+
+        # (1) the engine started
+        assert eng.telegram.notify_started(eng._telegram_snapshot(sig24)) is True
+        assert len(tr24.calls) == 1
+        start24 = _unesc(tr24.texts[-1])
+        assert "Nifty options trade engine started at" in start24
+        assert "Total cycles completed: 12" in start24
+        assert "manual (interactive terminal)" in start24
+        assert "Overall nifty regime: TREND_SELL" in start24
+
+        # (3) a trade order placed - and only once
+        _add_position(db24, "p24", day=day24)
+        eng._telegram_after_cycle(sig24, 348.14)
+        assert len(tr24.calls) == 2, "a placed trade did not produce a message"
+        assert "Trade order placed - Trade-1 BULL_PUT_SPREAD" in _unesc(tr24.texts[-1])
+        eng._telegram_after_cycle(sig24, 348.14)
+        assert len(tr24.calls) == 2, "the same open trade was announced twice"
+
+        # (4) a trade order closed
+        _close_position(db24, "p24")
+        eng._telegram_after_cycle(sig24, 696.28)
+        assert len(tr24.calls) == 3, "a closed trade did not produce a message"
+        closed24 = _unesc(tr24.texts[-1])
+        assert "Trade order closed - Trade-1 BULL_PUT_SPREAD" in closed24
+        assert "Net Rs +348.14 realised" in closed24
+
+        # A second trade, left open, so the heartbeat has something to carry
+        # and compute_unrealized_pnl() has something to mark.
+        _add_position(db24, "p24b", day=day24, entry="2026-09-15T13:05:00+05:30",
+                      last_known_premium=15.50, last_liquidation_premium=15.50)
+        eng._telegram_after_cycle(sig24, 348.14)
+        assert len(tr24.calls) == 4
+        assert "Trade order placed - Trade-2" in _unesc(tr24.texts[-1])
+
+        # (2) the heartbeat: nothing before 15 minutes, one at 15
+        eng._telegram_heartbeat()
+        assert len(tr24.calls) == 4, "a heartbeat fired early"
+        clk24.advance(15 * 60)
+        eng._telegram_heartbeat()
+        assert len(tr24.calls) == 5, "the 15-minute heartbeat did not fire"
+        hb24 = _unesc(tr24.texts[-1])
+        assert "15-minute heartbeat" in hb24
+        expected_unrealized = (
+            (19.05 - 15.50) * cfg24.lot_size * 2) - 57.67 - (57.67 * 0.95)
+        snap24 = eng._telegram_snapshot(sig24)
+        assert abs(snap24["unrealized_pnl"] - expected_unrealized) < 0.01, \
+            f"unrealised P&L {snap24['unrealized_pnl']} != {expected_unrealized}"
+        assert abs(snap24["total_pnl"] - (348.14 + expected_unrealized)) < 0.01
+        assert f"unrealised {_tr_signed(expected_unrealized)}" in hb24, hb24
+        assert "Trade-2" in "\n".join(_pre_bodies(tr24.texts[-1])), \
+            "the heartbeat did not carry the open trade"
+        assert "Trade-1" not in "\n".join(_pre_bodies(tr24.texts[-1])), \
+            "the heartbeat re-sent a trade that already had its own message"
+
+        # (5) the engine stopped, with the reason, once
+        assert eng._telegram_stop_reason() == "main loop ended"
+        eng._signal_received = _signal24.SIGINT
+        assert eng._telegram_stop_reason() == "signal SIGINT (Ctrl+C)"
+        eng._signal_received = _signal24.SIGTERM
+        assert eng._telegram_stop_reason() == "signal SIGTERM"
+        eng._eod_done = True
+        assert eng._telegram_stop_reason() == "end of day", \
+            "the end-of-day reason must win over the signal that ended it"
+        eng._eod_done = False
+        eng._signal_received = _signal24.SIGINT
+        eng._telegram_notify_stopped()
+        assert len(tr24.calls) == 6, "the stop message was not sent"
+        stop24 = _unesc(tr24.texts[-1])
+        assert "Nifty options trade engine stopped at" in stop24
+        assert "signal SIGINT (Ctrl+C)" in stop24
+        stop_blocks = "\n".join(_pre_bodies(tr24.texts[-1]))
+        assert "Trade-1" in stop_blocks and "Trade-2" in stop_blocks, \
+            "the stop message must carry the whole day"
+        eng._telegram_notify_stopped()
+        assert len(tr24.calls) == 6, "the engine announced its stop twice"
+
+        assert not log24.problems, f"the wiring logged problems: {log24.problems}"
+        print("  [OK] start, heartbeat, placed, closed and stop all fire from")
+        print("       MainEngine's own methods, once each, with the engine's")
+        print("       own P&L and regime numbers")
+
+    print_section("TELEGRAM REPORTER SELF-TEST COMPLETE", char="#")
+    print("  All tests passed")
+    print("  Live probe (needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in env.txt):")
+    print("      python3 telegram_reporter.py --send-test")
+
+
+def _print_status() -> int:
+    """Show what the reporter would do with the current env.txt. Sends nothing."""
+    config = load_config()
+    rep = TelegramReporter(None, config, None, worker=False)
+    print_section("TELEGRAM REPORTER - RESOLVED CONFIGURATION")
+    for label, value in (
+        ("enabled",            rep.enabled),
+        ("bot token",          rep.masked_token),
+        ("chat id",            rep.chat_id or "(unset)"),
+        ("report chat id",     getattr(config, "telegram_report_chat_id", "") or "(same as alerts)"),
+        ("heartbeat",          f"every {rep.heartbeat_sec / 60.0:.1f} min"),
+        ("min gap between sends", f"{rep.min_gap:.2f}s"),
+        ("timeout",            f"{rep.timeout:.1f}s"),
+        ("max queued updates", rep.max_queue),
+        ("parse mode",         rep.parse_mode or "(plain text)"),
+        ("trade block style",  rep.block_style),
+        ("open blocks in heartbeat", rep.include_open_blocks),
+        ("requests available", requests is not None),
+    ):
+        print(f"  {label:<26}: {value}")
+    print()
+    print(f"  {rep.describe()}")
+    return 0 if rep.enabled else 1
+
+
+def _live_send_test() -> int:
+    """Send one real message. The only test that needs the network."""
+    config = load_config()
+    rep = TelegramReporter(None, config, None, worker=False)
+    print_section("TELEGRAM REPORTER - LIVE SEND TEST")
+    print(f"  {rep.describe()}")
+    if not rep.enabled:
+        print("  Nothing to send: configure TELEGRAM_BOT_TOKEN and "
+              "TELEGRAM_CHAT_ID in env.txt")
+        return 1
+    snap = rep.session_snapshot(cycles=0)
+    text = rep.compose_status(KIND_START, snap)
+    print(f"  sending {len(text)} character(s) to chat {rep.chat_id} ...")
+    ok = rep.send(text, KIND_START)
+    print(f"  delivered: {ok}")
+    if not ok:
+        print(f"  last error: {rep.last_error}")
+        print("  A 401 means the bot token is wrong; a 400 usually means the "
+              "chat id is; a 403 means the bot was never added to that chat.")
+    return 0 if ok else 1
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--send-test" in argv:
+        return _live_send_test()
+    if "--status" in argv:
+        return _print_status()
+    _self_test()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+''',
+}
 
 
 def root(argv):
@@ -644,12 +2718,25 @@ def apply_hunks(text, hunks):
 
 
 def write_atomic(path, text):
-    """Replace a file in one step, so a crash cannot leave it half-written."""
+    """Replace a file in one step, so a crash cannot leave it half-written.
+
+    The mode is carried over from the file being replaced (or 0644 for a new
+    one): mkstemp creates 0600, and os.replace() keeps the temporary file's
+    mode, which would otherwise leave the patched tree readable only by its
+    owner.
+    """
     d = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".patch_v7_", suffix=".tmp")
+    mode = 0o644
+    if os.path.exists(path):
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except OSError:
+            pass
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".patch_v8_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):
@@ -659,54 +2746,72 @@ def write_atomic(path, text):
 
 def main(argv):
     base = root(argv)
+    every = TARGETS + CREATED
     missing = [r for r in TARGETS if not os.path.isfile(os.path.join(base, r))]
     if missing:
         print(f"ABORT: not found under {base}: {', '.join(missing)}")
-        print("usage: python3 patch_v7.py [/path/to/repo]")
+        print("usage: python3 patch_v8.py [/path/to/repo]")
         return 2
 
-    staged, notes = {}, []
-    for rel in TARGETS:
-        path = os.path.join(base, rel)
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-        digest = hashlib.md5(text.encode()).hexdigest()
-        table = MD5[rel]
-
-        if digest == table["final"]:
-            staged[rel] = (text, "current", 0, len([
-                h for h in PLANS["v6"] if h[0] == rel]))
-            continue
-
-        if digest != table["v6"]:
-            notes.append(
-                f"{rel}: content is neither the tested v6 state nor the v7 "
-                f"result (got {digest[:12]}); trying the hunks anyway")
-
-        mine = [h for h in PLANS["v6"] if h[0] == rel]
-        if not mine and digest != table["final"]:
-            print(f"ABORT: {rel}: this patch carries no hunk for that file and "
-                  f"it is not the tested v7 content ({digest[:12]} != "
-                  f"{table['final'][:12]}) - nothing was modified")
+    # The patch itself is checked before anything is touched: the embedded
+    # new-file source has to hash to the tested v8 content, or this file was
+    # truncated or edited in transit.
+    for rel in CREATED:
+        got = hashlib.md5(NEW_SOURCE[rel].encode()).hexdigest()
+        if got != MD5[rel]["v8"]:
+            print(f"ABORT: patch_v8.py is corrupt - the embedded {rel} hashes "
+                  f"to {got[:12]}, expected {MD5[rel]['v8'][:12]}")
             return 3
 
-        out, status, applied, skipped = apply_hunks(text, mine)
+    staged, notes = {}, []
+    for rel in every:
+        path = os.path.join(base, rel)
+        text = None
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        digest = hashlib.md5(text.encode()).hexdigest() if text is not None else None
+        table = MD5[rel]
+
+        if digest == table["v8"]:
+            staged[rel] = (text, "current", 0, len([
+                h for h in PLAN_V8 if h[0] == rel]) or (1 if rel in CREATED else 0))
+            continue
+
+        if rel in CREATED:
+            if text is not None:
+                print(f"ABORT: {rel} already exists with unrecognised content "
+                      f"({digest[:12]} != {table['v8'][:12]}) - it will not be "
+                      f"overwritten, and nothing else was modified")
+                return 3
+            staged[rel] = (NEW_SOURCE[rel], "create", 1, 0)
+            continue
+
+        if digest != table["v7"]:
+            notes.append(
+                f"{rel}: content is neither the tested v7 state nor the v8 "
+                f"result (got {digest[:12] if digest else 'missing'}); trying "
+                f"the hunks anyway")
+
+        mine = [h for h in PLAN_V8 if h[0] == rel]
+        out, status, applied, skipped = apply_hunks(text or "", mine)
         if out is None:
             print(f"ABORT: {rel}: {status} - nothing was modified")
-            print("The file has drifted from the tested v6 content. Restore it")
-            print("(git checkout -- " + rel + ") or apply the missing patch.")
+            print("The file has drifted from the tested v7 content. Apply")
+            print("patch_v7.py first, or restore the file (git checkout -- "
+                  + rel + ") and re-apply the patch chain.")
             return 3
 
         got = hashlib.md5(out.encode()).hexdigest()
-        if got != table["final"]:
-            print(f"ABORT: {rel} did not land on the tested v7 content")
-            print(f"       got {got[:12]} expected {table['final'][:12]} "
+        if got != table["v8"]:
+            print(f"ABORT: {rel} did not land on the tested v8 content")
+            print(f"       got {got[:12]} expected {table['v8'][:12]} "
                   f"- nothing was modified")
             return 3
         staged[rel] = (out, status, applied, skipped)
 
-    print(f"patch_v7: patching {base}")
-    for rel in TARGETS:
+    print(f"patch_v8: patching {base}")
+    for rel in every:
         _text, status, applied, skipped = staged[rel]
         print(f"  {rel:22s} {status:9s} applied={applied} already_present={skipped}")
     for n in notes:
@@ -716,34 +2821,46 @@ def main(argv):
     try:
         for rel, (text, status, _a, _s) in staged.items():
             path = os.path.join(base, rel)
-            with open(path, "r", encoding="utf-8") as fh:
-                backups[rel] = fh.read()
+            backups[rel] = None
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    backups[rel] = fh.read()
             if status not in ("unchanged", "current"):
                 write_atomic(path, text)
                 written.append(rel)
-        for rel in TARGETS:
+        for rel in every:
             py_compile.compile(os.path.join(base, rel), doraise=True)
     except Exception as exc:
         print(f"ABORT: {exc.__class__.__name__}: {exc} - reverting")
         for rel, text in backups.items():
-            write_atomic(os.path.join(base, rel), text)
+            path = os.path.join(base, rel)
+            if text is None:
+                if os.path.exists(path):
+                    os.unlink(path)
+            else:
+                write_atomic(path, text)
         return 4
 
     if written:
-        print(f"patch_v7 applied: {len(written)} file(s) changed "
+        print(f"patch_v8 applied: {len(written)} file(s) written "
               f"({', '.join(written)})")
     else:
-        print("patch_v7 applied: nothing to do - the tree is already at v7")
+        print("patch_v8 applied: nothing to do - the tree is already at v8")
     print()
     for c in CHANGES:
         print(f"  + {c}")
     print()
-    print("verify:  python3 verify_all.py")
-    print("         python3 backtest_engine.py --test")
-    print("         python3 execution_engine.py")
+    print("env.txt: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are the only")
+    print("         required keys, and they are the v6 alert ones - if the")
+    print("         failure alerts already reach your phone, so will these.")
+    print("         Switch the lot off with TELEGRAM_UPDATES_ENABLED=false.")
+    print()
+    print("verify:  python3 verify_all.py            # 8 of 8 targets")
+    print("         python3 telegram_reporter.py --test   # 24 sections")
+    print("         python3 telegram_reporter.py --status # what is configured")
+    print("         python3 telegram_reporter.py --send-test  # one real message")
     print("replay:  python3 backtest_engine.py --db data/per_day/"
           "nifty_algo_2026-09-11.db --trade-report=each_cycle")
-    print("report:  TRADE_REPORT_MODE=each_cycle|on_change|off in env.txt")
     return 0
 
 

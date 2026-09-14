@@ -944,6 +944,38 @@ class Config:
     # trades are the ones printed when the cap bites.
     trade_report_max_per_cycle:    int   = 0
 
+    # ── v8: Telegram lifecycle updates ────────────────────────────────
+    # Five messages and no more: the engine started, a heartbeat every
+    # telegram_heartbeat_min minutes while it runs, a trade order placed, a
+    # trade order closed, and the engine stopped (with the reason). They are
+    # sent by telegram_reporter.TelegramReporter on its own daemon thread, so
+    # a slow or dead network can never stall a trading cycle.
+    # The bot token and chat id are the v6 alert ones (TELEGRAM_BOT_TOKEN /
+    # TELEGRAM_CHAT_ID); telegram_report_chat_id optionally sends these
+    # reports to a different chat than the failure alerts.
+    telegram_updates_enabled:      bool  = True
+    telegram_report_chat_id:       str   = ""
+    # 15 minutes is what the operator asked for. The floor is 1 minute:
+    # Telegram allows roughly 20 messages a minute into one group chat, and
+    # a heartbeat faster than that would compete with the trade events for
+    # the same budget.
+    telegram_heartbeat_min:        float = 15.0
+    # Minimum spacing between two sends, default 3.5s = ~17/minute, inside
+    # Telegram's per-chat flood limit, so a burst of closes queues rather
+    # than 429s.
+    telegram_min_gap_sec:          float = 3.5
+    telegram_timeout_sec:          float = 8.0
+    telegram_max_queue:            int   = 60
+    # HTML keeps the trade block monospaced with <pre>; "" sends plain text.
+    telegram_parse_mode:           str   = "HTML"
+    # console -> the exact 84-column block the terminal prints.
+    # compact -> the same fields at 44 columns, for a phone screen that
+    #            would otherwise wrap every rule and every leg line.
+    telegram_trade_block_style:    str   = "console"
+    # A heartbeat carries the trades still in progress; a stop carries the
+    # whole day. Switch this off for status lines only.
+    telegram_include_open_blocks:  bool  = True
+
     def __repr__(self) -> str:
         def mask(s: str) -> str:
             if not s:
@@ -1330,6 +1362,34 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         trade_report_max_per_cycle=min(
             max(_get_int(env, "TRADE_REPORT_MAX_PER_CYCLE", 0), 0), 500
         ),
+        # ── v8 Telegram lifecycle updates ─────────────────────────────────
+        # The token and chat id are read above with the v6 alert settings
+        # (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), so one env.txt entry feeds
+        # both the failure alerts and these lifecycle updates.
+        telegram_updates_enabled=_get_bool(env, "TELEGRAM_UPDATES_ENABLED", True),
+        telegram_report_chat_id=env.get("TELEGRAM_REPORT_CHAT_ID", "").strip(),
+        telegram_heartbeat_min=min(
+            max(_get_float(env, "TELEGRAM_HEARTBEAT_MIN", 15.0), 1.0), 240.0
+        ),
+        telegram_min_gap_sec=min(
+            max(_get_float(env, "TELEGRAM_MIN_GAP_SEC", 3.5), 0.0), 60.0
+        ),
+        telegram_timeout_sec=min(
+            max(_get_float(env, "TELEGRAM_TIMEOUT_SEC", 8.0), 1.0), 30.0
+        ),
+        telegram_max_queue=min(
+            max(_get_int(env, "TELEGRAM_MAX_QUEUE", 60), 4), 1000
+        ),
+        # Not _get_choice(): Telegram's parse_mode is case-sensitive, and
+        # _get_choice lowercases what it returns. The reporter canonicalises
+        # whatever is written here ("html" -> "HTML", "plain"/"none" -> "").
+        telegram_parse_mode=env.get("TELEGRAM_PARSE_MODE", "HTML").strip(),
+        telegram_trade_block_style=_get_choice(
+            env, "TELEGRAM_TRADE_BLOCK_STYLE", "console", ("console", "compact")
+        ),
+        telegram_include_open_blocks=_get_bool(
+            env, "TELEGRAM_INCLUDE_OPEN_BLOCKS", True
+        ),
     )
 
 
@@ -1469,6 +1529,13 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_vrp               REAL,
     entry_vrp_smoothed      REAL,
     entry_credit            REAL,
+    -- v8: the credit the FILLS booked, written beside the planned credit by
+    -- the live close path since v7 - but declared in no schema, so a book
+    -- created by Database() alone (a tool, a test, eod_report.py) never had
+    -- the column. Same class of gap as v7's trade_exits columns: declared
+    -- here, migrated below, and still ensured at engine start so an existing
+    -- book is repaired on the next run.
+    entry_credit_realised   REAL,
     gross_credit            REAL,
     opening_straddle_at_entry REAL,
     total_slippage          REAL,
@@ -1492,6 +1559,13 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_costs_rupees       REAL,
     net_pnl_rupees          REAL,
     last_known_premium      REAL,
+    -- v8: the mark a forced liquidation would have got, written by
+    -- monitor_position() every cycle and read by the trade report. It was
+    -- created only by MarketDataEngine._ensure_extra_columns() and (since v7)
+    -- ExecutionEngine._ensure_extra_columns(), never by the schema itself, so
+    -- which engine happened to be constructed first decided whether the
+    -- column existed at all.
+    last_liquidation_premium REAL,
     profit_lock_activated   INTEGER DEFAULT 0,
     profit_lock_stop_level  REAL,
     paper_trade             INTEGER DEFAULT 1,
@@ -2181,6 +2255,10 @@ MIGRATION_SQL: List[str] = [
     "ALTER TABLE positions ADD COLUMN price_stop_level_call REAL",
     "ALTER TABLE positions ADD COLUMN price_stop_level_put REAL",
     "ALTER TABLE positions ADD COLUMN is_borderline_sell INTEGER DEFAULT 0",
+    # v8: the two positions columns the engines have been writing since v7
+    # (and, for the liquidation mark, before it) that no schema declared.
+    "ALTER TABLE positions ADD COLUMN entry_credit_realised REAL",
+    "ALTER TABLE positions ADD COLUMN last_liquidation_premium REAL",
     "ALTER TABLE trade_entries ADD COLUMN vol_regime_at_entry TEXT",
     "ALTER TABLE trade_entries ADD COLUMN price_regime_at_entry TEXT",
     "ALTER TABLE trade_entries ADD COLUMN positioning_at_entry TEXT",

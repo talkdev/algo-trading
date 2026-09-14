@@ -28,6 +28,11 @@ from regime_engine import RegimeEngine, merge_regime_into_signals
 from calibration_engine import CalibrationEngine
 from strategy_engine import StrategyEngine
 from execution_engine import ExecutionEngine
+# v8: the five Telegram lifecycle updates - engine started, a heartbeat every
+# TELEGRAM_HEARTBEAT_MIN minutes while it runs, a trade order placed, a trade
+# order closed, and the engine stopped with the reason. Its own module and its
+# own daemon sender thread, so the trading loop never waits on the network.
+from telegram_reporter import TelegramReporter, start_mode as telegram_start_mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,6 +118,21 @@ class MainEngine:
         self.trade_reporter = TradeConsoleReporter(
             self.db, self.config, self.logger, source="TRADE ENGINE"
         )
+
+        # ── v8: Telegram lifecycle updates ───────────────────────────────
+        # Shares the console reporter, so Trade-<n> on a phone is the same
+        # trade as Trade-<n> on the screen, and the block is rendered by one
+        # piece of code from the persisted book. Disabled quietly when
+        # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not in env.txt.
+        self.telegram = TelegramReporter(
+            self.db, self.config, self.logger,
+            console=self.trade_reporter, source="TRADE ENGINE",
+        )
+        self._started_at    = now_ist()
+        self._start_mode    = telegram_start_mode()
+        # The last cycle's signals, so a heartbeat taken between cycles - or
+        # before the first one - can still name the current regime.
+        self._last_signals: dict = {}
 
         # ── Loop state ────────────────────────────────────────────────────
         self.loop_count              = 0
@@ -205,6 +225,8 @@ class MainEngine:
             print("\n  " + "!" * 70)
             print("  !!! WARNING: LIVE TRADING MODE — REAL ORDERS WILL BE PLACED !!!")
             print("  " + "!" * 70 + "\n")
+        # v8: say on the console whether the phone will ring, and why not.
+        print(f"  {self.telegram.describe()}")
         print()
 
     def _verify_lot_size(self) -> None:
@@ -522,6 +544,17 @@ class MainEngine:
         self._last_cycle_ok_mono    = time_module.monotonic()
         self._last_cycle_ok_at      = now_ist()
         self.loop_count             = 0
+
+        # ── v8: the Telegram trade latch is a per-session latch too ───────
+        # Without this, a process left running across sessions would treat
+        # today's positions as already announced if an id were ever reused,
+        # and would keep yesterday's trades in its "seen" set for good. The
+        # start/stop/heartbeat latches deliberately survive: they belong to
+        # the process, not to the session.
+        try:
+            self.telegram.reset_day(today_str)
+        except Exception as e:
+            self.logger.debug(f"telegram day reset error: {e}")
 
         self.logger.info(
             f"Daily state reset for new day: {today_str} "
@@ -970,6 +1003,10 @@ class MainEngine:
 
         self.loop_count += 1
 
+        # ── Step 12: Telegram trade updates (v8) ──────────────────────────
+        # After the counter, so the message reports the cycle it belongs to.
+        self._telegram_after_cycle(signals, total_pnl)
+
     def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:
         """Print concise cycle summary to console."""
         open_positions = self.execution_engine._get_open_positions()
@@ -1021,6 +1058,116 @@ class MainEngine:
             )
         except Exception as e:
             self.logger.debug(f"trade report error: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # v8: TELEGRAM LIFECYCLE UPDATES
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _telegram_snapshot(self, signals: Optional[dict] = None,
+                           total_pnl: Optional[float] = None) -> dict:
+        """What an update may say, taken from the engine's own state.
+
+        Anything not supplied here is read back out of the book by the
+        reporter, so a message composed before the first cycle - or after the
+        database has been reopened by a tool - still says something true.
+        Building it costs queries, which is why every caller either needs it
+        (a start, a stop, an event) or hands the reporter a callable that is
+        only invoked when an update is actually due.
+        """
+        try:
+            sig = signals if signals is not None else self._last_signals
+            return self.telegram.session_snapshot(
+                state=self.market_engine.state,
+                signals=sig,
+                cycles=self.loop_count,
+                started_at=self._started_at,
+                start_mode=self._start_mode,
+                unrealized_pnl=self.compute_unrealized_pnl(),
+                total_pnl=(
+                    total_pnl if total_pnl is not None
+                    else self.compute_total_daily_pnl()
+                ),
+                chain=self.market_engine.last_chain,
+            )
+        except Exception as e:
+            self.logger.debug(f"telegram snapshot error: {e}")
+            return {}
+
+    def _telegram_after_cycle(self, signals: dict, total_pnl: float) -> None:
+        """Requirements 3 and 4: one message per trade placed, one per close.
+
+        The reporter reads the book and works out what changed, which is why
+        this is safe to call unconditionally at the end of a cycle: a trade
+        closed by the hard-exit sweep, by a halt flatten or by the watchdog is
+        in the same table as one closed by the normal exit ladder, and gets
+        reported exactly once either way.
+        """
+        try:
+            self._last_signals = dict(signals or {})
+            self.telegram.sync_trades(
+                lambda: self._telegram_snapshot(signals, total_pnl)
+            )
+        except Exception as e:
+            self.logger.debug(f"telegram trade update error: {e}")
+
+    def _telegram_heartbeat(self) -> None:
+        """Requirement 2: one message every TELEGRAM_HEARTBEAT_MIN minutes.
+
+        Called at the top of every loop iteration, including the holiday and
+        pre-market branches: the operator asked to hear from a running engine,
+        not only from a trading one. When it is not due this is a single
+        monotonic comparison - no snapshot, no query, no message.
+        """
+        try:
+            self.telegram.heartbeat_if_due(lambda: self._telegram_snapshot())
+        except Exception as e:
+            self.logger.debug(f"telegram heartbeat error: {e}")
+
+    def _telegram_stop_reason(self) -> str:
+        """Why the engine stopped, for the message that says it stopped."""
+        if self._eod_done:
+            return "end of day"
+        signum = self._signal_received
+        if signum is not None:
+            try:
+                name = signal.Signals(signum).name
+            except Exception:
+                name = str(signum)
+            return f"signal {name}" + (" (Ctrl+C)" if name == "SIGINT" else "")
+        if not self.running:
+            return "engine stopped"
+        return "main loop ended"
+
+    def _telegram_notify_stopped(self, reason: Optional[str] = None) -> None:
+        """Requirement 5: one message when the engine stops, at most once.
+
+        Every exit path funnels through here - the end-of-day break, Ctrl+C,
+        SIGTERM and a fatal error - and the reporter latches, so a stop that
+        was already announced is not announced twice.
+        """
+        try:
+            self.telegram.notify_stopped(
+                self._telegram_snapshot(),
+                reason=reason or self._telegram_stop_reason(),
+            )
+        except Exception as e:
+            self.logger.debug(f"telegram stop update error: {e}")
+
+    def _telegram_notify_start_failed(self, reason: str) -> None:
+        """A start that never reached the loop still gets one message.
+
+        These paths return before the loop's finally block, so they close the
+        sender thread themselves: without that, the process would exit with
+        the message still queued and the operator would see nothing at all.
+        """
+        try:
+            self.telegram.notify_start_failed(reason, self._telegram_snapshot())
+        except Exception as e:
+            self.logger.debug(f"telegram start-failure update error: {e}")
+        try:
+            self.telegram.close(timeout=5.0)
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────────────────
     # DAILY SUMMARY
@@ -1374,6 +1521,16 @@ class MainEngine:
         self._eod_done = True
         self.logger.info("End-of-day tasks complete.")
 
+        # ── v8 requirement 5, end-of-day path: the day's record ───────────
+        # Sent last, after the daily summary is written, so the message can
+        # carry today's close (labelled "today" rather than "previous day")
+        # and every trade of the session in its final state. The loop's
+        # finally block will find this latch already set and stay quiet.
+        # The queue is flushed by the main loop's finally block, which always
+        # runs after this one: stopping the sender thread here would leave the
+        # rest of the process sending inline.
+        self._telegram_notify_stopped(reason="end of day")
+
     # ─────────────────────────────────────────────────────────────────────
     # GRACEFUL SHUTDOWN
     # ─────────────────────────────────────────────────────────────────────
@@ -1668,6 +1825,12 @@ class MainEngine:
             self.logger.error(
                 "FATAL: UPSTOX_ACCESS_TOKEN not set in env.txt. Cannot start."
             )
+            # v8: a start that never reached the loop still has to be heard
+            # about - this is the failure nobody sees, because there is no
+            # console attached to a supervised restart.
+            self._telegram_notify_start_failed(
+                "UPSTOX_ACCESS_TOKEN is not set in env.txt"
+            )
             self.db.close()
             return
 
@@ -1675,6 +1838,9 @@ class MainEngine:
             self.logger.error(
                 "FATAL: Upstox access token is invalid/expired. "
                 "Regenerate and update env.txt."
+            )
+            self._telegram_notify_start_failed(
+                "the Upstox access token is invalid or expired"
             )
             self.db.close()
             return
@@ -1730,6 +1896,17 @@ class MainEngine:
                 "Post-market: Engine ready. Next session starts at 09:15."
             )
         self._start_watchdog()
+
+        # ── v8 requirement 1: the engine has started ──────────────────────
+        # Sent here rather than at the top of run(): by now the token has
+        # been validated, the book reconciled and capital carried forward, so
+        # "started" is a true statement. Whether a human typed the command or
+        # a supervisor did is in the message.
+        try:
+            self.telegram.notify_started(self._telegram_snapshot())
+        except Exception as e:
+            self.logger.debug(f"telegram start update error: {e}")
+
         self.logger.info("Press Ctrl+C to stop.")
 
         # ── Main loop ─────────────────────────────────────────────────────
@@ -1738,6 +1915,13 @@ class MainEngine:
                 loop_start   = now_ist()
                 current_time = loop_start.time()
                 now_mono     = time_module.monotonic()
+
+                # ── v8 requirement 2: the 15-minute heartbeat ─────────────
+                # Ahead of the holiday and pre-market branches on purpose, so
+                # the update keeps arriving while the engine is up and
+                # waiting. Not due -> one monotonic comparison and nothing
+                # else happens.
+                self._telegram_heartbeat()
 
                 # ── Holiday check ─────────────────────────────────────────
                 if ExpiryCalendar.is_holiday(today_ist()):
@@ -1814,6 +1998,20 @@ class MainEngine:
 
         finally:
             self._stop_watchdog()
+            # ── v8 requirement 5: the engine has stopped ──────────────────
+            # Every exit path lands here - the end-of-day break, Ctrl+C,
+            # SIGTERM and a fatal error - and it runs after
+            # perform_graceful_shutdown(), so the message reports the book as
+            # it was actually left. notify_stopped() latches, so the
+            # end-of-day message sent from perform_end_of_day_tasks() and this
+            # one can never both go out.
+            self._telegram_notify_stopped()
+            try:
+                # Flush the sender thread before the process goes away: it is
+                # a daemon, so an unflushed queue would simply vanish.
+                self.telegram.close(timeout=8.0)
+            except Exception as e:
+                self.logger.debug(f"telegram shutdown error: {e}")
 
         self.db.close()
 
