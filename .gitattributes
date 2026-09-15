@@ -1,1 +1,0 @@
-data/nifty_algo_v3.db filter=lfs diff=lfs merge=lfs -text

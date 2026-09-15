@@ -878,6 +878,103 @@ class Config:
         "wide_or", "dangerous_to_sell",
     )
 
+    # ── v12 (patch_v12): the directional trend route ────────────────────
+    # v5 taught the engine to buy a confirmed trend. It then fenced that
+    # route out of the tape it was written for: it answers only six refusal
+    # markers, so it never sees an IV-expansion or day-move refusal (the two
+    # that account for 298 of 484 cycles on 2026-09-15), it cannot trade DTE
+    # 0 (momentum_min_dte = 1 — expiry day IS the trend day on the Tuesday
+    # weekly), it re-blocks EXPANDING IV in its own gate, and its
+    # day_move cap (90) is stricter than the sell-side gate it exists to
+    # answer (125), so it is refused by the very number that refused the
+    # sell side. The result was a two-hour, 265-point opening-range
+    # breakdown traded by nobody.
+    #
+    # The route below is the buy-side answer to a SELL-SIDE refusal, and
+    # nothing else. It is a different trade from the sell side, not a
+    # looser version of it: the risk is the premium paid (capped), the
+    # exposure is delta not vega, the stop is on the option's own value and
+    # the ticket is flattened before the bell on expiry day.
+    trend_route_enabled:                     bool  = True
+    # Its own entry window. Deliberately NOT tied to entry_start: the
+    # Tuesday 0DTE sell-side window (10:30) is calibrated for naked gamma
+    # and is preserved untouched. An opening-range breakout is a 09:45-11:00
+    # event by construction — the OR is not complete until 09:45 and the
+    # level is usually spent within the hour — so the buy-side window opens
+    # at 09:50 and closes with the session's own last-entry rule.
+    trend_route_start:                       dtime = dtime(9, 50)
+    trend_route_last_entry:                  dtime = dtime(14, 0)
+    trend_route_min_minutes_left:            int   = 75
+    # A breakout ticket is ATM-or-further in the trend direction; a 0DTE
+    # long is never carried into the close.
+    trend_route_min_dte:                     int   = 0
+    trend_route_max_dte:                     int   = 4
+    trend_route_dte0_flat_min:               int   = 30
+    # Trend confirmation. The direction itself comes from the regime
+    # layer's price classifier (which on the measured session printed
+    # DOWNTREND from 09:48:50, fourteen minutes before ADX existed at all).
+    # ADX on a 5-minute series needs 2*period+1 bars and is therefore 0.0
+    # for the first ~50 minutes of every session, so requiring it at the
+    # entry moment is how a route guarantees it only ever arrives after the
+    # move: it is used as a CONFIRMING reading when present, never as a
+    # precondition. The opening-range structure carries the confirmation
+    # when it is absent.
+    trend_route_adx_min:                     float = 20.0
+    # The break must be a break, and it must be young. Both bounds are
+    # expressed in opening ranges travelled from the level the trend broke
+    # out of, which is scale-free (it means the same thing at 18,000 and at
+    # 26,000), instrument-neutral and cannot be fitted to one session's
+    # point count. On 2026-09-15 (OR width 135.8) the band was 20.4 to 81.5
+    # points below OR low: the 09:50 print of 23416.7 sat at 40.4 (inside),
+    # the 10:30 print of 23358 sat at 99.1 (outside — the move was spent).
+    trend_route_or_break_frac:               float = 0.15
+    trend_route_max_extension_frac:          float = 0.60
+    trend_route_vwap_buffer_pts:             float = 8.0
+    # Do-not-chase: refuse to buy an option that has already quadrupled its
+    # premium since the open, and refuse a genuine vol spike outright.
+    trend_route_max_iv_change_pct:           float = 30.0
+    # The refusal families this route MAY answer. Every entry is a refusal
+    # that assets something about the SELL side; nothing that asserts
+    # something about the ACCOUNT or the DATA is present, because those are
+    # re-checked by the route's own gate but must never be substituted away.
+    trend_route_block_markers:               tuple = (
+        # sell-side risk vetoes
+        "iv_expanding_never_sell_into_rising_iv",
+        "straddle_expanding",
+        "straddle_explosion",
+        "day_move_used_",
+        "dangerous_to_sell_premium",
+        "range_wide_or",
+        # sell-side structure / calendar refusals a momentum ticket can answer
+        "vol_buy_options",
+        "before_entry_window_",
+        "no_exception",
+        "condor_requires_sell_premium",
+        "requires_no_buy_options",
+        "or_very_wide_too_wide",
+        "immature",
+    )
+    # Sizing. The regime's size_multiplier is a NAKED-GAMMA schedule (on the
+    # measured session it read 0.106 on a DTE-0 taper); a defined-risk long
+    # with a 35% premium stop is not that trade, so the schedule is floored
+    # and then stepped down by the three things that genuinely widen a long
+    # option's loss distribution.
+    trend_route_size_floor:                  float = 0.70
+    trend_route_min_size_frac:               float = 0.35
+    trend_route_dte0_size_mult:              float = 0.50
+    trend_route_straddle_expanding_size_mult: float = 0.70
+    trend_route_max_trades_per_day:          int   = 1
+    # A day that has already spent several times its opening straddle has
+    # no unpriced range left to sell - but a trend ticket is paid ON the
+    # realised move, so this cap is deliberately far looser than the 125%
+    # sell-side gate. It exists only to refuse a tape that has gone
+    # parabolic (a 4x straddle day is not a breakout, it is an event).
+    trend_route_day_move_max_pct:            float = 400.0
+    # Risk ladder on the premium paid, per lot.
+    trend_route_stop_frac:                   float = 0.35
+    trend_route_target_frac:                 float = 0.60
+    trend_route_lock_trigger:                float = 0.25
+
     # ── v6: live execution hardening ──────────────────────────────────
     # The replay harness has its own fill model, so nothing below can move
     # a backtested number: these knobs govern the live order path
@@ -1332,6 +1429,75 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
                 for s in env.get("MOMENTUM_BLOCK_MARKERS", "").split(",")
                 if s.strip()
             ) or Config.momentum_block_markers
+        ),
+        # ── v12 directional trend route ───────────────────────────────────
+        trend_route_enabled=_get_bool(env, "TREND_ROUTE_ENABLED", True),
+        trend_route_start=_get_time(env, "TREND_ROUTE_START", dtime(9, 50)),
+        trend_route_last_entry=_get_time(
+            env, "TREND_ROUTE_LAST_ENTRY", dtime(14, 0)
+        ),
+        trend_route_min_minutes_left=min(
+            max(_get_int(env, "TREND_ROUTE_MIN_MINUTES_LEFT", 75), 20), 240
+        ),
+        trend_route_min_dte=min(
+            max(_get_int(env, "TREND_ROUTE_MIN_DTE", 0), 0), 6
+        ),
+        trend_route_max_dte=min(
+            max(_get_int(env, "TREND_ROUTE_MAX_DTE", 4), 0), 6
+        ),
+        trend_route_dte0_flat_min=min(
+            max(_get_int(env, "TREND_ROUTE_DTE0_FLAT_MIN", 30), 5), 120
+        ),
+        trend_route_adx_min=min(
+            max(_get_float(env, "TREND_ROUTE_ADX_MIN", 20.0), 0.0), 60.0
+        ),
+        trend_route_or_break_frac=min(
+            max(_get_float(env, "TREND_ROUTE_OR_BREAK_FRAC", 0.15), 0.0), 1.00
+        ),
+        trend_route_max_extension_frac=min(
+            max(_get_float(env, "TREND_ROUTE_MAX_EXTENSION_FRAC", 0.60), 0.16), 3.00
+        ),
+        trend_route_vwap_buffer_pts=min(
+            max(_get_float(env, "TREND_ROUTE_VWAP_BUFFER_PTS", 8.0), 0.0), 80.0
+        ),
+        trend_route_max_iv_change_pct=min(
+            max(_get_float(env, "TREND_ROUTE_MAX_IV_CHANGE_PCT", 30.0), 3.0), 120.0
+        ),
+        trend_route_block_markers=(
+            tuple(
+                s.strip().lower()
+                for s in env.get("TREND_ROUTE_BLOCK_MARKERS", "").split(",")
+                if s.strip()
+            ) or Config.trend_route_block_markers
+        ),
+        trend_route_size_floor=min(
+            max(_get_float(env, "TREND_ROUTE_SIZE_FLOOR", 0.70), 0.10), 1.00
+        ),
+        trend_route_min_size_frac=min(
+            max(_get_float(env, "TREND_ROUTE_MIN_SIZE_FRAC", 0.35), 0.05), 1.00
+        ),
+        trend_route_dte0_size_mult=min(
+            max(_get_float(env, "TREND_ROUTE_DTE0_SIZE_MULT", 0.50), 0.10), 1.00
+        ),
+        trend_route_straddle_expanding_size_mult=min(
+            max(_get_float(env, "TREND_ROUTE_STRADDLE_EXPANDING_SIZE_MULT", 0.70),
+                0.10), 1.00
+        ),
+        trend_route_max_trades_per_day=max(
+            _get_int(env, "TREND_ROUTE_MAX_TRADES_PER_DAY", 1), 1
+        ),
+        trend_route_day_move_max_pct=min(
+            max(_get_float(env, "TREND_ROUTE_DAY_MOVE_MAX_PCT", 400.0), 125.0),
+            2000.0
+        ),
+        trend_route_stop_frac=min(
+            max(_get_float(env, "TREND_ROUTE_STOP_FRAC", 0.35), 0.10), 0.70
+        ),
+        trend_route_target_frac=min(
+            max(_get_float(env, "TREND_ROUTE_TARGET_FRAC", 0.60), 0.10), 3.00
+        ),
+        trend_route_lock_trigger=min(
+            max(_get_float(env, "TREND_ROUTE_LOCK_TRIGGER", 0.25), 0.05), 1.00
         ),
         # ── v6 live execution hardening ───────────────────────────────────
         order_max_retries=min(max(_get_int(env, "ORDER_MAX_RETRIES", 0), 0), 2),
