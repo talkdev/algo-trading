@@ -292,6 +292,18 @@ class HistoricalStore:
             (trading_date,),
         )
         prev_close = float(prev[0]["close"]) if prev else None
+        # PATCH_V12: gap-blind preflight. A database without the
+        # previous session's last candle replays with NO gap detection
+        # (measured 2026-09-09: -113pt DOWN gap missed, condor +1,121
+        # instead of the true +542 two-ticket session). Loud on
+        # purpose: silent wrong inputs are worse than no replay.
+        if prev_close is None:
+            print(
+                f"[backtest] WARNING: {trading_date}: no previous-session "
+                f"candle in this database \u2014 gap detection DISABLED, the "
+                f"gap leans cannot fire. Re-split with a patched "
+                f"split_db_per_day.py for live-faithful replays."
+            )
         return DaySlice(trading_date, rows, candles, prev_close)
 
 

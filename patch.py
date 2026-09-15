@@ -53,6 +53,14 @@ Running it applies every fix below to the working tree it is run from:
      down. Banking resumes the moment the trend opposes, dies, or
      loses the breakout — restoring the designed 1.7R+ instead of
      +15% scalps on trend days.
+  13. Gap-aware per-day splits ............ each per-day database now
+     carries the previous session's last 1-minute candle, so replays
+     see the same gaps live saw (09-Sep: a -113pt DOWN gap was
+     missed, pricing a condor +1,121 instead of the true +542
+     two-ticket session; 11-Sep: a -207pt gap, two lean tickets
+     missed). Re-split every per-day file after applying. The
+     backtest now warns loudly when a database has no
+     previous-session context.
 
 HOW TO RUN
 ----------
@@ -84,6 +92,7 @@ ALLOWED_FILES = {
     "execution_engine.py",
     "backtest_engine.py",
     "main.py",
+    "split_db_per_day.py",
 }
 
 
@@ -1251,6 +1260,79 @@ HUNKS: list = [
         '                signals.get("final_regime") not in ("ABORT", None) and\n'
         "                not self._feed_stale",
         "not in (\"ABORT\", None) and",
+    ),
+    # =====================================================================
+    # split_db_per_day.py — previous-session context candle (gap-aware splits)
+    # =====================================================================
+    _h(
+        "split_db_per_day.py",
+        "P1:prev-session-context",
+        "        # 3. global bookkeeping tables (whole)\n"
+        "        for table in GLOBAL:\n"
+        "            counts[table] = copy_table(dst=dst, src=src, table=table)\n"
+        "\n"
+        "    dst.close()",
+        "        # 3. global bookkeeping tables (whole)\n"
+        "        for table in GLOBAL:\n"
+        "            counts[table] = copy_table(dst=dst, src=src, table=table)\n"
+        "\n"
+        "        # 4. PATCH_V12: previous-session context. The replay reads the\n"
+        "        #    previous session's last 1-minute close (gap detection) via\n"
+        "        #    a cross-date query on intraday_candles (trading_date < ?).\n"
+        "        #    A strictly same-day split leaves every per-day replay\n"
+        "        #    gap-blind: 2026-09-09 missed a -113pt DOWN gap and priced\n"
+        "        #    a condor (+1,121) instead of the gap-down bear-call lean\n"
+        "        #    the engine takes on full data (+542 true session);\n"
+        "        #    2026-09-11 missed a -207pt gap and two lean tickets.\n"
+        "        #    Copy that single row with its ORIGINAL date so the query\n"
+        "        #    finds it. Re-split every per-day file after applying.\n"
+        "        counts[\"intraday_candles:context\"] = 0\n"
+        "        try:\n"
+        "            _ctx_cols = [c[1] for c in src.execute(\n"
+        "                'PRAGMA table_info(\"intraday_candles\")').fetchall()]\n"
+        "            _ctx = src.execute(\n"
+        "                'SELECT * FROM \"intraday_candles\" '\n"
+        "                'WHERE \"trading_date\" < ? AND \"interval_min\" = 1 '\n"
+        "                'ORDER BY \"trading_date\" DESC, \"candle_time\" DESC LIMIT 1',\n"
+        "                (date,),\n"
+        "            ).fetchone()\n"
+        "            if _ctx is not None and _ctx_cols:\n"
+        "                _colq = \", \".join(f'\"{c}\"' for c in _ctx_cols)\n"
+        "                _ph = \", \".join(\"?\" for _ in _ctx_cols)\n"
+        "                dst.execute(\n"
+        "                    f'INSERT INTO \"intraday_candles\" ({_colq}) VALUES ({_ph})',\n"
+        "                    tuple(_ctx),\n"
+        "                )\n"
+        "                counts[\"intraday_candles:context\"] = 1\n"
+        "        except sqlite3.Error:\n"
+        "            pass\n"
+        "\n"
+        "    dst.close()",
+        "intraday_candles:context",
+    ),
+    # =====================================================================
+    # backtest_engine.py — gap-blind preflight warning
+    # =====================================================================
+    _h(
+        "backtest_engine.py",
+        "B2:gap-blind-preflight",
+        "        prev_close = float(prev[0][\"close\"]) if prev else None\n"
+        "        return DaySlice(trading_date, rows, candles, prev_close)",
+        "        prev_close = float(prev[0][\"close\"]) if prev else None\n"
+        "        # PATCH_V12: gap-blind preflight. A database without the\n"
+        "        # previous session's last candle replays with NO gap detection\n"
+        "        # (measured 2026-09-09: -113pt DOWN gap missed, condor +1,121\n"
+        "        # instead of the true +542 two-ticket session). Loud on\n"
+        "        # purpose: silent wrong inputs are worse than no replay.\n"
+        "        if prev_close is None:\n"
+        "            print(\n"
+        "                f\"[backtest] WARNING: {trading_date}: no previous-session \"\n"
+        "                f\"candle in this database \\u2014 gap detection DISABLED, the \"\n"
+        "                f\"gap leans cannot fire. Re-split with a patched \"\n"
+        "                f\"split_db_per_day.py for live-faithful replays.\"\n"
+        "            )\n"
+        "        return DaySlice(trading_date, rows, candles, prev_close)",
+        "gap detection DISABLED",
     ),
 ]
 

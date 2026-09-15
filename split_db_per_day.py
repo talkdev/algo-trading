@@ -218,6 +218,37 @@ def build_day(src: sqlite3.Connection, out_path: Path, date: str) -> dict:
         for table in GLOBAL:
             counts[table] = copy_table(dst=dst, src=src, table=table)
 
+        # 4. PATCH_V12: previous-session context. The replay reads the
+        #    previous session's last 1-minute close (gap detection) via
+        #    a cross-date query on intraday_candles (trading_date < ?).
+        #    A strictly same-day split leaves every per-day replay
+        #    gap-blind: 2026-09-09 missed a -113pt DOWN gap and priced
+        #    a condor (+1,121) instead of the gap-down bear-call lean
+        #    the engine takes on full data (+542 true session);
+        #    2026-09-11 missed a -207pt gap and two lean tickets.
+        #    Copy that single row with its ORIGINAL date so the query
+        #    finds it. Re-split every per-day file after applying.
+        counts["intraday_candles:context"] = 0
+        try:
+            _ctx_cols = [c[1] for c in src.execute(
+                'PRAGMA table_info("intraday_candles")').fetchall()]
+            _ctx = src.execute(
+                'SELECT * FROM "intraday_candles" '
+                'WHERE "trading_date" < ? AND "interval_min" = 1 '
+                'ORDER BY "trading_date" DESC, "candle_time" DESC LIMIT 1',
+                (date,),
+            ).fetchone()
+            if _ctx is not None and _ctx_cols:
+                _colq = ", ".join(f'"{c}"' for c in _ctx_cols)
+                _ph = ", ".join("?" for _ in _ctx_cols)
+                dst.execute(
+                    f'INSERT INTO "intraday_candles" ({_colq}) VALUES ({_ph})',
+                    tuple(_ctx),
+                )
+                counts["intraday_candles:context"] = 1
+        except sqlite3.Error:
+            pass
+
     dst.close()
 
     # Compact the file (reclaims any free pages left by the big insert) and
