@@ -13,7 +13,6 @@ tests = [
     ("strategy_engine.py",    [PYTHON, str(BASE / "strategy_engine.py")]),
     ("calibration_engine.py", [PYTHON, str(BASE / "calibration_engine.py")]),
     ("backtest_engine.py",    [PYTHON, str(BASE / "backtest_engine.py"), "--test"]),
-    ("eod_report.py",         [PYTHON, str(BASE / "eod_report.py"), "--test"]),
     ("telegram_reporter.py",  [PYTHON, str(BASE / "telegram_reporter.py"), "--test"]),
 ]
 

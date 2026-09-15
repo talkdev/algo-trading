@@ -46,6 +46,13 @@ Running it applies every fix below to the working tree it is run from:
  11. Series-aware opening straddle ...... re-taken when the active expiry
      changes mid-session (the v3.5 IV-baseline fix, extended to the
      straddle the day-move math prices off).
+ 12. Trend-persist debit hold ............ a momentum ticket rides while
+     its thesis lives (mature ADX above the 15 death line, price still
+     trend-side-or-napping, breakout side of the OR mid held): the
+     ratchet locks only the free trade and the fixed target stands
+     down. Banking resumes the moment the trend opposes, dies, or
+     loses the breakout — restoring the designed 1.7R+ instead of
+     +15% scalps on trend days.
 
 HOW TO RUN
 ----------
@@ -96,7 +103,8 @@ HUNKS: list = [
         '# PATCH_V12 (2026-09-15): profitability repair pass — Tuesday-0DTE\n'
         '# discipline, DTE2 unification, directional day-move, floor\n'
         '# discipline, event-day confirmation, trend-flip exit, momentum\n'
-        '# resurrection, honest ADX, weekly exit realism. See patch_v12.py.\n'
+        '# resurrection, trend-persist debit hold, honest ADX, weekly exit\n'
+        '# realism. See patch_v12.py.\n'
         'NIFTY_ENGINE_PROFIT_PATCH_V12 = "12.0"',
         'NIFTY_ENGINE_PROFIT_PATCH_V12 = "12.0"',
     ),
@@ -1046,6 +1054,126 @@ HUNKS: list = [
         "        if chain_expiry and chain_expiry.isoformat() != position.get(\"target_expiry\"):\n"
         "            chain = {}  # Wrong expiry chain — use empty dict (falls back to entry price)",
         '"_chain_by_expiry", None)',
+    ),
+    _h(
+        "execution_engine.py",
+        "E4a:debit-monitor-signals-param",
+        "    def _monitor_debit_position(\n"
+        "        self,\n"
+        "        position:         dict,\n"
+        "        open_legs:        List[dict],\n"
+        "        chain:            dict,\n"
+        "        current_time:     dtime,\n"
+        "        spot:             float,\n"
+        "        current_premium:  float,\n"
+        "        liq_premium:      float,\n"
+        "    ) -> Tuple[str, int, dict]:",
+        "    # PATCH_V12: the debit ladder takes the live signals (optional,\n"
+        "    # so every existing caller keeps working) for the trend-persist\n"
+        "    # hold below.\n"
+        "    def _monitor_debit_position(\n"
+        "        self,\n"
+        "        position:         dict,\n"
+        "        open_legs:        List[dict],\n"
+        "        chain:            dict,\n"
+        "        current_time:     dtime,\n"
+        "        spot:             float,\n"
+        "        current_premium:  float,\n"
+        "        liq_premium:      float,\n"
+        "        signals: Optional[dict] = None,\n"
+        "    ) -> Tuple[str, int, dict]:",
+        "signals: Optional[dict] = None,",
+    ),
+    _h(
+        "execution_engine.py",
+        "E4b:debit-monitor-pass-signals",
+        '        if entry_credit < 0 or str(position.get("strategy_type") or "").upper() == "BUY":\n'
+        "            return self._monitor_debit_position(\n"
+        "                position, open_legs, chain, current_time, spot,\n"
+        "                current_premium, liq_premium,\n"
+        "            )",
+        '        if entry_credit < 0 or str(position.get("strategy_type") or "").upper() == "BUY":\n'
+        "            return self._monitor_debit_position(\n"
+        "                position, open_legs, chain, current_time, spot,\n"
+        "                current_premium, liq_premium,\n"
+        "                signals=signals,  # PATCH_V12: trend-persist hold\n"
+        "            )",
+        "signals=signals,  # PATCH_V12",
+    ),
+    _h(
+        "execution_engine.py",
+        "E4c:trend-persist-ratchet-cap",
+        '        activated = bool(position.get("profit_lock_activated"))\n'
+        '        locked    = position.get("profit_lock_stop_level")\n'
+        "        if value_mid >= lock:\n"
+        '            keep = float(getattr(cfg, "momentum_lock_keep_frac", 0.50))\n'
+        "            new_level = max(\n"
+        "                value_mid - max(value_mid - entry_value, 0.0) * keep,\n"
+        "                entry_value + rt_cost,\n"
+        "            )",
+        '        activated = bool(position.get("profit_lock_activated"))\n'
+        '        locked    = position.get("profit_lock_stop_level")\n'
+        "        # PATCH_V12: trend-persist hold. A momentum ticket exists to\n"
+        "        # ride a trend; banking it on a fixed give-back fraction\n"
+        "        # while the thesis is still alive converts 1.7R+ winners\n"
+        "        # into +15% scalps (measured 11-Sep: call spiked +38% by\n"
+        "        # noon, stopped at +18% at 12:12 ahead of an afternoon\n"
+        "        # rally; 15-Sep: put ran +31%, stopped at +15% at 13:19\n"
+        "        # ahead of the waterfall). While the thesis lives — mature\n"
+        "        # ADX above the death line, price still trend-side or\n"
+        "        # merely napping (never opposed), spot still holding the\n"
+        "        # breakout side of the opening-range mid — the ratchet locks\n"
+        "        # only the free trade. The ride ends at the closing\n"
+        "        # flatten, the breakeven stop, or the trend break, whichever\n"
+        "        # comes first. Entry/exit asymmetry is deliberate:\n"
+        "        # conviction (24) to enter, thesis-death (15) to abandon.\n"
+        "        _persist = False\n"
+        "        try:\n"
+        "            _sig = signals or {}\n"
+        '            _sname = str(position.get("strategy_name") or "")\n'
+        '            if "PUT" in _sname:\n'
+        "                _dir = -1\n"
+        '            elif "CALL" in _sname:\n'
+        "                _dir = 1\n"
+        "            else:\n"
+        '                _dir = int(raw.get("momentum_direction") or position.get("momentum_direction") or 0)\n'
+        '            _px = str(_sig.get("price_regime") or "")\n'
+        '            _adx = float(_sig.get("adx_15") or 0.0)\n'
+        '            _mat = bool(_sig.get("adx_15_mature", False))\n'
+        '            _orh = float(_sig.get("or_high") or 0.0)\n'
+        '            _orl = float(_sig.get("or_low") or 0.0)\n'
+        "            _ormid = (_orh + _orl) / 2.0 if (_orh > 0 and _orl > 0) else 0.0\n"
+        "            _trend_side_ok = (\n"
+        '                (_dir > 0 and _px in ("UPTREND", "STRONG_UPTREND", "RANGE"))\n'
+        '                or (_dir < 0 and _px in ("DOWNTREND", "STRONG_DOWNTREND", "RANGE"))\n'
+        "            )\n"
+        "            _brk_ok = (\n"
+        "                _ormid <= 0\n"
+        "                or (_dir > 0 and spot >= _ormid)\n"
+        "                or (_dir < 0 and spot <= _ormid)\n"
+        "            )\n"
+        '            _death = float(getattr(cfg, "momentum_trend_death_adx", 15.0))\n'
+        "            _persist = bool(_dir != 0 and _trend_side_ok and _brk_ok and _mat and _adx >= _death)\n"
+        "        except Exception:\n"
+        "            _persist = False\n"
+        "        if value_mid >= lock:\n"
+        '            keep = float(getattr(cfg, "momentum_lock_keep_frac", 0.50))\n'
+        "            new_level = max(\n"
+        "                value_mid - max(value_mid - entry_value, 0.0) * keep,\n"
+        "                entry_value + rt_cost,\n"
+        "            )\n"
+        "            if _persist:\n"
+        "                # Ride: lock only the free trade, never bank into strength.\n"
+        "                new_level = min(new_level, entry_value + rt_cost)",
+        "_persist = bool(_dir != 0 and _trend_side_ok",
+    ),
+    _h(
+        "execution_engine.py",
+        "E4d:trend-persist-target-stand-down",
+        "        if target > 0 and value >= target:",
+        "        # PATCH_V12: no fixed targets into a living trend (see D2).\n"
+        "        if target > 0 and value >= target and not _persist:",
+        "value >= target and not _persist:",
     ),
     # =====================================================================
     # backtest_engine.py — honest exit pricing
