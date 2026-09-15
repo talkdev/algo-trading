@@ -9,8 +9,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BASE_DIR = r"C:\Users\Administrator\Desktop\algo-trading"
 ENV_FILE = os.path.join(BASE_DIR, "env.txt")
 TARGET_SCRIPT = os.path.join(BASE_DIR, "main.py")
-LOG_FILE = os.path.join(BASE_DIR, "algo.log")
-PID_FILE = os.path.join(BASE_DIR, "algo.pid")
+BASE_DIR2 = r"C:\Users\Administrator\Desktop\algo-trading\logs"
+LOG_FILE = os.path.join(BASE_DIR2, "algo.log")
+PID_FILE = os.path.join(BASE_DIR2, "algo.pid")
 
 def load_env_config(filepath):
     """Parses env.txt line-by-line, ignoring comments and stripping quotes."""
