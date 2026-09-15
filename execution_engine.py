@@ -1710,6 +1710,9 @@ class ExecutionEngine:
     # v5 — NET-DEBIT (LONG-PREMIUM) EXIT LADDER
     # ─────────────────────────────────────────────────────────────────────
 
+    # PATCH_V12: the debit ladder takes the live signals (optional,
+    # so every existing caller keeps working) for the trend-persist
+    # hold below.
     def _monitor_debit_position(
         self,
         position:         dict,
@@ -1719,6 +1722,7 @@ class ExecutionEngine:
         spot:             float,
         current_premium:  float,
         liq_premium:      float,
+        signals: Optional[dict] = None,
     ) -> Tuple[str, int, dict]:
         """Exit ladder for a net-debit structure (the engine's own premium).
 
@@ -1774,12 +1778,58 @@ class ExecutionEngine:
         # ── D2: profit lock, ratcheted upward on the mid ─────────────────
         activated = bool(position.get("profit_lock_activated"))
         locked    = position.get("profit_lock_stop_level")
+        # PATCH_V12: trend-persist hold. A momentum ticket exists to
+        # ride a trend; banking it on a fixed give-back fraction
+        # while the thesis is still alive converts 1.7R+ winners
+        # into +15% scalps (measured 11-Sep: call spiked +38% by
+        # noon, stopped at +18% at 12:12 ahead of an afternoon
+        # rally; 15-Sep: put ran +31%, stopped at +15% at 13:19
+        # ahead of the waterfall). While the thesis lives — mature
+        # ADX above the death line, price still trend-side or
+        # merely napping (never opposed), spot still holding the
+        # breakout side of the opening-range mid — the ratchet locks
+        # only the free trade. The ride ends at the closing
+        # flatten, the breakeven stop, or the trend break, whichever
+        # comes first. Entry/exit asymmetry is deliberate:
+        # conviction (24) to enter, thesis-death (15) to abandon.
+        _persist = False
+        try:
+            _sig = signals or {}
+            _sname = str(position.get("strategy_name") or "")
+            if "PUT" in _sname:
+                _dir = -1
+            elif "CALL" in _sname:
+                _dir = 1
+            else:
+                _dir = int(raw.get("momentum_direction") or position.get("momentum_direction") or 0)
+            _px = str(_sig.get("price_regime") or "")
+            _adx = float(_sig.get("adx_15") or 0.0)
+            _mat = bool(_sig.get("adx_15_mature", False))
+            _orh = float(_sig.get("or_high") or 0.0)
+            _orl = float(_sig.get("or_low") or 0.0)
+            _ormid = (_orh + _orl) / 2.0 if (_orh > 0 and _orl > 0) else 0.0
+            _trend_side_ok = (
+                (_dir > 0 and _px in ("UPTREND", "STRONG_UPTREND", "RANGE"))
+                or (_dir < 0 and _px in ("DOWNTREND", "STRONG_DOWNTREND", "RANGE"))
+            )
+            _brk_ok = (
+                _ormid <= 0
+                or (_dir > 0 and spot >= _ormid)
+                or (_dir < 0 and spot <= _ormid)
+            )
+            _death = float(getattr(cfg, "momentum_trend_death_adx", 15.0))
+            _persist = bool(_dir != 0 and _trend_side_ok and _brk_ok and _mat and _adx >= _death)
+        except Exception:
+            _persist = False
         if value_mid >= lock:
             keep = float(getattr(cfg, "momentum_lock_keep_frac", 0.50))
             new_level = max(
                 value_mid - max(value_mid - entry_value, 0.0) * keep,
                 entry_value + rt_cost,
             )
+            if _persist:
+                # Ride: lock only the free trade, never bank into strength.
+                new_level = min(new_level, entry_value + rt_cost)
             cur_level = float(locked or 0.0)
             if not activated or new_level > cur_level:
                 self.db.update(
@@ -1803,7 +1853,8 @@ class ExecutionEngine:
                 }
 
         # ── D3: planned target ───────────────────────────────────────────
-        if target > 0 and value >= target:
+        # PATCH_V12: no fixed targets into a living trend (see D2).
+        if target > 0 and value >= target and not _persist:
             self.logger.info(
                 f"DEBIT TARGET: {position['strategy_name']} value={value:.2f} "
                 f">= target={target:.2f}"
@@ -1945,6 +1996,7 @@ class ExecutionEngine:
             return self._monitor_debit_position(
                 position, open_legs, chain, current_time, spot,
                 current_premium, liq_premium,
+                signals=signals,  # PATCH_V12: trend-persist hold
             )
 
         # ── Priority 1: Delta breach ──────────────────────────────────────
