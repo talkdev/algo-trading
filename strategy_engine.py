@@ -3031,11 +3031,6 @@ class StrategyEngine:
         selection_reason: str,
         signals:          dict,
         size_mult:        float,
-        stop_frac:        Optional[float] = None,
-        target_frac:      Optional[float] = None,
-        lock_trigger:     Optional[float] = None,
-        size_floor:       Optional[float] = None,
-        trend_route:      bool = False,
     ) -> dict:
         """Build a single-leg long-premium breakout position.
 
@@ -3103,14 +3098,7 @@ class StrategyEngine:
         entry_costs0 = _costs0["total_rupees"] / max(C02, 1.0)
         friction_pts = self._round_trip_friction(legs, entry_costs0)
 
-        # v12: the risk ladder is overridable so the directional trend route
-        # can run its own (config-driven, defaulting to these) numbers
-        # without duplicating a 200-line credit-free pricing pipeline. The
-        # v5 defaults are unchanged when nothing is passed.
-        stop_frac = float(
-            stop_frac if stop_frac is not None
-            else getattr(cfg, "momentum_stop_frac", 0.35)
-        )
+        stop_frac = float(getattr(cfg, "momentum_stop_frac", 0.35))
         stop_pts  = exec_price * stop_frac
         # The real per-lot loss when the stop is taken: the premium
         # give-back plus the round trip that had to be paid to find out.
@@ -3119,10 +3107,7 @@ class StrategyEngine:
             return {"valid": False, "reason": "momentum_non_positive_risk"}
 
         # ── edge test: the planned capture must beat the ticket ─────────
-        target_frac = float(
-            target_frac if target_frac is not None
-            else getattr(cfg, "momentum_target_frac", 0.60)
-        )
+        target_frac = float(getattr(cfg, "momentum_target_frac", 0.60))
         expected_pts = exec_price * target_frac
         _min_over = float(getattr(cfg, "min_target_over_friction", 1.25))
         if expected_pts < friction_pts * max(_min_over, 1.0):
@@ -3146,16 +3131,8 @@ class StrategyEngine:
         risk_per_lot  = risk_pts * C02
         structural_risk_per_lot = exec_price * C02          # premium paid, all of it
         raw_lots = max_risk / max(risk_per_lot, 1.0)
-        # v12: size_floor is overridable. The trend route computes its own
-        # schedule factor (regime schedule floored, then stepped down for
-        # extension / DTE 0 / an expanding straddle) and must be able to
-        # apply it verbatim; the v5 route keeps the 0.80 floor it was
-        # measured with.
-        _size_floor = float(
-            size_floor if size_floor is not None
-            else getattr(cfg, "momentum_size_floor", 0.80)
-        )
-        sched = max(float(size_mult or 1.0), _size_floor)
+        sched = max(float(size_mult or 1.0),
+                    float(getattr(cfg, "momentum_size_floor", 0.80)))
         sized = raw_lots * sched
         min_lots = float(getattr(cfg, "momentum_min_lots", 0.60))
         if sized < min_lots:
@@ -3197,11 +3174,9 @@ class StrategyEngine:
         net_debit        = exec_price + entry_costs_pts + entry_slip
         target_premium   = net_debit * (1.0 + target_frac)
         stop_premium     = net_debit * (1.0 - stop_frac)
-        _lock_frac = float(
-            lock_trigger if lock_trigger is not None
-            else getattr(cfg, "momentum_lock_trigger", 0.25)
+        lock_trigger     = net_debit * (
+            1.0 + float(getattr(cfg, "momentum_lock_trigger", 0.25))
         )
-        lock_trigger     = net_debit * (1.0 + _lock_frac)
 
         try:
             hard_exit_str = state.get(
@@ -3269,445 +3244,7 @@ class StrategyEngine:
             "stop_at_breakeven":      False,
             "momentum":               True,
             "momentum_direction":     int(direction),
-            "trend_route":            bool(trend_route),
-            "stop_frac":              round(stop_frac, 4),
-            "target_frac":            round(target_frac, 4),
         }
-
-    # ─────────────────────────────────────────────────────────────────────
-    # v12 — DIRECTIONAL TREND ROUTE (the buy-side answer to a sell-side veto)
-    # ─────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _tr_num(value, default: float = 0.0) -> float:
-        """Float coercion that never raises inside a decision path."""
-        try:
-            if value is None:
-                return default
-            out = float(value)
-            if out != out:          # NaN
-                return default
-            return out
-        except (TypeError, ValueError):
-            return default
-
-    def _trend_route_gate(
-        self,
-        signals:      dict,
-        block_reason: str,
-        _test_time:   Optional[dtime] = None,
-    ) -> Tuple[bool, str, int]:
-        """May the DIRECTIONAL TREND ROUTE be considered on this cycle?
-
-        Returns (allowed, why, direction), direction +1 = calls, -1 = puts.
-        Every refusal is a distinct, greppable string so the reason a
-        substitution did not happen is measurable rather than inferred.
-
-        The route answers a refusal ONLY when the refusal is a statement
-        about the sell side (see Config.trend_route_block_markers). It then
-        validates the tape itself; it does not inherit the sell side's
-        conclusion. Account-safety refusals (daily halt, ABORT, circuit
-        breaker, VIX emergency, an open position, a cooldown, the stop
-        counter) and market-data refusals (no opening range, stale chain)
-        are never substitutable and are re-checked here as well, so a
-        caller that reaches this function by some future path still cannot
-        trade through them.
-        """
-        cfg = self.config
-        if not bool(getattr(cfg, "trend_route_enabled", True)):
-            return False, "trend_route_disabled", 0
-
-        state = self.market_engine.state
-        cur   = _test_time if _test_time is not None else now_ist().time()
-
-        # ── 1. substitution only, and only for a sell-side family ─────────
-        reason  = str(block_reason or "").lower()
-        markers = tuple(getattr(cfg, "trend_route_block_markers", ())) or ()
-        if not any(str(m).lower() in reason for m in markers):
-            return False, (
-                f"trend_route_sell_side_not_refused({reason[:40]})"
-            ), 0
-
-        # ── 2. never over a safety interlock ──────────────────────────────
-        if signals.get("block_new_entries"):
-            return False, "trend_route_regime_abort", 0
-        if state.get("daily_halted"):
-            return False, "trend_route_daily_halt", 0
-        if signals.get("circuit_breaker_suspected"):
-            return False, "trend_route_circuit_breaker", 0
-        if signals.get("vix_spike_detected"):
-            return False, "trend_route_vix_spike", 0
-        if signals.get("chain_stale"):
-            return False, "trend_route_chain_stale", 0
-        if state.get("consecutive_stops", 0) >= 2:
-            return False, "trend_route_two_consecutive_stops", 0
-        if self._count_open_positions() > 0:
-            return False, "trend_route_position_open", 0
-        if signals.get("spot_velocity_block"):
-            return False, (
-                f"trend_route_spot_velocity_"
-                f"{self._tr_num(signals.get('spot_velocity_pts')):.0f}pts_3min"
-            ), 0
-
-        # ── 3. calendar and clip limit ────────────────────────────────────
-        dte = signals.get("actual_dte")
-        if dte is None:
-            return False, "trend_route_no_expiry_resolution", 0
-        try:
-            dte_i = int(dte)
-        except (TypeError, ValueError):
-            return False, "trend_route_dte_unparseable", 0
-        if dte_i < int(getattr(cfg, "trend_route_min_dte", 0)):
-            return False, f"trend_route_dte_{dte_i}_below_min", 0
-        if dte_i > int(getattr(cfg, "trend_route_max_dte", 4)):
-            return False, f"trend_route_dte_{dte_i}_above_max", 0
-
-        used = self._count_momentum_entries()
-        if used >= int(getattr(cfg, "trend_route_max_trades_per_day", 1)):
-            return False, f"trend_route_daily_limit_{used}_reached", 0
-
-        # ── 4. the direction is the regime layer's own trend label ────────
-        price = str(signals.get("price_regime") or "")
-        if price in ("UPTREND", "STRONG_UPTREND"):
-            direction = 1
-        elif price in ("DOWNTREND", "STRONG_DOWNTREND"):
-            direction = -1
-        else:
-            return False, f"trend_route_needs_trend_got_{price or 'NONE'}", 0
-
-        conf = str(signals.get("confidence_level") or "")
-        if conf not in ("HIGH", "MEDIUM"):
-            return False, f"trend_route_confidence_{conf or 'NONE'}_insufficient", 0
-
-        # ── 5. the opening-range break, with a scale-free band ────────────
-        spot = self._tr_num(signals.get("spot"))
-        if spot <= 0:
-            return False, "trend_route_no_spot", 0
-        if not signals.get("or_computed"):
-            return False, "trend_route_no_opening_range", 0
-        or_high = self._tr_num(signals.get("or_high"))
-        or_low  = self._tr_num(signals.get("or_low"))
-        or_w    = self._tr_num(signals.get("or_width"))
-        if or_high <= 0 or or_low <= 0 or or_w <= 0:
-            return False, "trend_route_opening_range_incomplete", 0
-
-        _brk_frac = float(getattr(cfg, "trend_route_or_break_frac", 0.15))
-        _max_frac = float(getattr(cfg, "trend_route_max_extension_frac", 0.60))
-        if _max_frac <= _brk_frac:
-            return False, "trend_route_extension_band_misconfigured", 0
-        need = max(5.0, or_w * _brk_frac)
-        ext_cap = or_w * _max_frac
-
-        if direction < 0:
-            brk = or_low - spot
-            if brk < need:
-                return False, (
-                    f"trend_route_put_not_through_or_low_"
-                    f"{spot:.0f}>{or_low - need:.0f}"
-                ), 0
-        else:
-            brk = spot - or_high
-            if brk < need:
-                return False, (
-                    f"trend_route_call_not_through_or_high_"
-                    f"{spot:.0f}<{or_high + need:.0f}"
-                ), 0
-        if brk > ext_cap:
-            return False, (
-                f"trend_route_break_{brk:.0f}pts_is_{brk / or_w:.2f}x_or_"
-                f"beyond_{_max_frac:.2f}x_no_chase"
-            ), 0
-
-        # ── 6. VWAP on the trend side ─────────────────────────────────────
-        vwap = self._tr_num(signals.get("vwap"))
-        if vwap > 0:
-            _vbuf = float(getattr(cfg, "trend_route_vwap_buffer_pts", 8.0))
-            if direction < 0 and spot > vwap - _vbuf:
-                return False, f"trend_route_put_not_under_vwap_{vwap:.0f}", 0
-            if direction > 0 and spot < vwap + _vbuf:
-                return False, f"trend_route_call_not_over_vwap_{vwap:.0f}", 0
-
-        # ── 7. confirmation: the opening-range structure AND the trend read
-        want = "UPTREND" if direction > 0 else "DOWNTREND"
-        orb  = str(signals.get("orb_price_regime") or "")
-        adx  = self._tr_num(signals.get("adx_15"))
-        adx_min = float(getattr(cfg, "trend_route_adx_min", 20.0))
-        adx_mature = bool(signals.get("adx_15_mature"))
-        if orb != want:
-            return False, f"trend_route_orb_{orb or 'NONE'}_disagrees", 0
-        if not (adx >= adx_min or (adx <= 0.0 and not adx_mature)):
-            return False, (
-                f"trend_route_adx_{adx:.0f}_immature_reading_below_"
-                f"{adx_min:.0f}"
-            ), 0
-
-        # ── 8. do not buy the top of an IV spike ─────────────────────────
-        ivb = str(signals.get("iv_behavior") or "UNKNOWN")
-        if ivb == "SPIKING":
-            return False, "trend_route_iv_spiking", 0
-        iv_chg = self._tr_num(signals.get("iv_change_pct_from_open"))
-        iv_cap = float(getattr(cfg, "trend_route_max_iv_change_pct", 30.0))
-        if iv_chg > iv_cap:
-            return False, (
-                f"trend_route_iv_change_{iv_chg:.0f}pct_above_{iv_cap:.0f}"
-            ), 0
-
-        # ── 9. a day already past its statistical range is not fresh ─────
-        dmu = self._tr_num(signals.get("day_move_used_pct"))
-        dmu_cap = float(getattr(cfg, "trend_route_day_move_max_pct", 400.0))
-        if dmu >= dmu_cap:
-            return False, (
-                f"trend_route_day_move_{dmu:.0f}pct_exhausted"
-            ), 0
-
-        # ── 10. its own entry window, inside the session's rules ─────────
-        try:
-            tr_start = datetime.strptime(
-                getattr(cfg, "trend_route_start",
-                        dtime(9, 50)).strftime("%H:%M"), "%H:%M"
-            ).time()
-        except Exception:
-            tr_start = dtime(9, 50)
-        try:
-            tr_end = datetime.strptime(
-                getattr(cfg, "trend_route_last_entry",
-                        dtime(14, 0)).strftime("%H:%M"), "%H:%M"
-            ).time()
-        except Exception:
-            tr_end = dtime(14, 0)
-        # The session's own last-entry rule still applies on top: a Tuesday
-        # 0DTE session must not take a NEW directional ticket after its
-        # 13:00 cut-off, and no session may take one after trading_window
-        # last entry. This route may start EARLIER than entry_start; it may
-        # never end later.
-        try:
-            sess_end = datetime.strptime(
-                state.get("entry_end", "14:00"), "%H:%M"
-            ).time()
-        except Exception:
-            sess_end = cfg.trading_window_last_entry
-        eff_start = max(tr_start, dtime(9, 15))
-        eff_end   = min(tr_end, sess_end)
-        if cur < eff_start:
-            return False, f"trend_route_before_{eff_start}", 0
-        if cur > eff_end:
-            return False, f"trend_route_past_{eff_end}", 0
-
-        try:
-            hard_exit = datetime.strptime(
-                state.get("hard_exit_time", "15:00"), "%H:%M"
-            ).time()
-        except Exception:
-            hard_exit = cfg.hard_exit_time
-        mins_left = self._minutes_to_time(cur, hard_exit)
-        _min_left = float(getattr(cfg, "trend_route_min_minutes_left", 75))
-        if mins_left < _min_left:
-            return False, (
-                f"trend_route_only_{mins_left:.0f}min_before_hard_exit"
-            ), 0
-
-        return True, "trend_route_gate_open", direction
-
-    def trend_route_size_plan(self, signals: dict, direction: int) -> dict:
-        """Size the trend ticket, and say why in numbers.
-
-        Four independent multipliers. None of them is fitted to a session;
-        each answers a question about the distribution of a long option:
-
-          regime schedule : the regime layer's size_multiplier, floored —
-                            it is a naked-gamma schedule, this is a
-                            defined-risk ticket.
-          extension       : how far the break has already travelled, as a
-                            fraction of the young-to-extended band. Linear
-                            from 1.0 at the band's start to
-                            trend_route_min_size_frac at its edge.
-          DTE 0           : a 0DTE long is a more binary instrument (pin
-                            risk, an accelerating theta, no overnight
-                            optionality) and gets a permanent haircut.
-          straddle expand : the market is repricing realised vol in real
-                            time. Right side, wrong entry — take less.
-        """
-        cfg   = self.config
-        state = self.market_engine.state
-        out = {
-            "size_mult": 1.0, "multipliers": {}, "refuse": False, "reason": ""
-        }
-
-        raw_sched = self._tr_num(signals.get("size_multiplier"), 1.0)
-        if raw_sched <= 0:
-            raw_sched = float(getattr(cfg, "trend_route_size_floor", 0.70))
-        floor = float(getattr(cfg, "trend_route_size_floor", 0.70))
-        base  = max(raw_sched, floor)
-
-        # extension multiplier
-        spot = self._tr_num(signals.get("spot"))
-        or_high = self._tr_num(signals.get("or_high"))
-        or_low  = self._tr_num(signals.get("or_low"))
-        or_w    = self._tr_num(signals.get("or_width"))
-        brk_frac = float(getattr(cfg, "trend_route_or_break_frac", 0.15))
-        max_frac = float(getattr(cfg, "trend_route_max_extension_frac", 0.60))
-        min_size = float(getattr(cfg, "trend_route_min_size_frac", 0.35))
-        if or_w > 0 and spot > 0:
-            brk = (or_low - spot) if direction < 0 else (spot - or_high)
-            ext = max(brk / or_w, 0.0)
-        else:
-            ext = 0.0
-        span = max(max_frac - brk_frac, 1e-6)
-        ext_frac = min(max((ext - brk_frac) / span, 0.0), 1.0)
-        ext_mult = 1.0 - ext_frac * (1.0 - min_size)
-
-        # DTE multiplier
-        dte_i = int(self._tr_num(signals.get("actual_dte"), 1.0))
-        dte_mult = (
-            float(getattr(cfg, "trend_route_dte0_size_mult", 0.50))
-            if dte_i == 0 else 1.0
-        )
-
-        # straddle-expansion multiplier
-        straddle_mult = (
-            float(getattr(cfg, "trend_route_straddle_expanding_size_mult", 0.70))
-            if signals.get("straddle_expanding") else 1.0
-        )
-
-        size = base * ext_mult * dte_mult * straddle_mult
-        out["size_mult"] = round(size, 6)
-        out["multipliers"] = {
-            "regime_schedule_raw": round(raw_sched, 4),
-            "regime_schedule_floored": round(base, 4),
-            "extension": round(ext_mult, 4),
-            "extension_frac_of_band": round(ext_frac, 4),
-            "extension_x_or": round(ext, 4),
-            "dte0": round(dte_mult, 4),
-            "straddle_expanding": round(straddle_mult, 4),
-            "final": round(size, 4),
-        }
-        _cap = float(getattr(cfg, "trend_route_size_floor", 0.70))
-        if size > _cap:
-            out["size_mult"] = _cap
-            out["multipliers"]["final"] = round(_cap, 4)
-            out["multipliers"]["capped_at"] = _cap
-        return out
-
-    def compute_trend_params(
-        self,
-        direction:        int,
-        selection_reason: str,
-        signals:          dict,
-        size_mult:        float,
-    ) -> dict:
-        """Trend-route parameters, on the momentum pipeline's own economics.
-
-        The position geometry is identical to the v5 long-premium ticket (one
-        leg, ATM-or-further in the trend direction, |delta| nearest 0.55, band
-        0.35-0.75, premium between 0.18% and 0.90% of spot), because that
-        geometry was chosen for exactly this trade and is not the defect. The
-        only differences are the risk ladder (configurable), the size floor
-        (applied verbatim rather than floored at 0.80) and the provenance
-        stamps the exit ladder reads.
-        """
-        cfg = self.config
-        params = self.compute_momentum_params(
-            direction, selection_reason, signals, size_mult,
-            stop_frac=float(getattr(cfg, "trend_route_stop_frac", 0.35)),
-            target_frac=float(getattr(cfg, "trend_route_target_frac", 0.60)),
-            lock_trigger=float(getattr(cfg, "trend_route_lock_trigger", 0.25)),
-            size_floor=float(size_mult),
-            trend_route=True,
-        )
-        if params.get("valid"):
-            params["trend_route"] = True
-            params["selection_reason"] = selection_reason
-        return params
-
-    def _trend_route_decision(
-        self, signals: dict, block_reason: str
-    ) -> Optional[dict]:
-        """Long-premium trend substitute for a refused sell-side structure.
-
-        Returns a complete ENTER decision or None. When it returns None the
-        caller keeps the ORIGINAL refusal unaltered as the logged reason —
-        this route is never allowed to rewrite why the sell side was refused.
-        Its own verdict is still recorded (signals["trend_route_verdict"],
-        persisted into strategy_decisions.signals_json) so the census and a
-        forensic query both stay honest.
-        """
-        try:
-            ok, why, direction = self._trend_route_gate(signals, block_reason)
-        except Exception as exc:
-            self.logger.warning(f"trend route gate failed: {exc}")
-            signals["trend_route_verdict"] = f"trend_route_error:{exc}"
-            return None
-        signals["trend_route_verdict"] = why
-        if not ok:
-            self.logger.info(f"TREND ROUTE refused: {why}")
-            return None
-
-        plan = self.trend_route_size_plan(signals, direction)
-        signals["trend_route_size_plan"] = plan.get("multipliers")
-        if plan.get("refuse"):
-            signals["trend_route_verdict"] = plan.get("reason") or "size_refused"
-            self.logger.info(f"TREND ROUTE sizing refused: {plan.get('reason')}")
-            return None
-
-        _mv = plan.get("multipliers") or {}
-        reason = (
-            f"trend_route:{'LONG_CALL' if direction > 0 else 'LONG_PUT'}"
-            f":dte={signals.get('actual_dte')}"
-            f":adx={self._tr_num(signals.get('adx_15')):.0f}"
-            f":conf={signals.get('confidence_level')}"
-            f":ext={_mv.get('extension_x_or', 0.0)}x_or"
-            f":size={_mv.get('final', 1.0)}"
-            f":replacing={block_reason}"
-        )
-        params = self.compute_trend_params(
-            direction, reason, signals, plan["size_mult"]
-        )
-        if not params.get("valid"):
-            signals["trend_route_verdict"] = (
-                f"trend_route_params_invalid:{params.get('reason')}"
-            )
-            self.logger.info(
-                f"trend route ticket rejected: {params.get('reason')}"
-            )
-            return None
-
-        strat_name = params["strategy_name"]
-        self._log_decision(signals, "STRATEGY_SELECTED", reason, strat_name, params)
-        self._persist_decision(signals, strat_name, reason, params,
-                               "STRATEGY_SELECTED")
-        self.market_engine.finalize_cycle_log(
-            f"STRATEGY_SELECTED:{strat_name}", None, self._count_open_positions()
-        )
-        state = self.market_engine.state
-        state["momentum_entries"] = int(state.get("momentum_entries", 0) or 0) + 1
-        state["trend_route_entries"] = int(
-            state.get("trend_route_entries", 0) or 0
-        ) + 1
-        return {
-            "action":        "ENTER",
-            "strategy_name": strat_name,
-            "reason":        reason,
-            "params":        params,
-        }
-
-    def _debit_substitute(
-        self, signals: dict, block_reason: str
-    ) -> Optional[dict]:
-        """Long-premium substitutes for a refused sell-side ticket.
-
-        Order matters and is deliberate: the v5 momentum route is asked
-        FIRST, exactly as before v12, so every day that already traded keeps
-        its behaviour. The trend route only ever sees what the momentum
-        route refused.
-        """
-        alt = self._momentum_decision(signals, block_reason)
-        if alt is not None:
-            return alt
-        try:
-            return self._trend_route_decision(signals, block_reason)
-        except Exception as exc:                    # never lose the day to
-            self.logger.warning(f"trend route failed: {exc}")   # a new path
-            return None
 
     def _momentum_decision(self, signals: dict, block_reason: str) -> Optional[dict]:
         """Long-premium substitute for a refused sell-side structure.
@@ -3755,7 +3292,7 @@ class StrategyEngine:
         if gate:
             action, reason = gate
             if action == "NO_TRADE":
-                alt = self._debit_substitute(signals, reason)
+                alt = self._momentum_decision(signals, reason)
                 if alt is not None:
                     return alt
             self._log_decision(signals, action, reason)
@@ -3767,7 +3304,7 @@ class StrategyEngine:
 
         strategy_name, selection_reason = self._map_regime_to_strategy(signals)
         if strategy_name == "NO_TRADE":
-            alt = self._debit_substitute(signals, selection_reason)
+            alt = self._momentum_decision(signals, selection_reason)
             if alt is not None:
                 return alt
             self._log_decision(signals, "NO_TRADE", selection_reason)
@@ -3807,7 +3344,7 @@ class StrategyEngine:
 
         if not params.get("valid"):
             full_reason = f"params_invalid:{params.get('reason', 'unknown')}"
-            alt = self._debit_substitute(signals, full_reason)
+            alt = self._momentum_decision(signals, full_reason)
             if alt is not None:
                 return alt
             if "neutral" in full_reason.lower() or "vrp" in full_reason.lower():

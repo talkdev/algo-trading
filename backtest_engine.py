@@ -597,7 +597,6 @@ class Results:
             "consecutive", "entry_window", "day_move", "chain_stale",
             "no_strategy", "strike", "hard_exit", "lots", "or_not_established",
             "vix", "dte", "spread", "liquidity", "regime",
-            "strategy_rules_failed", "wide_or", "trend_route", "momentum",
         ):
             if key in low:
                 return key.rstrip("_")
@@ -1362,19 +1361,11 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
     ("regime verdict", (
         "VOL_NEUTRAL", "VOL_BUY_OPTIONS", "CHOPPY_MARKET", "regime",
         "RANGE_UNCLEAR", "STRADDLE_EXPLOSION", "or_not_established",
-        # v12: the regime layer's own wide-opening-range veto. It was
-        # unclassified, so 10 of 2026-09-15's 484 refusals were dropped from
-        # the funnel entirely - and they were the first 10 of the session.
-        "wide_or",
         "NO_CLEAR", "UNCLEAR", "TRENDING", "EXPANSION",
         "PAST_14", "BEFORE_09", "CONFIDENCE_NONE")),
     ("safety interlocks", (
         "vix", "circuit_breaker", "expanding", "spiking", "daily_loss_halt",
-        "daily", "abort",
-        # v12: these two sit inside _check_hard_gates' safety block, between
-        # the IV veto and the entry window. Unclassified, "day_move" alone
-        # hid 110 of 484 refusals on 2026-09-15 - a quarter of the session.
-        "day_move", "trend_route", "momentum")),
+        "daily", "abort")),
     ("entry window", ("entry_window",)),
     ("position limits", (
         "max_concurrent", "max_entries", "position_already_open",
@@ -1386,12 +1377,6 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
     ("structure build", (
         "no_strategy", "strike", "lots", "net_credit", "credit_ratio",
         "credit_risk", "wing_cost", "condor_weak_side", "friction",
-        # v12: _validate_entry_rules() refusals arrive prefixed
-        # "strategy_rules_failed:". Without this key every one of them
-        # became its own bucket (the strike and the distance are in the
-        # string), so a gate that fires all session read as dozens of
-        # singletons.
-        "strategy_rules_failed",
         "brokerage", "risk_budget", "target", "margin", "chain_stale",
         "fill_unavailable")),
     ("EV gate", ("ev_gate",)),
