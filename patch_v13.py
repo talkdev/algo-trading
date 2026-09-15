@@ -6,7 +6,7 @@ Usage: python patch_v13.py --check [--root PATH]
        python patch_v13.py --reverse [--root PATH]
 
 Only backtest_engine.py is modified. Python standard library only. Exact source
-fingerprints reject unexpected local edits; application is atomic, backed up and
+fingerprints ignore only CRLF/LF and UTF-8 BOM differences and reject code edits; application is atomic, backed up and
 idempotent. Read NEW_SOURCE below for the complete resulting implementation.
 
 Scope: pre-trade validation; live entry wrapper gates; shared post-close state;
@@ -4695,8 +4695,93 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())'''
 
+def canonical(data):
+    """Ignore transport-only Windows encoding differences, never code edits."""
+    try:
+        return data.decode("utf-8-sig").replace("\r\n", "\n").encode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SystemExit("Refusing: source must be UTF-8: " + str(exc))
+
+
 def digest(data):
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(canonical(data)).hexdigest()
+
+
+def mismatch(name, current, expected):
+    actual_lines = canonical(current).decode("utf-8").split("\n")
+    expected_lines = expected.split("\n")
+    for i in range(max(len(actual_lines), len(expected_lines))):
+        actual = actual_lines[i] if i < len(actual_lines) else "<end of file>"
+        wanted = expected_lines[i] if i < len(expected_lines) else "<end of file>"
+        if actual != wanted:
+            return (f"Refusing: {name} has a code/content difference at line {i + 1}.\n"
+                    f"  Expected: {wanted[:180]!r}\n"
+                    f"  Found:    {actual[:180]!r}\n"
+                    "CRLF/LF and UTF-8 BOM differences have already been ignored.\n"
+                    "No application file was changed. Supply this diagnostic and your "
+                    "current source for a compatible patch; do not bypass the guard.")
+    return f"Refusing: unexpected source mismatch in {name}."
+
+
+def output_bytes(text, original):
+    """Preserve the target's newline convention and optional UTF-8 BOM."""
+    body = original.removeprefix(b"\xef\xbb\xbf")
+    crlf = body.count(b"\r\n")
+    lf = body.count(b"\n") - crlf
+    if crlf > lf:
+        text = text.replace("\n", "\r\n")
+    prefix = b"\xef\xbb\xbf" if original.startswith(b"\xef\xbb\xbf") else b""
+    return prefix + text.encode("utf-8")
+
+
+def installer_self_test(source_root):
+    """Exercise the real CLI on LF, CRLF and BOM+CRLF copies, never the source."""
+    import subprocess
+    import sys
+    script = str(Path(__file__).resolve())
+    for newline, bom in (("\n", False), ("\r\n", False), ("\r\n", True)):
+        with tempfile.TemporaryDirectory(prefix="patch_v13_installer_") as tmp:
+            root = Path(tmp)
+            def encoded(text):
+                return (b"\xef\xbb\xbf" if bom else b"") + text.replace("\n", newline).encode("utf-8")
+            for name in DEPENDENCIES:
+                text = canonical((source_root / name).read_bytes()).decode("utf-8")
+                (root / name).write_bytes(encoded(text))
+            target = root / "backtest_engine.py"
+            original = encoded(OLD_SOURCE)
+            target.write_bytes(original)
+            def run(*flags, ok=True):
+                result = subprocess.run([sys.executable, script, "--root", tmp, *flags],
+                                        capture_output=True, text=True)
+                if (result.returncode == 0) != ok:
+                    raise RuntimeError("Installer test failed: " + result.stdout + result.stderr)
+                return result
+            run("--check")
+            if target.read_bytes() != original:
+                raise RuntimeError("--check changed source")
+            run()
+            patched = encoded(NEW_SOURCE)
+            if target.read_bytes() != patched:
+                raise RuntimeError("Installer did not preserve encoding/newlines")
+            if (root / "backtest_engine.py.v13.bak").read_bytes() != original:
+                raise RuntimeError("Backup is not byte-exact")
+            run()  # idempotent
+            run("--reverse")
+            if target.read_bytes() != original:
+                raise RuntimeError("Rollback is not byte-exact")
+            changed = original + b"\n# local edit\n"
+            target.write_bytes(changed)
+            result = run(ok=False)
+            if "difference at line" not in result.stderr or target.read_bytes() != changed:
+                raise RuntimeError("Code difference guard failed")
+            target.write_bytes(original)
+            dependency = root / "execution_engine.py"
+            dependency.write_bytes(dependency.read_bytes() + b"\n# local edit\n")
+            run(ok=False)
+            if target.read_bytes() != original:
+                raise RuntimeError("Dependency rejection changed source")
+    print("Installer tests passed: LF, CRLF, BOM, backups, rollback, idempotence, edit guards.")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -4706,6 +4791,7 @@ def main():
     ap.add_argument("--self-test", action="store_true", help="test patched code in a temporary copy; requires app dependencies")
     args = ap.parse_args()
     if args.self_test:
+        installer_self_test(args.root)
         import shutil
         import subprocess
         import sys
@@ -4725,14 +4811,15 @@ def main():
     path = args.root / "backtest_engine.py"
     before, after = (NEW_SOURCE, OLD_SOURCE) if args.reverse else (OLD_SOURCE, NEW_SOURCE)
     current = path.read_bytes()
-    if current == after.encode():
+    if canonical(current) == after.encode("utf-8"):
         print("Already in requested state; no changes.")
         return
-    if current != before.encode():
-        raise SystemExit("Refusing: backtest_engine.py differs from the validated source.")
+    if canonical(current) != before.encode("utf-8"):
+        raise SystemExit(mismatch(path.name, current, before))
     for name, expected in DEPENDENCIES.items():
         if digest((args.root / name).read_bytes()) != expected:
             raise SystemExit("Refusing: dependency differs from validated version: " + name)
+    replacement = output_bytes(after, current)
     compile(after, str(path), "exec")
     if args.check:
         print("Source/dependency fingerprints and syntax OK; no files changed.")
@@ -4748,7 +4835,7 @@ def main():
     fd, tmp = tempfile.mkstemp(prefix=".patch_v13_", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as out:
-            out.write(after.encode())
+            out.write(replacement)
             out.flush()
             os.fsync(out.fileno())
         os.chmod(tmp, path.stat().st_mode)
