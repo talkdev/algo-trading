@@ -64,6 +64,11 @@ NIFTY_ENGINE_PROFIT_PATCH_V38 = "3.8"
 # v3.9 (2026-09-09): VIX-11 expiry-day profitability pass. See the
 # v3.3-tagged blocks in core.py / strategy_engine.py / execution_engine.py.
 NIFTY_ENGINE_PROFIT_PATCH_V39 = "3.9"
+# PATCH_V12 (2026-09-15): profitability repair pass — Tuesday-0DTE
+# discipline, DTE2 unification, directional day-move, floor
+# discipline, event-day confirmation, trend-flip exit, momentum
+# resurrection, honest ADX, weekly exit realism. See patch_v12.py.
+NIFTY_ENGINE_PROFIT_PATCH_V12 = "12.0"
 
 
 def now_ist() -> datetime:
@@ -832,16 +837,28 @@ class Config:
     # that route; every gate below keeps it inside intraday, defined-risk
     # (max loss = premium paid) and out of the vol-spike tops.
     momentum_enabled:              bool  = True
-    momentum_min_dte:              int   = 1
+    # PATCH_V12: 0DTE momentum allowed (was 1). A confirmed 0DTE
+    # breakout is the highest-expectancy intraday ticket on the
+    # board; banning it left 15-Sep (a -458 crash) with no long-
+    # premium route at all. Half risk + 2-lot cap, see below.
+    momentum_min_dte:              int   = 0
     momentum_max_dte:              int   = 4
     # Trend confirmation: the fast (5m) ADX the strategy layer actually
     # consumes, and the OR/VWAP structure that proves it is a breakout and
     # not a drift inside a range.
-    momentum_adx_min:              float = 30.0
+    # PATCH_V12: 30 -> 24. With honest (mature-only) ADX, 30 is a
+    # bar a real intraday trend often never prints; 24 + OR-break
+    # + VWAP proof is the professional confirmation stack.
+    momentum_adx_min:              float = 24.0
     momentum_or_break_frac:        float = 0.15
     momentum_vwap_buffer_pts:      float = 8.0
     # Do not chase a move that has already spent the day's priced range.
-    momentum_day_move_max_pct:     float = 90.0
+    # PATCH_V12: 90 -> 200. 90% of priced range is spent by
+    # mid-morning on every trend day worth trading (measured
+    # 15-Sep: 200%+ by 11:45 with another -230pts to come).
+    # Anti-chase protection comes from OR-break freshness, the IV
+    # gates and the stop — not from a cap that bans trend days.
+    momentum_day_move_max_pct:     float = 200.0
     # Buy option, not a vol-spike top: India VIX must not be gapping up.
     momentum_vix_gap_max_pct:      float = 12.0
     # Premium paid, as a fraction of spot, for a strike that is neither a
@@ -868,14 +885,39 @@ class Config:
     # risk budget: a long option's worst case is its premium, and that is
     # only realised if it is carried to expiry, which the hard exit forbids.
     momentum_structural_risk_cap_mult: float = 2.5
+    # PATCH_V12: 0DTE momentum economics + event-day floor.
+    momentum_dte0_risk_frac:       float = 0.50
+    momentum_dte0_max_lots:        int   = 2
+    momentum_event_size_floor:      float = 0.40
     # The route substitutes for the sell side ONLY where the sell side was
     # refused; these markers identify the refusal families it may answer.
     # "day_move_used_..._no_edge" (>=125% of the opening straddle spent) is
     # deliberately NOT one of them: the momentum gate caps day_move_used
     # below that, so the two can never agree on the same tape.
+    # PATCH_V12: the substitute must also answer event-day and
+    # IV-expansion refusals. A confirmed trend THROUGH those blocks
+    # is exactly the tape a long-premium ticket is for (measured
+    # 11-Sep: CPI rally blocked all afternoon as
+    # EVENT:ONLY_RANGE_ALLOWED while the ATM call gained 43pts).
+    # The gate still refuses while IV is EXPANDING or the straddle
+    # is expanding — the markers only let the tape REACH the gate.
     momentum_block_markers:        tuple = (
         "dte2", "no_exception", "immature", "buy_options",
         "wide_or", "dangerous_to_sell",
+        # PATCH_V12 (round 3): the substitute also answers
+        # sell-side ECONOMIC refusals. A thin credit, a binding
+        # brokerage ratio or a negative short-premium EV says the
+        # READ cannot be expressed short — it says nothing about
+        # the same read expressed long, which the momentum gate
+        # underwrites from scratch (own trend/OR/VWAP/IV stack, own
+        # budget, own stop). Measured 2026-09-15: the confirmed
+        # bear read died on credit_risk/brokerage/EV at 1 lot while
+        # the long-put ticket that fit the budget was never
+        # consulted. day_move is answerable too: the 125 sell-side
+        # bar and the momentum chase cap are different standards,
+        # and the gate's own cap arbitrates.
+        "event", "only_range_allowed", "iv_expanding", "straddle_exp",
+        "params_invalid", "strategy_rules_failed", "day_move_used",
     )
 
     # ── v6: live execution hardening ──────────────────────────────────
@@ -1197,7 +1239,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         spot_proximity_pts=_get_int(env, "SPOT_PROXIMITY_PTS", 40),
         price_stop_straddle_mult=_get_float(env, "PRICE_STOP_STRADDLE_MULT", 0.42),
         profit_lock_pct_dte0=_get_float(env, "PROFIT_LOCK_PCT_DTE0", 0.40),
-        profit_lock_pct_dte1plus=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS", 0.25),
+        profit_lock_pct_dte1plus=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS", 0.22),  # PATCH_V12: was 0.25
         cheap_buyback_pts=_get_float(env, "CHEAP_BUYBACK_PTS", 5.0),
         cheap_buyback_after_time=_get_time(env, "CHEAP_BUYBACK_AFTER_TIME", dtime(13, 0)),
 
@@ -1303,12 +1345,12 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "300s",
         # ── v5 long-premium momentum expression ───────────────────────────
         momentum_enabled=_get_bool(env, "MOMENTUM_ENABLED", True),
-        momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 1),
+        momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 0),  # PATCH_V12: was 1
         momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 4),
-        momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 30.0), 15.0), 60.0),
+        momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 24.0), 15.0), 60.0),  # PATCH_V12: was 30.0
         momentum_or_break_frac=min(max(_get_float(env, "MOMENTUM_OR_BREAK_FRAC", 0.15), 0.0), 1.00),
         momentum_vwap_buffer_pts=min(max(_get_float(env, "MOMENTUM_VWAP_BUFFER_PTS", 8.0), 0.0), 60.0),
-        momentum_day_move_max_pct=min(max(_get_float(env, "MOMENTUM_DAY_MOVE_MAX_PCT", 90.0), 10.0), 400.0),
+        momentum_day_move_max_pct=min(max(_get_float(env, "MOMENTUM_DAY_MOVE_MAX_PCT", 200.0), 10.0), 400.0),  # PATCH_V12: was 90.0
         momentum_vix_gap_max_pct=min(max(_get_float(env, "MOMENTUM_VIX_GAP_MAX_PCT", 12.0), 0.5), 100.0),
         momentum_prem_min_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MIN_PCT_OF_SPOT", 0.0018), 0.0002), 0.01),
         momentum_prem_max_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MAX_PCT_OF_SPOT", 0.0090), 0.001), 0.03),
@@ -1326,6 +1368,10 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_structural_risk_cap_mult=min(
             max(_get_float(env, "MOMENTUM_STRUCTURAL_RISK_CAP_MULT", 2.5), 1.0), 5.0
         ),
+        # PATCH_V12: 0DTE momentum economics + event-day floor.
+        momentum_dte0_risk_frac=min(max(_get_float(env, "MOMENTUM_DTE0_RISK_FRAC", 0.50), 0.10), 1.00),
+        momentum_dte0_max_lots=min(max(_get_int(env, "MOMENTUM_DTE0_MAX_LOTS", 2), 1), 10),
+        momentum_event_size_floor=min(max(_get_float(env, "MOMENTUM_EVENT_SIZE_FLOOR", 0.40), 0.10), 1.00),
         momentum_block_markers=(
             tuple(
                 s.strip().lower()

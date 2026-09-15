@@ -277,6 +277,26 @@ class StrategyEngine:
         if signals.get("chain_stale"):
             return "NO_TRADE", "chain_stale_cannot_validate_strikes"
 
+        # PATCH_V12: on Tuesdays the tradeable contract is the 0DTE
+        # series. If the broker has not listed it yet, the engine
+        # used to trade the NEXT weekly as if it were a normal day
+        # and then get re-priced onto the 0DTE chain mid-position
+        # (measured 2026-09-08: Sep-15 spread sold at 09:51, marked
+        # on Sep-08 quotes by the afternoon — a phantom Rs 8,993).
+        # Wait for the real contract.
+        try:
+            _tue_wait = (
+                state.get("day_label") == "TUESDAY"
+                and signals.get("active_expiry") is not None
+                and signals.get("trading_date") is not None
+                and str(signals.get("active_expiry"))[:10] != str(signals.get("trading_date"))[:10]
+                and current_time < dtime(14, 0)
+            )
+        except Exception:
+            _tue_wait = False
+        if _tue_wait:
+            return "NO_TRADE", "tuesday_waiting_for_0dte_series_listed"
+
         confidence = signals.get("confidence_level", "NONE")
         if confidence in ("LOW", "NONE"):
             return "NO_TRADE", f"confidence_{confidence}_insufficient_edge_after_costs"
@@ -290,10 +310,42 @@ class StrategyEngine:
                     f"dte_{actual_dte}_requires_medium_high_confidence"
                 )
 
+        # PATCH_V12: the day-move block is measured on the side that
+        # threatens the structure, not the whole range. A 250%
+        # down-range day is the SAFEST tape to be short calls on
+        # (measured 2026-09-15: regime said PREMIUM_SELL_BEAR all
+        # day, the blanket block refused every cycle, zero trades on
+        # a -458 crash). Condors keep the total-range block.
         day_move_used = float(signals.get("day_move_used_pct") or 0.0)
-        if day_move_used >= self.config.day_move_used_block_pct:
+        _dm_threat = day_move_used
+        try:
+            if final_regime == "PREMIUM_SELL_BEAR":
+                _dm_threat = float(signals.get("day_up_used_pct", day_move_used) or 0.0)
+            elif final_regime == "PREMIUM_SELL_BULL":
+                _dm_threat = float(signals.get("day_down_used_pct", day_move_used) or 0.0)
+        except (TypeError, ValueError):
+            _dm_threat = day_move_used
+        # PATCH_V12 (round 2): a CONFIRMED trend exempts the
+        # trend-side vertical from the day-move block. An exhausted
+        # WITH-trend move is the thesis of the structure, not its
+        # risk: the opening spike that inflates the gauge is ancient
+        # history when spot sits 250pts below it (measured
+        # 2026-09-15: a +100pt opening spike annualised to 358% by
+        # the time-fraction normalisation, blocking a confirmed
+        # STRONG_DOWNTREND bear regime all session). Reversal risk is
+        # managed where it belongs — strike distance, the premium/
+        # price stops and the trend-flip exit — not by refusing the
+        # trend-side ticket. Condors and unconfirmed leans keep the
+        # block (directional threat for leans, total range for
+        # condors).
+        _dm_px = signals.get("price_regime", "")
+        _dm_trend_confirmed = (
+            (final_regime == "PREMIUM_SELL_BEAR" and _dm_px in ("DOWNTREND", "STRONG_DOWNTREND"))
+            or (final_regime == "PREMIUM_SELL_BULL" and _dm_px in ("UPTREND", "STRONG_UPTREND"))
+        )
+        if _dm_threat >= self.config.day_move_used_block_pct and not _dm_trend_confirmed:
             return "NO_TRADE", (
-                f"day_move_used_{day_move_used:.0f}pct_of_opening_straddle_no_edge"
+                f"day_move_used_{_dm_threat:.0f}pct_of_opening_straddle_no_edge"
             )
 
         try:
@@ -316,7 +368,17 @@ class StrategyEngine:
 
         or_condition = signals.get("or_condition", "MODERATE")
         if or_condition in ("WIDE", "VERY_WIDE"):
-            if not signals.get("gap_fade_opportunity"):
+            # PATCH_V12: a wide opening range bans the DELTA-NEUTRAL
+            # condor, not the trend-side vertical. Selling calls
+            # above a confirmed breakdown (or puts below a breakout)
+            # is how a wide-range trend day is harvested; the blanket
+            # ban left 2026-09-15 untradeable by every route.
+            _px = signals.get("price_regime", "")
+            _trend_side_ok = (
+                (final_regime == "PREMIUM_SELL_BEAR" and _px in ("DOWNTREND", "STRONG_DOWNTREND"))
+                or (final_regime == "PREMIUM_SELL_BULL" and _px in ("UPTREND", "STRONG_UPTREND"))
+            )
+            if not signals.get("gap_fade_opportunity") and not _trend_side_ok:
                 return "NO_TRADE", f"wide_or_{or_condition}_dangerous_to_sell_premium"
 
         return None
@@ -541,7 +603,15 @@ class StrategyEngine:
                         f"_by_{spot - or_mid:.0f}pts"
                     )
             max_pain = float(signals.get("max_pain") or 0)
-            if max_pain > 0 and abs(spot - max_pain) < 25:
+            # PATCH_V12 (round 2): pin risk is a range-tape
+            # phenomenon. A tape printing a confirmed downtrend is
+            # TRENDING THROUGH max pain, not pinning to it (measured
+            # 2026-09-15: STRONG_DOWNTREND, mature ADX 33, spot
+            # falling through 23350 — the veto blocked the
+            # trend-side vertical for 20 minutes mid-trend).
+            _mp_px = signals.get("price_regime", "")
+            _mp_trend_through = _mp_px in ("DOWNTREND", "STRONG_DOWNTREND")
+            if max_pain > 0 and abs(spot - max_pain) < 25 and not _mp_trend_through:
                 return False, (
                     f"bear_call_spot_within_25pts_of_max_pain_{max_pain:.0f}"
                 )
@@ -2482,13 +2552,20 @@ class StrategyEngine:
         # round(raw_lots) lots instead - never above the day cap. Low/MEDIUM
         # conviction and borderline-VRP reads are untouched: their size
         # reduction is a conviction signal, not a calendar artifact.
+        # PATCH_V12: the fixed-cost floor never fires on event days,
+        # is capped at 3 lots, and re-checks the structural guardrail
+        # it used to jump over. Measured 2026-09-11 (CPI): a 0.14
+        # size schedule was floored to the 5-lot day MAXIMUM on a
+        # thin, unmeasured setup; the stop cost Rs 3,924.
+        _is_event_floor = bool(signals.get("event_day", False))
         if (
             final_lots == 1
             and raw_lots >= 1.5
             and signals.get("confidence_level") == "HIGH"
             and not bool(signals.get("borderline_sell", False))
+            and not _is_event_floor
         ):
-            _floor_lots = min(int(round(raw_lots)), day_cap)
+            _floor_lots = min(int(round(raw_lots)), day_cap, 3)
             if _floor_lots >= 2:
                 self.logger.info(
                     f"Fixed-cost floor: budget supports {raw_lots:.2f} "
@@ -2496,6 +2573,8 @@ class StrategyEngine:
                     f"sizing to {_floor_lots} lots (day cap {day_cap})"
                 )
                 final_lots = _floor_lots
+                if structural_loss_per_lot * final_lots > max_risk * 1.5:
+                    final_lots = max(1, int(max_risk / structural_loss_per_lot))
 
         # ── v3.2 [F3] re-validate the economics at the FINAL size ─────
         # The gates above were priced at the provisional lot count. If
@@ -2867,6 +2946,11 @@ class StrategyEngine:
             return False, (
                 f"momentum_confidence_{signals.get('confidence_level')}_insufficient"
             ), 0
+        # PATCH_V12: event-day momentum needs HIGH conviction — the
+        # schedule is already softened for the substitute, so the
+        # read itself must be unambiguous.
+        if signals.get("event_day") and str(signals.get("confidence_level") or "") != "HIGH":
+            return False, "momentum_event_day_needs_high_confidence", 0
 
         try:
             adx = float(signals.get("adx_15") or 0.0)
@@ -2926,11 +3010,25 @@ class StrategyEngine:
 
         # ── freshness: a day that has already spent its priced range is
         #    not a breakout, it is the trade everyone is already in ───────
+        # PATCH_V12: a MEASURED-STRONG trend is exempt from the chase
+        # cap. Mature ADX above the strong threshold with a STRONG_*
+        # price read is continuation, not exhaustion — the opening
+        # spike that inflates the gauge is ancient history by
+        # mid-morning (measured 2026-09-15: 2.26x consumed at 11:00
+        # with ADX 86 on a tape that fell 230pts further). The cap
+        # still refuses plain-trend and immature-read chases, and
+        # the 35% premium stop bounds every ticket. No new knob: the
+        # strong threshold and the maturity flag are reused.
         try:
             used = float(signals.get("day_move_used_pct") or 0.0)
         except (TypeError, ValueError):
             used = 0.0
-        if used >= float(getattr(cfg, "momentum_day_move_max_pct", 90.0)):
+        _mom_strong = (
+            bool(signals.get("adx_15_mature", False))
+            and adx >= float(getattr(cfg, "adx_strong_threshold", 28.0))
+            and price in ("STRONG_UPTREND", "STRONG_DOWNTREND")
+        )
+        if used >= float(getattr(cfg, "momentum_day_move_max_pct", 90.0)) and not _mom_strong:
             return False, f"momentum_day_move_used_{used:.0f}pct_exhausted", 0
 
         # ── intraday-only timing ─────────────────────────────────────────
@@ -3124,15 +3222,25 @@ class StrategyEngine:
             state.get("current_capital", cfg.starting_capital) or cfg.starting_capital
         )
         budget  = float(cfg.max_risk_per_trade_pct or 0.006)
-        max_risk = (
-            current_capital * budget
-            * float(getattr(cfg, "momentum_risk_frac_of_budget", 1.0))
-        )
+        # PATCH_V12: 0DTE momentum (newly allowed) risks half the
+        # ticket: the theta cliff is real, the stop is the plan.
+        _mom_risk_frac = float(getattr(cfg, "momentum_risk_frac_of_budget", 1.0))
+        try:
+            if int(actual_dte) == 0:
+                _mom_risk_frac = min(_mom_risk_frac, float(getattr(cfg, "momentum_dte0_risk_frac", 0.50)))
+        except (TypeError, ValueError):
+            pass
+        max_risk = current_capital * budget * _mom_risk_frac
         risk_per_lot  = risk_pts * C02
         structural_risk_per_lot = exec_price * C02          # premium paid, all of it
         raw_lots = max_risk / max(risk_per_lot, 1.0)
-        sched = max(float(size_mult or 1.0),
-                    float(getattr(cfg, "momentum_size_floor", 0.80)))
+        # PATCH_V12: the size floor respects event days (0.40): a CPI
+        # breakout is still sized with the schedule's fear, just not
+        # into the ground.
+        _mom_floor = float(getattr(cfg, "momentum_size_floor", 0.80))
+        if signals.get("event_day"):
+            _mom_floor = min(_mom_floor, float(getattr(cfg, "momentum_event_size_floor", 0.40)))
+        sched = max(float(size_mult or 1.0), _mom_floor)
         sized = raw_lots * sched
         min_lots = float(getattr(cfg, "momentum_min_lots", 0.60))
         if sized < min_lots:
@@ -3150,6 +3258,14 @@ class StrategyEngine:
         _eq = max((current_capital / float(cfg.starting_capital or 1.0)) ** 0.5, 0.35)
         day_cap = max(1, int(LOT_CAPS_BY_DAY.get(day_label, 3) * _eq))
         final_lots = max(1, min(int(round(sized)), day_cap))
+        # PATCH_V12: a 0DTE long-premium ticket is capped at 2 lots:
+        # the structural cap below is premium-multiple based and
+        # would let a cheap ticket size itself into a cliff.
+        try:
+            if int(actual_dte) == 0:
+                final_lots = min(final_lots, int(getattr(cfg, "momentum_dte0_max_lots", 2)))
+        except (TypeError, ValueError):
+            pass
         # The sell side caps a position's STRUCTURAL loss (the margin that
         # could actually be called if the stop never filled) at 1.5x the
         # per-trade budget. A long option cannot lose more than the premium
@@ -3319,6 +3435,15 @@ class StrategyEngine:
         rules_ok, rules_reason = self._validate_entry_rules(strategy_name, signals)
         if not rules_ok:
             full_reason = f"strategy_rules_failed:{rules_reason}"
+            # PATCH_V12 (round 3): the substitute is consulted on
+            # structure-rule refusals exactly as on hard-gate and
+            # economics refusals — the rules are sell-structure-
+            # specific (pin veto, OR-mid positioning, delta gates)
+            # and a long-premium ticket re-underwrites every one of
+            # them in its own gate.
+            alt = self._momentum_decision(signals, full_reason)
+            if alt is not None:
+                return alt
             self._log_decision(signals, "NO_TRADE", full_reason)
             self._persist_decision(
                 signals, strategy_name, full_reason, None, "NO_TRADE"

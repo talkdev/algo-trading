@@ -945,7 +945,13 @@ class MainEngine:
                 not self.market_engine.state.get("daily_halted") and
                 not signals.get("block_new_entries") and
                 bool(signals.get("or_computed", False)) and
-                signals.get("final_regime") not in ("NO_TRADE", "ABORT", None) and
+                # PATCH_V12: decide() also runs when the regime layer
+                # refused the sell side, so the long-premium momentum
+                # substitute is consulted exactly as in replay. The
+                # sell side cannot leak through: _check_hard_gates
+                # refuses every NO_TRADE regime before any structure
+                # is built, and ABORT still never reaches decide().
+                signals.get("final_regime") not in ("ABORT", None) and
                 not self._feed_stale
             )
 
