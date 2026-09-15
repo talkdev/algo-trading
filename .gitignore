@@ -67,7 +67,7 @@ dist/
 /data/*.db
 
 *.pid
-
+patch.py
 # Ignore SQLite temporary/locking files everywhere
 *.db-wal
 *.db-shm

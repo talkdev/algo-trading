@@ -222,18 +222,69 @@ class StrategyEngine:
         if open_count >= 1:
             return "NO_TRADE", "position_already_open_single_position_engine"
 
-        last_entry_time = state.get("last_entry_time")
-        if last_entry_time and open_count == 0 and total_count > 0:
+        # ── PATCH_V13: the entry cooldown is measured from the last ACT ──
+        # It used to be measured from last_entry_time only, so a position
+        # that was OPEN for two hours and closed at 12:30:01 satisfied the
+        # cooldown at 12:30:02 and the engine re-sold the same regime
+        # fifteen seconds later (measured 2026-09-09: bear call banked
+        # +625 at 12:30:01, a four-leg condor entered at 12:31:01 at the
+        # same spot, scratched -82). The cooldown exists to stop churn, and
+        # churn is measured from the close, not from the open.
+        _last_act = None
+        for _t in (state.get("last_entry_time"), state.get("last_exit_time")):
+            if not _t:
+                continue
             try:
-                mins = (
-                    now_ist() - datetime.fromisoformat(last_entry_time)
-                ).total_seconds() / 60.0
+                _dt = datetime.fromisoformat(str(_t))
+            except Exception:
+                continue
+            if _last_act is None or _dt > _last_act:
+                _last_act = _dt
+        if _last_act is not None and open_count == 0 and total_count > 0:
+            try:
+                mins = (now_ist() - _last_act).total_seconds() / 60.0
                 if mins < ENTRY_COOLDOWN_MIN:
                     return "NO_TRADE", (
                         f"entry_cooldown_{ENTRY_COOLDOWN_MIN - mins:.0f}min_remaining"
                     )
             except Exception:
                 pass
+
+        # ── PATCH_V13: a re-entry has to be a NEW trade, not a repeat ────
+        # After a close, the sell side stands aside until the tape has moved
+        # enough that the structure it would sell is priced differently from
+        # the one it just bought back - or until enough of the session has
+        # passed that the read is re-confirmed on its own merits. This is
+        # deliberately NOT answerable by the long-premium substitute: the
+        # rule says "you just took this trade", which is as true of the
+        # opposite expression of the same tape as of the same one.
+        _exit_spot = state.get("last_exit_spot")
+        _exit_time = state.get("last_exit_time")
+        if _exit_spot and _exit_time and open_count == 0:
+            try:
+                _xdt = datetime.fromisoformat(str(_exit_time))
+                _since = (now_ist() - _xdt).total_seconds() / 60.0
+            except Exception:
+                _since = None
+            if _since is not None and _since < float(
+                    getattr(self.config, "reentry_reconfirm_min", 45)):
+                try:
+                    _sp = float(signals.get("spot") or 0.0)
+                    _xs = float(_exit_spot)
+                except (TypeError, ValueError):
+                    _sp = _xs = 0.0
+                if _sp > 0 and _xs > 0:
+                    _moved = abs(_sp - _xs)
+                    _need = max(
+                        float(getattr(self.config, "reentry_material_move_pts", 15.0)),
+                        _sp * float(getattr(
+                            self.config, "reentry_material_move_pct", 0.12)) / 100.0,
+                    )
+                    if _moved < _need:
+                        return "NO_TRADE", (
+                            f"no_material_change_since_exit_{_moved:.0f}pts_"
+                            f"lt_{_need:.0f}pts_needed"
+                        )
 
         if state.get("consecutive_stops", 0) >= 2:
             return "NO_TRADE", "2_consecutive_stops_halt"
@@ -412,6 +463,27 @@ class StrategyEngine:
             return strategy, reason
 
         if final_regime == "PREMIUM_SELL_BULL":
+            # ── PATCH_V13: the day's own structure vetoes selling the
+            # downside. A gap-down that has NOT been filled, with spot still
+            # under the previous close and a call wall above it, is a heavy
+            # tape: an intraday rally inside that structure is a bounce, and
+            # selling puts into it puts the short strike exactly where the
+            # day's remaining risk lives. The engine already leans bearish
+            # off this structure inside a RANGE regime (see
+            # _range_day_bearish_lean); a UPTREND classification is a
+            # 15-minute read of the same tape and must not be allowed to
+            # flip the book to the other side of it. Measured 2026-09-09:
+            # the midday rally printed PREMIUM_SELL_BULL at 12:36 with the
+            # gap-down unfilled (day high 23,571 vs prev close 23,635) and
+            # spot 77pts under the close; the flat engine's next ticket was
+            # a bull put, and the tape fell 130pts from there into the bell.
+            # Standing aside is not a directional bet - it is refusing to
+            # sell the side of the book the day's structure contradicts.
+            _ds_ok, _ds_why = self._day_structure_bearish(signals)
+            if _ds_ok:
+                return "NO_TRADE", (
+                    f"day_structure_contradicts_bull_premium:{_ds_why}"
+                )
             reason = (
                 f"regime:{final_regime}:conf={confidence}:"
                 f"dte={dte}:adx={adx_15:.0f}:"
@@ -428,6 +500,46 @@ class StrategyEngine:
             return BEAR_CALL_SPREAD, reason
 
         return "NO_TRADE", f"no_strategy_for_regime:{final_regime}"
+
+    def _day_structure_bearish(self, signals: dict) -> Tuple[bool, str]:
+        """The session's structural facts, independent of any regime read.
+
+        All of these are slow, measurable properties of the day rather than
+        of the last fifteen minutes: the engine's own gap classification,
+        whether that gap has been filled, where spot sits against the
+        previous close, and whether there is real call-side open interest
+        above spot to sell into. Regime classifications flicker cycle to
+        cycle (RANGE -> UPTREND -> RANGE inside twenty minutes on
+        2026-09-09); these do not, which is exactly why they are allowed to
+        arbitrate structure selection.
+        """
+        if signals.get("gap_direction") != "DOWN":
+            return False, "structure_needs_down_gap"
+        try:
+            _pc = float(signals.get("prev_close") or 0.0)
+            _dh = float(signals.get("day_high") or 0.0)
+            _sp = float(signals.get("spot") or 0.0)
+        except (TypeError, ValueError):
+            return False, "structure_day_unknown"
+        if _pc <= 0 or _dh <= 0 or _sp <= 0:
+            return False, "structure_day_unknown"
+        if _dh >= _pc:
+            return False, "structure_gap_filled"
+        if _sp >= _pc:
+            return False, "structure_spot_reclaimed_prev_close"
+        try:
+            _rw = float(signals.get("resistance_strike") or 0.0)
+            _rs = float(signals.get("resistance_strength") or 0.0)
+        except (TypeError, ValueError):
+            return False, "structure_no_call_wall"
+        if _rw <= _sp:
+            return False, "structure_call_wall_not_above_spot"
+        if _rs < 2.0:
+            return False, "structure_call_wall_too_weak"
+        return True, (
+            f"gap_down_unfilled_dh={_dh:.0f}_pc={_pc:.0f}_"
+            f"wall={_rw:.0f}x{_rs:.1f}"
+        )
 
     def _range_day_bearish_lean(self, signals: dict) -> Tuple[bool, str]:
         """Day-structure lean: heavy tape inside a range regime.
@@ -458,35 +570,24 @@ class StrategyEngine:
             return False, "lean_skipped_friday_dte2_delta_neutral_only"
         if signals.get("price_regime") != "RANGE":
             return False, "lean_needs_range_price"
+        # PATCH_V13: positioning that is UNCLEAR is still a veto here, and
+        # deliberately so. Relaxing it was measured, not assumed: on
+        # 2026-09-11 the lean then fired at 10:01 off a VERY_NARROW opening
+        # range with an immature ADX and an UNCLEAR OI read, thirteen minutes
+        # earlier and Rs 333 worse than the entry the confirmed bearish read
+        # produced on its own. The lean is a tie-breaker for a RANGE regime
+        # whose positioning evidence has gone quiet, not a licence to sell
+        # the downside on a gap day before the tape has said anything. What
+        # PATCH_V13 does change is that the STRUCTURAL half of this test now
+        # lives in _day_structure_bearish(), where the same facts also veto
+        # selling puts into an unfilled gap-down (see _map_regime_to_strategy)
+        # - one definition of the day's structure, used by both routes.
         if signals.get("positioning_regime") not in ("RANGE", "BEARISH"):
             return False, "lean_blocked_by_bullish_positioning"
-        if signals.get("gap_direction") != "DOWN":
-            return False, "lean_needs_down_gap"
-        try:
-            _pc = float(signals.get("prev_close") or 0.0)
-            _dh = float(signals.get("day_high") or 0.0)
-            _sp = float(signals.get("spot") or 0.0)
-        except (TypeError, ValueError):
-            return False, "lean_day_structure_unknown"
-        if _pc <= 0 or _dh <= 0 or _sp <= 0:
-            return False, "lean_day_structure_unknown"
-        if _dh >= _pc:
-            return False, "lean_gap_filled"
-        if _sp >= _pc:
-            return False, "lean_spot_reclaimed_prev_close"
-        try:
-            _rw = float(signals.get("resistance_strike") or 0.0)
-            _rs = float(signals.get("resistance_strength") or 0.0)
-        except (TypeError, ValueError):
-            return False, "lean_no_call_wall"
-        if _rw <= _sp:
-            return False, "lean_call_wall_not_above_spot"
-        if _rs < 2.0:
-            return False, "lean_call_wall_too_weak"
-        return True, (
-            f"day_structure_lean_bearish:gap_down_unfilled_"
-            f"dh={_dh:.0f}_pc={_pc:.0f}_wall={_rw:.0f}x{_rs:.1f}"
-        )
+        _ds_ok, _ds_why = self._day_structure_bearish(signals)
+        if not _ds_ok:
+            return False, f"lean_{_ds_why}"
+        return True, f"day_structure_lean_bearish:{_ds_why}"
 
     def _resolve_range_strategy(
         self,
@@ -516,6 +617,271 @@ class StrategyEngine:
             self.logger.info(f"Range resolution: {_lean_reason0}")
             return BEAR_CALL_SPREAD
         return IRON_CONDOR
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PATCH_V13: tape evidence, entry/exit symmetry, session price memory
+    # ═══════════════════════════════════════════════════════════════════
+    def _note_price(self, signals: dict) -> None:
+        """Keep a rolling session price memory for the closing-hour route.
+
+        decide() is called on every cycle the engine is allowed to act, so
+        this is the same series in live and in replay. It is trimmed to the
+        session and to the lookback the closing-hour gate needs, so it stays
+        a few hundred tuples.
+        """
+        try:
+            spot = float(signals.get("spot") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if spot <= 0:
+            return
+        hist = getattr(self, "_v13_price_hist", None)
+        if hist is None:
+            hist = []
+            self._v13_price_hist = hist
+        now = now_ist()
+        hist.append((now, spot))
+        lookback = float(getattr(
+            self.config, "momentum_late_extreme_lookback_min", 45)) + 30.0
+        cut = now - timedelta(minutes=lookback)
+        today = now.date()
+        while hist and (hist[0][0] < cut or hist[0][0].date() != today):
+            hist.pop(0)
+        if len(hist) > 2000:
+            del hist[:-2000]
+
+    def _trend_evidence(self, signals: dict) -> Tuple[int, float, bool, float]:
+        """The smoothed directional read of the tape.
+
+        Returns (direction, adx, adx_mature, vwap_dist_pct) with direction
+        +1 up, -1 down, 0 no evidence. Evidence is an OR of three
+        independent reads the engine already computes - the price regime
+        classification, the 15-minute EMA structure, and displacement from
+        VWAP - because any one of them flickers on its own (measured
+        2026-09-09: price_regime went RANGE -> UPTREND -> RANGE -> UPTREND
+        four times in ninety minutes while spot went nowhere, and
+        ema_structure flipped TRANSITIONAL for single cycles inside a
+        sustained move). Three reads agreeing is a trend; one of three
+        firing on one cycle is noise.
+        """
+        try:
+            adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            adx = 0.0
+        mature = bool(signals.get("adx_15_mature", False))
+        price  = str(signals.get("price_regime") or "")
+        ema    = str(signals.get("ema_structure") or "")
+        try:
+            vd = float(signals.get("vwap_dist_pct") or 0.0)
+        except (TypeError, ValueError):
+            vd = 0.0
+        buf = abs(float(getattr(
+            self.config, "counter_trend_vwap_dist_min_pct", 0.10)))
+        up = (
+            price in ("UPTREND", "STRONG_UPTREND")
+            or (ema == "BULLISH" and vd >= buf)
+        )
+        dn = (
+            price in ("DOWNTREND", "STRONG_DOWNTREND")
+            or (ema == "BEARISH" and vd <= -buf)
+        )
+        if up and not dn:
+            return 1, adx, mature, vd
+        if dn and not up:
+            return -1, adx, mature, vd
+        return 0, adx, mature, vd
+
+    def _tape_displacement(self, signals: dict) -> Optional[dict]:
+        """Latch the trend read so one cycle cannot flip the book.
+
+        A regime read that is re-derived from scratch every fifteen seconds
+        produces a different structure every fifteen seconds. The read is
+        therefore held for displaced_tape_hold_min minutes once established,
+        dropped the moment the tape asserts the opposite direction, and
+        expired by the clock otherwise.
+        """
+        cfg   = self.config
+        state = self.market_engine.state
+        now   = now_ist()
+        direction, adx, mature, vd = self._trend_evidence(signals)
+        hold = float(getattr(cfg, "displaced_tape_hold_min", 10))
+        _adx_trend = float(getattr(cfg, "adx_trend_threshold", 20.0))
+
+        latch = state.get("tape_displacement")
+        if isinstance(latch, dict):
+            try:
+                until = datetime.fromisoformat(str(latch.get("until")))
+            except Exception:
+                until = now
+            if now > until or int(latch.get("dir", 0)) == 0:
+                latch = None
+            elif direction != 0 and direction != int(latch.get("dir", 0)):
+                latch = None          # the tape contradicts it: drop at once
+        else:
+            latch = None
+
+        if direction != 0 and mature and adx >= _adx_trend:
+            latch = {
+                "dir":        direction,
+                "adx":        round(adx, 2),
+                "vwap_dist":  round(vd, 4),
+                "price":      str(signals.get("price_regime") or ""),
+                "ema":        str(signals.get("ema_structure") or ""),
+                "since":      now.isoformat(),
+                "until":      (now + timedelta(minutes=hold)).isoformat(),
+            }
+        state["tape_displacement"] = latch
+        return latch
+
+    def _counter_trend_entry_refusal(
+        self,
+        strategy_name: str,
+        signals:       dict,
+    ) -> Optional[str]:
+        """Refuse to OPEN what the exit ladder is built to eject.
+
+        The v12 trend-flip exit closes a credit vertical that a measured
+        trend has run against, at a loss, by design. Opening one is the same
+        trade entered from the wrong side of it: the entry pays the spread,
+        the ladder ejects it, and the round trip is the P&L. Symmetric
+        structures are refused on the same evidence only when the
+        displacement is strong - a condor is a range trade and a tape 0.10%+
+        off VWAP with a mature ADX at or above the strong threshold is not
+        ranging, so one of its two shorts is being tested from the first
+        cycle.
+        """
+        cfg = self.config
+        if not bool(getattr(cfg, "counter_trend_entry_block", True)):
+            return None
+        latch = self._tape_displacement(signals)
+        if not latch:
+            return None
+        try:
+            d    = int(latch.get("dir", 0))
+            ladx = float(latch.get("adx", 0.0))
+            lvd  = float(latch.get("vwap_dist", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if d == 0:
+            return None
+        _side = "uptrend" if d > 0 else "downtrend"
+        _tag = f"measured_{_side}_adx_{ladx:.0f}_vwap_{lvd:+.2f}pct"
+
+        if strategy_name == BEAR_CALL_SPREAD and d > 0:
+            return f"counter_trend_entry_blocked:{strategy_name}:{_tag}"
+        if strategy_name == BULL_PUT_SPREAD and d < 0:
+            return f"counter_trend_entry_blocked:{strategy_name}:{_tag}"
+        if strategy_name in (IRON_CONDOR, IRON_BUTTERFLY):
+            _strong = float(getattr(cfg, "displaced_tape_adx_min",
+                                    getattr(cfg, "adx_strong_threshold", 28.0)))
+            _buf = abs(float(getattr(cfg, "counter_trend_vwap_dist_min_pct", 0.10)))
+            if ladx >= _strong and abs(lvd) >= _buf:
+                return (
+                    f"displaced_tape_no_symmetric_structure:{strategy_name}:"
+                    f"adx_{ladx:.0f}_ge_{_strong:.0f}:vwap_{lvd:+.2f}pct"
+                )
+        return None
+
+    def _in_late_momentum_window(self, cur: dtime) -> bool:
+        """True when the closing-hour route owns the clock.
+
+        Starts after the sell side's last entry so the two routes can never
+        compete for a cycle; ends at the configured cut, and independently
+        at hard_exit - momentum_late_min_minutes_left, which keeps the rule
+        correct on a Tuesday's 15:00 square-off without a second clock.
+        """
+        cfg   = self.config
+        state = self.market_engine.state
+        if not bool(getattr(cfg, "momentum_late_enabled", True)):
+            return False
+        if not bool(getattr(cfg, "momentum_enabled", True)):
+            return False
+        try:
+            start = datetime.strptime(
+                str(getattr(cfg, "momentum_late_window_start", "14:30")),
+                "%H:%M").time()
+            end = datetime.strptime(
+                str(getattr(cfg, "momentum_late_window_end", "14:57")),
+                "%H:%M").time()
+        except Exception:
+            return False
+        try:
+            hard_exit = datetime.strptime(
+                state.get("hard_exit_time", "15:00"), "%H:%M").time()
+        except Exception:
+            hard_exit = cfg.hard_exit_time
+        _min_left = float(getattr(cfg, "momentum_late_min_minutes_left", 25))
+        try:
+            _last = (
+                datetime.combine(date.today(), hard_exit)
+                - datetime.combine(date.today(), end)
+            ).total_seconds() / 60.0
+            if _last < _min_left:
+                end = (
+                    datetime.combine(date.today(), hard_exit)
+                    - timedelta(minutes=_min_left)
+                ).time()
+        except Exception:
+            pass
+        return start <= cur <= end
+
+    def _late_fresh_extreme(self, signals: dict, direction: int) -> Tuple[bool, str]:
+        """The closing-hour trend must still be making ground NOW.
+
+        Primary test: spot beyond the extreme of the last
+        momentum_late_extreme_lookback_min minutes of the session, excluding
+        the current print (a level equal to the print that set it is not a
+        breakout). Fallback, used only when the price memory is shorter than
+        momentum_late_extreme_min_span_min - the replay harness calls decide()
+        only on cycles where the book is flat, so its memory starts when the
+        last position closed - : spot inside
+        momentum_late_range_proximity_frac of the session range from the
+        extreme it is attacking. Both tests ask the same question of the tape
+        and agree on every recorded session.
+        """
+        cfg  = self.config
+        try:
+            spot = float(signals.get("spot") or 0.0)
+        except (TypeError, ValueError):
+            spot = 0.0
+        if spot <= 0:
+            return False, "late_no_spot"
+        lookback = float(getattr(cfg, "momentum_late_extreme_lookback_min", 45))
+        min_span = float(getattr(cfg, "momentum_late_extreme_min_span_min", 30))
+        now  = now_ist()
+        cut  = now - timedelta(minutes=lookback)
+        hist = getattr(self, "_v13_price_hist", None) or []
+        win  = [(t, s) for (t, s) in hist if cut <= t < now]
+        span = 0.0
+        if len(win) >= 2:
+            span = (win[-1][0] - win[0][0]).total_seconds() / 60.0
+        if span >= min_span:
+            ref = min(s for _, s in win) if direction < 0 \
+                else max(s for _, s in win)
+            ok  = spot < ref if direction < 0 else spot > ref
+            return ok, (
+                f"late_fresh_extreme_{lookback:.0f}min_ref_{ref:.2f}_"
+                f"spot_{spot:.2f}_span_{span:.0f}min"
+            )
+        try:
+            dh = float(signals.get("day_high") or 0.0)
+            dl = float(signals.get("day_low") or 0.0)
+        except (TypeError, ValueError):
+            dh = dl = 0.0
+        rng = dh - dl
+        if dh > 0 and dl > 0 and rng > 0:
+            frac = float(getattr(cfg, "momentum_late_range_proximity_frac", 0.30))
+            if direction < 0:
+                ok  = spot <= dl + frac * rng
+                ref = dl + frac * rng
+            else:
+                ok  = spot >= dh - frac * rng
+                ref = dh - frac * rng
+            return ok, (
+                f"late_range_proximity_ref_{ref:.2f}_spot_{spot:.2f}_"
+                f"span_{span:.0f}min"
+            )
+        return False, "late_no_extreme_reference"
 
     def _validate_entry_rules(
         self,
@@ -2933,9 +3299,39 @@ class StrategyEngine:
         if dte_i > int(getattr(cfg, "momentum_max_dte", 4)):
             return False, f"momentum_dte_{dte_i}_above_max", 0
 
+        # ── PATCH_V13: which route owns this cycle ───────────────────────
+        # The closing hour is a different trade from the morning breakout:
+        # the opening range is ancient, the session has 25-75 minutes left,
+        # and the classification that matters is the smoothed one (EMA
+        # structure, displacement from VWAP, a mature ADX at the strong
+        # threshold) rather than the fifteen-minute price regime, which on a
+        # closing-hour tape alternates RANGE/CHOPPY/UPTREND while the trend
+        # itself never stops. Everything below the route split is shared:
+        # the IV stack, the chase cap, the daily clip limit, the flat book
+        # requirement, the budget and the stop.
+        late = self._in_late_momentum_window(cur)
+
         # ── the read itself: a trend, not a range with drift ─────────────
         price   = str(signals.get("price_regime") or "")
-        if price in ("UPTREND", "STRONG_UPTREND"):
+        ema     = str(signals.get("ema_structure") or "")
+        if late:
+            # The EMA structure sets the direction; the price regime is only
+            # allowed to VETO it, never to supply it (a single-cycle
+            # UPTREND print inside a bearish closing hour is the trap this
+            # route exists to avoid).
+            if ema == "BEARISH":
+                direction = -1
+            elif ema == "BULLISH":
+                direction = 1
+            else:
+                return False, f"momentum_late_ema_{ema or 'NONE'}_no_direction", 0
+            if (direction < 0 and price in ("UPTREND", "STRONG_UPTREND")) or \
+               (direction > 0 and price in ("DOWNTREND", "STRONG_DOWNTREND")):
+                return False, (
+                    f"momentum_late_price_regime_{price}_contradicts_"
+                    f"{'call' if direction > 0 else 'put'}_side"
+                ), 0
+        elif price in ("UPTREND", "STRONG_UPTREND"):
             direction = 1
         elif price in ("DOWNTREND", "STRONG_DOWNTREND"):
             direction = -1
@@ -2956,29 +3352,70 @@ class StrategyEngine:
             adx = float(signals.get("adx_15") or 0.0)
         except (TypeError, ValueError):
             adx = 0.0
-        if adx < float(getattr(cfg, "momentum_adx_min", 30.0)):
+        # PATCH_V13: the closing hour pays premium out of a session that is
+        # nearly over, so it demands a MEASURED-STRONG trend - the same bar
+        # the engine uses everywhere else to separate "trending" from "has
+        # drifted" (adx_strong_threshold). The morning breakout route keeps
+        # its own, lower bar. Measured across the five recorded sessions:
+        # the afternoon ADX on the two days whose closing hour went nowhere
+        # (2026-09-08: 12-17, 2026-09-10: 22-27 at 14:40) sits below 28, and
+        # the one day whose closing hour carried the session (2026-09-09:
+        # 24 -> 31 -> 40 between 14:39 and 15:06) crosses it at 14:45 and
+        # never looks back.
+        _adx_min = float(getattr(cfg, "momentum_late_adx_min", 28.0)) if late \
+            else float(getattr(cfg, "momentum_adx_min", 30.0))
+        if adx < _adx_min:
             return False, f"momentum_adx_{adx:.0f}_below_min", 0
+        if late and not bool(signals.get("adx_15_mature", False)):
+            return False, "momentum_late_adx_immature", 0
 
         # ── breakout PROOF: through the opening range, in the trend side ─
         spot = float(signals.get("spot") or 0.0)
         if spot <= 0:
             return False, "momentum_no_spot", 0
-        # The opening range is mandatory: it is the level the trend has to be
-        # measured against, and without it "momentum" is just a green candle.
-        or_high = float(signals.get("or_high") or 0.0)
-        or_low  = float(signals.get("or_low") or 0.0)
-        or_w    = float(signals.get("or_width") or 0.0)
-        if not signals.get("or_computed") or or_high <= 0 or or_low <= 0:
-            return False, "momentum_no_opening_range_to_confirm", 0
-        _need = max(5.0, or_w * float(getattr(cfg, "momentum_or_break_frac", 0.15)))
-        if direction > 0 and spot < or_high + _need:
-            return False, (
-                f"momentum_call_not_through_or_high_{spot:.0f}<{or_high + _need:.0f}"
-            ), 0
-        if direction < 0 and spot > or_low - _need:
-            return False, (
-                f"momentum_put_not_through_or_low_{spot:.0f}>{or_low - _need:.0f}"
-            ), 0
+        if late:
+            # PATCH_V13: displacement + a fresh extreme. The opening range
+            # was set five hours ago; by the closing hour it is a level, not
+            # a reference (2026-09-09: the whole afternoon move happened
+            # inside the morning range, so an OR-break test could never see
+            # it). What a closing-hour continuation has to prove is that the
+            # tape is OFF VWAP by more than noise and is still making ground
+            # now.
+            try:
+                _vd = float(signals.get("vwap_dist_pct") or 0.0)
+            except (TypeError, ValueError):
+                _vd = 0.0
+            _vd_min = float(getattr(cfg, "momentum_late_vwap_dist_min_pct", 0.10))
+            if direction < 0 and _vd > -_vd_min:
+                return False, (
+                    f"momentum_late_put_displacement_{_vd:+.3f}pct_"
+                    f"above_{-_vd_min:.2f}pct"
+                ), 0
+            if direction > 0 and _vd < _vd_min:
+                return False, (
+                    f"momentum_late_call_displacement_{_vd:+.3f}pct_"
+                    f"below_{_vd_min:.2f}pct"
+                ), 0
+            _fx_ok, _fx_why = self._late_fresh_extreme(signals, direction)
+            if not _fx_ok:
+                return False, f"momentum_{_fx_why}", 0
+        else:
+            # The opening range is mandatory: it is the level the trend has to be
+            # measured against, and without it "momentum" is just a green candle.
+            or_high = float(signals.get("or_high") or 0.0)
+            or_low  = float(signals.get("or_low") or 0.0)
+            or_w    = float(signals.get("or_width") or 0.0)
+            if not signals.get("or_computed") or or_high <= 0 or or_low <= 0:
+                return False, "momentum_no_opening_range_to_confirm", 0
+            _need = max(5.0, or_w * float(getattr(cfg, "momentum_or_break_frac", 0.15)))
+            if direction > 0 and spot < or_high + _need:
+                return False, (
+                    f"momentum_call_not_through_or_high_{spot:.0f}<{or_high + _need:.0f}"
+                ), 0
+            if direction < 0 and spot > or_low - _need:
+                return False, (
+                    f"momentum_put_not_through_or_low_{spot:.0f}>{or_low - _need:.0f}"
+                ), 0
         vwap = signals.get("vwap")
         try:
             vwap = float(vwap) if vwap else 0.0
@@ -3045,15 +3482,28 @@ class StrategyEngine:
                 state.get("hard_exit_time", "15:00"), "%H:%M").time()
         except Exception:
             hard_exit = cfg.hard_exit_time
-        if cur < entry_start:
-            return False, f"momentum_before_entry_window_{entry_start}", 0
-        if cur > entry_end:
-            return False, f"momentum_past_entry_window_{entry_end}", 0
-        mins_left = self._minutes_to_time(cur, hard_exit)
-        if mins_left < float(getattr(cfg, "momentum_min_minutes_left", 90)):
-            return False, (
-                f"momentum_only_{mins_left:.0f}min_before_hard_exit"
-            ), 0
+        if late:
+            # PATCH_V13: the closing-hour clock. _in_late_momentum_window
+            # already clipped the window end to hard_exit - min_minutes_left,
+            # so a Tuesday's 15:00 square-off is handled by the same rule as
+            # a 15:20 day. The check is repeated here so the reason string
+            # says which bound failed.
+            _late_min = float(getattr(cfg, "momentum_late_min_minutes_left", 25))
+            _mins_left = self._minutes_to_time(cur, hard_exit)
+            if _mins_left < _late_min:
+                return False, (
+                    f"momentum_late_only_{_mins_left:.0f}min_before_hard_exit"
+                ), 0
+        else:
+            if cur < entry_start:
+                return False, f"momentum_before_entry_window_{entry_start}", 0
+            if cur > entry_end:
+                return False, f"momentum_past_entry_window_{entry_end}", 0
+            mins_left = self._minutes_to_time(cur, hard_exit)
+            if mins_left < float(getattr(cfg, "momentum_min_minutes_left", 90)):
+                return False, (
+                    f"momentum_only_{mins_left:.0f}min_before_hard_exit"
+                ), 0
 
         # ── one clip a day, and never beside an open position ───────────
         if self._count_momentum_entries() >= int(
@@ -3069,7 +3519,9 @@ class StrategyEngine:
         if signals.get("chain_stale"):
             return False, "momentum_chain_stale", 0
 
-        return True, "momentum_gate_open", direction
+        return True, (
+            "momentum_gate_open_late_window" if late else "momentum_gate_open"
+        ), direction
 
     def _momentum_pick_strike(
         self,
@@ -3129,6 +3581,7 @@ class StrategyEngine:
         selection_reason: str,
         signals:          dict,
         size_mult:        float,
+        late:             bool = False,
     ) -> dict:
         """Build a single-leg long-premium breakout position.
 
@@ -3230,6 +3683,15 @@ class StrategyEngine:
                 _mom_risk_frac = min(_mom_risk_frac, float(getattr(cfg, "momentum_dte0_risk_frac", 0.50)))
         except (TypeError, ValueError):
             pass
+        # PATCH_V13: a closing-hour ticket risks half the ticket again. The
+        # edge is the session's last trend leg, but the ride is bounded by a
+        # clock rather than by a thesis, so the budget is halved and the lot
+        # count capped below.
+        if late:
+            _mom_risk_frac = min(
+                _mom_risk_frac,
+                float(getattr(cfg, "momentum_late_risk_frac", 0.50)),
+            )
         max_risk = current_capital * budget * _mom_risk_frac
         risk_per_lot  = risk_pts * C02
         structural_risk_per_lot = exec_price * C02          # premium paid, all of it
@@ -3266,6 +3728,11 @@ class StrategyEngine:
                 final_lots = min(final_lots, int(getattr(cfg, "momentum_dte0_max_lots", 2)))
         except (TypeError, ValueError):
             pass
+        # PATCH_V13: closing-hour clip cap (see the risk fraction above).
+        if late:
+            final_lots = max(
+                1, min(final_lots, int(getattr(cfg, "momentum_late_max_lots", 4)))
+            )
         # The sell side caps a position's STRUCTURAL loss (the margin that
         # could actually be called if the stop never filled) at 1.5x the
         # per-trade budget. A long option cannot lose more than the premium
@@ -3360,6 +3827,10 @@ class StrategyEngine:
             "stop_at_breakeven":      False,
             "momentum":               True,
             "momentum_direction":     int(direction),
+            # PATCH_V13: read by the debit exit ladder - a ticket opened
+            # inside the final window rides its ratchet and its stop to the
+            # hard exit instead of being banked at breakeven by D4.
+            "momentum_late":          bool(late),
         }
 
     def _momentum_decision(self, signals: dict, block_reason: str) -> Optional[dict]:
@@ -3377,13 +3848,23 @@ class StrategyEngine:
         if not ok:
             return None
 
+        # PATCH_V13: the gate tags which route opened - the morning breakout
+        # or the closing-hour continuation. The closing hour is sized smaller
+        # and is exempted from the "bank a long option at breakeven inside
+        # the final 45 minutes" rule, which would otherwise flatten a ticket
+        # bought inside that window on its first profitable cycle.
+        _late = "late_window" in str(why)
+
         size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
         reason = (
             f"momentum_trend_expression:{'LONG_CALL' if direction > 0 else 'LONG_PUT'}"
             f":dte={signals.get('actual_dte')}:adx={float(signals.get('adx_15') or 0.0):.0f}"
-            f":conf={signals.get('confidence_level')}:replacing={block_reason}"
+            f":conf={signals.get('confidence_level')}"
+            f"{':late_window' if _late else ''}:replacing={block_reason}"
         )
-        params = self.compute_momentum_params(direction, reason, signals, size_mult)
+        params = self.compute_momentum_params(
+            direction, reason, signals, size_mult, late=_late
+        )
         if not params.get("valid"):
             self.logger.info(f"momentum substitute rejected: {params.get('reason')}")
             return None
@@ -3404,6 +3885,11 @@ class StrategyEngine:
         }
 
     def decide(self, signals: dict) -> dict:
+        # PATCH_V13: session price memory for the closing-hour route. Kept
+        # here (not in the data engine) so the series is exactly the set of
+        # cycles on which the engine was allowed to act, in live and replay.
+        self._note_price(signals)
+
         gate = self._check_hard_gates(signals)
         if gate:
             action, reason = gate
@@ -3431,6 +3917,28 @@ class StrategyEngine:
                 "NO_TRADE", selection_reason, self._count_open_positions()
             )
             return {"action": "NO_TRADE", "reason": selection_reason}
+
+        # ── PATCH_V13: entry/exit trend symmetry ─────────────────────────
+        # The exit ladder ejects a credit vertical that a measured trend has
+        # run against, and refuses a symmetric structure only when the tape
+        # is not ranging. Opening either one into that same tape is a round
+        # trip paid for in advance: the entry, the ladder, the exit costs.
+        # The refusal is deliberately NOT answerable by the long-premium
+        # substitute - a measured trend against a credit structure is a
+        # reason to stand aside in the middle of the session, and the
+        # closing-hour route (which is separately gated on a strong trend, a
+        # fresh extreme, displacement and its own clock) is the only place
+        # this engine pays premium for a trend it did not see at the open.
+        _ct_reason = self._counter_trend_entry_refusal(strategy_name, signals)
+        if _ct_reason:
+            self._log_decision(signals, "NO_TRADE", _ct_reason)
+            self._persist_decision(
+                signals, strategy_name, _ct_reason, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _ct_reason, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _ct_reason}
 
         rules_ok, rules_reason = self._validate_entry_rules(strategy_name, signals)
         if not rules_ok:

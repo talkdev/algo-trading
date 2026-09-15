@@ -918,7 +918,107 @@ class Config:
         # and the gate's own cap arbitrates.
         "event", "only_range_allowed", "iv_expanding", "straddle_exp",
         "params_invalid", "strategy_rules_failed", "day_move_used",
+        # PATCH_V13 (round 4): the substitute also answers TIME and
+        # POST-STOP refusals.
+        #
+        # (a) TIME. The sell side stops entering at 14:00 and the regime
+        #     layer refuses everything after 14:30, so the last hour of the
+        #     session was structurally untradeable even when it carried the
+        #     day's cleanest trend (measured 2026-09-09: spot fell 110pts
+        #     from 14:30 to the close while the engine sat flat, its only
+        #     afternoon ticket a symmetric condor that scratched). The
+        #     closing-hour route below is gated on its own clock, its own
+        #     trend evidence and its own size; these markers only let the
+        #     tape REACH that gate. The base route cannot leak through them:
+        #     its own window test (entry_start..entry_end, 90min to the hard
+        #     exit) still refuses every cycle before 14:30.
+        #
+        # (b) POST-STOP. A credit structure stopped out BY the trend is the
+        #     trend telling you which side of the book to be on. Refusing the
+        #     long-premium expression of the same read for 30 minutes is what
+        #     the cooldown was never for - it exists to stop re-selling the
+        #     structure that just lost, not to stop buying the move that beat
+        #     it (measured 2026-09-11: bear call trend-flipped out at 11:10
+        #     for -250, the ATM call then gained 91pts and the substitute was
+        #     locked out by the very cooldown the stop created).
+        "past_entry_window", "past_14:30",
+        "stop_cooldown", "same_signal_combo",
     )
+
+    # ══ PATCH_V13: closing-hour trend continuation ══════════════════════
+    # A strictly gated long-premium ticket for the hour after the sell side
+    # has closed. Long premium only (defined risk, no short leg added when
+    # the session cannot be supervised), a measured-strong trend only, and a
+    # hard stop on the clock: it must still have room to run when it is
+    # bought, and it is squared off with everything else.
+    momentum_late_enabled:               bool  = True
+    # Window. The start is 14:30, the boundary the regime layer ALREADY
+    # treats as the end of the tradeable session (NO_TRADE:PAST_14:30), so
+    # the two routes can never compete for a cycle and the new route owns
+    # exactly the hour the engine had written off. It is not 14:05: measured
+    # on 2026-09-09, the fifteen minutes after the sell side closes still
+    # carry the MIDDAY trend reads - EMA structure BULLISH off a rally that
+    # had already peaked, ADX 24 and decaying - and a window that opens
+    # there bought a long call at 14:06 into the day's high and rode it down
+    # 100pts for -6,584. The closing hour is a different microstructure
+    # (square-off flow, expiry rolls, the closing auction); it starts when
+    # the engine says it does. The binding end is
+    # momentum_late_min_minutes_left, which keeps the rule correct on
+    # Tuesdays (15:00 hard exit) without a second clock.
+    momentum_late_window_start:          str   = "14:30"
+    momentum_late_window_end:            str   = "14:57"
+    momentum_late_min_minutes_left:      int   = 25
+    # A closing-hour ticket is paid for out of a session that is nearly
+    # over: it needs a MEASURED-STRONG trend, not merely a present one. This
+    # reuses adx_strong_threshold's meaning rather than inventing a number.
+    momentum_late_adx_min:               float = 28.0
+    # Displacement: the tape has to be off VWAP, not drifting beside it.
+    momentum_late_vwap_dist_min_pct:     float = 0.10
+    # Fresh extreme: the trend must still be making ground in the last
+    # N minutes (the morning opening range is ancient by the closing hour,
+    # so the breakout reference is rolled forward instead of reused).
+    momentum_late_extreme_lookback_min:  int   = 45
+    momentum_late_extreme_min_span_min:  int   = 30
+    # Fallback when the session price history is shorter than the lookback
+    # (the harness only sees cycles in which the engine is flat): the spot
+    # must sit inside this fraction of the day's range from the extreme.
+    momentum_late_range_proximity_frac:  float = 0.30
+    # Size: half the per-trade risk budget and a hard lot cap. The edge is
+    # real but the window is short and the exit is a clock, not a thesis.
+    momentum_late_risk_frac:             float = 0.50
+    momentum_late_max_lots:              int   = 4
+
+    # ══ PATCH_V13: re-entry discipline (anti-churn) ═════════════════════
+    # A structure that has just been closed has already given the session
+    # what it had. Re-selling the same regime at the same price seconds
+    # later is churn: it pays a second round trip for an edge that was just
+    # harvested. The tape must actually move before the sell side re-enters.
+    reentry_material_move_pct:           float = 0.12
+    reentry_material_move_pts:           float = 15.0
+    reentry_reconfirm_min:               int   = 45
+
+    # ══ PATCH_V13: entry/exit trend symmetry ════════════════════════════
+    # The exit ladder already ejects a credit vertical that a measured trend
+    # has run against (v12 trend-flip). Paying a spread to OPEN one is the
+    # same trade entered from the wrong side: the ladder is designed to
+    # close it. Symmetric structures are refused on the same evidence when
+    # the displacement is strong - a condor is a range trade, and a tape
+    # 0.10%+ off VWAP with a mature ADX 28+ is not ranging.
+    counter_trend_entry_block:           bool  = True
+    counter_trend_vwap_dist_min_pct:     float = 0.10
+    displaced_tape_adx_min:              float = 28.0
+    # Regime persistence: a single cycle of evidence must not flip the book
+    # between structures, so the read latches for this many minutes unless
+    # the tape contradicts it.
+    displaced_tape_hold_min:             int   = 10
+
+    # ══ PATCH_V13: exit classification ══════════════════════════════════
+    # A protective exit that BANKS a profit (the ratcheted lock, or a price
+    # stop taken above water) is not a stop: counting it as one spends the
+    # day's stop budget on a winner and halts the session after two good
+    # trades. It is still an exit, and the anti-churn gate above still
+    # applies to it.
+    banked_exit_is_not_a_stop:           bool  = True
 
     # ── v6: live execution hardening ──────────────────────────────────
     # The replay harness has its own fill model, so nothing below can move

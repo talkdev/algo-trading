@@ -938,10 +938,32 @@ class MainEngine:
             self.check_daily_loss_halt()
 
             # ── Step 8: Strategy decision and entry ─────────────────────────
+            # PATCH_V13: the outer entry window extends to the closing-hour
+            # route's own cut. Nothing about the sell side changes - it still
+            # cannot enter after trading_window_last_entry (14:00, refused by
+            # _check_hard_gates) and the regime layer still refuses every new
+            # position after 14:30. What the extra minutes buy is that
+            # decide() RUNS, so the long-premium closing-hour ticket is
+            # considered in production exactly as it is in replay: the
+            # harness calls decide() on every cycle it is flat, and a live
+            # engine that stopped asking at 14:30 would silently drop the
+            # route the replay is measuring.
+            try:
+                _late_cut = datetime.strptime(
+                    str(getattr(self.config, "momentum_late_window_end", "14:57")),
+                    "%H:%M",
+                ).time()
+            except Exception:
+                _late_cut = dtime(14, 57)
+            _entry_cut = dtime(14, 30)
+            if bool(getattr(self.config, "momentum_late_enabled", True)) and \
+                    bool(getattr(self.config, "momentum_enabled", True)):
+                _entry_cut = max(_entry_cut, _late_cut)
+
             entry_possible = (
                 acting and
                 current_time >= dtime(9, 30) and
-                current_time <= dtime(14, 30) and
+                current_time <= _entry_cut and
                 not self.market_engine.state.get("daily_halted") and
                 not signals.get("block_new_entries") and
                 bool(signals.get("or_computed", False)) and
@@ -963,7 +985,7 @@ class MainEngine:
                 except Exception as e:
                     self.logger.error(f"Strategy/entry error: {e}", exc_info=True)
             elif acting and current_time >= dtime(9, 30) and \
-                    current_time <= dtime(14, 30) and self._feed_stale:
+                    current_time <= _entry_cut and self._feed_stale:
                 self.logger.info(
                     "entries blocked this cycle: trading feed is stale (watchdog)"
                 )
