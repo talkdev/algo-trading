@@ -1824,6 +1824,33 @@ class ExecutionEngine:
             - datetime.combine(now_ist().date(), current_time)
         ).total_seconds() / 60.0
         window = float(getattr(cfg, "momentum_final_window_min", 45))
+        # ── D3b [v12]: a 0DTE long is flat before the bell, in profit or not
+        # D4 below flattens a long inside the final window only IF it is
+        # worth more than it cost. That is the right rule for a two-session
+        # contract and the wrong one for a ticket that expires today: an
+        # out-of-the-money 0DTE option that is not in profit at 14:30 has a
+        # theta curve, not a chance, and holding it to the 15:00 bell books
+        # the whole premium. Expiry-day longs are therefore flattened on the
+        # clock, unconditionally, at trend_route_dte0_flat_min before the
+        # hard exit. Only the v12 trend route can hold a DTE-0 long (the v5
+        # route is gated at DTE >= 1 and the credit ladder never holds a
+        # debit position at all), so nothing that traded before this patch
+        # changes behaviour here.
+        _raw_dte = raw.get("actual_dte")
+        if (_raw_dte is not None and int(_raw_dte) == 0
+                and raw.get("trend_route")):
+            _flat_min = float(getattr(cfg, "trend_route_dte0_flat_min", 30))
+            if mins_left <= _flat_min:
+                self.logger.info(
+                    f"0DTE TREND FLAT: {position['strategy_name']} "
+                    f"{mins_left:.0f}min to hard exit, value={value:.2f} "
+                    f"(entry {entry_value:.2f})"
+                )
+                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                    "reason_detail": "trend_route_dte0_time_flat",
+                    "minutes_left":  mins_left,
+                    "value":         value,
+                }
         if mins_left <= window:
             if value >= entry_value + rt_cost:
                 return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
