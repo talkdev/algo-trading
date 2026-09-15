@@ -20,7 +20,7 @@
 #
 #  USAGE
 #  -----
-#     python split_db.py                          # shard the default source DB
+#     python split_db.py                                          # shard the default source DB
 #     python split_db.py --src /path/to/big.db --out data/per_day
 #     python split_db.py --dates 2026-09-08 2026-09-09   # only these days
 #
@@ -33,8 +33,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -239,6 +241,8 @@ def main() -> int:
     ap.add_argument("--dates", nargs="*", default=None,
                     help="optional list of YYYY-MM-DD dates to shard "
                          "(default: every date found)")
+    ap.add_argument("--holidays", default="nse_holidays.json",
+                    help="JSON file containing list of holiday dates (default: nse_holidays.json)")
     args = ap.parse_args()
 
     src_path = Path(args.src)
@@ -249,13 +253,41 @@ def main() -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load holidays
+    holidays_path = Path(args.holidays)
+    holiday_dates: Set[str] = set()
+    if holidays_path.exists():
+        with open(holidays_path, "r") as f:
+            holiday_dates = set(json.load(f))
+    else:
+        print(f"\n  Warning: Holidays file '{holidays_path}' not found. Skipping holiday checks.\n")
+
     src = open_db(str(src_path), readonly=True)
     try:
         dates = discover_dates(src)
         if args.dates:
             dates = [d for d in dates if d in set(args.dates)]
+
+        # Filter out weekends and holidays
+        valid_trading_dates = []
+        for d in dates:
+            try:
+                # Parse date to check day of week (0=Mon ... 5=Sat, 6=Sun)
+                dt = datetime.strptime(d, "%Y-%m-%d")
+                if dt.weekday() >= 5:
+                    continue
+                if d in holiday_dates:
+                    continue
+                
+                valid_trading_dates.append(d)
+            except ValueError:
+                # If date format is somehow invalid in the db, ignore it safely
+                continue
+
+        dates = valid_trading_dates
+
         if not dates:
-            print("\n  No dates found in the source database.\n")
+            print("\n  No valid trading dates found to process.\n")
             return 1
 
         print(f"\n  Source : {src_path}")
