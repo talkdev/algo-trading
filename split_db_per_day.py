@@ -187,8 +187,14 @@ def build_day(src: sqlite3.Connection, out_path: Path, date: str) -> dict:
 
         # 1. date-scoped tables
         for table, col in BY_DATE:
+            # PATCH_V14: date columns are not consistently stored as DATE;
+            # several feeds write ISO timestamps.  Equality to YYYY-MM-DD
+            # silently dropped those rows while discover_dates() still
+            # advertised the day.  Prefix matching is safe for ISO dates and
+            # preserves the complete day shard.
             n = copy_table(dst=dst, src=src, table=table,
-                           where_sql=f' WHERE "{col}" = ?', params=(date,))
+                           where_sql=f' WHERE substr("{col}", 1, 10) = ?',
+                           params=(date,))
             counts[table] = n
 
         # 2. foreign-key tables (position_legs, trade_exits) - copy rows whose

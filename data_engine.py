@@ -397,6 +397,34 @@ class MarketDataEngine:
         )
 
         if row is not None:
+            # PATCH_V14: restart-safe expiry/DTE reconciliation.  A persisted
+            # session row is not authoritative for contract selection: the
+            # process may have been started before the broker listed the
+            # expiry, or the row may have been created by an earlier calendar
+            # rule.  Leaving its old actual_dte in place silently selects the
+            # wrong risk/target ladder (observed in the 2026-09-10/11 shards).
+            # Recompute the calendar DTE on every restart; discover_active_
+            # expiry() will replace it with the actual broker expiry later.
+            try:
+                _fresh_dte = ExpiryCalendar.get_dte(today_ist())
+                if row.get("actual_expiry"):
+                    _exp = datetime.strptime(str(row["actual_expiry"])[:10], "%Y-%m-%d").date()
+                    _today = today_ist()
+                    _fresh_dte = 0 if _exp <= _today else 0
+                    _walk = _today + timedelta(days=1)
+                    while _walk <= _exp:
+                        if not ExpiryCalendar.is_holiday(_walk):
+                            _fresh_dte += 1
+                        _walk += timedelta(days=1)
+                if row.get("actual_dte") != _fresh_dte:
+                    self.db.update("session_state", {"actual_dte": _fresh_dte},
+                                   {"trading_date": today_str})
+                    row["actual_dte"] = _fresh_dte
+                    self.logger.warning(
+                        f"PATCH_V14 corrected persisted DTE to {_fresh_dte} for {today_str}")
+            except Exception as exc:
+                self.logger.error(f"PATCH_V14 DTE reconciliation failed: {exc}")
+
             # Reconcile entry_count with actual DB positions
             actual = self.db.query_one(
                 "SELECT COUNT(*) as cnt FROM positions "
@@ -3832,3 +3860,4 @@ def _self_test() -> None:
 
 if __name__ == "__main__":
     _self_test()
+# PATCH_V14_APPLIED
