@@ -34,9 +34,8 @@ It shells out to run each file's `_self_test()`/`--test`: `data_engine.py`, `reg
 
 1. **"Run the engine" / "trade paper"** → `python main.py` works today, using the **old generation** (`nifty_algo_core.py`/`market_data_engine.py`/`strategy_engine.py`/`execution_engine.py`). It does **not** use `core.py`, `data_engine.py`, `regime_engine.py`, or `calibration_engine.py` at all — none of those are imported anywhere in the old chain. If you're asked to change "the strategy logic" or "the regime classification" without qualification, ask (or infer from context) whether they mean the live engine (old generation, `strategy_engine.py`'s `_select_strategy`) or the newer regime-based design (`regime_engine.py`, not currently wired to anything runnable).
 2. **"Fix a bug in `strategy_engine.py`/`execution_engine.py`"** → these are live, running code. Edit them in place using the old-generation vocabulary; don't "helpfully" rename things to match `core.py`/`data_engine.py` unless the task is explicitly the migration itself.
-3. **"Run the backtester"** → `backtest_engine.py --audit` and `--test` will not currently succeed end-to-end (see above). If asked to get it working, the real task is **the migration**: port `strategy_engine.py`/`execution_engine.py` to import from `core`/`data_engine`, accept a `CalibrationEngine` instance, and speak the new signal vocabulary — using the *old* `strategy_engine.py`/`execution_engine.py` as the source of the actual trading logic to preserve, and `regime_engine.py` + `backtest_engine.py`'s expectations as the target API to land on.
-4. **"Fix `regime_engine.py`"** → swap its two import lines to the new generation (`core`/`data_engine`) and reconcile the small number of symbol mismatches (§7). It is not, and cannot become, old-generation-compatible (`ExpiryCalendar`/`TechnicalEngine` don't exist there).
-5. **`eod_report.py` and `split_db_per_day.py`** are safe, independent utilities — see §3. `eod_report.py` in particular is schema-tolerant and will produce a report from a DB written by *either* generation (it does `SELECT *` and checks column/table existence defensively), which makes it a good reference for "what fields exist across both schemas."
+3. **"Fix `regime_engine.py`"** → swap its two import lines to the new generation (`core`/`data_engine`) and reconcile the small number of symbol mismatches (§7). It is not, and cannot become, old-generation-compatible (`ExpiryCalendar`/`TechnicalEngine` don't exist there).
+4. **`eod_report.py` and `split_db_per_day.py`** are safe, independent utilities — see §3. `eod_report.py` in particular is schema-tolerant and will produce a report from a DB written by *either* generation (it does `SELECT *` and checks column/table existence defensively), which makes it a good reference for "what fields exist across both schemas."
 
 ---
 
@@ -114,6 +113,7 @@ Lot size defaults to **65** in both generations — verify against the live NSE 
 ## 7. Concrete punch list if asked to "finish the migration" / "make everything green in `verify_all.py`"
 
 1. **`regime_engine.py` imports.** Change:
+
    ```python
    from nifty_algo_core import (Config, Database, RateLimiter, UpstoxClient,
        ExpiryCalendar, now_ist, today_ist, load_config, setup_logging,
