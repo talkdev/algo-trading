@@ -1,0 +1,15 @@
+﻿# ============================================================
+# algo-trading - Python dependencies
+# ============================================================
+
+# Numerical / data processing
+numpy
+pandas
+
+# HTTP / API communication
+requests
+urllib3
+
+# Telegram bot controller
+python-telegram-bot
+psutil
