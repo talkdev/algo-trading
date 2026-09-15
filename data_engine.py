@@ -1552,6 +1552,74 @@ class MarketDataEngine:
             return 0.0
         return round(abs(spot - first_close) / _straddle_ref * 100.0, 2)
 
+    def _compute_directional_day_move(self, spot: Optional[float]) -> Tuple[float, float]:
+        """
+        PATCH_V12: upward and downward range consumed, each as % of
+        the priced move for the time elapsed — the _compute_day_move_used
+        normalisation, split by direction.
+
+        A short call is threatened by rallies, not by selloffs: on
+        a day that falls 400% of its straddle and never rallies,
+        the threat to a bear call is ~0, not 400% (measured
+        2026-09-15: the blanket block refused a correct
+        PREMIUM_SELL_BEAR regime all day).
+
+        Returns (up_pct, down_pct) measured from the session
+        reference (first bar close) to the day high/low so far.
+        Note there is deliberately NO 1.93 range factor here: that
+        factor converts a priced DISPLACEMENT into a priced RANGE,
+        and a one-sided excursion is already a displacement, so
+        100 means 'rallying exactly as priced'.
+        """
+        opening_straddle = (
+            self.state.get("opening_straddle_pts") or
+            self.state.get("_straddle_open_for_regime") or 0.0
+        )
+        if opening_straddle <= 0 or spot is None:
+            return 0.0, 0.0
+        _dte = self.state.get("actual_dte", 0) or 0
+        if _dte >= 2:
+            import math as _math
+            _theta_frac = max(1.0 / max(_dte, 1), 0.10)
+            _straddle_ref = max(
+                opening_straddle * _math.sqrt(_theta_frac),
+                60.0
+            )
+        else:
+            _straddle_ref = opening_straddle
+        import math as _math_dm
+        _elapsed_dm = max(0.0, (
+            datetime.combine(today_ist(), now_ist().time()) -
+            datetime.combine(today_ist(), dtime(9, 15))
+        ).total_seconds() / 60.0)
+        _frac_dm = min(max(_elapsed_dm / 375.0, 0.06), 1.0)
+        _straddle_ref = max(
+            _straddle_ref * _math_dm.sqrt(_frac_dm),
+            12.0,
+        )
+        ref = self.state.get("first_bar_close")
+        if ref is None or ref <= 0:
+            try:
+                ref = float(self._first_bar_close_today or 0.0)
+            except Exception:
+                ref = 0.0
+        if not ref or ref <= 0:
+            return 0.0, 0.0
+        today_str = today_ist().isoformat()
+        try:
+            bars = self._load_candles_from_db(today_str)
+            if bars is not None and not bars.empty and len(bars) >= 3:
+                market_bars = bars[bars["time"] >= "09:15:00"]
+                if not market_bars.empty:
+                    day_high = float(market_bars["high"].max())
+                    day_low = float(market_bars["low"].min())
+                    up = max(day_high - ref, 0.0) / _straddle_ref * 100.0
+                    down = max(ref - day_low, 0.0) / _straddle_ref * 100.0
+                    return round(up, 2), round(down, 2)
+        except Exception:
+            pass
+        return 0.0, 0.0
+
     # ─────────────────────────────────────────────────────────────────────
     # OPTION CHAIN COMPUTATIONS
     # ─────────────────────────────────────────────────────────────────────
@@ -2740,6 +2808,28 @@ class MarketDataEngine:
                     int(pe_leg.get("volume", 0) or 0),
                 )
 
+        # PATCH_V12: the opening straddle belongs to a SERIES, not
+        # the day. When the active expiry flips mid-session (Tuesday
+        # 0DTE listed at midday), re-take it on the new series — the
+        # same expiry-change bug v3.5 fixed for the IV baseline. On
+        # 2026-09-08 the engine priced the whole 0DTE afternoon off
+        # the Sep-15 series' 280pt open against a live 82pt chain.
+        try:
+            _soe = self.state.get("_straddle_open_expiry")
+            _axe = expiry.isoformat() if expiry else None
+            if (_soe and _axe and _soe != _axe
+                    and current_time >= dtime(9, 30) and not chain_stale
+                    and atm_straddle > 20 and atm_ce > 0 and atm_pe > 0):
+                self.state["_straddle_open_for_regime"] = atm_straddle
+                self.state["_straddle_open_for_summary"] = atm_straddle
+                self.state["opening_straddle_pts"] = atm_straddle
+                self.state["_straddle_open_expiry"] = _axe
+                self.logger.info(
+                    f"Opening straddle re-taken on expiry change {_soe} -> "
+                    f"{_axe}: {atm_straddle:.2f}pts"
+                )
+        except Exception:
+            pass
         # Record opening straddle (once per session, after 09:30)
         current_time = now_ist().time()
         if (atm_straddle > 20 and
@@ -2750,6 +2840,7 @@ class MarketDataEngine:
             self.state["_straddle_open_for_regime"]  = atm_straddle
             self.state["_straddle_open_for_summary"] = atm_straddle
             self.state["opening_straddle_pts"]       = atm_straddle
+            self.state["_straddle_open_expiry"] = expiry.isoformat() if expiry else None  # PATCH_V12
             self.logger.info(
                 f"Opening straddle recorded: {atm_straddle:.2f}pts"
             )
@@ -2842,6 +2933,8 @@ class MarketDataEngine:
 
         # ── 15. Day move used ─────────────────────────────────────────────
         day_move_used_pct = self._compute_day_move_used(spot)
+        # PATCH_V12: directional components for the threat-aware gate.
+        day_up_used_pct, day_down_used_pct = self._compute_directional_day_move(spot)
 
         # ── 16. Opening range ─────────────────────────────────────────────
         if current_time >= dtime(9, 30) and not self.state.get("or_computed"):
@@ -2914,29 +3007,36 @@ class MarketDataEngine:
                 adx_15_raw > 0.0 and len(df15) >= 2 * _period_15 + 2
             )
 
-        # Adaptive Wilder period on the fast series: always chosen so the
-        # 2*period+1 requirement is satisfied by the bars available.
+        # PATCH_V12: fixed Wilder period on the fast series + honest
+        # immaturity. The adaptive period (5..14 by bar count)
+        # printed 30-92 on flat tapes (measured 2026-09-10 10:15: 46
+        # on a 30-point drift; 2026-09-15 10:15: 92) and the maturity
+        # flag flickered as the bar count grew, so gates reading the
+        # VALUE (DTE exceptions, momentum adx>=30, condor strong-adx
+        # veto) alternately blocked sound trades and passed noise. A
+        # fixed period-10 Wilder on 5-minute bars needs 21 bars
+        # (~10:55) and then stays mature; before that adx_15 reads
+        # 0.0 and the price classifier's immature path (ORB + VWAP
+        # confirmation) owns the read, exactly as designed.
+        _ADX5_PERIOD = 10
         adx_5        = 0.0
         adx_5_mature = False
-        _period_5    = 0
-        if not df5.empty and len(df5) >= 11:
-            _period_5 = max(5, min(self.config.adx_period, (len(df5) - 1) // 2))
-            if len(df5) >= 2 * _period_5 + 1:
-                adx_5 = TechnicalEngine.calculate_adx(df5, _period_5)
-                adx_5_mature = (
-                    adx_5 > 0.0 and _period_5 >= 9 and len(df5) >= 2 * _period_5 + 2
-                )
+        _period_5    = _ADX5_PERIOD
+        if not df5.empty and len(df5) >= 2 * _ADX5_PERIOD + 1:
+            adx_5 = TechnicalEngine.calculate_adx(df5, _ADX5_PERIOD)
+            adx_5_mature = bool(adx_5 > 0.0)
 
         # The effective reading every downstream gate consumes: the
         # 15-minute value when it is genuinely mature, otherwise the
-        # fast-series value, which on NIFTY intraday is the number a
-        # discretionary trader would actually be looking at.
+        # fast-series value once THAT is mature, otherwise 0.0
+        # (unknown). Publishing an immature print as a number made
+        # every ADX gate a coin flip before ~11:00.
         if adx_15_mature and adx_15_raw > 0.0:
             adx_15 = adx_15_raw
-        elif adx_5 > 0.0:
+        elif adx_5_mature:
             adx_15 = adx_5
         else:
-            adx_15 = adx_15_raw
+            adx_15 = 0.0
         adx_15_mature = bool(adx_15_mature or adx_5_mature)
 
         adx_60        = 0.0
@@ -3278,6 +3378,9 @@ class MarketDataEngine:
 
             # Day move
             "day_move_used_pct":        day_move_used_pct,
+            # PATCH_V12: one-sided excursion vs priced displacement.
+            "day_up_used_pct":          day_up_used_pct,
+            "day_down_used_pct":        day_down_used_pct,
             "opening_straddle_pts":     self.state.get("opening_straddle_pts", 0.0),
             "expected_move_remaining_pts": _expected_move_remaining,
             "expected_range_so_far_pts":   _expected_range_so_far,

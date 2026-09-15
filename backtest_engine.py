@@ -923,7 +923,21 @@ class BacktestRunner:
     # -- exit -------------------------------------------------------------
     def _close(self, live: dict, signals: dict, reason: str, priority: int,
                day: DaySlice) -> Trade:
+        # PATCH_V12: price the exit on the POSITION's expiry chain,
+        # not the active one. The runner snapshots every active chain
+        # per cycle (see run_day), so a weekly spread held across a
+        # Tuesday 0DTE listing exits on its own last-known quotes
+        # instead of the 0DTE lottery tickets (measured 2026-09-08:
+        # exit debit 0.93 on the wrong series turned ~Rs 750 of decay
+        # into Rs 8,993).
         chain = self.me.last_chain or {}
+        try:
+            _pos_exp = str((live.get("params") or {}).get("target_expiry") or "")[:10]
+            _by_exp = getattr(self, "_chain_by_expiry", None) or {}
+            if _pos_exp and _pos_exp in _by_exp:
+                chain = _by_exp[_pos_exp]
+        except Exception:
+            pass
         urgent = priority in (1, 2, 3, 7)
         exit_legs = []
         debit = 0.0
@@ -1031,6 +1045,7 @@ class BacktestRunner:
         state["daily_halted"] = False
         live: Optional[dict] = None
         day_pnl = 0.0
+        self._chain_by_expiry = {}  # PATCH_V12: reset per session (see _close)
 
         for capture_time in day.cycles:
             dt = day.cycle_dt(capture_time)
@@ -1057,6 +1072,18 @@ class BacktestRunner:
             self.results.cycles += 1
 
             signals = self._classify(signals)
+            # PATCH_V12: snapshot the active chain per expiry for
+            # honest exit pricing (see _close).
+            try:
+                _cb = getattr(self, "_chain_by_expiry", None)
+                if _cb is None:
+                    _cb = {}
+                    self._chain_by_expiry = _cb
+                _ax = self.me.state.get("actual_expiry") or signals.get("active_expiry")
+                if _ax and self.me.last_chain:
+                    _cb[str(_ax)[:10]] = dict(self.me.last_chain)
+            except Exception:
+                pass
             state["current_capital"] = self.results.starting_capital + \
                 sum(self.results.daily_pnl.values())
             state["daily_pnl"] = day_pnl

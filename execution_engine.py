@@ -1872,6 +1872,35 @@ class ExecutionEngine:
 
         # Get chain for the correct expiry
         chain_expiry = self.market_engine.last_chain_expiry
+        # PATCH_V12: keep the last chain per expiry so a position is
+        # always marked on its OWN series. Without this, a Tuesday
+        # session whose active expiry flips mid-position (0DTE listed
+        # at midday) marks the morning's weekly spread on 0DTE quotes
+        # — or, with the guard below, goes blind and holds everything
+        # to the bell. (The strategy layer now refuses Tuesday
+        # pre-0DTE entries, so this is defence in depth — and it is
+        # what makes replayed marks honest whenever series coverage
+        # is partial.)
+        try:
+            _cache = getattr(self, "_chain_by_expiry", None)
+            if _cache is None:
+                _cache = {}
+                self._chain_by_expiry = _cache
+            if chain and chain_expiry is not None:
+                try:
+                    _cache[str(chain_expiry.isoformat())] = dict(chain)
+                    while len(_cache) > 3:
+                        _cache.pop(next(iter(_cache)))
+                except Exception:
+                    pass
+            _want = str(position.get("target_expiry") or "")[:10]
+            if _want and chain_expiry is not None and str(chain_expiry.isoformat())[:10] != _want:
+                _cached = _cache.get(_want)
+                if _cached:
+                    chain = _cached
+                    chain_expiry = None  # already the position's own chain
+        except Exception:
+            pass
         if chain_expiry and chain_expiry.isoformat() != position.get("target_expiry"):
             chain = {}  # Wrong expiry chain — use empty dict (falls back to entry price)
 
@@ -2054,6 +2083,56 @@ class ExecutionEngine:
                         "strike": strike,
                         "spot": spot,
                     }
+
+        # ── PATCH_V12 Priority 2.5: trend-flip exit for verticals ─────────
+        # A BEAR_CALL held into a MEASURED uptrend (or BULL_PUT into a
+        # measured downtrend) is no longer the trade that was approved
+        # — the premium stop will take it eventually, at a worse
+        # price. Measured 2026-09-11: a bear call held 85 minutes
+        # into a CPI rally to a -Rs 3,924 premium stop; the flip was
+        # measurable ~25 minutes earlier at roughly half the loss.
+        # Fires only when the flip is measured (mature ADX >= 20),
+        # the position is underwater (never cut a winner on a regime
+        # flicker), and the trade is older than 10 minutes.
+        # Condors/flys are exempt: a trend does not invalidate both
+        # sides at once.
+        try:
+            _flip_name = str(position.get("strategy_name") or "")
+            _flip_px   = str(signals.get("price_regime") or "")
+            _flip_adx  = float(signals.get("adx_15") or 0.0)
+            _flip_mat  = bool(signals.get("adx_15_mature", False))
+            _flip_hold_min = 9999.0
+            try:
+                _flip_entry_t = position.get("entry_time")
+                if _flip_entry_t:
+                    _flip_hold_min = (
+                        now_ist() - datetime.fromisoformat(str(_flip_entry_t))
+                    ).total_seconds() / 60.0
+            except Exception:
+                _flip_hold_min = 9999.0
+            _flip_against = (
+                (_flip_name == "BEAR_CALL_SPREAD" and
+                 _flip_px in ("UPTREND", "STRONG_UPTREND"))
+                or (_flip_name == "BULL_PUT_SPREAD" and
+                    _flip_px in ("DOWNTREND", "STRONG_DOWNTREND"))
+            )
+            if (_flip_against and _flip_mat and _flip_adx >= 20.0
+                    and entry_credit > 0
+                    and liq_premium > entry_credit * 1.05
+                    and _flip_hold_min >= 10.0):
+                self.logger.warning(
+                    f"PATCH_V12 TREND FLIP: {_flip_name} held into "
+                    f"{_flip_px} (adx={_flip_adx:.0f} mature), "
+                    f"liq={liq_premium:.2f} vs credit={entry_credit:.2f} — closing early"
+                )
+                return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                    "reason_detail": (
+                        f"trend_flip_exit_{_flip_px}_adx_{_flip_adx:.0f}_"
+                        f"liq_{liq_premium:.2f}_vs_credit_{entry_credit:.2f}"
+                    ),
+                }
+        except Exception as _flip_exc:
+            self.logger.debug(f"trend-flip check skipped: {_flip_exc}")
 
         # ── Priority 3: Price stop ────────────────────────────────────────
         # Price stop = 0.30 × opening straddle from short strike level
@@ -2325,10 +2404,16 @@ class ExecutionEngine:
                     (dtime(14, 15), 0.25),
                 ]
             else:
+                # PATCH_V12: weekly targets 48/40/32 -> 40/32/24. A
+                # DTE1-4 structure decays ~5-15% of credit intraday;
+                # the old ladder never fired (measured 09/10-Sep: both
+                # winners held to the bell, +Rs 1,121 and +Rs 92).
+                # The ladder still demands real decay — it just no
+                # longer demands the impossible.
                 time_targets = [
-                    (dtime(12, 0),  0.48),
-                    (dtime(13, 0),  0.40),
-                    (dtime(14, 0),  0.32),
+                    (dtime(12, 0),  0.40),
+                    (dtime(13, 0),  0.32),
+                    (dtime(14, 0),  0.24),
                 ]
 
             # ── v3.1 [F1]: the ladder was inverted by a min() ──────────
