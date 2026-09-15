@@ -1875,7 +1875,16 @@ class ExecutionEngine:
             - datetime.combine(now_ist().date(), current_time)
         ).total_seconds() / 60.0
         window = float(getattr(cfg, "momentum_final_window_min", 45))
-        if mins_left <= window:
+        # PATCH_V13: a ticket OPENED inside the final window is exempt from
+        # the flatten-at-breakeven rule - it was bought with 25-45 minutes
+        # left, so D4 would bank it on its first profitable cycle and the
+        # closing-hour route could never earn the move it exists for. Its
+        # risk is still bounded three ways: the premium stop (D1), the
+        # ratchet once it is free (D2), and the hard exit (D5).
+        _late_ticket = bool(raw.get("momentum_late")) or (
+            "late_window" in str(position.get("selection_reason") or "")
+        )
+        if mins_left <= window and not _late_ticket:
             if value >= entry_value + rt_cost:
                 return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
                     "reason_detail": "momentum_flat_before_close",
@@ -1915,6 +1924,19 @@ class ExecutionEngine:
         6. Time-based target (take profit at scheduled times)
         7. Hard exit (time-based forced close)
         """
+        # PATCH_V13: remember the tape the position was last marked on, so
+        # the close bookkeeping below can record WHERE the session exited.
+        # The anti-churn gate in the strategy engine measures the re-entry
+        # from this spot, and without it the engine re-sold the same regime
+        # at the same price fifteen seconds after banking a winner
+        # (measured 2026-09-09: +625 banked at 12:30:01 on spot 23,511, a
+        # four-leg condor entered at 12:31:01 on spot 23,516).
+        try:
+            self.market_engine.state["_last_monitor_spot"] = float(
+                signals.get("spot") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+
         legs         = self._get_position_legs(position["position_id"])
         open_legs    = [l for l in legs if l.get("leg_status") == "OPEN"]
         chain        = self.market_engine.last_chain
@@ -2936,13 +2958,48 @@ class ExecutionEngine:
         state["current_capital"] = float(state.get("current_capital",
                                                      self.config.starting_capital) or 0) + net_pnl_rs
 
-        # Consecutive stops tracking
-        if reason == "CLOSE_STOP" or priority in (
+        # ── PATCH_V13: record the exit itself, not only the stop ─────────
+        # The anti-churn gate needs to know where and when the book last
+        # went flat; the stop machinery needs to know whether the exit was a
+        # loss. Both are recorded here so the replay harness can mirror this
+        # method exactly instead of keeping its own, divergent, copy.
+        _now_iso = now_ist().isoformat()
+        state["last_exit_time"]   = _now_iso
+        state["last_exit_reason"] = reason
+        state["last_exit_priority"] = int(priority or 0)
+        state["last_exit_pnl_rs"] = float(net_pnl_rs or 0.0)
+        try:
+            _xspot = float(state.get("_last_monitor_spot") or 0.0)
+        except (TypeError, ValueError):
+            _xspot = 0.0
+        if _xspot > 0:
+            state["last_exit_spot"] = _xspot
+
+        # ── PATCH_V13: a protective exit that BANKS profit is not a stop ──
+        # The ratcheted profit lock and an in-the-money price stop both come
+        # back as CLOSE_TARGET/CLOSE_STOP on a priority-1..3 rung, and the
+        # bookkeeping below counted every one of them against the day's stop
+        # budget regardless of the P&L - so two WINNERS taken by the trail
+        # halted the session (consecutive_stops >= 2 -> daily_halted) and a
+        # single banked winner locked the sell side out for the 30-minute
+        # CLOSE_STOP cooldown. What the stop budget exists to stop is
+        # re-selling a tape that has just punished the structure, and a trade
+        # that closed green did not.
+        _protective = reason == "CLOSE_STOP" or priority in (
             EXIT_PRIORITY_DELTA_BREACH,
             EXIT_PRIORITY_SPOT_PROXIMITY,
             EXIT_PRIORITY_PRICE_STOP,
-        ):
-            state["last_stop_time"]   = now_ist().isoformat()
+            EXIT_PRIORITY_PROFIT_LOCK,
+        )
+        _banked = bool(getattr(self.config, "banked_exit_is_not_a_stop", True)) \
+            and _protective and float(net_pnl_rs or 0.0) > 0.0
+        if _protective and _banked:
+            state["last_stop_time"]   = None
+            state["last_stop_reason"] = ""
+            state["last_stop_signal_combo"] = ""
+            state["consecutive_stops"] = 0
+        elif _protective:
+            state["last_stop_time"]   = _now_iso
             state["last_stop_reason"] = reason
             state["consecutive_stops"] = int(state.get("consecutive_stops", 0) or 0) + 1
 

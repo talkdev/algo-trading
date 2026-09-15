@@ -165,6 +165,29 @@ class SimClock:
         self._installed.clear()
 
 
+def bt_exit_reason(action: str, priority: int) -> str:
+    """PATCH_V13: the reason string the LIVE close path would have used.
+
+    monitor_all_positions() does not hand execute_close() the ladder's
+    reason_detail; it maps the exit priority through EXIT_REASON_MAP and
+    overrides for the forced closes. The session-state bookkeeping keys off
+    that string (CLOSE_STOP drives the 30-minute cooldown, CLOSE_TARGET
+    resets the stop budget), so replaying it with the harness's own detail
+    text would have kept the two paths disagreeing.
+    """
+    reason = action
+    try:
+        from execution_engine import EXIT_REASON_MAP
+        reason = EXIT_REASON_MAP.get(int(priority), action)
+    except Exception:
+        reason = action
+    if action == "HARD_EXIT_15:00":
+        return "HARD_EXIT_15:00"
+    if action in ("EOD_CLOSE", "SHUTDOWN_CLOSE", "STALE_PRIOR_DAY_CLOSE"):
+        return action
+    return reason
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  HISTORICAL DATA
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1121,14 +1144,38 @@ class BacktestRunner:
                     day_pnl += t.pnl_rs
                     live = None
                     state["daily_pnl"] = day_pnl
-                    state["consecutive_stops"] = (
-                        int(state.get("consecutive_stops", 0)) + 1
-                        if t.pnl_rs < 0 else 0
-                    )
-                    state["last_stop_time"] = (
-                        self.clock.now().isoformat() if t.pnl_rs < 0 else
-                        state.get("last_stop_time")
-                    )
+                    # ── PATCH_V13: replay the LIVE close bookkeeping ──────
+                    # This block used to keep its own copy of the session
+                    # state: consecutive_stops incremented on any losing
+                    # exit, last_stop_time set, and last_stop_reason never
+                    # set at all - so the 30-minute CLOSE_STOP cooldown, the
+                    # same-signal-combo block and the two-stop halt were all
+                    # dead code in replay while being live in production.
+                    # Every number this harness printed was therefore an
+                    # upper bound on what the engine would have done, and
+                    # the difference was not theoretical: on 2026-09-09 the
+                    # replay re-entered fifteen seconds after a profit-lock
+                    # exit that live would have cooled down for ten minutes.
+                    # The live method is now called with the same reason
+                    # string monitor_all_positions() derives, so the two
+                    # paths cannot drift again.
+                    try:
+                        state["_last_monitor_spot"] = float(
+                            signals.get("spot") or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    _live_reason = bt_exit_reason(action, priority)
+                    try:
+                        with self._quiet():
+                            self.xe._update_state_after_close(
+                                _live_reason, t.pnl_rs, priority)
+                    except Exception as exc:
+                        if self.verbose:
+                            print(f"  close bookkeeping failed: {exc}")
+                    # the harness owns the day accumulator and recomputes
+                    # capital from the results ledger every cycle
+                    state = self.me.state
+                    state["daily_pnl"] = day_pnl
                     if self.verbose:
                         print(f"  {trading_date} {dt:%H:%M} EXIT  "
                               f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")
