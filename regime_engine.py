@@ -1801,6 +1801,71 @@ class RegimeClassifier:
                     FinalRegime.NO_TRADE,
                     f"RANGE_DTE{dte}_REQUIRES_NO_BUY_OPTIONS",
                 )
+            # ── PATCH_V15: failed-break, cushioned vertical ──────────────
+            # A range session that broke one edge of the opening range and
+            # RECLAIMED it is the highest-quality premium sell of the day:
+            # the break flushed the stops, the reclaim proves the edge held,
+            # and the sold strike can sit beyond the failed extreme. This is
+            # how intraday NIFTY premium sellers trade a range day, and it
+            # is the read the engine was missing: with NEUTRAL vol (no VRP
+            # edge to harvest) it could only build a delta-neutral condor,
+            # which needs rich vol by design. Measured 2026-09-16: the tape
+            # broke the 23,186.55 opening-range low to 23,125 at 09:45,
+            # reclaimed it by 09:53, and a cushioned 23,050/22,750 put
+            # spread sold there returned +9.8pts by 10:50 while the condor
+            # of the same vintage returned -1.8pts. Sized DOWN (0.5) - the
+            # structure is directional, the vol edge is not there, and the
+            # cushion is what carries it.
+            try:
+                _v15_orl = float(signals.get("or_low") or 0.0)
+                _v15_orh = float(signals.get("or_high") or 0.0)
+                _v15_dlo = float(signals.get("day_low_so_far") or 0.0)
+                _v15_orw = max(_v15_orh - _v15_orl, 1.0)
+            except (TypeError, ValueError):
+                _v15_orl = _v15_orh = _v15_dlo = 0.0
+                _v15_orw = 1.0
+            _v15_orh_s = float(signals.get("day_high_so_far") or 0.0)
+            _v15_broke_lo = _v15_orl > 0 and _v15_dlo > 0 and \
+                _v15_dlo <= _v15_orl - 0.15 * _v15_orw
+            _v15_broke_hi = _v15_orh > 0 and _v15_orh_s > 0 and \
+                _v15_orh_s >= _v15_orh + 0.15 * _v15_orw
+            _v15_reclaim = max(
+                float(getattr(self.config, "failed_break_reclaim_pts", 10.0)),
+                0.10 * _v15_orw,
+            )
+            _v15_quiet = (
+                bool(signals.get("or_computed"))
+                and vol == VolatilityRegime.NEUTRAL
+                and conf in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM)
+                and 0.0 <= adx_15 < float(
+                    getattr(self.config, "adx_trend_threshold", 20.0))
+                and or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
+                and spot > 0
+                and float(signals.get("day_move_used_pct") or 0.0)
+                    < float(getattr(self.config, "failed_break_dmu_max", 200.0))
+                and not bool(signals.get("event_day"))
+            )
+            _v15_fb = (
+                _v15_quiet
+                and pos in (PositioningRegime.RANGE,
+                            PositioningRegime.STRONG_RANGE,
+                            PositioningRegime.UNCLEAR)
+                and ((_v15_broke_lo and spot >= _v15_orl + _v15_reclaim)
+                     or (_v15_broke_hi and spot <= _v15_orh - _v15_reclaim))
+            )
+            if _v15_fb:
+                signals["neutral_range_vertical"] = True
+                signals["weekly_range_size_discount"] = float(
+                    getattr(self.config, "failed_break_size", 0.50))
+                if _v15_broke_lo and spot >= _v15_orl + _v15_reclaim:
+                    return (
+                        FinalRegime.PREMIUM_SELL_BULL,
+                        f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BULL_PUT",
+                    )
+                return (
+                    FinalRegime.PREMIUM_SELL_BEAR,
+                    f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BEAR_CALL",
+                )
             # Range positioning → condor (both wings), which on a fresh
             # weekly needs a contained opening range and a flat trend.
             # BULLISH/BEARISH positioning → fall through to the single-sided
@@ -1829,6 +1894,30 @@ class RegimeClassifier:
                 # through paths below - see classify_final Hard Block 3).
                 if vol not in (VolatilityRegime.SELL_PREMIUM,
                                VolatilityRegime.STRONG_SELL_PREMIUM):
+                    # ── PATCH_V15: range-confirmed WIDE condor on NEUTRAL vol
+                    _dmu_v15 = float(signals.get("day_move_used_pct") or 0.0)
+                    _wide_ok_v15 = (
+                        int(dte) >= 2
+                        and not _v15_broke_lo
+                        and not _v15_broke_hi
+                        and vol == VolatilityRegime.NEUTRAL
+                        and conf in (ConfidenceLevel.HIGH,
+                                     ConfidenceLevel.MEDIUM)
+                        and 0.0 <= adx_15 < float(
+                            getattr(self.config, "adx_trend_threshold", 20.0))
+                        and _dmu_v15 < float(getattr(
+                            self.config, "neutral_range_dmu_max", 200.0))
+                        and not bool(signals.get("event_day"))
+                    )
+                    if _wide_ok_v15:
+                        signals["neutral_range_condor"] = True
+                        signals["weekly_range_size_discount"] = float(
+                            getattr(self.config, "neutral_range_size_weekly",
+                                    0.60))
+                        return (
+                            FinalRegime.PREMIUM_SELL_RANGE,
+                            f"RANGE_DTE{dte}_WIDE_CONDOR_NEUTRAL_VOL",
+                        )
                     return (
                         FinalRegime.NO_TRADE,
                         f"RANGE_DTE{dte}_CONDOR_REQUIRES_SELL_PREMIUM"

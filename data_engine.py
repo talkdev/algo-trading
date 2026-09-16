@@ -424,6 +424,46 @@ class MarketDataEngine:
                 if bool_col in row and row[bool_col] is not None:
                     row[bool_col] = bool(row[bool_col])
 
+            # ── PATCH_V16: restore the in-memory-only session anchors ────
+            # A restart must not restart the SESSION. The columns above
+            # survive a restart; these do not, and every one of them is an
+            # anchor that the rest of the day is measured against:
+            #   opening_iv_rem_frac   the fraction of the session remaining
+            #                         when the IV baseline was taken - the
+            #                         only thing that makes a 0DTE IV change
+            #                         comparable across the day
+            #   opening_iv_expiry     which series that baseline belongs to
+            #   _straddle_open_expiry which series the opening straddle
+            #                         belongs to
+            #   _prev_close_for_gap   the gap/level reference
+            #   _last_atm_straddle    the previous cycle's ATM straddle
+            #   _straddle_hist        the 10-minute straddle-expansion window
+            #   rv_anchor_pct         the session's realised-vol anchor
+            # Measured cost of losing them (2026-09-15, 8s gap at 12:27:42):
+            # iv_change_pct_from_open flipped from -8.59 (DECLINING) to
+            # +28.52 (SPIKING) and premium selling was refused for the rest
+            # of the session. They are persisted as JSON (see
+            # _save_session_state) so a resume is a resume.
+            try:
+                _aux = json.loads(row.get("aux_json") or "{}")
+            except Exception:
+                _aux = {}
+            if isinstance(_aux, dict) and _aux:
+                for _k, _v in _aux.items():
+                    try:
+                        if (_k == "_straddle_hist"
+                                and isinstance(_v, list)):
+                            row[_k] = [
+                                (float(_p[0]), float(_p[1]))
+                                for _p in _v
+                                if isinstance(_p, (list, tuple))
+                                and len(_p) == 2
+                            ]
+                        elif _k not in row or row.get(_k) in (None, 0, 0.0):
+                            row[_k] = _v
+                    except (TypeError, ValueError, IndexError):
+                        continue
+
             self.logger.info(
                 f"Session state loaded for {today_str} "
                 f"(mid-day restart recovery, entries={row.get('entry_count', 0)})"
@@ -543,6 +583,7 @@ class MarketDataEngine:
                 data[k] = int(v)
 
         # Only update columns that exist in the table
+        existing_cols = set()
         try:
             existing_cols = {
                 row[1] for row in
@@ -550,9 +591,58 @@ class MarketDataEngine:
                     "PRAGMA table_info(session_state)"
                 ).fetchall()
             }
-            data = {k: v for k, v in data.items() if k in existing_cols}
         except Exception:
             pass
+
+        # ── PATCH_V16: persist the anchors that have no column of their own ─
+        # PATCH_V15 and the v3.5 IV normalisation both depend on state that
+        # used to exist only in the process's memory, so a restart silently
+        # re-based the session: the IV change went back to a raw read, the
+        # gap reference went to 0, the straddle history emptied. They are
+        # written to a single JSON overflow column instead of six new
+        # columns - one ALTER, no migration ordering to get wrong, and any
+        # future in-memory-only key has somewhere to live. The column is
+        # added lazily on first save so an existing DB needs no separate
+        # migration step.
+        if existing_cols and "aux_json" not in existing_cols:
+            try:
+                self.db.get_connection().execute(
+                    "ALTER TABLE session_state ADD COLUMN aux_json TEXT"
+                )
+                self.db.get_connection().commit()
+                existing_cols.add("aux_json")
+            except Exception as _aux_err:
+                self.logger.debug(f"aux_json column add skipped: {_aux_err}")
+        if "aux_json" in existing_cols:
+            _aux_out = {}
+            for _k in (
+                "opening_iv_expiry", "opening_iv_rem_frac",
+                "_straddle_open_expiry", "_straddle_open_for_regime",
+                "_straddle_open_for_summary", "_last_atm_straddle",
+                "_prev_close_for_gap", "_straddle_hist",
+                "rv_anchor_pct", "rv_anchor_date", "first_bar_close",
+            ):
+                if _k not in data:
+                    continue
+                _v = data[_k]
+                try:
+                    if _k == "_straddle_hist" and isinstance(_v, (list, tuple)):
+                        _aux_out[_k] = [
+                            [float(_p[0]), float(_p[1])]
+                            for _p in list(_v)[-40:]
+                            if isinstance(_p, (list, tuple)) and len(_p) == 2
+                        ]
+                    elif _v is None or isinstance(_v, (str, int, float)):
+                        _aux_out[_k] = _v
+                except (TypeError, ValueError, IndexError):
+                    continue
+            try:
+                data["aux_json"] = json.dumps(_aux_out)
+            except Exception as _aux_dump_err:
+                self.logger.debug(f"aux_json not written: {_aux_dump_err}")
+
+        if existing_cols:
+            data = {k: v for k, v in data.items() if k in existing_cols}
 
         self.db.update("session_state", data, {"trading_date": trading_date})
 
@@ -815,6 +905,7 @@ class MarketDataEngine:
                 "SELECT candle_time as time, open, high, low, close, volume "
                 "FROM intraday_candles "
                 "WHERE trading_date=? AND interval_min=1 "
+                "AND candle_time >= '09:15:00' AND candle_time <= '15:30:00' "
                 "ORDER BY candle_time",
                 (trading_date,),
             )
@@ -1251,6 +1342,28 @@ class MarketDataEngine:
                             )
                             return cached_rv, "cached_spike_guard"
 
+                    # ── PATCH_V15: session-anchored RV ────────────────
+                    # The rolling window is SHORT at the open (bar count,
+                    # not clock time, decides: tail(90) on dte>=2 is the
+                    # whole session before 10:45). A violent 09:15-09:45
+                    # therefore sets the "realized" vol for hours and
+                    # differenced against a forward IV it produced a
+                    # NEGATIVE VRP - the engine read 2026-09-16 as BUY
+                    # (RV 18.3% vs IV 13.7%) while the session's own range
+                    # was half the priced straddle. Cap the spike against
+                    # the session anchor and shrink the estimate toward
+                    # that anchor while the window is incomplete.
+                    _anchor_v15 = float(self.state.get("rv_anchor_pct") or 0.0)
+                    if _anchor_v15 < rv_floor:
+                        _anchor_v15 = float(cached_rv or 0.0) \
+                            if self.state.get("parkinson_rv_computed_date") == today_str \
+                            else 0.0
+                    if _anchor_v15 >= rv_floor:
+                        if rv > _anchor_v15 * 1.35:
+                            rv = _anchor_v15 * 1.35
+                        _w_v15 = min(len(log_hl_sq) / 60.0, 1.0)
+                        rv = _w_v15 * rv + (1.0 - _w_v15) * _anchor_v15
+
                     # Valid RV
                     self.state["parkinson_rv_pct"]            = rv
                     self.state["parkinson_rv_computed_date"]  = today_str
@@ -1266,6 +1379,11 @@ class MarketDataEngine:
         if vix_now and vix_now > 0:
             vix_implied = (vix_now / 100.0) * 0.75
             if rv_floor * 0.5 < vix_implied < rv_ceil:
+                # PATCH_V15: remember the session anchor (persisted) so the
+                # first rolling estimate is measured against the prior the
+                # session opened with, not against a stale cross-session RV.
+                self.state["rv_anchor_pct"] = vix_implied
+                self.state["rv_anchor_date"] = today_str
                 self.logger.debug(
                     f"Parkinson RV unavailable — VIX-implied: "
                     f"{vix_implied*100:.2f}% (VIX={vix_now:.2f})"
@@ -1449,6 +1567,33 @@ class MarketDataEngine:
         _rem_base = self.state.get("opening_iv_rem_frac")
         _tol = 1.0
 
+        # ── PATCH_V16: a lost baseline is not a volatility spike ─────────
+        # On a 0DTE series the raw "IV against the open" read is
+        # meaningless: as T collapses the annualised IV rises on its own -
+        # this module's own v3.5 note measures +536% across one afternoon on
+        # a 90-point day. The normalised path (IV * sqrt(T_remaining))
+        # exists to remove exactly that, and it needs `opening_iv_rem_frac`,
+        # which used to live only in memory. A mid-session restart lost it
+        # and fell through to the RAW branch, outside every tolerance band:
+        # measured 2026-09-15 at 12:27:50, one cycle after an 8s gap,
+        # iv_change_pct_from_open went from -8.59 (DECLINING) to +28.52
+        # (SPIKING) with nothing happening in the market, and BOTH the
+        # strategy gate (iv_spiking) and the regime Gate 3 hard-block then
+        # refused premium selling for the remaining 427 cycles of a session
+        # this replay trades for +Rs 8,367. The fraction is persisted now
+        # (see _save_session_state); if it is still missing - an old row, a
+        # hand-built caller, a process started mid-session - report UNKNOWN
+        # (not a hard block) rather than a spike that is really time decay.
+        if _dte_iv == 0 and not _rem_base:
+            if not self.state.get("_iv_baseline_missing_logged"):
+                self.state["_iv_baseline_missing_logged"] = True
+                self.logger.warning(
+                    "IV baseline fraction missing on a 0DTE session - "
+                    "reporting iv_behavior=UNKNOWN this cycle instead of a "
+                    "raw read that turns time decay into a spike"
+                )
+            return "UNKNOWN", 0.0
+
         if _dte_iv == 0 and _rem_base:
             _rem_now   = self._session_rem_frac()
             _cur_norm  = atm_iv_pct * math.sqrt(max(_rem_now, 1e-6))
@@ -1544,6 +1689,10 @@ class MarketDataEngine:
                 if not market_bars.empty:
                     day_high = float(market_bars["high"].max())
                     day_low  = float(market_bars["low"].min())
+                    # PATCH_V15: expose the session extremes - the range
+                    # gates and the failed-break structure read need them.
+                    self.state["day_high_so_far"] = day_high
+                    self.state["day_low_so_far"]  = day_low
                     return round((day_high - day_low) / _straddle_ref * 100.0, 2)
         except Exception:
             pass
@@ -2832,8 +2981,30 @@ class MarketDataEngine:
             pass
         # Record opening straddle (once per session, after 09:30)
         current_time = now_ist().time()
+        # ── PATCH_V16: the opening straddle is an OPENING, not a snapshot ──
+        # The guard below is only as good as the row it was loaded from.
+        # Measured 2026-09-08: the anchor read 280.4pts at 11:43 and 175.0pts
+        # at 12:03 (the first cycle after a 1,189s gap) while
+        # `_straddle_open_for_regime` still held 280.4 - one session, two
+        # "openings". The day-move gauge divides by this number, so the same
+        # tape read 36.31% before the gap and 62.46% after it, and the block
+        # fires at 125: adopting a noon straddle as "the open" silently
+        # re-scales every remaining cycle of the session.
+        # Two changes: never re-record when EITHER anchor already carries a
+        # number, and - when the series the open came from is unknown - only
+        # adopt a straddle inside the opening-range window. Outside it the
+        # anchor stays 0, and a gauge with no denominator returns 0.0 (see
+        # _compute_day_move_used), which disables the gate instead of
+        # mis-scaling it: the conservative direction.
+        _open_series     = self.state.get("_straddle_open_expiry")
+        _open_window_v16 = current_time <= dtime(9, 45)
+        _no_anchor_v16   = (
+            self.state.get("_straddle_open_for_regime", 0) == 0
+            and float(self.state.get("opening_straddle_pts") or 0.0) <= 0.0
+        )
         if (atm_straddle > 20 and
-                self.state.get("_straddle_open_for_regime", 0) == 0 and
+                _no_anchor_v16 and
+                (_open_series or _open_window_v16) and
                 current_time >= dtime(9, 30) and
                 not chain_stale and
                 atm_ce > 0 and atm_pe > 0):
@@ -3390,6 +3561,9 @@ class MarketDataEngine:
 
             # Day move
             "day_move_used_pct":        day_move_used_pct,
+            # PATCH_V15: session extremes for the failed-break structure
+            "day_high_so_far":          self.state.get("day_high_so_far"),
+            "day_low_so_far":           self.state.get("day_low_so_far"),
             # PATCH_V12: one-sided excursion vs priced displacement.
             "day_up_used_pct":          day_up_used_pct,
             "day_down_used_pct":        day_down_used_pct,
