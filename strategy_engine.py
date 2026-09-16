@@ -414,7 +414,53 @@ class StrategyEngine:
             (final_regime == "PREMIUM_SELL_BEAR" and _dm_px in ("DOWNTREND", "STRONG_DOWNTREND"))
             or (final_regime == "PREMIUM_SELL_BULL" and _dm_px in ("UPTREND", "STRONG_UPTREND"))
         )
-        if _dm_threat >= self.config.day_move_used_block_pct and not _dm_trend_confirmed:
+        # ── PATCH_V15: the range verdict is judged on RANGE, not speed ───
+        # The time-scaled gauge above says how fast the session has moved
+        # for the clock; that is the right question for a directional
+        # vertical (an exhausted with-trend move is its thesis) but the
+        # wrong one for a delta-neutral condor. What kills a condor is the
+        # day's RANGE running beyond the range the straddle priced for the
+        # WHOLE session - a front-loaded morning that then goes nowhere is
+        # the condor's best tape, not its worst. Measured 2026-09-16: the
+        # gauge sat at 126-156% from 09:45 to 10:18 and refused the
+        # session, while the realised range (165pts) was 52% of the 319pt
+        # the 4-day 330.7 straddle priced for the day. Reconstructed from
+        # the same two fields the gauge itself is built from, so the
+        # exemption can never disagree with the metric that raised it.
+        _dm_range_confirmed = False
+        if final_regime == "PREMIUM_SELL_RANGE":
+            try:
+                _dm_es = float(signals.get("expected_range_so_far_pts") or 0.0)
+                _dm_os = float(signals.get("opening_straddle_pts") or 0.0)
+                _dm_dte_v15 = int(actual_dte or 0)
+                _dm_range_pts = (
+                    day_move_used / 100.0 * _dm_es if _dm_es > 0 else 0.0
+                )
+                _dm_theta_v15 = (
+                    (1.0 / max(_dm_dte_v15, 1)) ** 0.5
+                    if _dm_dte_v15 >= 2 else 1.0
+                )
+                _dm_full_ref = _dm_os * _dm_theta_v15 * 1.93
+                _dm_frac_range = (
+                    _dm_range_pts / _dm_full_ref if _dm_full_ref > 0 else 9.9
+                )
+            except (TypeError, ValueError):
+                _dm_frac_range = 9.9
+            _dm_range_confirmed = (
+                _dm_px in ("RANGE", "STRONG_RANGE")
+                and 0.0 <= float(signals.get("adx_15") or 0.0)
+                < float(self.config.adx_trend_threshold)
+                and _dm_frac_range < float(
+                    getattr(self.config, "day_range_frac_block_condor", 0.75))
+            )
+        # PATCH_V15: the failed-break vertical is the same argument - its
+        # thesis IS the exhausted excursion the gauge is measuring, and its
+        # strike sits beyond the failed extreme.
+        if bool(signals.get("neutral_range_vertical")):
+            _dm_range_confirmed = True
+        if _dm_threat >= self.config.day_move_used_block_pct and not (
+            _dm_trend_confirmed or _dm_range_confirmed
+        ):
             return "NO_TRADE", (
                 f"day_move_used_{_dm_threat:.0f}pct_of_opening_straddle_no_edge"
             )
@@ -972,7 +1018,11 @@ class StrategyEngine:
         elif strategy_name == BULL_PUT_SPREAD:
             or_high = float(signals.get("or_high") or 0)
             or_low  = float(signals.get("or_low") or 0)
-            if or_high > 0 and or_low > 0:
+            # PATCH_V15: the failed-break vertical confirmed itself by
+            # RECLAIMING the range low, so the OR-mid veto is satisfied by
+            # a different measurement than the one it was written for.
+            if or_high > 0 and or_low > 0 and not signals.get(
+                    "neutral_range_vertical"):
                 or_mid    = (or_high + or_low) / 2.0
                 or_buffer = 30 if dte == 0 else 15
                 if spot < or_mid - or_buffer:
@@ -2398,6 +2448,12 @@ class StrategyEngine:
         _wm = float(getattr(self.config, "ev_blend_model_w", 0.40))
         _wp = float(getattr(self.config, "ev_blend_prior_w", 0.30))
         _wk = float(getattr(self.config, "ev_blend_market_w", 0.30))
+        # PATCH_V15: for the failed-break vertical the market's own
+        # per-strike delta is the sharpest touch estimate - the edge IS
+        # the cushion, and delta prices exactly that. The DTE x OR prior
+        # was built around ATM-ish shorts; weight the quote instead.
+        if signals.get("neutral_range_vertical"):
+            _wm, _wp, _wk = 0.25, 0.20, 0.55
         if p_win_model is None:
             if _p_mkt is not None and (_wp + _wk) > 0:
                 p_win = (_wp * p_win_prior + _wk * _p_mkt) / (_wp + _wk)
@@ -2867,6 +2923,28 @@ class StrategyEngine:
         if _wing_cap_pre > 0:
             _stop_premium_pre = min(_stop_premium_pre, _wing_cap_pre)
         _stop_premium_pre = max(_stop_premium_pre, net_credit * 1.10)
+        # ── PATCH_V15: failed-break vertical is stopped by its thesis ────
+        # The structure is sold because the failed extreme held; if the
+        # tape revisits it the reason for the trade is gone. Pricing that
+        # as a multiple of the credit (1.7x on dte2+) overstates the risk
+        # and made every such trade fail the EV gate.
+        if signals.get("neutral_range_vertical"):
+            try:
+                if strategy_name == BULL_PUT_SPREAD:
+                    _fb_ref_pre = float(signals.get("day_low_so_far") or 0.0)
+                else:
+                    _fb_ref_pre = float(signals.get("day_high_so_far") or 0.0)
+                _fb_spot_pre = float(signals.get("spot") or 0.0)
+                if _fb_ref_pre > 0 and _fb_spot_pre > 0:
+                    _fb_risk_pre = max(
+                        0.25 * abs(_fb_spot_pre - _fb_ref_pre),
+                        0.15 * net_credit,
+                    )
+                    _stop_premium_pre = min(
+                        _stop_premium_pre, net_credit + _fb_risk_pre
+                    )
+            except (TypeError, ValueError):
+                pass
 
         # v3.2: the spot backstop is computed BEFORE the EV gate so the
         # gate can price the barrier the engine will genuinely defend
