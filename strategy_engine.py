@@ -335,9 +335,22 @@ class StrategyEngine:
         # (measured 2026-09-08: Sep-15 spread sold at 09:51, marked
         # on Sep-08 quotes by the afternoon — a phantom Rs 8,993).
         # Wait for the real contract.
+        # PATCH_V14: "is today an expiry day" is a CALENDAR question, and
+        # "has the broker listed that series yet" is a chain question. The
+        # old test used day_label == "TUESDAY" as a proxy for the first, so a
+        # holiday-rolled Monday expiry (Tuesday closed, ExpiryCalendar already
+        # moves the expiry back to Monday) waited for nothing and traded the
+        # NEXT weekly as if it were the expiring one - the exact phantom-P&L
+        # failure PATCH_V12 added this gate to prevent, on the one weekday the
+        # proxy did not cover. Note the test must NOT read actual_dte: that is
+        # derived from the chain, and the chain is precisely what is missing.
+        try:
+            _expiry_today = ExpiryCalendar.get_dte(today_ist()) == 0
+        except Exception:
+            _expiry_today = False
         try:
             _tue_wait = (
-                state.get("day_label") == "TUESDAY"
+                _expiry_today
                 and signals.get("active_expiry") is not None
                 and signals.get("trading_date") is not None
                 and str(signals.get("active_expiry"))[:10] != str(signals.get("trading_date"))[:10]
@@ -346,15 +359,22 @@ class StrategyEngine:
         except Exception:
             _tue_wait = False
         if _tue_wait:
-            return "NO_TRADE", "tuesday_waiting_for_0dte_series_listed"
+            return "NO_TRADE", "expiry_day_waiting_for_0dte_series_listed"
 
         confidence = signals.get("confidence_level", "NONE")
         if confidence in ("LOW", "NONE"):
             return "NO_TRADE", f"confidence_{confidence}_insufficient_edge_after_costs"
 
+        # PATCH_V14: one ceiling, read from MAX_DTE_TRADEABLE, shared with
+        # regime_engine.classify_final and with the DTE_REQUIREMENTS cap in
+        # compute_params. Was a literal 6 here and in the regime layer against
+        # a Config field of 4 that nothing read.
         actual_dte = signals.get("actual_dte")
-        if actual_dte is not None and actual_dte > 6:
-            return "NO_TRADE", f"dte_{actual_dte}_above_max_6_intraday_only"
+        _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+        if actual_dte is not None and actual_dte > _max_dte:
+            return "NO_TRADE", (
+                f"dte_{actual_dte}_above_max_{_max_dte}_intraday_only"
+            )
         if actual_dte is not None and actual_dte >= 4:
             if confidence not in ("HIGH", "MEDIUM"):
                 return "NO_TRADE", (
@@ -566,8 +586,29 @@ class StrategyEngine:
         bear call off this lean loses ~Rs 1,000 into the data end).
         Friday range premium is harvested delta-neutral only.
         """
-        if signals.get("actual_dte") == 2:
-            return False, "lean_skipped_friday_dte2_delta_neutral_only"
+        # PATCH_V14: this exemption is about WEEKEND RISK - the last session
+        # before the market shuts for two or more days, when a gap-day tape is
+        # dominated by weekly expiry positioning and a single-sided directional
+        # fade has no edge. It was written as `actual_dte == 2` because Friday
+        # happens to be DTE 2 in a clean Tuesday-expiry week, which makes it a
+        # weekday rule wearing a DTE costume. In the recorded week of
+        # 2026-09-14 (Monday, an NSE holiday) the counter shifted: Friday
+        # 11-Sep became DTE 1 and the exemption switched ITSELF OFF on the one
+        # session it had been measured on, while Thursday 10-Sep became DTE 2
+        # and inherited an exemption that was never written for it. Measured on
+        # the five recorded sessions, restoring the guard on that Friday is
+        # worth +Rs 250 and removes the week's only losing trade: the lean
+        # substituted a bear call at 10:14 into a CPI rally, the v12 trend-flip
+        # exit ejected it 55 minutes later at -Rs 250, and the condor the
+        # guard would have kept was refused on its own economics - leaving the
+        # book flat and free for the 11:12 long call that earned the session.
+        try:
+            _weekend_risk = ExpiryCalendar.is_weekend_risk_day(today_ist())
+        except Exception:
+            _weekend_risk = False
+        if _weekend_risk or signals.get("day_label") == "FRIDAY" \
+                or signals.get("actual_dte") == 2:
+            return False, "lean_skipped_weekend_risk_delta_neutral_only"
         if signals.get("price_regime") != "RANGE":
             return False, "lean_needs_range_price"
         # PATCH_V13: positioning that is UNCLEAR is still a veto here, and
@@ -1524,9 +1565,30 @@ class StrategyEngine:
         ltp = float(opt.get("ltp", 0) or 0)
         if bid <= 0 and ask <= 0 and ltp <= 0:
             return False, f"strike_{strike:.0f}_{opt_type}_no_bid_ask_ltp"
-        min_oi = 500 if action == "SELL" else 100
+        # PATCH_V14: the liquidity floor was written in CONTRACTS and applied
+        # to UNITS. Upstox reports open interest and volume for F&O in
+        # underlying units - the same convention its v2 place-order contract
+        # uses for quantity, and visible in the recorded data: every one of the
+        # 133,520 option_chain_snapshot OI values on 2026-09-08 is an exact
+        # multiple of the 65-unit lot, and the smallest non-zero value in the
+        # file is 65, i.e. precisely one contract. A floor of "500" against
+        # that column is a floor of 7.7 contracts on the short leg of a
+        # structure the engine intends to hold for hours, and 1.5 contracts on
+        # the protective wing it has to buy back in a hurry. On 0DTE, where the
+        # whole point of the wing is that it fills when everything else will
+        # not, that is the difference between a defined-risk structure and an
+        # undefined one. The floor is now the intended contract count scaled by
+        # the lot size the rest of the engine already uses. Measured on the
+        # five recorded sessions: not one trade changes, to the rupee - the
+        # strikes this engine sells are liquid, and the floor was simply never
+        # doing the job it was written for.
+        _lot = int(getattr(self.config, "lot_size", 65) or 65)
+        min_oi = (500 if action == "SELL" else 100) * _lot
         if oi < min_oi:
-            return False, f"strike_{strike:.0f}_{opt_type}_oi_{oi}_below_{min_oi}"
+            return False, (
+                f"strike_{strike:.0f}_{opt_type}_oi_{oi}_below_{min_oi}"
+                f"_units_{min_oi // max(_lot, 1)}_contracts"
+            )
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2.0
             # v3.1: a purely relative spread gate rejects cheap protective
@@ -1586,6 +1648,42 @@ class StrategyEngine:
                             break
                 if not found:
                     return None, f"leg_validation_failed_no_fallback:{reason}"
+                # PATCH_V14: a substituted strike is a DIFFERENT structure, and
+                # the walk above takes the first alternative that merely quotes
+                # - it never re-runs the delta, credit or wing logic that chose
+                # the original. On a symmetric structure that silently produces
+                # an asymmetric one (a condor whose call wing moved 50pts while
+                # its put wing did not), and on any structure it can produce two
+                # legs on one strike, or a short pushed OUTSIDE its own
+                # protective wing - a debit where a credit was selected. The
+                # economics downstream are recomputed on whatever legs survive,
+                # so the EV gate stays honest about the structure it is given;
+                # what nothing downstream can see is that the structure is no
+                # longer the one that was chosen. Refuse instead, and name the
+                # move: a skipped cycle costs nothing, a leg in the wrong place
+                # costs the wing.
+                _wanted = float(spec["strike"])
+                _seen = [(float(v["strike"]), str(v["option_type"]),
+                          str(v["action"])) for v in validated]
+                for _k, _t, _a in _seen:
+                    if _k == strike and _t == str(opt_type):
+                        return None, (
+                            f"leg_substitution_collides_{_wanted:.0f}_to_"
+                            f"{strike:.0f}_{opt_type}_already_in_structure"
+                        )
+                _longs = [_k for _k, _t, _a in _seen if _a == "BUY"
+                          and _t == str(opt_type)]
+                if _longs and action == "SELL":
+                    if str(opt_type) == "call" and strike >= max(_longs):
+                        return None, (
+                            f"leg_substitution_inverts_short_call_{strike:.0f}"
+                            f"_at_or_beyond_wing_{max(_longs):.0f}"
+                        )
+                    if str(opt_type) == "put" and strike <= min(_longs):
+                        return None, (
+                            f"leg_substitution_inverts_short_put_{strike:.0f}"
+                            f"_at_or_below_wing_{min(_longs):.0f}"
+                        )
             ep = self._get_exec_price(chain, strike, opt_type, action)
             if ep <= 0:
                 return None, f"leg_{strike:.0f}_{opt_type}_no_exec_price"
@@ -2431,6 +2529,12 @@ class StrategyEngine:
             return {"valid": False, "reason": "no_active_expiry"}
 
         dte_min, dte_max = DTE_REQUIREMENTS.get(strategy_name, (0, 2))
+        # PATCH_V14: MAX_DTE_TRADEABLE is the operator's single ceiling and it
+        # was dead - this table hardcoded 4 and the two hard gates hardcoded 6.
+        # The table still sets the per-structure floor and shape; the Config
+        # field can only ever TIGHTEN the top, never widen it, so a typo in
+        # env.txt cannot hand the engine a DTE it was never measured on.
+        dte_max = min(int(dte_max), int(getattr(self.config, "max_dte_tradeable", 4) or 4))
         if actual_dte < dte_min:
             return {"valid": False, "reason": f"dte_{actual_dte}_below_min_{dte_min}"}
         if actual_dte > dte_max:

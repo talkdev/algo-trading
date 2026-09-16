@@ -460,13 +460,26 @@ class ExpiryCalendar:
         return count
 
     @classmethod
-    def get_day_type(cls, d: Optional[date] = None) -> str:
-        """Return a label describing the trading day type."""
+    def get_day_type(cls, d: Optional[date] = None,
+                     dte: Optional[int] = None) -> str:
+        """Return a label describing the trading day type.
+
+        PATCH_V14: `dte` may be supplied by the caller. Every DTE-indexed
+        table in the engine keys off the DTE of the contract the broker
+        actually listed, while this label used to be derived from the
+        calendar's own next-Tuesday assumption. The two disagree whenever an
+        expiry is holiday-shifted or nse_holidays.json is stale, and the
+        disagreement was silent: regime_decisions recorded one DTE and one
+        day_type while the strategy, the EV gate and the exit ladder traded
+        on another. The label is now derived from the same number the
+        decision layer uses.
+        """
         if d is None:
             d = today_ist()
         if cls.is_holiday(d):
             return "NON_TRADING"
-        dte = cls.get_dte(d)
+        if dte is None:
+            dte = cls.get_dte(d)
         weekday = d.weekday()
         if dte == 0:
             return "EXPIRY_DAY"
@@ -479,6 +492,30 @@ class ExpiryCalendar:
         if weekday == 0:
             return "PRE_EXPIRY"
         return "MID_WEEK"
+
+    @classmethod
+    def is_weekend_risk_day(cls, d: Optional[date] = None) -> bool:
+        """PATCH_V14: True when d is the last session before a >=2-day gap.
+
+        "Weekend risk" is a property of the CALENDAR, not of the DTE counter:
+        it is the last trading day before the market shuts for two or more
+        consecutive days (an ordinary Friday, or the Thursday before a Friday
+        holiday). Rules that were written as `dte == 2` because Friday happens
+        to be DTE 2 in a clean Tuesday-expiry week silently change meaning the
+        moment a holiday moves the counter - measured on the recorded week of
+        2026-09-14 (Monday, an NSE holiday): Friday 11-Sep became DTE 1 and
+        the weekend-risk exemption switched itself off on the one session it
+        had been measured on, while Thursday 10-Sep became DTE 2 and inherited
+        it. This helper asks the question that was meant to be asked.
+        """
+        if d is None:
+            d = today_ist()
+        if cls.is_holiday(d):
+            return False
+        nxt = cls.get_next_trading_day(d)
+        if nxt is None:
+            return False
+        return (nxt - d).days >= 3
 
     @classmethod
     def is_monthly_expiry(cls, d: Optional[date] = None) -> bool:
@@ -1047,11 +1084,18 @@ class Config:
     daily_halt_action:             str   = "flatten"
     soft_halt_frac:                float = 0.50
     flatten_on_daily_halt:         bool  = True
-    # Square-off watchdog. Deliberately later than the in-loop 15:00 sweep
-    # and well before Upstox's 15:20 intraday F&O RMS sweep.
+    # Square-off watchdog. PATCH_V14: deliberately later than the in-loop
+    # hard-exit sweep (15:15 for a weekly, 15:00 on a DTE-0 session) and
+    # still before Upstox's 15:20 intraday F&O RMS sweep, so the ladder is
+    # in-loop sweep -> watchdog -> broker, in that order. At 15:08 it fired
+    # BETWEEN nothing: the sweep it was meant to backstop had already run at
+    # 15:00 and the position-level hard exit it was meant to catch had not
+    # arrived yet, so on a weekly session the watchdog flattened the book
+    # twelve minutes before the engine's own exit and eight minutes before
+    # the closing-hour route could use the tape it exists for.
     watchdog_enabled:              bool  = True
     watchdog_poll_sec:             float = 5.0
-    square_off_deadline:           dtime = dtime(15, 8)
+    square_off_deadline:           dtime = dtime(15, 18)
     feed_degrade_sec:              int   = 45
     feed_force_exit_sec:           int   = 120
     # Broker-side sweeps. Off by default: /order/positions/exit exits EVERY
@@ -1266,12 +1310,35 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         # Windows
         trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 45)),
         trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),
-        # Defined-risk, non-expiry NIFTY positions may remain open until
-        # 15:20 IST, leaving a small but tradeable final-theta window while
-        # deliberately flattening before the end-of-session liquidity taper.
-        # Tuesday / 0DTE continues to use its separate 15:00 hard exit
-        # (data_engine overrides the window on Tuesday 0DTE sessions).
-        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 20)),
+        # Defined-risk, non-expiry NIFTY positions may remain open past the
+        # 15:00 expiry-day square-off, leaving a small but tradeable
+        # final-theta window while deliberately flattening before the
+        # end-of-session liquidity taper. Tuesday / 0DTE continues to use its
+        # separate 15:00 hard exit (data_engine overrides the window on any
+        # DTE-0 session, not only on a Tuesday).
+        #
+        # PATCH_V14: 15:20 -> 15:15, for two reasons that are both about the
+        # live order path and neither about the strategy.
+        #   (a) Orders go out as product="I" (execution_engine._dispatch_write
+        #       -> UpstoxClient.place_order), and the broker's own intraday
+        #       F&O RMS sweep is at 15:20. A hard exit scheduled ON the
+        #       minute the broker force-squares is not an exit: it is a race
+        #       the engine loses whenever a leg needs a re-price, and the
+        #       penalty fill is the broker's, not ours.
+        #   (b) The value was dead anyway. perform_hard_exit_sweep() clamped
+        #       its trigger to min(15:00, HARD_EXIT_TIME), so live flattened
+        #       everything at 15:00 while the position-level Priority-7 exit
+        #       and the entry gates both read 15:20 from state. The replay
+        #       harness never calls the sweep, so it held positions to 15:20:
+        #       the two paths disagreed by twenty minutes on every non-expiry
+        #       session. Measured on the five recorded sessions, that gap was
+        #       worth Rs 5,711 - the 2026-09-09 closing-hour long put is only
+        #       enterable at all when the square-off is after 14:35, and the
+        #       2026-09-11 long call is banked twenty minutes earlier.
+        # 15:15 keeps five minutes of margin before the broker sweep, and the
+        # sweep now honours the position's own hard exit instead of clamping
+        # it (see execution_engine.perform_hard_exit_sweep).
+        hard_exit_time=_get_time(env, "HARD_EXIT_TIME", dtime(15, 15)),
         tuesday_hard_exit=_get_time(env, "TUESDAY_HARD_EXIT", dtime(15, 0)),
         tuesday_last_entry=_get_time(env, "TUESDAY_LAST_ENTRY", dtime(12, 30)),
 
@@ -1506,7 +1573,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         watchdog_poll_sec=min(
             max(_get_float(env, "WATCHDOG_POLL_SEC", 5.0), 1.0), 60.0
         ),
-        square_off_deadline=_get_time(env, "SQUARE_OFF_DEADLINE", dtime(15, 8)),
+        square_off_deadline=_get_time(env, "SQUARE_OFF_DEADLINE", dtime(15, 18)),
         feed_degrade_sec=min(max(_get_int(env, "FEED_DEGRADE_SEC", 45), 15), 600),
         feed_force_exit_sec=min(
             max(_get_int(env, "FEED_FORCE_EXIT_SEC", 120), 30), 1800
@@ -1682,6 +1749,22 @@ CREATE TABLE IF NOT EXISTS session_state (
     gap_size_pts                REAL DEFAULT 0,
     gap_fade_opportunity        INTEGER DEFAULT 0,
     first_bar_close             REAL,
+    -- PATCH_V14: the anti-churn and once-a-day-clip latches. These five keys
+    -- have been written into MarketDataEngine.state since PATCH_V13 and had
+    -- no column, so _save_session_state() (which filters to existing columns)
+    -- dropped every one of them on the floor. A process that restarted at
+    -- 12:00 came back with no memory of where or when it last went flat, so
+    -- the ten-minute cooldown, the "tape must have moved" re-entry gate and
+    -- the closing-hour clip counter were all disarmed for the rest of the
+    -- session. This is not hypothetical: the recorded 2026-09-11 paper book
+    -- shows a close at 11:49:23.584 and the next entry at 11:49:23.601 -
+    -- seventeen milliseconds later, on the same regime at the same spot.
+    last_exit_time              TEXT,
+    last_exit_spot              REAL,
+    last_exit_reason            TEXT,
+    last_exit_priority          INTEGER,
+    last_exit_pnl_rs            REAL,
+    momentum_entries            INTEGER DEFAULT 0,
     _straddle_open_for_regime   REAL DEFAULT 0,
     _straddle_open_for_summary  REAL DEFAULT 0,
     created_at                  TEXT,
@@ -2459,6 +2542,14 @@ MIGRATION_SQL: List[str] = [
     "ALTER TABLE session_state ADD COLUMN gap_fade_opportunity INTEGER DEFAULT 0",
     "ALTER TABLE session_state ADD COLUMN first_bar_close REAL",
     "ALTER TABLE session_state ADD COLUMN last_stop_signal_combo TEXT",
+    # PATCH_V14: see the session_state CREATE above - written since v13,
+    # never declared, silently dropped on every save and lost on restart.
+    "ALTER TABLE session_state ADD COLUMN last_exit_time TEXT",
+    "ALTER TABLE session_state ADD COLUMN last_exit_spot REAL",
+    "ALTER TABLE session_state ADD COLUMN last_exit_reason TEXT",
+    "ALTER TABLE session_state ADD COLUMN last_exit_priority INTEGER",
+    "ALTER TABLE session_state ADD COLUMN last_exit_pnl_rs REAL",
+    "ALTER TABLE session_state ADD COLUMN momentum_entries INTEGER DEFAULT 0",
     "ALTER TABLE daily_summary ADD COLUMN dominant_vol_regime TEXT",
     "ALTER TABLE daily_summary ADD COLUMN dominant_price_regime TEXT",
     "ALTER TABLE daily_summary ADD COLUMN dominant_final_regime TEXT",
@@ -2714,7 +2805,7 @@ class Database:
         """Return VIX history as pandas DataFrame."""
         try:
             import pandas as pd
-            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            cutoff = (today_ist() - timedelta(days=days)).isoformat()
             if from_date and from_date > cutoff:
                 cutoff = from_date
             rows = self.query(
@@ -2733,7 +2824,7 @@ class Database:
         """Return daily_summary as pandas DataFrame with weekday column."""
         try:
             import pandas as pd
-            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            cutoff = (today_ist() - timedelta(days=days)).isoformat()
             rows = self.query(
                 "SELECT *, CAST(strftime('%w', trading_date) AS INTEGER) as weekday_sql "
                 "FROM daily_summary WHERE trading_date >= ? ORDER BY trading_date",
@@ -2761,7 +2852,7 @@ class Database:
         """Return intraday candles as pandas DataFrame."""
         try:
             import pandas as pd
-            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            cutoff = (today_ist() - timedelta(days=days)).isoformat()
             rows = self.query(
                 "SELECT trading_date as date, candle_time as time, "
                 "open, high, low, close, volume "
@@ -2781,7 +2872,7 @@ class Database:
         """Return market_snapshots as pandas DataFrame."""
         try:
             import pandas as pd
-            cutoff = (date.today() - timedelta(days=days)).isoformat()
+            cutoff = (today_ist() - timedelta(days=days)).isoformat()
             rows = self.query(
                 "SELECT * FROM market_snapshots WHERE date >= ? ORDER BY timestamp",
                 (cutoff,),
@@ -2799,7 +2890,7 @@ class Database:
         Return win rate by VRP bucket for calibration.
         Buckets are 0.5pp wide (0.0-0.5, 0.5-1.0, ..., 5.0+).
         """
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        cutoff = (today_ist() - timedelta(days=days)).isoformat()
         return self.query(
             """
             SELECT
@@ -2824,7 +2915,7 @@ class Database:
         Return percentage of NEUTRAL-blocked phantom trades that would have been profitable.
         Used to determine if NEUTRAL threshold is too tight.
         """
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        cutoff = (today_ist() - timedelta(days=days)).isoformat()
         row = self.query_one(
             """
             SELECT
@@ -2845,7 +2936,7 @@ class Database:
         Positive avg_improvement means holding longer would have helped.
         Negative means exit was correct.
         """
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        cutoff = (today_ist() - timedelta(days=days)).isoformat()
         row = self.query_one(
             """
             SELECT
@@ -2865,7 +2956,7 @@ class Database:
 
     def get_regime_accuracy(self, days: int = 30) -> dict:
         """Return regime classification accuracy metrics."""
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        cutoff = (today_ist() - timedelta(days=days)).isoformat()
         row = self.query_one(
             """
             SELECT
@@ -2889,7 +2980,7 @@ class Database:
         Return how well each signal predicted trade outcomes.
         Used to set signal weights in calibration.
         """
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        cutoff = (today_ist() - timedelta(days=days)).isoformat()
         rows = self.query(
             """
             SELECT
