@@ -13,4 +13,3 @@ urllib3
 # Telegram bot controller
 python-telegram-bot
 psutil
-requests

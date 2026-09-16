@@ -267,6 +267,37 @@ class HistoricalStore:
             d.update(live.get(td, {"mkt_cycles": 0, "spots": 0, "range": 0.0}))
         return {"days": chain_days, "candle_days": candle_days}
 
+    def recorded_sessions(self, dates: List[str]) -> Dict[str, dict]:
+        """PATCH_V14: what the live capture wrote into session_state.
+
+        The replay rebuilds every session parameter from the recorded chain
+        and today's config; session_state holds the values the engine itself
+        believed at capture time. Comparing the two is the only way to know
+        whether a replay is simulating the session that was recorded or a
+        different one - a moved expiry, a changed square-off default and a
+        re-scoped entry window all silently change the day being tested, and
+        none of them raises an error.
+
+        Read-only and failure-tolerant by design: a database captured before
+        the column existed, or a per-day split that dropped the table, must
+        degrade to an absent parity block rather than a failed replay.
+        """
+        out: Dict[str, dict] = {}
+        fields = ("trading_date", "day_label", "day_mode", "actual_dte",
+                  "hard_exit_time", "entry_start", "entry_end", "wing_width",
+                  "actual_expiry", "size_multiplier", "updated_at")
+        for r in self._q(
+            f"SELECT {', '.join(fields)} FROM session_state"
+        ):
+            td = str(r.get("trading_date") or "")[:10]
+            if not td or (dates and td not in dates):
+                continue
+            prev = out.get(td)
+            if prev is None or str(r.get("updated_at") or "") > str(
+                    prev.get("updated_at") or ""):
+                out[td] = {k: v for k, v in r.items() if v is not None}
+        return out
+
     def tradable_dates(self, d_from: Optional[str], d_to: Optional[str]) -> List[str]:
         sql = (
             "SELECT DISTINCT trading_date FROM option_chain_snapshot "
@@ -328,6 +359,99 @@ class HistoricalStore:
                 f"split_db_per_day.py for live-faithful replays."
             )
         return DaySlice(trading_date, rows, candles, prev_close)
+
+
+# PATCH_V14: the session parameters compared against the recorded row, in the
+# order the replay change-log stores them.
+SESSION_PARITY_FIELDS: Tuple[str, ...] = (
+    "day_label", "day_mode", "actual_dte", "hard_exit_time",
+    "entry_start", "entry_end", "wing_width", "actual_expiry",
+)
+# What each one is, so the block can say why a divergence happened instead of
+# leaving the operator to go and read three modules.
+SESSION_PARITY_NOTES: Dict[str, str] = {
+    "actual_dte":     "sessions to the listed expiry; nse_holidays.json moves it",
+    "hard_exit_time": "HARD_EXIT_TIME default, or the DTE-0 override",
+    "entry_start":    "session entry window opens (10:30 on a DTE-0 session)",
+    "entry_end":      "session entry window closes",
+    "wing_width":     "adaptive: scaled off the opening straddle and the DTE",
+    "day_label":      "weekday the calendar assigned the session",
+    "day_mode":       "EVENT / PRE_EVENT / NORMAL from high_impact_events.json",
+    "actual_expiry":  "the series the engine traded",
+}
+
+
+class MultiStore:
+    """PATCH_V14: several per-session databases behind one store interface.
+
+    split_db_per_day.py writes one database per session and the harness could
+    only ever be pointed at ONE of them, so a run could not span sessions.
+    Three consequences, all of them in the numbers an operator is asked to
+    judge the engine on:
+
+      * the annualised Sharpe was computed over a single daily return, which
+        gives a standard deviation of zero and a ratio of 0.00 - printed next
+        to a profit factor as though it meant the same kind of thing;
+      * the close-to-close drawdown had one session to walk, so it reported
+        the worst day and called it the worst period;
+      * there was no way to ask the only question the risk statistics exist to
+        answer - what does this engine do over a PERIOD - without stitching
+        five separate runs together by hand outside the tool.
+
+    --db now accepts several paths, or a directory of them, and the sessions
+    replay as one run with one ledger. Routing is by trading_date: each
+    session is read from the database that actually holds it, and a date no
+    database holds falls back to the first so the existing error paths
+    ("only N snapshots - skipped") still fire instead of a KeyError.
+    """
+
+    def __init__(self, paths: List[str]):
+        self.stores: List[HistoricalStore] = []
+        self._owner: Dict[str, HistoricalStore] = {}
+        for pth in paths:
+            st = HistoricalStore(pth)
+            self.stores.append(st)
+            for d in st.tradable_dates(None, None):
+                self._owner.setdefault(str(d), st)
+        self.path = self.stores[0].path if self.stores else ""
+
+    def _for(self, trading_date: str) -> HistoricalStore:
+        return self._owner.get(str(trading_date)) or self.stores[0]
+
+    def load_day(self, trading_date: str,
+                 market_hours_only: bool = True) -> "DaySlice":
+        return self._for(trading_date).load_day(
+            trading_date, market_hours_only=market_hours_only)
+
+    def tradable_dates(self, d_from: Optional[str],
+                       d_to: Optional[str]) -> List[str]:
+        out = set()
+        for st in self.stores:
+            out.update(str(d) for d in st.tradable_dates(d_from, d_to))
+        return sorted(out)
+
+    def audit(self) -> dict:
+        days: List[dict] = []
+        candles: Dict[str, int] = {}
+        seen = set()
+        for st in self.stores:
+            a = st.audit()
+            for d in a.get("days", []):
+                key = str(d.get("trading_date"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                days.append(d)
+            candles.update(a.get("candle_days", {}))
+        days.sort(key=lambda d: str(d.get("trading_date")))
+        return {"days": days, "candle_days": candles}
+
+    def recorded_sessions(self, dates: List[str]) -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        for st in self.stores:
+            for k, v in st.recorded_sessions(dates).items():
+                out.setdefault(k, v)
+        return out
 
 
 class DaySlice:
@@ -591,6 +715,84 @@ class Results:
         self.entries_considered = 0
         self.reason_log: List[Tuple[str, str, str]] = []   # (date, bucket, raw)
         self._cur_day = "?"
+        # PATCH_V14: an equity series sampled every cycle while a position is
+        # open, marked on the recorded chain with the same liquidation pricing
+        # a close would have used. The drawdown reported next to the realised
+        # one is therefore what the book was WORTH intraday, not the
+        # close-to-close series of settled trades that summary() used to call
+        # max drawdown. On an intraday options book those differ by the whole
+        # adverse excursion between entry and exit, which is exactly the part
+        # an operator sizes the account against.
+        # PATCH_V14: the session parameters the replay itself settled on, per
+        # date, for the recorded-vs-replay parity block in print_report().
+        self.replay_sessions: Dict[str, dict] = {}
+        # ...and the moments they changed, so the parity block can compare
+        # against the recorded row AS OF the time it was written instead of
+        # against whatever the last replayed cycle happened to hold. Recorded
+        # session_state rows are not all stamped inside their own session -
+        # split_db_per_day.py rewrites them when it copies - so the alignment
+        # is best-effort and says so when it cannot be done.
+        self.replay_session_path: Dict[str, List[Tuple[str, tuple]]] = {}
+        self.equity_path: List[Tuple[str, float]] = []
+        self.equity_peak: float = float(starting_capital)
+        self.max_intraday_dd: float = 0.0
+        self.max_intraday_dd_at: str = ""
+        self.max_intraday_dd_day: str = ""
+
+    def mark_equity(self, stamp: str, equity: float) -> None:
+        """Sample marked-to-market equity and extend the peak-to-trough."""
+        self.equity_path.append((stamp, equity))
+        if equity > self.equity_peak:
+            self.equity_peak = equity
+        dd = self.equity_peak - equity
+        if dd > self.max_intraday_dd:
+            self.max_intraday_dd = dd
+            self.max_intraday_dd_at = stamp
+            self.max_intraday_dd_day = self._cur_day
+
+    def by_dte(self) -> Dict[str, dict]:
+        """Per-DTE roll-up: the audit asks the same questions of each DTE."""
+        out: Dict[str, dict] = {}
+        for t in self.trades:
+            key = "?" if t.dte is None else str(t.dte)
+            row = out.setdefault(key, {
+                "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0,
+                "gross_win": 0.0, "gross_loss": 0.0,
+                "strategies": Counter(), "days": set(), "held": [],
+            })
+            row["trades"] += 1
+            row["pnl"] += t.pnl_rs or 0.0
+            row["days"].add(t.trading_date)
+            if t.held_min is not None:
+                row["held"].append(int(t.held_min))
+            row["strategies"][t.strategy] += 1
+            if (t.pnl_rs or 0.0) > 0:
+                row["wins"] += 1
+                row["gross_win"] += t.pnl_rs
+            else:
+                row["losses"] += 1
+                row["gross_loss"] += abs(t.pnl_rs or 0.0)
+        return out
+
+    def momentum_census(self) -> List[Tuple[str, int]]:
+        """Every refusal that mentions momentum, counted by its real cause.
+
+        The top-level reason bucket is a stage name, and one stage
+        (strategy_refused_downstream) swallows half a dozen unrelated checks,
+        so a report grouped by bucket cannot answer "how many entries did the
+        momentum gate refuse, and on which condition". The raw reason carries
+        the cause; this folds it back out.
+        """
+        causes: Counter = Counter()
+        for _date, _bucket, raw in self.reason_log:
+            if "momentum" not in str(raw).lower():
+                continue
+            body = str(raw)
+            for sep in ("|", ":"):
+                if sep in body:
+                    body = body.split(sep, 1)[1].strip()
+            causes[re.sub(r"[\d.]+", "N", body).strip()[:78]] += 1
+        return causes.most_common()
 
     # -- accumulation -----------------------------------------------------
     def add_trade(self, t: Trade) -> None:
@@ -657,8 +859,17 @@ class Results:
             peak = max(peak, equity)
             max_dd = max(max_dd, peak - equity)
 
+        # PATCH_V14: over EVERY replayed session. The series used to be built
+        # from daily_pnl's keys, which only exist for days that booked a
+        # trade, so a session that was correctly refused all day - a 0.00%
+        # return on capital, and the outcome the engine is supposed to produce
+        # most days - was dropped from the mean and from the variance. Both
+        # ratios came out too high and the sample looked smaller than the
+        # period actually replayed. A flat day is a return of zero, not a
+        # missing observation.
+        _sessions = sorted(set(self.days) | set(self.daily_pnl))
         day_returns = [
-            self.daily_pnl[d] / self.starting_capital for d in sorted(self.daily_pnl)
+            self.daily_pnl.get(d, 0.0) / self.starting_capital for d in _sessions
         ]
         mean = sum(day_returns) / len(day_returns) if day_returns else 0.0
         var = (
@@ -667,6 +878,23 @@ class Results:
         )
         sd = math.sqrt(var)
         sharpe = (mean / sd * math.sqrt(252)) if sd > 0 else 0.0
+        # Sortino: same numerator, downside deviation only, measured against
+        # the 0% return the capital could have earned sitting flat.
+        _down = [r for r in day_returns if r < 0.0]
+        _dvar = (
+            sum(r ** 2 for r in _down) / len(day_returns)
+            if day_returns else 0.0
+        )
+        _dsd = math.sqrt(_dvar)
+        sortino = (mean / _dsd * math.sqrt(252)) if _dsd > 0 else float("inf")
+        # True peak-to-trough on the close-to-close equity curve, over the
+        # same complete session list (the old loop walked daily_pnl again).
+        _eq, _peak, _mdd = self.starting_capital, self.starting_capital, 0.0
+        for d in _sessions:
+            _eq += self.daily_pnl.get(d, 0.0)
+            _peak = max(_peak, _eq)
+            _mdd = max(_mdd, _peak - _eq)
+        max_dd = _mdd
 
         return {
             "trades": n,
@@ -681,7 +909,16 @@ class Results:
             "expectancy": total / n,
             "max_drawdown": max_dd,
             "sharpe_daily_ann": sharpe,
+            "sortino_daily_ann": sortino,
             "total_costs": sum(t.costs_rs for t in self.trades),
+            # PATCH_V14
+            "sessions_in_ratio": len(day_returns),
+            "flat_sessions": len(_sessions) - len(self.daily_pnl),
+            "max_intraday_dd": self.max_intraday_dd,
+            "max_intraday_dd_at": self.max_intraday_dd_at,
+            "max_intraday_dd_day": self.max_intraday_dd_day,
+            "equity_samples": len(self.equity_path),
+            "downside_days": len(_down),
         }
 
 
@@ -1066,6 +1303,93 @@ class BacktestRunner:
             held_min=int((now - live["entry_time"]).total_seconds() / 60),
         )
 
+    # -- PATCH_V14: parity with the live in-loop hard-exit sweep ───────────
+    def _hard_exit_of(self, live: dict) -> dtime:
+        """The square-off time the simulated position was WRITTEN with.
+
+        Read from the same column the live sweep reads
+        (positions.hard_exit_time), cached per position: the harness has at
+        most one open at a time, so this is one query per entry, not one per
+        cycle.
+        """
+        cache = getattr(self, "_hx_cache", None)
+        if cache is None:
+            cache = {}
+            self._hx_cache = cache
+        pid = live.get("position_id")
+        if pid in cache:
+            return cache[pid]
+        raw = ""
+        try:
+            row = self.db.query_one(
+                "SELECT hard_exit_time FROM positions WHERE position_id=?",
+                (pid,),
+            )
+            raw = str((row or {}).get("hard_exit_time") or "").strip()
+        except Exception:
+            raw = ""
+        hx = None
+        for cand, fmt in ((raw[:8], "%H:%M:%S"), (raw[:5], "%H:%M")):
+            try:
+                hx = datetime.strptime(cand, fmt).time()
+                break
+            except Exception:
+                continue
+        if hx is None:
+            try:
+                cfg = self.config.hard_exit_time
+                hx = cfg if isinstance(cfg, dtime) else dtime(15, 0)
+            except Exception:
+                hx = dtime(15, 0)
+        cache[pid] = hx
+        return hx
+
+    def _position_chain(self, live: dict) -> dict:
+        """The chain the position would be priced on (its own expiry)."""
+        chain = self.me.last_chain or {}
+        try:
+            _pos_exp = str(
+                (live.get("params") or {}).get("target_expiry") or "")[:10]
+            _by_exp = getattr(self, "_chain_by_expiry", None) or {}
+            if _pos_exp and _pos_exp in _by_exp:
+                chain = _by_exp[_pos_exp]
+        except Exception:
+            pass
+        return chain
+
+    def _mark_open(self, live: dict) -> Optional[float]:
+        """Unrealised P&L of the open position in rupees, or None.
+
+        Read-only: the same liquidation pricing and the same cost model
+        _close() would apply to this cycle's chain, with no book writes. None
+        means this cycle's quotes cannot price the position - the sample is
+        skipped rather than carried forward at a stale mark, because a stale
+        mark is precisely what makes a drawdown read smaller than it was.
+        """
+        chain = self._position_chain(live)
+        debit, exit_legs = 0.0, []
+        for f in live["filled"]:
+            q = (chain.get(f["strike"]) or {}).get(f["option_type"]) or {}
+            close_action = "BUY" if f["action"] == "SELL" else "SELL"
+            px = self.fills.price(q, close_action, urgent=False)
+            if px is None or px <= 0:
+                return None
+            exit_legs.append({
+                "action": close_action,
+                "option_type": f["option_type"],
+                "strike": f["strike"],
+                "exec_price": px,
+            })
+            debit += px if close_action == "BUY" else -px
+        try:
+            exit_costs = self.se._compute_costs(
+                exit_legs, live["lots"], "EXIT")["total_rupees"]
+        except Exception:
+            exit_costs = 0.0
+        gross_pts = live["entry_credit"] - debit
+        return (gross_pts * self.config.lot_size * live["lots"]
+                - (live["entry_costs"] + exit_costs))
+
     # -- one session ------------------------------------------------------
     def run_day(self, trading_date: str) -> None:
         day = self.store.load_day(trading_date)
@@ -1136,6 +1460,36 @@ class BacktestRunner:
                     if self.verbose:
                         print(f"  monitor_position failed: {exc}")
                     action, priority, ctx = "HOLD", 0, {}
+
+                # ── PATCH_V14: mirror the live in-loop hard-exit sweep ──
+                # main.py calls perform_hard_exit_sweep() every cycle, after
+                # monitor_all_positions(). This harness never did, so the one
+                # exit path that carries the force flag was never exercised by
+                # a replay and the two were free to disagree about when the
+                # book goes flat. They did, by twenty minutes: the sweep
+                # flattened live at min(15:00, HARD_EXIT_TIME) while the
+                # ladder - and therefore every number this tool printed -
+                # honoured the position's own hard exit at 15:15, and the
+                # closing-hour entry window, defined as hard_exit minus 25
+                # minutes, opened tickets in replay that live would already
+                # have been flattening. Rs 5,711 across five sessions.
+                # Priority 7 fires on the same per-position time, so on a
+                # healthy cycle this is a no-op that PROVES the two paths
+                # agree; on a cycle where the ladder was bypassed - a failed
+                # monitor_position, a missing row - the sweep still flattens
+                # the book exactly as production would.
+                if action == "HOLD" or str(action).startswith("TIGHTEN"):
+                    _hx = self._hard_exit_of(live)
+                    if dt.time() >= _hx:
+                        action, priority = "HARD_EXIT_15:00", 7
+                        ctx = {
+                            "reason_detail": f"hard_exit_sweep_{_hx:%H:%M}",
+                            "hard_exit_time": f"{_hx:%H:%M}",
+                            "current_time": f"{dt:%H:%M:%S}",
+                        }
+                        if self.verbose:
+                            print(f"  {trading_date} {dt:%H:%M} SWEEP  "
+                                  f"hard exit {_hx:%H:%M} reached")
 
                 if action != "HOLD" and not action.startswith("TIGHTEN"):
                     reason = ctx.get("reason_detail") or action
@@ -1230,6 +1584,44 @@ class BacktestRunner:
                 else:
                     self.results.add_rejection(decision.get("reason", "unknown"))
 
+            # ── PATCH_V14: log a change in the session parameters ─────────
+            try:
+                _sig = (
+                    state.get("day_label"), state.get("day_mode"),
+                    state.get("actual_dte"), state.get("hard_exit_time"),
+                    state.get("entry_start"), state.get("entry_end"),
+                    state.get("wing_width"),
+                    str(state.get("actual_expiry") or "")[:10] or None,
+                )
+                _path = self.results.replay_session_path.setdefault(
+                    trading_date, [])
+                if not _path or _path[-1][1] != _sig:
+                    _path.append((f"{trading_date} {dt:%H:%M:%S}", _sig))
+            except Exception:
+                pass
+
+            # ── PATCH_V14: sample the marked-to-market equity path ────────
+            # Realised P&L of the earlier sessions, plus this session's, plus
+            # the open position marked on this cycle's own chain. Flat cycles
+            # are sampled too, so the path is continuous and a drawdown that
+            # opened and closed inside one trade is still visible.
+            try:
+                _prior = sum(
+                    v for d, v in self.results.daily_pnl.items()
+                    if d != trading_date
+                )
+                _eq = (self.results.starting_capital + _prior + day_pnl)
+                if live is not None:
+                    _mark = self._mark_open(live)
+                    if _mark is not None:
+                        _eq += _mark
+                        self.results.mark_equity(
+                            f"{trading_date} {dt:%H:%M}", _eq)
+                else:
+                    self.results.mark_equity(f"{trading_date} {dt:%H:%M}", _eq)
+            except Exception:
+                pass
+
             # ── v7: end of the cycle ───────────────────────────────────────
             # The book as it now stands: every trade of this session, the ones
             # already performed and the one in progress, on every cycle.
@@ -1249,6 +1641,16 @@ class BacktestRunner:
             # v7: the session's last trade gets its final block too - the loop
             # above ended before this close happened.
             self._report_trades(day)
+
+        # ── PATCH_V14: pin what this replay believed about the session ─────
+        try:
+            _st = self.me.state
+            _plog = self.results.replay_session_path.get(trading_date) or [
+                (None, (None,) * len(SESSION_PARITY_FIELDS))]
+            self.results.replay_sessions[trading_date] = dict(
+                zip(SESSION_PARITY_FIELDS, _plog[-1][1]))
+        except Exception:
+            pass
 
         # ── v9: pin the session's closing state for the end-of-run report ──
         # The last simulated clock time and the session's own last chain: the
@@ -1425,18 +1827,45 @@ def print_audit(store: HistoricalStore) -> int:
     return 0 if usable else 1
 
 
-# Gate order as actually implemented in StrategyEngine.decide(). Verified by
-# reading the function, not assumed: the regime verdict is consumed first,
-# then safety interlocks, then the entry window, then position limits, then
-# structure validation (credit_risk_ratio at strategy_engine.py:1244), and
-# the EV gate last (strategy_engine.py:1304).
+# Gate order as actually implemented in StrategyEngine.decide().
 #
-# This ordering is what makes the raw census misleading. A gate late in the
+# PATCH_V14: re-verified against the function, because the table below it had
+# drifted. decide() calls _check_hard_gates() FIRST - and that one call holds
+# the capital and loss floors, the cooldown, the position limits, the entry
+# clock, the 90-minute-to-square-off floor, the DTE ceiling and the
+# expiry-day "series not listed yet" wait - and only then _map_regime_to_
+# strategy(), _counter_trend_entry_refusal(), _validate_entry_rules() and
+# compute_params(). The old table listed the regime verdict first and claimed
+# in its own comment that the order had been verified by reading the function,
+# so every pass rate below the first row was computed against a chain the
+# engine does not run: candidates the hard gates had already killed were
+# counted as "reached" the regime layer. Two buckets the strategy really emits
+# were missing entirely - day_structure_contradicts_bull_premium and the
+# time-to-square-off floor - and 96 refusals in a single five-session run fell
+# through to UNCLASSIFIED, which the funnel then reported as excluded.
+#
+# The ordering is what makes the raw census misleading. A gate late in the
 # chain is only ever offered the candidates every earlier gate approved, so
 # its share of TOTAL cycles understates it badly. The number that matters is
 # the conditional one: of the candidates that reached this gate, how many did
 # it kill.
 STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
+    # _check_hard_gates(), stage 1 of decide(): the account-level floors.
+    ("safety interlocks", (
+        "vix", "circuit_breaker", "expanding", "spiking", "daily_loss_halt",
+        "daily", "abort", "capital", "day_move")),
+    # _check_hard_gates(), stage 2: the entry clock. Includes the floor that
+    # refuses a new sell-side entry with under 90 minutes to the square-off,
+    # which the old table had no row for at all.
+    ("entry window", (
+        "entry_window", "hard_exit", "min_before_hard_exit", "only_",
+        "waiting_for_0dte", "0dte_series")),
+    ("position limits", (
+        "max_concurrent", "max_entries", "position_already_open",
+        "cooldown", "consecutive")),
+    # compute_params checks the contract before it builds anything, and
+    # _check_hard_gates refuses a DTE above MAX_DTE_TRADEABLE before that.
+    ("contract / DTE", ("dte", "expiry", "no_expiry")),
     # The regime combiner applies its own time gates (before 09:45, past
     # 14:30) and its confidence block in the same pass that produces the
     # verdict, so they belong here and not later. Leaving PAST_14:30 out
@@ -1448,23 +1877,29 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
         "VOL_NEUTRAL", "VOL_BUY_OPTIONS", "CHOPPY_MARKET", "regime",
         "RANGE_UNCLEAR", "STRADDLE_EXPLOSION", "or_not_established",
         "NO_CLEAR", "UNCLEAR", "TRENDING", "EXPANSION",
-        "PAST_14", "BEFORE_09", "CONFIDENCE_NONE")),
-    ("safety interlocks", (
-        "vix", "circuit_breaker", "expanding", "spiking", "daily_loss_halt",
-        "daily", "abort")),
-    ("entry window", ("entry_window",)),
-    ("position limits", (
-        "max_concurrent", "max_entries", "position_already_open",
-        "cooldown", "consecutive")),
-    # compute_params checks the contract before it builds anything: the DTE
-    # of the expiry actually discovered from the chain is validated at the
-    # top of the function, ahead of credit_risk_ratio and the EV gate.
-    ("contract / DTE", ("dte", "expiry", "no_expiry")),
+        "PAST_14", "BEFORE_09", "CONFIDENCE_NONE",
+        # PATCH_V14: classify_final() applies the event-day rule in the same
+        # pass as the verdict (EVENT:ONLY_RANGE_ALLOWED, EVENT:US_CPI_...).
+        # It had no key, so 136 refusals in one five-session run reported
+        # themselves as unplaceable.
+        "EVENT")),
+    # _map_regime_to_strategy(): which structure the day is allowed to trade,
+    # including the day-structure veto on selling a bull premium and the
+    # weekend-risk lean guard.
+    ("strategy selection", (
+        "day_structure", "no_strategy", "range_dte", "lean_skipped",
+        "premium_sell", "premium_buy")),
+    # _counter_trend_entry_refusal(): refuse to open what the exit ladder is
+    # built to eject.
+    ("counter-trend symmetry", (
+        "counter_trend", "displaced_tape", "no_symmetric_structure")),
+    # _validate_entry_rules(): the per-structure entry rules.
+    ("structure rules", ("strategy_rules", "pin_veto", "positioning")),
     ("structure build", (
-        "no_strategy", "strike", "lots", "net_credit", "credit_ratio",
+        "strike", "lots", "net_credit", "credit_ratio",
         "credit_risk", "wing_cost", "condor_weak_side", "friction",
         "brokerage", "risk_budget", "target", "margin", "chain_stale",
-        "fill_unavailable")),
+        "fill_unavailable", "leg_substitution", "oi_")),
     ("EV gate", ("ev_gate",)),
 ]
 
@@ -1698,7 +2133,7 @@ def print_ev_decomposition(res: "Results") -> None:
     print("  Only replaying the rejected structures can say if it was right.")
 
 
-def print_report(res: Results, config: Config, args) -> None:
+def print_report(res: Results, config: Config, args, store=None) -> None:
     s = res.summary()
     print()
     print(hr("═"))
@@ -1728,8 +2163,50 @@ def print_report(res: Results, config: Config, args) -> None:
         print(f"  expectancy/trade  : Rs {s['expectancy']:>12,.0f}")
         print(f"  avg win / avg loss: Rs {s['avg_win']:,.0f} / Rs {s['avg_loss']:,.0f}")
         print(f"  profit factor     : {s['profit_factor']:.2f}")
-        print(f"  max drawdown      : Rs {s['max_drawdown']:,.0f}")
-        print(f"  Sharpe (daily ann): {s['sharpe_daily_ann']:.2f}")
+        print(f"  max drawdown      : Rs {s['max_drawdown']:,.0f}"
+              f"   (close-to-close, realised)")
+        # PATCH_V14: the drawdown an operator actually has to fund. The
+        # realised figure above is a peak-to-trough on SETTLED daily P&L, so
+        # an intraday excursion that never became a losing close is invisible
+        # in it - on a book that sells premium the adverse move happens while
+        # the position is open, by definition. This one marks the open
+        # position every cycle on the recorded chain, at the same liquidation
+        # pricing a close would have used, and reports the worst peak-to-trough
+        # of that series.
+        if s.get("equity_samples"):
+            print(f"  max intraday DD   : Rs {s['max_intraday_dd']:,.0f}"
+                  f"   (marked-to-market, {s['equity_samples']:,} samples)")
+            if s.get("max_intraday_dd_at"):
+                print(f"     worst point    : {s['max_intraday_dd_day']} "
+                      f"{s['max_intraday_dd_at'][-5:]}")
+            _lim = getattr(config, "max_daily_loss_pct", 0) or 0
+            _cap = getattr(config, "starting_capital", 0) or 0
+            if _lim and _cap:
+                print(f"     vs day limit   : Rs {_lim * _cap:,.0f} "
+                      f"({_lim * 100:.1f}% of capital) - "
+                      f"{'not breached' if s['max_intraday_dd'] < _lim * _cap else 'BREACHED'}")
+        # PATCH_V14: a ratio needs a variance, and a variance needs two
+        # observations. Printing 0.00 for a one-session run is worse than
+        # printing nothing: 0.00 reads as "measured and found to be zero".
+        _n_ratio = s.get("sessions_in_ratio", 0)
+        if _n_ratio < 2:
+            print(f"  Sortino (daily ann): n/a - {_n_ratio} session(s) "
+                  f"replayed, a ratio needs at least 2")
+            print(f"  Sharpe (daily ann): n/a - replay several sessions in one "
+                  f"run (--db dir/ or --db a.db b.db)")
+        else:
+            _sort = s.get("sortino_daily_ann")
+            _txt = ("inf (no downside session in the sample)"
+                    if _sort == float("inf") else f"{_sort:.2f}")
+            print(f"  Sortino (daily ann): {_txt}")
+            print(f"  Sharpe (daily ann): {s['sharpe_daily_ann']:.2f}")
+        # PATCH_V14: name the sample the ratios were computed on. Both used to
+        # be built from the days that booked a trade, which silently dropped
+        # every correctly-refused session from the mean and the variance and
+        # reported a ratio nobody could reproduce from the session count above.
+        print(f"     ratio sample   : {s.get('sessions_in_ratio', 0)} session(s)"
+              f"   ({s.get('flat_sessions', 0)} flat, "
+              f"{s.get('downside_days', 0)} losing)")
         print(f"  total costs paid  : Rs {s['total_costs']:,.0f}"
               f"   ({s['total_costs']/max(abs(s['total_pnl']),1)*100:.0f}% of |P&L|)")
 
@@ -1756,6 +2233,165 @@ def print_report(res: Results, config: Config, args) -> None:
         for k in sorted(by_reason, key=lambda x: -abs(sum(by_reason[x]))):
             v = by_reason[k]
             print(f"  {k:<28} {len(v):>4} {sum(v):>12,.0f} {sum(v)/len(v):>10,.0f}")
+
+    # -- PATCH_V14: per-DTE breakdown -------------------------------------
+    # The engine is a different machine at each DTE: the strategy set, the
+    # stop multiple, the target, the wing width, the entry window and the
+    # square-off time are all keyed on it. A single aggregate line therefore
+    # averages together behaviours that were never meant to be averaged, and
+    # hides the case that matters most - a DTE bucket with one trade in it,
+    # which is not evidence of anything.
+    _dte = res.by_dte()
+    if _dte:
+        print()
+        print(hr())
+        print("PER-DTE BREAKDOWN  (the engine is a different machine at each DTE)")
+        print(hr())
+        print(f"  {'DTE':>4} {'sessions':>9} {'trades':>7} {'wins':>5} "
+              f"{'win%':>6} {'total':>11} {'avg':>9} {'PF':>7} {'hold':>7}  strategies")
+        print(f"  {hr('-', 96)}")
+        for k in sorted(_dte, key=lambda x: (x == "?", int(x) if x.isdigit() else 0)):
+            r = _dte[k]
+            pf = (r["gross_win"] / r["gross_loss"]) if r["gross_loss"] > 0 else float("inf")
+            pf_txt = "inf" if pf == float("inf") else f"{pf:.2f}"
+            hold = (f"{sum(r['held']) / len(r['held']):.0f}m"
+                    if r["held"] else "-")
+            strat = ", ".join(f"{n}x{c}" for n, c in r["strategies"].most_common())
+            print(f"  {k:>4} {len(r['days']):>9} {r['trades']:>7} {r['wins']:>5} "
+                  f"{100.0 * r['wins'] / max(r['trades'], 1):>5.0f}% "
+                  f"{r['pnl']:>11,.0f} {r['pnl'] / max(r['trades'], 1):>9,.0f} "
+                  f"{pf_txt:>7} {hold:>7}  {strat}")
+        print(f"  {hr('-', 96)}")
+        _thin = [k for k, r in _dte.items() if r["trades"] < 5]
+        if _thin:
+            print(f"  DTE {', '.join(sorted(_thin))}: fewer than 5 trades. At one")
+            print(f"  trade per session these buckets are unmeasured, not proven -")
+            print(f"  a DTE the engine rarely trades is a DTE nothing is known about.")
+
+    # -- PATCH_V14: closing-hour / momentum refusal census ------------------
+    # The momentum route is the only one that buys premium, it is gated on
+    # half a dozen independent conditions, and every one of them reports
+    # through a stage bucket shared with unrelated checks. Grouped by bucket
+    # the report cannot say how often the route was offered a cycle and on
+    # which condition it said no - which is the first question when a
+    # directional route produces one trade in five sessions.
+    _mom = res.momentum_census()
+    if _mom:
+        print()
+        print(hr())
+        print("MOMENTUM / CLOSING-HOUR REFUSALS  (by the condition that fired)")
+        print(hr())
+        _tot = sum(c for _k, c in _mom)
+        print(f"  {_tot} cycle(s) refused on a momentum condition:")
+        for k, c in _mom[:14]:
+            print(f"    {c:>5}  {100.0 * c / _tot:>4.0f}%  {k}")
+        if len(_mom) > 14:
+            print(f"    ... and {len(_mom) - 14} further condition(s)")
+        print()
+        print("  Read this before concluding the route is broken: a refusal is")
+        print("  the gate working. What matters is whether ONE condition accounts")
+        print("  for nearly all of them - that one is mis-calibrated, the rest are")
+        print("  the route correctly declining to trade.")
+
+    # -- PATCH_V14: recorded-vs-replay session parity -----------------------
+    # The harness rebuilds the session from the recorded chain; the live run
+    # wrote what it believed into session_state. When those disagree the
+    # replay is simulating a different session from the one that was captured,
+    # and every number above describes the wrong day. Nothing surfaced it
+    # before: the divergence shows up as P&L, not as an error.
+    if store is not None:
+        try:
+            rec = store.recorded_sessions(res.days)
+        except Exception:
+            rec = {}
+        if rec:
+            print()
+            print(hr())
+            print("SESSION PARITY  (what the live capture recorded vs this replay)")
+            print(hr())
+            print(f"  {'session':<12} {'field':<15} {'recorded':>11} "
+                  f"{'replay':>11}   what it is")
+            print(f"  {hr('-', 86)}")
+            _diffs = 0
+            for d in res.days:
+                row = rec.get(d)
+                if not row:
+                    continue
+                # Compare as of the moment the recorded row was written, not as
+                # of the replay's last cycle. A recorded row stamped inside its
+                # own session is a snapshot of what the engine believed then;
+                # the replay keeps cycling past the close (the recorder polls a
+                # frozen book until it is stopped), so the two end-of-day
+                # states are not the same observation. Rows stamped OUTSIDE
+                # their session - split_db_per_day.py rewrites them when it
+                # copies - cannot be aligned, and the block says so rather than
+                # silently comparing the wrong instants.
+                _stamp = str(row.get("updated_at") or "")[:19].replace("T", " ")
+                _plog = res.replay_session_path.get(d) or []
+                _asof, _aligned = None, False
+                for _t, _sig in _plog:
+                    if _stamp and _t <= _stamp:
+                        _asof = _sig
+                    else:
+                        break
+                if _asof is None:
+                    _asof = (res.replay_sessions.get(d) or {})
+                    _asof = tuple(_asof.get(f) for f in SESSION_PARITY_FIELDS)
+                else:
+                    # "inside its own session" means between the first and the
+                    # last cycle this replay actually ran - not merely the same
+                    # calendar date. split_db_per_day.py re-writes session_state
+                    # when it copies, and 2026-09-08's row is stamped 23:14,
+                    # eight hours after the close.
+                    _aligned = bool(_stamp and _plog
+                                    and _plog[0][0] <= _stamp <= _plog[-1][0])
+                for idx, field in enumerate(SESSION_PARITY_FIELDS):
+                    if field not in row or row[field] is None:
+                        continue
+                    a, b = str(row[field]), str(_asof[idx])
+                    if a == b or b == "None":
+                        continue
+                    _diffs += 1
+                    print(f"  {d:<12} {field:<15} {a:>11} {b:>11}   "
+                          f"{SESSION_PARITY_NOTES.get(field, '')}")
+                if not _aligned:
+                    print(f"  {d:<12} {'(stamp)':<15} {_stamp or '-':>11} "
+                          f"{'':>11}   recorded row was written outside the "
+                          f"session; compared end-of-day")
+            # A day_mode divergence is not a parameter difference, it is a
+            # RULE-SET difference: EVENT switches on defined_risk_only and
+            # restricts classify_final to a RANGE verdict at HIGH confidence,
+            # so a session replayed under a different mode was not offered the
+            # same trades at all. high_impact_events.json is edited by hand and
+            # is not recorded with the session, so the only evidence that it
+            # moved is that the two columns disagree.
+            _modes = [(d, str((rec.get(d) or {}).get("day_mode")),
+                       str((res.replay_sessions.get(d) or {}).get("day_mode")))
+                      for d in res.days]
+            _mode_diff = [(d, a, b) for d, a, b in _modes if a != b and a != "None"]
+            if _diffs == 0 and not _mode_diff:
+                print("  (identical on every field compared)")
+            elif _mode_diff:
+                print(f"  {hr('-', 86)}")
+                for d, a, b in _mode_diff:
+                    print(f"  !! {d}: recorded {a}, replayed {b}. day_mode is not a")
+                    print(f"     parameter, it is a RULE SET - EVENT turns on")
+                    print(f"     defined_risk_only and allows a RANGE verdict at HIGH")
+                    print(f"     confidence and nothing else. high_impact_events.json")
+                    print(f"     is hand-edited and is NOT recorded with the session,")
+                    print(f"     so this replay did not offer itself the same trades")
+                    print(f"     the live run was offered. Nothing in the P&L above")
+                    print(f"     can be attributed to the strategy until the event")
+                    print(f"     calendar for that date is settled.")
+            else:
+                print(f"  {hr('-', 86)}")
+                print(f"  {_diffs} divergence(s). Neither column is 'wrong': the")
+                print(f"  recorded one is what the engine believed when the data")
+                print(f"  was captured, the replay one is what it believes now.")
+                print(f"  But a replay is only evidence about the session it")
+                print(f"  reproduces - where these differ, the P&L above is")
+                print(f"  TODAY's rules on THAT day's tape, and the gap should be")
+                print(f"  read before the number is quoted anywhere.")
 
     if res.halted_days:
         print()
@@ -2232,7 +2868,12 @@ def main() -> int:
                     "options engine.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--db", default=None, help="database (default: config.db_path)")
+    ap.add_argument(
+        "--db", default=None, nargs="+",
+        help="database path(s), or a directory of per-day databases "
+             "(default: config.db_path). Several sessions in one run is what "
+             "makes the Sharpe, Sortino and period drawdown mean anything.",
+    )
     ap.add_argument("--from", dest="d_from", default=None, help="first date YYYY-MM-DD")
     ap.add_argument("--to", dest="d_to", default=None, help="last date YYYY-MM-DD")
     ap.add_argument("--capital", type=float, default=None, help="override capital")
@@ -2264,13 +2905,30 @@ def main() -> int:
         import dataclasses
         config = dataclasses.replace(config, starting_capital=args.capital)
 
-    db_path = args.db or str(config.db_path)
+    # PATCH_V14: --db takes one path, several, or a directory of per-day
+    # splits. Multiple sources are served through MultiStore so the run has a
+    # single ledger and a single set of period statistics.
+    _requested = list(args.db) if args.db else [str(config.db_path)]
+    db_paths: List[str] = []
+    for _p in _requested:
+        _pp = Path(_p).expanduser()
+        if _pp.is_dir():
+            _found = sorted(str(x) for x in _pp.glob("*.db"))
+            if not _found:
+                print(f"\n  No .db files under {_pp}\n")
+                return 1
+            db_paths.extend(_found)
+        else:
+            db_paths.append(str(_pp))
     try:
-        store = HistoricalStore(db_path)
+        store = (MultiStore(db_paths) if len(db_paths) > 1
+                 else HistoricalStore(db_paths[0]))
     except FileNotFoundError:
-        print(f"\n  No database at {db_path}")
+        print(f"\n  No database at {', '.join(db_paths)}")
         print("  Run the engine in paper mode first, or pass --db.\n")
         return 1
+    if len(db_paths) > 1:
+        print(f"  sources           : {len(db_paths)} databases")
 
     if args.audit:
         return print_audit(store)
@@ -2304,7 +2962,7 @@ def main() -> int:
         trade_report=args.trade_report,
     )
     res = runner.run(dates)
-    print_report(res, config, args)
+    print_report(res, config, args, store=store)
     if args.csv:
         write_csv(res, args.csv)
 

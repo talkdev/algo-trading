@@ -1892,6 +1892,13 @@ class ExecutionEngine:
                 }
         if current_time >= hard_exit:
             return "HARD_EXIT_15:00", EXIT_PRIORITY_HARD_EXIT, {
+                # PATCH_V14: the action string stays the literal the close
+                # bookkeeping classifies on; the reason detail now says WHICH
+                # hard exit fired. A weekly squared at 15:15 used to be
+                # reported, persisted and attributed as "HARD_EXIT_15:00",
+                # which is the kind of label that gets an operator to believe
+                # a config value is being honoured when it is not.
+                "reason_detail": f"hard_exit_{hard_exit:%H:%M}",
                 "hard_exit_time": str(hard_exit),
                 "current_time": str(current_time),
             }
@@ -2611,6 +2618,13 @@ class ExecutionEngine:
                 f"time={current_time} >= hard_exit={hard_exit}"
             )
             return "HARD_EXIT_15:00", EXIT_PRIORITY_HARD_EXIT, {
+                # PATCH_V14: the action string stays the literal the close
+                # bookkeeping classifies on; the reason detail now says WHICH
+                # hard exit fired. A weekly squared at 15:15 used to be
+                # reported, persisted and attributed as "HARD_EXIT_15:00",
+                # which is the kind of label that gets an operator to believe
+                # a config value is being honoured when it is not.
+                "reason_detail": f"hard_exit_{hard_exit:%H:%M}",
                 "hard_exit_time": str(hard_exit),
                 "current_time": str(current_time),
             }
@@ -3224,31 +3238,106 @@ class ExecutionEngine:
             "cycle reconciles them"
         )
 
-    def perform_hard_exit_sweep(self) -> None:
-        """
-        Perform hard exit sweep at 15:00.
-        Closes all open positions regardless of P&L.
-        Called from main.py every cycle.
+    def _position_hard_exit(self, position: dict) -> dtime:
+        """PATCH_V14: the square-off time THIS position was written with.
 
-        The trigger is the earlier of 15:00 and HARD_EXIT_TIME so tightening
-        the configured time cannot silently arrive after the broker's own
-        square-off; the sweep forces confirmation because a LIMIT that did not
-        fill at 15:00 must not be left sitting there.
+        positions.hard_exit_time is captured at entry from the session state
+        (15:00 on a DTE-0 session, HARD_EXIT_TIME otherwise) and it is the
+        value Priority 7 of the credit ladder and D5 of the debit ladder both
+        read. The sweep used to ignore it and clamp to min(15:00,
+        HARD_EXIT_TIME), which made HARD_EXIT_TIME unreadable on the one path
+        that carries the force flag.
         """
-        current_time = now_ist().time()
-        trigger      = dtime(15, 0)
+        raw = str(position.get("hard_exit_time") or "").strip()
+        for cand in (raw[:8], raw[:5]):
+            for fmt in ("%H:%M:%S", "%H:%M"):
+                try:
+                    return datetime.strptime(cand, fmt).time()
+                except Exception:
+                    continue
         try:
-            configured = self.config.hard_exit_time
-            if isinstance(configured, dtime):
-                trigger = min(trigger, configured)
+            cfg = self.config.hard_exit_time
+            if isinstance(cfg, dtime):
+                return cfg
         except Exception:
             pass
-        if current_time >= trigger:
-            open_positions = self._get_open_positions()
-            if open_positions:
-                self.logger.info(
-                    f"HARD EXIT SWEEP @ {trigger.strftime('%H:%M')} — "
-                    f"closing {len(open_positions)} position(s)"
+        return dtime(15, 0)
+
+    def perform_hard_exit_sweep(self) -> None:
+        """
+        Force every position out at its OWN hard exit, whatever the P&L.
+        Called from main.py every cycle.
+
+        PATCH_V14: this used to fire at min(15:00, HARD_EXIT_TIME) against the
+        whole book. Two consequences, both measured.
+
+        (a) HARD_EXIT_TIME was dead. Every non-expiry position carries a
+            position-level hard exit of HARD_EXIT_TIME - Priority 7 of the
+            ladder reads it, and so does the debit ladder's D5 - and the sweep
+            flattened the book twenty minutes before it. Live and replay
+            disagreed by exactly that gap, because the replay harness drives
+            the ladder and never called the sweep: on 2026-09-09 the harness
+            held a closing-hour long put to 15:20 and booked +Rs 3,284, while
+            the live loop it claims to simulate had already force-flattened at
+            15:00 and - because the closing-hour entry window is defined as
+            hard_exit minus 25 minutes - would never have opened the ticket at
+            all. Across the five recorded sessions that gap was Rs 5,711 of
+            P&L production could not have earned.
+        (b) An expiry-day position and a weekly position were squared off at
+            the same minute, because the clamp is one global time.
+
+        The sweep now reads each position's own hard exit and keeps a single
+        global backstop at SQUARE_OFF_DEADLINE for anything still open past
+        it - the ordering the config always described: position ladder,
+        in-loop sweep, watchdog, then the broker's 15:20 RMS square-off on a
+        product="I" order. The action string is unchanged because
+        _update_state_after_close() classifies non-stop exits by it; the real
+        time goes into the context and the log.
+        """
+        current_time   = now_ist().time()
+        open_positions = self._get_open_positions()
+        if not open_positions:
+            return
+
+        backstop = dtime(15, 18)
+        try:
+            _so = getattr(self.config, "square_off_deadline", None)
+            if isinstance(_so, dtime):
+                backstop = _so
+        except Exception:
+            pass
+
+        for position in open_positions:
+            _hx = self._position_hard_exit(position)
+            if current_time < _hx:
+                continue
+            self.logger.info(
+                f"HARD EXIT SWEEP: {position.get('strategy_name')} "
+                f"{position['position_id'][:16]}... due {_hx:%H:%M}, "
+                f"now {current_time:%H:%M:%S}"
+            )
+            try:
+                self.execute_close(
+                    position, "HARD_EXIT_15:00", EXIT_PRIORITY_HARD_EXIT,
+                    {
+                        "reason_detail": f"hard_exit_sweep_{_hx:%H:%M}",
+                        "hard_exit_time": f"{_hx:%H:%M}",
+                        "current_time": f"{current_time:%H:%M:%S}",
+                    },
+                )
+            except Exception as e:
+                self.logger.critical(
+                    f"hard-exit sweep close failed for "
+                    f"{position['position_id']}: {e}"
+                )
+
+        if current_time >= backstop:
+            remaining = self._get_open_positions()
+            if remaining:
+                self.logger.warning(
+                    f"SQUARE-OFF BACKSTOP @ {backstop:%H:%M} - "
+                    f"{len(remaining)} position(s) still open past their own "
+                    f"hard exit; forcing flat before the broker's RMS sweep"
                 )
                 self.close_all_positions("HARD_EXIT_15:00", force=True)
 

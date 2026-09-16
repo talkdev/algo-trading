@@ -3188,11 +3188,23 @@ class MarketDataEngine:
         event_day     = bool(event_day_str)
         event_name    = event_day_str
 
-        # ── 26. Tuesday 0DTE entry window adjustment ──────────────────────
+        # ── 26. Expiry-day (DTE 0) entry window adjustment ────────────────
         day_label  = self.state.get("day_label")
         actual_dte = dte if dte is not None else self.state.get("actual_dte")
 
-        if day_label == "TUESDAY" and actual_dte == 0:
+        # PATCH_V14: keyed on DTE, not on the weekday. The session rules
+        # below are about the CONTRACT that expires today - a late entry
+        # window that waits for the 0DTE series to be liquid, and a 15:00
+        # square-off that refuses to hold gamma into the closing auction.
+        # Neither has anything to do with it being a Tuesday. NIFTY weeklies
+        # expire on Tuesday, but when Tuesday is an NSE holiday the exchange
+        # rolls the expiry BACK to Monday, and ExpiryCalendar.get_next_expiry
+        # already does that roll - so on that Monday actual_dte is 0 and this
+        # branch used to be skipped, leaving a genuine 0DTE session running
+        # the weekly window: entries from 09:45 instead of 10:30, and a hard
+        # exit at HARD_EXIT_TIME instead of 15:00. Same defect, same fix, in
+        # strategy_engine._check_hard_gates' "wait for the 0DTE series" gate.
+        if actual_dte == 0:
             tue_start = "10:30"
             tue_end   = "13:00"
             tue_exit  = "15:00"
@@ -3201,8 +3213,8 @@ class MarketDataEngine:
                 self.state["entry_end"]      = tue_end
                 self.state["hard_exit_time"] = tue_exit
                 self.logger.info(
-                    f"Tuesday 0DTE: entry window {tue_start}-{tue_end}, "
-                    f"hard exit {tue_exit}"
+                    f"DTE-0 expiry session ({day_label}): entry window "
+                    f"{tue_start}-{tue_end}, hard exit {tue_exit}"
                 )
 
         # v3.1: a flat 35pt/3min abort is 0.19% at an 18,000 index but only

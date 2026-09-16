@@ -1691,8 +1691,23 @@ class RegimeClassifier:
             return FinalRegime.NO_TRADE, "NO_TRADE:PAST_14:30", False
 
         # ── DTE Filter ────────────────────────────────────────────────────
-        if dte is not None and dte > 6:
-            return FinalRegime.NO_TRADE, f"NO_TRADE:DTE_{dte}_ABOVE_MAX_6", False
+        # PATCH_V14: this ceiling, the one in strategy_engine._check_hard_gates
+        # and the one in DTE_REQUIREMENTS were three different numbers (6, 6
+        # and 4) describing one rule, and MAX_DTE_TRADEABLE - the Config field
+        # documented as "highest DTE at which the credit structures may be
+        # opened" - was read by nothing at all. An operator who set it changed
+        # nothing. All three now read the one field. At its default of 4 the
+        # behaviour is identical, because no credit structure could be built
+        # above DTE 4 anyway; what changes is that DTE 5-6 is now refused once,
+        # by name, instead of being passed through the regime layer to die in
+        # compute_params with a different reason.
+        _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+        if dte is not None and dte > _max_dte:
+            return (
+                FinalRegime.NO_TRADE,
+                f"NO_TRADE:DTE_{dte}_ABOVE_MAX_{_max_dte}",
+                False,
+            )
 
         if dte is not None and dte >= 4:
             if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
@@ -2281,6 +2296,10 @@ class RegimeEngine:
             )
 
         self._last_reset_date = today
+        # PATCH_V14: re-arm the once-per-session DTE integrity warning, so a
+        # process left running across sessions reports the new day's DTE
+        # disagreement instead of staying quiet because it spoke yesterday.
+        self._dte_mismatch_warned = False
         self.logger.info(f"RegimeEngine daily reset for {today}")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2420,8 +2439,39 @@ class RegimeEngine:
         ts           = now_ist()
         trading_date = today_ist().isoformat()
         today_d      = today_ist()
+        # ── PATCH_V14: one DTE, from the contract that will be traded ──────
+        # The calendar's get_dte() answers "how many sessions to the next
+        # Tuesday the holiday file knows about". The data engine's
+        # actual_dte answers "how many sessions to the expiry the BROKER
+        # listed", and it is the number every classifier below already reads
+        # out of signals. This function used to compute the first one for the
+        # snapshot and persistence while the decision tree consumed the
+        # second, so regime_decisions - the table an operator audits the
+        # engine's own reasoning against - could carry a different DTE and a
+        # different day_type from the ones the trade was sized, stopped and
+        # targeted on. They diverge on any holiday-shifted expiry, and the
+        # divergence is silent. The broker's number now wins, the calendar's
+        # is the fallback, and a disagreement is said out loud once a session
+        # instead of being written into two tables.
         dte          = ExpiryCalendar.get_dte(today_d)
-        day_type     = ExpiryCalendar.get_day_type(today_d)
+        _cal_dte     = dte
+        _sig_dte     = signals.get("actual_dte")
+        if _sig_dte is not None:
+            try:
+                dte = int(_sig_dte)
+            except (TypeError, ValueError):
+                pass
+        if dte != _cal_dte and not getattr(self, "_dte_mismatch_warned", False):
+            self._dte_mismatch_warned = True
+            self.logger.warning(
+                f"DTE INTEGRITY: broker-confirmed DTE {dte} != calendar DTE "
+                f"{_cal_dte} for {trading_date}. Every DTE-indexed table "
+                f"(stop multiple, target, p_win, wing width, day type) is "
+                f"keyed on the broker's {dte}. Check nse_holidays.json and "
+                f"the listed expiries - a stale holiday file silently "
+                f"re-buckets the whole week."
+            )
+        day_type     = ExpiryCalendar.get_day_type(today_d, dte=dte)
         day_label    = ExpiryCalendar.get_day_label(today_d)
 
         # Straddle explosion check (before vol classification)
