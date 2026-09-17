@@ -644,8 +644,15 @@ class StrategyEngine:
 
         17-Sep chart: 10:15 high, 11:00 low, 12:30 higher high, 13:30 dump.
         A weekly condor cannot harvest that; a bull put at the high is the
-        wrong side. After a failed-break scalp the mid-range condor is the
-        trade (16-Sep) — do not steal it with a high fade before lunch.
+        wrong side.
+
+        PATCH_V29: after a failed-break scalp, PATCH_V28 banned the
+        mid-range weekly iron condor. The old pre-12:15 stand-aside was
+        protecting that condor. With it gone, standing aside at a day
+        extreme (16-Sep 11:04 loc≈0.95 at the open-high) leaves a dead
+        zone until lunch while the professional tape sells the tested
+        extreme immediately. Mid-range after FB still waits — only
+        extremes may fade early.
         """
         if bool(signals.get("event_day")):
             return
@@ -671,17 +678,24 @@ class StrategyEngine:
         if raw_rng < _floor:
             return
         after_fb = bool(self.market_engine.state.get("last_exit_is_failed_break_scalp"))
-        if after_fb and current_time < dtime(12, 15):
-            return
-        if current_time >= dtime(12, 15) and current_time <= dtime(14, 0) and pos >= 0.80:
+        # Standard afternoon high-fade: 12:15–14:00 at loc≥0.80.
+        # After-FB extreme: from 10:45 at loc≥0.85 (stricter) so the
+        # V-recovery exhaustion prints a bear call instead of silence.
+        _hi_start = dtime(10, 45) if after_fb else dtime(12, 15)
+        _hi_thresh = 0.85 if (after_fb and current_time < dtime(12, 15)) else 0.80
+        if (current_time >= _hi_start and current_time <= dtime(14, 0)
+                and pos >= _hi_thresh):
             signals["afternoon_high_fade"] = True
             signals["final_regime"] = "PREMIUM_SELL_BEAR"
             signals["weekly_range_size_discount"] = 0.90
             return
-        if current_time >= dtime(10, 50) and current_time < dtime(12, 15) and pos <= 0.22:
-            signals["afternoon_low_fade"] = True
-            signals["final_regime"] = "PREMIUM_SELL_BULL"
-            signals["weekly_range_size_discount"] = 0.90
+        # Low fade: morning window, plus after-FB extreme ≤0.15.
+        if current_time >= dtime(10, 50) and current_time < dtime(12, 15):
+            _lo_thresh = 0.15 if after_fb else 0.22
+            if pos <= _lo_thresh:
+                signals["afternoon_low_fade"] = True
+                signals["final_regime"] = "PREMIUM_SELL_BULL"
+                signals["weekly_range_size_discount"] = 0.90
 
     def _map_regime_to_strategy(
         self,
@@ -881,6 +895,25 @@ class StrategyEngine:
             if _lean:
                 self.logger.info(f"Range resolution: {_lean_reason}")
                 return BEAR_CALL_SPREAD
+            # PATCH_V29: after FB on a two-way weekly, IC is banned
+            # (V28). If we somehow still land here at a day extreme
+            # without the fade flag (race / mid-cycle), prefer the
+            # directional vertical over a doomed condor selection.
+            _after_fb = bool(
+                self.market_engine.state.get("last_exit_is_failed_break_scalp")
+            )
+            if _after_fb and int(dte or -1) >= 2:
+                _rng, _loc, _, _ = self._session_range_pos(signals)
+                if _rng >= 100.0 and _loc >= 0.85:
+                    self.logger.info(
+                        "Range resolution: after_fb_extreme_high_prefer_bear_call"
+                    )
+                    return BEAR_CALL_SPREAD
+                if _rng >= 100.0 and _loc <= 0.15:
+                    self.logger.info(
+                        "Range resolution: after_fb_extreme_low_prefer_bull_put"
+                    )
+                    return BULL_PUT_SPREAD
             return IRON_CONDOR
         if (or_condition in ("VERY_NARROW", "NARROW") and
                 adx_15 < 20 and
