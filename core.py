@@ -1162,6 +1162,17 @@ class Config:
     # whole day. Switch this off for status lines only.
     telegram_include_open_blocks:  bool  = True
 
+
+    # ══ PATCH_V27: open-drive spike exclusion for extreme fades ══
+    # 10-Sep: DH wick 23495, midday LH 23474, raw day range ~92pts
+    # until the close — the 100pt fade gate never opened. Use a
+    # lower floor when the wick still owns the extreme, locate on
+    # post-open highs, and defer bear/range credit until 12:15.
+    open_spike_min_gap_pts:            float = 15.0
+    open_spike_cutoff_hhmm:            str   = "09:45"
+    open_spike_wait_until_hhmm:        str   = "12:15"
+    open_spike_fade_min_range_pts:     float = 70.0
+
     def __repr__(self) -> str:
         def mask(s: str) -> str:
             if not s:
