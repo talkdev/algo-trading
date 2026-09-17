@@ -1228,17 +1228,26 @@ class StrategyEngine:
                 ):
                     return False, "weekly_condor_blocked_open_spike_wick"
                 if _ic_rng >= 100.0:
+                    # PATCH_V28: after a failed-break scalp on a two-way
+                    # weekly, do NOT re-enter with an iron condor. The
+                    # 16-Sep path sold IC at 11:04 at loc 0.95 (day high
+                    # after the V-recovery), locked the single-slot book,
+                    # and blocked 174 AFTERNOON_DAY_HIGH_FADE cycles that
+                    # correctly wanted a bear-call into the 13:15→13:45
+                    # selloff. Extremes on an expanding auction are
+                    # directional fades; a delta-neutral condor there is
+                    # the wrong machine. First-print two-way condors
+                    # remain banned (no failed-break).
                     _ic_fb = bool(state.get("last_exit_is_failed_break_scalp"))
                     if not _ic_fb:
                         return False, (
                             f"weekly_condor_blocked_two_way_"
                             f"{_ic_rng:.0f}pts_no_failed_break"
                         )
-                    if 0.22 < _ic_loc < 0.80:
-                        return False, (
-                            f"weekly_condor_blocked_two_way_mid_"
-                            f"{_ic_rng:.0f}pts_loc_{_ic_loc:.2f}"
-                        )
+                    return False, (
+                        f"weekly_condor_blocked_two_way_after_failed_break_"
+                        f"{_ic_rng:.0f}pts_prefer_extreme_fade"
+                    )
 
         elif strategy_name == BULL_PUT_SPREAD:
             or_high = float(signals.get("or_high") or 0)
