@@ -1771,6 +1771,101 @@ class RegimeClassifier:
         current_time = now_ist().time()
         r_str        = float(signals.get("resistance_strength") or 0.0)
 
+        # PATCH_V23: failed-break vertical for every tradeable DTE.
+        # The DTE 3/4 V15 path used 0.15*OR (~11 pts), the first 09:46
+        # print, ADX=0, and DMU 200, then exempted day-move. 17-Sep
+        # sold 3-lot 23350 calls into a 36-pt OR-high poke and stopped
+        # 20 minutes later (Rs -4,522).
+        try:
+            _dte_i = int(dte) if dte is not None else -1
+        except (TypeError, ValueError):
+            _dte_i = -1
+        if 0 <= _dte_i <= 4:
+            try:
+                _v23_orl = float(signals.get("or_low") or 0.0)
+                _v23_orh = float(signals.get("or_high") or 0.0)
+                _v23_dlo = float(signals.get("day_low_so_far") or 0.0)
+                _v23_dhi = float(signals.get("day_high_so_far") or 0.0)
+                _v23_orw = max(_v23_orh - _v23_orl, 1.0)
+            except (TypeError, ValueError):
+                _v23_orl = _v23_orh = _v23_dlo = _v23_dhi = 0.0
+                _v23_orw = 1.0
+            _v23_min_poke = max(
+                float(getattr(self.config, "failed_break_min_poke_pts", 25.0)),
+                0.40 * _v23_orw,
+            )
+            _v23_broke_lo = (
+                _v23_orl > 0 and _v23_dlo > 0
+                and _v23_dlo <= _v23_orl - _v23_min_poke
+            )
+            _v23_broke_hi = (
+                _v23_orh > 0 and _v23_dhi > 0
+                and _v23_dhi >= _v23_orh + _v23_min_poke
+            )
+            _v23_reclaim = max(
+                float(getattr(self.config, "failed_break_reclaim_pts", 10.0)),
+                0.10 * _v23_orw,
+            )
+            try:
+                _v23_hold = datetime.strptime(
+                    str(getattr(self.config, "failed_break_hold_hhmm", "10:00")),
+                    "%H:%M",
+                ).time()
+            except Exception:
+                _v23_hold = time(10, 0)
+            _v23_dmu_cap = float(
+                getattr(self.config, "day_move_used_block_pct", 125.0) or 125.0
+            )
+            if _v23_broke_hi and not _v23_broke_lo:
+                _v23_threat = float(
+                    signals.get("day_up_used_pct")
+                    or signals.get("day_move_used_pct")
+                    or 0.0
+                )
+            elif _v23_broke_lo and not _v23_broke_hi:
+                _v23_threat = float(
+                    signals.get("day_down_used_pct")
+                    or signals.get("day_move_used_pct")
+                    or 0.0
+                )
+            else:
+                _v23_threat = float(signals.get("day_move_used_pct") or 0.0)
+            _v23_quiet = (
+                bool(signals.get("or_computed"))
+                and vol == VolatilityRegime.NEUTRAL
+                and conf in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM)
+                and bool(signals.get("adx_15_mature", False))
+                and adx_15 > 0.0
+                and adx_15 < float(
+                    getattr(self.config, "adx_trend_threshold", 20.0))
+                and or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
+                and spot > 0
+                and current_time >= _v23_hold
+                and _v23_threat < _v23_dmu_cap
+                and not bool(signals.get("event_day"))
+            )
+            _v23_fb = (
+                _v23_quiet
+                and pos in (PositioningRegime.RANGE,
+                            PositioningRegime.STRONG_RANGE,
+                            PositioningRegime.UNCLEAR)
+                and ((_v23_broke_lo and spot >= _v23_orl + _v23_reclaim)
+                     or (_v23_broke_hi and spot <= _v23_orh - _v23_reclaim))
+            )
+            if _v23_fb:
+                signals["neutral_range_vertical"] = True
+                signals["weekly_range_size_discount"] = float(
+                    getattr(self.config, "failed_break_size", 0.50))
+                if _v23_broke_lo and spot >= _v23_orl + _v23_reclaim:
+                    return (
+                        FinalRegime.PREMIUM_SELL_BULL,
+                        f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BULL_PUT",
+                    )
+                return (
+                    FinalRegime.PREMIUM_SELL_BEAR,
+                    f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BEAR_CALL",
+                )
+
         # ── PATCH_V12: the DTE 2 special-case is deleted ─────────────────
         # It demanded STRONG_SELL + RANGE/STRONG_RANGE + narrow OR +
         # flat ADX together — a stack calibrated on a mislabelled
@@ -1845,27 +1940,9 @@ class RegimeClassifier:
                     < float(getattr(self.config, "failed_break_dmu_max", 200.0))
                 and not bool(signals.get("event_day"))
             )
-            _v15_fb = (
-                _v15_quiet
-                and pos in (PositioningRegime.RANGE,
-                            PositioningRegime.STRONG_RANGE,
-                            PositioningRegime.UNCLEAR)
-                and ((_v15_broke_lo and spot >= _v15_orl + _v15_reclaim)
-                     or (_v15_broke_hi and spot <= _v15_orh - _v15_reclaim))
-            )
-            if _v15_fb:
-                signals["neutral_range_vertical"] = True
-                signals["weekly_range_size_discount"] = float(
-                    getattr(self.config, "failed_break_size", 0.50))
-                if _v15_broke_lo and spot >= _v15_orl + _v15_reclaim:
-                    return (
-                        FinalRegime.PREMIUM_SELL_BULL,
-                        f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BULL_PUT",
-                    )
-                return (
-                    FinalRegime.PREMIUM_SELL_BEAR,
-                    f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BEAR_CALL",
-                )
+            # PATCH_V23: the loose 0.15*OR / 09:46 / DMU-200 vertical
+            # return is gone. Failed-break lives in the all-DTE gate
+            # above. _v15_broke_* still gates the NEUTRAL-vol wide condor.
             # Range positioning → condor (both wings), which on a fresh
             # weekly needs a contained opening range and a flat trend.
             # BULLISH/BEARISH positioning → fall through to the single-sided
@@ -2016,6 +2093,13 @@ class RegimeClassifier:
 
         # ── BULLISH positioning → bull put (unless spot below OR midpoint) ─
         if pos == PositioningRegime.BULLISH:
+            # PATCH_V23: RANGE-origin directional credit, every DTE.
+            if (not bool(signals.get("adx_15_mature", False))
+                    or float(signals.get("adx_15") or 0.0) <= 0.0):
+                return (
+                    FinalRegime.NO_TRADE,
+                    "RANGE_VERTICAL_ADX_IMMATURE",
+                )
             # PATCH_V12: on event days a positioning read with no
             # measured trend behind it is not a directional edge.
             if signals.get("event_day") and not signals.get("adx_15_mature"):
@@ -2037,6 +2121,13 @@ class RegimeClassifier:
 
         # ── BEARISH positioning → bear call (unless spot above OR midpoint) ─
         if pos == PositioningRegime.BEARISH:
+            # PATCH_V23: RANGE-origin directional credit, every DTE.
+            if (not bool(signals.get("adx_15_mature", False))
+                    or float(signals.get("adx_15") or 0.0) <= 0.0):
+                return (
+                    FinalRegime.NO_TRADE,
+                    "RANGE_VERTICAL_ADX_IMMATURE",
+                )
             # PATCH_V12: on event days a positioning read with no
             # measured trend behind it is not a directional edge.
             if signals.get("event_day") and not signals.get("adx_15_mature"):
@@ -2309,6 +2400,17 @@ class RegimeClassifier:
         # Floor so a pile-up of modifiers still leaves a real (if small)
         # position rather than a meaningless one.
         conflict_reduction = max(round(conflict_reduction, 4), 0.15)
+
+        # PATCH_V23: apply the regime-layer clip here so size_multiplier
+        # matches lots. Previously failed_break_size only ran in
+        # strategy_engine after cycle_log had already stored 0.65.
+        try:
+            _wk = signals.get("weekly_range_size_discount")
+            if _wk is not None:
+                conflict_reduction *= max(0.15, min(1.0, float(_wk)))
+                conflict_reduction = max(round(conflict_reduction, 4), 0.15)
+        except (TypeError, ValueError):
+            pass
 
         final_size = round(raw_size * conflict_reduction, 3)
         final_size = max(final_size, 0.0)
