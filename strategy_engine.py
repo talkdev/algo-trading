@@ -453,11 +453,9 @@ class StrategyEngine:
                 and _dm_frac_range < float(
                     getattr(self.config, "day_range_frac_block_condor", 0.75))
             )
-        # PATCH_V15: the failed-break vertical is the same argument - its
-        # thesis IS the exhausted excursion the gauge is measuring, and its
-        # strike sits beyond the failed extreme.
-        if bool(signals.get("neutral_range_vertical")):
-            _dm_range_confirmed = True
+        # PATCH_V23: failed-break keeps the threat-side day-move block.
+        # 17-Sep day_up_used_pct=209 on a bear call; the V15 exemption
+        # was why 3 lots still went out.
         if _dm_threat >= self.config.day_move_used_block_pct and not (
             _dm_trend_confirmed or _dm_range_confirmed
         ):
@@ -1306,6 +1304,47 @@ class StrategyEngine:
             short_dist = None
         else:
             short_dist = (int(_dist_call), int(_dist_put))
+
+        # PATCH_V23: pin the failed-break short beyond failed extreme
+        # plus two proximity bands so a retest cannot trip the 40-pt stop
+        # (17-Sep 23350 was only 46 pts past the 23304 poke).
+        if signals.get("neutral_range_vertical") and short_dist is not None:
+            try:
+                _fb_orw = max(
+                    float(signals.get("or_high") or 0.0)
+                    - float(signals.get("or_low") or 0.0),
+                    1.0,
+                )
+                _spot_fb = float(signals.get("spot") or 0.0)
+                _prox_fb = max(
+                    float(getattr(self.config, "spot_proximity_pts", 40) or 40),
+                    (_spot_fb * float(getattr(
+                        self.config, "spot_proximity_pct", 0.0016))
+                     if _spot_fb > 0 else 0.0),
+                )
+                _fb_cush = max(float(step), 0.40 * _fb_orw, _prox_fb) + _prox_fb
+                if strategy_name == BULL_PUT_SPREAD:
+                    _wall = min(
+                        x for x in (
+                            float(signals.get("day_low_so_far") or 0.0),
+                            float(signals.get("or_low") or 0.0),
+                        ) if x > 0
+                    )
+                    if _wall > 0:
+                        _want = int(round((_wall - _fb_cush) / step) * step)
+                        _dput = max(float(_center_ref) - _want, float(step))
+                        short_dist = (int(short_dist[0]), int(_dput))
+                elif strategy_name == BEAR_CALL_SPREAD:
+                    _wall = max(
+                        float(signals.get("day_high_so_far") or 0.0),
+                        float(signals.get("or_high") or 0.0),
+                    )
+                    if _wall > 0:
+                        _want = int(round((_wall + _fb_cush) / step) * step)
+                        _dcall = max(_want - float(_center_ref), float(step))
+                        short_dist = (int(_dcall), int(short_dist[1]))
+            except (TypeError, ValueError):
+                pass
 
         # ── Protective wing (v3.1) ────────────────────────────────────────
         # The wing determines BOTH the maximum loss and how much of the short
