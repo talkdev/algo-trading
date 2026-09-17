@@ -811,6 +811,9 @@ class Config:
     ev_regime_align_bonus:     float = 0.05
     # Minimum economic size, in lots, before a trade is worth doing.
     min_lots_fraction:         float = 0.60
+    # Post-decision lot clamp (FORCE_LOTS in env). None/0 = off; >=1 forces
+    # that many lots on fills after all gates/sizing have already run.
+    force_lots:                Optional[int] = None
     # Structure economics.
     wing_cost_frac_max:        float = 0.50
     condor_weak_side_min_frac: float = 0.30
@@ -1506,6 +1509,10 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         ev_strong_sell_prior_bonus=min(max(_get_float(env, "EV_STRONG_SELL_PRIOR_BONUS", 0.05), 0.0), 0.08),
         ev_regime_align_bonus=min(max(_get_float(env, "EV_REGIME_ALIGN_BONUS", 0.05), 0.0), 0.08),
         min_lots_fraction=min(max(_get_float(env, "MIN_LOTS_FRACTION", 0.60), 0.10), 1.00),
+        # FORCE_LOTS: post-decision qty clamp only. 0 / empty / missing = off.
+        force_lots=(
+            (lambda _n: _n if _n >= 1 else None)(_get_int(env, "FORCE_LOTS", 0))
+        ),
         wing_cost_frac_max=min(max(_get_float(env, "WING_COST_FRAC_MAX", 0.50), 0.10), 0.70),
         condor_weak_side_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),
         # v4.2 fresh-weekly (DTE >= 2) intraday premium selling

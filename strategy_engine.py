@@ -164,6 +164,26 @@ class StrategyEngine:
         dt2 = datetime.combine(today_ist(), t2)
         return (dt2 - dt1).total_seconds() / 60.0
 
+    def _apply_force_lots(self, final_lots: int) -> int:
+        """Clamp order size after decisions. Does not re-run gates/EV.
+
+        FORCE_LOTS in env.txt (e.g. 1) overrides final_lots for fills only.
+        Unset / 0 leaves sizing untouched.
+        """
+        raw = getattr(self.config, "force_lots", None)
+        if raw is None:
+            return int(final_lots)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return int(final_lots)
+        if n < 1:
+            return int(final_lots)
+        cur = max(1, int(final_lots))
+        if n != cur:
+            self.logger.info(f"FORCE_LOTS: sizing {cur} → {n} (post-decision clamp)")
+        return n
+
     def _get_calibration(self) -> Optional[CalibrationState]:
         return self.cal_engine.state
 
@@ -3666,6 +3686,10 @@ class StrategyEngine:
             "hard_exit_time", self.config.hard_exit_time.strftime("%H:%M")
         )
 
+        # Post-decision qty clamp only — gates/EV already ran at full size.
+        final_lots = self._apply_force_lots(final_lots)
+        total_margin = margin_per_lot * final_lots
+
         return {
             "valid":                  True,
             "strategy_name":          strategy_name,
@@ -4371,6 +4395,9 @@ class StrategyEngine:
             final_lots = max(1, int(current_capital * 0.80 / max(debit_per_lot, 1.0)))
         if final_lots < 1:
             return {"valid": False, "reason": "momentum_no_capital_for_one_lot"}
+
+        # Post-decision qty clamp only — momentum gates already ran at full size.
+        final_lots = self._apply_force_lots(final_lots)
 
         entry_costs_dict = self._compute_costs(legs, final_lots, "ENTRY")
         entry_costs_pts  = entry_costs_dict["total_rupees"] / max(C02 * final_lots, 1.0)
