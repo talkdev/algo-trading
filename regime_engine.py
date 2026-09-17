@@ -1657,6 +1657,55 @@ class RegimeClassifier:
         if price == PriceRegime.OBSERVING:
             return FinalRegime.NO_TRADE, "NO_TRADE:OR_NOT_ESTABLISHED", False
 
+        # PATCH_V26: afternoon extreme fade MUST run before CHOPPY /
+        # BUY_OPTIONS / ADX-immature blocks. 17-Sep 12:15 was UPTREND
+        # at the day high and those hard blocks either banned selling
+        # or fell through to a bull put — the wrong side of a 160pt
+        # two-way tape.
+        try:
+            _fade_t = current_time
+            _fade_start = datetime.strptime(
+                str(getattr(self.config, "afternoon_high_fade_hhmm", "12:15")),
+                "%H:%M",
+            ).time()
+        except Exception:
+            _fade_t = current_time
+            _fade_start = time(12, 15)
+        try:
+            _dte_fade = int(dte) if dte is not None else -1
+        except (TypeError, ValueError):
+            _dte_fade = -1
+        if (1 <= _dte_fade <= 4 and _fade_t >= _fade_start
+                and _fade_t <= time(14, 0)
+                and not bool(event_day)
+                and vol != VolatilityRegime.ABORT):
+            try:
+                _fh = float(signals.get("day_high_so_far") or 0.0)
+                _fl = float(signals.get("day_low_so_far") or 0.0)
+                _fspot = float(spot or 0.0)
+                _frng = (_fh - _fl) if (_fh > 0 and _fl > 0) else 0.0
+                _fpos = ((_fspot - _fl) / _frng) if _frng > 0 else 0.5
+            except (TypeError, ValueError, ZeroDivisionError):
+                _fh = _fl = _fspot = _frng = 0.0
+                _fpos = 0.5
+            if _frng >= 100.0 and _fspot > 0 and conf != ConfidenceLevel.NONE:
+                if _fpos >= 0.80:
+                    signals["afternoon_high_fade"] = True
+                    signals["weekly_range_size_discount"] = 0.90
+                    return (
+                        FinalRegime.PREMIUM_SELL_BEAR,
+                        f"AFTERNOON_DAY_HIGH_FADE_DTE{_dte_fade}",
+                        False,
+                    )
+                if _fpos <= 0.20:
+                    signals["afternoon_low_fade"] = True
+                    signals["weekly_range_size_discount"] = 0.90
+                    return (
+                        FinalRegime.PREMIUM_SELL_BULL,
+                        f"AFTERNOON_DAY_LOW_FADE_DTE{_dte_fade}",
+                        False,
+                    )
+
         if price == PriceRegime.CHOPPY:
             return FinalRegime.NO_TRADE, "NO_TRADE:CHOPPY_MARKET", False
 

@@ -174,6 +174,7 @@ class StrategyEngine:
     ) -> Optional[Tuple[str, str]]:
         state        = self.market_engine.state
         current_time = _test_time if _test_time is not None else now_ist().time()
+        self._apply_two_way_location(signals, current_time)
 
         final_regime = signals.get("final_regime")
         if signals.get("block_new_entries"):
@@ -190,9 +191,12 @@ class StrategyEngine:
             return "NO_TRADE", "vix_spike_detected"
 
         iv_behavior = signals.get("iv_behavior", "UNKNOWN")
-        if iv_behavior == "EXPANDING":
+        _loc_fade = bool(
+            signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
+        )
+        if iv_behavior == "EXPANDING" and not _loc_fade:
             return "NO_TRADE", "iv_expanding_never_sell_into_rising_iv"
-        if iv_behavior == "SPIKING":
+        if iv_behavior == "SPIKING" and not _loc_fade:
             return "NO_TRADE", "iv_spiking"
 
         try:
@@ -250,7 +254,16 @@ class StrategyEngine:
                         state.get("last_exit_is_failed_break_scalp")
                     )
                     _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
-                    if not (_scalp_done and _range_next):
+                    _stale_done = bool(state.get("last_exit_is_stale_weekly"))
+                    _fade_next = (
+                        (str(final_regime or "") == "PREMIUM_SELL_BEAR"
+                         and bool(signals.get("afternoon_high_fade")))
+                        or (str(final_regime or "") == "PREMIUM_SELL_BULL"
+                            and bool(signals.get("afternoon_low_fade")))
+                    )
+                    if not ((_scalp_done and _range_next)
+                            or (_scalp_done and _fade_next)
+                            or (_stale_done and _fade_next)):
                         return "NO_TRADE", (
                             f"entry_cooldown_{ENTRY_COOLDOWN_MIN - mins:.0f}min_remaining"
                         )
@@ -294,7 +307,16 @@ class StrategyEngine:
                             state.get("last_exit_is_failed_break_scalp")
                         )
                         _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
-                        if not (_scalp_done and _range_next):
+                        _stale_done = bool(state.get("last_exit_is_stale_weekly"))
+                        _fade_next = (
+                            (str(final_regime or "") == "PREMIUM_SELL_BEAR"
+                             and bool(signals.get("afternoon_high_fade")))
+                            or (str(final_regime or "") == "PREMIUM_SELL_BULL"
+                                and bool(signals.get("afternoon_low_fade")))
+                        )
+                        if not ((_scalp_done and _range_next)
+                                or (_scalp_done and _fade_next)
+                                or (_stale_done and _fade_next)):
                             return "NO_TRADE", (
                                 f"no_material_change_since_exit_{_moved:.0f}pts_"
                                 f"lt_{_need:.0f}pts_needed"
@@ -474,6 +496,9 @@ class StrategyEngine:
         if bool(signals.get("neutral_range_vertical")) and str(
                 signals.get("final_regime") or "") == "PREMIUM_SELL_BULL":
             _dm_range_confirmed = True
+        if bool(signals.get("afternoon_high_fade")
+                or signals.get("afternoon_low_fade")):
+            _dm_range_confirmed = True
         if _dm_threat >= self.config.day_move_used_block_pct and not (
             _dm_trend_confirmed or _dm_range_confirmed
         ):
@@ -516,18 +541,92 @@ class StrategyEngine:
 
         return None
 
+    def _session_range_pos(self, signals: dict) -> Tuple[float, float, float, float]:
+        """Return (range, location 0-1, high, low) for two-way mean-reversion.
+
+        Location 1.0 = at the session high, 0.0 = at the session low.
+        Falls back to opening-range extremes when candle max/min have not
+        been published yet — the 17-Sep 12:15 bull-put fired because the
+        regime tree never saw a 160pt range and sold the trend label.
+        """
+        try:
+            spot = float(signals.get("spot") or 0.0)
+        except (TypeError, ValueError):
+            spot = 0.0
+        highs, lows = [], []
+        for key in ("day_high_so_far", "or_high", "day_high"):
+            try:
+                v = float(signals.get(key) or 0.0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v > 0:
+                highs.append(v)
+        for key in ("day_low_so_far", "or_low", "day_low"):
+            try:
+                v = float(signals.get(key) or 0.0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v > 0:
+                lows.append(v)
+        if spot > 0:
+            highs.append(spot)
+            lows.append(spot)
+        if not highs or not lows:
+            return 0.0, 0.5, 0.0, 0.0
+        hi, lo = max(highs), min(lows)
+        rng = hi - lo
+        if rng < 1.0:
+            return 0.0, 0.5, hi, lo
+        pos = min(max((spot - lo) / rng, 0.0), 1.0)
+        return rng, pos, hi, lo
+
+    def _apply_two_way_location(self, signals: dict, current_time: dtime) -> None:
+        """On a two-way tape, sell the tested extreme — not the trend label.
+
+        17-Sep chart: 10:15 high, 11:00 low, 12:30 higher high, 13:30 dump.
+        A weekly condor cannot harvest that; a bull put at the high is the
+        wrong side. After a failed-break scalp the mid-range condor is the
+        trade (16-Sep) — do not steal it with a high fade before lunch.
+        """
+        if bool(signals.get("event_day")):
+            return
+        if str(signals.get("vol_regime") or "") in ("ABORT", "BUY_OPTIONS"):
+            return
+        try:
+            dte = int(signals.get("actual_dte")) if signals.get("actual_dte") is not None else -1
+        except (TypeError, ValueError):
+            dte = -1
+        if not (0 <= dte <= 4):
+            return
+        rng, pos, _, _ = self._session_range_pos(signals)
+        if rng < 100.0:
+            return
+        after_fb = bool(self.market_engine.state.get("last_exit_is_failed_break_scalp"))
+        if after_fb and current_time < dtime(12, 15):
+            return
+        if current_time >= dtime(12, 15) and current_time <= dtime(14, 0) and pos >= 0.80:
+            signals["afternoon_high_fade"] = True
+            signals["final_regime"] = "PREMIUM_SELL_BEAR"
+            signals["weekly_range_size_discount"] = 0.90
+            return
+        if current_time >= dtime(10, 50) and current_time < dtime(12, 15) and pos <= 0.22:
+            signals["afternoon_low_fade"] = True
+            signals["final_regime"] = "PREMIUM_SELL_BULL"
+            signals["weekly_range_size_discount"] = 0.90
+
     def _map_regime_to_strategy(
         self,
         signals: dict,
         _test_time: Optional[dtime] = None,
     ) -> Tuple[str, str]:
+        current_time  = _test_time if _test_time is not None else now_ist().time()
+        self._apply_two_way_location(signals, current_time)
         final_regime  = signals.get("final_regime", "NO_TRADE")
         confidence    = signals.get("confidence_level", "NONE")
         dte           = signals.get("actual_dte")
         or_condition  = signals.get("or_condition", "MODERATE")
         adx_15        = float(signals.get("adx_15") or 0.0)
         adx_15_mature = bool(signals.get("adx_15_mature", False))
-        current_time  = _test_time if _test_time is not None else now_ist().time()
         vol_regime    = signals.get("vol_regime", "NEUTRAL")
 
         if final_regime == "PREMIUM_SELL_RANGE":
@@ -562,10 +661,16 @@ class StrategyEngine:
             # Standing aside is not a directional bet - it is refusing to
             # sell the side of the book the day's structure contradicts.
             _ds_ok, _ds_why = self._day_structure_bearish(signals)
-            if _ds_ok:
+            if _ds_ok and not signals.get("afternoon_low_fade"):
                 return "NO_TRADE", (
                     f"day_structure_contradicts_bull_premium:{_ds_why}"
                 )
+            if not signals.get("afternoon_low_fade"):
+                _tw_rng, _tw_loc, _, _ = self._session_range_pos(signals)
+                if _tw_rng >= 100.0 and _tw_loc >= 0.70:
+                    return "NO_TRADE", (
+                        f"two_way_wait_no_puts_at_high_{_tw_loc:.2f}"
+                    )
             reason = (
                 f"regime:{final_regime}:conf={confidence}:"
                 f"dte={dte}:adx={adx_15:.0f}:"
@@ -856,6 +961,11 @@ class StrategyEngine:
         cfg = self.config
         if not bool(getattr(cfg, "counter_trend_entry_block", True)):
             return None
+        # PATCH_V26: fading a two-way day-high IS selling into a measured
+        # uptrend label. The latch was written to stop 17-Sep 09:46 BCS
+        # into a first poke; the afternoon extreme is the opposite trade.
+        if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+            return None
         latch = self._tape_displacement(signals)
         if not latch:
             return None
@@ -1030,6 +1140,30 @@ class StrategyEngine:
                 return False, f"condor_blocked_strong_adx_{adx_15:.0f}"
             if signals.get("or_condition") == "VERY_WIDE":
                 return False, "condor_blocked_very_wide_or"
+            # PATCH_V26: a two-way weekly tape does not pin.
+            # A 100pt+ session may sell a weekly condor ONLY as a
+            # follow-up after a confirmed failed-break scalp (16-Sep).
+            # First-print condors (17-Sep 10:35 ~Rs 650) and condors
+            # sandwiched after a two-way low fade (17-Sep 11:57 scratch)
+            # sit in an expanding auction and cap/kill the day.
+            try:
+                _ic_dte = int(dte) if dte is not None else -1
+            except (TypeError, ValueError):
+                _ic_dte = -1
+            if _ic_dte >= 2:
+                _ic_rng, _ic_loc, _, _ = self._session_range_pos(signals)
+                if _ic_rng >= 100.0:
+                    _ic_fb = bool(state.get("last_exit_is_failed_break_scalp"))
+                    if not _ic_fb:
+                        return False, (
+                            f"weekly_condor_blocked_two_way_"
+                            f"{_ic_rng:.0f}pts_no_failed_break"
+                        )
+                    if 0.22 < _ic_loc < 0.80:
+                        return False, (
+                            f"weekly_condor_blocked_two_way_mid_"
+                            f"{_ic_rng:.0f}pts_loc_{_ic_loc:.2f}"
+                        )
 
         elif strategy_name == BULL_PUT_SPREAD:
             or_high = float(signals.get("or_high") or 0)
@@ -1037,6 +1171,8 @@ class StrategyEngine:
             # PATCH_V15: the failed-break vertical confirmed itself by
             # RECLAIMING the range low, so the OR-mid veto is satisfied by
             # a different measurement than the one it was written for.
+            if signals.get("afternoon_low_fade"):
+                return True, "entry_rules_passed"
             if or_high > 0 and or_low > 0 and not signals.get(
                     "neutral_range_vertical"):
                 or_mid    = (or_high + or_low) / 2.0
@@ -1068,6 +1204,8 @@ class StrategyEngine:
             # replaces contains the SAME short call with no such veto.
             # Behaviour on the trend path (PREMIUM_SELL_BEAR) is unchanged.
             _px_regime = signals.get("price_regime", "")
+            if signals.get("afternoon_high_fade"):
+                return True, "entry_rules_passed"
             if (_px_regime in ("DOWNTREND", "STRONG_DOWNTREND")
                     and or_high > 0 and or_low > 0):
                 or_mid    = (or_high + or_low) / 2.0
@@ -1368,6 +1506,35 @@ class StrategyEngine:
             except (TypeError, ValueError):
                 pass
 
+        if (signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")) and short_dist is not None:
+            try:
+                _fd_spot = float(signals.get("spot") or 0.0)
+                _fd_cush = max(float(step), 80.0)
+                if strategy_name == BEAR_CALL_SPREAD:
+                    _wall = max(
+                        float(signals.get("day_high_so_far") or 0.0),
+                        float(signals.get("or_high") or 0.0),
+                        _fd_spot,
+                    )
+                    if _wall > 0:
+                        _want = int(round((_wall + _fd_cush) / step) * step)
+                        _dcall = max(_want - float(_center_ref), float(step))
+                        short_dist = (int(_dcall), int(short_dist[1]))
+                elif strategy_name == BULL_PUT_SPREAD:
+                    _wall = min(
+                        x for x in (
+                            float(signals.get("day_low_so_far") or 0.0),
+                            float(signals.get("or_low") or 0.0),
+                            _fd_spot if _fd_spot > 0 else 1e12,
+                        ) if x > 0
+                    )
+                    if _wall > 0:
+                        _want = int(round((_wall - _fd_cush) / step) * step)
+                        _dput = max(float(_center_ref) - _want, float(step))
+                        short_dist = (int(short_dist[0]), int(_dput))
+            except (TypeError, ValueError):
+                pass
+
         # ── Protective wing (v3.1) ────────────────────────────────────────
         # The wing determines BOTH the maximum loss and how much of the short
         # premium is handed back to the long. Taking it as a fixed number
@@ -1383,6 +1550,8 @@ class StrategyEngine:
         if (signals.get("neutral_range_vertical")
                 and strategy_name == BULL_PUT_SPREAD):
             _wing_hint = max(_wing_hint, 300 if _weekly_dte else 200)
+        if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+            _wing_hint = max(_wing_hint, 150)
         if isinstance(short_dist, (tuple, list)):
             _short_dist_ref = min(float(short_dist[0]), float(short_dist[1]))
         else:
@@ -3134,6 +3303,10 @@ class StrategyEngine:
         if (signals.get("neutral_range_vertical")
                 and strategy_name == BULL_PUT_SPREAD):
             final_lots = min(final_lots, 3)
+        if signals.get("afternoon_high_fade") and strategy_name == BEAR_CALL_SPREAD:
+            final_lots = min(max(final_lots, 3), 4)
+        if signals.get("afternoon_low_fade") and strategy_name == BULL_PUT_SPREAD:
+            final_lots = min(max(final_lots, 3), 4)
 
         # ── [G2] Day cap ──────────────────────────────────────────────────
         # int(capital / starting_capital) is a step function: the cap doubles
@@ -3379,13 +3552,19 @@ class StrategyEngine:
             "stop_at_breakeven":      False,
             # PATCH_V25: exit ladder harvests failed-LOW as a scalp.
             "failed_break_scalp":     bool(
-                signals.get("neutral_range_vertical")
-                and strategy_name == BULL_PUT_SPREAD
+                (signals.get("neutral_range_vertical")
+                 and strategy_name == BULL_PUT_SPREAD)
+                or signals.get("afternoon_low_fade")
             ),
+            "afternoon_high_fade":    bool(signals.get("afternoon_high_fade")),
+            "afternoon_low_fade":     bool(signals.get("afternoon_low_fade")),
             "max_hold_min":           (
                 int(getattr(self.config, "failed_break_max_hold_min", 70))
-                if (signals.get("neutral_range_vertical")
-                    and strategy_name == BULL_PUT_SPREAD)
+                if (
+                    (signals.get("neutral_range_vertical")
+                     and strategy_name == BULL_PUT_SPREAD)
+                    or signals.get("afternoon_low_fade")
+                )
                 else None
             ),
         }
@@ -4109,6 +4288,12 @@ class StrategyEngine:
         allowed or does not price up — in which case the caller keeps the
         original refusal, unaltered, as the logged reason.
         """
+        if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+            return None
+        if self.market_engine.state.get("last_exit_is_stale_weekly"):
+            return None
+        if "two_way_wait" in str(block_reason or ""):
+            return None
         try:
             ok, why, direction = self._momentum_gate(signals, block_reason)
         except Exception as exc:                      # never lose the day to
@@ -4246,6 +4431,11 @@ class StrategyEngine:
                 )
             except (TypeError, ValueError):
                 size_mult = max(size_mult, 0.75)
+        elif signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+            try:
+                size_mult = max(size_mult, float(_weekly_discount or 0.90), 0.85)
+            except (TypeError, ValueError):
+                size_mult = max(size_mult, 0.85)
         elif _weekly_discount:
             try:
                 size_mult = size_mult * float(_weekly_discount)
