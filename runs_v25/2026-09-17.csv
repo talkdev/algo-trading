@@ -1,0 +1,2 @@
+trading_date,strategy,regime,confidence,dte,entry_time,exit_time,lots,entry_credit,exit_debit,gross_pts,costs_rs,pnl_rs,exit_reason,exit_priority,entry_spot,exit_spot,strikes,wing,held_min
+2026-09-17,IRON_CONDOR,PREMIUM_SELL_RANGE,HIGH,3,10:35:25,14:54:06,3,48.03,44.7,3.33,248.03,401.32,END_OF_DATA_FORCED_FLAT,7,23271.8,23298.0,SC23500/SP23050/BC23650/BP22900,150.0,258

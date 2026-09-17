@@ -1734,6 +1734,20 @@ class RegimeClassifier:
                     False,
                 )
 
+        # PATCH_V24: ORB+VWAP must not mint UPTREND/DOWNTREND credit
+        # while ADX is 0 (17-Sep 10:02 5-lot bull put, ADX=0).
+        if price in (
+            PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
+            PriceRegime.DOWNTREND, PriceRegime.STRONG_DOWNTREND,
+        ):
+            if (not bool(signals.get("adx_15_mature", False))
+                    or float(signals.get("adx_15") or 0.0) <= 0.0):
+                return (
+                    FinalRegime.NO_TRADE,
+                    "NO_TRADE:ADX_IMMATURE_NO_DIRECTIONAL_CREDIT",
+                    False,
+                )
+
         # ── Price Regime → Structure ──────────────────────────────────────
         if price == PriceRegime.RANGE:
             final, note = self._classify_range(vol, pos, conf, signals)
@@ -1790,59 +1804,83 @@ class RegimeClassifier:
             except (TypeError, ValueError):
                 _v23_orl = _v23_orh = _v23_dlo = _v23_dhi = 0.0
                 _v23_orw = 1.0
-            _v23_min_poke = max(
+            # PATCH_V24: failed-LOW (bull put) is the 16-Sep harvest —
+            # a stop-run through OR low, then reclaim. Failed-HIGH
+            # (bear call) is the 17-Sep 09:46 loser. They do not share
+            # ADX / clock / DMU / poke bars.
+            _v24_min_lo = max(
+                float(getattr(self.config, "failed_break_min_poke_low", 20.0)),
+                0.18 * _v23_orw,
+            )
+            _v24_min_hi = max(
                 float(getattr(self.config, "failed_break_min_poke_pts", 25.0)),
                 0.40 * _v23_orw,
             )
             _v23_broke_lo = (
                 _v23_orl > 0 and _v23_dlo > 0
-                and _v23_dlo <= _v23_orl - _v23_min_poke
+                and _v23_dlo <= _v23_orl - _v24_min_lo
             )
             _v23_broke_hi = (
                 _v23_orh > 0 and _v23_dhi > 0
-                and _v23_dhi >= _v23_orh + _v23_min_poke
+                and _v23_dhi >= _v23_orh + _v24_min_hi
             )
             _v23_reclaim = max(
                 float(getattr(self.config, "failed_break_reclaim_pts", 10.0)),
                 0.10 * _v23_orw,
             )
+            _v24_hold_lo = time(9, 50)
+            _v24_hold_hi = time(10, 0)
             try:
-                _v23_hold = datetime.strptime(
+                _v24_hold_lo = datetime.strptime(
+                    str(getattr(self.config, "failed_break_hold_low_hhmm", "09:50")),
+                    "%H:%M",
+                ).time()
+            except Exception:
+                pass
+            try:
+                _v24_hold_hi = datetime.strptime(
                     str(getattr(self.config, "failed_break_hold_hhmm", "10:00")),
                     "%H:%M",
                 ).time()
             except Exception:
-                _v23_hold = time(10, 0)
+                pass
             _v23_dmu_cap = float(
                 getattr(self.config, "day_move_used_block_pct", 125.0) or 125.0
             )
-            if _v23_broke_hi and not _v23_broke_lo:
-                _v23_threat = float(
-                    signals.get("day_up_used_pct")
-                    or signals.get("day_move_used_pct")
-                    or 0.0
-                )
-            elif _v23_broke_lo and not _v23_broke_hi:
-                _v23_threat = float(
-                    signals.get("day_down_used_pct")
-                    or signals.get("day_move_used_pct")
-                    or 0.0
-                )
-            else:
-                _v23_threat = float(signals.get("day_move_used_pct") or 0.0)
-            _v23_quiet = (
-                bool(signals.get("or_computed"))
-                and vol == VolatilityRegime.NEUTRAL
-                and conf in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM)
-                and bool(signals.get("adx_15_mature", False))
+            _v23_threat_up = float(
+                signals.get("day_up_used_pct")
+                or signals.get("day_move_used_pct")
+                or 0.0
+            )
+            _v23_adx_ok = (
+                bool(signals.get("adx_15_mature", False))
                 and adx_15 > 0.0
                 and adx_15 < float(
                     getattr(self.config, "adx_trend_threshold", 20.0))
+            )
+            _v23_base = (
+                bool(signals.get("or_computed"))
+                and vol == VolatilityRegime.NEUTRAL
+                and conf in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM)
                 and or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
                 and spot > 0
-                and current_time >= _v23_hold
-                and _v23_threat < _v23_dmu_cap
                 and not bool(signals.get("event_day"))
+            )
+            # Low flush: the DMU gauge IS the stop-run. Do not require ADX.
+            _v23_quiet_lo = (
+                _v23_base
+                and current_time >= _v24_hold_lo
+            )
+            # High poke: keep V23 (ADX, 10:00, upside DMU).
+            _v23_quiet_hi = (
+                _v23_base
+                and _v23_adx_ok
+                and current_time >= _v24_hold_hi
+                and _v23_threat_up < _v23_dmu_cap
+            )
+            _v23_quiet = (
+                (_v23_broke_lo and not _v23_broke_hi and _v23_quiet_lo)
+                or (_v23_broke_hi and not _v23_broke_lo and _v23_quiet_hi)
             )
             _v23_fb = (
                 _v23_quiet
@@ -1855,7 +1893,7 @@ class RegimeClassifier:
             if _v23_fb:
                 signals["neutral_range_vertical"] = True
                 signals["weekly_range_size_discount"] = float(
-                    getattr(self.config, "failed_break_size", 0.50))
+                    getattr(self.config, "failed_break_size", 1.00))
                 if _v23_broke_lo and spot >= _v23_orl + _v23_reclaim:
                     return (
                         FinalRegime.PREMIUM_SELL_BULL,

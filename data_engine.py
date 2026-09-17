@@ -621,6 +621,7 @@ class MarketDataEngine:
                 "_straddle_open_for_summary", "_last_atm_straddle",
                 "_prev_close_for_gap", "_straddle_hist",
                 "rv_anchor_pct", "rv_anchor_date", "first_bar_close",
+                "last_exit_is_failed_break_scalp",
             ):
                 if _k not in data:
                     continue

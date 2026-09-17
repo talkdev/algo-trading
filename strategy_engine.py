@@ -244,9 +244,16 @@ class StrategyEngine:
             try:
                 mins = (now_ist() - _last_act).total_seconds() / 60.0
                 if mins < ENTRY_COOLDOWN_MIN:
-                    return "NO_TRADE", (
-                        f"entry_cooldown_{ENTRY_COOLDOWN_MIN - mins:.0f}min_remaining"
+                    # PATCH_V25: after a failed-break scalp, the range
+                    # condor is a DIFFERENT trade — do not wait 10 min.
+                    _scalp_done = bool(
+                        state.get("last_exit_is_failed_break_scalp")
                     )
+                    _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
+                    if not (_scalp_done and _range_next):
+                        return "NO_TRADE", (
+                            f"entry_cooldown_{ENTRY_COOLDOWN_MIN - mins:.0f}min_remaining"
+                        )
             except Exception:
                 pass
 
@@ -281,10 +288,17 @@ class StrategyEngine:
                             self.config, "reentry_material_move_pct", 0.12)) / 100.0,
                     )
                     if _moved < _need:
-                        return "NO_TRADE", (
-                            f"no_material_change_since_exit_{_moved:.0f}pts_"
-                            f"lt_{_need:.0f}pts_needed"
+                        # PATCH_V25: same exemption as cooldown — scalp
+                        # then range condor on a pinned tape.
+                        _scalp_done = bool(
+                            state.get("last_exit_is_failed_break_scalp")
                         )
+                        _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
+                        if not (_scalp_done and _range_next):
+                            return "NO_TRADE", (
+                                f"no_material_change_since_exit_{_moved:.0f}pts_"
+                                f"lt_{_need:.0f}pts_needed"
+                            )
 
         if state.get("consecutive_stops", 0) >= 2:
             return "NO_TRADE", "2_consecutive_stops_halt"
@@ -453,9 +467,13 @@ class StrategyEngine:
                 and _dm_frac_range < float(
                     getattr(self.config, "day_range_frac_block_condor", 0.75))
             )
-        # PATCH_V23: failed-break keeps the threat-side day-move block.
-        # 17-Sep day_up_used_pct=209 on a bear call; the V15 exemption
-        # was why 3 lots still went out.
+        # PATCH_V25: only the failed-LOW bull put may ignore day-move
+        # (the flush IS the thesis). Without this, 16-Sep is blocked for
+        # ~189 cycles at day_move ~210% and only the 10:58 condor fires.
+        # Failed-HIGH bear calls keep the 125% block (17-Sep day_up 209%).
+        if bool(signals.get("neutral_range_vertical")) and str(
+                signals.get("final_regime") or "") == "PREMIUM_SELL_BULL":
+            _dm_range_confirmed = True
         if _dm_threat >= self.config.day_move_used_block_pct and not (
             _dm_trend_confirmed or _dm_range_confirmed
         ):
@@ -1029,7 +1047,9 @@ class StrategyEngine:
                         f"_by_{or_mid - spot:.0f}pts"
                     )
             vwap = signals.get("vwap")
-            if vwap and vwap > 0 and spot < vwap - 30:
+            # PATCH_V25: failed-break reclaim IS a bounce through lagging VWAP.
+            if (vwap and vwap > 0 and spot < vwap - 30
+                    and not signals.get("neutral_range_vertical")):
                 return False, (
                     f"bull_put_spot_below_vwap_{vwap:.0f}_by_{vwap - spot:.0f}pts"
                 )
@@ -1322,7 +1342,9 @@ class StrategyEngine:
                         self.config, "spot_proximity_pct", 0.0016))
                      if _spot_fb > 0 else 0.0),
                 )
-                _fb_cush = max(float(step), 0.40 * _fb_orw, _prox_fb) + _prox_fb
+                # PATCH_V25: V18 cushion = 0.40*OR only. A 40pt prox
+                # stack still left a thin 200-pt wing on 16-Sep.
+                _fb_cush = max(float(step), 0.40 * _fb_orw)
                 if strategy_name == BULL_PUT_SPREAD:
                     _wall = min(
                         x for x in (
@@ -1357,6 +1379,10 @@ class StrategyEngine:
         # straddle-based hint from data_engine as a fallback, then clamped by
         # DTE so 0DTE max loss stays small where credits are small.
         _wing_hint = int(signals.get("wing_width") or 150)
+        # PATCH_V25: 300-pt wing on dte>=2 failed-LOW so 15% scalp clears costs.
+        if (signals.get("neutral_range_vertical")
+                and strategy_name == BULL_PUT_SPREAD):
+            _wing_hint = max(_wing_hint, 300 if _weekly_dte else 200)
         if isinstance(short_dist, (tuple, list)):
             _short_dist_ref = min(float(short_dist[0]), float(short_dist[1]))
         else:
@@ -1372,6 +1398,9 @@ class StrategyEngine:
         _wing_max = 250 if dte == 0 else (350 if dte == 1 else 450)
         wing = int(round(_wing_raw / step + 0.001) * step)
         wing = int(max(_wing_min, min(wing, _wing_max)))
+        if (signals.get("neutral_range_vertical")
+                and strategy_name == BULL_PUT_SPREAD):
+            wing = int(min(max(wing, 300 if _weekly_dte else 200), _wing_max))
 
         # ── v4.2: adaptive wing fit ───────────────────────────────────────
         # A fresh-weekly wing (multi-day vega) routinely costs 55-65% of a
@@ -3026,6 +3055,10 @@ class StrategyEngine:
         )
         _efficacy = float(getattr(self.config, "stop_efficacy", 0.55))
         _efficacy = min(max(_efficacy, 0.0), 0.80)
+        # PATCH_V25: size failed-LOW on the thesis stop, not the 300-pt wing.
+        if (signals.get("neutral_range_vertical")
+                and strategy_name == BULL_PUT_SPREAD):
+            _efficacy = 0.80
         structural_loss_per_lot = (
             _efficacy * _stop_loss_per_lot
             + (1.0 - _efficacy) * _structural_per_lot
@@ -3097,6 +3130,10 @@ class StrategyEngine:
                     ),
                 }
         final_lots = 1 if _clipped_to_minimum else max(1, int(round(_sized)))
+        # PATCH_V25: 3-lot cap on the failed-LOW scalp (clears Rs 2k after costs).
+        if (signals.get("neutral_range_vertical")
+                and strategy_name == BULL_PUT_SPREAD):
+            final_lots = min(final_lots, 3)
 
         # ── [G2] Day cap ──────────────────────────────────────────────────
         # int(capital / starting_capital) is a step function: the cap doubles
@@ -3340,6 +3377,17 @@ class StrategyEngine:
             "profit_lock_activated":  False,
             "profit_lock_stop_level": None,
             "stop_at_breakeven":      False,
+            # PATCH_V25: exit ladder harvests failed-LOW as a scalp.
+            "failed_break_scalp":     bool(
+                signals.get("neutral_range_vertical")
+                and strategy_name == BULL_PUT_SPREAD
+            ),
+            "max_hold_min":           (
+                int(getattr(self.config, "failed_break_max_hold_min", 70))
+                if (signals.get("neutral_range_vertical")
+                    and strategy_name == BULL_PUT_SPREAD)
+                else None
+            ),
         }
 
     def _log_decision(
@@ -4187,7 +4235,18 @@ class StrategyEngine:
         # range condors (UNCLEAR OI positioning, or elevated-but-not-strong
         # ADX): the structure is allowed but size is discounted.
         _weekly_discount = signals.get("weekly_range_size_discount")
-        if _weekly_discount:
+        # PATCH_V25: failed-LOW sized on thesis stop — floor size_mult at 0.75.
+        if (signals.get("neutral_range_vertical")
+                and strategy_name == BULL_PUT_SPREAD):
+            try:
+                size_mult = max(
+                    size_mult,
+                    float(_weekly_discount or 0.75),
+                    0.75,
+                )
+            except (TypeError, ValueError):
+                size_mult = max(size_mult, 0.75)
+        elif _weekly_discount:
             try:
                 size_mult = size_mult * float(_weekly_discount)
             except (TypeError, ValueError):
