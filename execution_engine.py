@@ -1238,6 +1238,18 @@ class ExecutionEngine:
 
         final_lots = max(1, int(final_lots * size_adj))
 
+        # FORCE_LOTS: post-decision clamp so live entry cannot re-inflate size.
+        _force = getattr(self.config, "force_lots", None)
+        try:
+            _force_n = int(_force) if _force is not None else 0
+        except (TypeError, ValueError):
+            _force_n = 0
+        if _force_n >= 1 and _force_n != final_lots:
+            self.logger.info(
+                f"FORCE_LOTS: execution sizing {final_lots} → {_force_n}"
+            )
+            final_lots = _force_n
+
         # ── Check 2: Chain availability ───────────────────────────────────
         chain = self.market_engine.last_chain
         if not chain:
