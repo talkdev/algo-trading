@@ -361,6 +361,33 @@ class StrategyEngine:
             return "NO_TRADE", "opening_range_not_yet_computed"
         if signals.get("price_regime") in ("OBSERVING",):
             return "NO_TRADE", "opening_range_pending"
+
+        # PATCH_V27: unresolved open-HIGH wick — defer BEAR/RANGE credit
+        # until 12:15 so the book is free for the lower-high fade (10-Sep).
+        # Do NOT block failed-break / low-fade bull puts (16-Sep scalp).
+        try:
+            _dte_os = int(signals.get("actual_dte")) if signals.get("actual_dte") is not None else -1
+        except (TypeError, ValueError):
+            _dte_os = -1
+        if (
+            _dte_os >= 2
+            and bool(signals.get("day_high_is_open_spike"))
+            and not bool(signals.get("afternoon_low_fade"))
+            and not bool(signals.get("failed_break_low"))
+            and not bool(signals.get("failed_break_high"))
+            and str(signals.get("final_regime") or "") in (
+                "PREMIUM_SELL_BEAR", "PREMIUM_SELL_RANGE",
+            )
+        ):
+            try:
+                _os_until = datetime.strptime(
+                    str(getattr(self.config, "open_spike_wait_until_hhmm", "12:15")),
+                    "%H:%M",
+                ).time()
+            except Exception:
+                _os_until = dtime(12, 15)
+            if current_time < _os_until and not signals.get("afternoon_high_fade"):
+                return "NO_TRADE", "open_spike_wait_unresolved_lower_high"
         if signals.get("chain_stale"):
             return "NO_TRADE", "chain_stale_cannot_validate_strikes"
 
@@ -580,6 +607,38 @@ class StrategyEngine:
         pos = min(max((spot - lo) / rng, 0.0), 1.0)
         return rng, pos, hi, lo
 
+    def _fade_range_pos(self, signals: dict) -> Tuple[float, float, float, float, float]:
+        """PATCH_V27: (raw_rng, loc, eff_hi, eff_lo, eff_rng) for fades."""
+        try:
+            spot = float(signals.get("spot") or 0.0)
+            dh = float(signals.get("day_high_so_far") or signals.get("day_high") or 0.0)
+            dl = float(signals.get("day_low_so_far") or signals.get("day_low") or 0.0)
+            poh = float(signals.get("post_open_high_so_far") or 0.0)
+            pol = float(signals.get("post_open_low_so_far") or 0.0)
+            gap = float(getattr(self.config, "open_spike_min_gap_pts", 15.0) or 15.0)
+        except (TypeError, ValueError):
+            rng, pos, hi, lo = self._session_range_pos(signals)
+            return rng, pos, hi, lo, rng
+        raw_rng = (dh - dl) if (dh > 0 and dl > 0) else 0.0
+        hi, lo = dh, dl
+        if (bool(signals.get("day_high_is_open_spike")) or
+                (poh > 0 and dh > 0 and (dh - poh) >= gap)) and poh > 0:
+            hi = poh
+        if (bool(signals.get("day_low_is_open_spike")) or
+                (pol > 0 and dl > 0 and (pol - dl) >= gap)) and pol > 0:
+            lo = pol
+        if spot > 0:
+            hi = max(hi, spot) if hi > 0 else spot
+            lo = min(lo, spot) if lo > 0 else spot
+        if hi <= 0 or lo <= 0:
+            rng, pos, hi, lo = self._session_range_pos(signals)
+            return raw_rng or rng, pos, hi, lo, rng
+        eff_rng = hi - lo
+        if eff_rng < 1.0:
+            return raw_rng, 0.5, hi, lo, eff_rng
+        pos = min(max((spot - lo) / eff_rng, 0.0), 1.0)
+        return raw_rng, pos, hi, lo, eff_rng
+
     def _apply_two_way_location(self, signals: dict, current_time: dtime) -> None:
         """On a two-way tape, sell the tested extreme — not the trend label.
 
@@ -598,8 +657,18 @@ class StrategyEngine:
             dte = -1
         if not (0 <= dte <= 4):
             return
-        rng, pos, _, _ = self._session_range_pos(signals)
-        if rng < 100.0:
+        # PATCH_V27: raw day-range eligibility (lower floor on open spike),
+        # post-open location for unretested lower highs (10-Sep ~92pt day).
+        raw_rng, pos, _, _, _ = self._fade_range_pos(signals)
+        _spike = bool(signals.get("day_high_is_open_spike")
+                      or signals.get("day_low_is_open_spike"))
+        try:
+            _floor = float(
+                getattr(self.config, "open_spike_fade_min_range_pts", 70.0) or 70.0
+            ) if _spike else 100.0
+        except (TypeError, ValueError):
+            _floor = 70.0 if _spike else 100.0
+        if raw_rng < _floor:
             return
         after_fb = bool(self.market_engine.state.get("last_exit_is_failed_break_scalp"))
         if after_fb and current_time < dtime(12, 15):
@@ -1152,6 +1221,12 @@ class StrategyEngine:
                 _ic_dte = -1
             if _ic_dte >= 2:
                 _ic_rng, _ic_loc, _, _ = self._session_range_pos(signals)
+                # PATCH_V27: an unretested open-high wick is a two-way tape
+                # even when raw range is still sub-100 (10-Sep ~92pts).
+                if bool(signals.get("day_high_is_open_spike")) and not bool(
+                    state.get("last_exit_is_failed_break_scalp")
+                ):
+                    return False, "weekly_condor_blocked_open_spike_wick"
                 if _ic_rng >= 100.0:
                     _ic_fb = bool(state.get("last_exit_is_failed_break_scalp"))
                     if not _ic_fb:

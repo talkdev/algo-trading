@@ -1695,6 +1695,39 @@ class MarketDataEngine:
                     # gates and the failed-break structure read need them.
                     self.state["day_high_so_far"] = day_high
                     self.state["day_low_so_far"]  = day_low
+                    # PATCH_V27: post-open extremes + open-spike flag.
+                    try:
+                        _cut = str(
+                            getattr(self.config, "open_spike_cutoff_hhmm", "09:45")
+                            or "09:45"
+                        )
+                        if len(_cut) == 5:
+                            _cut = _cut + ":00"
+                        _gap = float(
+                            getattr(self.config, "open_spike_min_gap_pts", 15.0) or 15.0
+                        )
+                        _pre = market_bars[market_bars["time"] < _cut]
+                        _post = market_bars[market_bars["time"] >= _cut]
+                        _poh = float(_post["high"].max()) if not _post.empty else day_high
+                        _pol = float(_post["low"].min()) if not _post.empty else day_low
+                        self.state["post_open_high_so_far"] = _poh
+                        self.state["post_open_low_so_far"] = _pol
+                        _odh = float(_pre["high"].max()) if not _pre.empty else 0.0
+                        self.state["day_high_is_open_spike"] = bool(
+                            _odh > 0
+                            and abs(day_high - _odh) < 0.51
+                            and (day_high - _poh) >= _gap
+                        )
+                        self.state["day_low_is_open_spike"] = bool(
+                            not _pre.empty
+                            and abs(day_low - float(_pre["low"].min())) < 0.51
+                            and (_pol - day_low) >= _gap
+                        )
+                    except Exception:
+                        self.state.setdefault("post_open_high_so_far", day_high)
+                        self.state.setdefault("post_open_low_so_far", day_low)
+                        self.state.setdefault("day_high_is_open_spike", False)
+                        self.state.setdefault("day_low_is_open_spike", False)
                     return round((day_high - day_low) / _straddle_ref * 100.0, 2)
         except Exception:
             pass
@@ -2903,6 +2936,38 @@ class MarketDataEngine:
                 if not _mb.empty:
                     _day_high = float(_mb["high"].max())
                     _day_low  = float(_mb["low"].min())
+                    self.state["day_high_so_far"] = _day_high
+                    self.state["day_low_so_far"] = _day_low
+                    try:
+                        _cut = str(
+                            getattr(self.config, "open_spike_cutoff_hhmm", "09:45")
+                            or "09:45"
+                        )
+                        if len(_cut) == 5:
+                            _cut = _cut + ":00"
+                        _gap = float(
+                            getattr(self.config, "open_spike_min_gap_pts", 15.0) or 15.0
+                        )
+                        _pre = _mb[_mb["time"] < _cut]
+                        _post = _mb[_mb["time"] >= _cut]
+                        _poh = float(_post["high"].max()) if not _post.empty else _day_high
+                        _pol = float(_post["low"].min()) if not _post.empty else _day_low
+                        self.state["post_open_high_so_far"] = _poh
+                        self.state["post_open_low_so_far"] = _pol
+                        _odh = float(_pre["high"].max()) if not _pre.empty else 0.0
+                        self.state["day_high_is_open_spike"] = bool(
+                            _odh > 0
+                            and abs(_day_high - _odh) < 0.51
+                            and (_day_high - _poh) >= _gap
+                        )
+                        self.state["day_low_is_open_spike"] = bool(
+                            not _pre.empty
+                            and abs(_day_low - float(_pre["low"].min())) < 0.51
+                            and (_pol - _day_low) >= _gap
+                        )
+                    except Exception:
+                        self.state.setdefault("post_open_high_so_far", _day_high)
+                        self.state.setdefault("post_open_low_so_far", _day_low)
         except Exception:
             _day_high = _day_low = 0.0
 
@@ -3566,6 +3631,11 @@ class MarketDataEngine:
             # PATCH_V15: session extremes for the failed-break structure
             "day_high_so_far":          self.state.get("day_high_so_far"),
             "day_low_so_far":           self.state.get("day_low_so_far"),
+            # PATCH_V27: open-drive-aware extremes for lower-high fades
+            "post_open_high_so_far":    self.state.get("post_open_high_so_far"),
+            "post_open_low_so_far":     self.state.get("post_open_low_so_far"),
+            "day_high_is_open_spike":   bool(self.state.get("day_high_is_open_spike")),
+            "day_low_is_open_spike":    bool(self.state.get("day_low_is_open_spike")),
             # PATCH_V12: one-sided excursion vs priced displacement.
             "day_up_used_pct":          day_up_used_pct,
             "day_down_used_pct":        day_down_used_pct,

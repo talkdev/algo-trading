@@ -1680,15 +1680,50 @@ class RegimeClassifier:
                 and not bool(event_day)
                 and vol != VolatilityRegime.ABORT):
             try:
-                _fh = float(signals.get("day_high_so_far") or 0.0)
-                _fl = float(signals.get("day_low_so_far") or 0.0)
+                # PATCH_V27: raw-range eligibility (70pt floor on open spike),
+                # post-open location for unretested lower highs (10-Sep).
+                _raw_h = float(signals.get("day_high_so_far") or 0.0)
+                _raw_l = float(signals.get("day_low_so_far") or 0.0)
+                _fh, _fl = _raw_h, _raw_l
+                _poh = float(signals.get("post_open_high_so_far") or 0.0)
+                _pol = float(signals.get("post_open_low_so_far") or 0.0)
+                _gap = float(
+                    getattr(self.config, "open_spike_min_gap_pts", 15.0) or 15.0
+                )
+                _spike = bool(signals.get("day_high_is_open_spike")) or bool(
+                    signals.get("day_low_is_open_spike")
+                )
+                if (
+                    bool(signals.get("day_high_is_open_spike"))
+                    or (_poh > 0 and _raw_h > 0 and (_raw_h - _poh) >= _gap)
+                ) and _poh > 0:
+                    _fh = _poh
+                if (
+                    bool(signals.get("day_low_is_open_spike"))
+                    or (_pol > 0 and _raw_l > 0 and (_pol - _raw_l) >= _gap)
+                ) and _pol > 0:
+                    _fl = _pol
                 _fspot = float(spot or 0.0)
+                if _fspot > 0:
+                    if _fh > 0:
+                        _fh = max(_fh, _fspot)
+                    if _fl > 0:
+                        _fl = min(_fl, _fspot)
+                _raw_rng = (_raw_h - _raw_l) if (_raw_h > 0 and _raw_l > 0) else 0.0
                 _frng = (_fh - _fl) if (_fh > 0 and _fl > 0) else 0.0
                 _fpos = ((_fspot - _fl) / _frng) if _frng > 0 else 0.5
+                try:
+                    _floor = float(
+                        getattr(self.config, "open_spike_fade_min_range_pts", 70.0)
+                        or 70.0
+                    ) if _spike else 100.0
+                except (TypeError, ValueError):
+                    _floor = 70.0 if _spike else 100.0
             except (TypeError, ValueError, ZeroDivisionError):
-                _fh = _fl = _fspot = _frng = 0.0
+                _fh = _fl = _fspot = _frng = _raw_rng = 0.0
                 _fpos = 0.5
-            if _frng >= 100.0 and _fspot > 0 and conf != ConfidenceLevel.NONE:
+                _floor = 100.0
+            if _raw_rng >= _floor and _fspot > 0 and conf != ConfidenceLevel.NONE:
                 if _fpos >= 0.80:
                     signals["afternoon_high_fade"] = True
                     signals["weekly_range_size_discount"] = 0.90
