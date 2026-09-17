@@ -250,9 +250,10 @@ class StrategyEngine:
                 if mins < ENTRY_COOLDOWN_MIN:
                     # PATCH_V25: after a failed-break scalp, the range
                     # condor is a DIFFERENT trade — do not wait 10 min.
-                    _scalp_done = bool(
-                        state.get("last_exit_is_failed_break_scalp")
-                    )
+                    # PATCH_V30: opposite-extreme fade after a true
+                    # failed-break also skips; low-fade→high-fade keeps
+                    # the clock (17-Sep needs the extension to settle).
+                    _fb_only = bool(state.get("last_exit_is_failed_break_scalp"))
                     _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
                     _stale_done = bool(state.get("last_exit_is_stale_weekly"))
                     _fade_next = (
@@ -261,8 +262,8 @@ class StrategyEngine:
                         or (str(final_regime or "") == "PREMIUM_SELL_BULL"
                             and bool(signals.get("afternoon_low_fade")))
                     )
-                    if not ((_scalp_done and _range_next)
-                            or (_scalp_done and _fade_next)
+                    if not ((_fb_only and _range_next)
+                            or (_fb_only and _fade_next)
                             or (_stale_done and _fade_next)):
                         return "NO_TRADE", (
                             f"entry_cooldown_{ENTRY_COOLDOWN_MIN - mins:.0f}min_remaining"
@@ -303,9 +304,11 @@ class StrategyEngine:
                     if _moved < _need:
                         # PATCH_V25: same exemption as cooldown — scalp
                         # then range condor on a pinned tape.
-                        _scalp_done = bool(
-                            state.get("last_exit_is_failed_break_scalp")
-                        )
+                        # PATCH_V30: opposite-extreme fade after extreme
+                        # scalp only when the tape has ALSO made a
+                        # material move (do not waive the move check for
+                        # low-fade→high-fade; 17-Sep 11:59 was +10pts).
+                        _fb_only = bool(state.get("last_exit_is_failed_break_scalp"))
                         _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
                         _stale_done = bool(state.get("last_exit_is_stale_weekly"))
                         _fade_next = (
@@ -314,8 +317,8 @@ class StrategyEngine:
                             or (str(final_regime or "") == "PREMIUM_SELL_BULL"
                                 and bool(signals.get("afternoon_low_fade")))
                         )
-                        if not ((_scalp_done and _range_next)
-                                or (_scalp_done and _fade_next)
+                        if not ((_fb_only and _range_next)
+                                or (_fb_only and _fade_next)
                                 or (_stale_done and _fade_next)):
                             return "NO_TRADE", (
                                 f"no_material_change_since_exit_{_moved:.0f}pts_"
@@ -639,6 +642,25 @@ class StrategyEngine:
         pos = min(max((spot - lo) / eff_rng, 0.0), 1.0)
         return raw_rng, pos, hi, lo, eff_rng
 
+    def _after_two_way_extreme_scalp(self) -> bool:
+        """True after a harvested extreme vertical on a two-way tape.
+
+        PATCH_V30: PATCH_V25 clears last_exit_is_failed_break_scalp when
+        the scalp was also an afternoon_low_fade (so a weekly IC stays
+        banned). That flag was the only unlock for PATCH_V29's early
+        opposite-extreme fade — leaving 17-Sep 12:00–12:14 at loc≥0.95
+        with puts correctly blocked and the bear-call fade still gated
+        to 12:15. A low-fade OR failed-break close both confirm the
+        two-way auction; either may unlock the opposite fade. IC unlock
+        remains failed-break-only (see structure rules).
+        """
+        st = self.market_engine.state
+        return bool(
+            st.get("last_exit_is_failed_break_scalp")
+            or st.get("last_exit_is_afternoon_low_fade")
+            or st.get("last_exit_is_afternoon_high_fade")
+        )
+
     def _apply_two_way_location(self, signals: dict, current_time: dtime) -> None:
         """On a two-way tape, sell the tested extreme — not the trend label.
 
@@ -653,6 +675,9 @@ class StrategyEngine:
         zone until lunch while the professional tape sells the tested
         extreme immediately. Mid-range after FB still waits — only
         extremes may fade early.
+
+        PATCH_V30: same early unlock after an afternoon_low_fade scalp
+        (17-Sep), which V25 intentionally does not count as failed-break.
         """
         if bool(signals.get("event_day")):
             return
@@ -677,21 +702,31 @@ class StrategyEngine:
             _floor = 70.0 if _spike else 100.0
         if raw_rng < _floor:
             return
+        after_extreme = self._after_two_way_extreme_scalp()
         after_fb = bool(self.market_engine.state.get("last_exit_is_failed_break_scalp"))
         # Standard afternoon high-fade: 12:15–14:00 at loc≥0.80.
-        # After-FB extreme: from 10:45 at loc≥0.85 (stricter) so the
-        # V-recovery exhaustion prints a bear call instead of silence.
-        _hi_start = dtime(10, 45) if after_fb else dtime(12, 15)
-        _hi_thresh = 0.85 if (after_fb and current_time < dtime(12, 15)) else 0.80
+        # True failed-break (16-Sep): from 10:45 at loc≥0.85.
+        # Low/high-fade scalp (17-Sep): from 12:00 at loc≥0.90 — converts
+        # the 12:00–12:14 two_way_wait dead zone into a bear-call without
+        # selling the 11:59 mid-extension knife.
+        if after_fb:
+            _hi_start = dtime(10, 45)
+            _hi_thresh = 0.85 if current_time < dtime(12, 15) else 0.80
+        elif after_extreme:
+            _hi_start = dtime(12, 0)
+            _hi_thresh = 0.90 if current_time < dtime(12, 15) else 0.80
+        else:
+            _hi_start = dtime(12, 15)
+            _hi_thresh = 0.80
         if (current_time >= _hi_start and current_time <= dtime(14, 0)
                 and pos >= _hi_thresh):
             signals["afternoon_high_fade"] = True
             signals["final_regime"] = "PREMIUM_SELL_BEAR"
             signals["weekly_range_size_discount"] = 0.90
             return
-        # Low fade: morning window, plus after-FB extreme ≤0.15.
+        # Low fade: morning window, plus after-extreme ≤0.15.
         if current_time >= dtime(10, 50) and current_time < dtime(12, 15):
-            _lo_thresh = 0.15 if after_fb else 0.22
+            _lo_thresh = 0.15 if after_extreme else 0.22
             if pos <= _lo_thresh:
                 signals["afternoon_low_fade"] = True
                 signals["final_regime"] = "PREMIUM_SELL_BULL"
@@ -895,23 +930,19 @@ class StrategyEngine:
             if _lean:
                 self.logger.info(f"Range resolution: {_lean_reason}")
                 return BEAR_CALL_SPREAD
-            # PATCH_V29: after FB on a two-way weekly, IC is banned
-            # (V28). If we somehow still land here at a day extreme
-            # without the fade flag (race / mid-cycle), prefer the
-            # directional vertical over a doomed condor selection.
-            _after_fb = bool(
-                self.market_engine.state.get("last_exit_is_failed_break_scalp")
-            )
-            if _after_fb and int(dte or -1) >= 2:
+            # PATCH_V29/V30: after an extreme scalp on a two-way weekly,
+            # IC is banned (V28). Prefer the directional vertical at the
+            # day extreme over a doomed condor selection.
+            if self._after_two_way_extreme_scalp() and int(dte or -1) >= 2:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
                 if _rng >= 100.0 and _loc >= 0.85:
                     self.logger.info(
-                        "Range resolution: after_fb_extreme_high_prefer_bear_call"
+                        "Range resolution: after_extreme_high_prefer_bear_call"
                     )
                     return BEAR_CALL_SPREAD
                 if _rng >= 100.0 and _loc <= 0.15:
                     self.logger.info(
-                        "Range resolution: after_fb_extreme_low_prefer_bull_put"
+                        "Range resolution: after_extreme_low_prefer_bull_put"
                     )
                     return BULL_PUT_SPREAD
             return IRON_CONDOR
@@ -1625,28 +1656,52 @@ class StrategyEngine:
 
         if (signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")) and short_dist is not None:
             try:
+                # PATCH_V30/V31: pin the fade short beyond the tested
+                # extreme by cushion, then bump ONE step away only when
+                # nearest rounding leaves the short inside the proximity
+                # stop band. Blind ceil (V30) pushed 10-Sep from SC23550
+                # (+₹2,261) to SC23600 (+₹2,046). Blind round left 17-Sep
+                # 12:08 on SC23400 and the 40-pt stop ate the day. On an
+                # open-spike wick, wall is the post-open extreme (V27),
+                # not the unretested open print.
                 _fd_spot = float(signals.get("spot") or 0.0)
                 _fd_cush = max(float(step), 80.0)
+                _prox = max(
+                    float(getattr(self.config, "spot_proximity_pts", 40) or 40),
+                    float(step),
+                )
+                _, _, _eff_hi, _eff_lo, _ = self._fade_range_pos(signals)
                 if strategy_name == BEAR_CALL_SPREAD:
-                    _wall = max(
-                        float(signals.get("day_high_so_far") or 0.0),
-                        float(signals.get("or_high") or 0.0),
-                        _fd_spot,
-                    )
+                    # Open-spike OR/day high is an unretested wick (10-Sep
+                    # 23494.95). Pinning the short beyond that wick forces
+                    # SC23600 and donates ~₹215 of credit vs fading the
+                    # post-open lower high (~23472 → SC23550).
+                    _wall = max(float(_eff_hi or 0.0), _fd_spot)
+                    if not bool(signals.get("day_high_is_open_spike")):
+                        _wall = max(
+                            _wall, float(signals.get("or_high") or 0.0)
+                        )
                     if _wall > 0:
                         _want = int(round((_wall + _fd_cush) / step) * step)
+                        # Bump only when nearest short sits inside the
+                        # proximity band (+ small wick buffer). prox+step
+                        # (90) still forced 10-Sep SC23600; prox+25 keeps
+                        # SC23550 there while lifting 17-Sep SC23400→23450.
+                        if (_want - _wall) < (_prox + 25.0):
+                            _want = int(_want + step)
                         _dcall = max(_want - float(_center_ref), float(step))
                         short_dist = (int(_dcall), int(short_dist[1]))
                 elif strategy_name == BULL_PUT_SPREAD:
-                    _wall = min(
-                        x for x in (
-                            float(signals.get("day_low_so_far") or 0.0),
-                            float(signals.get("or_low") or 0.0),
-                            _fd_spot if _fd_spot > 0 else 1e12,
-                        ) if x > 0
-                    )
+                    _cands = [float(_eff_lo or 0.0), _fd_spot]
+                    if not bool(signals.get("day_low_is_open_spike")):
+                        _cands.append(float(signals.get("or_low") or 0.0))
+                    _wall = min(x for x in _cands if x > 0) if any(
+                        x > 0 for x in _cands
+                    ) else 0.0
                     if _wall > 0:
                         _want = int(round((_wall - _fd_cush) / step) * step)
+                        if (_wall - _want) < (_prox + 25.0):
+                            _want = int(_want - step)
                         _dput = max(float(_center_ref) - _want, float(step))
                         short_dist = (int(short_dist[0]), int(_dput))
             except (TypeError, ValueError):
@@ -4411,12 +4466,33 @@ class StrategyEngine:
             return None
         if "two_way_wait" in str(block_reason or ""):
             return None
+        # PATCH_V30: after a protective stop on a credit vertical, do not
+        # chase with long premium on the same session — 17-Sep bought a
+        # LONG_CALL at 13:04 after the bear-call proximity stop and lost
+        # the day into the dump.
+        try:
+            _pri = int(self.market_engine.state.get("last_exit_priority") or 0)
+        except (TypeError, ValueError):
+            _pri = 0
+        if _pri in (1, 2, 3) and float(
+            self.market_engine.state.get("last_exit_pnl_rs") or 0.0
+        ) < 0.0:
+            _rng, _, _, _ = self._session_range_pos(signals)
+            if _rng >= 100.0:
+                return None
         try:
             ok, why, direction = self._momentum_gate(signals, block_reason)
         except Exception as exc:                      # never lose the day to
             self.logger.warning(f"momentum gate failed: {exc}")  # a new code path
             return None
         if not ok:
+            return None
+        # PATCH_V30: never buy calls while the engine is in a bear-credit
+        # regime (or puts in a bull-credit regime).
+        _final = str(signals.get("final_regime") or "")
+        if direction > 0 and _final == "PREMIUM_SELL_BEAR":
+            return None
+        if direction < 0 and _final == "PREMIUM_SELL_BULL":
             return None
 
         # PATCH_V13: the gate tags which route opened - the morning breakout
