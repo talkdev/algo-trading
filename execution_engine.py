@@ -2374,6 +2374,8 @@ class ExecutionEngine:
                 self.market_engine.state["_closing_failed_break_scalp"] = True
                 if bool(_fb_raw.get("afternoon_low_fade")):
                     self.market_engine.state["_closing_afternoon_low_fade"] = True
+                if bool(_fb_raw.get("afternoon_high_fade")):
+                    self.market_engine.state["_closing_afternoon_high_fade"] = True
                 self.logger.info(
                     f"PATCH_V25 FAILED_BREAK_SCALP: {position.get('strategy_name')} "
                     f"liq={liq_premium:.2f} tgt={_fb_tgt:.2f} held={_held_fb:.0f}m "
@@ -3108,10 +3110,16 @@ class ExecutionEngine:
         # PATCH_V25: remember FB scalp close so range condor can re-enter.
         # A two-way low fade is harvested the same way but must NOT unlock
         # a weekly condor (17-Sep: 11:40 IC then scratched into the high).
+        # PATCH_V30: still remember the low/high fade so the opposite
+        # extreme fade can unlock early without unlocking the IC.
         _fb_closed = bool(state.pop("_closing_failed_break_scalp", False))
         _low_fade_closed = bool(state.pop("_closing_afternoon_low_fade", False))
+        _high_fade_closed = bool(state.pop("_closing_afternoon_high_fade", False))
         state["last_exit_is_afternoon_low_fade"] = _low_fade_closed
-        state["last_exit_is_failed_break_scalp"] = _fb_closed and not _low_fade_closed
+        state["last_exit_is_afternoon_high_fade"] = _high_fade_closed
+        state["last_exit_is_failed_break_scalp"] = (
+            _fb_closed and not _low_fade_closed and not _high_fade_closed
+        )
         state["last_exit_is_stale_weekly"] = bool(
             state.pop("_closing_stale_weekly", False)
         )
