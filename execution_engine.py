@@ -15,7 +15,7 @@ from typing import Optional, List, Tuple, Dict
 
 from core import (
     Config, Database,
-    ExpiryCalendar, now_ist, today_ist,
+    ExpiryCalendar, now_ist, today_ist, parse_ist_timestamp,
     print_section, print_kv_table,
     load_config, setup_logging,
     RateLimiter, UpstoxClient,
@@ -2270,6 +2270,50 @@ class ExecutionEngine:
                     "stop_premium": stop_premium,
                 }
 
+        # ── PATCH_V25: failed-LOW scalp harvest ──────────────────────────
+        # Take 15% of credit, or 2x round-trip once 70 minutes are up.
+        # Measured 2026-09-16: +9.8 pts by ~10:50, leftover if held to EOD.
+        _fb_raw = {}
+        try:
+            _fb_raw = json.loads(position.get("raw_params_json") or "{}")
+        except Exception:
+            _fb_raw = {}
+        _is_fb_scalp = bool(_fb_raw.get("failed_break_scalp"))
+        if _is_fb_scalp and entry_credit > 0:
+            _fb_pct = float(getattr(self.config, "failed_break_target_pct", 0.15) or 0.15)
+            _fb_pct = min(max(_fb_pct, 0.10), 0.28)
+            _fb_tgt = entry_credit * (1.0 - _fb_pct)
+            _held_fb = 0.0
+            try:
+                _et_fb = parse_ist_timestamp(position.get("entry_time"))
+                if _et_fb is not None:
+                    _held_fb = (now_ist() - _et_fb).total_seconds() / 60.0
+            except Exception:
+                _held_fb = 0.0
+            _max_hold_fb = float(_fb_raw.get("max_hold_min") or
+                                 getattr(self.config, "failed_break_max_hold_min", 70)
+                                 or 70)
+            _rt_fb = self._round_trip_cost_pts(open_legs, chain)
+            _ach_fb = entry_credit - liq_premium
+            _harvest = liq_premium <= _fb_tgt
+            if (not _harvest) and _held_fb >= _max_hold_fb:
+                _harvest = _ach_fb >= max(2.0 * _rt_fb, 0.08 * entry_credit)
+            if (not _harvest) and _held_fb >= (_max_hold_fb + 20.0):
+                _harvest = liq_premium <= (entry_credit + _rt_fb)
+            if _harvest:
+                self.market_engine.state["_closing_failed_break_scalp"] = True
+                self.logger.info(
+                    f"PATCH_V25 FAILED_BREAK_SCALP: {position.get('strategy_name')} "
+                    f"liq={liq_premium:.2f} tgt={_fb_tgt:.2f} held={_held_fb:.0f}m "
+                    f"ach={_ach_fb:.2f}pts"
+                )
+                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                    "current_premium": current_premium,
+                    "liquidation_premium": liq_premium,
+                    "target_premium": _fb_tgt,
+                    "reason_detail": "failed_break_scalp_harvest",
+                }
+
         # ── Priority 4: Profit lock ───────────────────────────────────────
         # Move stop to breakeven when profit reaches threshold
         # v10 [T2]: set when the trail is armed/ratcheted on THIS cycle; the
@@ -2988,6 +3032,11 @@ class ExecutionEngine:
             _xspot = 0.0
         if _xspot > 0:
             state["last_exit_spot"] = _xspot
+
+        # PATCH_V25: remember FB scalp close so range condor can re-enter.
+        state["last_exit_is_failed_break_scalp"] = bool(
+            state.pop("_closing_failed_break_scalp", False)
+        )
 
         # ── PATCH_V13: a protective exit that BANKS profit is not a stop ──
         # The ratcheted profit lock and an in-the-money price stop both come

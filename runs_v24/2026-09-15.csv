@@ -1,0 +1,2 @@
+trading_date,strategy,regime,confidence,dte,entry_time,exit_time,lots,entry_credit,exit_debit,gross_pts,costs_rs,pnl_rs,exit_reason,exit_priority,entry_spot,exit_spot,strikes,wing,held_min
+2026-09-15,LONG_PUT,PREMIUM_SELL_BEAR,MEDIUM,0,10:57:15,14:15:06,2,-66.2,-131.21,65.01,83.84,8367.46,momentum_flat_before_close,6,23331.5,23225.0,BP23350,,197
