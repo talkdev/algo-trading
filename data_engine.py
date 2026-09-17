@@ -622,6 +622,7 @@ class MarketDataEngine:
                 "_prev_close_for_gap", "_straddle_hist",
                 "rv_anchor_pct", "rv_anchor_date", "first_bar_close",
                 "last_exit_is_failed_break_scalp",
+                "last_exit_is_stale_weekly",
             ):
                 if _k not in data:
                     continue

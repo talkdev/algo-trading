@@ -2197,7 +2197,16 @@ class ExecutionEngine:
                 or (_flip_name == "BULL_PUT_SPREAD" and
                     _flip_px in ("DOWNTREND", "STRONG_DOWNTREND"))
             )
-            if (_flip_against and _flip_mat and _flip_adx >= 20.0
+            _flip_raw = {}
+            try:
+                _flip_raw = json.loads(position.get("raw_params_json") or "{}")
+            except Exception:
+                _flip_raw = {}
+            _flip_is_fade = bool(
+                _flip_raw.get("afternoon_high_fade")
+                or _flip_raw.get("afternoon_low_fade")
+            )
+            if (_flip_against and (not _flip_is_fade) and _flip_mat and _flip_adx >= 20.0
                     and entry_credit > 0
                     and liq_premium > entry_credit * 1.05
                     and _flip_hold_min >= 10.0):
@@ -2270,6 +2279,67 @@ class ExecutionEngine:
                     "stop_premium": stop_premium,
                 }
 
+        # PATCH_V26: scratch a weekly IC that is not capturing while the
+        # tape is printing a two-way afternoon extreme. Measured 17-Sep:
+        # IC +0.5pts at 11:30, -5pts at the 12:20 high, +4.6pts EOD
+        # (Rs 650). 16-Sep 12:20 spot was 60pts inside the range, so
+        # this does not fire.
+        try:
+            _sname = str(position.get("strategy_name") or "")
+            _sdte = int(actual_dte if actual_dte is not None else 0)
+            _held_stale = 0.0
+            try:
+                _et_raw = position.get("entry_time")
+                if _et_raw:
+                    _et_st = datetime.fromisoformat(str(_et_raw))
+                    _now_st = now_ist()
+                    if _et_st.tzinfo is None and _now_st.tzinfo is not None:
+                        _et_st = _et_st.replace(tzinfo=_now_st.tzinfo)
+                    elif _et_st.tzinfo is not None and _now_st.tzinfo is None:
+                        _now_st = _now_st.replace(tzinfo=_et_st.tzinfo)
+                    _held_stale = (_now_st - _et_st).total_seconds() / 60.0
+            except Exception:
+                _held_stale = 0.0
+            _min_hold_st = float(getattr(self.config, "stale_weekly_min_hold_min", 45) or 45)
+            _stale_after = dtime(12, 15)
+            try:
+                _stale_after = datetime.strptime(
+                    str(getattr(self.config, "stale_weekly_after_hhmm", "12:15")),
+                    "%H:%M",
+                ).time()
+            except Exception:
+                pass
+            _ach_st = (entry_credit - liq_premium) if entry_credit > 0 else 0.0
+            _need_st = entry_credit * float(
+                getattr(self.config, "stale_weekly_min_frac", 0.12) or 0.12)
+            _dh_st = float(signals.get("day_high_so_far") or 0.0)
+            _dl_st = float(signals.get("day_low_so_far") or 0.0)
+            _rng_st = (_dh_st - _dl_st) if (_dh_st > 0 and _dl_st > 0) else 0.0
+            _band_st = max(25.0, spot * 0.0010 if spot > 0 else 25.0)
+            _at_hi = _dh_st > 0 and spot >= _dh_st - _band_st
+            _at_lo = _dl_st > 0 and spot <= _dl_st + _band_st
+            if (
+                _sname == "IRON_CONDOR"
+                and _sdte >= 2
+                and _held_stale >= _min_hold_st
+                and current_time >= _stale_after
+                and _ach_st <= 0.5
+                and _rng_st >= 100.0
+                and (_at_hi or _at_lo)
+            ):
+                self.market_engine.state["_closing_stale_weekly"] = True
+                self.logger.info(
+                    f"PATCH_V26 STALE_WEEKLY_SCRATCH: {_sname} held={_held_stale:.0f}m "
+                    f"ach={_ach_st:.2f} need={_need_st:.2f} spot={spot:.0f}"
+                )
+                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                    "current_premium": current_premium,
+                    "liquidation_premium": liq_premium,
+                    "reason_detail": "stale_weekly_credit_scratch",
+                }
+        except Exception as _stale_exc:
+            self.logger.debug(f"stale weekly check skipped: {_stale_exc}")
+
         # ── PATCH_V25: failed-LOW scalp harvest ──────────────────────────
         # Take 15% of credit, or 2x round-trip once 70 minutes are up.
         # Measured 2026-09-16: +9.8 pts by ~10:50, leftover if held to EOD.
@@ -2302,6 +2372,8 @@ class ExecutionEngine:
                 _harvest = liq_premium <= (entry_credit + _rt_fb)
             if _harvest:
                 self.market_engine.state["_closing_failed_break_scalp"] = True
+                if bool(_fb_raw.get("afternoon_low_fade")):
+                    self.market_engine.state["_closing_afternoon_low_fade"] = True
                 self.logger.info(
                     f"PATCH_V25 FAILED_BREAK_SCALP: {position.get('strategy_name')} "
                     f"liq={liq_premium:.2f} tgt={_fb_tgt:.2f} held={_held_fb:.0f}m "
@@ -3034,8 +3106,14 @@ class ExecutionEngine:
             state["last_exit_spot"] = _xspot
 
         # PATCH_V25: remember FB scalp close so range condor can re-enter.
-        state["last_exit_is_failed_break_scalp"] = bool(
-            state.pop("_closing_failed_break_scalp", False)
+        # A two-way low fade is harvested the same way but must NOT unlock
+        # a weekly condor (17-Sep: 11:40 IC then scratched into the high).
+        _fb_closed = bool(state.pop("_closing_failed_break_scalp", False))
+        _low_fade_closed = bool(state.pop("_closing_afternoon_low_fade", False))
+        state["last_exit_is_afternoon_low_fade"] = _low_fade_closed
+        state["last_exit_is_failed_break_scalp"] = _fb_closed and not _low_fade_closed
+        state["last_exit_is_stale_weekly"] = bool(
+            state.pop("_closing_stale_weekly", False)
         )
 
         # ── PATCH_V13: a protective exit that BANKS profit is not a stop ──
