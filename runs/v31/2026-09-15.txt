@@ -1,0 +1,141 @@
+
+══════════════════════════════════════════════════════════════════════════════
+REPLAYING 1 SESSION(S): 2026-09-15 .. 2026-09-15
+══════════════════════════════════════════════════════════════════════════════
+  per-trade console report : each_cycle  (--trade-report=on_change for a quiet run)
+
+
+══════════════════════════════════════════════════════════════════════════════
+BACKTEST RESULT
+══════════════════════════════════════════════════════════════════════════════
+  sessions replayed : 1
+  engine cycles     : 1,499
+  entry decisions   : 1,499
+  fill model        : edge=0.25 stress=0.50
+  capital           : Rs 1,000,000
+
+  NO TRADES TAKEN.
+
+  That is a result, not a failure of the harness. The rejection
+  census below says which gate was responsible. If one gate accounts
+  for most of it, that is the number to examine first - and it is
+  now a measurement rather than an opinion.
+
+──────────────────────────────────────────────────────────────────────────────
+SESSION PARITY  (what the live capture recorded vs this replay)
+──────────────────────────────────────────────────────────────────────────────
+  session      field              recorded      replay   what it is
+  --------------------------------------------------------------------------------------
+  2026-09-15   day_mode          PRE_EVENT      NORMAL   EVENT / PRE_EVENT / NORMAL from high_impact_events.json
+  2026-09-15   (stamp)         2026-09-15 15:34:50               recorded row was written outside the session; compared end-of-day
+  --------------------------------------------------------------------------------------
+  !! 2026-09-15: recorded PRE_EVENT, replayed NORMAL. day_mode is not a
+     parameter, it is a RULE SET - EVENT turns on
+     defined_risk_only and allows a RANGE verdict at HIGH
+     confidence and nothing else. high_impact_events.json
+     is hand-edited and is NOT recorded with the session,
+     so this replay did not offer itself the same trades
+     the live run was offered. Nothing in the P&L above
+     can be attributed to the strategy until the event
+     calendar for that date is settled.
+
+──────────────────────────────────────────────────────────────────────────────
+ENTRY FUNNEL  (gates in the order decide() applies them)
+──────────────────────────────────────────────────────────────────────────────
+  A late gate only ever sees what the earlier gates let through, so
+  its share of all cycles understates it. Read the pass rate.
+
+  stage                 blocked  reached   passed  pass rate   top gate
+  ----------------------------------------------------------------------------------------
+  safety interlocks          17     1499     1482        99%   day_move (17)
+  entry window              347     1482     1135        77%   entry_window (347)
+  position limits             0     1135     1135       100%   -
+  contract / DTE              0     1135     1135       100%   -
+  regime verdict            408     1135      727        64%   PAST_14:30 (243)
+  strategy selection          0      727      727       100%   -
+  counter-trend symmetry        0      727      727       100%   -
+  structure rules             0      727      727       100%   -
+  structure build           426      727      301        41%   credit_risk_ratio (426)
+  EV gate                    96      301      205        68%   ev_gate (96)
+  ----------------------------------------------------------------------------------------
+  ENTERED                                       0
+
+  !! 205 rejection(s) from gates this tool cannot place in the chain:
+       ADX_IMMATURE_NO_DIRECTIONAL_CREDIT  (197)
+       RANGE_WIDE_OR_VERY_WIDE_NO_TRADE  (8)
+     Their position in the funnel above is therefore unknown,
+     and the stage totals exclude them. Add them to STAGE_ORDER.
+
+  NEAR-MISS MARGINS  (how far short, when the reason says)
+  --------------------------------------------------------------------------
+  gate                                   n     median       best
+  credit_risk_ratio                    426       0.06       0.00
+  ev_gate                               96       3.87       2.28
+
+  A gate missing by a hair on most cycles is mis-calibrated.
+  A gate missing by a mile is telling you the trade was not there.
+
+  EPISODES  (contiguous runs - the honest sample size)
+  --------------------------------------------------------------------------
+  gate                                 cycles   episodes   cycles/ep
+  credit_risk_ratio                       426         11          39
+  entry_window                            347          3         116
+  PAST_14:30                              243          1         243
+  ADX_IMMATURE_NO_DIRECTIONAL_CREDIT      197          2          98
+  ev_gate                                  96          3          32
+  or_not_established                       74          1          74
+  STRADDLE_EXPLOSION                       47          3          16
+  BEFORE_09:45                             44          1          44
+
+  Treat 'episodes', not 'cycles', as n when judging significance.
+
+──────────────────────────────────────────────────────────────────────────────
+EV DECOMPOSITION  (median of 96 rejected candidates)
+──────────────────────────────────────────────────────────────────────────────
+  Which term is actually killing expected value.
+
+  term                        probability     points   contribution
+  ------------------------------------------------------------------
+  reward (target hit)               0.468      10.28          +4.81
+  stop loss                         0.383       9.27          -3.55
+  tail (stop jumped)                0.149      31.85          -4.75
+  round-trip friction                           0.52          -0.52
+  ------------------------------------------------------------------
+  EXPECTED VALUE                                              -4.00   (engine: -3.39)
+  required minimum                                            +0.46
+
+  Largest drag: TAIL at -4.75 pts.
+
+  This is the engine's OPINION of these trades, not their outcome.
+  Only replaying the rejected structures can say if it was right.
+
+──────────────────────────────────────────────────────────────────────────────
+REJECTION CENSUS  (why entries did not happen)
+──────────────────────────────────────────────────────────────────────────────
+  gate                                     count   share   example
+  --------------------------------------------------------------------------
+  credit_risk_ratio                          426   28.4%   params_invalid:credit_risk_ratio_0.147_below_min_0.151
+  entry_window                               347   23.1%   past_entry_window_13:00:00
+  PAST_14:30                                 243   16.2%   NO_TRADE:PAST_14:30
+  ADX_IMMATURE_NO_DIRECTIONAL_CREDIT         197   13.1%   NO_TRADE:ADX_IMMATURE_NO_DIRECTIONAL_CREDIT
+  ev_gate                                     96    6.4%   params_invalid:ev_gate:ev_-1.88pts_below_min_0.42pts(p_win=0.57,p_tail
+  or_not_established                          74    4.9%   NO_TRADE:OR_NOT_ESTABLISHED
+  STRADDLE_EXPLOSION                          47    3.1%   NO_TRADE:STRADDLE_EXPLOSION
+  BEFORE_09:45                                44    2.9%   NO_TRADE:BEFORE_09:45
+  day_move                                    17    1.1%   day_move_used_268pct_of_opening_straddle_no_edge
+  RANGE_WIDE_OR_VERY_WIDE_NO_TRADE             8    0.5%   RANGE_WIDE_OR_VERY_WIDE_NO_TRADE
+
+══════════════════════════════════════════════════════════════════════════════
+
+  HOW TO READ THIS
+  ----------------
+  * Fills are modelled, not observed. Nothing here includes partial fills,
+    rejections or latency, and the simulated monitoring loop is only as fast
+    as the recorded snapshot cadence - a stop hit and recovered between two
+    snapshots is invisible. Both of those bias the result OPTIMISTIC.
+  * If you tuned any threshold while looking at these dates, this is an
+    in-sample number and it is not evidence. Re-run on dates you have not
+    looked at.
+  * The rejection census is the actionable half of this report.
+
+  trade blotter -> runs\v31\2026-09-15.csv
