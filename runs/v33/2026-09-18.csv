@@ -1,3 +1,0 @@
-trading_date,strategy,regime,confidence,dte,entry_time,exit_time,lots,entry_credit,exit_debit,gross_pts,costs_rs,pnl_rs,exit_reason,exit_priority,entry_spot,exit_spot,strikes,wing,held_min
-2026-09-18,BULL_PUT_SPREAD,PREMIUM_SELL_BULL,NONE,2,11:05:15,11:53:37,5,25.11,20.84,4.27,166.75,1221.0,failed_break_scalp_harvest,6,23297.3,23322.6,SP23200/BP23100,100.0,48
-2026-09-18,BEAR_CALL_SPREAD,PREMIUM_SELL_BEAR,HIGH,2,12:36:28,13:36:52,5,25.91,23.13,2.78,147.62,755.88,END_OF_DATA_FORCED_FLAT,7,23331.2,23321.2,SC23450/BC23550,100.0,60
