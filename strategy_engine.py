@@ -367,6 +367,21 @@ class StrategyEngine:
                             _extreme_done and _fade_next
                             and _moved >= max(25.0, 0.40 * _need)
                         )
+                        # PATCH_V33: after 12:15, an opposite extreme fade
+                        # on a confirmed two-way/fade scalp is location-
+                        # defined. 18-Sep printed fade_hi from 12:36 with
+                        # only +7–10pts from the low-fade exit and waited
+                        # until the 45-min reconfirm clock (12:38). Sep17
+                        # knife-catch at 11:59 stays gated (pre-12:15).
+                        _opp_pm_ok = False
+                        try:
+                            _now_t = current_time
+                            if (_extreme_done and _fade_next
+                                    and _now_t >= dtime(12, 15)
+                                    and _moved >= max(8.0, 0.20 * _need)):
+                                _opp_pm_ok = True
+                        except Exception:
+                            _opp_pm_ok = False
                         # OPT_V32: SAME-side extreme re-entry (e.g. 16-Sep
                         # second high-fade) — location still at the edge
                         # IS the material change; do not wait a full 28pts.
@@ -393,6 +408,7 @@ class StrategyEngine:
                                 or (_fb_only and _fade_next)
                                 or (_stale_done and _fade_next)
                                 or _two_way_fade_ok
+                                or _opp_pm_ok
                                 or _same_side_extreme):
                             return "NO_TRADE", (
                                 f"no_material_change_since_exit_{_moved:.0f}pts_"
@@ -511,7 +527,13 @@ class StrategyEngine:
             return "NO_TRADE", "expiry_day_waiting_for_0dte_series_listed"
 
         confidence = signals.get("confidence_level", "NONE")
-        if confidence in ("LOW", "NONE"):
+        # PATCH_V33: extreme location fades carry their own edge (18-Sep
+        # 11:05 live entered on CHOPPY+MEDIUM; replay printed NONE and
+        # refused). Do not let a stale confidence label ban the fade.
+        _loc_fade = bool(
+            signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
+        )
+        if confidence in ("LOW", "NONE") and not _loc_fade:
             return "NO_TRADE", f"confidence_{confidence}_insufficient_edge_after_costs"
 
         # PATCH_V14: one ceiling, read from MAX_DTE_TRADEABLE, shared with

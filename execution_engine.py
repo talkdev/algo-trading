@@ -3063,6 +3063,23 @@ class ExecutionEngine:
         except Exception as e:
             self.logger.debug(f"Exit quality log error: {e}")
 
+        # PATCH_V33: ANY close of a fade ticket (target, stop, harvest)
+        # must remember the fade so the opposite extreme can unlock.
+        # 18-Sep live banked the low-fade via CLOSE_TARGET (priority 6);
+        # only the failed-break harvest path tagged the fade, so the
+        # high-fade sat behind material_change until the 45-min clock
+        # expired at 12:38 — 35 minutes of dead zone at the day high.
+        try:
+            _rp = json.loads(position.get("raw_params_json") or "{}")
+        except Exception:
+            _rp = {}
+        if bool(_rp.get("afternoon_low_fade")
+                or position.get("afternoon_low_fade")):
+            self.market_engine.state["_closing_afternoon_low_fade"] = True
+        if bool(_rp.get("afternoon_high_fade")
+                or position.get("afternoon_high_fade")):
+            self.market_engine.state["_closing_afternoon_high_fade"] = True
+
         # ── Update session state ──────────────────────────────────────────
         self._update_state_after_close(reason, net_pnl_rs, priority)
 
