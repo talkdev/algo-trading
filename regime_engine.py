@@ -1662,6 +1662,11 @@ class RegimeClassifier:
         # at the day high and those hard blocks either banned selling
         # or fell through to a bull put — the wrong side of a 160pt
         # two-way tape.
+        #
+        # PATCH_V31: on a confirmed two-way / wide swing day, fade the
+        # tested extreme from 10:45 (not only 12:15). CHOPPY OR
+        # wick-throughs ARE the two-way signal — convert them to a
+        # location fade at the edge instead of a hard NO_TRADE.
         try:
             _fade_t = current_time
             _fade_start = datetime.strptime(
@@ -1675,73 +1680,143 @@ class RegimeClassifier:
             _dte_fade = int(dte) if dte is not None else -1
         except (TypeError, ValueError):
             _dte_fade = -1
-        if (1 <= _dte_fade <= 4 and _fade_t >= _fade_start
+        try:
+            _raw_h = float(signals.get("day_high_so_far") or 0.0)
+            _raw_l = float(signals.get("day_low_so_far") or 0.0)
+            _fh, _fl = _raw_h, _raw_l
+            _poh = float(signals.get("post_open_high_so_far") or 0.0)
+            _pol = float(signals.get("post_open_low_so_far") or 0.0)
+            _gap = float(
+                getattr(self.config, "open_spike_min_gap_pts", 15.0) or 15.0
+            )
+            _spike = bool(signals.get("day_high_is_open_spike")) or bool(
+                signals.get("day_low_is_open_spike")
+            )
+            if (
+                bool(signals.get("day_high_is_open_spike"))
+                or (_poh > 0 and _raw_h > 0 and (_raw_h - _poh) >= _gap)
+            ) and _poh > 0:
+                _fh = _poh
+            if (
+                bool(signals.get("day_low_is_open_spike"))
+                or (_pol > 0 and _raw_l > 0 and (_pol - _raw_l) >= _gap)
+            ) and _pol > 0:
+                _fl = _pol
+            _fspot = float(spot or 0.0)
+            if _fspot > 0:
+                if _fh > 0:
+                    _fh = max(_fh, _fspot)
+                if _fl > 0:
+                    _fl = min(_fl, _fspot)
+            _raw_rng = (_raw_h - _raw_l) if (_raw_h > 0 and _raw_l > 0) else 0.0
+            _frng = (_fh - _fl) if (_fh > 0 and _fl > 0) else 0.0
+            _fpos = ((_fspot - _fl) / _frng) if _frng > 0 else 0.5
+            try:
+                _floor = float(
+                    getattr(self.config, "open_spike_fade_min_range_pts", 70.0)
+                    or 70.0
+                ) if _spike else 100.0
+            except (TypeError, ValueError):
+                _floor = 70.0 if _spike else 100.0
+            # Two-way: BOTH OR sides poked, or CHOPPY on a wide day.
+            # Do NOT treat a one-way 120pt trend day as two-way (15-Sep).
+            _or_h = float(signals.get("or_high") or 0.0)
+            _or_l = float(signals.get("or_low") or 0.0)
+            _both = False
+            if _or_h > _or_l > 0 and _raw_h > 0 and _raw_l > 0:
+                _poke = max(15.0, 0.25 * (_or_h - _or_l))
+                _both = (_raw_h >= _or_h + _poke) and (_raw_l <= _or_l - _poke)
+            _two_way = bool(
+                _raw_rng >= min(_floor, 85.0)
+                and (_both or (bool(signals.get("choppy_detected"))
+                               and _raw_rng >= 100.0))
+            )
+            if _two_way:
+                signals["two_way_auction"] = True
+                _floor = min(_floor, float(
+                    getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
+                ))
+        except (TypeError, ValueError, ZeroDivisionError):
+            _fh = _fl = _fspot = _frng = _raw_rng = 0.0
+            _fpos = 0.5
+            _floor = 100.0
+            _two_way = False
+            _spike = False
+
+        # Earlier fade window on two-way tapes (professional NIFTY book).
+        if _two_way and 0 <= _dte_fade <= 4:
+            _fade_start = time(10, 45)
+
+        if (0 <= _dte_fade <= 4 and _fade_t >= _fade_start
                 and _fade_t <= time(14, 0)
                 and not bool(event_day)
                 and vol != VolatilityRegime.ABORT):
-            try:
-                # PATCH_V27: raw-range eligibility (70pt floor on open spike),
-                # post-open location for unretested lower highs (10-Sep).
-                _raw_h = float(signals.get("day_high_so_far") or 0.0)
-                _raw_l = float(signals.get("day_low_so_far") or 0.0)
-                _fh, _fl = _raw_h, _raw_l
-                _poh = float(signals.get("post_open_high_so_far") or 0.0)
-                _pol = float(signals.get("post_open_low_so_far") or 0.0)
-                _gap = float(
-                    getattr(self.config, "open_spike_min_gap_pts", 15.0) or 15.0
-                )
-                _spike = bool(signals.get("day_high_is_open_spike")) or bool(
-                    signals.get("day_low_is_open_spike")
-                )
-                if (
-                    bool(signals.get("day_high_is_open_spike"))
-                    or (_poh > 0 and _raw_h > 0 and (_raw_h - _poh) >= _gap)
-                ) and _poh > 0:
-                    _fh = _poh
-                if (
-                    bool(signals.get("day_low_is_open_spike"))
-                    or (_pol > 0 and _raw_l > 0 and (_pol - _raw_l) >= _gap)
-                ) and _pol > 0:
-                    _fl = _pol
-                _fspot = float(spot or 0.0)
-                if _fspot > 0:
-                    if _fh > 0:
-                        _fh = max(_fh, _fspot)
-                    if _fl > 0:
-                        _fl = min(_fl, _fspot)
-                _raw_rng = (_raw_h - _raw_l) if (_raw_h > 0 and _raw_l > 0) else 0.0
-                _frng = (_fh - _fl) if (_fh > 0 and _fl > 0) else 0.0
-                _fpos = ((_fspot - _fl) / _frng) if _frng > 0 else 0.5
-                try:
-                    _floor = float(
-                        getattr(self.config, "open_spike_fade_min_range_pts", 70.0)
-                        or 70.0
-                    ) if _spike else 100.0
-                except (TypeError, ValueError):
-                    _floor = 70.0 if _spike else 100.0
-            except (TypeError, ValueError, ZeroDivisionError):
-                _fh = _fl = _fspot = _frng = _raw_rng = 0.0
-                _fpos = 0.5
-                _floor = 100.0
             if _raw_rng >= _floor and _fspot > 0 and conf != ConfidenceLevel.NONE:
-                if _fpos >= 0.80:
+                _hi_th = 0.80
+                _lo_th = 0.20
+                if _two_way and _fade_t < time(12, 15):
+                    _hi_th = 0.85
+                    _lo_th = 0.20
+                if _fpos >= _hi_th:
                     signals["afternoon_high_fade"] = True
-                    signals["weekly_range_size_discount"] = 0.90
+                    signals["weekly_range_size_discount"] = 1.0
                     return (
                         FinalRegime.PREMIUM_SELL_BEAR,
                         f"AFTERNOON_DAY_HIGH_FADE_DTE{_dte_fade}",
                         False,
                     )
-                if _fpos <= 0.20:
-                    signals["afternoon_low_fade"] = True
-                    signals["weekly_range_size_discount"] = 0.90
-                    return (
-                        FinalRegime.PREMIUM_SELL_BULL,
-                        f"AFTERNOON_DAY_LOW_FADE_DTE{_dte_fade}",
-                        False,
-                    )
+                if _fpos <= _lo_th:
+                    # Low fades are a morning product (≤12:15). After lunch
+                    # the bearish lean / high-fade book owns the tape;
+                    # strategy_engine unlocks a post-scalp low fade only.
+                    if _fade_t >= time(12, 15):
+                        pass
+                    else:
+                        _gap_dir = str(signals.get("gap_direction") or "")
+                        _pc = float(signals.get("prev_close") or 0.0)
+                        _dh = float(signals.get("day_high_so_far") or 0.0)
+                        if _gap_dir == "DOWN" and _pc > 0 and _dh > 0 and _dh < _pc:
+                            pass
+                        else:
+                            signals["afternoon_low_fade"] = True
+                            signals["weekly_range_size_discount"] = 1.0
+                            return (
+                                FinalRegime.PREMIUM_SELL_BULL,
+                                f"AFTERNOON_DAY_LOW_FADE_DTE{_dte_fade}",
+                                False,
+                            )
 
         if price == PriceRegime.CHOPPY:
+            # PATCH_V31: CHOPPY at a day extreme on a two-way auction is
+            # the fade setup, not a stand-aside. Mid-range chop still
+            # blocks — that is where premium sellers get chopped up.
+            if (_two_way and _fspot > 0 and conf != ConfidenceLevel.NONE
+                    and _fade_t <= time(14, 0) and 0 <= _dte_fade <= 4
+                    and not bool(event_day)
+                    and vol != VolatilityRegime.ABORT):
+                if _fpos >= 0.80:
+                    signals["afternoon_high_fade"] = True
+                    signals["weekly_range_size_discount"] = 1.0
+                    return (
+                        FinalRegime.PREMIUM_SELL_BEAR,
+                        f"TWO_WAY_CHOPPY_HIGH_FADE_DTE{_dte_fade}",
+                        False,
+                    )
+                if _fpos <= 0.20:
+                    # PATCH_V31d: gap-down structure vetoes choppy low fades.
+                    _gap_dir = str(signals.get("gap_direction") or "")
+                    _pc = float(signals.get("prev_close") or 0.0)
+                    _dh = float(signals.get("day_high_so_far") or 0.0)
+                    if _gap_dir == "DOWN" and _pc > 0 and _dh > 0 and _dh < _pc:
+                        pass
+                    else:
+                        signals["afternoon_low_fade"] = True
+                        signals["weekly_range_size_discount"] = 1.0
+                        return (
+                            FinalRegime.PREMIUM_SELL_BULL,
+                            f"TWO_WAY_CHOPPY_LOW_FADE_DTE{_dte_fade}",
+                            False,
+                        )
             return FinalRegime.NO_TRADE, "NO_TRADE:CHOPPY_MARKET", False
 
         # ── Hard Block 3: Volatility blocks ───────────────────────────────
@@ -1820,11 +1895,15 @@ class RegimeClassifier:
 
         # PATCH_V24: ORB+VWAP must not mint UPTREND/DOWNTREND credit
         # while ADX is 0 (17-Sep 10:02 5-lot bull put, ADX=0).
+        # PATCH_V31: extreme fades already returned above; remaining
+        # directional credit still needs a measured ADX.
         if price in (
             PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
             PriceRegime.DOWNTREND, PriceRegime.STRONG_DOWNTREND,
         ):
-            if (not bool(signals.get("adx_15_mature", False))
+            if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+                pass  # location fade owns the book
+            elif (not bool(signals.get("adx_15_mature", False))
                     or float(signals.get("adx_15") or 0.0) <= 0.0):
                 return (
                     FinalRegime.NO_TRADE,
@@ -2529,7 +2608,8 @@ class RegimeClassifier:
         try:
             _wk = signals.get("weekly_range_size_discount")
             if _wk is not None:
-                conflict_reduction *= max(0.15, min(1.0, float(_wk)))
+                # OPT_V32: allow fade boosts up to 1.25x (was capped 1.0).
+                conflict_reduction *= max(0.15, min(1.25, float(_wk)))
                 conflict_reduction = max(round(conflict_reduction, 4), 0.15)
         except (TypeError, ValueError):
             pass

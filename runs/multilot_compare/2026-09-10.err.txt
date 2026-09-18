@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\algo-trading\runs\run_multilot_day.py", line 16, in <module>
+    raise SystemExit(be.main())
+                     ~~~~~~~^^
+  File "C:\Users\Administrator\Desktop\algo-trading\backtest_engine.py", line 2903, in main
+    config = load_config()
+  File "C:\Users\Administrator\Desktop\algo-trading\runs\run_multilot_day.py", line 8, in load_config
+    c.force_lots = None
+    ^^^^^^^^^^^^
+  File "<string>", line 248, in __setattr__
+dataclasses.FrozenInstanceError: cannot assign to field 'force_lots'

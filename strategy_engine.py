@@ -242,7 +242,17 @@ class StrategyEngine:
         if open_count >= self.config.max_concurrent_positions:
             return "NO_TRADE", "max_concurrent_positions_reached"
         if total_count >= self.config.max_entries_per_day:
-            return "NO_TRADE", f"max_entries_per_day_{total_count}_reached"
+            # OPT_V32: two-way auctions print multiple extreme fades;
+            # allow one extra ticket (cap 4) when the auction is live.
+            _tw_extra = (
+                bool(signals.get("two_way_auction"))
+                and int(self.config.max_entries_per_day) <= 3
+                and total_count < 4
+                and bool(signals.get("afternoon_high_fade")
+                         or signals.get("afternoon_low_fade"))
+            )
+            if not _tw_extra:
+                return "NO_TRADE", f"max_entries_per_day_{total_count}_reached"
         if open_count >= 1:
             return "NO_TRADE", "position_already_open_single_position_engine"
 
@@ -271,9 +281,14 @@ class StrategyEngine:
                     # PATCH_V25: after a failed-break scalp, the range
                     # condor is a DIFFERENT trade — do not wait 10 min.
                     # PATCH_V30: opposite-extreme fade after a true
-                    # failed-break also skips; low-fade→high-fade keeps
-                    # the clock (17-Sep needs the extension to settle).
+                    # failed-break also skips.
+                    # PATCH_V31: on a confirmed two-way auction, the
+                    # opposite extreme AFTER any extreme scalp is a new
+                    # trade (17-Sep 11:57→12:00 loc≥0.90 was blocked for
+                    # 7 min, then hit the velocity gate). Mid-range
+                    # still keeps the clock.
                     _fb_only = bool(state.get("last_exit_is_failed_break_scalp"))
+                    _extreme_done = self._after_two_way_extreme_scalp()
                     _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
                     _stale_done = bool(state.get("last_exit_is_stale_weekly"))
                     _fade_next = (
@@ -282,9 +297,16 @@ class StrategyEngine:
                         or (str(final_regime or "") == "PREMIUM_SELL_BULL"
                             and bool(signals.get("afternoon_low_fade")))
                     )
+                    _two_way_fade = (
+                        _extreme_done and _fade_next
+                        and bool(signals.get("two_way_auction")
+                                 or signals.get("afternoon_high_fade")
+                                 or signals.get("afternoon_low_fade"))
+                    )
                     if not ((_fb_only and _range_next)
                             or (_fb_only and _fade_next)
-                            or (_stale_done and _fade_next)):
+                            or (_stale_done and _fade_next)
+                            or _two_way_fade):
                         return "NO_TRADE", (
                             f"entry_cooldown_{ENTRY_COOLDOWN_MIN - mins:.0f}min_remaining"
                         )
@@ -324,11 +346,15 @@ class StrategyEngine:
                     if _moved < _need:
                         # PATCH_V25: same exemption as cooldown — scalp
                         # then range condor on a pinned tape.
-                        # PATCH_V30: opposite-extreme fade after extreme
-                        # scalp only when the tape has ALSO made a
-                        # material move (do not waive the move check for
-                        # low-fade→high-fade; 17-Sep 11:59 was +10pts).
+                        # PATCH_V30: opposite-extreme fade after FB/stale.
+                        # PATCH_V31c: after a low/high fade scalp, require
+                        # a real extension (40% of material move, floor
+                        # 25pts) before the opposite fade. Waiving on
+                        # location alone let 17-Sep enter at 11:59
+                        # (+₹367) instead of waiting for the 12:07
+                        # extension (+₹657).
                         _fb_only = bool(state.get("last_exit_is_failed_break_scalp"))
+                        _extreme_done = self._after_two_way_extreme_scalp()
                         _range_next = str(final_regime or "") == "PREMIUM_SELL_RANGE"
                         _stale_done = bool(state.get("last_exit_is_stale_weekly"))
                         _fade_next = (
@@ -337,9 +363,37 @@ class StrategyEngine:
                             or (str(final_regime or "") == "PREMIUM_SELL_BULL"
                                 and bool(signals.get("afternoon_low_fade")))
                         )
+                        _two_way_fade_ok = (
+                            _extreme_done and _fade_next
+                            and _moved >= max(25.0, 0.40 * _need)
+                        )
+                        # OPT_V32: SAME-side extreme re-entry (e.g. 16-Sep
+                        # second high-fade) — location still at the edge
+                        # IS the material change; do not wait a full 28pts.
+                        _same_side_extreme = False
+                        try:
+                            _sr, _sloc, _, _ = self._session_range_pos(signals)
+                            _hi = bool(signals.get("afternoon_high_fade"))
+                            _lo = bool(signals.get("afternoon_low_fade"))
+                            _same_side_extreme = (
+                                _sr >= 85.0
+                                and (
+                                    (_hi and _sloc >= 0.92
+                                     and bool(state.get("last_exit_is_afternoon_high_fade")))
+                                    or (_lo and _sloc <= 0.08
+                                        and bool(state.get("last_exit_is_afternoon_low_fade")))
+                                    or (_hi and _sloc >= 0.92
+                                        and bool(state.get("last_exit_is_failed_break_scalp")))
+                                )
+                                and _moved >= max(12.0, 0.25 * _need)
+                            )
+                        except Exception:
+                            _same_side_extreme = False
                         if not ((_fb_only and _range_next)
                                 or (_fb_only and _fade_next)
-                                or (_stale_done and _fade_next)):
+                                or (_stale_done and _fade_next)
+                                or _two_way_fade_ok
+                                or _same_side_extreme):
                             return "NO_TRADE", (
                                 f"no_material_change_since_exit_{_moved:.0f}pts_"
                                 f"lt_{_need:.0f}pts_needed"
@@ -375,7 +429,16 @@ class StrategyEngine:
                 pass
 
         if signals.get("spot_velocity_block"):
-            return "NO_TRADE", f"spot_velocity_too_fast_{signals.get('spot_velocity_pts', 0):.0f}pts_in_3min"
+            # PATCH_V31: only waive velocity on a confirmed two-way extreme
+            # fade. Trend-day spikes still stand aside.
+            if not (bool(signals.get("two_way_auction"))
+                    and (signals.get("afternoon_high_fade")
+                         or signals.get("afternoon_low_fade"))):
+                return "NO_TRADE", (
+                    f"spot_velocity_too_fast_"
+                    f"{signals.get('spot_velocity_pts', 0):.0f}pts_in_3min"
+                )
+
 
         if signals.get("straddle_expanding"):
             return "NO_TRADE", "straddle_expanding_no_sell_into_rising_iv"
@@ -681,6 +744,64 @@ class StrategyEngine:
             or st.get("last_exit_is_afternoon_high_fade")
         )
 
+    def _mark_two_way_auction(self, signals: dict) -> bool:
+        """PATCH_V31: detect a single-day bull↔bear swing auction.
+
+        NIFTY 2026 weekly books treat a wide, two-sided session as a
+        mean-reversion tape: sell the tested extreme, never mid-range
+        condors, and never chase 15-min trend labels that flip all day.
+        Marks signals['two_way_auction'] and returns True when active.
+        """
+        if bool(signals.get("event_day")):
+            signals["two_way_auction"] = False
+            return False
+        if str(signals.get("vol_regime") or "") in ("ABORT", "BUY_OPTIONS"):
+            signals["two_way_auction"] = False
+            return False
+        raw_rng, pos, _, _, _ = self._fade_range_pos(signals)
+        _spike = bool(signals.get("day_high_is_open_spike")
+                      or signals.get("day_low_is_open_spike"))
+        try:
+            _floor = float(
+                getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
+            )
+            if _spike:
+                _floor = min(
+                    _floor,
+                    float(getattr(self.config, "open_spike_fade_min_range_pts", 70.0)
+                          or 70.0),
+                )
+        except (TypeError, ValueError):
+            _floor = 70.0 if _spike else 85.0
+        _chop = bool(signals.get("choppy_detected"))
+        _both_sides = False
+        try:
+            or_h = float(signals.get("or_high") or 0.0)
+            or_l = float(signals.get("or_low") or 0.0)
+            dh = float(signals.get("day_high_so_far") or signals.get("day_high") or 0.0)
+            dl = float(signals.get("day_low_so_far") or signals.get("day_low") or 0.0)
+            if or_h > or_l > 0 and dh > 0 and dl > 0:
+                _poke = max(15.0, 0.25 * (or_h - or_l))
+                _both_sides = (dh >= or_h + _poke) and (dl <= or_l - _poke)
+        except (TypeError, ValueError):
+            _both_sides = False
+        _after = self._after_two_way_extreme_scalp()
+        # PATCH_V31b: require BOTH OR sides poked (or a confirmed extreme
+        # scalp / choppy-on-wide). A one-way trend day easily prints a
+        # 120pt range (15-Sep) — that must NOT look like a two-way auction
+        # or fade flags steal the book from the momentum substitute.
+        active = bool(
+            raw_rng >= _floor
+            and (_both_sides or _after or (_chop and raw_rng >= 100.0))
+        )
+        signals["two_way_auction"] = active
+        if active:
+            # OPT_V32: marking two-way must not shrink size; fades boost later.
+            signals["weekly_range_size_discount"] = max(
+                float(signals.get("weekly_range_size_discount") or 1.0), 1.0
+            )
+        return active
+
     def _apply_two_way_location(self, signals: dict, current_time: dtime) -> None:
         """On a two-way tape, sell the tested extreme — not the trend label.
 
@@ -698,6 +819,12 @@ class StrategyEngine:
 
         PATCH_V30: same early unlock after an afternoon_low_fade scalp
         (17-Sep), which V25 intentionally does not count as failed-break.
+
+        PATCH_V31: once the session is a confirmed two-way auction,
+        location alone selects the credit side (high→bear call, low→bull
+        put) from 10:45, including through CHOPPY wick-throughs. That is
+        how established NIFTY intraday premium sellers trade a no-trend
+        swing day — fade the edge, stand aside mid-range.
         """
         if bool(signals.get("event_day")):
             return
@@ -709,6 +836,7 @@ class StrategyEngine:
             dte = -1
         if not (0 <= dte <= 4):
             return
+        two_way = self._mark_two_way_auction(signals)
         # PATCH_V27: raw day-range eligibility (lower floor on open spike),
         # post-open location for unretested lower highs (10-Sep ~92pt day).
         raw_rng, pos, _, _, _ = self._fade_range_pos(signals)
@@ -718,18 +846,24 @@ class StrategyEngine:
             _floor = float(
                 getattr(self.config, "open_spike_fade_min_range_pts", 70.0) or 70.0
             ) if _spike else 100.0
+            # Confirmed two-way may fade from 85pts (NIFTY 2026 typical OR).
+            if two_way:
+                _floor = min(
+                    _floor,
+                    float(getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0),
+                )
         except (TypeError, ValueError):
-            _floor = 70.0 if _spike else 100.0
+            _floor = 70.0 if _spike else (85.0 if two_way else 100.0)
         if raw_rng < _floor:
             return
         after_extreme = self._after_two_way_extreme_scalp()
         after_fb = bool(self.market_engine.state.get("last_exit_is_failed_break_scalp"))
         # Standard afternoon high-fade: 12:15–14:00 at loc≥0.80.
         # True failed-break (16-Sep): from 10:45 at loc≥0.85.
-        # Low/high-fade scalp (17-Sep): from 12:00 at loc≥0.90 — converts
-        # the 12:00–12:14 two_way_wait dead zone into a bear-call without
-        # selling the 11:59 mid-extension knife.
-        if after_fb:
+        # Low/high-fade scalp (17-Sep): from 12:00 at loc≥0.90.
+        # PATCH_V31 two-way auction: from 10:45 at loc≥0.85 (professional
+        # fade of the tested edge on a swinging tape).
+        if after_fb or two_way:
             _hi_start = dtime(10, 45)
             _hi_thresh = 0.85 if current_time < dtime(12, 15) else 0.80
         elif after_extreme:
@@ -742,15 +876,29 @@ class StrategyEngine:
                 and pos >= _hi_thresh):
             signals["afternoon_high_fade"] = True
             signals["final_regime"] = "PREMIUM_SELL_BEAR"
-            signals["weekly_range_size_discount"] = 0.90
+            # OPT_V32: fade is the edge — do not size-discount it.
+            signals["weekly_range_size_discount"] = 1.0
             return
-        # Low fade: morning window, plus after-extreme ≤0.15.
-        if current_time >= dtime(10, 50) and current_time < dtime(12, 15):
-            _lo_thresh = 0.15 if after_extreme else 0.22
+        # Low fade: morning window ends at 12:15 so a bearish lean can
+        # own the afternoon book (08-Sep 12:15 BCS). Only AFTER an
+        # extreme scalp may the opposite low fade run past lunch.
+        _lo_end = dtime(12, 15)
+        if after_extreme:
+            _lo_end = dtime(14, 0)
+        if current_time >= dtime(10, 45) and current_time < _lo_end:
+            if after_extreme:
+                _lo_thresh = 0.15
+            elif two_way:
+                _lo_thresh = 0.20
+            else:
+                _lo_thresh = 0.22
             if pos <= _lo_thresh:
+                _ds_ok, _ = self._day_structure_bearish(signals)
+                if _ds_ok:
+                    return
                 signals["afternoon_low_fade"] = True
                 signals["final_regime"] = "PREMIUM_SELL_BULL"
-                signals["weekly_range_size_discount"] = 0.90
+                signals["weekly_range_size_discount"] = 1.0
 
     def _map_regime_to_strategy(
         self,
@@ -766,6 +914,22 @@ class StrategyEngine:
         adx_15        = float(signals.get("adx_15") or 0.0)
         adx_15_mature = bool(signals.get("adx_15_mature", False))
         vol_regime    = signals.get("vol_regime", "NEUTRAL")
+
+        # PATCH_V31: on a two-way auction, never sell the wrong extreme.
+        # Positioning/ORB labels flip every 15 min; location does not.
+        if bool(signals.get("two_way_auction")) and not bool(
+            signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
+        ):
+            _tw_rng, _tw_loc, _, _ = self._session_range_pos(signals)
+            if _tw_rng >= 85.0:
+                if _tw_loc >= 0.80:
+                    signals["afternoon_high_fade"] = True
+                    signals["final_regime"] = "PREMIUM_SELL_BEAR"
+                    final_regime = "PREMIUM_SELL_BEAR"
+                elif _tw_loc <= 0.20:
+                    signals["afternoon_low_fade"] = True
+                    signals["final_regime"] = "PREMIUM_SELL_BULL"
+                    final_regime = "PREMIUM_SELL_BULL"
 
         if final_regime == "PREMIUM_SELL_RANGE":
             strategy = self._resolve_range_strategy(
@@ -817,6 +981,15 @@ class StrategyEngine:
             return BULL_PUT_SPREAD, reason
 
         if final_regime == "PREMIUM_SELL_BEAR":
+            # PATCH_V31: never sell calls at the day low on a two-way tape
+            # (10-Sep printed RANGE_BEARISH_SPOT_BELOW_OR_MID at loc≤0.10).
+            if not signals.get("afternoon_high_fade"):
+                _tw_rng, _tw_loc, _, _ = self._session_range_pos(signals)
+                if (bool(signals.get("two_way_auction"))
+                        and _tw_rng >= 85.0 and _tw_loc <= 0.25):
+                    return "NO_TRADE", (
+                        f"two_way_wait_no_calls_at_low_{_tw_loc:.2f}"
+                    )
             reason = (
                 f"regime:{final_regime}:conf={confidence}:"
                 f"dte={dte}:adx={adx_15:.0f}:"
@@ -953,17 +1126,23 @@ class StrategyEngine:
             # PATCH_V29/V30: after an extreme scalp on a two-way weekly,
             # IC is banned (V28). Prefer the directional vertical at the
             # day extreme over a doomed condor selection.
-            if self._after_two_way_extreme_scalp() and int(dte or -1) >= 2:
-                _rng, _loc, _, _ = self._session_range_pos(signals)
-                if _rng >= 100.0 and _loc >= 0.85:
+            # PATCH_V31: same preference on any confirmed two-way auction
+            # (do not wait for a prior scalp — 17-Sep 11:00 mid-range IC
+            # was correctly banned; the edge at loc≥0.85 must still trade).
+            _rng, _loc, _, _ = self._session_range_pos(signals)
+            _tw = bool(signals.get("two_way_auction")) or self._after_two_way_extreme_scalp()
+            if _tw and int(dte or -1) >= 1 and _rng >= 85.0:
+                if _loc >= 0.85:
                     self.logger.info(
-                        "Range resolution: after_extreme_high_prefer_bear_call"
+                        "Range resolution: two_way_high_prefer_bear_call"
                     )
+                    signals["afternoon_high_fade"] = True
                     return BEAR_CALL_SPREAD
-                if _rng >= 100.0 and _loc <= 0.15:
+                if _loc <= 0.15:
                     self.logger.info(
-                        "Range resolution: after_extreme_low_prefer_bull_put"
+                        "Range resolution: two_way_low_prefer_bull_put"
                     )
+                    signals["afternoon_low_fade"] = True
                     return BULL_PUT_SPREAD
             return IRON_CONDOR
         if (or_condition in ("VERY_NARROW", "NARROW") and
@@ -3496,9 +3675,16 @@ class StrategyEngine:
                 and strategy_name == BULL_PUT_SPREAD):
             final_lots = min(final_lots, 3)
         if signals.get("afternoon_high_fade") and strategy_name == BEAR_CALL_SPREAD:
-            final_lots = min(max(final_lots, 3), 4)
+            # OPT_V32: two-way extreme fades are the book's edge — allow
+            # up to 6 lots (was hard-capped at 4). Floor at 4 on a
+            # confirmed two-way auction so fixed costs stay amortized.
+            _fade_cap = 6 if bool(signals.get("two_way_auction")) else 5
+            _fade_floor = 4 if bool(signals.get("two_way_auction")) else 3
+            final_lots = min(max(final_lots, _fade_floor), _fade_cap)
         if signals.get("afternoon_low_fade") and strategy_name == BULL_PUT_SPREAD:
-            final_lots = min(max(final_lots, 3), 4)
+            _fade_cap = 6 if bool(signals.get("two_way_auction")) else 5
+            _fade_floor = 4 if bool(signals.get("two_way_auction")) else 3
+            final_lots = min(max(final_lots, _fade_floor), _fade_cap)
 
         # ── [G2] Day cap ──────────────────────────────────────────────────
         # int(capital / starting_capital) is a step function: the cap doubles
@@ -4652,10 +4838,12 @@ class StrategyEngine:
             except (TypeError, ValueError):
                 size_mult = max(size_mult, 0.75)
         elif signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+            # OPT_V32: size UP confirmed extreme fades (was floor-only).
             try:
-                size_mult = max(size_mult, float(_weekly_discount or 0.90), 0.85)
+                _boost = 1.15 if bool(signals.get("two_way_auction")) else 1.05
+                size_mult = max(size_mult, float(_weekly_discount or 1.0), 0.90) * _boost
             except (TypeError, ValueError):
-                size_mult = max(size_mult, 0.85)
+                size_mult = max(size_mult, 0.90) * 1.05
         elif _weekly_discount:
             try:
                 size_mult = size_mult * float(_weekly_discount)
