@@ -1522,6 +1522,14 @@ class BacktestRunner:
 
                 if action != "HOLD" and not action.startswith("TIGHTEN"):
                     reason = ctx.get("reason_detail") or action
+                    # Capture params BEFORE _close nulls the live handle —
+                    # fade / rotation latches need the entry raw_params.
+                    _close_rp = dict(live.get("params") or {})
+                    _close_sname = str(
+                        _close_rp.get("strategy_name")
+                        or live.get("strategy_name")
+                        or ""
+                    )
                     t = self._close(live, signals, reason, priority, day)
                     self.results.add_trade(t)
                     day_pnl += t.pnl_rs
@@ -1554,8 +1562,9 @@ class BacktestRunner:
                     # that, so last_exit_is_afternoon_*_fade stayed False
                     # after a fade CLOSE_TARGET — breaking opposite-extreme
                     # unlocks (canonical 2026-09-18 11:53→12:38 path).
+                    # PATCH_V45: also stash strategy side + regime-rotation.
                     try:
-                        _rp = live.get("params") or {}
+                        _rp = _close_rp
                         if bool(_rp.get("afternoon_low_fade")):
                             state["_closing_afternoon_low_fade"] = True
                         if bool(_rp.get("afternoon_high_fade")):
@@ -1566,6 +1575,9 @@ class BacktestRunner:
                             state["_closing_failed_break_scalp"] = True
                         if bool(_rp.get("stale_weekly_vertical")):
                             state["_closing_stale_weekly"] = True
+                        if "regime_rotation" in str(reason or ""):
+                            state["_closing_regime_rotation"] = True
+                        state["_closing_strategy_name"] = _close_sname
                     except Exception:
                         pass
                     try:

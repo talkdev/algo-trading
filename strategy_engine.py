@@ -269,6 +269,24 @@ class StrategyEngine:
         # +625 at 12:30:01, a four-leg condor entered at 12:31:01 at the
         # same spot, scratched -82). The cooldown exists to stop churn, and
         # churn is measured from the close, not from the open.
+        # PATCH_V45: opposite-side rotation after a regime flip is a
+        # different trade — use the short opposite cooldown.
+        _next_side = None
+        if str(final_regime or "") == "PREMIUM_SELL_BULL":
+            _next_side = "BULL"
+        elif str(final_regime or "") == "PREMIUM_SELL_BEAR":
+            _next_side = "BEAR"
+        elif str(final_regime or "") == "PREMIUM_SELL_RANGE":
+            _next_side = "RANGE"
+        _last_side = str(state.get("last_exit_strategy_side") or "")
+        _opp_rotation = (
+            bool(state.get("last_exit_is_regime_rotation"))
+            and _next_side in ("BULL", "BEAR")
+            and _last_side in ("BULL", "BEAR")
+            and _next_side != _last_side
+        )
+        _opp_cd = float(getattr(
+            self.config, "reentry_opposite_cooldown_min", 3) or 3)
         _last_act = None
         for _t in (state.get("last_entry_time"), state.get("last_exit_time")):
             if not _t:
@@ -282,7 +300,8 @@ class StrategyEngine:
         if _last_act is not None and open_count == 0 and total_count > 0:
             try:
                 mins = (now_ist() - _last_act).total_seconds() / 60.0
-                if mins < ENTRY_COOLDOWN_MIN:
+                _cd_need = _opp_cd if _opp_rotation else float(ENTRY_COOLDOWN_MIN)
+                if mins < _cd_need:
                     # PATCH_V25: after a failed-break scalp, the range
                     # condor is a DIFFERENT trade — do not wait 10 min.
                     # PATCH_V30: opposite-extreme fade after a true
@@ -311,9 +330,10 @@ class StrategyEngine:
                     if not ((_fb_only and _range_next)
                             or (_fb_only and _fade_next)
                             or (_stale_done and _fade_next)
-                            or _two_way_fade):
+                            or _two_way_fade
+                            or _opp_rotation):
                         return "NO_TRADE", (
-                            f"entry_cooldown_{ENTRY_COOLDOWN_MIN - mins:.0f}min_remaining"
+                            f"entry_cooldown_{_cd_need - mins:.0f}min_remaining"
                         )
             except Exception:
                 pass
@@ -326,6 +346,7 @@ class StrategyEngine:
         # deliberately NOT answerable by the long-premium substitute: the
         # rule says "you just took this trade", which is as true of the
         # opposite expression of the same tape as of the same one.
+        # PATCH_V45: opposite-side rotation IS the material change.
         _exit_spot = state.get("last_exit_spot")
         _exit_time = state.get("last_exit_time")
         if _exit_spot and _exit_time and open_count == 0:
@@ -334,8 +355,11 @@ class StrategyEngine:
                 _since = (now_ist() - _xdt).total_seconds() / 60.0
             except Exception:
                 _since = None
-            if _since is not None and _since < float(
-                    getattr(self.config, "reentry_reconfirm_min", 45)):
+            _reconfirm = float(getattr(self.config, "reentry_reconfirm_min", 45))
+            if _opp_rotation:
+                _reconfirm = float(getattr(
+                    self.config, "reentry_opposite_reconfirm_min", 12) or 12)
+            if _since is not None and _since < _reconfirm:
                 try:
                     _sp = float(signals.get("spot") or 0.0)
                     _xs = float(_exit_spot)
@@ -348,6 +372,10 @@ class StrategyEngine:
                         _sp * float(getattr(
                             self.config, "reentry_material_move_pct", 0.12)) / 100.0,
                     )
+                    if _opp_rotation:
+                        _need = _need * float(getattr(
+                            self.config, "reentry_opposite_material_frac", 0.25
+                        ) or 0.25)
                     if _moved < _need:
                         # PATCH_V25: same exemption as cooldown — scalp
                         # then range condor on a pinned tape.
@@ -378,10 +406,25 @@ class StrategyEngine:
                         # only +7–10pts from the low-fade exit and waited
                         # until the 45-min reconfirm clock (12:38). Sep17
                         # knife-catch at 11:59 stays gated (pre-12:15).
+                        # PATCH_V45: require a true OPPOSITE extreme — same-
+                        # side high→high (16-Sep 12:33) must still pay the
+                        # material-move clock.
                         _opp_pm_ok = False
                         try:
                             _now_t = current_time
-                            if (_extreme_done and _fade_next
+                            _opp_pair = (
+                                (bool(signals.get("afternoon_high_fade"))
+                                 and bool(state.get("last_exit_is_afternoon_low_fade")))
+                                or (bool(signals.get("afternoon_low_fade"))
+                                    and bool(state.get("last_exit_is_afternoon_high_fade")))
+                                or (bool(signals.get("afternoon_high_fade"))
+                                    and bool(state.get("last_exit_is_failed_break_scalp"))
+                                    and str(state.get("last_exit_strategy_side") or "") == "BULL")
+                                or (bool(signals.get("afternoon_low_fade"))
+                                    and bool(state.get("last_exit_is_failed_break_scalp"))
+                                    and str(state.get("last_exit_strategy_side") or "") == "BEAR")
+                            )
+                            if (_extreme_done and _fade_next and _opp_pair
                                     and _now_t >= dtime(12, 15)
                                     and _moved >= max(8.0, 0.20 * _need)):
                                 _opp_pm_ok = True
@@ -390,13 +433,27 @@ class StrategyEngine:
                         # OPT_V32: SAME-side extreme re-entry (e.g. 16-Sep
                         # second high-fade) — location still at the edge
                         # IS the material change; do not wait a full 28pts.
+                        # PATCH_V45: not after a protective stop — a stop
+                        # means the structure was stressed; re-selling the
+                        # same side at the extreme without a real move was
+                        # the 16-Sep 12:33 knife that underperformed the
+                        # 13:09 ticket the full reconfirm would have taken.
                         _same_side_extreme = False
+                        try:
+                            _pri_x = int(state.get("last_exit_priority") or 0)
+                        except (TypeError, ValueError):
+                            _pri_x = 0
+                        _after_stop = (
+                            str(state.get("last_exit_reason") or "").startswith("CLOSE_STOP")
+                            or _pri_x in (1, 2, 3)
+                        )
                         try:
                             _sr, _sloc, _, _ = self._session_range_pos(signals)
                             _hi = bool(signals.get("afternoon_high_fade"))
                             _lo = bool(signals.get("afternoon_low_fade"))
                             _same_side_extreme = (
-                                _sr >= 85.0
+                                (not _after_stop)
+                                and _sr >= 85.0
                                 and (
                                     (_hi and _sloc >= 0.92
                                      and bool(state.get("last_exit_is_afternoon_high_fade")))
@@ -414,7 +471,8 @@ class StrategyEngine:
                                 or (_stale_done and _fade_next)
                                 or _two_way_fade_ok
                                 or _opp_pm_ok
-                                or _same_side_extreme):
+                                or _same_side_extreme
+                                or _opp_rotation):
                             return "NO_TRADE", (
                                 f"no_material_change_since_exit_{_moved:.0f}pts_"
                                 f"lt_{_need:.0f}pts_needed"
@@ -657,9 +715,29 @@ class StrategyEngine:
             hard_exit = self.config.hard_exit_time
 
         mins_to_exit = self._minutes_to_time(current_time, hard_exit)
-        if mins_to_exit < 90:
+        # PATCH_V45: afternoon directional / fade credit is a short-hold
+        # ticket. Morning/range still needs the 90-minute floor.
+        _need_mins = float(getattr(self.config, "credit_min_minutes_left", 90) or 90)
+        try:
+            _aft_hhmm = str(getattr(
+                self.config, "afternoon_credit_after_hhmm", "13:00") or "13:00")
+            _aft_start = datetime.strptime(_aft_hhmm, "%H:%M").time()
+        except Exception:
+            _aft_start = dtime(13, 0)
+        if (
+            current_time >= _aft_start
+            and (
+                bool(signals.get("afternoon_high_fade")
+                     or signals.get("afternoon_low_fade"))
+                or str(final_regime or "") in (
+                    "PREMIUM_SELL_BEAR", "PREMIUM_SELL_BULL")
+            )
+        ):
+            _need_mins = float(getattr(
+                self.config, "afternoon_credit_min_minutes_left", 50) or 50)
+        if mins_to_exit < _need_mins:
             return "NO_TRADE", (
-                f"only_{mins_to_exit:.0f}min_before_hard_exit_need_90"
+                f"only_{mins_to_exit:.0f}min_before_hard_exit_need_{_need_mins:.0f}"
             )
 
         if signals.get("event_day") and self.config.defined_risk_only_on_event:
@@ -4821,18 +4899,27 @@ class StrategyEngine:
             signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
             return None
         # After a harvested extreme fade the session is a mean-reversion
-        # book. Buying directional premium into the close is the wipe trade
+        # book. Buying directional premium mid-day is the wipe trade
         # (canonical 2026-09-18: BPS low-fade + BCS high-fade then 14:30
         # LONG_CALL into hard_exit −₹2.5k). Crash-continuation days never
-        # set these fade-exit flags. Use the sticky session latch — the
-        # per-exit last_exit_* bits are overwritten by the next close.
+        # set these fade-exit flags.
+        # PATCH_V45: defer the fade latch until direction is known. The
+        # closing-hour route may continue the LAST credit side (bear
+        # credit → long put, bull credit → long call); the opposite
+        # chase stays blocked. Mid-day after a fade still stands down.
         _st = self.market_engine.state
-        if (
+        _fade_latch = (
             _st.get("session_mean_reversion_book")
             or _st.get("last_exit_is_afternoon_high_fade")
             or _st.get("last_exit_is_afternoon_low_fade")
             or _st.get("last_exit_is_failed_break_scalp")
-        ):
+        )
+        _late_now = False
+        try:
+            _late_now = self._in_late_momentum_window(now_ist().time())
+        except Exception:
+            _late_now = False
+        if _fade_latch and not _late_now:
             signals["_momentum_refuse_reason"] = (
                 "momentum_skipped_after_extreme_fade"
             )
@@ -4846,7 +4933,13 @@ class StrategyEngine:
         # Confirmed two-way auction = fade the edges, do not express mid/
         # late trend with debit. Crash days (IV expand + strong ADX) are
         # excluded so 15-Sep long puts remain reachable.
-        if bool(signals.get("two_way_auction")) or self._after_two_way_extreme_scalp():
+        # PATCH_V45: closing-hour with-side continuation (checked after
+        # direction is known) is allowed through; mid-day stays blocked.
+        if (
+            (not _late_now)
+            and (bool(signals.get("two_way_auction"))
+                 or self._after_two_way_extreme_scalp())
+        ):
             try:
                 _adx_tw = float(signals.get("adx_15") or 0.0)
             except (TypeError, ValueError):
@@ -4884,6 +4977,18 @@ class StrategyEngine:
         if not ok:
             signals["_momentum_refuse_reason"] = why
             return None
+        # PATCH_V45: closing-hour after a fade — only with-side continuation.
+        if _fade_latch and _late_now:
+            _last_side = str(_st.get("last_exit_strategy_side") or "")
+            _aligned = (
+                (_last_side == "BEAR" and direction < 0)
+                or (_last_side == "BULL" and direction > 0)
+            )
+            if not _aligned:
+                signals["_momentum_refuse_reason"] = (
+                    "momentum_skipped_after_extreme_fade"
+                )
+                return None
         # PATCH_V30: never buy calls while the engine is in a bear-credit
         # regime (or puts in a bull-credit regime).
         _final = str(signals.get("final_regime") or "")

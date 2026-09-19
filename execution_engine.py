@@ -1354,14 +1354,31 @@ class ExecutionEngine:
         except Exception:
             hard_exit = self.config.hard_exit_time
 
-        min_buffer = 90  # v44: was `90 if dte == 0 else 90` - one value, no bucket
+        min_buffer = float(getattr(self.config, "credit_min_minutes_left", 90) or 90)
+        # PATCH_V45: afternoon directional / fade credit uses the shorter
+        # buffer so entries can reach ~14:25 on a 15:15 weekly flat.
+        try:
+            _aft_hhmm = str(getattr(
+                self.config, "afternoon_credit_after_hhmm", "13:00") or "13:00")
+            _aft_start = datetime.strptime(_aft_hhmm, "%H:%M").time()
+        except Exception:
+            _aft_start = dtime(13, 0)
+        _sname_buf = str(params.get("strategy_name") or "")
+        _is_dir = (
+            "BULL_PUT" in _sname_buf or "BEAR_CALL" in _sname_buf
+            or bool(params.get("afternoon_high_fade")
+                    or params.get("afternoon_low_fade"))
+        )
+        if current_time >= _aft_start and _is_dir:
+            min_buffer = float(getattr(
+                self.config, "afternoon_credit_min_minutes_left", 50) or 50)
         dt1        = datetime.combine(today_ist(), current_time)
         dt2        = datetime.combine(today_ist(), hard_exit)
         mins_to_exit = (dt2 - dt1).total_seconds() / 60.0
 
         if mins_to_exit < min_buffer:
             return "NO_GO", {
-                "reason": f"only_{mins_to_exit:.0f}min_before_hard_exit_need_{min_buffer}"
+                "reason": f"only_{mins_to_exit:.0f}min_before_hard_exit_need_{min_buffer:.0f}"
             }
 
         # ── Update params with validated lot count ────────────────────────
@@ -2235,6 +2252,93 @@ class ExecutionEngine:
                 }
         except Exception as _flip_exc:
             self.logger.debug(f"trend-flip check skipped: {_flip_exc}")
+
+        # ── PATCH_V45: regime-rotation exit (free the single slot) ────────
+        # Trend-flip above only fires when the vertical is already
+        # underwater. A morning bull put that is still green while the
+        # session flips to a measured bear (or the reverse) occupies the
+        # only slot through the next leg. Professionals scratch/rotate on
+        # the regime change and re-express on the new side; this exit is
+        # CLOSE_TARGET so it does not spend the day's stop budget.
+        try:
+            if bool(getattr(self.config, "regime_rotation_enabled", True)):
+                _rot_name = str(position.get("strategy_name") or "")
+                _rot_final = str(signals.get("final_regime") or "")
+                _rot_px = str(signals.get("price_regime") or "")
+                _rot_adx = float(signals.get("adx_15") or 0.0)
+                _rot_mat = bool(signals.get("adx_15_mature", False))
+                _rot_hold = 9999.0
+                try:
+                    _rot_et = position.get("entry_time")
+                    if _rot_et:
+                        _rot_hold = (
+                            now_ist() - datetime.fromisoformat(str(_rot_et))
+                        ).total_seconds() / 60.0
+                except Exception:
+                    _rot_hold = 9999.0
+                _rot_min = float(getattr(
+                    self.config, "regime_rotation_min_hold_min", 25) or 25)
+                _rot_adx_need = float(getattr(
+                    self.config, "regime_rotation_adx_min", 22) or 22)
+                _rot_raw = {}
+                try:
+                    _rot_raw = json.loads(position.get("raw_params_json") or "{}")
+                except Exception:
+                    _rot_raw = {}
+                _rot_is_fade = bool(
+                    _rot_raw.get("afternoon_high_fade")
+                    or _rot_raw.get("afternoon_low_fade")
+                )
+                _bull_to_bear = (
+                    "BULL_PUT" in _rot_name
+                    and (
+                        _rot_final == "PREMIUM_SELL_BEAR"
+                        or _rot_px in ("DOWNTREND", "STRONG_DOWNTREND")
+                    )
+                )
+                _bear_to_bull = (
+                    "BEAR_CALL" in _rot_name
+                    and (
+                        _rot_final == "PREMIUM_SELL_BULL"
+                        or _rot_px in ("UPTREND", "STRONG_UPTREND")
+                    )
+                )
+                # Only rotate when the thesis is broken (underwater) or the
+                # position has already banked enough that freeing the slot
+                # is not abandoning unpaid edge. Flat morning winners must
+                # not be scratched into a midday credit that then blocks
+                # the closing-hour route (measured Sep-9).
+                _underwater = (
+                    entry_credit > 0 and liq_premium > entry_credit * 1.02
+                )
+                _banked = (
+                    entry_credit > 0
+                    and (entry_credit - liq_premium) >= 0.15 * entry_credit
+                )
+                if (
+                    (not _rot_is_fade)
+                    and (_bull_to_bear or _bear_to_bull)
+                    and _rot_mat
+                    and _rot_adx >= _rot_adx_need
+                    and _rot_hold >= _rot_min
+                    and (_underwater or _banked)
+                ):
+                    self.market_engine.state["_closing_regime_rotation"] = True
+                    self.logger.info(
+                        f"PATCH_V45 REGIME_ROTATION: {_rot_name} → "
+                        f"{_rot_final or _rot_px} (adx={_rot_adx:.0f} "
+                        f"held={_rot_hold:.0f}m) — freeing single slot"
+                    )
+                    return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                        "current_premium": current_premium,
+                        "liquidation_premium": liq_premium,
+                        "reason_detail": (
+                            f"regime_rotation_{_rot_name}_to_"
+                            f"{_rot_final or _rot_px}_adx_{_rot_adx:.0f}"
+                        ),
+                    }
+        except Exception as _rot_exc:
+            self.logger.debug(f"regime-rotation check skipped: {_rot_exc}")
 
         # ── Priority 3: Price stop ────────────────────────────────────────
         # Price stop = 0.30 × opening straddle from short strike level
@@ -3141,6 +3245,15 @@ class ExecutionEngine:
                 or position.get("afternoon_high_fade")):
             self.market_engine.state["_closing_afternoon_high_fade"] = True
 
+        # PATCH_V45: stash strategy name for side classification in
+        # _update_state_after_close (which does not receive the position).
+        try:
+            self.market_engine.state["_closing_strategy_name"] = str(
+                position.get("strategy_name") or ""
+            )
+        except Exception:
+            pass
+
         # ── Update session state ──────────────────────────────────────────
         self._update_state_after_close(reason, net_pnl_rs, priority)
 
@@ -3213,6 +3326,22 @@ class ExecutionEngine:
         state["last_exit_is_stale_weekly"] = bool(
             state.pop("_closing_stale_weekly", False)
         )
+        # PATCH_V45: remember a regime-rotation close so the opposite-side
+        # re-entry gate can waive the 45-minute same-thesis lock. Side is
+        # stashed by execute_close as _closing_strategy_name.
+        _rot_closed = bool(state.pop("_closing_regime_rotation", False))
+        if not _rot_closed:
+            _rot_closed = "regime_rotation" in str(reason or "")
+        state["last_exit_is_regime_rotation"] = _rot_closed
+        _sname_x = str(state.pop("_closing_strategy_name", "") or "")
+        if "BULL_PUT" in _sname_x:
+            state["last_exit_strategy_side"] = "BULL"
+        elif "BEAR_CALL" in _sname_x:
+            state["last_exit_strategy_side"] = "BEAR"
+        elif "CONDOR" in _sname_x or "BUTTERFLY" in _sname_x:
+            state["last_exit_strategy_side"] = "RANGE"
+        elif _sname_x:
+            state["last_exit_strategy_side"] = "OTHER"
         # Sticky session latch: once any extreme fade / failed-break scalp
         # closes, the day is a mean-reversion book for momentum purposes.
         # last_exit_* flags are overwritten by the next close (18-Sep high
