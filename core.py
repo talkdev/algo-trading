@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import math
 import time
 import sqlite3
 import logging
@@ -87,6 +88,56 @@ def now_ist() -> datetime:
 def today_ist() -> date:
     """Return current date in IST."""
     return now_ist().date()
+
+
+# ── v44: horizon blend replaces per-DTE buckets ───────────────────────────
+# Every risk quantity that used to be keyed on the DTE integer (stop width,
+# target, delta-close, tail probability, profit-lock arming and give-back,
+# EV theta carry, wing geometry) is a function of how much option life is
+# left, and gamma/theta scale with the SQUARE ROOT of that life. The engine
+# had encoded this as lookup tables with one row per DTE, which meant the
+# DTE1 row (Monday before a Tuesday expiry) was a guess: the recorded eight
+# sessions contain no DTE1 credit trade at all, and the tables were
+# non-monotone in places (stop 1.60 / 1.55 / 1.70). Two anchors carry all
+# the evidence - expiry day (DTE0, two sessions) and the fresh weekly
+# (DTE2-4, twelve trades). Everything in between is interpolated on
+# sqrt(life), so DTE1 lands where the geometry says, not where a row was
+# typed. At the anchors the blend reproduces the previous values exactly.
+#
+# life is measured in sessions at the midpoint of the day: DTE0 = 0.5,
+# DTE1 = 1.5, DTE2 = 2.5 (the weekly anchor; beyond it the weight is 0).
+DTE_BLEND_LIFE_EXPIRY = 0.5
+DTE_BLEND_LIFE_WEEKLY = 2.5
+
+
+def dte_blend(dte: Optional[int]) -> float:
+    """Weight of the expiry-day anchor: 1.0 on DTE0, 0.0 at DTE>=2.
+
+    DTE1 evaluates to ~0.41: an option with 1.5 sessions of life has
+    sqrt(1.5)=1.22 units of 'sqrt-life' against 0.71 on expiry day and
+    1.58 on the weekly anchor, i.e. it sits 41% of the way from weekly
+    toward expiry-day behaviour. Unknown DTE is treated as weekly (the
+    conservative side for sizing, the loose side for stops).
+    """
+    if dte is None:
+        return 0.0
+    try:
+        d = float(dte)
+    except (TypeError, ValueError):
+        return 0.0
+    if d <= 0:
+        return 1.0
+    life = d + DTE_BLEND_LIFE_EXPIRY
+    s_e = math.sqrt(DTE_BLEND_LIFE_EXPIRY)
+    s_w = math.sqrt(DTE_BLEND_LIFE_WEEKLY)
+    w = (s_w - math.sqrt(life)) / (s_w - s_e)
+    return float(min(max(w, 0.0), 1.0))
+
+
+def by_dte(dte: Optional[int], expiry_value: float, weekly_value: float) -> float:
+    """Interpolate a DTE-keyed quantity between its two anchors."""
+    w = dte_blend(dte)
+    return float(weekly_value) + w * (float(expiry_value) - float(weekly_value))
 
 
 # ── VRP data-error guard (single source of truth) ─────────────────────────
@@ -758,8 +809,11 @@ class Config:
     # leaves less than a point of room once liquidation slippage is
     # charged; 1.60x leaves ~4.5pts. The wider stop is the cost of the
     # gamma-gap that a 0DTE stop is not honoured through.
+    # v44: the DTE1 rows are DERIVED from the two anchors via dte_blend()
+    # unless explicitly set (env STOP_MULT_DTE1 / TARGET_PCT_DTE1). The
+    # typed 1.55 sat below both neighbours with no trade behind it.
     stop_mult_dte0:            float = 1.60
-    stop_mult_dte1:            float = 1.55
+    stop_mult_dte1:            Optional[float] = None
     stop_mult_dte2p:           float = 1.70
     # Profit target as a fraction of the net credit, by DTE. Paired with
     # the stop multiples above: 0.50 against 1.40 is reward/risk 1.25.
@@ -769,7 +823,7 @@ class Config:
     # engine's historical 1.1-1.25 posture on a VIX-11 day where the
     # whole credit is ~18 points.
     target_pct_dte0:           float = 0.70
-    target_pct_dte1:           float = 0.45
+    target_pct_dte1:           Optional[float] = None
     target_pct_dte2p:          float = 0.40
     # Short-leg delta at which the engine closes, by DTE.
     delta_close_dte0:          float = 0.45
@@ -1078,6 +1132,39 @@ class Config:
     # applies to it.
     banked_exit_is_not_a_stop:           bool  = True
 
+    # ══ v41: afternoon trail for weekly (DTE>=1) credit verticals ════════
+    # The profit-lock arms at profit_lock_pct_dte1plus (22%) all day. On a
+    # weekly the residual same-day theta after ~13:30 is 1-2 pts on a 25pt
+    # credit, while the 14:00-15:00 NIFTY window routinely prints a 50-70pt
+    # directional leg. Holding an UNLOCKED green vertical through that for
+    # the last few points of decay is the wrong side of the trade-off, and
+    # the book is force-flat at 15:15 anyway (no overnight to recover).
+    # Measured 2026-09-18 (live, real money): BCS credit 25.20 reached
+    # +4.4pts (17.5%) at 13:45, never armed the 22% lock, rode the 14:10-
+    # 15:00 +60pt ramp and hard-exited -1.6pts. The replay of the same
+    # session, 1.15pts more credit from the fill model, armed at 23.4% and
+    # banked +2.9pts six minutes later: a Rs 1,000 swing on one point of
+    # fill. The arming bar therefore steps DOWN with the clock, exactly as
+    # the Priority-6 time-target ladder already does (40%/32%/24%). The
+    # ratchet itself (keep_frac) is unchanged. DTE0 keeps its own gamma
+    # ladder and is not affected.
+    profit_lock_pct_dte1plus_after_1330: float = 0.15
+    profit_lock_pct_dte1plus_after_1415: float = 0.10
+    # Trail give-back once armed: stop = credit - keep_frac x peak achieved.
+    # v41: the ratchet that re-tightens this as profit grows was inverted
+    # (compared in the bought-option direction) and had never fired, so
+    # these fractions only ever applied at the arming cycle. With the trail
+    # live, a 0.50 give-back on a weekly sits inside routine premium noise
+    # (DTE3-4 credit 55-65pts moves 4-5pts on nothing) and converts
+    # retracements into stop-outs: measured 2026-09-16 the 13:08 bear call
+    # was cut at 14:16 for +5.8pts on a 43% retracement of an 11.4pt peak,
+    # then finished +11.7pts at the bell. 0.35 clears that noise band and
+    # still guarantees a third of the peak; 0.65 stopped every afternoon
+    # winner early (-6% over the eight sessions). DTE0 keeps 0.65: expiry
+    # gamma gives back 95% of a peak inside 40 minutes (2026-09-08).
+    profit_lock_keep_frac_dte0:          float = 0.65
+    profit_lock_keep_frac_dte1plus:      float = 0.35
+
     # ── v6: live execution hardening ──────────────────────────────────
     # The replay harness has its own fill model, so nothing below can move
     # a backtested number: these knobs govern the live order path
@@ -1196,6 +1283,40 @@ class Config:
     # resolved (RANGE may trade; directional BEAR still waits for fade/clock).
     open_spike_pullback_pts:           float = 30.0
     open_spike_fade_min_range_pts:     float = 70.0
+
+    # ── v44: horizon-blended accessors (single source for every DTE-keyed
+    # risk quantity; see dte_blend() at module level). Each returns the
+    # expiry-day value on DTE0, the weekly value on DTE>=2, and the
+    # sqrt-life interpolation on DTE1. Where a DTE1 field is explicitly
+    # configured it wins, so an operator can still pin a row.
+    def stop_mult_for_dte(self, dte: Optional[int]) -> float:
+        if dte == 1 and self.stop_mult_dte1 is not None:
+            return float(self.stop_mult_dte1)
+        return by_dte(dte, self.stop_mult_dte0, self.stop_mult_dte2p)
+
+    def target_pct_for_dte(self, dte: Optional[int]) -> float:
+        if dte == 1 and self.target_pct_dte1 is not None:
+            return float(self.target_pct_dte1)
+        return by_dte(dte, self.target_pct_dte0, self.target_pct_dte2p)
+
+    def delta_close_for_dte(self, dte: Optional[int]) -> float:
+        return by_dte(dte, self.delta_close_dte0, self.delta_close_dte1p)
+
+    def gamma_tail_prob_for_dte(self, dte: Optional[int]) -> float:
+        return by_dte(dte, self.gamma_tail_prob_dte0, self.gamma_tail_prob_dte1p)
+
+    def ev_carry_discount_for_dte(self, dte: Optional[int]) -> float:
+        # 1.0 = no theta credit (expiry-day conservative), weekly = the
+        # measured discount. DTE1 used to be charged the full expiry-day
+        # severity despite carrying a night of theta.
+        return by_dte(dte, 1.0, self.ev_carry_discount_dte2p)
+
+    def profit_lock_pct_for_dte(self, dte: Optional[int]) -> float:
+        return by_dte(dte, self.profit_lock_pct_dte0, self.profit_lock_pct_dte1plus)
+
+    def profit_lock_keep_frac_for_dte(self, dte: Optional[int]) -> float:
+        return by_dte(dte, self.profit_lock_keep_frac_dte0,
+                      self.profit_lock_keep_frac_dte1plus)
 
     def __repr__(self) -> str:
         def mask(s: str) -> str:
@@ -1495,10 +1616,12 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
 
         # v3.2 profitability calibration
         stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.60), 1.15), 2.50),
-        stop_mult_dte1=min(max(_get_float(env, "STOP_MULT_DTE1", 1.55), 1.15), 2.50),
+        stop_mult_dte1=(min(max(_get_float(env, "STOP_MULT_DTE1", 0.0), 1.15), 2.50)
+                        if env.get("STOP_MULT_DTE1") not in (None, "") else None),
         stop_mult_dte2p=min(max(_get_float(env, "STOP_MULT_DTE2P", 1.70), 1.15), 3.00),
         target_pct_dte0=min(max(_get_float(env, "TARGET_PCT_DTE0", 0.70), 0.18), 0.85),
-        target_pct_dte1=min(max(_get_float(env, "TARGET_PCT_DTE1", 0.45), 0.18), 0.70),
+        target_pct_dte1=(min(max(_get_float(env, "TARGET_PCT_DTE1", 0.0), 0.18), 0.70)
+                         if env.get("TARGET_PCT_DTE1") not in (None, "") else None),
         target_pct_dte2p=min(max(_get_float(env, "TARGET_PCT_DTE2P", 0.40), 0.18), 0.70),
         delta_close_dte0=min(max(_get_float(env, "DELTA_CLOSE_DTE0", 0.45), 0.20), 0.55),
         delta_close_dte1p=min(max(_get_float(env, "DELTA_CLOSE_DTE1P", 0.30), 0.18), 0.50),

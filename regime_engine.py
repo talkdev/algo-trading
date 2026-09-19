@@ -2545,22 +2545,18 @@ class RegimeClassifier:
         # non-Tuesday trade to a single lot — below the size at which fixed
         # brokerage can be amortised. DTE 1-4 now size at full; the genuinely
         # far-dated 5-6 stay discounted.
-        if dte == 0:
+        # v44: written as the rule it is - full size inside the tradeable
+        # window (max_dte_tradeable), a steep discount beyond it - rather
+        # than eight rows, five of which were identical.
+        try:
+            _dte_i = int(dte) if dte is not None else 0
+        except (TypeError, ValueError):
+            _dte_i = 0
+        _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+        if _dte_i <= _max_dte:
             dte_mult = 1.0
-        elif dte == 1:
-            dte_mult = 1.0
-        elif dte == 2:
-            dte_mult = 1.0
-        elif dte == 3:
-            dte_mult = 1.0
-        elif dte == 4:
-            dte_mult = 1.0
-        elif dte == 5:
-            dte_mult = 0.25
-        elif dte == 6:
-            dte_mult = 0.20
         else:
-            dte_mult = 0.10
+            dte_mult = max(0.10, 0.25 * (0.8 ** (_dte_i - _max_dte - 1)))
 
         # ── event_mult ────────────────────────────────────────────────────
         event_mult = self.config.event_size_multiplier if event_day else 1.0

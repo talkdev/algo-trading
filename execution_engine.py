@@ -16,6 +16,7 @@ from typing import Optional, List, Tuple, Dict
 from core import (
     Config, Database,
     ExpiryCalendar, now_ist, today_ist, parse_ist_timestamp,
+    dte_blend, by_dte,
     print_section, print_kv_table,
     load_config, setup_logging,
     RateLimiter, UpstoxClient,
@@ -1353,8 +1354,7 @@ class ExecutionEngine:
         except Exception:
             hard_exit = self.config.hard_exit_time
 
-        dte        = signals.get("actual_dte")
-        min_buffer = 90 if dte == 0 else 90
+        min_buffer = 90  # v44: was `90 if dte == 0 else 90` - one value, no bucket
         dt1        = datetime.combine(today_ist(), current_time)
         dt2        = datetime.combine(today_ist(), hard_exit)
         mins_to_exit = (dt2 - dt1).total_seconds() / 60.0
@@ -2074,14 +2074,9 @@ class ExecutionEngine:
             if "BUTTERFLY" in strategy_name_p1:
                 delta_thresh_p1 = 0.72
             else:
-                if actual_dte == 0:
-                    _abs_p1 = float(
-                        getattr(self.config, "delta_close_dte0", 0.35)
-                    )
-                else:
-                    _abs_p1 = float(
-                        getattr(self.config, "delta_close_dte1p", 0.30)
-                    )
+                # v44: floor blended on sqrt-life (0.45 DTE0 -> ~0.36 DTE1
+                # -> 0.30 DTE2+), replacing the DTE0 / DTE1+ step.
+                _abs_p1 = self.config.delta_close_for_dte(actual_dte)
                 try:
                     _entry_d_p1 = abs(float(leg.get("entry_delta", 0) or 0))
                 except (TypeError, ValueError):
@@ -2149,8 +2144,13 @@ class ExecutionEngine:
             # entry gap for each short leg - the same line the EV gate
             # now prices - so the defense is where the risk model said
             # it would be when the trade was approved.
-            _prox_dte0 = (actual_dte == 0) and \
-                ("BUTTERFLY" not in strategy_name_p2)
+            # v44: the gap-relative bound is structural (a band can never
+            # be wider than the room the trade was approved with) and is
+            # applied on every DTE, not only expiry day. On weeklies the
+            # short sits 150-300pts out, so 0.30 x gap exceeds the
+            # absolute band and the min() leaves it unchanged; the rule
+            # only bites where the gap is small enough that it should.
+            _prox_dte0 = ("BUTTERFLY" not in strategy_name_p2)
             _prox_gap_frac = float(getattr(self.config, "prox_gap_frac_dte0", 0.70))
             _entry_spot_p2 = float(position.get("entry_spot") or 0)
             for leg in open_legs:
@@ -2412,12 +2412,37 @@ class ExecutionEngine:
             # cannot trade at is how a "free trade" becomes a loser.
             profit_pct = (gross_credit - liq_premium) / gross_credit
 
-            # Profit lock threshold: 40% for DTE0, 25% for DTE1+
-            lock_thresh = (
-                self.config.profit_lock_pct_dte0
-                if actual_dte == 0
-                else self.config.profit_lock_pct_dte1plus
-            )
+            # Profit lock threshold: 40% on expiry day, 22% on a fresh
+            # weekly. v44: blended on sqrt-life, so DTE1 arms at ~29%
+            # instead of inheriting the DTE4 bar.
+            lock_thresh = self.config.profit_lock_pct_for_dte(actual_dte)
+            # ── v41: the weekly arming bar steps down with the clock ──────
+            # After 13:30 a weekly credit vertical has 1-2 pts of same-day
+            # theta left against a 50-70pt afternoon leg it cannot survive
+            # before the 15:15 flat. Arm the trail on a smaller achieved
+            # profit as the session ages (same philosophy as the Priority-6
+            # time-target ladder). The bar only ever steps DOWN, and the
+            # ratchet / keep_frac / round-trip floor below are unchanged.
+            # Measured 2026-09-18 live: +17.5% at 13:45 never armed the 22%
+            # bar, hard-exited -1.6pts at 15:15 after the 14:10 ramp.
+            # v44: the afternoon rungs are blended too. The expiry-day
+            # anchor is the unstepped 40% (DTE0 afternoons are governed by
+            # the Priority-6 gamma ladder, 35%/25%), so on DTE0 the min()
+            # is a no-op and on DTE1 the rungs land at ~25% / ~22%.
+            try:
+                _pl0 = float(self.config.profit_lock_pct_dte0)
+                if current_time >= dtime(14, 15):
+                    lock_thresh = min(lock_thresh, by_dte(
+                        actual_dte, _pl0, float(getattr(
+                            self.config,
+                            "profit_lock_pct_dte1plus_after_1415", 0.10))))
+                elif current_time >= dtime(13, 30):
+                    lock_thresh = min(lock_thresh, by_dte(
+                        actual_dte, _pl0, float(getattr(
+                            self.config,
+                            "profit_lock_pct_dte1plus_after_1330", 0.15))))
+            except (TypeError, ValueError):
+                pass
 
             # ── v10 [T1]: the give-back is now DTE-aware and RATCHETS ──────
             # Two defects, both measured on the recorded sessions.
@@ -2443,15 +2468,13 @@ class ExecutionEngine:
             #     winners therefore keep 0.65 of what they achieved; weeklies
             #     keep the existing 0.50, which the 2026-09-10 measurement
             #     below already justified.
+            #     v41: weeklies now keep 0.35 (see Config) - the ratchet is
+            #     live for the first time and 0.50 sat inside premium noise.
             #
             # The v3.1 floor is retained unchanged: a locked trade can never be
             # stopped for worse than covering its own round trip.
-            _keep_frac = float(getattr(
-                self.config,
-                "profit_lock_keep_frac_dte0" if actual_dte == 0
-                else "profit_lock_keep_frac_dte1plus",
-                0.65 if actual_dte == 0 else 0.50,
-            ))
+            #     v44: blended on sqrt-life (0.65 -> ~0.47 on DTE1 -> 0.35).
+            _keep_frac = self.config.profit_lock_keep_frac_for_dte(actual_dte)
             _keep_frac = min(max(_keep_frac, 0.05), 0.90)
             _rt_cost = self._round_trip_cost_pts(open_legs, chain)
             _stop_floor = max(entry_credit - _rt_cost, 0.05)
@@ -2531,8 +2554,19 @@ class ExecutionEngine:
                 if _achieved_now > _locked_now + 1e-9:
                     _cand = liq_premium + (1.0 - _keep_frac) * _achieved_now
                     _cand = min(_cand, _stop_floor)
-                    # monotone: a trail only ever moves in our favour
-                    if _cand > _stop_now + 1e-9:
+                    # monotone: a trail only ever moves in our favour.
+                    # v41: for a SOLD structure "in our favour" is a LOWER
+                    # stop premium (stop = credit - keep_frac x achieved
+                    # falls as achieved grows). The test was written
+                    # `_cand > _stop_now`, which is the direction for a
+                    # bought option, so this branch never fired: the trail
+                    # armed once and never tightened, and everything earned
+                    # after the arming cycle was unprotected - exactly the
+                    # defect (a) above says it fixes. Measured 2026-09-18
+                    # replay: armed at 24.35 (15%), achieved grew to 6.2pts
+                    # (23%), stop stayed 24.35, exit +1.9pts instead of the
+                    # +2.9pts the ratchet was supposed to protect.
+                    if _cand < _stop_now - 1e-9:
                         _persist_lock(_cand)
                         self.logger.info(
                             f"PRIORITY 4 PROFIT LOCK RATCHET: "
@@ -2607,25 +2641,52 @@ class ExecutionEngine:
 
         # ── Priority 6: Time-based target ─────────────────────────────────
         if entry_credit > 0:
-            if actual_dte == 0:
-                time_targets = [
-                    (dtime(11, 30), 0.50),
-                    (dtime(12, 30), 0.42),
-                    (dtime(13, 30), 0.35),
-                    (dtime(14, 15), 0.25),
-                ]
-            else:
-                # PATCH_V12: weekly targets 48/40/32 -> 40/32/24. A
-                # DTE1-4 structure decays ~5-15% of credit intraday;
-                # the old ladder never fired (measured 09/10-Sep: both
-                # winners held to the bell, +Rs 1,121 and +Rs 92).
-                # The ladder still demands real decay — it just no
-                # longer demands the impossible.
-                time_targets = [
-                    (dtime(12, 0),  0.40),
-                    (dtime(13, 0),  0.32),
-                    (dtime(14, 0),  0.24),
-                ]
+            # Two anchor ladders. Expiry day: gamma decay is the whole
+            # session, so the bar falls fast. Fresh weekly (PATCH_V12:
+            # 48/40/32 -> 40/32/24): a DTE2-4 structure decays ~5-15% of
+            # credit intraday; the old ladder never fired (measured
+            # 09/10-Sep: both winners held to the bell, +Rs 1,121 and
+            # +Rs 92). The ladder still demands real decay - it just no
+            # longer demands the impossible.
+            # v44: one ladder for every DTE, each rung's percentage
+            # blended on sqrt-life between the two anchors. On DTE0 and
+            # DTE>=2 this reproduces the anchor ladders exactly; on DTE1
+            # the rungs land between them (44/41/36/33/29/24%) instead of
+            # inheriting the DTE4 ladder. A rung is live once the weekly
+            # anchor has one (12:00), except on expiry day itself.
+            _ladder_expiry = [
+                (dtime(11, 30), 0.50),
+                (dtime(12, 30), 0.42),
+                (dtime(13, 30), 0.35),
+                (dtime(14, 15), 0.25),
+            ]
+            _ladder_weekly = [
+                (dtime(12, 0),  0.40),
+                (dtime(13, 0),  0.32),
+                (dtime(14, 0),  0.24),
+            ]
+
+            def _step(_ladder, _t):
+                _v = None
+                for _tt, _p in _ladder:
+                    if _t >= _tt:
+                        _v = _p
+                return _v
+
+            _w_dte = dte_blend(actual_dte)
+            time_targets = []
+            for _tt in sorted({t for t, _ in _ladder_expiry} |
+                              {t for t, _ in _ladder_weekly}):
+                _pe = _step(_ladder_expiry, _tt)
+                _pw = _step(_ladder_weekly, _tt)
+                if _w_dte >= 1.0 - 1e-9:
+                    _p = _pe
+                elif _pw is None:
+                    _p = None
+                else:
+                    _p = by_dte(actual_dte, _pe if _pe is not None else _pw, _pw)
+                if _p is not None:
+                    time_targets.append((_tt, float(_p)))
 
             # ── v3.1 [F1]: the ladder was inverted by a min() ──────────
             # These are PREMIUM LEVELS the position must fall BELOW to take

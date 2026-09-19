@@ -1,0 +1,2 @@
+trading_date,strategy,regime,confidence,dte,entry_time,exit_time,lots,entry_credit,exit_debit,gross_pts,costs_rs,pnl_rs,exit_reason,exit_priority,entry_spot,exit_spot,strikes,wing,held_min
+2026-09-08,BEAR_CALL_SPREAD,PREMIUM_SELL_BEAR,HIGH,0,12:15:00,13:51:28,6,18.55,10.95,7.6,122.33,2841.67,time_decayed_target_reached,6,23650.6,23629.2,SC23700/BC23800,100.0,96
