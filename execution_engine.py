@@ -3152,6 +3152,12 @@ class ExecutionEngine:
         state["last_exit_is_stale_weekly"] = bool(
             state.pop("_closing_stale_weekly", False)
         )
+        # Sticky session latch: once any extreme fade / failed-break scalp
+        # closes, the day is a mean-reversion book for momentum purposes.
+        # last_exit_* flags are overwritten by the next close (18-Sep high
+        # fade replaced the low-fade latch, then late LONG_CALL slipped in).
+        if _fb_closed or _low_fade_closed or _high_fade_closed:
+            state["session_mean_reversion_book"] = True
 
         # ── PATCH_V13: a protective exit that BANKS profit is not a stop ──
         # The ratcheted profit lock and an in-the-money price stop both come

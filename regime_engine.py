@@ -1728,8 +1728,11 @@ class RegimeClassifier:
                 _both = (_raw_h >= _or_h + _poke) and (_raw_l <= _or_l - _poke)
             _two_way = bool(
                 _raw_rng >= min(_floor, 85.0)
-                and (_both or (bool(signals.get("choppy_detected"))
-                               and _raw_rng >= 100.0))
+                and (
+                    _both
+                    or (bool(signals.get("choppy_detected"))
+                        and _raw_rng >= 100.0)
+                )
             )
             if _two_way:
                 signals["two_way_auction"] = True
@@ -2380,6 +2383,16 @@ class RegimeClassifier:
                     FinalRegime.NO_TRADE,
                     "DOWNTREND_BULLISH_CONFLICT_NEEDS_HIGH_CONFIDENCE",
                 )
+            # Live 2026-09-08: this branch minted PREMIUM_SELL_BEAR with
+            # ADX=0 (note DOWNTREND_BULLISH_CONFLICT_PRICE_OVERRIDES_ADX_0)
+            # and burned EV/friction cycles. Price may override
+            # positioning, never an unmeasured ADX.
+            if (not bool(signals.get("adx_15_mature", False))
+                    or adx_15 <= 0.0):
+                return (
+                    FinalRegime.NO_TRADE,
+                    "DOWNTREND_BULLISH_CONFLICT_ADX_IMMATURE",
+                )
             # Price overrides positioning — still bear call but reduced size
             return (
                 FinalRegime.PREMIUM_SELL_BEAR,
@@ -2420,6 +2433,12 @@ class RegimeClassifier:
                 return (
                     FinalRegime.NO_TRADE,
                     "UPTREND_BEARISH_CONFLICT_NEEDS_HIGH_CONFIDENCE",
+                )
+            if (not bool(signals.get("adx_15_mature", False))
+                    or adx_15 <= 0.0):
+                return (
+                    FinalRegime.NO_TRADE,
+                    "UPTREND_BEARISH_CONFLICT_ADX_IMMATURE",
                 )
             return (
                 FinalRegime.PREMIUM_SELL_BULL,
