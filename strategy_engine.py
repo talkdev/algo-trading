@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import datetime, date, time as dtime, timedelta
 from typing import Optional, Tuple, List, Dict
 
@@ -101,6 +102,10 @@ class StrategyEngine:
         self.cal_engine    = cal_engine
         self.logger        = logger
         self._ensure_tables()
+        # Live sell→ticket latch: auction_key → consecutive econ rejects.
+        # Survives only in-process (same as tape_displacement); a restart
+        # re-probes construction once, which is the intended behaviour.
+        self._construct_fail_counts: Dict[str, int] = {}
 
     def _ensure_tables(self) -> None:
         self.db.execute("""
@@ -467,6 +472,9 @@ class StrategyEngine:
         # PATCH_V27: unresolved open-HIGH wick — defer BEAR/RANGE credit
         # until 12:15 so the book is free for the lower-high fade (10-Sep).
         # Do NOT block failed-break / low-fade bull puts (16-Sep scalp).
+        # (A pullback-based early unlock was measured: it let morning RANGE
+        # condors steal the book on 10-Sep / 17-Sep and cut those sessions
+        # hard. Keep the clock; fades already bypass via afternoon_high_fade.)
         try:
             _dte_os = int(signals.get("actual_dte")) if signals.get("actual_dte") is not None else -1
         except (TypeError, ValueError):
@@ -914,7 +922,41 @@ class StrategyEngine:
                 _lo_thresh = 0.20
             else:
                 _lo_thresh = 0.22
-            if pos <= _lo_thresh:
+            # Open-HIGH wick is excluded from fade_pos so lower-high BCS
+            # stays honest (10-Sep). That same exclusion understates day
+            # lows on a spike mean-reversion tape (18-Sep: raw_loc≈0.16
+            # while fade_pos≈0.23 → CHOPPY stand-aside until 11:05). For
+            # LOW fades only, also honour raw session location — but only
+            # on a sell-premium / non-trend tape. A crash day can print an
+            # open-high spike + raw lows while the correct book is debit
+            # puts (15-Sep); never sell put credit into that.
+            _loc_low = pos
+            _px = str(signals.get("price_regime") or "")
+            _vol = str(signals.get("vol_regime") or "")
+            _spike_mr = (
+                bool(signals.get("day_high_is_open_spike"))
+                and _px in ("CHOPPY", "RANGE")
+                and _vol in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+                and float(signals.get("day_move_used_pct") or 0.0) < 80.0
+            )
+            if _spike_mr:
+                try:
+                    _sp = float(signals.get("spot") or 0.0)
+                    _dh = float(
+                        signals.get("day_high_so_far")
+                        or signals.get("day_high")
+                        or 0.0
+                    )
+                    _dl = float(
+                        signals.get("day_low_so_far")
+                        or signals.get("day_low")
+                        or 0.0
+                    )
+                    if _dh > _dl > 0 and _sp > 0:
+                        _loc_low = min(pos, (_sp - _dl) / (_dh - _dl))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    _loc_low = pos
+            if _loc_low <= _lo_thresh:
                 _ds_ok, _ = self._day_structure_bearish(signals)
                 if _ds_ok:
                     return
@@ -958,6 +1000,8 @@ class StrategyEngine:
                 dte, or_condition, adx_15, adx_15_mature,
                 current_time, vol_regime, signals,
             )
+            if strategy == "NO_TRADE":
+                return "NO_TRADE", "two_way_auction_wait_for_extreme"
             reason = (
                 f"regime:{final_regime}:conf={confidence}:"
                 f"dte={dte}:or={or_condition}:adx={adx_15:.0f}"
@@ -1145,27 +1189,27 @@ class StrategyEngine:
             if _lean:
                 self.logger.info(f"Range resolution: {_lean_reason}")
                 return BEAR_CALL_SPREAD
-            # PATCH_V29/V30: after an extreme scalp on a two-way weekly,
-            # IC is banned (V28). Prefer the directional vertical at the
-            # day extreme over a doomed condor selection.
-            # PATCH_V31: same preference on any confirmed two-way auction
-            # (do not wait for a prior scalp — 17-Sep 11:00 mid-range IC
-            # was correctly banned; the edge at loc≥0.85 must still trade).
+            # Two-way / expanding auction: never default to a pin condor.
+            # Mid-range IC on a two-way tape is the live wrong-ticket failure
+            # (session locks the single slot on a delta-neutral structure while
+            # the edge is at the extremes). Only directional verticals at the
+            # extremes are allowed; otherwise stand aside until location prints.
             _rng, _loc, _, _ = self._session_range_pos(signals)
             _tw = bool(signals.get("two_way_auction")) or self._after_two_way_extreme_scalp()
-            if _tw and int(dte or -1) >= 1 and _rng >= 85.0:
-                if _loc >= 0.85:
+            if _tw and int(dte or -1) >= 1:
+                if _rng >= 85.0 and _loc >= 0.85:
                     self.logger.info(
                         "Range resolution: two_way_high_prefer_bear_call"
                     )
                     signals["afternoon_high_fade"] = True
                     return BEAR_CALL_SPREAD
-                if _loc <= 0.15:
+                if _rng >= 85.0 and _loc <= 0.15:
                     self.logger.info(
                         "Range resolution: two_way_low_prefer_bull_put"
                     )
                     signals["afternoon_low_fade"] = True
                     return BULL_PUT_SPREAD
+                return "NO_TRADE"
             return IRON_CONDOR
         if (or_condition in ("VERY_NARROW", "NARROW") and
                 adx_15 < 20 and
@@ -1492,6 +1536,13 @@ class StrategyEngine:
                 )
             if adx_15 >= self.config.adx_strong_threshold:
                 return False, f"condor_blocked_strong_adx_{adx_15:.0f}"
+            # Pin/condor needs a real ADX read. Immature/zero ADX with a
+            # RANGE label was how live sold a weekly IC into a two-way tape
+            # (no trend proof, no pin proof — just OR narrow).
+            if not bool(signals.get("adx_15_mature", False)) or adx_15 <= 0:
+                return False, "condor_requires_mature_adx"
+            if bool(signals.get("two_way_auction")):
+                return False, "condor_banned_on_two_way_auction"
             if signals.get("or_condition") == "VERY_WIDE":
                 return False, "condor_blocked_very_wide_or"
             # PATCH_V26: a two-way weekly tape does not pin.
@@ -4190,20 +4241,41 @@ class StrategyEngine:
         else:
             return False, f"momentum_needs_trend_got_{price or 'NONE'}", 0
 
-        if str(signals.get("confidence_level") or "") not in ("HIGH", "MEDIUM"):
-            return False, (
-                f"momentum_confidence_{signals.get('confidence_level')}_insufficient"
-            ), 0
-        # PATCH_V12: event-day momentum needs HIGH conviction — the
-        # schedule is already softened for the substitute, so the
-        # read itself must be unambiguous.
-        if signals.get("event_day") and str(signals.get("confidence_level") or "") != "HIGH":
-            return False, "momentum_event_day_needs_high_confidence", 0
-
         try:
             adx = float(signals.get("adx_15") or 0.0)
         except (TypeError, ValueError):
             adx = 0.0
+
+        if str(signals.get("confidence_level") or "") not in ("HIGH", "MEDIUM"):
+            # Live 2026-09-15: 647 IV-EXPANDING/SPIKING cycles were through
+            # the OR on a DOWNTREND with ADX≈98 but confidence stuck at LOW
+            # (regime confidence collapses when IV is hot). Sell was correctly
+            # refused; the debit substitute must still be reachable when the
+            # tape has already proven the breakout. Narrow: sell refused for
+            # IV, ADX at/above 40, price in a with-trend label.
+            _br = str(block_reason or "").lower()
+            _iv_sell = ("iv_expand" in _br) or ("iv_spik" in _br)
+            _trend_ok = (
+                (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+                or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+            )
+            if not (_iv_sell and adx >= 40.0 and _trend_ok):
+                return False, (
+                    f"momentum_confidence_{signals.get('confidence_level')}_insufficient"
+                ), 0
+        # PATCH_V12: event-day momentum needs HIGH conviction — the
+        # schedule is already softened for the substitute, so the
+        # read itself must be unambiguous.
+        if signals.get("event_day") and str(signals.get("confidence_level") or "") != "HIGH":
+            # Same crash-continuation carve-out: an event crash with IV-hot
+            # sell refusal and a measured ADX is the long-put tape.
+            _br_e = str(block_reason or "").lower()
+            if not (
+                (("iv_expand" in _br_e) or ("iv_spik" in _br_e))
+                and adx >= 40.0
+            ):
+                return False, "momentum_event_day_needs_high_confidence", 0
+
         # PATCH_V13: the closing hour pays premium out of a session that is
         # nearly over, so it demands a MEASURED-STRONG trend - the same bar
         # the engine uses everywhere else to separate "trending" from "has
@@ -4281,10 +4353,33 @@ class StrategyEngine:
                 return False, f"momentum_put_at_or_above_vwap_{vwap:.0f}", 0
 
         # ── do not buy a volatility top ─────────────────────────────────
-        if str(signals.get("iv_behavior") or "") in ("EXPANDING", "SPIKING"):
-            return False, "momentum_iv_expanding_no_chase", 0
+        # Exception: measured with-trend continuation after OR break.
+        # Buying puts into a crash while IV expands is the trade; refusing
+        # it left live 2026-09-15 dark for 647 IV-hot through-OR cycles.
+        # OR + VWAP already proved above; require ADX at/above strong.
+        _ivb = str(signals.get("iv_behavior") or "")
+        if _ivb in ("EXPANDING", "SPIKING"):
+            _adx_strong_iv = float(getattr(cfg, "adx_strong_threshold", 28.0))
+            _iv_cont = (
+                adx >= max(40.0, _adx_strong_iv)
+                and (
+                    (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+                    or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+                )
+            )
+            if not _iv_cont:
+                return False, "momentum_iv_expanding_no_chase", 0
         if signals.get("straddle_expanding"):
-            return False, "momentum_straddle_expanding", 0
+            _adx_strong_iv = float(getattr(cfg, "adx_strong_threshold", 28.0))
+            _st_cont = (
+                adx >= max(40.0, _adx_strong_iv)
+                and (
+                    (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+                    or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+                )
+            )
+            if not _st_cont:
+                return False, "momentum_straddle_expanding", 0
         if signals.get("spot_velocity_block"):
             return False, "momentum_spot_velocity_too_fast", 0
         try:
@@ -4308,14 +4403,43 @@ class StrategyEngine:
         # still refuses plain-trend and immature-read chases, and
         # the 35% premium stop bounds every ticket. No new knob: the
         # strong threshold and the maturity flag are reused.
+        #
+        # Live 2026-09-15: the same ADX-86 crash printed plain
+        # DOWNTREND (not STRONG_DOWNTREND) for long stretches while
+        # day_move sat at 220%+, so the STRONG_*-only exemption never
+        # fired and momentum returned None every cycle (live took
+        # zero tickets; replay only cleared once the label upgraded).
+        # A mature ADX at/above the strong threshold IS the measured
+        # trend — the STRONG_* label is a lagging classifier detail.
         try:
             used = float(signals.get("day_move_used_pct") or 0.0)
         except (TypeError, ValueError):
             used = 0.0
+        _adx_strong = float(getattr(cfg, "adx_strong_threshold", 28.0))
+        _ema = str(signals.get("ema_structure") or "")
+        _ema_align = (
+            (direction < 0 and _ema == "BEARISH")
+            or (direction > 0 and _ema == "BULLISH")
+        )
+        # Mature ADX at/above strong is enough. Also accept a high ADX
+        # print with EMA alignment when the mature flag is false — live
+        # 2026-09-15 published adx=86 with mat=False for long stretches
+        # (pre-honest-immaturity publisher), and requiring the flag alone
+        # left the debit path dark all morning.
+        # OR is already proven above: extreme ADX (>=50) without EMA is
+        # enough for the day_move chase exemption on crash tapes where
+        # ema_structure is still INSUFFICIENT_DATA (Sep15 10:06).
         _mom_strong = (
-            bool(signals.get("adx_15_mature", False))
-            and adx >= float(getattr(cfg, "adx_strong_threshold", 28.0))
-            and price in ("STRONG_UPTREND", "STRONG_DOWNTREND")
+            adx >= _adx_strong
+            and price in (
+                "STRONG_UPTREND", "STRONG_DOWNTREND",
+                "UPTREND", "DOWNTREND",
+            )
+            and (
+                bool(signals.get("adx_15_mature", False))
+                or (adx >= 40.0 and _ema_align)
+                or adx >= 50.0
+            )
         )
         if used >= float(getattr(cfg, "momentum_day_move_max_pct", 90.0)) and not _mom_strong:
             return False, f"momentum_day_move_used_{used:.0f}pct_exhausted", 0
@@ -4695,39 +4819,86 @@ class StrategyEngine:
         allowed or does not price up — in which case the caller keeps the
         original refusal, unaltered, as the logged reason.
         """
+        signals.pop("_momentum_refuse_reason", None)
         if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+            signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
             return None
-        if self.market_engine.state.get("last_exit_is_stale_weekly"):
+        # After a harvested extreme fade the session is a mean-reversion
+        # book. Buying directional premium into the close is the wipe trade
+        # (canonical 2026-09-18: BPS low-fade + BCS high-fade then 14:30
+        # LONG_CALL into hard_exit −₹2.5k). Crash-continuation days never
+        # set these fade-exit flags. Use the sticky session latch — the
+        # per-exit last_exit_* bits are overwritten by the next close.
+        _st = self.market_engine.state
+        if (
+            _st.get("session_mean_reversion_book")
+            or _st.get("last_exit_is_afternoon_high_fade")
+            or _st.get("last_exit_is_afternoon_low_fade")
+            or _st.get("last_exit_is_failed_break_scalp")
+        ):
+            signals["_momentum_refuse_reason"] = (
+                "momentum_skipped_after_extreme_fade"
+            )
+            return None
+        if _st.get("last_exit_is_stale_weekly"):
+            signals["_momentum_refuse_reason"] = "momentum_skipped_stale_weekly"
             return None
         if "two_way_wait" in str(block_reason or ""):
+            signals["_momentum_refuse_reason"] = "momentum_skipped_two_way_wait"
             return None
-        # PATCH_V30: after a protective stop on a credit vertical, do not
-        # chase with long premium on the same session — 17-Sep bought a
-        # LONG_CALL at 13:04 after the bear-call proximity stop and lost
-        # the day into the dump.
+        # Confirmed two-way auction = fade the edges, do not express mid/
+        # late trend with debit. Crash days (IV expand + strong ADX) are
+        # excluded so 15-Sep long puts remain reachable.
+        if bool(signals.get("two_way_auction")) or self._after_two_way_extreme_scalp():
+            try:
+                _adx_tw = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_tw = 0.0
+            _ivb = str(signals.get("iv_behavior") or "")
+            _crash = (
+                _ivb in ("EXPANDING", "SPIKING")
+                and _adx_tw >= 40.0
+            )
+            if not _crash:
+                signals["_momentum_refuse_reason"] = (
+                    "momentum_skipped_two_way_auction"
+                )
+                return None
+        # PATCH_V30: after a protective *losing* stop on a credit vertical,
+        # do not chase with long premium (17-Sep proximity stop → LONG_CALL).
+        # Do NOT blanket-block every priority-3 exit: 09-Sep banked a BCS
+        # premium_stop then correctly bought the late LONG_PUT continuation.
+        # Fade days are already covered by session_mean_reversion_book above.
         try:
-            _pri = int(self.market_engine.state.get("last_exit_priority") or 0)
+            _pri = int(_st.get("last_exit_priority") or 0)
         except (TypeError, ValueError):
             _pri = 0
-        if _pri in (1, 2, 3) and float(
-            self.market_engine.state.get("last_exit_pnl_rs") or 0.0
-        ) < 0.0:
-            _rng, _, _, _ = self._session_range_pos(signals)
-            if _rng >= 100.0:
-                return None
+        if _pri in (1, 2, 3) and float(_st.get("last_exit_pnl_rs") or 0.0) < 0.0:
+            signals["_momentum_refuse_reason"] = (
+                "momentum_skipped_after_credit_stop"
+            )
+            return None
         try:
             ok, why, direction = self._momentum_gate(signals, block_reason)
         except Exception as exc:                      # never lose the day to
             self.logger.warning(f"momentum gate failed: {exc}")  # a new code path
+            signals["_momentum_refuse_reason"] = f"momentum_gate_exception:{exc}"
             return None
         if not ok:
+            signals["_momentum_refuse_reason"] = why
             return None
         # PATCH_V30: never buy calls while the engine is in a bear-credit
         # regime (or puts in a bull-credit regime).
         _final = str(signals.get("final_regime") or "")
         if direction > 0 and _final == "PREMIUM_SELL_BEAR":
+            signals["_momentum_refuse_reason"] = (
+                "momentum_skipped_call_vs_bear_credit_regime"
+            )
             return None
         if direction < 0 and _final == "PREMIUM_SELL_BULL":
+            signals["_momentum_refuse_reason"] = (
+                "momentum_skipped_put_vs_bull_credit_regime"
+            )
             return None
 
         # PATCH_V13: the gate tags which route opened - the morning breakout
@@ -4748,6 +4919,8 @@ class StrategyEngine:
             direction, reason, signals, size_mult, late=_late
         )
         if not params.get("valid"):
+            _pr = f"momentum_params_invalid:{params.get('reason')}"
+            signals["_momentum_refuse_reason"] = _pr
             self.logger.info(f"momentum substitute rejected: {params.get('reason')}")
             return None
 
@@ -4766,6 +4939,188 @@ class StrategyEngine:
             "params":        params,
         }
 
+    def _with_momentum_refuse(self, signals: dict, reason: str) -> str:
+        """Append momentum refusal so live logs are not sell-side-only."""
+        mom = signals.pop("_momentum_refuse_reason", None)
+        if not mom:
+            return reason
+        return f"{reason}|momentum_refused:{mom}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Live sell→ticket: buildable structure or one clear construct_fail
+    # ═══════════════════════════════════════════════════════════════════
+    # Geometry fails that will not clear without a new auction key, plus
+    # DEEP EV / hopeless friction (Sep8: ev≈-36 x91, friction x58). Do NOT
+    # sticky-latch mild EV / credit_risk / brokerage — those move with
+    # premium every cycle; latching them blocked Sep11/15 winners.
+    _STRUCTURAL_FAIL_MARKERS: Tuple[str, ...] = (
+        "wing_cost",
+        "condor_weak_side",
+    )
+
+    def _parse_ev_pts(self, reason: str) -> Optional[float]:
+        """Extract reported EV from ev_gate / params_invalid reason text."""
+        m = re.search(r"ev_(-?\d+(?:\.\d+)?)pts", (reason or ""), re.I)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _econ_fail_family(self, reason: str) -> Optional[str]:
+        r = (reason or "").lower()
+        for m in self._STRUCTURAL_FAIL_MARKERS:
+            if m in r:
+                return m
+        # Deep negative EV only — structure is untradeable this auction.
+        if "ev_" in r:
+            ev = self._parse_ev_pts(reason)
+            if ev is not None:
+                thr = float(getattr(
+                    self.config, "construct_fail_deep_ev_pts", -10.0
+                ))
+                if ev <= thr:
+                    return "deep_ev"
+        # Credit cannot clear the round trip (net_credit below friction).
+        if "friction" in r and "below" in r and "net_credit" in r:
+            return "deep_friction"
+        return None
+
+    def _loc_bucket(self, signals: dict) -> str:
+        try:
+            rng, loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return "unk"
+        if rng < 40.0:
+            return "thin"
+        if loc >= 0.80:
+            return "high"
+        if loc <= 0.20:
+            return "low"
+        return "mid"
+
+    def _construct_auction_key(
+        self,
+        signals: dict,
+        strategy_name: str,
+        family: str,
+    ) -> str:
+        """Identity of a refused sell construction attempt.
+
+        Changes when the live engine should re-probe: regime, two-way
+        state, fade tags, location bucket, or DTE. Same key + family is
+        the Sep9/10 wing_cost loop (37–120 identical IC rejects).
+        """
+        fr = str(signals.get("final_regime") or "")
+        tw = int(bool(signals.get("two_way_auction")))
+        fade = (
+            "H" if signals.get("afternoon_high_fade")
+            else ("L" if signals.get("afternoon_low_fade") else "0")
+        )
+        dte = signals.get("actual_dte")
+        return (
+            f"{strategy_name}|{family}|{fr}|tw={tw}|fade={fade}|"
+            f"loc={self._loc_bucket(signals)}|dte={dte}"
+        )
+
+    def _sticky_construct_reason(
+        self,
+        signals: dict,
+        strategy_name: str,
+    ) -> Optional[str]:
+        """If a prior structural reject is still latched for this auction, refuse once."""
+        state = self.market_engine.state
+        latch = state.get("construct_fail")
+        if not isinstance(latch, dict):
+            return None
+        try:
+            until = datetime.fromisoformat(str(latch.get("until")))
+        except Exception:
+            state["construct_fail"] = None
+            return None
+        now = now_ist()
+        if now > until:
+            state["construct_fail"] = None
+            return None
+        family = str(latch.get("family") or "")
+        key = self._construct_auction_key(signals, strategy_name, family)
+        if key != str(latch.get("key") or ""):
+            # Auction moved — allow a fresh construction probe.
+            state["construct_fail"] = None
+            self._construct_fail_counts.pop(str(latch.get("key") or ""), None)
+            return None
+        detail = str(latch.get("detail") or family)
+        return f"construct_fail_sticky:{detail}"
+
+    def _note_construct_fail(
+        self,
+        signals: dict,
+        strategy_name: str,
+        reason: str,
+    ) -> Optional[str]:
+        """Count structural rejects; latch sticky after N identical auction keys.
+
+        Returns the sticky reason once latched, else None (caller still
+        returns the raw params_invalid reason on this cycle).
+        """
+        family = self._econ_fail_family(reason)
+        if not family:
+            return None
+        key = self._construct_auction_key(signals, strategy_name, family)
+        n = int(self._construct_fail_counts.get(key, 0)) + 1
+        self._construct_fail_counts[key] = n
+        need = int(getattr(self.config, "construct_fail_latch_after", 1) or 1)
+        if n < need:
+            return None
+        hold = float(getattr(self.config, "construct_fail_hold_min", 15.0) or 15.0)
+        now = now_ist()
+        detail = (reason or "")[:160]
+        self.market_engine.state["construct_fail"] = {
+            "key":     key,
+            "family":  family,
+            "strategy": strategy_name,
+            "detail":  detail,
+            "since":   now.isoformat(),
+            "until":   (now + timedelta(minutes=hold)).isoformat(),
+            "count":   n,
+        }
+        self.logger.info(
+            f"construct_fail latched: {strategy_name} family={family} "
+            f"n={n} hold={hold:.0f}m key={key}"
+        )
+        return f"construct_fail_sticky:{detail}"
+
+    def _clear_construct_fail(self) -> None:
+        state = self.market_engine.state
+        latch = state.get("construct_fail")
+        if isinstance(latch, dict):
+            self._construct_fail_counts.pop(str(latch.get("key") or ""), None)
+        state["construct_fail"] = None
+
+    def _demote_condor_on_econ_fail(
+        self,
+        signals: dict,
+        reason: str,
+    ) -> Optional[str]:
+        """IC unbuildable on wing geometry → vertical ONLY with lean/fade evidence.
+
+        Bare location demotion stole the Sep11 book (losing BCS filled the
+        slot that the later momentum/winner path needed). Mid-range with no
+        lean stays flat via sticky construct_fail.
+        """
+        family = self._econ_fail_family(reason)
+        if family not in ("wing_cost", "condor_weak_side"):
+            return None
+        lean, _ = self._range_day_bearish_lean(signals)
+        if lean:
+            return BEAR_CALL_SPREAD
+        if signals.get("afternoon_high_fade"):
+            return BEAR_CALL_SPREAD
+        if signals.get("afternoon_low_fade"):
+            return BULL_PUT_SPREAD
+        return None
+
     def decide(self, signals: dict) -> dict:
         # PATCH_V13: session price memory for the closing-hour route. Kept
         # here (not in the data engine) so the series is exactly the set of
@@ -4779,6 +5134,7 @@ class StrategyEngine:
                 alt = self._momentum_decision(signals, reason)
                 if alt is not None:
                     return alt
+                reason = self._with_momentum_refuse(signals, reason)
             self._log_decision(signals, action, reason)
             self._persist_decision(signals, "NONE", reason, None, action)
             self.market_engine.finalize_cycle_log(
@@ -4791,6 +5147,9 @@ class StrategyEngine:
             alt = self._momentum_decision(signals, selection_reason)
             if alt is not None:
                 return alt
+            selection_reason = self._with_momentum_refuse(
+                signals, selection_reason
+            )
             self._log_decision(signals, "NO_TRADE", selection_reason)
             self._persist_decision(
                 signals, "NO_TRADE", selection_reason, None, "NO_TRADE"
@@ -4834,6 +5193,7 @@ class StrategyEngine:
             alt = self._momentum_decision(signals, full_reason)
             if alt is not None:
                 return alt
+            full_reason = self._with_momentum_refuse(signals, full_reason)
             self._log_decision(signals, "NO_TRADE", full_reason)
             self._persist_decision(
                 signals, strategy_name, full_reason, None, "NO_TRADE"
@@ -4842,6 +5202,22 @@ class StrategyEngine:
                 "NO_TRADE", full_reason, self._count_open_positions()
             )
             return {"action": "NO_TRADE", "reason": full_reason}
+
+        # Live sell→ticket: do not re-spam the same economics reject.
+        _sticky = self._sticky_construct_reason(signals, strategy_name)
+        if _sticky:
+            alt = self._momentum_decision(signals, _sticky)
+            if alt is not None:
+                return alt
+            _sticky = self._with_momentum_refuse(signals, _sticky)
+            self._log_decision(signals, "NO_TRADE", _sticky)
+            self._persist_decision(
+                signals, strategy_name, _sticky, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _sticky, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _sticky}
 
         size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
         # v4.2: regime layer can ask for a smaller clip on fresh-weekly
@@ -4876,10 +5252,59 @@ class StrategyEngine:
         )
 
         if not params.get("valid"):
-            full_reason = f"params_invalid:{params.get('reason', 'unknown')}"
+            fail_reason = str(params.get("reason", "unknown"))
+            full_reason = f"params_invalid:{fail_reason}"
+
+            # IC unbuildable on economics → one demotion to lean/location vertical.
+            if strategy_name == IRON_CONDOR:
+                _alt_name = self._demote_condor_on_econ_fail(signals, fail_reason)
+                if _alt_name:
+                    _alt_reason = (
+                        f"{selection_reason}:demoted_from_ic_on_{fail_reason[:80]}"
+                    )
+                    _alt_params = self.compute_params(
+                        _alt_name, _alt_reason, signals, size_mult
+                    )
+                    if _alt_params.get("valid"):
+                        self._clear_construct_fail()
+                        self.logger.info(
+                            f"IC construct demoted → {_alt_name} "
+                            f"(was {fail_reason[:100]})"
+                        )
+                        self._log_decision(
+                            signals, "STRATEGY_SELECTED", _alt_reason,
+                            _alt_name, _alt_params,
+                        )
+                        self._persist_decision(
+                            signals, _alt_name, _alt_reason,
+                            _alt_params, "STRATEGY_SELECTED",
+                        )
+                        self.market_engine.finalize_cycle_log(
+                            f"STRATEGY_SELECTED:{_alt_name}",
+                            None, self._count_open_positions(),
+                        )
+                        return {
+                            "action":        "ENTER",
+                            "strategy_name": _alt_name,
+                            "reason":        _alt_reason,
+                            "params":        _alt_params,
+                        }
+                    full_reason = (
+                        f"params_invalid:{fail_reason}"
+                        f"|demote_{_alt_name}_also:"
+                        f"{_alt_params.get('reason', 'unknown')}"
+                    )
+
+            sticky = self._note_construct_fail(
+                signals, strategy_name, fail_reason
+            )
+            if sticky:
+                full_reason = sticky
+
             alt = self._momentum_decision(signals, full_reason)
             if alt is not None:
                 return alt
+            full_reason = self._with_momentum_refuse(signals, full_reason)
             if "neutral" in full_reason.lower() or "vrp" in full_reason.lower():
                 self._log_phantom_if_neutral(signals, full_reason)
             self._log_decision(signals, "NO_TRADE", full_reason)
@@ -4891,6 +5316,7 @@ class StrategyEngine:
             )
             return {"action": "NO_TRADE", "reason": full_reason}
 
+        self._clear_construct_fail()
         self._log_decision(
             signals, "STRATEGY_SELECTED", selection_reason, strategy_name, params
         )

@@ -1519,6 +1519,26 @@ class BacktestRunner:
                     except (TypeError, ValueError):
                         pass
                     _live_reason = bt_exit_reason(action, priority)
+                    # PATCH_V34 parity: mirror execute_close fade tagging.
+                    # Live sets _closing_afternoon_*_fade from raw_params
+                    # before _update_state_after_close; replay used to skip
+                    # that, so last_exit_is_afternoon_*_fade stayed False
+                    # after a fade CLOSE_TARGET — breaking opposite-extreme
+                    # unlocks (canonical 2026-09-18 11:53→12:38 path).
+                    try:
+                        _rp = live.get("params") or {}
+                        if bool(_rp.get("afternoon_low_fade")):
+                            state["_closing_afternoon_low_fade"] = True
+                        if bool(_rp.get("afternoon_high_fade")):
+                            state["_closing_afternoon_high_fade"] = True
+                        if bool(_rp.get("neutral_range_vertical")) or bool(
+                            _rp.get("failed_break_scalp")
+                        ):
+                            state["_closing_failed_break_scalp"] = True
+                        if bool(_rp.get("stale_weekly_vertical")):
+                            state["_closing_stale_weekly"] = True
+                    except Exception:
+                        pass
                     try:
                         with self._quiet():
                             self.xe._update_state_after_close(

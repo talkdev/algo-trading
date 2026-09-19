@@ -56,6 +56,8 @@ except Exception:
 NIFTY_ENGINE_PROFIT_PATCH_V31 = "3.1"
 NIFTY_ENGINE_PROFIT_PATCH_V32 = "3.2"
 NIFTY_ENGINE_PROFIT_PATCH_V33 = "3.3"
+# PATCH_V34 (2026-09-18): replay close path mirrors execute_close fade
+# tagging so live and replay share opposite-extreme unlock state.
 NIFTY_ENGINE_PROFIT_PATCH_V34 = "3.4"
 NIFTY_ENGINE_PROFIT_PATCH_V35 = "3.5"
 NIFTY_ENGINE_PROFIT_PATCH_V36 = "3.6"
@@ -64,6 +66,9 @@ NIFTY_ENGINE_PROFIT_PATCH_V38 = "3.8"
 # v3.9 (2026-09-09): VIX-11 expiry-day profitability pass. See the
 # v3.3-tagged blocks in core.py / strategy_engine.py / execution_engine.py.
 NIFTY_ENGINE_PROFIT_PATCH_V39 = "3.9"
+# PATCH_V40 (2026-09-18): after extreme fades / confirmed two-way auction,
+# do not substitute late debit premium (mean-reversion book owns the day).
+NIFTY_ENGINE_PROFIT_PATCH_V40 = "4.0"
 # PATCH_V12 (2026-09-15): profitability repair pass — Tuesday-0DTE
 # discipline, DTE2 unification, directional day-move, floor
 # discipline, event-day confirmation, trend-flip exit, momentum
@@ -838,6 +843,19 @@ class Config:
     # Weekly wings (multi-day vega) are inherently pricier relative to
     # their shorts than 0DTE wings; 0.50 was calibrated for expiry day.
     wing_cost_frac_max_weekly: float = 0.58
+    # Live sell→ticket: once construction/economics rejects a named sell
+    # structure, do not re-spam the same reject every cycle. Hold the
+    # refusal until the auction key changes or this clock expires, so
+    # live either prints a buildable ticket or one clear construct_fail.
+    construct_fail_hold_min:   float = 15.0
+    # After this many consecutive identical economics rejects for the
+    # same auction key, latch the sticky construct_fail (1 = latch on
+    # first reject — matches Sep9/10 live wing_cost loops).
+    construct_fail_latch_after: int = 1
+    # Sticky-latch EV only when the reported EV is this deep (pts) or
+    # worse. Mild near-miss EV must keep re-probing (latching all EV
+    # blocked Sep11/15 winners). Sep8 live printed ev≈-36 for 91 cycles.
+    construct_fail_deep_ev_pts: float = -10.0
     # On DTE3/4 RANGE sessions with ADX in [trend, strong) the price
     # classifier still says RANGE (mean-reverting, not trending); allow
     # a WIDE condor (shorts forced to the strong-delta target below) up
@@ -1174,6 +1192,9 @@ class Config:
     open_spike_min_gap_pts:            float = 15.0
     open_spike_cutoff_hhmm:            str   = "09:45"
     open_spike_wait_until_hhmm:        str   = "12:15"
+    # Spot pullback from the open-HIGH wick that marks the lower high as
+    # resolved (RANGE may trade; directional BEAR still waits for fade/clock).
+    open_spike_pullback_pts:           float = 30.0
     open_spike_fade_min_range_pts:     float = 70.0
 
     def __repr__(self) -> str:
@@ -1523,6 +1544,9 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         em_band_hi_weekly=min(max(_get_float(env, "EM_BAND_HI_WEEKLY", 2.10), 1.20), 3.00),
         em_band_hi_condor_weekly=min(max(_get_float(env, "EM_BAND_HI_CONDOR_WEEKLY", 1.35), 0.80), 2.00),
         wing_cost_frac_max_weekly=min(max(_get_float(env, "WING_COST_FRAC_MAX_WEEKLY", 0.58), 0.30), 0.80),
+        construct_fail_hold_min=min(max(_get_float(env, "CONSTRUCT_FAIL_HOLD_MIN", 15.0), 1.0), 60.0),
+        construct_fail_latch_after=min(max(_get_int(env, "CONSTRUCT_FAIL_LATCH_AFTER", 1), 1), 5),
+        construct_fail_deep_ev_pts=max(min(_get_float(env, "CONSTRUCT_FAIL_DEEP_EV_PTS", -10.0), -1.0), -100.0),
         range_adx_wide_max=min(max(_get_float(env, "RANGE_ADX_WIDE_MAX", 28.0), 20.0), 40.0),
         range_adx_wide_size=min(max(_get_float(env, "RANGE_ADX_WIDE_SIZE", 0.80), 0.40), 1.00),
         unclear_range_size_weekly=min(max(_get_float(env, "UNCLEAR_RANGE_SIZE_WEEKLY", 0.75), 0.40), 1.00),
