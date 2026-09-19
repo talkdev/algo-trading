@@ -1053,7 +1053,7 @@ class Config:
         #     it (measured 2026-09-11: bear call trend-flipped out at 11:10
         #     for -250, the ATM call then gained 91pts and the substitute was
         #     locked out by the very cooldown the stop created).
-        "past_entry_window", "past_14:30",
+        "past_entry_window", "past_14:30", "past_14:",
         "stop_cooldown", "same_signal_combo",
     )
 
@@ -1065,14 +1065,17 @@ class Config:
     # bought, and it is squared off with everything else.
     momentum_late_enabled:               bool  = True
     # Window. The start is 14:30, the boundary the regime layer ALREADY
-    # treats as the end of the tradeable session (NO_TRADE:PAST_14:30), so
-    # the two routes can never compete for a cycle and the new route owns
-    # exactly the hour the engine had written off. It is not 14:05: measured
-    # on 2026-09-09, the fifteen minutes after the sell side closes still
-    # carry the MIDDAY trend reads - EMA structure BULLISH off a rally that
-    # had already peaked, ADX 24 and decaying - and a window that opens
-    # there bought a long call at 14:06 into the day's high and rode it down
-    # 100pts for -6,584. The closing hour is a different microstructure
+    # treats as the end of the tradeable sell session (NO_TRADE:PAST_14:30 /
+    # sell_regime_cutoff), so the two routes can never compete for a cycle
+    # and the new route owns exactly the hour the sell side has released.
+    # PATCH_V45: sell last-entry moved to 14:30 (was 14:00); this window
+    # still starts where sell classification ends so the routes abut
+    # rather than overlap. It is not 14:05: measured on 2026-09-09, the
+    # fifteen minutes after an early sell close still carry the MIDDAY
+    # trend reads - EMA structure BULLISH off a rally that had already
+    # peaked, ADX 24 and decaying - and a window that opens there bought
+    # a long call at 14:06 into the day's high and rode it down 100pts
+    # for -6,584. The closing hour is a different microstructure
     # (square-off flow, expiry rolls, the closing auction); it starts when
     # the engine says it does. The binding end is
     # momentum_late_min_minutes_left, which keeps the rule correct on
@@ -1108,6 +1111,34 @@ class Config:
     reentry_material_move_pct:           float = 0.12
     reentry_material_move_pts:           float = 15.0
     reentry_reconfirm_min:               int   = 45
+
+    # ══ PATCH_V45: single-slot rotation + afternoon credit window ═══════
+    # MAX_CONCURRENT=1 is correct for NIFTY defined-risk margin, but a
+    # morning vertical that rides to the hard exit plus a 45-minute
+    # same-thesis reconfirm leaves the book physically unable to rotate
+    # with the session's legs (measured 2026-09-11: 10:22 bull put held
+    # through a +64pt leg — 462 cycles of max_concurrent_positions_reached).
+    # Professionals free the slot on a regime flip and treat the opposite
+    # side as a NEW trade, not a churn of the old one.
+    regime_rotation_enabled:             bool  = True
+    regime_rotation_min_hold_min:        float = 25.0
+    regime_rotation_adx_min:             float = 22.0
+    # After an opposite-side exit the anti-churn clocks shrink: same-side
+    # re-entries still pay the full 10/45/15pt discipline.
+    reentry_opposite_cooldown_min:       float = 3.0
+    reentry_opposite_reconfirm_min:      float = 12.0
+    reentry_opposite_material_frac:      float = 0.25
+    # Hard-exit buffer. Morning/range still needs ~90 minutes of room.
+    # From afternoon_credit_after_hhmm a measured fade/trend ticket is a
+    # short-hold (professional NIFTY desks flat well before the 15:20
+    # broker sweep); 50 minutes leaves entries open until ~14:25 on a
+    # 15:15 weekly flat — unlocking the 13:00-15:00 leg the old 14:00
+    # cut + 90-minute floor had made untradeable by construction.
+    credit_min_minutes_left:             float = 90.0
+    afternoon_credit_after_hhmm:         str   = "13:00"
+    afternoon_credit_min_minutes_left:   float = 50.0
+    # Sell-regime classification cutoff; releases before momentum_late (14:30).
+    sell_regime_cutoff_hhmm:             str   = "14:15"
 
     # ══ PATCH_V13: entry/exit trend symmetry ════════════════════════════
     # The exit ladder already ejects a credit vertical that a measured trend
@@ -1465,7 +1496,11 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
 
         # Windows
         trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 45)),
-        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 0)),
+        # PATCH_V45: 14:00 -> 14:15. With the afternoon 50-minute hard-exit
+        # buffer this unlocks credit through ~14:15 on a 15:15 weekly flat
+        # (was ~13:45 under the old flat 90-minute floor). Stops short of
+        # momentum_late at 14:30 so the routes abut rather than compete.
+        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 15)),
         # Defined-risk, non-expiry NIFTY positions may remain open past the
         # 15:00 expiry-day square-off, leaving a small but tradeable
         # final-theta window while deliberately flattening before the

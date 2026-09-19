@@ -1848,9 +1848,23 @@ class RegimeClassifier:
         if current_time < time(9, 45):
             return FinalRegime.NO_TRADE, "NO_TRADE:BEFORE_09:45", False
 
-        # ── Time Gate 2: After 14:30 ──────────────────────────────────────
-        if current_time > time(14, 30):
-            return FinalRegime.NO_TRADE, "NO_TRADE:PAST_14:30", False
+        # ── Time Gate 2: After sell-regime cutoff (default 14:30) ─────────
+        # PATCH_V45: configurable so the afternoon credit window and the
+        # momentum_late hand-off stay aligned. Default remains 14:30.
+        try:
+            _sell_cut = datetime.strptime(
+                str(getattr(self.config, "sell_regime_cutoff_hhmm", "14:30")
+                    or "14:30"),
+                "%H:%M",
+            ).time()
+        except Exception:
+            _sell_cut = time(14, 30)
+        if current_time > _sell_cut:
+            return (
+                FinalRegime.NO_TRADE,
+                f"NO_TRADE:PAST_{_sell_cut.strftime('%H:%M')}",
+                False,
+            )
 
         # ── DTE Filter ────────────────────────────────────────────────────
         # PATCH_V14: this ceiling, the one in strategy_engine._check_hard_gates

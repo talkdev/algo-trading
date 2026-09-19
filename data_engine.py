@@ -623,6 +623,8 @@ class MarketDataEngine:
                 "rv_anchor_pct", "rv_anchor_date", "first_bar_close",
                 "last_exit_is_failed_break_scalp",
                 "last_exit_is_stale_weekly",
+                "last_exit_is_regime_rotation",
+                "last_exit_strategy_side",
             ):
                 if _k not in data:
                     continue
