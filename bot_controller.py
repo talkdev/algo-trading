@@ -9,6 +9,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BASE_DIR = r"C:\Users\Administrator\Desktop\algo-trading"
 ENV_FILE = os.path.join(BASE_DIR, "env.txt")
 TARGET_SCRIPT = os.path.join(BASE_DIR, "main.py")
+STOCK_SCREENER_SCRIPT = os.path.join(BASE_DIR, "stock-screener.py")
 BASE_DIR2 = r"C:\Users\Administrator\Desktop\algo-trading\logs"
 LOG_FILE = os.path.join(BASE_DIR2, "algo.log")
 PID_FILE = os.path.join(BASE_DIR2, "algo.pid")
@@ -84,12 +85,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Configuration Management:*\n"
         "• `/get` - View all variables in `env.txt`\n"
         "• `/get KEY` - View value of a specific key\n"
-        "• `/set KEY VALUE` - Update or add a key-value pair\n\n"
+        "• `/set VALUE` - Update UPSTOX_ACCESS_TOKEN\n\n"
         "*Process Execution:*\n"
         "• `/run` - Launch `main.py` in the background\n"
         "• `/stop` - Terminate running `main.py` process tree\n"
         "• `/status` - Check process state and recent output\n"
-        "• `/logs [N]` - View last N lines of output (default: 20)"
+        "• `/logs [N]` - View last N lines of output (default: 20)\n\n"
+        "*Screeners:*\n"
+        "• `/stock` - Trigger `stock-screener.py`"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -132,12 +135,14 @@ async def set_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: `/set KEY VALUE`\nExample: `/set DRY_RUN False`", parse_mode="Markdown")
+    # Check if a value was actually provided
+    if not context.args:
+        await update.message.reply_text("Usage: `/set VALUE`\nExample: `/set eyJhbGciOiJIUzI1Ni...`", parse_mode="Markdown")
         return
 
-    key_to_set = context.args[0].strip()
-    value_to_set = " ".join(context.args[1:]).strip()
+    # Hardcode the key and take the entire input as the value
+    key_to_set = "UPSTOX_ACCESS_TOKEN"
+    value_to_set = " ".join(context.args).strip()
     new_entry = f"{key_to_set}={value_to_set}\n"
 
     lines = []
@@ -198,6 +203,27 @@ async def run_algo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f.write(str(process.pid))
 
         await update.message.reply_text(f"🚀 Started `main.py`\n• **PID:** `{process.pid}`", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Execution failed:\n`{str(e)}`", parse_mode="Markdown")
+
+
+async def run_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggers the stock-screener.py script"""
+    if not is_authorized(update):
+        return
+
+    if not os.path.exists(STOCK_SCREENER_SCRIPT):
+        await update.message.reply_text(f"❌ Script not found: `{STOCK_SCREENER_SCRIPT}`", parse_mode="Markdown")
+        return
+
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-u", STOCK_SCREENER_SCRIPT],
+            cwd=BASE_DIR,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+
+        await update.message.reply_text(f"📈 Triggered `stock-screener.py` successfully!\n• **PID:** `{process.pid}`", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Execution failed:\n`{str(e)}`", parse_mode="Markdown")
 
@@ -290,6 +316,7 @@ def main():
     app.add_handler(CommandHandler("get", get_env))
     app.add_handler(CommandHandler("set", set_env))
     app.add_handler(CommandHandler("run", run_algo))
+    app.add_handler(CommandHandler("stock", run_stock))
     app.add_handler(CommandHandler("stop", stop_algo))
     app.add_handler(CommandHandler("status", status_algo))
     app.add_handler(CommandHandler("logs", view_logs))
