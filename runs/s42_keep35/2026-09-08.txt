@@ -1,0 +1,174 @@
+
+══════════════════════════════════════════════════════════════════════════════
+REPLAYING 1 SESSION(S): 2026-09-08 .. 2026-09-08
+══════════════════════════════════════════════════════════════════════════════
+[backtest] WARNING: 2026-09-08: no previous-session candle in this database — gap detection DISABLED, the gap leans cannot fire. Re-split with a patched split_db_per_day.py for live-faithful replays.
+
+══════════════════════════════════════════════════════════════════════════════
+BACKTEST RESULT
+══════════════════════════════════════════════════════════════════════════════
+  sessions replayed : 1
+  engine cycles     : 768
+  entry decisions   : 622
+  fill model        : edge=0.25 stress=0.50
+  capital           : Rs 1,000,000
+
+  trades            : 1
+  win rate          : 100.0%
+  total P&L         : Rs        2,861
+  return on capital :         0.29%
+  expectancy/trade  : Rs        2,861
+  avg win / avg loss: Rs 2,861 / Rs 0
+  profit factor     : inf
+  max drawdown      : Rs 0   (close-to-close, realised)
+  max intraday DD   : Rs 2,674   (marked-to-market, 767 samples)
+     worst point    : 2026-09-08 12:37
+     vs day limit   : Rs 80,000 (8.0% of capital) - not breached
+  Sortino (daily ann): n/a - 1 session(s) replayed, a ratio needs at least 2
+  Sharpe (daily ann): n/a - replay several sessions in one run (--db dir/ or --db a.db b.db)
+     ratio sample   : 1 session(s)   (0 flat, 0 losing)
+  total costs paid  : Rs 122   (4% of |P&L|)
+
+  ⚠  1 trades is not a sample. The standard error on a win rate
+     at n=1 is about 50 percentage points. Any
+     conclusion drawn from these numbers is noise with a decimal
+     point attached.
+
+──────────────────────────────────────────────────────────────────────────────
+EXIT ATTRIBUTION  (where the P&L actually comes from)
+──────────────────────────────────────────────────────────────────────────────
+  exit                            n        total        avg
+  ----------------------------------------------------------
+  P6 time                         1        2,861      2,861
+
+──────────────────────────────────────────────────────────────────────────────
+PER-DTE BREAKDOWN  (the engine is a different machine at each DTE)
+──────────────────────────────────────────────────────────────────────────────
+   DTE  sessions  trades  wins   win%       total       avg      PF    hold  strategies
+  ------------------------------------------------------------------------------------------------
+     0         1       1     1   100%       2,861     2,861     inf     96m  BEAR_CALL_SPREADx1
+  ------------------------------------------------------------------------------------------------
+  DTE 0: fewer than 5 trades. At one
+  trade per session these buckets are unmeasured, not proven -
+  a DTE the engine rarely trades is a DTE nothing is known about.
+
+──────────────────────────────────────────────────────────────────────────────
+MOMENTUM / CLOSING-HOUR REFUSALS  (by the condition that fired)
+──────────────────────────────────────────────────────────────────────────────
+  621 cycle(s) refused on a momentum condition:
+      376    61%  momentum_needs_trend_got_RANGE
+       80    13%  momentum_skipped_fade_owns_book
+       48     8%  momentum_adx_N_below_min
+       25     4%  momentum_sell_side_open(no_trade:or_not_established)
+       24     4%  momentum_sell_side_open(open_spike_wait_unresolved_lower_h)
+       20     3%  momentum_late_ema_TRANSITIONAL_no_direction
+       17     3%  momentum_sell_side_open(no_trade:before_N:N)
+        9     1%  momentum_sell_side_open(no_trade:choppy_market)
+        9     1%  momentum_skipped_two_way_auction
+        8     1%  momentum_past_entry_window_N:N:N
+        3     0%  momentum_sell_side_open(range_dteN_condor_requires_sell_pr)
+        2     0%  momentum_sell_side_open(expiry_day_waiting_for_Ndte_series)
+
+  Read this before concluding the route is broken: a refusal is
+  the gate working. What matters is whether ONE condition accounts
+  for nearly all of them - that one is mis-calibrated, the rest are
+  the route correctly declining to trade.
+
+──────────────────────────────────────────────────────────────────────────────
+SESSION PARITY  (what the live capture recorded vs this replay)
+──────────────────────────────────────────────────────────────────────────────
+  session      field              recorded      replay   what it is
+  --------------------------------------------------------------------------------------
+  2026-09-08   day_mode          PRE_EVENT      NORMAL   EVENT / PRE_EVENT / NORMAL from high_impact_events.json
+  2026-09-08   wing_width              100         150   adaptive: scaled off the opening straddle and the DTE
+  2026-09-08   (stamp)         2026-09-08 23:14:22               recorded row was written outside the session; compared end-of-day
+  --------------------------------------------------------------------------------------
+  !! 2026-09-08: recorded PRE_EVENT, replayed NORMAL. day_mode is not a
+     parameter, it is a RULE SET - EVENT turns on
+     defined_risk_only and allows a RANGE verdict at HIGH
+     confidence and nothing else. high_impact_events.json
+     is hand-edited and is NOT recorded with the session,
+     so this replay did not offer itself the same trades
+     the live run was offered. Nothing in the P&L above
+     can be attributed to the strategy until the event
+     calendar for that date is settled.
+
+──────────────────────────────────────────────────────────────────────────────
+ENTRY FUNNEL  (gates in the order decide() applies them)
+──────────────────────────────────────────────────────────────────────────────
+  A late gate only ever sees what the earlier gates let through, so
+  its share of all cycles understates it. Read the pass rate.
+
+  stage                 blocked  reached   passed  pass rate   top gate
+  ----------------------------------------------------------------------------------------
+  entry window              153      622      469        75%   entry_window (153)
+  position limits             0      469      469       100%   -
+  contract / DTE             67      469      402        86%   dte (67)
+  regime verdict            304      402       98        24%   PAST_14:30|MOMENTUM_REFUSED:MOMENTUM (238)
+  strategy selection          0       98       98       100%   -
+  counter-trend symmetry        0       98       98       100%   -
+  structure rules             0       98       98       100%   -
+  structure build            18       98       80        82%   credit_risk_ratio (18)
+  EV gate                     0       80       80       100%   -
+  ----------------------------------------------------------------------------------------
+  ENTERED                                       1
+
+  !! 79 rejection(s) from gates this tool cannot place in the chain:
+       RANGE_VERTICAL_ADX_IMMATURE|MOMENTUM  (55)
+       OPEN_SPIKE_WAIT_UNRESOLVED_LOWER_HIG  (24)
+     Their position in the funnel above is therefore unknown,
+     and the stage totals exclude them. Add them to STAGE_ORDER.
+
+  NEAR-MISS MARGINS  (how far short, when the reason says)
+  --------------------------------------------------------------------------
+  gate                                   n     median       best
+  entry_window                          48       9.00       5.00
+  credit_risk_ratio                     18       0.08       0.07
+
+  A gate missing by a hair on most cycles is mis-calibrated.
+  A gate missing by a mile is telling you the trade was not there.
+
+  EPISODES  (contiguous runs - the honest sample size)
+  --------------------------------------------------------------------------
+  gate                                 cycles   episodes   cycles/ep
+  PAST_14:30|MOMENTUM_REFUSED:MOMENTUM      238          4          60
+  entry_window                            153          1         153
+  dte                                      67          6          11
+  RANGE_VERTICAL_ADX_IMMATURE|MOMENTUM       55          5          11
+  or_not_established                       25          1          25
+  OPEN_SPIKE_WAIT_UNRESOLVED_LOWER_HIG       24          5           5
+  CHOPPY_MARKET|MOMENTUM_REFUSED:MOMEN       18          3           6
+  credit_risk_ratio                        18          1          18
+
+  Treat 'episodes', not 'cycles', as n when judging significance.
+
+──────────────────────────────────────────────────────────────────────────────
+REJECTION CENSUS  (why entries did not happen)
+──────────────────────────────────────────────────────────────────────────────
+  gate                                     count   share   example
+  --------------------------------------------------------------------------
+  PAST_14:30|MOMENTUM_REFUSED:MOMENTUM       238   38.3%   NO_TRADE:PAST_14:30|momentum_refused:momentum_late_ema_TRANSITIONAL_no
+  entry_window                               153   24.6%   past_entry_window_13:00:00|momentum_refused:momentum_needs_trend_got_R
+  dte                                         67   10.8%   RANGE_DTE4_CONDOR_REQUIRES_SELL_PREMIUM_GOT_NEUTRAL|momentum_refused:m
+  RANGE_VERTICAL_ADX_IMMATURE|MOMENTUM        55    8.9%   RANGE_VERTICAL_ADX_IMMATURE|momentum_refused:momentum_needs_trend_got_
+  or_not_established                          25    4.0%   NO_TRADE:OR_NOT_ESTABLISHED|momentum_refused:momentum_sell_side_open(n
+  OPEN_SPIKE_WAIT_UNRESOLVED_LOWER_HIG        24    3.9%   open_spike_wait_unresolved_lower_high|momentum_refused:momentum_sell_s
+  CHOPPY_MARKET|MOMENTUM_REFUSED:MOMEN        18    2.9%   NO_TRADE:CHOPPY_MARKET|momentum_refused:momentum_sell_side_open(no_tra
+  credit_risk_ratio                           18    2.9%   params_invalid:credit_risk_ratio_0.053_below_min_0.132|momentum_refuse
+  BEFORE_09:45|MOMENTUM_REFUSED:MOMENT        17    2.7%   NO_TRADE:BEFORE_09:45|momentum_refused:momentum_sell_side_open(no_trad
+  STRADDLE_EXPLOSION|MOMENTUM_REFUSED:         6    1.0%   NO_TRADE:STRADDLE_EXPLOSION|momentum_refused:momentum_needs_trend_got_
+
+══════════════════════════════════════════════════════════════════════════════
+
+  HOW TO READ THIS
+  ----------------
+  * Fills are modelled, not observed. Nothing here includes partial fills,
+    rejections or latency, and the simulated monitoring loop is only as fast
+    as the recorded snapshot cadence - a stop hit and recovered between two
+    snapshots is invisible. Both of those bias the result OPTIMISTIC.
+  * If you tuned any threshold while looking at these dates, this is an
+    in-sample number and it is not evidence. Re-run on dates you have not
+    looked at.
+  * The rejection census is the actionable half of this report.
+
+  trade blotter -> runs\s42_keep35\2026-09-08.csv

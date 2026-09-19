@@ -707,6 +707,13 @@ class Results:
         self.starting_capital = starting_capital
         self.trades: List[Trade] = []
         self.halted_days: List[str] = []
+        # Sessions whose recorded chain ends well before the square-off. A
+        # partial capture replays as a partial day and reports a partial
+        # P&L with no error; measured 2026-09-18: the per-day split ended at
+        # 13:36, the replay printed +2,050 and was quoted as the day's
+        # result, while the full-day replay is +1,952 (the late BCS ran
+        # into its trailing stop). (date, last_cycle_hhmm) pairs.
+        self.truncated_days: List[Tuple[str, str]] = []
         self.rejections: Counter = Counter()
         self.rejection_detail: Dict[str, List[str]] = defaultdict(list)
         self.cycles = 0
@@ -1400,6 +1407,28 @@ class BacktestRunner:
 
         self.results.days.append(trading_date)
         self.results._cur_day = trading_date
+
+        # ── truncated-capture guard ───────────────────────────────────────
+        # If the last recorded snapshot is earlier than the latest square-off
+        # any session can carry (15:00, 0DTE) the day is a PARTIAL capture:
+        # whatever is open at the last cycle is force-flattened on a mark that
+        # the real session never printed, and every entry window after it is
+        # silently missing. Say so, loudly, and remember it for the report.
+        try:
+            _last_hhmm = str(day.cycles[-1])[11:16]
+        except Exception:
+            _last_hhmm = ""
+        if _last_hhmm and _last_hhmm < "15:00":
+            self.results.truncated_days.append((trading_date, _last_hhmm))
+            print(
+                f"[backtest] WARNING: {trading_date}: recorded chain ends at "
+                f"{_last_hhmm} — PARTIAL SESSION. Open positions will be "
+                f"force-flattened at that mark and later entry windows are "
+                f"missing; do not quote this day's P&L as a full-day result. "
+                f"Re-split from the full database (split_db_per_day.py "
+                f"--dates {trading_date})."
+            )
+
         state = self.me.state
         state["daily_halted"] = False
         live: Optional[dict] = None
@@ -2418,6 +2447,15 @@ def print_report(res: Results, config: Config, args, store=None) -> None:
         print(f"  daily loss limit hit on {len(res.halted_days)} session(s): "
               f"{', '.join(res.halted_days[:6])}"
               f"{' ...' if len(res.halted_days) > 6 else ''}")
+
+    if res.truncated_days:
+        print()
+        print(f"  !! PARTIAL CAPTURE on {len(res.truncated_days)} session(s) - "
+              f"recorded chain ends before 15:00:")
+        for _d, _t in res.truncated_days[:8]:
+            print(f"     {_d}  last snapshot {_t}   (P&L is NOT a full-day result)")
+        if len(res.truncated_days) > 8:
+            print("     ...")
 
     # -- funnel -----------------------------------------------------------
     print_funnel(res)

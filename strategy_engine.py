@@ -15,7 +15,7 @@ from typing import Optional, Tuple, List, Dict
 
 from core import (
     Config, Database,
-    ExpiryCalendar, now_ist, today_ist,
+    ExpiryCalendar, now_ist, today_ist, by_dte,
     print_section, print_kv_table,
     load_config, setup_logging,
     RateLimiter, UpstoxClient,
@@ -1150,8 +1150,13 @@ class StrategyEngine:
             _weekend_risk = ExpiryCalendar.is_weekend_risk_day(today_ist())
         except Exception:
             _weekend_risk = False
-        if _weekend_risk or signals.get("day_label") == "FRIDAY" \
-                or signals.get("actual_dte") == 2:
+        # v44: the `actual_dte == 2` clause is gone. PATCH_V14 diagnosed the
+        # DTE costume and added the calendar test, but left the costume on,
+        # so a Thursday in a holiday-shifted week was still refused for a
+        # reason (weekend gap) that does not apply to it. The rule is now
+        # exactly what its docstring says: last session before a >=2-day
+        # shut, plus the explicit FRIDAY label as belt-and-braces.
+        if _weekend_risk or signals.get("day_label") == "FRIDAY":
             return False, "lean_skipped_weekend_risk_delta_neutral_only"
         if signals.get("price_regime") != "RANGE":
             return False, "lean_needs_range_price"
@@ -1694,18 +1699,18 @@ class StrategyEngine:
             time_mult2 = math.sqrt(remaining_frac2)
             dist_mult  = 1.3 * time_mult2
             floor_pts  = max(int(150 * time_mult2), 70)
-        elif dte == 1:
-            dist_mult, floor_pts = 1.05, 150
-        elif dte == 2:
-            dist_mult, floor_pts = 0.80, 130
-        elif dte == 3:
-            dist_mult, floor_pts = 0.68, 120
-        elif dte == 4:
-            dist_mult, floor_pts = 0.58, 110
-        elif dte == 5:
-            dist_mult, floor_pts = 0.50, 100
         else:
-            dist_mult, floor_pts = 0.45, 95
+            # v44: the per-DTE table (1.05/0.80/0.68/0.58/0.50 x straddle,
+            # floors 150/130/120/110/100) was one row per DTE. The rows
+            # are 1.27 / sqrt(DTE + 0.5) to within 3% on DTE1-4 (the
+            # straddle of a DTE-d expiry grows with sqrt(life) while the
+            # intraday move the short must clear does not), and the floor
+            # is 150 - 10 x DTE. Both now written as the formula. This is
+            # the straddle FALLBACK only; delta selection places the
+            # strike when the chain quotes a greek.
+            _dte_f = float(dte) if dte is not None else 6.0
+            dist_mult = 1.27 / math.sqrt(_dte_f + 0.5)
+            floor_pts = int(max(150.0 - 10.0 * _dte_f, 95.0))
 
         if adx_15 >= self.config.adx_strong_threshold:
             dist_mult *= 1.20
@@ -2000,15 +2005,18 @@ class StrategyEngine:
             _short_dist_ref = min(float(short_dist[0]), float(short_dist[1]))
         else:
             _short_dist_ref = float(short_dist) if short_dist else 0.0
+        # v44: wing factor and cap blended on sqrt-life between the expiry
+        # (0.50 / 250) and weekly (0.62 / 450) anchors; DTE1 falls at
+        # ~0.57 / ~370 instead of the typed 0.60 / 350.
         if _short_dist_ref > 0:
-            _wing_factor = 0.50 if dte == 0 else (0.60 if dte == 1 else 0.62)
+            _wing_factor = by_dte(dte, 0.50, 0.62)
             _wing_raw = max(
                 _short_dist_ref * _wing_factor, float(_wing_hint) * 0.60
             )
         else:
             _wing_raw = float(_wing_hint)
         _wing_min = max(2 * step, 100)
-        _wing_max = 250 if dte == 0 else (350 if dte == 1 else 450)
+        _wing_max = int(round(by_dte(dte, 250.0, 450.0) / step) * step)
         wing = int(round(_wing_raw / step + 0.001) * step)
         wing = int(max(_wing_min, min(wing, _wing_max)))
         if (signals.get("neutral_range_vertical")
@@ -2506,12 +2514,10 @@ class StrategyEngine:
             # Mirror the engine's own efficacy-blended risk measure so the
             # provisional size matches the size that will really be used.
             eff = float(getattr(self.config, "stop_efficacy", 0.55))
-            if dte == 0:
-                sm = float(getattr(self.config, "stop_mult_dte0", 1.40))
-            elif dte == 1:
-                sm = float(getattr(self.config, "stop_mult_dte1", 1.55))
-            else:
-                sm = float(getattr(self.config, "stop_mult_dte2p", 1.70))
+            # v44: same blended multiple compute_params will use, so the
+            # provisional size matches the traded size (the old fallback
+            # here said 1.40 on DTE0 while Config said 1.60).
+            sm = self.config.stop_mult_for_dte(dte)
             stop_lot = max((sm - 1.0) * float(credit_pts) * C02, 1.0)
             struct_lot = max((float(wing_pts) - float(credit_pts)) * C02, 1.0)
             per_lot = min(
@@ -2662,14 +2668,12 @@ class StrategyEngine:
         # is genuinely wrong, rather than scalping a third of the
         # credit while leaving a catastrophic tail open.
         vix = float(signals.get("vix") or 11.0)
-        if dte == 0:
-            base_t = float(getattr(self.config, "target_pct_dte0", 0.50))
-        elif dte == 1:
-            base_t = float(getattr(self.config, "target_pct_dte1", 0.45))
-        elif dte == 2:
-            base_t = float(getattr(self.config, "target_pct_dte2p", 0.40))
-        else:
-            base_t = float(getattr(self.config, "target_pct_dte2p", 0.40)) - 0.03
+        # v44: blended on sqrt-life between the expiry-day and weekly
+        # anchors (0.70 -> ~0.52 on DTE1 -> 0.40). The -0.03 shave for
+        # DTE>=3 is kept as measured on the twelve weekly trades.
+        base_t = self.config.target_pct_for_dte(dte)
+        if dte is None or dte >= 3:
+            base_t -= 0.03
         # Richer implied vol means a wider distribution, so take the
         # money a little sooner.
         if vix >= 14.0:
@@ -3056,10 +3060,9 @@ class StrategyEngine:
                     # half is the theta that accrues before the barrier is
                     # reached. 0DTE keeps the undiscounted conservative
                     # number (gamma does not give theta time to accrue).
-                    if (dte is not None and dte >= 2):
-                        _carry_ev *= float(getattr(
-                            self.config, "ev_carry_discount_dte2p", 0.62
-                        ))
+                    # v44: blended on sqrt-life (1.0 on DTE0, the
+                    # measured weekly discount on DTE>=2, ~0.78 on DTE1).
+                    _carry_ev *= self.config.ev_carry_discount_for_dte(dte)
                     if _carry_ev < stop_loss_pts:
                         stop_loss_pts = _carry_ev
                         tail_loss_pts = max(
@@ -3179,11 +3182,8 @@ class StrategyEngine:
         p_win = max(0.28, min(0.92, p_win))
 
         # ── [E2] Three-outcome expectancy ─────────────────────────────────
-        p_tail = (
-            float(getattr(self.config, "gamma_tail_prob_dte0", 0.055))
-            if dte == 0 else
-            float(getattr(self.config, "gamma_tail_prob_dte1p", 0.025))
-        )
+        # v44: gamma-gap probability blended on sqrt-life, not a DTE0/1+ step
+        p_tail = self.config.gamma_tail_prob_for_dte(dte)
         # A wide opening range and a trending tape both fatten the tail.
         if or_condition in ("WIDE", "VERY_WIDE"):
             p_tail *= 1.8
@@ -3592,12 +3592,9 @@ class StrategyEngine:
         # for every structure, and capped at the structural loss - you
         # cannot lose more than the wing, so a stop above it is fiction
         # that only serves to oversize the position.
-        if actual_dte == 0:
-            _stop_mult_pre = float(getattr(self.config, "stop_mult_dte0", 1.40))
-        elif actual_dte == 1:
-            _stop_mult_pre = float(getattr(self.config, "stop_mult_dte1", 1.55))
-        else:
-            _stop_mult_pre = float(getattr(self.config, "stop_mult_dte2p", 1.70))
+        # v44: blended on sqrt-life (1.60 DTE0 -> ~1.66 DTE1 -> 1.70 DTE2+),
+        # monotone by construction; the typed DTE1 row was 1.55.
+        _stop_mult_pre = self.config.stop_mult_for_dte(actual_dte)
         _stop_mult_pre = min(max(_stop_mult_pre, 1.15), 3.00)
         _stop_premium_pre = net_credit * _stop_mult_pre
         _wing_cap_pre = float(actual_wing_pts or 150)

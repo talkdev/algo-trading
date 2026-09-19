@@ -1,0 +1,2 @@
+trading_date,strategy,regime,confidence,dte,entry_time,exit_time,lots,entry_credit,exit_debit,gross_pts,costs_rs,pnl_rs,exit_reason,exit_priority,entry_spot,exit_spot,strikes,wing,held_min
+2026-09-11,LONG_CALL,NO_TRADE,HIGH,1,11:21:06,14:30:11,2,-140.9,-201.94,61.04,105.87,7829.33,momentum_flat_before_close,6,23334.2,23427.9,BC23300,,189

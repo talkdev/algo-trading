@@ -1,0 +1,90 @@
+{
+  "as_of_requested": "2026-09-19",
+  "as_of_effective": "2026-09-18",
+  "provisional": false,
+  "benchmark": {
+    "name": "NIFTY 500",
+    "instrument_key": "NSE_INDEX|Nifty 500",
+    "B21": -0.023332,
+    "B63": -0.01312,
+    "B126": 0.06241,
+    "B252": -0.011345
+  },
+  "frozen_parameters": {
+    "HORIZONS": [
+      21,
+      63,
+      126,
+      252
+    ],
+    "MIN_HISTORY_DAYS": 253,
+    "MAX_MISSING_DAYS": 3,
+    "MIN_ELIGIBLE_FRACTION": 0.5,
+    "FETCH_CALENDAR_DAYS": 550,
+    "VOL_ANNUALISE": true,
+    "RANK_BASIS": "R",
+    "P_STRONG": 70.0,
+    "P_VERY_STRONG": 85.0,
+    "POS_COUNT_MIN": 3,
+    "COMPOSITE_WEIGHTS": {
+      "Rank252": 1.0,
+      "Rank126": 1.0,
+      "pct_MR252": 1.0,
+      "pct_MR126": 1.0,
+      "pct_RAM252": 1.0
+    },
+    "CORP_ACTION_JUMP": 0.25,
+    "BENCHMARK_NAME": "NIFTY 500",
+    "BENCHMARK_EXPECTED_KEY": "NSE_INDEX|Nifty 500"
+  },
+  "rank_basis": "R",
+  "counts": {
+    "universe": 90,
+    "resolved": 90,
+    "eligible": 90,
+    "per_flag": {
+      "MARKET_OUTPERFORMER": 33,
+      "STRONG_TREND": 29,
+      "STRONG_XS_MOMENTUM": 18,
+      "VERY_STRONG_MOMENTUM": 7,
+      "CORE_QUALIFIER": 16,
+      "FINAL_QUALIFIER": 5
+    },
+    "core": 16,
+    "final": 5
+  },
+  "unresolved": [],
+  "ineligible": [],
+  "data_source": {
+    "provider": "Upstox",
+    "base_url": "https://api.upstox.com",
+    "instrument_master_url": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+    "access_paths": [
+      "historical_cache",
+      "instrument_master_cache"
+    ]
+  },
+  "adjustment_note": "Upstox daily closes are stated to be split-adjusted; dividend adjustment is not guaranteed. Returns are price returns against the NIFTY 500 price index, not TRI. Later vendor revisions or split adjustments can change historical results.",
+  "timestamp_utc": "2026-09-19T15:17:02.853745+00:00",
+  "data_window": {
+    "first_date": "2025-09-11",
+    "last_date": "2026-09-18",
+    "rows": 253,
+    "master_first_date": "2025-03-18",
+    "master_rows": 373,
+    "fetch_from": "2025-03-18",
+    "fetch_to": "2026-09-19"
+  },
+  "output_labels": {
+    "screen_2026-09-18.csv": {
+      "PROVISIONAL": false
+    },
+    "universe_2026-09-18.csv": {
+      "PROVISIONAL": false
+    },
+    "run_2026-09-18.json": {
+      "PROVISIONAL": false
+    }
+  },
+  "status": "success"
+}
