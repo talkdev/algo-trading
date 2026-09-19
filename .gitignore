@@ -65,7 +65,8 @@ dist/
 # Ignore database files directly inside /data/
 # Example: data/nifty_algo_v3.db
 /data/*.db
-
+/data/cache/*
+/output/*
 *.pid
 patch.py
 # Ignore SQLite temporary/locking files everywhere

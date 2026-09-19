@@ -18,11 +18,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as wall_time, timedelta, timezone
 import gzip
+import html
 import json
 import logging
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import textwrap
@@ -220,6 +222,8 @@ class Credentials:
     access_token: str = field(repr=False)
     api_key: str | None = field(default=None, repr=False)
     api_secret: str | None = field(default=None, repr=False)
+    telegram_bot_token: str | None = field(default=None, repr=False)
+    telegram_chat_id: str | None = field(default=None, repr=False)
 
 
 def load_credentials(env_path: str | Path) -> Credentials:
@@ -257,11 +261,19 @@ def load_credentials(env_path: str | Path) -> Credentials:
     def get_value(key: str) -> str | None:
         """Preserve explicit empty file values instead of overriding them."""
         raw = values[key] if key in values else os.environ.get(key)
-        return str(raw).strip() if raw is not None else None
+        if raw is None:
+            return None
+        val = str(raw).strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1].strip()
+        return val if val else None
 
     token = get_value("UPSTOX_ACCESS_TOKEN")
     api_key = get_value("UPSTOX_API_KEY")
     api_secret = get_value("UPSTOX_API_SECRET")
+    telegram_bot_token = get_value("TELEGRAM_STOCK_BOT_TOKEN") or get_value("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = get_value("TELEGRAM_STOCK_CHAT_ID") or get_value("TELEGRAM_CHAT_ID")
+
     for name, value in (("UPSTOX_API_KEY", api_key), ("UPSTOX_API_SECRET", api_secret)):
         if not value:
             logging.warning("%s is missing; it is not used for market data.", name)
@@ -274,7 +286,28 @@ def load_credentials(env_path: str | Path) -> Credentials:
         )
     if any(character in token for character in ("\r", "\n")):
         raise ScreenerError("UPSTOX_ACCESS_TOKEN has an invalid format; keep it on one line.")
-    return Credentials(token, api_key, api_secret)
+    if telegram_bot_token and any(character in telegram_bot_token for character in ("\r", "\n")):
+        raise ScreenerError("TELEGRAM_STOCK_BOT_TOKEN has an invalid format; keep it on one line.")
+    if telegram_chat_id and any(character in telegram_chat_id for character in ("\r", "\n")):
+        raise ScreenerError("TELEGRAM_STOCK_CHAT_ID has an invalid format; keep it on one line.")
+
+    if telegram_bot_token and telegram_chat_id:
+        if ":" not in telegram_bot_token:
+            logging.warning(
+                "TELEGRAM_STOCK_BOT_TOKEN appears incomplete (missing ':'). "
+                "Telegram bot tokens from @BotFather follow the format '<bot_id>:<token_secret>' "
+                "(e.g., '123456789:ABCdefGhIJK...'). Check token from @BotFather."
+            )
+        logging.info("Telegram notification enabled for chat ID: %s (bot token is not logged).", telegram_chat_id)
+    elif (telegram_bot_token and not telegram_chat_id) or (telegram_chat_id and not telegram_bot_token):
+        logging.warning(
+            "Telegram notification requires both TELEGRAM_STOCK_BOT_TOKEN and "
+            "TELEGRAM_STOCK_CHAT_ID. One is missing; Telegram notifications will be disabled."
+        )
+    else:
+        logging.info("Telegram notification not configured (skipping Telegram delivery).")
+
+    return Credentials(token, api_key, api_secret, telegram_bot_token, telegram_chat_id)
 
 
 # =============================================================================
@@ -1087,34 +1120,22 @@ def evaluate_buying_candidates(metrics: pd.DataFrame,
 
 
 def console_buying_tables(buying_results: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
-    """Build readable display tables for stocks passing buying checks."""
+    """Build readable display table for entry quality score components."""
     if buying_results.empty:
         return []
     display = buying_results.copy(deep=True)
     display.insert(0, "#", range(1, len(display) + 1))
-    display["Close"] = display["Close"].map(lambda val: f"{val:,.2f}")
-    display["HH20"] = display["HH20"].map(lambda val: f"{val:,.2f}")
-    display["RS20"] = display["RS20"].map(lambda val: f"{val * 100:+.2f}%")
-    display["RS60"] = display["RS60"].map(lambda val: f"{val * 100:+.2f}%")
-    display["RVOL20"] = display["RVOL20"].map(lambda val: f"{val:.2f}x")
-    display["ATR14"] = display["ATR14"].map(lambda val: f"{val:,.2f}")
-    display["BreakoutDist"] = display["BreakoutDistance20"].map(lambda val: f"{val:.2f} ATR")
-    display["CloseLoc"] = display["CloseLocation"].map(lambda val: f"{val:.2f}")
-    display["Score"] = display["ENTRY_QUALITY_SCORE"].map(lambda val: f"{val:.2f}")
-
     display["PRS20"] = display["PRS20"].map(lambda val: f"{val:.2f}")
     display["PRS60"] = display["PRS60"].map(lambda val: f"{val:.2f}")
     display["PRVOL20"] = display["PRVOL20"].map(lambda val: f"{val:.2f}")
     display["PQuality"] = display["PQuality"].map(lambda val: f"{val:.2f}")
     display["PExtension"] = display["PExtension"].map(lambda val: f"{val:.2f}")
     display["ExtScore"] = display["ExtensionScore"].map(lambda val: f"{val:.2f}")
+    display["Score"] = display["ENTRY_QUALITY_SCORE"].map(lambda val: f"{val:.2f}")
 
-    table1_cols = ["#", "Symbol", "Close", "HH20", "RS20", "RS60", "RVOL20", "ATR14", "BreakoutDist", "CloseLoc", "Score"]
     table2_cols = ["#", "Symbol", "PRS20", "PRS60", "PRVOL20", "PQuality", "PExtension", "ExtScore", "Score"]
 
     return [
-        ("BUYING CHECKS (CONFIRMED BREAKOUTS) | CANDIDATE METRICS (Ranked by ENTRY_QUALITY_SCORE)",
-         display.loc[:, table1_cols].copy()),
         ("BUYING CHECKS | ENTRY QUALITY SCORE COMPONENTS (Percentiles among passing candidates)",
          display.loc[:, table2_cols].copy()),
     ]
@@ -1304,12 +1325,9 @@ def write_outputs(out_dir: Path, metrics: pd.DataFrame, diagnostics: pd.DataFram
 
 
 def console_tables(metrics: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
-    """Build readable display-only tables in the exact full-precision screen order.
-
-    Console R values use percentages and MR values use percentage points; raw
-    metrics and machine-readable files remain unchanged decimal fractions.
-    Every panel repeats the same numbered stock order for easy comparison.
-    """
+    """Build readable display-only table for final qualifiers overall strength."""
+    if metrics.empty or "FINAL_QUALIFIER" not in metrics.columns:
+        return []
     rows = final_screen(metrics)
     if rows.empty:
         return []
@@ -1318,18 +1336,9 @@ def console_tables(metrics: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     display["Close"] = display["Close"].map(lambda value: f"{value:,.2f}")
     display["POS_COUNT"] = display["POS_COUNT"].map(lambda value: f"{int(value)}/4")
     display["FINAL_SCREEN_RANK"] = display["FINAL_SCREEN_RANK"].map(lambda value: f"{value:.2f}")
-    for n in HORIZONS:
-        display[f"R{n}"] = display[f"R{n}"].map(lambda value: f"{value * 100:+.2f}%")
-        display[f"MR{n}"] = display[f"MR{n}"].map(lambda value: f"{value * 100:+.2f} pp")
-        display[f"RAM{n}"] = display[f"RAM{n}"].map(lambda value: f"{value:.3f}")
-        display[f"Rank{n}"] = display[f"Rank{n}"].map(lambda value: f"{value:.2f}")
     groups = (
         ("1. OVERALL STRENGTH | Close in INR; score out of 100",
          ["Close", "POS_COUNT", "FINAL_SCREEN_RANK"]),
-        ("2. PRICE CHANGE | % gain or loss", [f"R{n}" for n in HORIZONS]),
-        ("3. RETURN RELATIVE TO PRICE SWINGS | RAM ratio", [f"RAM{n}" for n in HORIZONS]),
-        ("4. RANK AMONG ELIGIBLE STOCKS | 0 to 100", [f"Rank{n}" for n in HORIZONS]),
-        ("5. COMPARED WITH NIFTY 500 | pp = percentage points", [f"MR{n}" for n in HORIZONS]),
     )
     return [(title, display.loc[:, ["#", "Symbol", *columns]].copy())
             for title, columns in groups]
@@ -1364,98 +1373,224 @@ def console_legend() -> str:
 def console_report(metadata: Mapping[str, Any], metrics: pd.DataFrame | None = None,
                    aborted: str | None = None, out_dir: Path | None = None,
                    buying_results: pd.DataFrame | None = None) -> None:
-    """The only application print site: readable summary, ranked panels and short guide."""
-    border = "=" * 88
+    """The only application print site: displays only the two requested stock selection tables."""
     divider = "-" * 88
-    print("\n" + border)
-    print("MOMENTUM SCREEN | NIFTY 500 | SCREENING ONLY")
-    print(border)
-    print(f"Requested date : {metadata['as_of_requested']}    "
-          f"Data through : {metadata['as_of_effective']}")
-    print(f"PROVISIONAL={metadata['provisional']}")
-    if metadata["provisional"]:
-        print("NOTE: Provisional data - Upstox may still revise the current-session close.")
-    else:
-        print("Completed-session data only; current-session intraday data not included.")
-    benchmark = metadata.get("benchmark", {})
-    if benchmark:
-        print("\nNIFTY 500 PRICE CHANGE")
-        print("  " + "  |  ".join(f"{n} days: {benchmark[f'B{n}'] * 100:+.2f}%" for n in HORIZONS))
-    if "counts" in metadata:
-        counts = metadata["counts"]
-        print(f"\nCOVERAGE   Universe={counts['universe']}  |  Resolved={counts['resolved']}  |  "
-              f"Eligible={counts['eligible']}")
-        labels = {
-            "MARKET_OUTPERFORMER": "Ahead of the market (6 and 12 months)",
-            "STRONG_TREND": "Positive own-price trend",
-            "STRONG_XS_MOMENTUM": "Strong rank among eligible stocks",
-            "VERY_STRONG_MOMENTUM": "Very strong rank among eligible stocks",
-            "CORE_QUALIFIER": "Passed core screening rules",
-            "FINAL_QUALIFIER": "Passed final screening rules",
-        }
-        for name, value in counts["per_flag"].items():
-            shown = str(value) if value is not None else "not calculated"
-            print(f"  {labels.get(name, name):<43} : {shown}")
-    exclusions = metadata.get("ineligible", [])
-    print(f"\nEXCLUSIONS ({len(exclusions)})")
-    if not exclusions:
-        print("  None - all universe symbols have usable data.")
-    else:
-        grouped: dict[str, list[str]] = {}
-        for item in exclusions:
-            grouped.setdefault(str(item["reason"]), []).append(str(item["Symbol"]))
-        descriptions = {
-            "UNRESOLVED": "symbol not found",
-            "FETCH_FAILED": "could not retrieve data",
-            "STALE": "latest session close missing",
-            "INSUFFICIENT_HISTORY": "not enough price history",
-            "TOO_MANY_GAPS": "too many missing daily closes",
-            "BAD_DATA": "invalid prices or unusable volatility",
-        }
-        for reason, symbols in grouped.items():
-            print(f"  {reason} ({len(symbols)}) - {descriptions.get(reason, reason)}")
-            print(textwrap.fill(", ".join(symbols), width=88, initial_indent="    ", subsequent_indent="    "))
-    print("\n" + divider)
     if aborted:
+        print("\n" + divider)
         print("SCREEN NOT COMPLETED")
         print(textwrap.fill(aborted, width=88))
-        print("No new screening CSVs were generated; check the run status before using old files.")
-    else:
-        if metrics is not None:
-            tables = console_tables(metrics)
-            print("FINAL QUALIFIERS | STRONGEST FIRST")
-            print("Sorted by FINAL_SCREEN_RANK, then Rank252, then stock code for ties.")
-            print("Only stocks passing the final rules are shown; #1 has the highest composite score.")
-            if not tables:
-                print("\nNo stocks passed the final screening rules.")
-                print("This is a valid result. See the universe CSV for all stocks and their metrics.")
+        print(divider + "\n")
+        return
+
+    if metrics is not None:
+        tables = console_tables(metrics)
+        print("\n" + divider)
+        print("FINAL QUALIFIERS | STRONGEST FIRST")
+        print("Sorted by FINAL_SCREEN_RANK, then Rank252, then stock code for ties.")
+        print("Only stocks passing the final rules are shown; #1 has the highest composite score.")
+        if not tables:
+            print("\nNo stocks passed the final screening rules.")
+        else:
             for title, table in tables:
                 print("\n" + title)
                 print(divider)
                 print(table.to_string(index=False, justify="right"))
 
-        if buying_results is not None:
-            print("\n" + divider)
-            print("BUYING CHECKS (CONFIRMED BREAKOUTS) | STAGE 2")
-            print("Filters: Close[T] > HH20[T], RS20 > 0, RS60 > 0, RVOL20 >= 1.5, 0.0 <= BreakoutDist <= 1.5")
-            print("Score: 20% RS20 + 20% RS60 + 15% RVOL20 + 15% CloseLocation + 15% (100 - BreakoutDist)")
-            print(divider)
-            if buying_results.empty:
-                print("\nNone of the stocks passes the buying checks.")
-            else:
-                buying_tables = console_buying_tables(buying_results)
-                for title, table in buying_tables:
-                    print("\n" + title)
-                    print(divider)
-                    print(table.to_string(index=False, justify="right"))
+    if buying_results is not None:
+        print("\n" + divider)
+        print("BUYING CHECKS (CONFIRMED BREAKOUTS) | STAGE 2")
+        print("Filters: Close[T] > HH20[T], RS20 > 0, RS60 > 0, RVOL20 >= 1.5, 0.0 <= BreakoutDist <= 1.5")
+        print("Score: 20% RS20 + 20% RS60 + 15% RVOL20 + 15% CloseLocation + 15% (100 - BreakoutDist)")
+        print(divider)
+        if buying_results.empty:
+            print("\nNone of the stocks passes the buying checks.")
+        else:
+            buying_tables = console_buying_tables(buying_results)
+            for title, table in buying_tables:
+                print("\n" + title)
+                print(divider)
+                print(table.to_string(index=False, justify="right"))
+    print()
 
-    if out_dir is not None and metadata.get("output_labels"):
-        print("\nFILES")
-        for filename in metadata["output_labels"]:
-            print(f"  {out_dir / filename}")
-    print("\n" + divider)
-    print(console_legend())
-    print(border + "\n")
+
+# =============================================================================
+# Telegram notifications
+# =============================================================================
+def strip_html_tags(text: str) -> str:
+    """Fallback plain text stripper if Telegram HTML parsing fails."""
+    clean = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(clean)
+
+
+def build_telegram_messages(
+    metadata: Mapping[str, Any],
+    metrics: pd.DataFrame | None = None,
+    aborted: str | None = None,
+    buying_results: pd.DataFrame | None = None,
+    max_chars: int = 3900,
+) -> list[str]:
+    """Compose structured, formatted Telegram messages containing readable tables."""
+    effective = metadata.get("as_of_effective", metadata.get("as_of_requested", ""))
+    provisional = " (Provisional)" if metadata.get("provisional") else ""
+    header = f"📈 <b>MOMENTUM SCREEN | NIFTY 500</b>\n📅 Date: <b>{effective}</b>{provisional}"
+
+    if aborted:
+        return [f"{header}\n\n⚠️ <b>SCREEN NOT COMPLETED</b>\n<pre>{html.escape(aborted)}</pre>"]
+
+    sections: list[str] = []
+
+    # 1. Final Qualifiers
+    if metrics is not None:
+        tables = console_tables(metrics)
+        if not tables:
+            sections.append(
+                "<b>1. OVERALL STRENGTH (Final Qualifiers)</b>\n"
+                "<i>No stocks passed the final screening rules.</i>"
+            )
+        else:
+            df = tables[0][1]
+            total_rows = len(df)
+            chunk_size = 35
+            for start in range(0, total_rows, chunk_size):
+                sub = df.iloc[start : start + chunk_size]
+                part = f" (Part {start // chunk_size + 1}/{(total_rows - 1) // chunk_size + 1})" if total_rows > chunk_size else ""
+                table_str = sub.to_string(index=False, justify="right")
+                txt = (
+                    f"<b>1. OVERALL STRENGTH (Final Qualifiers)</b>{part}\n"
+                    f"<pre>{html.escape(table_str)}</pre>"
+                )
+                sections.append(txt)
+
+    # 2. Stage 2 Buying Checks
+    if buying_results is not None:
+        if buying_results.empty:
+            sections.append(
+                "<b>2. BUYING CHECKS | STAGE 2 (Confirmed Breakouts)</b>\n"
+                "<i>None of the stocks passes the buying checks.</i>"
+            )
+        else:
+            buying_tables = console_buying_tables(buying_results)
+            for title, df in buying_tables:
+                total_rows = len(df)
+                chunk_size = 35
+                for start in range(0, total_rows, chunk_size):
+                    sub = df.iloc[start : start + chunk_size]
+                    part = f" (Part {start // chunk_size + 1}/{(total_rows - 1) // chunk_size + 1})" if total_rows > chunk_size else ""
+                    table_str = sub.to_string(index=False, justify="right")
+                    txt = (
+                        f"<b>2. BUYING CHECKS | STAGE 2 (Confirmed Breakouts)</b>{part}\n"
+                        f"<i>ENTRY QUALITY SCORE COMPONENTS</i>\n"
+                        f"<pre>{html.escape(table_str)}</pre>"
+                    )
+                    sections.append(txt)
+
+    # Pack sections into messages up to max_chars
+    messages: list[str] = []
+    current_msg = header
+    for sec in sections:
+        candidate = f"{current_msg}\n\n{sec}" if current_msg else sec
+        if len(candidate) <= max_chars:
+            current_msg = candidate
+        else:
+            if current_msg:
+                messages.append(current_msg)
+            current_msg = sec
+    if current_msg:
+        messages.append(current_msg)
+    return messages
+
+
+def send_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    parse_mode: str | None = "HTML",
+    session: requests.Session | None = None,
+    timeout: float = 15.0,
+) -> bool:
+    """Send one message via Telegram Bot API with HTML fallback and error redaction."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    http = session or requests.Session()
+    try:
+        response = http.post(url, json=payload, timeout=timeout)
+        # If HTML parse error (HTTP 400 with entity parsing failure), retry as plain text
+        if response.status_code == 400 and parse_mode:
+            logging.warning("Telegram HTML parsing error; retrying message as plain text.")
+            plain_payload = {
+                "chat_id": chat_id,
+                "text": strip_html_tags(text),
+                "disable_web_page_preview": True,
+            }
+            response = http.post(url, json=plain_payload, timeout=timeout)
+
+        if response.ok:
+            logging.info("Telegram message sent successfully.")
+            return True
+        elif response.status_code == 404:
+            logging.error(
+                "Telegram API error (HTTP 404 Not Found): The bot token is invalid or incomplete. "
+                "Telegram bot tokens must follow the format '<bot_id>:<token_secret>' from @BotFather."
+            )
+            return False
+        elif response.status_code == 401:
+            logging.error(
+                "Telegram API error (HTTP 401 Unauthorized): The bot token was rejected by Telegram."
+            )
+            return False
+        elif response.status_code == 400:
+            logging.error(
+                "Telegram API error (HTTP 400 Bad Request): %s. "
+                "Verify that chat ID '%s' is correct and that the bot has been added to the chat.",
+                response.text, chat_id
+            )
+            return False
+        else:
+            logging.error("Telegram API error (HTTP %d): %s", response.status_code, response.text)
+            return False
+    except requests.exceptions.RequestException as exc:
+        safe_msg = str(exc).replace(bot_token, "<REDACTED>")
+        logging.error("Telegram network request failed: %s", safe_msg)
+        return False
+
+
+def send_telegram_report(
+    credentials: Credentials,
+    metadata: Mapping[str, Any],
+    metrics: pd.DataFrame | None = None,
+    aborted: str | None = None,
+    buying_results: pd.DataFrame | None = None,
+    session: requests.Session | None = None,
+    timeout: float = 15.0,
+) -> bool:
+    """Format and send the readable screener report to Telegram if credentials are set."""
+    token = credentials.telegram_bot_token
+    chat_id = credentials.telegram_chat_id
+    if not token or not chat_id:
+        logging.info("Telegram notification skipped: credentials not configured.")
+        return False
+
+    messages = build_telegram_messages(metadata, metrics=metrics, aborted=aborted,
+                                       buying_results=buying_results)
+    if not messages:
+        return False
+
+    logging.info("Sending %d Telegram message(s)...", len(messages))
+    all_ok = True
+    for i, msg in enumerate(messages):
+        if i > 0:
+            time.sleep(0.5)
+        ok = send_telegram_message(token, chat_id, msg, session=session, timeout=timeout)
+        if not ok:
+            all_ok = False
+    return all_ok
 
 
 # =============================================================================
@@ -1485,6 +1620,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--include-intraday", action="store_true")
+    parser.add_argument("--no-telegram", action="store_true", default=False,
+                        help="Disable sending Telegram notifications even if credentials are configured.")
     parser.add_argument("--log-level", type=str.upper, default="INFO",
                         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     return parser
@@ -1545,6 +1682,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             atomic_text(args.out / f"run_{metadata['as_of_effective']}.json",
                         json.dumps(metadata, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
             console_report(metadata, aborted=str(error), out_dir=args.out)
+            if not args.no_telegram:
+                send_telegram_report(credentials, metadata, aborted=str(error))
             return 1
         aligned_bench = benchmark.reindex(closes.index)
         metrics = compute_metrics(closes, aligned_bench)
@@ -1558,6 +1697,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         metadata["status"] = "success"
         write_outputs(args.out, metrics, diagnostics, benchmark, metadata, buying_results=buying_results)
         console_report(metadata, metrics, out_dir=args.out, buying_results=buying_results)
+        if not args.no_telegram:
+            send_telegram_report(credentials, metadata, metrics=metrics, buying_results=buying_results)
         return 0
     except ScreenerError as error:
         logging.error("%s", error)
