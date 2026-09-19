@@ -1,2 +1,0 @@
-trading_date,strategy,regime,confidence,dte,entry_time,exit_time,lots,entry_credit,exit_debit,gross_pts,costs_rs,pnl_rs,exit_reason,exit_priority,entry_spot,exit_spot,strikes,wing,held_min
-2026-09-10,BULL_PUT_SPREAD,PREMIUM_SELL_BULL,HIGH,2,10:51:53,15:15:13,5,18.6,23.22,-4.62,159.79,-1661.29,hard_exit_15:15,7,23418.2,23389.2,SP23300/BP23200,100.0,263

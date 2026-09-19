@@ -1,3 +1,0 @@
-trading_date,strategy,regime,confidence,dte,entry_time,exit_time,lots,entry_credit,exit_debit,gross_pts,costs_rs,pnl_rs,exit_reason,exit_priority,entry_spot,exit_spot,strikes,wing,held_min
-2026-09-09,BEAR_CALL_SPREAD,PREMIUM_SELL_RANGE,HIGH,3,09:45:31,12:36:01,3,39.81,44.62,-4.81,146.84,-1084.79,trend_flip_exit_UPTREND_adx_25_liq_44.65_vs_credit_39.81,3,23522.0,23558.2,SC23700/BC23850,150.0,170
-2026-09-09,BEAR_CALL_SPREAD,PREMIUM_SELL_BEAR,HIGH,3,13:21:35,15:05:10,5,51.67,36.98,14.69,188.66,4585.59,time_decayed_target_reached,6,23554.2,23455.6,SC23650/BC23800,150.0,103
