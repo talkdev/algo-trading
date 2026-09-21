@@ -1000,6 +1000,9 @@ class Config:
     # PATCH_V12: 0DTE momentum economics + event-day floor.
     momentum_dte0_risk_frac:       float = 0.50
     momentum_dte0_max_lots:        int   = 2
+    # v48: aligned long beside an open credit vertical — hard lot cap so
+    # the second slot cannot dominate book risk.
+    momentum_second_slot_max_lots: int   = 3
     momentum_event_size_floor:      float = 0.40
     # The route substitutes for the sell side ONLY where the sell side was
     # refused; these markers identify the refusal families it may answer.
@@ -1055,6 +1058,16 @@ class Config:
         #     locked out by the very cooldown the stop created).
         "past_entry_window", "past_14:30", "past_14:",
         "stop_cooldown", "same_signal_combo",
+        # v48: second concurrent slot. When a credit vertical is already
+        # open, the sell-side mapper keeps proposing the same structure
+        # (slot_conflict) or a same-side chase after harvest. Those are
+        # sell-expression refusals, not trend refusals — the aligned
+        # long-premium ticket (bull put + long call, bear call + long
+        # put) is how a NIFTY desk runs a two-ticket book. Measured
+        # 2026-09-21: BPS open with ADX 37 UPTREND never reached the
+        # momentum gate because slot_conflict returned without consulting
+        # the substitute.
+        "slot_conflict", "same_side_chase",
     )
 
     # ══ PATCH_V13: closing-hour trend continuation ══════════════════════
@@ -1743,6 +1756,9 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         # PATCH_V12: 0DTE momentum economics + event-day floor.
         momentum_dte0_risk_frac=min(max(_get_float(env, "MOMENTUM_DTE0_RISK_FRAC", 0.50), 0.10), 1.00),
         momentum_dte0_max_lots=min(max(_get_int(env, "MOMENTUM_DTE0_MAX_LOTS", 2), 1), 10),
+        momentum_second_slot_max_lots=min(
+            max(_get_int(env, "MOMENTUM_SECOND_SLOT_MAX_LOTS", 3), 1), 6
+        ),
         momentum_event_size_floor=min(max(_get_float(env, "MOMENTUM_EVENT_SIZE_FLOOR", 0.40), 0.10), 1.00),
         momentum_block_markers=(
             tuple(

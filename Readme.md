@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v47)](#11-latest-change-logic-v47--one-tape-rule-every-dte)
+   - [1.1 Latest change logic (v48)](#11-latest-change-logic-v48--second-slot-aligned-long--life-only-economics)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,23 +40,23 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v47) — one tape rule, every DTE
+### 1.1 Latest change logic (v48) — second-slot aligned long + life-only economics
 
-The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots) are therefore the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()` (stops, targets, wing width, credit ratio, IV/VIX sanity, 0DTE 15:00 square-off and 10:30 listing wait).
+The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots) are the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()` (stops, targets, wing width/factor, credit ratio, IV/VIX sanity, 0DTE 15:00 square-off and 10:30 listing wait).
 
-18 Sep (DTE2 two-way) and 21 Sep (DTE1 grind) were the stress sample, not date patches. Full-day signal streams vs `decide()` blockers:
+18 Sep (DTE2 two-way) and 21 Sep (DTE1 grind) were the stress sample. Full-day signal streams vs `decide()` blockers:
 
 | Sample | Engine-wanted book | What blocked it | General rule |
 | --- | --- | --- | --- |
-| 18 Sep | Failed-low bull put, then afternoon high-fade bear call | Sequential book already correct. Same-structure stacking and unresolved open-high wait were the real blocks, not DTE. | Harvesting one extreme is **not** a two-way auction. Opposite credit waits for noon + loc ≥ 0.80 (after-extreme) or 10:45 + loc ≥ 0.85 (confirmed both-OR-sides two-way). |
-| 21 Sep | First bull put at loc 0.75 (with-trend). Second bull put at loc 0.99 | The loc 0.99 ticket was a chase into the high of a grind (−₹553 hard-exit). | After harvesting puts, refuse another put at loc ≥ 0.80 unless it is a new low-fade. Symmetric for calls at loc ≤ 0.20. |
+| 18 Sep | Failed-low bull put, then afternoon high-fade bear call | Sequential book already correct. Same-structure stacking and unresolved open-high wait were the real blocks, not DTE. Holding the BCS longer would have fought a late new-high continuation. | Harvesting one extreme is **not** a two-way auction. Opposite credit waits for noon + loc ≥ 0.80 (after-extreme) or 10:45 + loc ≥ 0.85 (confirmed both-OR-sides two-way). |
+| 21 Sep | First bull put at loc 0.75 (with-trend). Second ticket: aligned long call while the put is open (ADX 37 UPTREND) | `slot_conflict_same_structure` returned without consulting the momentum substitute — the second concurrent slot was never offered. Same-side put chase at loc ≥ 0.98 correctly refused. | When a credit vertical is open, sell-side stacking is refused, but an **aligned** long (bull put + long call / bear call + long put) may fill the free slot at 0.70× size, capped at `momentum_second_slot_max_lots` (3). |
 
 **Two concurrent tickets** (`max_concurrent_positions = 2`):
 
-- Allowed: aligned long premium beside a credit vertical, **or** the opposite *extreme* fade beside an open vertical on a confirmed two-way tape after 12:15 at loc ≥ 0.85 / ≤ 0.15, sized at 0.70×.
-- Refused: the same structure twice, a condor beside anything, opposite credit that is not an extreme fade (synthetic condor at 2× risk).
+- Allowed: aligned long premium beside a credit vertical (v48 wires `slot_conflict` / `same_side_chase` into `momentum_block_markers` and consults `_momentum_decision` on those refusals), **or** the opposite *extreme* fade beside an open vertical on a confirmed two-way tape after 12:15 at loc ≥ 0.85 / ≤ 0.15, sized at 0.70×.
+- Refused: the same structure twice, a condor beside anything, opposite credit that is not an extreme fade (synthetic condor at 2× risk), and same-side credit chase at a worse location.
 
-Strike/wing geometry uses remaining-life (`dte_blend < 0.35` = weekly vega), not a calendar-DTE `if dte == 0 / 1 / 2` maze.
+Strike/wing geometry uses remaining-life (`by_dte` on wing factor and wing max — no `if dte == 0 / 1 / 2` step table).
 
 ---
 
