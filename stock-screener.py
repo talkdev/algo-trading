@@ -7,6 +7,9 @@ Stage-2 buying checks apply confirmed breakout, relative strength, volume confir
 and extension filters to FINAL_QUALIFIER stocks, ranked by ENTRY_QUALITY_SCORE.
 The aligned-matrix metric interface is pure and suitable for research harnesses.
 
+All reports, candle caches, instrument-master JSON and log files are written under
+stock-data/ beside this script (never under data/, output/ or logs/).
+
 Credential loading: by default, env.txt is read from beside this Python file,
 not from the shell's working directory. Override with --env /path/to/env.txt.
 No manual environment-variable setup is necessary when that file is populated.
@@ -133,6 +136,12 @@ assert len(UNIVERSE) == len(set(UNIVERSE)) == 500
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com"
 MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+
+# All screener artefacts (reports, candle cache, instrument master, logs)
+# live under this directory — nowhere else under the repo.
+STOCK_DATA_ROOT = Path(__file__).resolve().parent / "stock-data"
+STOCK_CACHE_DIR = STOCK_DATA_ROOT / "cache"
+STOCK_LOG_DIR = STOCK_DATA_ROOT / "logs"
 SCREEN_COLUMNS = (
     "Symbol", "Close", "R21", "R63", "R126", "R252",
     "RAM21", "RAM63", "RAM126", "RAM252",
@@ -378,7 +387,8 @@ class UpstoxClient:
 
     def __init__(self, credentials: Credentials, cache_dir: Path,
                  refresh: bool = False, offline: bool = False,
-                 today: date | None = None, master_dir: Path = Path("data")) -> None:
+                 today: date | None = None,
+                 master_dir: Path | None = None) -> None:
         """Build separate authenticated API and unauthenticated asset sessions."""
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {credentials.access_token}",
@@ -386,7 +396,7 @@ class UpstoxClient:
         self.asset_session = requests.Session()
         self.asset_session.headers.update({"Accept": "application/json"})
         self.cache_dir = Path(cache_dir)
-        self.master_dir = Path(master_dir)
+        self.master_dir = Path(master_dir) if master_dir is not None else STOCK_DATA_ROOT
         self.refresh = refresh
         self.offline = offline
         self.today = today or datetime.now(IST).date()
@@ -394,6 +404,8 @@ class UpstoxClient:
         self.sources: set[str] = set()
         if refresh and offline:
             raise ScreenerError("--refresh and --offline cannot be combined.")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.master_dir.mkdir(parents=True, exist_ok=True)
 
     def close(self) -> None:
         """Release both HTTP connection pools."""
@@ -1615,8 +1627,14 @@ def make_parser() -> argparse.ArgumentParser:
         help="Credential file (default: env.txt beside this Python file).",
     )
     parser.add_argument("--as-of", type=parse_date)
-    parser.add_argument("--out", type=Path, default=Path("output"))
-    parser.add_argument("--cache", type=Path, default=Path("data/cache"))
+    parser.add_argument(
+        "--out", type=Path, default=STOCK_DATA_ROOT,
+        help=f"Report/output directory (default: {STOCK_DATA_ROOT}).",
+    )
+    parser.add_argument(
+        "--cache", type=Path, default=STOCK_CACHE_DIR,
+        help=f"OHLCV cache directory (default: {STOCK_CACHE_DIR}).",
+    )
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--include-intraday", action="store_true")
@@ -1627,12 +1645,47 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_logging(level: str) -> Path:
+    """Log to console and to stock-data/logs — never to the repo logs/ tree."""
+    STOCK_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = STOCK_LOG_DIR / "stock-screener.log"
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(getattr(logging, level))
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s",
+                                  datefmt="%Y-%m-%d %H:%M:%S")
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+    # Do not expose HTTP internals even when application-level DEBUG is selected.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    return log_path
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Fetch, align, screen, report, and stop; return nonzero on every abort condition."""
     args = make_parser().parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
-    # Do not expose HTTP internals even when application-level DEBUG is selected.
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    # Resolve relative --out/--cache against the process CWD, then keep everything
+    # under stock-data by default (absolute paths rooted next to this script).
+    out_dir = Path(args.out).expanduser()
+    cache_dir = Path(args.cache).expanduser()
+    if not out_dir.is_absolute():
+        out_dir = (Path.cwd() / out_dir).resolve()
+    if not cache_dir.is_absolute():
+        cache_dir = (Path.cwd() / cache_dir).resolve()
+    args.out = out_dir
+    args.cache = cache_dir
+
+    log_path = configure_logging(args.log_level)
+    args.out.mkdir(parents=True, exist_ok=True)
+    args.cache.mkdir(parents=True, exist_ok=True)
+    logging.info("Screener data root: %s", STOCK_DATA_ROOT)
+    logging.info("Reports -> %s | cache -> %s | log -> %s",
+                 args.out, args.cache, log_path)
+
     client: UpstoxClient | None = None
     try:
         validate_config()
@@ -1644,7 +1697,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ScreenerError("--refresh and --offline cannot be combined.")
         credentials = load_credentials(args.env)
         provisional = intraday_enabled(requested, now, args.include_intraday)
-        client = UpstoxClient(credentials, args.cache, args.refresh, args.offline, now.date())
+        client = UpstoxClient(
+            credentials, args.cache, args.refresh, args.offline, now.date(),
+            master_dir=STOCK_DATA_ROOT,
+        )
         master = client.instrument_master()
         benchmark_key = client.resolve_index(master)
         benchmark_ohlcv = fetch_ohlcv(client, "NIFTY500", benchmark_key, requested, provisional)
