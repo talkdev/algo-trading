@@ -168,7 +168,8 @@ def vrp_anomaly_limit(atm_iv_pct: Optional[float], dte=None) -> float:
         _dte = int(dte) if dte is not None else None
     except (TypeError, ValueError):
         _dte = None
-    _frac = VRP_DATA_ERROR_FRAC_DTE0 if _dte == 0 else VRP_DATA_ERROR_FRAC
+    # Near-expiry IV anomaly bound blended on remaining life.
+    _frac = by_dte(_dte, VRP_DATA_ERROR_FRAC_DTE0, VRP_DATA_ERROR_FRAC)
     try:
         _iv = float(atm_iv_pct) if atm_iv_pct else 0.0
     except (TypeError, ValueError):

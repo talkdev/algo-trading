@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v48)](#11-latest-change-logic-v48--second-slot-aligned-long--life-only-economics)
+   - [1.1 Latest change logic (v49)](#11-latest-change-logic-v49--life-only-economics--two-slot-discipline)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,23 +40,25 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v48) — second-slot aligned long + life-only economics
+### 1.1 Latest change logic (v49) — life-only economics + two-slot discipline
 
-The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots) are the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()` (stops, targets, wing width/factor, credit ratio, IV/VIX sanity, 0DTE 15:00 square-off and 10:30 listing wait).
+The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots) are the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()` (stops, targets, wing width/factor, credit ratio, IV/VIX sanity, VRP anomaly bound, max-pain EV haircut, stale-weekly scratch, 0DTE 15:00 square-off and 10:30 listing wait).
 
-18 Sep (DTE2 two-way) and 21 Sep (DTE1 grind) were the stress sample. Full-day signal streams vs `decide()` blockers:
+18 Sep (DTE2 open-spike mean-reversion) and 21 Sep (DTE1 grind) were the stress sample. Full-day signal streams vs `decide()` blockers:
 
 | Sample | Engine-wanted book | What blocked it | General rule |
 | --- | --- | --- | --- |
-| 18 Sep | Failed-low bull put, then afternoon high-fade bear call | Sequential book already correct. Same-structure stacking and unresolved open-high wait were the real blocks, not DTE. Holding the BCS longer would have fought a late new-high continuation. | Harvesting one extreme is **not** a two-way auction. Opposite credit waits for noon + loc ≥ 0.80 (after-extreme) or 10:45 + loc ≥ 0.85 (confirmed both-OR-sides two-way). |
-| 21 Sep | First bull put at loc 0.75 (with-trend). Second ticket: aligned long call while the put is open (ADX 37 UPTREND) | `slot_conflict_same_structure` returned without consulting the momentum substitute — the second concurrent slot was never offered. Same-side put chase at loc ≥ 0.98 correctly refused. | When a credit vertical is open, sell-side stacking is refused, but an **aligned** long (bull put + long call / bear call + long put) may fill the free slot at 0.70× size, capped at `momentum_second_slot_max_lots` (3). |
+| 18 Sep | Failed-low bull put, then afternoon high-fade bear call | Sequential book is correct (₹1,720). Same-structure stacking, unresolved open-high wait (blocks mid-range IC/BEAR until 12:15), and post-fade late long are the real blocks — not DTE. Holding the BCS past the profit-lock into the 14:00+ new-high continuation loses. Concurrent opposite beside a still-open same-side put is a synthetic condor (measured on 16-Sep). | Harvesting one extreme is **not** a two-way auction. Opposite credit runs **sequentially** after the harvest clock (noon + loc ≥ 0.80). Confirmed both-OR-sides two-way may fade from 10:45 at loc ≥ 0.85 and may stack the opposite extreme after 12:15. |
+| 21 Sep | First bull put at loc 0.75 (with-trend). Second ticket: aligned long call while the put is open (ADX 37 UPTREND) | Sell-side `slot_conflict_same_structure` is refused, then `_momentum_decision` fills the free slot with the aligned long (v48). Same-side put chase at loc ≥ 0.98 correctly refused. | When a credit vertical is open, sell-side stacking is refused, but an **aligned** long (bull put + long call / bear call + long put) may fill the free slot at 0.70× size, capped at `momentum_second_slot_max_lots` (3). |
 
 **Two concurrent tickets** (`max_concurrent_positions = 2`):
 
-- Allowed: aligned long premium beside a credit vertical (v48 wires `slot_conflict` / `same_side_chase` into `momentum_block_markers` and consults `_momentum_decision` on those refusals), **or** the opposite *extreme* fade beside an open vertical on a confirmed two-way tape after 12:15 at loc ≥ 0.85 / ≤ 0.15, sized at 0.70×.
-- Refused: the same structure twice, a condor beside anything, opposite credit that is not an extreme fade (synthetic condor at 2× risk), and same-side credit chase at a worse location.
+- Allowed: aligned long premium beside a credit vertical (`slot_conflict` / `same_side_chase` consult `_momentum_decision`), **or** the opposite *extreme* fade beside an open vertical on a **confirmed two-way** tape after 12:15 (fade flags + effective post-open location — not raw session loc ≥ 0.85), sized at 0.70×.
+- Refused: the same structure twice, a condor beside anything, opposite credit after a one-sided harvest while the first ticket is still open (synthetic condor), and same-side credit chase at a worse location.
 
-Strike/wing geometry uses remaining-life (`by_dte` on wing factor and wing max — no `if dte == 0 / 1 / 2` step table).
+**Fade sizing (v49):** extreme fades size at 1.15× when the tape is confirmed two-way, post-harvest opposite, or open-spike mean-reversion — same clip, every DTE. Tighter profit-lock keep on spike fades was measured and rejected: it banks more on 18-Sep BCS but cuts 10-Sep BCS winners that still have room to the time-decay target.
+
+Strike/wing geometry and risk tables use remaining-life (`by_dte` / `dte_blend` — no `if dte == 0 / 1 / 2` selection maze).
 
 ---
 

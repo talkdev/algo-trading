@@ -215,8 +215,13 @@ class StrategyEngine:
         """True when the candidate is the opposite extreme of the open book.
 
         Concurrent opposite credit is only the professional two-extreme
-        book: confirmed two-way, afternoon, location at the tested edge.
-        Mid-range opposite credit is a synthetic condor at 2x risk.
+        book on a CONFIRMED two-way auction (both OR edges poked / choppy
+        wide). A one-sided harvest unlocks the opposite fade SEQUENTIALLY
+        via the after-extreme clock — stacking it beside a still-open
+        same-side vertical is a synthetic condor (measured 2026-09-16:
+        BCS at 12:32 beside an open bull put underperformed the 13:09
+        post-rotation ticket). Location uses fade flags (effective
+        post-open loc on wick days), not raw session loc. Same at every DTE.
         """
         if not signals:
             return False
@@ -229,10 +234,10 @@ class StrategyEngine:
         if now_t < dtime(12, 15):
             return False
         try:
-            _rng, _loc, _, _ = self._session_range_pos(signals)
+            raw_rng, _loc, _, _, _ = self._fade_range_pos(signals)
         except Exception:
             return False
-        if _rng < 85.0:
+        if raw_rng < 85.0:
             return False
         open_names = self._open_strategy_names()
         if not open_names:
@@ -240,13 +245,15 @@ class StrategyEngine:
         open_sides: set = set()
         for o in open_names:
             open_sides |= self._sides_of(o)
+        # Fade flags already encode location thresholds (incl. open-spike
+        # effective loc). Do not re-impose raw session loc >= 0.85.
         if strategy_name == BEAR_CALL_SPREAD and bool(
             signals.get("afternoon_high_fade")
-        ) and _loc >= 0.85:
+        ):
             return "BULL" in open_sides and "BEAR" not in open_sides
         if strategy_name == BULL_PUT_SPREAD and bool(
             signals.get("afternoon_low_fade")
-        ) and _loc <= 0.15:
+        ):
             return "BEAR" in open_sides and "BULL" not in open_sides
         return False
 
@@ -1107,8 +1114,9 @@ class StrategyEngine:
         except (TypeError, ValueError):
             _both_sides = False
         # Harvesting ONE extreme is not a two-way auction. Two-way means
-        # both OR edges poked (or choppy-on-wide). The opposite fade after
-        # a one-sided harvest is a separate clock in _apply_two_way_location.
+        # both OR edges poked (or choppy-on-wide, excluding open-HIGH
+        # wick days — those unlock the opposite fade via the harvest
+        # latch in _apply_two_way_location / _opposite_extreme_fade).
         _chop_wide = bool(_chop and raw_rng >= 100.0 and not _spike_hi)
         _latched = bool(signals.get("two_way_auction")) and not _spike_hi
         active = bool(
@@ -3511,7 +3519,9 @@ class StrategyEngine:
             # inside half an expected move of it, the touch probability
             # is haircut accordingly.
             _mp = float(signals.get("max_pain") or 0.0)
-            if _mp > 0 and _spot_ev > 0 and dte == 0:
+            # Near-expiry pinning (life weight >= 0.9 ≈ DTE0). Same geometry
+            # via dte_blend — no calendar-DTE step.
+            if _mp > 0 and _spot_ev > 0 and dte_blend(dte) >= 0.9:
                 _pin_dist = abs(_mp - _spot_ev)
                 if _pin_dist < 0.5 * _sigma_pts:
                     _p_touch *= 0.85
@@ -4426,6 +4436,8 @@ class StrategyEngine:
             ),
             "afternoon_high_fade":    bool(signals.get("afternoon_high_fade")),
             "afternoon_low_fade":     bool(signals.get("afternoon_low_fade")),
+            "day_high_is_open_spike": bool(signals.get("day_high_is_open_spike")),
+            "day_low_is_open_spike":  bool(signals.get("day_low_is_open_spike")),
             "max_hold_min":           (
                 int(getattr(self.config, "failed_break_max_hold_min", 70))
                 if (
@@ -5777,8 +5789,19 @@ class StrategyEngine:
                 size_mult = max(size_mult, 0.75)
         elif signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
             # OPT_V32: size UP confirmed extreme fades (was floor-only).
+            # v49: open-spike mean-reversion and post-harvest opposite
+            # fades are the same professional edge as a confirmed two-way
+            # — do not leave them on the 1.05 clip while two_way gets 1.15.
             try:
-                _boost = 1.15 if bool(signals.get("two_way_auction")) else 1.05
+                _spike_mr = bool(
+                    signals.get("day_high_is_open_spike")
+                    or signals.get("day_low_is_open_spike")
+                )
+                _after_ext = self._after_two_way_extreme_scalp()
+                if bool(signals.get("two_way_auction")) or _after_ext or _spike_mr:
+                    _boost = 1.15
+                else:
+                    _boost = 1.05
                 size_mult = max(size_mult, float(_weekly_discount or 1.0), 0.90) * _boost
             except (TypeError, ValueError):
                 size_mult = max(size_mult, 0.90) * 1.05

@@ -1755,6 +1755,9 @@ class RegimeClassifier:
                     getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
                 ))
             elif _spike_hi:
+                # Unretested open-HIGH wick: not a through-OR two-way
+                # (08-Sep failed reclaim). Opposite fades after a harvested
+                # extreme still unlock via _after_two_way_extreme_scalp.
                 signals["two_way_auction"] = False
                 _two_way = False
         except (TypeError, ValueError, ZeroDivisionError):
