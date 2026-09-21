@@ -24,6 +24,7 @@ from core import (
     load_config, setup_logging,
     get_nse_holidays, get_high_impact_events,
     vrp_anomaly_limit, VRP_RV_DEAD_PCT,
+    by_dte,
 )
 
 
@@ -3558,15 +3559,15 @@ class MarketDataEngine:
             if _aw_straddle <= 20 and _aw_spot > 0:
                 _aw_straddle = _aw_spot * 0.009
             if _aw_straddle > 20:
-                _aw_factor = 0.55 if _aw_dte == 0 else (
-                    0.70 if _aw_dte == 1 else 0.85
-                )
+                # v48: interpolate wing factor on sqrt-life (0.55 expiry
+                # → 0.85 weekly). Removes the DTE0/1/2+ step table.
+                _aw_factor = by_dte(_aw_dte, 0.55, 0.85)
                 _aw_raw = _aw_straddle * _aw_factor
             else:
                 _aw_raw = 150.0
             _aw = int(round(_aw_raw / _aw_step + 0.001) * _aw_step)
             _aw_min = max(2 * _aw_step, 100)
-            _aw_max = 250 if _aw_dte == 0 else (350 if _aw_dte == 1 else 450)
+            _aw_max = int(round(by_dte(_aw_dte, 250.0, 450.0) / _aw_step) * _aw_step)
             _adaptive_wing_width = int(max(_aw_min, min(_aw, _aw_max)))
         except Exception:
             _adaptive_wing_width = int(self.state.get("wing_width", 150) or 150)

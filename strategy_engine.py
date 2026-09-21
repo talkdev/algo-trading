@@ -5133,6 +5133,8 @@ class StrategyEngine:
         # Expiry-day debit: half-budget already applies. A confirmed
         # STRONG trend is the one 0DTE debit that should not be clipped
         # to 2 lots — that is a crash/melt-up, not a cheap gamma ticket.
+        # Life-weighted via dte_blend (not a calendar-DTE maze): near
+        # expiry still caps hard; weeklies use the day_cap above.
         try:
             if dte_blend(actual_dte) >= 0.9:
                 _px_m = str(signals.get("price_regime") or "")
@@ -5384,11 +5386,19 @@ class StrategyEngine:
         _late = "late_window" in str(why)
 
         size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
+        # v48: aligned long beside an open credit vertical is the second
+        # concurrent slot — size it down and hard-cap lots so a grind-day
+        # debit cannot print an 8-lot ticket next to a 3-lot put (21-Sep).
+        _concurrent_mom = self._count_open_positions() >= 1
+        if _concurrent_mom:
+            size_mult *= 0.70
         reason = (
             f"momentum_trend_expression:{'LONG_CALL' if direction > 0 else 'LONG_PUT'}"
             f":dte={signals.get('actual_dte')}:adx={float(signals.get('adx_15') or 0.0):.0f}"
             f":conf={signals.get('confidence_level')}"
-            f"{':late_window' if _late else ''}:replacing={block_reason}"
+            f"{':late_window' if _late else ''}"
+            f"{':second_slot' if _concurrent_mom else ''}"
+            f":replacing={block_reason}"
         )
         params = self.compute_momentum_params(
             direction, reason, signals, size_mult, late=_late
@@ -5398,6 +5408,20 @@ class StrategyEngine:
             signals["_momentum_refuse_reason"] = _pr
             self.logger.info(f"momentum substitute rejected: {params.get('reason')}")
             return None
+        if _concurrent_mom:
+            try:
+                _cap = int(getattr(
+                    self.config, "momentum_second_slot_max_lots", 3
+                ) or 3)
+                _lots = int(params.get("final_lots") or 1)
+                if _lots > _cap:
+                    params["final_lots"] = _cap
+                    params["selection_reason"] = (
+                        f"{params.get('selection_reason') or reason}"
+                        f":second_slot_lot_cap_{_cap}"
+                    )
+            except (TypeError, ValueError):
+                pass
 
         strat_name = params["strategy_name"]
         self._log_decision(signals, "STRATEGY_SELECTED", reason, strat_name, params)
@@ -5636,6 +5660,13 @@ class StrategyEngine:
 
         _chase = self._same_side_chase_refusal(strategy_name, signals)
         if _chase:
+            # Do not re-sell the harvested side at a worse location — but
+            # buying the continuation (aligned long) is the professional
+            # expression of the same tape (v48).
+            alt = self._momentum_decision(signals, _chase)
+            if alt is not None:
+                return alt
+            _chase = self._with_momentum_refuse(signals, _chase)
             self._log_decision(signals, "NO_TRADE", _chase)
             self._persist_decision(
                 signals, strategy_name, _chase, None, "NO_TRADE"
@@ -5668,8 +5699,14 @@ class StrategyEngine:
             return {"action": "NO_TRADE", "reason": _ct_reason}
 
         # ── second slot: the new structure must not stack the open one ──
+        # Sell-side stacking is refused, but the aligned long-premium
+        # substitute may still fill the free concurrent slot (v48).
         _slot_reason = self._slot_conflict(strategy_name, signals)
         if _slot_reason:
+            alt = self._momentum_decision(signals, _slot_reason)
+            if alt is not None:
+                return alt
+            _slot_reason = self._with_momentum_refuse(signals, _slot_reason)
             self._log_decision(signals, "NO_TRADE", _slot_reason)
             self._persist_decision(
                 signals, strategy_name, _slot_reason, None, "NO_TRADE"
