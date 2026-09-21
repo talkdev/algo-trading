@@ -1087,6 +1087,14 @@ class StrategyEngine:
             if strategy == BEAR_CALL_SPREAD:
                 _, _lean_why = self._range_day_bearish_lean(signals)
                 reason += f":{_lean_why}"
+            # DTE=1 location-lean annotation: helps trace why a RANGE regime
+            # chose a directional vertical instead of the default IC.
+            if int(dte or -1) == 1 and strategy in (BULL_PUT_SPREAD, BEAR_CALL_SPREAD):
+                try:
+                    _ann_rng, _ann_loc, _, _ = self._session_range_pos(signals)
+                    reason += f":dte1_loc_lean={_ann_loc:.2f}"
+                except Exception:
+                    pass
             return strategy, reason
 
         if final_regime == "PREMIUM_SELL_BULL":
@@ -1293,6 +1301,91 @@ class StrategyEngine:
                     signals["afternoon_low_fade"] = True
                     return BULL_PUT_SPREAD
                 return "NO_TRADE"
+
+            # ── DTE=1: gamma-intensive session ──────────────────────────────
+            # One session before expiry, NIFTY options carry the full remaining
+            # gamma of the week. An Iron Condor exposes BOTH short strikes to
+            # gamma attack; when the session range has established a directional
+            # lean (spot in the upper or lower portion of its range), a single-
+            # sided vertical is strictly safer and harvests the same theta with
+            # half the directional risk.
+            #
+            # Professional NIFTY intraday premium sellers on DTE=1 use the
+            # session's price location — not OI positioning (which lags on the
+            # day before expiry as books square) — to pick the safer short:
+            #   • Spot at upper range  → Bull Put (puts decay away from spot)
+            #   • Spot at lower range  → Bear Call (calls decay away from spot)
+            #   • Spot at centre + NARROW OR + flat ADX → Iron Butterfly
+            #   • Spot at centre + MODERATE+ OR → NO_TRADE (both gamma risks)
+            #
+            # The location threshold (0.62 / 0.38) requires ADX maturity as a
+            # directional-read quality gate; below that the 5-min ADX is still
+            # warming up and the location read is noisier.
+            if int(dte or -1) == 1:
+                _d1_or = signals.get("or_condition", "MODERATE")
+
+                # ── PATCH_V15: event-day bypass ─────────────────────────────
+                # On an event day (CPI / FOMC / data release), NIFTY can move
+                # 200-400 pts in a single direction. Pre-entering a location-
+                # based vertical spread caps profit at the wing width while
+                # the REAL edge is a momentum long option that captures the
+                # full move. On event days, skip the DTE=1 location lean and
+                # fall through to IRON_CONDOR — the ADX gate will block it
+                # once the trend is confirmed, and the momentum engine then
+                # fires LONG_CALL / LONG_PUT with its required HIGH confidence,
+                # which is exactly the right quality bar for event-day entries.
+                if bool(signals.get("event_day") or signals.get("event_announced")):
+                    self.logger.info(
+                        "DTE1 RANGE: event_day detected → bypassing location "
+                        "lean, falling through to IC/momentum path"
+                    )
+                    # fall through to IRON_CONDOR → ADX gate blocks if trend
+                    # is strong → momentum fires (HIGH confidence required)
+                    pass
+                else:
+                    # NARROW/VERY_NARROW OR + very flat MATURE ADX + spot near ATM
+                    # → Iron Butterfly (same logic extended to DTE=1 gamma risk)
+                    #
+                    # PATCH_V15: require adx_15_mature before selecting IRON_BUTTERFLY.
+                    # Without maturity, ADX=0 during the warm-up period (first ~10
+                    # 5-min bars) satisfies adx_15<18 even on strong trending days,
+                    # causing premature butterfly selection before the trend is visible.
+                    # ADX must be mature so that a reading < 18 genuinely means flat.
+                    if (_d1_or in ("VERY_NARROW", "NARROW")
+                            and adx_15_mature
+                            and adx_15 < 18
+                            and current_time < dtime(12, 0)):
+                        _d1_spot = float(signals.get("spot") or 0)
+                        _d1_atm  = int(signals.get("atm_strike") or 0)
+                        if _d1_atm > 0 and abs(_d1_spot - _d1_atm) < 50:
+                            return IRON_BUTTERFLY
+                    # Location-based lean — require mature ADX as a quality gate
+                    # and enough session range to have a meaningful position read.
+                    if _rng >= 50.0 and adx_15_mature:
+                        if _loc >= 0.62:
+                            self.logger.info(
+                                f"DTE1 RANGE: loc={_loc:.2f} >= 0.62 → BULL_PUT_SPREAD"
+                                f" (puts safer, spot at upper session range)"
+                            )
+                            return BULL_PUT_SPREAD
+                        if _loc <= 0.38:
+                            self.logger.info(
+                                f"DTE1 RANGE: loc={_loc:.2f} <= 0.38 → BEAR_CALL_SPREAD"
+                                f" (calls safer, spot at lower session range)"
+                            )
+                            return BEAR_CALL_SPREAD
+                    # MODERATE/WIDE OR, neutral location, DTE=1: Iron Condor has
+                    # both shorts in the gamma fire zone without a directional edge.
+                    # Stand aside — momentum substitute is tried next.
+                    if _d1_or not in ("VERY_NARROW", "NARROW"):
+                        self.logger.info(
+                            f"DTE1 RANGE: MODERATE+ OR={_d1_or}, loc={_loc:.2f}"
+                            f" neutral → NO_TRADE (IC gamma too risky without lean)"
+                        )
+                        return "NO_TRADE"
+                # NARROW/VERY_NARROW OR + neutral location (0.38–0.62)
+                # → standard Iron Condor (handled by structure-rules ADX gate)
+
             return IRON_CONDOR
         if (or_condition in ("VERY_NARROW", "NARROW") and
                 adx_15 < 20 and
@@ -1599,6 +1692,13 @@ class StrategyEngine:
                 return False, "butterfly_too_late_after_12:00_on_0dte"
             if adx_15 > 22:
                 return False, f"butterfly_blocked_adx_{adx_15:.0f}_needs_flat_below_22"
+            # PATCH_V15: on DTE=1, gamma risk is elevated; require mature ADX
+            # before committing to a pin structure so that a warming-up ADX=0
+            # during the first 10 bars cannot be mistaken for a genuinely flat
+            # market. DTE=0 is exempt because same-day butterflies are time-
+            # critical and the OR window already guards early misfires.
+            if dte == 1 and not bool(signals.get("adx_15_mature", False)):
+                return False, "butterfly_dte1_requires_mature_adx"
             if signals.get("or_condition", "MODERATE") not in ("VERY_NARROW", "NARROW", "MODERATE"):
                 return False, (
                     f"butterfly_requires_moderate_or_better_not_{signals.get('or_condition')}"
@@ -1666,6 +1766,17 @@ class StrategyEngine:
                     return False, (
                         f"weekly_condor_blocked_two_way_after_failed_break_"
                         f"{_ic_rng:.0f}pts_prefer_extreme_fade"
+                    )
+            # DTE=1: belt-and-suspenders for the _resolve_range_strategy
+            # location lean. If an IC was routed here (NARROW OR, neutral
+            # location at selection time) but the session has since drifted
+            # to an extreme, block it so the resolver can pick the correct
+            # directional vertical on the next cycle.
+            if _ic_dte == 1:
+                _ic1_rng, _ic1_loc, _, _ = self._session_range_pos(signals)
+                if _ic1_rng >= 50.0 and (_ic1_loc >= 0.62 or _ic1_loc <= 0.38):
+                    return False, (
+                        f"dte1_condor_location_drift_{_ic1_loc:.2f}_prefer_vertical"
                     )
 
         elif strategy_name == BULL_PUT_SPREAD:
