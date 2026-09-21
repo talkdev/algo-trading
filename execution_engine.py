@@ -2507,7 +2507,7 @@ class ExecutionEngine:
             _at_lo = _dl_st > 0 and spot <= _dl_st + _band_st
             if (
                 _sname == "IRON_CONDOR"
-                and _sdte >= 2
+                and dte_blend(_sdte) < 0.35
                 and _held_stale >= _min_hold_st
                 and current_time >= _stale_after
                 and _ach_st <= 0.5
