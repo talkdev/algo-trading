@@ -469,7 +469,11 @@ class MarketDataEngine:
                 f"Session state loaded for {today_str} "
                 f"(mid-day restart recovery, entries={row.get('entry_count', 0)})"
             )
-            return dict(row)
+            out = dict(row)
+            # Re-resolve day_mode from the current events file so a restart
+            # after a calendar edit does not keep a stale NORMAL flag.
+            out["day_mode"] = self._compute_day_mode(today_ist())
+            return out
 
         # Fresh session
         prev_day_vix = self.db.get_prev_day_vix_close()
@@ -488,7 +492,7 @@ class MarketDataEngine:
 
         defaults = {
             "trading_date":                today_str,
-            "day_mode":                    "NORMAL",
+            "day_mode":                    self._compute_day_mode(today_ist()),
             "vix_regime":                  "UNKNOWN",
             "day_label":                   day_label,
             "or_high":                     None,
@@ -2546,6 +2550,17 @@ class MarketDataEngine:
             return "ELEVATED"
         return "HIGH"
 
+    def _compute_day_mode(self, today: Optional[date] = None) -> str:
+        """EVENT / PRE_EVENT / NORMAL from high_impact_events.json."""
+        d = today or today_ist()
+        events = get_high_impact_events()
+        if d in events:
+            return "EVENT"
+        next_day = ExpiryCalendar.get_next_trading_day(d)
+        if next_day and next_day in events:
+            return "PRE_EVENT"
+        return "NORMAL"
+
     def _maybe_update_vix_regime(self, vix: Optional[float]) -> None:
         """
         Update vix_regime in session_state with hysteresis.
@@ -2578,20 +2593,12 @@ class MarketDataEngine:
         self.state["vix_regime"]              = new_regime
         self.state["vix_regime_last_checked"] = now_ist().isoformat()
 
-        # Update day label and mode
+        # Update day label and mode from the live events calendar (mtime-
+        # refreshed). Do not leave day_mode stuck at the NORMAL default
+        # from session init when the file lists today as EVENT.
         today = today_ist()
         self.state["day_label"] = ExpiryCalendar.get_day_label(today)
-
-        events    = get_high_impact_events()
-        today_str = today.isoformat()
-        if today_str in {d.isoformat() for d in events.keys()}:
-            self.state["day_mode"] = "EVENT"
-        else:
-            next_day = ExpiryCalendar.get_next_trading_day(today)
-            if next_day and next_day in events:
-                self.state["day_mode"] = "PRE_EVENT"
-            else:
-                self.state["day_mode"] = "NORMAL"
+        self.state["day_mode"] = self._compute_day_mode(today)
 
     # ─────────────────────────────────────────────────────────────────────
     # PERSISTENCE METHODS
@@ -3477,6 +3484,9 @@ class MarketDataEngine:
         event_day_str = ExpiryCalendar.is_event_day(today_ist())
         event_day     = bool(event_day_str)
         event_name    = event_day_str
+        # Keep day_mode in sync with the mtime-refreshed events calendar
+        # every cycle (not only on the 30-min VIX regime tick).
+        self.state["day_mode"] = self._compute_day_mode(today_ist())
 
         # ── 26. Expiry-day (DTE 0) entry window adjustment ────────────────
         day_label  = self.state.get("day_label")

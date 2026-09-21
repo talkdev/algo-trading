@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v52)](#11-latest-change-logic-v52--live-ic-ban-on-moderate-or--fade-needs-two-way)
+   - [1.1 Latest change logic (v54)](#11-latest-change-logic-v54--live-vs-replay-continuation-gaps)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,58 +40,82 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v52) — live IC ban on moderate OR + fade needs two-way
+### 1.1 Latest change logic (v54) — live-vs-replay continuation gaps
 
-**Live diagnosis (consolidated `nifty_algo_v3.db`, not hallucination):**
+**Live facts (DB, not guesswork):**
+- **11-Sep:** BPS filled the only slot (`max_concurrent=1` historically) → 462× `max_concurrent_positions_reached`; `day_mode=NORMAL` though CPI is on the calendar; momentum never reached the gate (`momentum_sell_side_open`).
+- **21-Sep:** IC stopped −₹886 at 11:58 into ADX≈32 UPTREND → **189×** `momentum_skipped_after_credit_stop`; later `two_way_wait` at loc 0.81 blocked LONG_CALL; `market_snapshots.final_regime` was **NULL on 1486/1486** rows (persisted before regime enrichment).
 
-| Live day | What live took | Live P&amp;L | Replay book |
-|----------|----------------|------------:|-------------|
-| 2026-09-16 | `IRON_CONDOR` OR=MODERATE ADX=10 | +₹788 | 3 credit verticals (+₹6,608) |
-| 2026-09-17 | `IRON_CONDOR` OR=NARROW ADX=0 | +₹552 | failed-break + fade (+₹5,792) |
-| 2026-09-21 | `IRON_CONDOR` OR=MODERATE ADX=15 → stop; then BPS; then BCS into UPTREND | **−₹364** | with-trend BPS + LONG_CALL (**+₹3,648**) |
+**v54 (same at every DTE):**
 
-Selection reasons had **no** `pinned_*` / `soft_location_*` suffix — live was still on a default-RANGE→IC path. Replay already preferred verticals; v52 hardens the pin so live cannot re-enter that failure even if a stale build selects IC.
+1. **After losing credit stop → one-way continuation:** allow long-premium when ADX ≥ strong + UPTREND/DOWNTREND and not two-way/chop; align debit to the side that beat the vertical (BCS→calls, BPS→puts; IC/RANGE free). Still block choppy chase (17-Sep).
+2. **False two-way tightened:** require meaningful poke past *both* OR edges (drop 1pt fallback); clear latch when measured one-way owns the tape; measured one-way may answer `two_way_wait` / two-way auction with debit.
+3. **`entry_cooldown` is a sell-expression marker** so post-stop continuation reaches the momentum gate.
+4. **Event calendar:** reload `high_impact_events.json` on mtime; refresh `day_mode` / `event_day` every cycle (not process-lifetime freeze).
+5. **Snapshot regimes:** after regime merge, patch the latest `market_snapshots` row (cycle_log already did this).
 
-**v52 tape rules (identical at every DTE):**
+**v53 kept:** extreme loc evidence, IC ADX∈[12,20), continuous `p_win`.
 
-1. **Pin OR = NARROW / VERY_NARROW only.** `MODERATE` is not a pin (closes the live 16/21-Sep IC). Butterfly/condor entry rules refuse non-narrow OR.
-2. **Pin ADX max 20**, mid-location band 0.40–0.60; any soft-lean location (≥0.58 / ≤0.42) forbids pin and prefers vertical or wait.
-3. **Soft lean 0.58 / 0.42** with EMA/VWAP evidence so early grinds book the away-side vertical before a false pin.
-4. **High/low fade exemption to counter-trend block only if `two_way_auction`.** One-way UPTREND + high-fade flag (live 21-Sep BCS −₹261) is refused; confirmed two-way fades still allowed.
-5. **Direct price-regime veto:** bear call into UPTREND / bull put into DOWNTREND blocked unless two-way (or structural bearish lean for the call side).
+Parallel replay vs `data/per_day` (fill-edge 0.25): **₹65,969** (same as v53 — no regression). Live gaps above were already expressed correctly in replay (11-Sep LONG_CALL, 21-Sep BPS+LONG_CALL); v54 makes the live path able to take them.
 
-Construction remains life-continuous (`by_dte` / `dte_blend`) from v51 — no behaviour×DTE tables.
+| Date           | Daily Profit (₹) | vs v53 |
+| -------------- | ---------------: | -----: |
+| 2026-09-08     |         ₹2,861 |      — |
+| 2026-09-09     |         ₹8,764 |      — |
+| 2026-09-10     |         ₹4,581 |      — |
+| 2026-09-11     |        ₹17,181 |      — |
+| 2026-09-15     |        ₹12,526 |      — |
+| 2026-09-16     |         ₹6,608 |      — |
+| 2026-09-17     |         ₹7,810 |      — |
+| 2026-09-18     |         ₹1,720 |      — |
+| 2026-09-21     |         ₹3,917 |      — |
+| Total          |        ₹65,969 |      — |
 
-Parallel replay vs `data/per_day` (fill-edge 0.25) after v52 — **identical blotter and ₹63,682**. Robustness is the live IC / counter-trend path closure, not a profit chase.
-
-| Date           | Daily Profit (₹) |
-| -------------- | ---------------: |
-| 2026-09-08     |         ₹2,861 |
-| 2026-09-09     |         ₹8,764 |
-| 2026-09-10     |         ₹4,581 |
-| 2026-09-11     |        ₹17,181 |
-| 2026-09-15     |        ₹12,526 |
-| 2026-09-16     |         ₹6,608 |
-| 2026-09-17     |         ₹5,792 |
-| 2026-09-18     |         ₹1,720 |
-| 2026-09-21     |         ₹3,648 |
-| Total          |        ₹63,682 |
+19 trades, 100% win rate. Restart live on this build so post-stop continuation, event calendar refresh, and snapshot regime persistence take effect.
 
 ---
 
-### 1.1b Prior (v51) — life-continuous construction + unified soft evidence
+### 1.1b Prior (v53) — extreme location is evidence + life-continuous p_win
 
-**Problem:** Live books kept missing with-trend verticals while the codebase still forked construction on a boolean `_weekly_life` (DTE≥2 vs DTE0/1) and hard-blocked directional credit whenever ADX was immature.
+**Live fact (candles, not guesswork):** on 21-Sep at 10:56 the session location was **loc=0.71** (range ≈96 pts) while live sold an IC. Soft lean required EMA/VWAP confirmation; VWAP dist was only ~+0.02, so evidence failed and an older build defaulted to IC. Professionals treat upper/lower-third location itself as the lean signal when the range is real.
 
-**v51 rule:** tape→structure DTE-agnostic; construction continuous via `by_dte()`; soft evidence after 10:15 at extreme location + EMA/VWAP; butterfly on pin-life; data-layer life curves. Soft lean was 0.65/0.35 (tightened further in v52).
+**v53 (same at every DTE):**
+
+1. **Extreme location is evidence:** soft lean at ≥0.58 / ≤0.42 still prefers EMA/VWAP, but **loc ≥0.70 / ≤0.30 alone** books the away-side vertical (no VWAP lag veto). Same rule in regime soft-directional path.
+2. **IC flat-ADX floor:** pin requires mature ADX in **[12, 20)** — closes live 16-Sep (ADX 10) and 17-Sep (ADX 0) IC selections.
+3. **EV `p_win` prior:** removed the 7×5 DTE×OR table; OR-width anchors blend with `by_dte(expiry, weekly)` only.
+4. **v52 pin/fade guards kept:** MODERATE OR cannot pin; fade exemption needs `two_way_auction`; counter-trend price-regime veto.
+
+Parallel replay vs `data/per_day` (fill-edge 0.25):
+
+| Date           | Daily Profit (₹) | vs v52 |
+| -------------- | ---------------: | -----: |
+| 2026-09-08     |         ₹2,861 |      — |
+| 2026-09-09     |         ₹8,764 |      — |
+| 2026-09-10     |         ₹4,581 |      — |
+| 2026-09-11     |        ₹17,181 |      — |
+| 2026-09-15     |        ₹12,526 |      — |
+| 2026-09-16     |         ₹6,608 |      — |
+| 2026-09-17     |         ₹7,810 |  +₹2,018 (earlier lean BCS) |
+| 2026-09-18     |         ₹1,720 |      — |
+| 2026-09-21     |         ₹3,917 |   +₹269 (BPS 10:08 vs 10:55) |
+| Total          |        ₹65,969 |  +₹2,287 |
+
+19 trades, 100% win rate. Live path: at loc 0.71 the book now takes BPS instead of IC; ADX&lt;12 cannot pin.
 
 ---
 
-### 1.1c Prior (v50) — no default condor + life-only economics
+### 1.1c Prior (v52) — live IC ban on moderate OR + fade needs two-way
 
-The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots, pin vs lean) are the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()`.
+**Live diagnosis:** 16/17/21-Sep live sold IC (MODERATE OR / ADX 0–15); 21-Sep then sold BCS into UPTREND (−₹364 day). Replay preferred verticals (+₹3,648 on 21-Sep).
 
-**Range ladder (first match, every DTE):** lean → two-way extreme → location lean → true pin → wait. Never default-IC. Two concurrent tickets unchanged.
+**v52:** pin OR = NARROW only; soft lean 0.58/0.42; fade exemption only if `two_way_auction`; price-regime counter-trend veto. Replay held ₹63,682.
+
+---
+
+### 1.1d Prior (v51/v50) — life-continuous construction + no default condor
+
+Tape→structure DTE-agnostic; construction via `by_dte()`; never default-IC; two concurrent tickets. See git history for full notes.
 
 ---
 
@@ -355,8 +379,8 @@ Range-bound markets are resolved via `_resolve_range_strategy` with a **single D
 2. **Confirmed two-way auction** → fade the tested extreme only (`loc ≥ 0.85` bear call / `loc ≤ 0.15` bull put when range ≥ 85 pts); mid-range returns `NO_TRADE`.
 3. **Location lean** on session range ≥ 50 pts:
    - Mature ADX: `loc ≥ 0.62` → bull put; `loc ≤ 0.38` → bear call.
-   - Soft evidence (EMA / VWAP agreement): `0.58 / 0.42` so early grinds still sell the away side (v52).
-4. **True pin only** — **NARROW / VERY_NARROW OR only** (not MODERATE), mature flat ADX (&lt;20), mid location (0.40–0.60), contained range (&lt;100 pts), sell-premium vol, before noon, no soft-lean grind → iron butterfly when `dte_blend ≥ 0.35` else iron condor.
+   - Soft: `0.58 / 0.42` with EMA/VWAP, **or loc ≥0.70 / ≤0.30 alone** (v53 — VWAP lag must not veto).
+4. **True pin only** — **NARROW / VERY_NARROW OR only** (not MODERATE), mature ADX in [12, 20), mid location (0.40–0.60), contained range (&lt;100 pts), sell-premium vol, before noon, no soft-lean grind → iron butterfly when `dte_blend ≥ 0.35` else iron condor.
 5. **Otherwise → `NO_TRADE` wait.** Never `range_default_condor`.
 
 #### Two-Way Auction Extreme Resolution:

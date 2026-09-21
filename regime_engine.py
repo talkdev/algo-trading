@@ -1679,9 +1679,13 @@ class RegimeClassifier:
         if _rng < self.SOFT_MIN_RANGE_PTS:
             return False
         if side == "BULL":
-            return _loc >= self.SOFT_LOC_HI and self._soft_tape_agrees(signals, "BULL")
+            return _loc >= self.SOFT_LOC_HI and (
+                _loc >= 0.70 or self._soft_tape_agrees(signals, "BULL")
+            )
         if side == "BEAR":
-            return _loc <= self.SOFT_LOC_LO and self._soft_tape_agrees(signals, "BEAR")
+            return _loc <= self.SOFT_LOC_LO and (
+                _loc <= 0.30 or self._soft_tape_agrees(signals, "BEAR")
+            )
         return False
 
     def classify_final(
@@ -2731,6 +2735,26 @@ class RegimeEngine:
         self._dte_mismatch_warned = False
         self.logger.info(f"RegimeEngine daily reset for {today}")
 
+    def _refresh_event_day(self) -> None:
+        """Re-read high_impact_events.json each cycle (mtime-aware cache).
+
+        Daily reset alone is not enough: a calendar edit while the process
+        is up must arm EVENT sizing / defined-risk without a restart
+        (live 11-Sep stayed NORMAL after CPI was added to the file).
+        """
+        today = today_ist()
+        event_str = ExpiryCalendar.is_event_day(today)
+        was = bool(self._event_day)
+        now_ev = bool(event_str)
+        self._event_day = now_ev
+        self._event_name = event_str or ""
+        if now_ev and not was:
+            self.logger.warning(
+                f"EVENT DAY (calendar refresh): {self._event_name} | "
+                f"Size reduced {int((1 - self.config.event_size_multiplier) * 100)}% | "
+                f"Defined risk only"
+            )
+
     # ─────────────────────────────────────────────────────────────────────
     # STRADDLE EXPLOSION CHECK
     # ─────────────────────────────────────────────────────────────────────
@@ -2861,6 +2885,7 @@ class RegimeEngine:
         Returns a RegimeSnapshot with all dimensions classified.
         """
         self._daily_reset_if_needed()
+        self._refresh_event_day()
 
         # Update classifier with latest calibration
         self.classifier.cal = self.calibrator.state
