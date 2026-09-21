@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v49)](#11-latest-change-logic-v49--life-only-economics--two-slot-discipline)
+   - [1.1 Latest change logic (v50)](#11-latest-change-logic-v50--no-default-condor--life-only-economics)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,25 +40,45 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v49) — life-only economics + two-slot discipline
+### 1.1 Latest change logic (v50) — no default condor + life-only economics
 
-The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots) are the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()` (stops, targets, wing width/factor, credit ratio, IV/VIX sanity, VRP anomaly bound, max-pain EV haircut, stale-weekly scratch, 0DTE 15:00 square-off and 10:30 listing wait).
+The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots, pin vs lean) are the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()` (stops, targets, wing width/factor, credit ratio, IV/VIX sanity, VRP anomaly bound, VRP sell threshold, max-pain EV haircut, stale-weekly scratch, 0DTE 15:00 square-off and 10:30 listing wait).
 
-18 Sep (DTE2 open-spike mean-reversion) and 21 Sep (DTE1 grind) were the stress sample. Full-day signal streams vs `decide()` blockers:
+**Live failure mode that v50 closes:** on 21-Sep the live book sold a `PREMIUM_SELL_RANGE → IRON_CONDOR` at ADX 15 into a one-way grind and stopped (−₹886), then sold a high-fade bear call into UPTREND (−₹261). Replay with the current book takes the with-trend bull put + aligned long call (+₹3,648). The root cause was a **default-to-condor** ladder: when RANGE had no mature lean, the resolver returned IC and hoped entry rules would refuse it. Live older builds entered that IC. Professional NIFTY intraday premium sellers treat a condor as a **pin** trade, not a catch-all.
 
-| Sample | Engine-wanted book | What blocked it | General rule |
-| --- | --- | --- | --- |
-| 18 Sep | Failed-low bull put, then afternoon high-fade bear call | Sequential book is correct (₹1,720). Same-structure stacking, unresolved open-high wait (blocks mid-range IC/BEAR until 12:15), and post-fade late long are the real blocks — not DTE. Holding the BCS past the profit-lock into the 14:00+ new-high continuation loses. Concurrent opposite beside a still-open same-side put is a synthetic condor (measured on 16-Sep). | Harvesting one extreme is **not** a two-way auction. Opposite credit runs **sequentially** after the harvest clock (noon + loc ≥ 0.80). Confirmed both-OR-sides two-way may fade from 10:45 at loc ≥ 0.85 and may stack the opposite extreme after 12:15. |
-| 21 Sep | First bull put at loc 0.75 (with-trend). Second ticket: aligned long call while the put is open (ADX 37 UPTREND) | Sell-side `slot_conflict_same_structure` is refused, then `_momentum_decision` fills the free slot with the aligned long (v48). Same-side put chase at loc ≥ 0.98 correctly refused. | When a credit vertical is open, sell-side stacking is refused, but an **aligned** long (bull put + long call / bear call + long put) may fill the free slot at 0.70× size, capped at `momentum_second_slot_max_lots` (3). |
+**Range ladder (first match, every DTE):**
 
-**Two concurrent tickets** (`max_concurrent_positions = 2`):
+1. Structural bearish lean (unfilled gap-down under a call wall) → bear call.
+2. Confirmed two-way auction → fade the tested extreme only; mid-range waits.
+3. Location lean on a real session range (≥50 pts): mature ADX at 0.62/0.38; soft tape evidence (EMA / price regime / VWAP agreement) at 0.70/0.30 so early grinds still sell the away side.
+4. True pin only — narrow/moderate OR, mature flat ADX (&lt;22), mid location, contained range, sell-premium vol, before noon → butterfly (where `DTE_REQUIREMENTS` allow) else iron condor.
+5. Otherwise → **NO_TRADE wait**. Never `range_default_condor`.
 
-- Allowed: aligned long premium beside a credit vertical (`slot_conflict` / `same_side_chase` consult `_momentum_decision`), **or** the opposite *extreme* fade beside an open vertical on a **confirmed two-way** tape after 12:15 (fade flags + effective post-open location — not raw session loc ≥ 0.85), sized at 0.70×.
+**IC demotion:** when a pin structure is selected but pin-gates fail (immature ADX, location drift, expanding range, open-spike wick, two-way ban, wing economics), demote to an evidenced vertical (day-structure lean, fade flags, or clear location ≥0.70 / ≤0.30). Event days and mid-range with no lean stay flat (protects the 11-Sep long-call path).
+
+**VRP sell threshold:** `CalibrationState.get_vrp_sell_for_dte` now uses `by_dte(dte, 0.75, 1.10)` instead of discrete `dte==0/1/2` multipliers. DTE1 lands on the sqrt-life curve (~0.96×), not a hand-typed 0.85× row.
+
+**Two concurrent tickets** (`max_concurrent_positions = 2`) unchanged from v49:
+
+- Allowed: aligned long premium beside a credit vertical, or the opposite *extreme* fade beside an open vertical on a **confirmed two-way** tape after 12:15 (fade flags + effective post-open location), sized at 0.70×.
 - Refused: the same structure twice, a condor beside anything, opposite credit after a one-sided harvest while the first ticket is still open (synthetic condor), and same-side credit chase at a worse location.
 
-**Fade sizing (v49):** extreme fades size at 1.15× when the tape is confirmed two-way, post-harvest opposite, or open-spike mean-reversion — same clip, every DTE. Tighter profit-lock keep on spike fades was measured and rejected: it banks more on 18-Sep BCS but cuts 10-Sep BCS winners that still have room to the time-decay target.
+**Fade sizing:** extreme fades size at 1.15× when the tape is confirmed two-way, post-harvest opposite, or open-spike mean-reversion — same clip, every DTE.
 
-Strike/wing geometry and risk tables use remaining-life (`by_dte` / `dte_blend` — no `if dte == 0 / 1 / 2` selection maze).
+Parallel replay vs `data/per_day` (fill-edge 0.25) after v50 — same trade blotter and ₹63,682 total as v49; 21-Sep top rejection is no longer `condor_requires_mature_adx` spam.
+
+| Date           | Daily Profit (₹) |
+| -------------- | ---------------: |
+| 2026-09-08     |         ₹2,861 |
+| 2026-09-09     |         ₹8,764 |
+| 2026-09-10     |         ₹4,581 |
+| 2026-09-11     |        ₹17,181 |
+| 2026-09-15     |        ₹12,526 |
+| 2026-09-16     |         ₹6,608 |
+| 2026-09-17     |         ₹5,792 |
+| 2026-09-18     |         ₹1,720 |
+| 2026-09-21     |         ₹3,648 |
+| Total          |        ₹63,682 |
 
 ---
 
@@ -312,42 +332,35 @@ _resolve_range_strategy()   BULL_PUT_SPREAD             BEAR_CALL_SPREAD
 
 ### 7. Range Strategy Resolution & Two-Way Extreme Fading Logic
 
-Range-bound markets are resolved via `_resolve_range_strategy`:
+Range-bound markets are resolved via `_resolve_range_strategy` with a **single DTE-agnostic ladder** (v50). A condor is a pin trade, never the default.
 
-#### 1. Bearish Structure Lean Detection (`_range_day_bearish_lean`):
+#### Ladder (first match wins):
 
-Even within an overall range, intraday structure frequently leans asymmetric. A Bear Call Spread is selected instead of an Iron Condor if:
+1. **Structural bearish lean** (`_range_day_bearish_lean`) → `BEAR_CALL_SPREAD` when an unfilled gap-down sits under a call wall (weekend-risk / Friday stays delta-neutral).
+2. **Confirmed two-way auction** → fade the tested extreme only (`loc ≥ 0.85` bear call / `loc ≤ 0.15` bull put when range ≥ 85 pts); mid-range returns `NO_TRADE`.
+3. **Location lean** on session range ≥ 50 pts:
+   - Mature ADX: `loc ≥ 0.62` → bull put; `loc ≤ 0.38` → bear call.
+   - Soft evidence (EMA / price regime / VWAP agreement): tighter `0.70 / 0.30` so early grinds still sell the away side.
+4. **True pin only** — narrow/moderate OR, mature flat ADX (&lt;22), mid location, contained range (&lt;100 pts), sell-premium vol, before noon → iron butterfly (DTE 0–1 where `DTE_REQUIREMENTS` allow) else iron condor.
+5. **Otherwise → `NO_TRADE` wait.** Never `range_default_condor`.
 
-- `lower_high_confirmed` is true and spot is below VWAP.
-- Failed breakout above the opening range occurred (`failed_break_above`).
-- PCR < 0.80 with call OI additions heavily exceeding put OI additions.
-
-#### 2. Two-Way Auction Extreme Resolution:
+#### Two-Way Auction Extreme Resolution:
 
 On volatile range sessions where the index swings between extremes without a persistent trend:
 
 - Selling an Iron Condor in the middle of the range guarantees testing one or both wings.
 - The engine calculates session range position via `_fade_range_pos(signals)`:
   ```text
-
+  loc = (spot - eff_lo) / (eff_hi - eff_lo)
   ```
-
-loc = (spot - eff_lo) / (eff_hi - eff_lo)
-
-```
   (Where `eff_hi` and `eff_lo` remove open-spike wicks when the spike gap ≥ 15 pts).
-- If session_range ≥ 85 pts and DTE ≥ 1:
-  - If loc ≥ 0.85: Selects **`BEAR_CALL_SPREAD`** (`afternoon_high_fade = True`).
-  - If loc ≤ 0.15: Selects **`BULL_PUT_SPREAD`** (`afternoon_low_fade = True`).
-  - If 0.15 < loc < 0.85: Returns **`NO_TRADE`** (`two_way_auction_wait_for_extreme`).
+- Confirmed two-way (both OR edges poked, or choppy-on-wide) may fade from 10:45; one-sided harvests wait for noon before opposite credit.
 
-#### 3. Iron Butterfly Resolution (0DTE Pin Spec):
-An Iron Butterfly (selling ATM Put + ATM Call, buying wings) is strictly restricted:
-- Requires DTE in (0, 1) (typically 0DTE).
-- `or_condition` must be `VERY_NARROW` or `NARROW`.
-- ADX_15 < 20 (flat volatility, absent momentum).
-- `current_time` < 12:00 IST (pre-midday entry).
-- |spot - atm_strike| < 50 pts (spot closely anchored to strike).
+#### Iron Butterfly / Condor Pin Spec:
+
+- Butterfly: DTE in (0, 1), `VERY_NARROW`/`NARROW` OR, ADX_15 &lt; 18, `|spot − ATM| < 50`, before 12:00.
+- Condor pin: same mid-location / contained-range / sell-premium gates with ADX_15 &lt; 22.
+- Pin-gate failure demotes to an evidenced vertical (clear location / fade / day-structure lean), not a blind substitute.
 
 ---
 

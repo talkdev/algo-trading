@@ -1532,44 +1532,77 @@ class StrategyEngine:
         return True, f"day_structure_lean_bearish:{_ds_why}"
 
     # ── Range-regime structure selection: ONE ladder for every DTE ─────────
-    # The resolver used to branch on DTE (0 / 1 / 2+) with a different rule
-    # set in each branch, and every session that misbehaved got a new
-    # sub-branch. The book is flat by the hard exit on EVERY session, so the
-    # question the resolver answers - "what does the tape look like right
-    # now, and which structure fits it" - is the same at every DTE. What
-    # genuinely differs by DTE is ECONOMICS (theta per hour, gamma, credit
-    # per point of wing) and that lives in the parameter tables
-    # (DTE_REQUIREMENTS, MIN_CREDIT_RATIO*, stop multiples, targets, size),
-    # not in the selection ladder.
+    # The book is flat by the hard exit on EVERY session, so the question
+    # the resolver answers — "what does the tape look like right now, and
+    # which structure fits it" — is the same at every DTE. What genuinely
+    # differs by DTE is ECONOMICS (theta per hour, gamma, credit per point
+    # of wing) via by_dte() / dte_blend(), not the selection ladder.
     #
-    # Ladder (first match wins):
+    # v50: professional NIFTY intraday premium sellers do NOT default to a
+    # condor. A condor is a PIN trade. Live 21-Sep sold a RANGE→IC at ADX 15
+    # into a grind and stopped; the profitable book was the with-trend
+    # vertical. Ladder (first match wins):
     #   1. Structural bearish lean (unfilled gap-down under a call wall)
-    #      -> bear call.  Day-structure fact, not a 15-minute label.
-    #   2. Confirmed two-way auction -> sell the tested EXTREME only
-    #      (>=0.85 bear call / <=0.15 bull put), otherwise wait. Mid-range
-    #      delta-neutral structures on a swinging tape are the measured
-    #      wrong ticket.
-    #   3. Location lean (mature ADX, session range >= RANGE_LEAN_MIN_PTS):
-    #      spot in the upper part of its range -> bull put, lower -> bear
-    #      call. A single exposed side, placed AWAY from where price is
-    #      trading, carries half the gamma of a condor for the same theta.
-    #      Skipped on event days: a directional vertical pre-positions
-    #      through the print and caps the move the momentum route exists
-    #      to capture.
-    #   4. Centre of a NARROW range, flat MATURE ADX, spot at ATM, before
-    #      noon -> iron butterfly where its economics allow (DTE_REQUIREMENTS),
-    #      iron condor otherwise.
-    #   5. Otherwise -> iron condor; the structure rules and EV gate decide
-    #      whether the condor is actually buildable.
+    #      -> bear call.
+    #   2. Confirmed two-way auction -> sell the tested EXTREME only,
+    #      otherwise wait.
+    #   3. Location lean (session range >= RANGE_LEAN_MIN_PTS):
+    #      mature ADX uses 0.62/0.38; soft tape evidence (EMA / price /
+    #      VWAP agreement) uses a tighter 0.70/0.30 so early grinds still
+    #      sell the away side without waiting for ADX maturity.
+    #   4. True pin only: narrow OR, mature flat ADX, mid location, contained
+    #      session range, before noon -> butterfly (where DTE_REQUIREMENTS
+    #      allow) else iron condor.
+    #   5. Otherwise -> NO_TRADE wait. Never default-IC.
     RANGE_LEAN_MIN_PTS   = 50.0
     RANGE_LEAN_HI        = 0.62
     RANGE_LEAN_LO        = 0.38
+    RANGE_SOFT_LEAN_HI   = 0.70
+    RANGE_SOFT_LEAN_LO   = 0.30
     TWO_WAY_FADE_HI      = 0.85
     TWO_WAY_FADE_LO      = 0.15
     TWO_WAY_MIN_RANGE    = 85.0
     BUTTERFLY_ADX_MAX    = 18.0
+    CONDOR_PIN_ADX_MAX   = 22.0
     BUTTERFLY_ATM_DIST   = 50.0
     CONDOR_MAX_SESSION_RANGE_PTS = 100.0
+    PIN_LOC_LO           = 0.38
+    PIN_LOC_HI           = 0.62
+
+    def _soft_location_evidence(self, signals: dict, side: str) -> bool:
+        """EMA / price-regime / VWAP agreement for an early location lean.
+
+        Mature ADX is ideal; until it prints, professional books still sell
+        the away side of a grind when independent tape reads agree. Side is
+        'BULL' (sell puts / upper loc) or 'BEAR' (sell calls / lower loc).
+        """
+        price = str(signals.get("price_regime") or "")
+        ema = str(signals.get("ema_structure") or "")
+        try:
+            vd = float(signals.get("vwap_dist_pct") or 0.0)
+        except (TypeError, ValueError):
+            vd = 0.0
+        buf = abs(float(getattr(
+            self.config, "counter_trend_vwap_dist_min_pct", 0.10)))
+        if side == "BULL":
+            return (
+                price in ("UPTREND", "STRONG_UPTREND", "RANGE", "CHOPPY")
+                and (
+                    ema == "BULLISH"
+                    or price in ("UPTREND", "STRONG_UPTREND")
+                    or vd >= buf
+                )
+            )
+        if side == "BEAR":
+            return (
+                price in ("DOWNTREND", "STRONG_DOWNTREND", "RANGE", "CHOPPY")
+                and (
+                    ema == "BEARISH"
+                    or price in ("DOWNTREND", "STRONG_DOWNTREND")
+                    or vd <= -buf
+                )
+            )
+        return False
 
     def _resolve_range_strategy(
         self,
@@ -1613,36 +1646,67 @@ class StrategyEngine:
 
         _event = bool(signals.get("event_day") or signals.get("event_announced"))
 
-        # 3. location lean (needs a mature trend read and a real range)
-        if (not _event) and adx_15_mature and _rng >= self.RANGE_LEAN_MIN_PTS:
-            if _loc >= self.RANGE_LEAN_HI:
-                self.logger.info(
-                    f"Range resolution: loc={_loc:.2f} >= {self.RANGE_LEAN_HI}"
-                    f" -> BULL_PUT_SPREAD (puts sit away from price)"
-                )
-                return BULL_PUT_SPREAD, f"range_location_lean_{_loc:.2f}"
-            if _loc <= self.RANGE_LEAN_LO:
-                self.logger.info(
-                    f"Range resolution: loc={_loc:.2f} <= {self.RANGE_LEAN_LO}"
-                    f" -> BEAR_CALL_SPREAD (calls sit away from price)"
-                )
-                return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
+        # 3. location lean — sell the away side of a real session range.
+        # Mature ADX: standard thresholds. Soft evidence: tighter thresholds
+        # so an early grind (live 21-Sep ADX 15 RANGE→IC) still books the
+        # with-trend vertical instead of waiting for a pin that never comes.
+        if (not _event) and _rng >= self.RANGE_LEAN_MIN_PTS:
+            if adx_15_mature:
+                if _loc >= self.RANGE_LEAN_HI:
+                    self.logger.info(
+                        f"Range resolution: loc={_loc:.2f} >= {self.RANGE_LEAN_HI}"
+                        f" -> BULL_PUT_SPREAD (puts sit away from price)"
+                    )
+                    return BULL_PUT_SPREAD, f"range_location_lean_{_loc:.2f}"
+                if _loc <= self.RANGE_LEAN_LO:
+                    self.logger.info(
+                        f"Range resolution: loc={_loc:.2f} <= {self.RANGE_LEAN_LO}"
+                        f" -> BEAR_CALL_SPREAD (calls sit away from price)"
+                    )
+                    return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
+            else:
+                if (_loc >= self.RANGE_SOFT_LEAN_HI
+                        and self._soft_location_evidence(signals, "BULL")):
+                    self.logger.info(
+                        f"Range resolution: soft lean loc={_loc:.2f} "
+                        f"-> BULL_PUT_SPREAD"
+                    )
+                    return BULL_PUT_SPREAD, f"range_soft_location_lean_{_loc:.2f}"
+                if (_loc <= self.RANGE_SOFT_LEAN_LO
+                        and self._soft_location_evidence(signals, "BEAR")):
+                    self.logger.info(
+                        f"Range resolution: soft lean loc={_loc:.2f} "
+                        f"-> BEAR_CALL_SPREAD"
+                    )
+                    return BEAR_CALL_SPREAD, f"range_soft_location_lean_{_loc:.2f}"
 
-        # 4. pinned centre of a narrow range -> butterfly where its theta
-        #    per hour pays for the ATM straddle's gamma (DTE_REQUIREMENTS)
-        if (or_condition in ("VERY_NARROW", "NARROW")
-                and adx_15_mature
-                and adx_15 < self.BUTTERFLY_ADX_MAX
-                and current_time < dtime(12, 0)):
+        # 4. true pin only — never a catch-all. Condor/fly need a contained
+        # mid-range auction with a real flat ADX read.
+        _pin_or = or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
+        _pin_adx = (
+            adx_15_mature
+            and 0.0 < adx_15 < self.CONDOR_PIN_ADX_MAX
+        )
+        _pin_loc = self.PIN_LOC_LO < _loc < self.PIN_LOC_HI
+        _pin_rng = _rng < self.CONDOR_MAX_SESSION_RANGE_PTS
+        _pin_vol = vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+        if (_pin_or and _pin_adx and _pin_loc and _pin_rng and _pin_vol
+                and current_time < dtime(12, 0) and not _event):
             spot       = float(signals.get("spot") or 0)
             atm_strike = int(signals.get("atm_strike") or 0)
             _ib_lo, _ib_hi = DTE_REQUIREMENTS.get(IRON_BUTTERFLY, (0, 1))
-            if (atm_strike > 0 and abs(spot - atm_strike) < self.BUTTERFLY_ATM_DIST
+            if (or_condition in ("VERY_NARROW", "NARROW")
+                    and adx_15 < self.BUTTERFLY_ADX_MAX
+                    and atm_strike > 0
+                    and abs(spot - atm_strike) < self.BUTTERFLY_ATM_DIST
                     and _ib_lo <= _dte <= _ib_hi):
                 return IRON_BUTTERFLY, f"pinned_narrow_range_adx_{adx_15:.0f}"
+            return IRON_CONDOR, f"pinned_mid_range_adx_{adx_15:.0f}"
 
-        # 5. default delta-neutral structure
-        return IRON_CONDOR, "range_default_condor"
+        # 5. no evidence of pin or lean — wait. Same at every DTE.
+        return "NO_TRADE", (
+            f"range_wait_no_pin_no_lean_loc_{_loc:.2f}_rng_{_rng:.0f}"
+        )
 
     # ═══════════════════════════════════════════════════════════════════
     # PATCH_V13: tape evidence, entry/exit symmetry, session price memory
@@ -5614,14 +5678,33 @@ class StrategyEngine:
         signals: dict,
         reason: str,
     ) -> Optional[str]:
-        """IC unbuildable on wing geometry → vertical ONLY with lean/fade evidence.
+        """IC unbuildable → vertical ONLY with lean/fade/location evidence.
 
-        Bare location demotion stole the Sep11 book (losing BCS filled the
-        slot that the later momentum/winner path needed). Mid-range with no
-        lean stays flat via sticky construct_fail.
+        Bare mid-range demotion stole the Sep11 book (losing BCS filled the
+        slot the later momentum winner needed). Event days stay flat.
+        v50: also demote on pin-gate refusals (immature ADX, location drift,
+        expanding range) — those prove the condor was the wrong ticket, and
+        a clear location lean is the professional substitute. Same at every DTE.
         """
+        if bool(signals.get("event_day") or signals.get("event_announced")):
+            return None
         family = self._econ_fail_family(reason)
-        if family not in ("wing_cost", "condor_weak_side"):
+        _rule = str(reason or "")
+        _pin_refuse = any(
+            tok in _rule
+            for tok in (
+                "condor_requires_mature_adx",
+                "condor_location_drift",
+                "condor_blocked_expanding_range",
+                "condor_blocked_open_spike",
+                "condor_banned_on_two_way",
+                "condor_blocked_strong_adx",
+                "condor_blocked_after_failed_break",
+                "wing_cost",
+                "condor_weak_side",
+            )
+        )
+        if family not in ("wing_cost", "condor_weak_side") and not _pin_refuse:
             return None
         lean, _ = self._range_day_bearish_lean(signals)
         if lean:
@@ -5630,6 +5713,17 @@ class StrategyEngine:
             return BEAR_CALL_SPREAD
         if signals.get("afternoon_low_fade"):
             return BULL_PUT_SPREAD
+        try:
+            _rng, _loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return None
+        if _rng < self.RANGE_LEAN_MIN_PTS:
+            return None
+        # Clear location only — soft mid-range stays flat (Sep11 protection).
+        if _loc >= max(self.RANGE_LEAN_HI, 0.70):
+            return BULL_PUT_SPREAD
+        if _loc <= min(self.RANGE_LEAN_LO, 0.30):
+            return BEAR_CALL_SPREAD
         return None
 
     def decide(self, signals: dict) -> dict:
@@ -5731,24 +5825,42 @@ class StrategyEngine:
         rules_ok, rules_reason = self._validate_entry_rules(strategy_name, signals)
         if not rules_ok:
             full_reason = f"strategy_rules_failed:{rules_reason}"
-            # PATCH_V12 (round 3): the substitute is consulted on
-            # structure-rule refusals exactly as on hard-gate and
-            # economics refusals — the rules are sell-structure-
-            # specific (pin veto, OR-mid positioning, delta gates)
-            # and a long-premium ticket re-underwrites every one of
-            # them in its own gate.
-            alt = self._momentum_decision(signals, full_reason)
-            if alt is not None:
-                return alt
-            full_reason = self._with_momentum_refuse(signals, full_reason)
-            self._log_decision(signals, "NO_TRADE", full_reason)
-            self._persist_decision(
-                signals, strategy_name, full_reason, None, "NO_TRADE"
-            )
-            self.market_engine.finalize_cycle_log(
-                "NO_TRADE", full_reason, self._count_open_positions()
-            )
-            return {"action": "NO_TRADE", "reason": full_reason}
+            # v50: IC pin-gate refusals demote to an evidenced vertical before
+            # the momentum substitute — same professional substitution the
+            # econ-fail path already uses. Event / mid-range stay flat.
+            if strategy_name == IRON_CONDOR:
+                _alt_name = self._demote_condor_on_econ_fail(signals, rules_reason)
+                if _alt_name and not self._slot_conflict(_alt_name, signals):
+                    _ct = self._counter_trend_entry_refusal(_alt_name, signals)
+                    _alt_ok, _alt_why = (False, "counter_trend") if _ct else (
+                        self._validate_entry_rules(_alt_name, signals)
+                    )
+                    if _alt_ok:
+                        strategy_name = _alt_name
+                        selection_reason = (
+                            f"{selection_reason}:demoted_from_ic_on_{rules_reason}"
+                        )
+                        rules_ok = True
+                        rules_reason = _alt_why
+            if not rules_ok:
+                # PATCH_V12 (round 3): the substitute is consulted on
+                # structure-rule refusals exactly as on hard-gate and
+                # economics refusals — the rules are sell-structure-
+                # specific (pin veto, OR-mid positioning, delta gates)
+                # and a long-premium ticket re-underwrites every one of
+                # them in its own gate.
+                alt = self._momentum_decision(signals, full_reason)
+                if alt is not None:
+                    return alt
+                full_reason = self._with_momentum_refuse(signals, full_reason)
+                self._log_decision(signals, "NO_TRADE", full_reason)
+                self._persist_decision(
+                    signals, strategy_name, full_reason, None, "NO_TRADE"
+                )
+                self.market_engine.finalize_cycle_log(
+                    "NO_TRADE", full_reason, self._count_open_positions()
+                )
+                return {"action": "NO_TRADE", "reason": full_reason}
 
         # Live sell→ticket: do not re-spam the same economics reject.
         _sticky = self._sticky_construct_reason(signals, strategy_name)
@@ -6156,7 +6268,7 @@ def _self_test() -> None:
     print(f"  PREMIUM_SELL_BEAR -> {strat4} (expect BEAR_CALL_SPREAD)")
     assert strat4 == BEAR_CALL_SPREAD, f"Expected BEAR_CALL_SPREAD, got {strat4}"
 
-    strat_condor, _ = engine._map_regime_to_strategy(
+    strat_condor, why_c = engine._map_regime_to_strategy(
         make_signals(
             final_regime="PREMIUM_SELL_RANGE",
             actual_dte=0, or_condition="WIDE", adx_15=26.0,
@@ -6164,8 +6276,26 @@ def _self_test() -> None:
         ),
         _test_time=dtime(10, 0),
     )
-    print(f"  PREMIUM_SELL_RANGE, DTE0, WIDE OR, ADX=26 -> {strat_condor} (expect IRON_CONDOR)")
-    assert strat_condor == IRON_CONDOR, f"Expected IRON_CONDOR for WIDE OR, got {strat_condor}"
+    print(f"  PREMIUM_SELL_RANGE, DTE0, WIDE OR, ADX=26 -> {strat_condor} "
+          f"(expect NO_TRADE wait — wide+elevated ADX is not a pin)")
+    assert strat_condor == "NO_TRADE", (
+        f"Expected NO_TRADE for WIDE OR (no default IC), got {strat_condor} ({why_c})"
+    )
+    # True pin: mid loc, narrow OR, mature flat ADX, sell-premium vol.
+    strat_pin, why_p = engine._map_regime_to_strategy(
+        make_signals(
+            final_regime="PREMIUM_SELL_RANGE",
+            actual_dte=2, or_condition="NARROW", adx_15=14.0,
+            adx_15_mature=True, vol_regime="SELL_PREMIUM",
+            spot=24000.0, atm_strike=24000,
+            day_high_so_far=24040.0, day_low_so_far=23960.0,
+        ),
+        _test_time=dtime(10, 0),
+    )
+    print(f"  true pin mid-range -> {strat_pin} ({why_p})")
+    assert strat_pin in (IRON_CONDOR, IRON_BUTTERFLY), (
+        f"Expected pin IC/IB, got {strat_pin}"
+    )
     print("  [OK] Regime mapping tests passed")
 
     print_section("Entry Rules Validation Tests")

@@ -2039,7 +2039,8 @@ class RegimeClassifier:
             _dte_i = int(dte) if dte is not None else -1
         except (TypeError, ValueError):
             _dte_i = -1
-        if 0 <= _dte_i <= 4:
+        _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+        if 0 <= _dte_i <= _max_dte:
             try:
                 _v23_orl = float(signals.get("or_low") or 0.0)
                 _v23_orh = float(signals.get("or_high") or 0.0)

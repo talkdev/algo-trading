@@ -20,7 +20,7 @@ import pandas as pd
 
 from core import (
     Config, Database,
-    now_ist, today_ist,
+    now_ist, today_ist, by_dte,
     load_config, setup_logging,
     ExpiryCalendar,
     print_section, print_kv_table,
@@ -121,20 +121,14 @@ class CalibrationState:
 
     def get_vrp_sell_for_dte(self, dte: Optional[int], or_condition: Optional[str] = None) -> float:
         """
-        Return the DTE-adjusted and OR-adjusted VRP sell threshold.
-        This is the primary threshold used by the volatility gate.
+        Return the life-adjusted and OR-adjusted VRP sell threshold.
+
+        v50: continuous sqrt-life blend between expiry (0.75x) and weekly
+        (1.10x) anchors — no discrete dte==0/1/2 branches. Same economics
+        curve the rest of the engine already uses via by_dte().
         """
         base = self.vrp_sell_threshold
-
-        # DTE adjustment
-        if dte == 0:
-            adjusted = base * 0.75
-        elif dte == 1:
-            adjusted = base * 0.85
-        elif dte is not None and dte >= 2:
-            adjusted = base * 1.10
-        else:
-            adjusted = base
+        adjusted = base * by_dte(dte, 0.75, 1.10)
 
         # OR condition adjustment
         or_mult = {
@@ -371,10 +365,11 @@ class CalibrationEngine:
             notes=row.get("notes", ""),
         )
 
-        # Compute DTE-specific VRP thresholds
-        state.vrp_sell_dte0    = vrp_sell * 0.75
-        state.vrp_sell_dte1    = vrp_sell * 0.85
-        state.vrp_sell_dte2plus = vrp_sell * 1.10
+        # Life-blended VRP anchors (display / legacy fields; live gate uses
+        # get_vrp_sell_for_dte → by_dte continuously).
+        state.vrp_sell_dte0     = vrp_sell * by_dte(0, 0.75, 1.10)
+        state.vrp_sell_dte1     = vrp_sell * by_dte(1, 0.75, 1.10)
+        state.vrp_sell_dte2plus = vrp_sell * by_dte(2, 0.75, 1.10)
 
         return state
 
@@ -531,10 +526,10 @@ class CalibrationEngine:
         if tier3 or schedule == "monthly":
             self._run_drift_detection(new_state)
 
-        # Compute DTE-specific VRP thresholds
-        new_state.vrp_sell_dte0     = new_state.vrp_sell_threshold * 0.75
-        new_state.vrp_sell_dte1     = new_state.vrp_sell_threshold * 0.85
-        new_state.vrp_sell_dte2plus = new_state.vrp_sell_threshold * 1.10
+        # Life-blended VRP anchors (display / legacy; live uses by_dte).
+        new_state.vrp_sell_dte0     = new_state.vrp_sell_threshold * by_dte(0, 0.75, 1.10)
+        new_state.vrp_sell_dte1     = new_state.vrp_sell_threshold * by_dte(1, 0.75, 1.10)
+        new_state.vrp_sell_dte2plus = new_state.vrp_sell_threshold * by_dte(2, 0.75, 1.10)
 
         # Build notes
         notes_parts = [
@@ -2268,12 +2263,13 @@ def _self_test() -> None:
         "VIX p50":           state.vix_p50,
     }, title="NIFTY 2026 Defaults")
 
-    # DTE-adjusted VRP thresholds
+    # Life-blended VRP thresholds (by_dte anchors)
+    _dte1_mult = by_dte(1, 0.75, 1.10)
     dte0_thresh = state.get_vrp_sell_for_dte(0, "NARROW")
     dte1_thresh = state.get_vrp_sell_for_dte(1, "MODERATE")
     dte2_thresh = state.get_vrp_sell_for_dte(2, "MODERATE")
     print(f"  VRP sell DTE0 NARROW:    {dte0_thresh:.3f}pp (expect ~{2.5*0.75*0.85:.3f})")
-    print(f"  VRP sell DTE1 MODERATE:  {dte1_thresh:.3f}pp (expect ~{2.5*0.85:.3f})")
+    print(f"  VRP sell DTE1 MODERATE:  {dte1_thresh:.3f}pp (expect ~{2.5*_dte1_mult:.3f})")
     print(f"  VRP sell DTE2 MODERATE:  {dte2_thresh:.3f}pp (expect ~{2.5*1.10:.3f})")
     assert dte0_thresh < dte1_thresh < dte2_thresh, \
         "DTE0 should have lowest threshold, DTE2 highest"
@@ -2458,14 +2454,15 @@ def _self_test() -> None:
     # ── DTE threshold computation test ───────────────────────────────────
     print_section("DTE Threshold Computation Test")
     test_state = CalibrationState(vrp_sell_threshold=2.5)
+    _m1 = by_dte(1, 0.75, 1.10)
 
     test_cases = [
         (0, "VERY_NARROW", 2.5 * 0.75 * 0.75),
         (0, "NARROW",      2.5 * 0.75 * 0.85),
         (0, "MODERATE",    2.5 * 0.75 * 1.00),
         (0, "WIDE",        2.5 * 0.75 * 1.20),
-        (1, "NARROW",      2.5 * 0.85 * 0.85),
-        (1, "MODERATE",    2.5 * 0.85 * 1.00),
+        (1, "NARROW",      2.5 * _m1 * 0.85),
+        (1, "MODERATE",    2.5 * _m1 * 1.00),
         (2, "MODERATE",    2.5 * 1.10 * 1.00),
     ]
 
