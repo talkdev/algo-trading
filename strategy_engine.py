@@ -1107,10 +1107,12 @@ class StrategyEngine:
             dh = float(signals.get("day_high_so_far") or signals.get("day_high") or 0.0)
             dl = float(signals.get("day_low_so_far") or signals.get("day_low") or 0.0)
             if or_h > or_l > 0 and dh > 0 and dl > 0 and not _spike_hi:
+                # v54: require a meaningful poke past BOTH OR edges.
+                # The old 1pt fallback (dh > or_h and dl < or_l) latched
+                # false two-way on one-way grind days (live 21-Sep: wait
+                # for puts at loc 0.81 while ADX trend owned the tape).
                 _poke = max(15.0, 0.25 * (or_h - or_l))
                 _both_sides = (dh >= or_h + _poke) and (dl <= or_l - _poke)
-                if not _both_sides:
-                    _both_sides = (dh > or_h) and (dl < or_l)
         except (TypeError, ValueError):
             _both_sides = False
         # Harvesting ONE extreme is not a two-way auction. Two-way means
@@ -1119,6 +1121,22 @@ class StrategyEngine:
         # latch in _apply_two_way_location / _opposite_extreme_fade).
         _chop_wide = bool(_chop and raw_rng >= 100.0 and not _spike_hi)
         _latched = bool(signals.get("two_way_auction")) and not _spike_hi
+        # v54: clear a stale latch once a measured one-way trend owns the
+        # session — do not keep fading/waiting after the auction resolved.
+        if _latched and not _both_sides and not _chop_wide:
+            try:
+                _adx_clr = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_clr = 0.0
+            _pr_clr = str(signals.get("price_regime") or "")
+            if (
+                _adx_clr >= float(
+                    getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
+                )
+                and _pr_clr in ("UPTREND", "DOWNTREND")
+                and not _chop
+            ):
+                _latched = False
         active = bool(
             raw_rng >= _floor
             and (_both_sides or _chop_wide)
@@ -1651,9 +1669,10 @@ class StrategyEngine:
         _event = bool(signals.get("event_day") or signals.get("event_announced"))
 
         # 3. location lean — sell the away side of a real session range.
-        # Mature ADX: standard thresholds. Soft evidence: tighter thresholds
-        # so an early grind (live 21-Sep ADX 15 RANGE→IC) still books the
-        # with-trend vertical instead of waiting for a pin that never comes.
+        # Mature ADX: standard thresholds. Soft evidence: EMA/VWAP, OR a
+        # clear extreme location (>=0.70 / <=0.30). Live 21-Sep printed
+        # loc=0.71 with vwap_dist only +0.02 — VWAP lag must not veto the
+        # away-side vertical while a false pin waits.
         if (not _event) and _rng >= self.RANGE_LEAN_MIN_PTS:
             if adx_15_mature:
                 if _loc >= self.RANGE_LEAN_HI:
@@ -1669,15 +1688,17 @@ class StrategyEngine:
                     )
                     return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
             else:
+                _ext_hi = _loc >= 0.70
+                _ext_lo = _loc <= 0.30
                 if (_loc >= self.RANGE_SOFT_LEAN_HI
-                        and self._soft_location_evidence(signals, "BULL")):
+                        and (_ext_hi or self._soft_location_evidence(signals, "BULL"))):
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BULL_PUT_SPREAD"
                     )
                     return BULL_PUT_SPREAD, f"range_soft_location_lean_{_loc:.2f}"
                 if (_loc <= self.RANGE_SOFT_LEAN_LO
-                        and self._soft_location_evidence(signals, "BEAR")):
+                        and (_ext_lo or self._soft_location_evidence(signals, "BEAR"))):
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BEAR_CALL_SPREAD"
@@ -1690,7 +1711,7 @@ class StrategyEngine:
         _pin_or = or_condition in ("VERY_NARROW", "NARROW")
         _pin_adx = (
             adx_15_mature
-            and 0.0 < adx_15 < self.CONDOR_PIN_ADX_MAX
+            and 12.0 <= adx_15 < self.CONDOR_PIN_ADX_MAX
         )
         _pin_loc = self.PIN_LOC_LO < _loc < self.PIN_LOC_HI
         _pin_rng = _rng < self.CONDOR_MAX_SESSION_RANGE_PTS
@@ -2070,8 +2091,12 @@ class StrategyEngine:
             # Pin/condor needs a real ADX read. Immature/zero ADX with a
             # RANGE label was how live sold a weekly IC into a two-way tape
             # (no trend proof, no pin proof — just OR narrow).
-            if not bool(signals.get("adx_15_mature", False)) or adx_15 <= 0:
-                return False, "condor_requires_mature_adx"
+            # v53: also refuse the noise band ADX in (0, 12) — live 17-Sep
+            # selected IC at adx=0 / 16-Sep at adx=10; a pin needs a
+            # settled flat print, not a warm-up coincident with maturity.
+            if (not bool(signals.get("adx_15_mature", False))
+                    or adx_15 < 12.0):
+                return False, "condor_requires_mature_flat_adx"
             if bool(signals.get("two_way_auction")):
                 return False, "condor_banned_on_two_way_auction"
             # v52: pin needs a NARROW OR. MODERATE was the live IC catch-all.
@@ -3336,24 +3361,20 @@ class StrategyEngine:
             else (entry_costs_pts + total_slippage) * 2.2
         )
 
-        p_win_table = {
-            0: {"VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62, "WIDE": 0.52, "VERY_WIDE": 0.44},
-            1: {"VERY_NARROW": 0.68, "NARROW": 0.64, "MODERATE": 0.58, "WIDE": 0.48, "VERY_WIDE": 0.40},
-            2: {"VERY_NARROW": 0.64, "NARROW": 0.60, "MODERATE": 0.54, "WIDE": 0.46, "VERY_WIDE": 0.38},
-            3: {"VERY_NARROW": 0.61, "NARROW": 0.57, "MODERATE": 0.51, "WIDE": 0.43, "VERY_WIDE": 0.35},
-            4: {"VERY_NARROW": 0.58, "NARROW": 0.54, "MODERATE": 0.48, "WIDE": 0.40, "VERY_WIDE": 0.32},
-            5: {"VERY_NARROW": 0.56, "NARROW": 0.52, "MODERATE": 0.46, "WIDE": 0.38, "VERY_WIDE": 0.30},
-            6: {"VERY_NARROW": 0.54, "NARROW": 0.50, "MODERATE": 0.44, "WIDE": 0.36, "VERY_WIDE": 0.28},
+        # v53: p_win prior continuous on life × OR width — no 7×5 DTE table.
+        # Anchors: expiry-day (DTE0) and weekly (DTE>=2). DTE1 lands on
+        # by_dte. Same OR geometry at every session; only life weight moves.
+        _or_expiry = {
+            "VERY_NARROW": 0.72, "NARROW": 0.68, "MODERATE": 0.62,
+            "WIDE": 0.52, "VERY_WIDE": 0.44,
         }
-        # ── [E3] Empirical OR-conditional prior ───────────────────────────
-        # This was previously computed and then thrown away the moment the
-        # barrier model returned a number. It carries everything the
-        # lognormal geometry cannot see — positioning, pinning, and the
-        # engine's own historical hit rate by opening range — so it is now
-        # blended in rather than discarded.
-        p_win_prior = p_win_table.get(
-            min(dte if dte is not None else 1, 6), p_win_table[6]
-        ).get(or_condition, 0.50)
+        _or_weekly = {
+            "VERY_NARROW": 0.64, "NARROW": 0.60, "MODERATE": 0.54,
+            "WIDE": 0.46, "VERY_WIDE": 0.38,
+        }
+        _pe = float(_or_expiry.get(or_condition, 0.50))
+        _pw = float(_or_weekly.get(or_condition, 0.50))
+        p_win_prior = by_dte(dte if dte is not None else 2, _pe, _pw)
         if vrp_smoothed > 3.5:
             p_win_prior += 0.05
         elif vrp_smoothed > 2.5:
@@ -5431,13 +5452,33 @@ class StrategyEngine:
             signals["_momentum_refuse_reason"] = "momentum_skipped_stale_weekly"
             return None
         if "two_way_wait" in str(block_reason or ""):
-            signals["_momentum_refuse_reason"] = "momentum_skipped_two_way_wait"
-            return None
+            # v54: sell-side waiting for an extreme fade is a sell-expression
+            # refusal. On a measured one-way tape (false two-way latch), the
+            # aligned long-premium ticket is the correct expression
+            # (live 21-Sep: two_way_wait at loc 0.81 blocked LONG_CALL).
+            try:
+                _adx_ww = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_ww = 0.0
+            _pr_ww = str(signals.get("price_regime") or "")
+            _one_way_ww = (
+                _adx_ww >= float(
+                    getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
+                )
+                and _pr_ww in ("UPTREND", "DOWNTREND")
+                and not bool(signals.get("choppy_detected"))
+            )
+            if not _one_way_ww:
+                signals["_momentum_refuse_reason"] = (
+                    "momentum_skipped_two_way_wait"
+                )
+                return None
         # Confirmed two-way auction = fade the edges, do not express mid/
         # late trend with debit. Crash days (IV expand + strong ADX) are
         # excluded so 15-Sep long puts remain reachable.
         # PATCH_V45: closing-hour with-side continuation (checked after
         # direction is known) is allowed through; mid-day stays blocked.
+        # v54: measured one-way also passes (false latch / auction resolved).
         if (
             (not _late_now)
             and (bool(signals.get("two_way_auction"))
@@ -5448,29 +5489,54 @@ class StrategyEngine:
             except (TypeError, ValueError):
                 _adx_tw = 0.0
             _ivb = str(signals.get("iv_behavior") or "")
+            _pr_tw = str(signals.get("price_regime") or "")
             _crash = (
                 _ivb in ("EXPANDING", "SPIKING")
                 and _adx_tw >= 40.0
             )
-            if not _crash:
+            _one_way_tw = (
+                _adx_tw >= float(
+                    getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
+                )
+                and _pr_tw in ("UPTREND", "DOWNTREND")
+                and not bool(signals.get("choppy_detected"))
+            )
+            if not _crash and not _one_way_tw:
                 signals["_momentum_refuse_reason"] = (
                     "momentum_skipped_two_way_auction"
                 )
                 return None
-        # PATCH_V30: after a protective *losing* stop on a credit vertical,
-        # do not chase with long premium (17-Sep proximity stop → LONG_CALL).
-        # Do NOT blanket-block every priority-3 exit: 09-Sep banked a BCS
-        # premium_stop then correctly bought the late LONG_PUT continuation.
-        # Fade days are already covered by session_mean_reversion_book above.
+        # PATCH_V30 / v54: after a protective *losing* stop on a credit
+        # vertical, do not chase into chop (17-Sep proximity stop → LONG_CALL).
+        # But on a measured one-way tape the stop IS the trend telling you
+        # which debit to buy (live 21-Sep: IC CLOSE_STOP → 189 cycles of
+        # momentum_skipped_after_credit_stop while UPTREND continued).
         try:
             _pri = int(_st.get("last_exit_priority") or 0)
         except (TypeError, ValueError):
             _pri = 0
+        _after_credit_cont = False
         if _pri in (1, 2, 3) and float(_st.get("last_exit_pnl_rs") or 0.0) < 0.0:
-            signals["_momentum_refuse_reason"] = (
-                "momentum_skipped_after_credit_stop"
+            try:
+                _adx_c = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_c = 0.0
+            _pr_c = str(signals.get("price_regime") or "")
+            _one_way_c = (
+                not bool(signals.get("two_way_auction"))
+                and not self._after_two_way_extreme_scalp()
+                and not bool(signals.get("choppy_detected"))
+                and _adx_c >= float(
+                    getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
+                )
+                and _pr_c in ("UPTREND", "DOWNTREND")
             )
-            return None
+            if not _one_way_c:
+                signals["_momentum_refuse_reason"] = (
+                    "momentum_skipped_after_credit_stop"
+                )
+                return None
+            _after_credit_cont = True
         try:
             ok, why, direction = self._momentum_gate(signals, block_reason)
         except Exception as exc:                      # never lose the day to
@@ -5492,6 +5558,21 @@ class StrategyEngine:
                     "momentum_skipped_after_extreme_fade"
                 )
                 return None
+        # v54: after a losing credit stop, only buy the continuation that
+        # beat the vertical (BCS stopped → calls; BPS stopped → puts).
+        # IC / RANGE / unknown side lets the gate direction stand.
+        if _after_credit_cont:
+            _last_side_c = str(_st.get("last_exit_strategy_side") or "")
+            if _last_side_c in ("BEAR", "BULL"):
+                _cont_ok = (
+                    (_last_side_c == "BEAR" and direction > 0)
+                    or (_last_side_c == "BULL" and direction < 0)
+                )
+                if not _cont_ok:
+                    signals["_momentum_refuse_reason"] = (
+                        "momentum_skipped_after_credit_stop_wrong_side"
+                    )
+                    return None
         # PATCH_V30: never buy calls while the engine is in a bear-credit
         # regime (or puts in a bull-credit regime).
         _final = str(signals.get("final_regime") or "")
@@ -5746,11 +5827,15 @@ class StrategyEngine:
             tok in _rule
             for tok in (
                 "condor_requires_mature_adx",
+                "condor_requires_mature_flat_adx",
+                "condor_requires_narrow_or",
+                "condor_location_not_mid",
                 "condor_location_drift",
                 "condor_blocked_expanding_range",
                 "condor_blocked_open_spike",
                 "condor_banned_on_two_way",
                 "condor_blocked_strong_adx",
+                "condor_blocked_adx_",
                 "condor_blocked_after_failed_break",
                 "wing_cost",
                 "condor_weak_side",

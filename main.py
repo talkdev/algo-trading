@@ -886,7 +886,7 @@ class MainEngine:
             self.logger.error(f"Regime engine error: {e}", exc_info=True)
             # Continue without regime — signals will have None for regime fields
 
-        # ── Step 4: Update cycle log with regime outputs ──────────────────
+        # ── Step 4: Update cycle log + market snapshot with regime outputs ─
         try:
             latest_cycle = self.db.query_one(
                 "SELECT cycle_id FROM cycle_log "
@@ -894,26 +894,48 @@ class MainEngine:
                 (today_ist().isoformat(),),
             )
             if latest_cycle and signals.get("final_regime"):
+                _regime_fields = {
+                    "vol_regime":        signals.get("vol_regime"),
+                    "price_regime":      signals.get("price_regime"),
+                    "positioning_regime":signals.get("positioning_regime"),
+                    "confidence_level":  signals.get("confidence_level"),
+                    "confidence_score":  signals.get("confidence_score"),
+                    "final_regime":      signals.get("final_regime"),
+                    "final_regime_notes":signals.get("final_regime_notes"),
+                    "size_multiplier":   signals.get("size_multiplier"),
+                    "block_new_entries": int(bool(signals.get("block_new_entries", False))),
+                    "no_trade_reason":   (
+                        signals.get("final_regime_notes")
+                        if signals.get("final_regime") in ("NO_TRADE", "ABORT")
+                        else None
+                    ),
+                }
                 self.db.update(
                     "cycle_log",
-                    {
-                        "vol_regime":        signals.get("vol_regime"),
-                        "price_regime":      signals.get("price_regime"),
-                        "positioning_regime":signals.get("positioning_regime"),
-                        "confidence_level":  signals.get("confidence_level"),
-                        "confidence_score":  signals.get("confidence_score"),
-                        "final_regime":      signals.get("final_regime"),
-                        "final_regime_notes":signals.get("final_regime_notes"),
-                        "size_multiplier":   signals.get("size_multiplier"),
-                        "block_new_entries": int(bool(signals.get("block_new_entries", False))),
-                        "no_trade_reason":   (
-                            signals.get("final_regime_notes")
-                            if signals.get("final_regime") in ("NO_TRADE", "ABORT")
-                            else None
-                        ),
-                    },
+                    _regime_fields,
                     {"cycle_id": latest_cycle["cycle_id"]},
                 )
+            # market_snapshots is written in data_engine.run_cycle BEFORE
+            # regime enrichment, so every live row historically had NULL
+            # regimes (1486/1486 on 21-Sep). Patch the latest row now.
+            if signals.get("final_regime"):
+                latest_snap = self.db.query_one(
+                    "SELECT id FROM market_snapshots "
+                    "WHERE date=? ORDER BY id DESC LIMIT 1",
+                    (today_ist().isoformat(),),
+                )
+                if latest_snap:
+                    self.db.update(
+                        "market_snapshots",
+                        {
+                            "vol_regime":         signals.get("vol_regime"),
+                            "price_regime":       signals.get("price_regime"),
+                            "positioning_regime": signals.get("positioning_regime"),
+                            "final_regime":       signals.get("final_regime"),
+                            "confidence_level":   signals.get("confidence_level"),
+                        },
+                        {"id": latest_snap["id"]},
+                    )
         except Exception as _cle:
             self.logger.debug(f"Cycle log regime update error: {_cle}")
 

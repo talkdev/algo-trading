@@ -428,6 +428,7 @@ def load_high_impact_events(path: Path = DEFAULT_EVENTS_FILE) -> Dict[date, str]
 
 _NSE_HOLIDAYS_CACHE: Optional[set] = None
 _HIGH_IMPACT_EVENTS_CACHE: Optional[Dict[date, str]] = None
+_HIGH_IMPACT_EVENTS_MTIME: Optional[float] = None
 
 
 def get_nse_holidays() -> set:
@@ -438,9 +439,24 @@ def get_nse_holidays() -> set:
 
 
 def get_high_impact_events() -> Dict[date, str]:
-    global _HIGH_IMPACT_EVENTS_CACHE
-    if _HIGH_IMPACT_EVENTS_CACHE is None:
-        _HIGH_IMPACT_EVENTS_CACHE = load_high_impact_events()
+    """Load high-impact events, refreshing when the JSON file changes.
+
+    A process-lifetime cache used to freeze a stale calendar: live 11-Sep
+    ran as NORMAL while high_impact_events.json later listed US CPI, so
+    EVENT sizing / defined-risk never armed. Reload on mtime.
+    """
+    global _HIGH_IMPACT_EVENTS_CACHE, _HIGH_IMPACT_EVENTS_MTIME
+    path = DEFAULT_EVENTS_FILE
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+    if (
+        _HIGH_IMPACT_EVENTS_CACHE is None
+        or mtime != _HIGH_IMPACT_EVENTS_MTIME
+    ):
+        _HIGH_IMPACT_EVENTS_CACHE = load_high_impact_events(path)
+        _HIGH_IMPACT_EVENTS_MTIME = mtime
     return _HIGH_IMPACT_EVENTS_CACHE
 
 
@@ -1061,7 +1077,7 @@ class Config:
         #     for -250, the ATM call then gained 91pts and the substitute was
         #     locked out by the very cooldown the stop created).
         "past_entry_window", "past_14:30", "past_14:",
-        "stop_cooldown", "same_signal_combo",
+        "stop_cooldown", "same_signal_combo", "entry_cooldown",
         # v48: second concurrent slot. When a credit vertical is already
         # open, the sell-side mapper keeps proposing the same structure
         # (slot_conflict) or a same-side chase after harvest. Those are
