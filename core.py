@@ -1533,8 +1533,13 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         tuesday_hard_exit=_get_time(env, "TUESDAY_HARD_EXIT", dtime(15, 0)),
         tuesday_last_entry=_get_time(env, "TUESDAY_LAST_ENTRY", dtime(12, 30)),
 
-        # Limits
-        max_concurrent_positions=_get_int(env, "MAX_CONCURRENT_POSITIONS", 1),
+        # Limits. Two slots: a second structure may sit beside an open one
+        # when it is a DIFFERENT trade (opposite credit side, or aligned
+        # long premium) - see strategy_engine._slot_conflict. Every open
+        # position is sized on its own max_risk_per_trade_pct budget, so
+        # peak exposure is at most 2x a single ticket; the daily loss halt
+        # is unchanged.
+        max_concurrent_positions=_get_int(env, "MAX_CONCURRENT_POSITIONS", 2),
         max_entries_per_day=_get_int(env, "MAX_ENTRIES_PER_DAY", 3),
 
         # Paths

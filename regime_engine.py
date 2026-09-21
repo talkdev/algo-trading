@@ -20,7 +20,7 @@ import pandas as pd
 
 from core import (
     Config, Database, RateLimiter, UpstoxClient,
-    ExpiryCalendar, now_ist, today_ist,
+    ExpiryCalendar, now_ist, today_ist, dte_blend,
     load_config, setup_logging,
     get_high_impact_events,
     print_section, print_kv_table,
@@ -1163,21 +1163,18 @@ class RegimeClassifier:
         vrp_sell = self._t("vrp_sell_threshold", "vrp_sell_threshold_default", 2.5)
         vrp_fair = self._t("vrp_fair_threshold", "vrp_fair_threshold_default", 1.5)
 
-        # DTE adjustment: lower threshold for 0DTE (theta compensates)
-        if dte == 0:
-            vrp_sell = vrp_sell * 1.00
-        elif dte == 1:
-            vrp_sell = vrp_sell * 1.00
-        elif dte == 2:
-            vrp_sell = vrp_sell * 1.05
-        elif dte == 3:
-            vrp_sell = vrp_sell * 1.10
-        elif dte == 4:
-            vrp_sell = vrp_sell * 1.20
-        elif dte == 5:
-            vrp_sell = vrp_sell * 1.30
-        elif dte is not None and dte >= 6:
-            vrp_sell = vrp_sell * 1.40
+        # Intraday book is flat by the hard exit on every session, so the
+        # VRP bar does not tighten with DTE inside the tradeable window.
+        # The old 1.00/1.00/1.05/1.10/1.20 ladder was leftover overnight
+        # gap-risk thinking and made Wednesday/Thursday a different
+        # machine from Monday. Beyond the ceiling, ask for richer premium.
+        try:
+            _dte_i = int(dte) if dte is not None else 0
+        except (TypeError, ValueError):
+            _dte_i = 0
+        _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+        if _dte_i > _max_dte:
+            vrp_sell = vrp_sell * (1.0 + 0.10 * min(_dte_i - _max_dte, 4))
 
         # OR condition adjustment
         if or_condition == "WIDE":
@@ -1227,7 +1224,8 @@ class RegimeClassifier:
 
         Conditions:
         - VRP within 25% of threshold (not too far below)
-        - DTE = 0 (Tuesday only — theta compensates)
+        - Near-expiry horizon (dte_blend >= 0.35: DTE 0 and DTE 1) —
+          theta per hour has to pay for the thin VRP; a weekly does not
         - OR condition NARROW or VERY_NARROW
         - IV behavior STABLE or DECLINING or CRUSHING
         - ADX < 20 (clearly flat market)
@@ -1242,8 +1240,8 @@ class RegimeClassifier:
         adx_15       = float(signals.get("adx_15") or 0.0)
         or_computed  = bool(signals.get("or_computed", False))
 
-        if dte != 0:
-            return False  # Only on Tuesday 0DTE
+        if dte_blend(dte) < 0.35:
+            return False  # weekly theta/hour cannot pay a thin VRP
 
         if or_condition not in ("VERY_NARROW", "NARROW"):
             return False  # Need narrow OR for borderline
@@ -1722,23 +1720,43 @@ class RegimeClassifier:
             # Do NOT treat a one-way 120pt trend day as two-way (15-Sep).
             _or_h = float(signals.get("or_high") or 0.0)
             _or_l = float(signals.get("or_low") or 0.0)
+            # Unretested open-HIGH wick is the OR print, not a through-OR
+            # auction. 08-Sep dumped under OR with the wick still the day
+            # high: that is a failed reclaim, not two-way.
+            _spike_hi = bool(signals.get("day_high_is_open_spike"))
             _both = False
-            if _or_h > _or_l > 0 and _raw_h > 0 and _raw_l > 0:
+            if (not _spike_hi) and _or_h > _or_l > 0 and _raw_h > 0 and _raw_l > 0:
                 _poke = max(15.0, 0.25 * (_or_h - _or_l))
                 _both = (_raw_h >= _or_h + _poke) and (_raw_l <= _or_l - _poke)
+                if not _both:
+                    # Traded through BOTH OR edges. No extra poke: a
+                    # 1pt flush on one side plus a real extension on
+                    # the other is still a two-way auction (17-Sep).
+                    # A one-way grind that only expands the trending
+                    # edge (21-Sep, 15-Sep) fails this.
+                    _both = (_raw_h > _or_h) and (_raw_l < _or_l)
+            _chop_wide = (
+                bool(signals.get("choppy_detected"))
+                and _raw_rng >= 100.0
+                and not _spike_hi
+            )
             _two_way = bool(
                 _raw_rng >= min(_floor, 85.0)
-                and (
-                    _both
-                    or (bool(signals.get("choppy_detected"))
-                        and _raw_rng >= 100.0)
-                )
+                and (_both or _chop_wide)
             )
             if _two_way:
                 signals["two_way_auction"] = True
                 _floor = min(_floor, float(
                     getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
                 ))
+            elif bool(signals.get("two_way_auction")) and not _spike_hi:
+                _two_way = True
+                _floor = min(_floor, float(
+                    getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
+                ))
+            elif _spike_hi:
+                signals["two_way_auction"] = False
+                _two_way = False
         except (TypeError, ValueError, ZeroDivisionError):
             _fh = _fl = _fspot = _frng = _raw_rng = 0.0
             _fpos = 0.5
@@ -1747,10 +1765,55 @@ class RegimeClassifier:
             _spike = False
 
         # Earlier fade window on two-way tapes (professional NIFTY book).
-        if _two_way and 0 <= _dte_fade <= 4:
+        _max_dte_fade = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+        if _two_way and 0 <= _dte_fade <= _max_dte_fade:
             _fade_start = time(10, 45)
 
-        if (0 <= _dte_fade <= 4 and _fade_t >= _fade_start
+        # A fade is mean-reversion. On a one-way tape a fresh high is
+        # continuation: selling calls into a measured uptrend (or puts
+        # into a measured downtrend) is the wrong side of the book.
+        # Two-way auctions still fade the tested extreme even when the
+        # 15-minute label says UPTREND — that label is what the fade
+        # is fading. Same tape rule at every DTE (measured 2026-09-21:
+        # a 12:16 high fade sold calls into ADX 38 UPTREND with no
+        # two-way confirmation).
+        try:
+            _adx_f = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx_f = 0.0
+        _adx_tr = float(getattr(self.config, "adx_trend_threshold", 20.0))
+        _adx_mat = bool(signals.get("adx_15_mature", False))
+        _measured_up = (
+            _adx_mat and _adx_f >= _adx_tr
+            and price in (PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND)
+        )
+        _measured_dn = (
+            _adx_mat and _adx_f >= _adx_tr
+            and price in (PriceRegime.DOWNTREND, PriceRegime.STRONG_DOWNTREND)
+        )
+        # Session structure, independent of the 15-minute label. An
+        # unfilled gap-down is resistance: a bounce high is a fade even
+        # when ADX prints UPTREND. An unfilled gap-up is the symmetric
+        # support. A grind with no such structure is continuation.
+        _gap_dir = str(signals.get("gap_direction") or "")
+        try:
+            _pc_s = float(signals.get("prev_close") or 0.0)
+            _dh_s = float(
+                signals.get("day_high_so_far") or signals.get("day_high") or 0.0
+            )
+            _dl_s = float(
+                signals.get("day_low_so_far") or signals.get("day_low") or 0.0
+            )
+        except (TypeError, ValueError):
+            _pc_s = _dh_s = _dl_s = 0.0
+        _struct_bear = (
+            _gap_dir == "DOWN" and _pc_s > 0 and _dh_s > 0 and _dh_s < _pc_s
+        )
+        _struct_bull = (
+            _gap_dir == "UP" and _pc_s > 0 and _dl_s > 0 and _dl_s > _pc_s
+        )
+
+        if (0 <= _dte_fade <= _max_dte_fade and _fade_t >= _fade_start
                 and _fade_t <= time(14, 0)
                 and not bool(event_day)
                 and vol != VolatilityRegime.ABORT):
@@ -1761,31 +1824,37 @@ class RegimeClassifier:
                     _hi_th = 0.85
                     _lo_th = 0.20
                 if _fpos >= _hi_th:
-                    signals["afternoon_high_fade"] = True
-                    signals["weekly_range_size_discount"] = 1.0
-                    return (
-                        FinalRegime.PREMIUM_SELL_BEAR,
-                        f"AFTERNOON_DAY_HIGH_FADE_DTE{_dte_fade}",
-                        False,
-                    )
+                    if (not _two_way) and _measured_up and not _struct_bear:
+                        signals["fade_vetoed_by_trend"] = (
+                            f"high_fade_vetoed_one_way_uptrend_adx_{_adx_f:.0f}"
+                        )
+                    else:
+                        signals["afternoon_high_fade"] = True
+                        signals["weekly_range_size_discount"] = 1.0
+                        return (
+                            FinalRegime.PREMIUM_SELL_BEAR,
+                            "AFTERNOON_DAY_HIGH_FADE",
+                            False,
+                        )
                 if _fpos <= _lo_th:
                     # Low fades are a morning product (≤12:15). After lunch
                     # the bearish lean / high-fade book owns the tape;
                     # strategy_engine unlocks a post-scalp low fade only.
                     if _fade_t >= time(12, 15):
                         pass
+                    elif _struct_bear:
+                        pass
                     else:
-                        _gap_dir = str(signals.get("gap_direction") or "")
-                        _pc = float(signals.get("prev_close") or 0.0)
-                        _dh = float(signals.get("day_high_so_far") or 0.0)
-                        if _gap_dir == "DOWN" and _pc > 0 and _dh > 0 and _dh < _pc:
-                            pass
+                        if (not _two_way) and _measured_dn and not _struct_bull:
+                            signals["fade_vetoed_by_trend"] = (
+                                f"low_fade_vetoed_one_way_downtrend_adx_{_adx_f:.0f}"
+                            )
                         else:
                             signals["afternoon_low_fade"] = True
                             signals["weekly_range_size_discount"] = 1.0
                             return (
                                 FinalRegime.PREMIUM_SELL_BULL,
-                                f"AFTERNOON_DAY_LOW_FADE_DTE{_dte_fade}",
+                                "AFTERNOON_DAY_LOW_FADE",
                                 False,
                             )
 
@@ -1794,7 +1863,8 @@ class RegimeClassifier:
             # the fade setup, not a stand-aside. Mid-range chop still
             # blocks — that is where premium sellers get chopped up.
             if (_two_way and _fspot > 0 and conf != ConfidenceLevel.NONE
-                    and _fade_t <= time(14, 0) and 0 <= _dte_fade <= 4
+                    and _fade_t <= time(14, 0)
+                    and 0 <= _dte_fade <= _max_dte_fade
                     and not bool(event_day)
                     and vol != VolatilityRegime.ABORT):
                 if _fpos >= 0.80:
@@ -1802,7 +1872,7 @@ class RegimeClassifier:
                     signals["weekly_range_size_discount"] = 1.0
                     return (
                         FinalRegime.PREMIUM_SELL_BEAR,
-                        f"TWO_WAY_CHOPPY_HIGH_FADE_DTE{_dte_fade}",
+                        "TWO_WAY_CHOPPY_HIGH_FADE",
                         False,
                     )
                 if _fpos <= 0.20:
@@ -1817,7 +1887,7 @@ class RegimeClassifier:
                         signals["weekly_range_size_discount"] = 1.0
                         return (
                             FinalRegime.PREMIUM_SELL_BULL,
-                            f"TWO_WAY_CHOPPY_LOW_FADE_DTE{_dte_fade}",
+                            "TWO_WAY_CHOPPY_LOW_FADE",
                             False,
                         )
             return FinalRegime.NO_TRADE, "NO_TRADE:CHOPPY_MARKET", False
@@ -1884,14 +1954,6 @@ class RegimeClassifier:
                 f"NO_TRADE:DTE_{dte}_ABOVE_MAX_{_max_dte}",
                 False,
             )
-
-        if dte is not None and dte >= 4:
-            if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"NO_TRADE:DTE_{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
-                    False,
-                )
 
         # ── Event Day Rules ───────────────────────────────────────────────
         if event_day and self.config.defined_risk_only_on_event:
@@ -2077,202 +2139,32 @@ class RegimeClassifier:
                 if _v23_broke_lo and spot >= _v23_orl + _v23_reclaim:
                     return (
                         FinalRegime.PREMIUM_SELL_BULL,
-                        f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BULL_PUT",
+                        "RANGE_FAILED_BREAK_RECLAIM_BULL_PUT",
                     )
                 return (
                     FinalRegime.PREMIUM_SELL_BEAR,
-                    f"RANGE_DTE{dte}_FAILED_BREAK_RECLAIM_BEAR_CALL",
+                    "RANGE_FAILED_BREAK_RECLAIM_BEAR_CALL",
                 )
-
-        # ── PATCH_V12: the DTE 2 special-case is deleted ─────────────────
-        # It demanded STRONG_SELL + RANGE/STRONG_RANGE + narrow OR +
-        # flat ADX together — a stack calibrated on a mislabelled
-        # session (the 'Friday DTE2' in the comments above is DTE1 on
-        # a holiday week, and the Friday cited was a CPI event day).
-        # Measured 2026-09-10: a textbook range tape (STRONG_SELL,
-        # HIGH confidence, flat ADX, NARROW OR) was refused for two
-        # hours because OI positioning read BEARISH/UNCLEAR, and the
-        # single flicker entry made Rs 92. This book is flat by 15:20
-        # daily, so DTE 2 carries no overnight risk and is gated
-        # exactly like every other DTE below: condor needs rich vol,
-        # verticals need their positioning read, event days keep
-        # their own strict path.
-
-        # ── DTE 3 / DTE 4 new-cycle branch (v3.1) ─────────────────────────
-        # Wednesday is DTE 4 and Thursday is DTE 3 on the Tuesday-expiry
-        # calendar. Previously neither could ever produce a tradeable regime
-        # (there was no branch here, and strategy_engine capped the condor at
-        # DTE 2 anyway), so 40% of the trading week was structurally dead.
-        # These are legitimate premium-selling sessions — a fresh weekly
-        # contract carries the most vega and the widest credit — but they hold
-        # overnight gap risk into the next session, so the bar is deliberately
-        # higher than for DTE 0/1: rich VRP, genuine range positioning, a
-        # contained opening range and a flat trend reading are ALL required.
-        if dte in (3, 4):
-            if vol == VolatilityRegime.BUY_OPTIONS:
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"RANGE_DTE{dte}_REQUIRES_NO_BUY_OPTIONS",
-                )
-            # ── PATCH_V15: failed-break, cushioned vertical ──────────────
-            # A range session that broke one edge of the opening range and
-            # RECLAIMED it is the highest-quality premium sell of the day:
-            # the break flushed the stops, the reclaim proves the edge held,
-            # and the sold strike can sit beyond the failed extreme. This is
-            # how intraday NIFTY premium sellers trade a range day, and it
-            # is the read the engine was missing: with NEUTRAL vol (no VRP
-            # edge to harvest) it could only build a delta-neutral condor,
-            # which needs rich vol by design. Measured 2026-09-16: the tape
-            # broke the 23,186.55 opening-range low to 23,125 at 09:45,
-            # reclaimed it by 09:53, and a cushioned 23,050/22,750 put
-            # spread sold there returned +9.8pts by 10:50 while the condor
-            # of the same vintage returned -1.8pts. Sized DOWN (0.5) - the
-            # structure is directional, the vol edge is not there, and the
-            # cushion is what carries it.
-            try:
-                _v15_orl = float(signals.get("or_low") or 0.0)
-                _v15_orh = float(signals.get("or_high") or 0.0)
-                _v15_dlo = float(signals.get("day_low_so_far") or 0.0)
-                _v15_orw = max(_v15_orh - _v15_orl, 1.0)
-            except (TypeError, ValueError):
-                _v15_orl = _v15_orh = _v15_dlo = 0.0
-                _v15_orw = 1.0
-            _v15_orh_s = float(signals.get("day_high_so_far") or 0.0)
-            _v15_broke_lo = _v15_orl > 0 and _v15_dlo > 0 and \
-                _v15_dlo <= _v15_orl - 0.15 * _v15_orw
-            _v15_broke_hi = _v15_orh > 0 and _v15_orh_s > 0 and \
-                _v15_orh_s >= _v15_orh + 0.15 * _v15_orw
-            _v15_reclaim = max(
-                float(getattr(self.config, "failed_break_reclaim_pts", 10.0)),
-                0.10 * _v15_orw,
-            )
-            _v15_quiet = (
-                bool(signals.get("or_computed"))
-                and vol == VolatilityRegime.NEUTRAL
-                and conf in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM)
-                and 0.0 <= adx_15 < float(
-                    getattr(self.config, "adx_trend_threshold", 20.0))
-                and or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
-                and spot > 0
-                and float(signals.get("day_move_used_pct") or 0.0)
-                    < float(getattr(self.config, "failed_break_dmu_max", 200.0))
-                and not bool(signals.get("event_day"))
-            )
-            # PATCH_V23: the loose 0.15*OR / 09:46 / DMU-200 vertical
-            # return is gone. Failed-break lives in the all-DTE gate
-            # above. _v15_broke_* still gates the NEUTRAL-vol wide condor.
-            # Range positioning → condor (both wings), which on a fresh
-            # weekly needs a contained opening range and a flat trend.
-            # BULLISH/BEARISH positioning → fall through to the single-sided
-            # vertical below (bull put / bear call with the OR-midpoint
-            # override), exactly as DTE 0/1 already does: the directional
-            # read IS the confirmation, so the condor-specific containment
-            # gates do not apply to a single exposed side.
-            if pos in (PositioningRegime.STRONG_RANGE, PositioningRegime.RANGE,
-                       PositioningRegime.UNCLEAR):
-                if or_condition not in ("VERY_NARROW", "NARROW", "MODERATE"):
-                    return (
-                        FinalRegime.NO_TRADE,
-                        f"RANGE_DTE{dte}_OR_{or_condition}_TOO_WIDE",
-                    )
-                # v4.2: the symmetric condor is delta-neutral by
-                # construction, so the rich-VRP / price=RANGE / narrow-OR
-                # stack is the edge and OI positioning is only a
-                # confirmation. UNCLEAR positioning previously banned it
-                # outright on DTE3/4 (measured 2026-09-10: STRONG_SELL,
-                # ADX 10-13, HIGH confidence, spot pinned all afternoon,
-                # yet no trade after 12:51).
-                # Rich vol is mandatory for ALL three positioning reads:
-                # the condor harvests the variance risk premium itself, so
-                # NEUTRAL vol removes its edge (directional BULLISH/BEARISH
-                # verticals do not need it and are handled on the fall-
-                # through paths below - see classify_final Hard Block 3).
-                if vol not in (VolatilityRegime.SELL_PREMIUM,
-                               VolatilityRegime.STRONG_SELL_PREMIUM):
-                    # ── PATCH_V15: range-confirmed WIDE condor on NEUTRAL vol
-                    _dmu_v15 = float(signals.get("day_move_used_pct") or 0.0)
-                    _wide_ok_v15 = (
-                        int(dte) >= 2
-                        and not _v15_broke_lo
-                        and not _v15_broke_hi
-                        and vol == VolatilityRegime.NEUTRAL
-                        and conf in (ConfidenceLevel.HIGH,
-                                     ConfidenceLevel.MEDIUM)
-                        and 0.0 <= adx_15 < float(
-                            getattr(self.config, "adx_trend_threshold", 20.0))
-                        and _dmu_v15 < float(getattr(
-                            self.config, "neutral_range_dmu_max", 200.0))
-                        and not bool(signals.get("event_day"))
-                    )
-                    if _wide_ok_v15:
-                        signals["neutral_range_condor"] = True
-                        signals["weekly_range_size_discount"] = float(
-                            getattr(self.config, "neutral_range_size_weekly",
-                                    0.60))
-                        return (
-                            FinalRegime.PREMIUM_SELL_RANGE,
-                            f"RANGE_DTE{dte}_WIDE_CONDOR_NEUTRAL_VOL",
-                        )
-                    return (
-                        FinalRegime.NO_TRADE,
-                        f"RANGE_DTE{dte}_CONDOR_REQUIRES_SELL_PREMIUM"
-                        f"_GOT_{vol.value}",
-                    )
-                if conf not in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM):
-                    return (
-                        FinalRegime.NO_TRADE,
-                        f"RANGE_DTE{dte}_REQUIRES_MEDIUM_HIGH_CONFIDENCE",
-                    )
-                # v4.2: ADX is non-directional and lagging. The hard veto at
-                # the 20 trend threshold fired on mean-reverting RANGE tapes
-                # (measured 2026-09-09 13:10-14:10, CPI day: price=RANGE,
-                # ADX 21-24 inherited from the morning whipsaw; spot topped
-                # and faded 136 points into the close). Only a genuine
-                # STRONG reading blocks the symmetric condor; readings in
-                # between force the wide ~0.15-delta condor at a size
-                # discount.
-                _adx_wide = (
-                    float(self.config.adx_trend_threshold) <= adx_15
-                    < float(getattr(self.config, "range_adx_wide_max", 28.0))
-                )
-                if adx_15 >= float(getattr(self.config, "range_adx_wide_max", 28.0)):
-                    return (
-                        FinalRegime.NO_TRADE,
-                        f"RANGE_DTE{dte}_ADX_{adx_15:.0f}_STRONG_TREND",
-                    )
-                if _adx_wide:
-                    signals["weekly_wide_condor"] = True
-                    signals["weekly_range_size_discount"] = float(
-                        getattr(self.config, "range_adx_wide_size", 0.80)
-                    )
-                    return (
-                        FinalRegime.PREMIUM_SELL_RANGE,
-                        f"RANGE_DTE{dte}_WIDE_CONDOR_ADX_{adx_15:.0f}",
-                    )
-                if pos == PositioningRegime.UNCLEAR:
-                    signals["weekly_range_size_discount"] = float(
-                        getattr(self.config, "unclear_range_size_weekly", 0.75)
-                    )
-                    return (
-                        FinalRegime.PREMIUM_SELL_RANGE,
-                        f"RANGE_DTE{dte}_UNCLEAR_RICH_VRP_CONDOR",
-                    )
-                return (
-                    FinalRegime.PREMIUM_SELL_RANGE,
-                    f"RANGE_DTE{dte}_NEW_CYCLE_STRONG_SELL_CONTAINED_OR",
-                )
-            # BULLISH / BEARISH fall through to the matching branches
-            # below; UNCLEAR is handled above.
 
         # ── Wide OR blocks condor ─────────────────────────────────────────
+        # The book is flat by the hard exit on every session, so the range
+        # tree is the same at every DTE: condor needs rich vol and a
+        # contained opening range; directional verticals need their
+        # positioning read; event days keep their own path. Overnight
+        # gap-risk tables (the old DTE 3/4 branch) do not apply.
         if or_condition in ("WIDE", "VERY_WIDE") and pos not in (
             PositioningRegime.STRONG_RANGE,
         ):
             return FinalRegime.NO_TRADE, f"RANGE_WIDE_OR_{or_condition}_NO_TRADE"
 
         # ── UNCLEAR positioning ───────────────────────────────────────────
+        # Rich VRP is the condor's edge; OI not having a side is not a
+        # veto when the variance premium is there. Same at every DTE.
         if pos == PositioningRegime.UNCLEAR:
-            if vol == VolatilityRegime.STRONG_SELL_PREMIUM and dte in (0, 1):
+            if vol == VolatilityRegime.STRONG_SELL_PREMIUM:
+                signals["weekly_range_size_discount"] = float(
+                    getattr(self.config, "unclear_range_size_weekly", 0.75)
+                )
                 return (
                     FinalRegime.PREMIUM_SELL_RANGE,
                     "RANGE_UNCLEAR_POS_STRONG_SELL_HALF_SIZE",
@@ -2295,14 +2187,26 @@ class RegimeClassifier:
                     f"RANGE_{pos.value}_CONDOR_REQUIRES_SELL_PREMIUM_"
                     f"GOT_{vol.value}",
                 )
-            if (dte == 0 and
+            # Elevated-but-not-strong ADX: still a range tape, sell a
+            # wider condor at a size discount. Tape rule, every DTE.
+            _adx_wide = (
+                float(self.config.adx_trend_threshold) <= adx_15
+                < float(getattr(self.config, "range_adx_wide_max", 28.0))
+            )
+            if _adx_wide:
+                signals["weekly_wide_condor"] = True
+                signals["weekly_range_size_discount"] = float(
+                    getattr(self.config, "range_adx_wide_size", 0.80)
+                )
+            # Expiry-day pin: remaining life IS the rest of the session.
+            if (dte_blend(dte) >= 0.9 and
                     current_time >= time(13, 0) and
                     max_pain > 0 and
                     abs(spot - max_pain) <= 80 and
                     r_str >= 1.5):
                 return (
                     FinalRegime.PREMIUM_SELL_RANGE,
-                    "RANGE_TUESDAY_AFTERNOON_PIN",
+                    "RANGE_EXPIRY_AFTERNOON_PIN",
                 )
             return (
                 FinalRegime.PREMIUM_SELL_RANGE,

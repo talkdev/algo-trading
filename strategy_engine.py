@@ -15,7 +15,7 @@ from typing import Optional, Tuple, List, Dict
 
 from core import (
     Config, Database,
-    ExpiryCalendar, now_ist, today_ist, by_dte,
+    ExpiryCalendar, now_ist, today_ist, by_dte, dte_blend,
     print_section, print_kv_table,
     load_config, setup_logging,
     RateLimiter, UpstoxClient,
@@ -142,6 +142,75 @@ class StrategyEngine:
         )
         return row["cnt"] if row else 0
 
+    def _open_strategy_names(self) -> List[str]:
+        try:
+            rows = self.db.query(
+                "SELECT strategy_name FROM positions "
+                "WHERE trading_date=? AND status='OPEN'",
+                (today_ist().isoformat(),),
+            )
+        except Exception:
+            rows = []
+        return [str(r["strategy_name"] or "") for r in (rows or [])]
+
+    @staticmethod
+    def _sides_of(strategy_name: str) -> set:
+        """Which side(s) of the book a structure sells (or, for the long
+        premium tickets, leans on). A condor / butterfly carries both."""
+        s = str(strategy_name or "")
+        if s in (IRON_CONDOR, IRON_BUTTERFLY):
+            return {"BULL", "BEAR"}
+        if s in (BULL_PUT_SPREAD, LONG_CALL):
+            return {"BULL"}
+        if s in (BEAR_CALL_SPREAD, LONG_PUT):
+            return {"BEAR"}
+        return set()
+
+    def _slot_conflict(self, strategy_name: str, signals: Optional[dict] = None) -> Optional[str]:
+        """Refuse a second structure that stacks or duplicates the book.
+
+        Two slots are for the SAME-direction book: a credit vertical plus
+        an aligned long-premium ticket (bull put + long call). Refused:
+        the same structure twice, a second symmetric structure, any
+        vertical when a condor/butterfly already covers both sides, a
+        long option against an open credit side, and opposite-side
+        credit beside an open vertical (a synthetic condor at 2x risk).
+        """
+        open_names = self._open_strategy_names()
+        if not open_names:
+            return None
+        new_sides = self._sides_of(strategy_name)
+        for o in open_names:
+            if o == strategy_name:
+                return f"slot_conflict_same_structure_open:{o}"
+            o_sides = self._sides_of(o)
+            if strategy_name in (IRON_CONDOR, IRON_BUTTERFLY):
+                return f"slot_conflict_symmetric_beside_open:{o}"
+            if o in (IRON_CONDOR, IRON_BUTTERFLY):
+                return f"slot_conflict_condor_already_covers_both_sides:{o}"
+            if strategy_name in MOMENTUM_STRATEGIES:
+                # long premium may only ride WITH an open credit vertical
+                if o in MOMENTUM_STRATEGIES or not (new_sides & o_sides):
+                    return f"slot_conflict_long_premium_against_open:{o}"
+                continue
+            if o in MOMENTUM_STRATEGIES:
+                # a credit vertical beside an open long option: same side only
+                if not (new_sides & o_sides):
+                    return f"slot_conflict_credit_against_open_long:{o}"
+                continue
+            if new_sides & o_sides:
+                return f"slot_conflict_same_side_already_sold:{o}"
+            # Opposite credit beside an open vertical is a synthetic
+            # condor at 2x single-ticket risk. On a two-way tape the
+            # professional book fades ONE extreme, harvests, then the
+            # other — never both at full size (measured 2026-09-17:
+            # 5-lot bull put + 5-lot bear call, both trend-flipped).
+            # Two slots are for the SAME-direction book: credit vertical
+            # + aligned long premium.
+            if new_sides and o_sides and not (new_sides & o_sides):
+                return f"slot_conflict_no_opposite_credit_beside_open:{o}"
+        return None
+
     def _count_momentum_entries(self) -> int:
         """Momentum tickets booked today, read from the ledger not from memory.
 
@@ -258,8 +327,27 @@ class StrategyEngine:
             )
             if not _tw_extra:
                 return "NO_TRADE", f"max_entries_per_day_{total_count}_reached"
+        # ── second slot discipline ───────────────────────────────────────
+        # MAX_CONCURRENT_POSITIONS > 1 lets a second structure sit beside an
+        # open one. The second ticket must be a DIFFERENT trade, not a
+        # re-fire of the same signal a few cycles later: it waits out the
+        # entry cooldown measured from the last ENTRY, and (in decide(),
+        # once the structure is known) it may not duplicate or stack the
+        # side an open position already carries.
         if open_count >= 1:
-            return "NO_TRADE", "position_already_open_single_position_engine"
+            _le = state.get("last_entry_time")
+            if _le:
+                try:
+                    _since_entry = (
+                        now_ist() - datetime.fromisoformat(str(_le))
+                    ).total_seconds() / 60.0
+                    if _since_entry < float(ENTRY_COOLDOWN_MIN):
+                        return "NO_TRADE", (
+                            f"second_slot_cooldown_"
+                            f"{ENTRY_COOLDOWN_MIN - _since_entry:.0f}min_remaining"
+                        )
+                except Exception:
+                    pass
 
         # ── PATCH_V13: the entry cooldown is measured from the last ACT ──
         # It used to be measured from last_entry_time only, so a position
@@ -285,6 +373,21 @@ class StrategyEngine:
             and _last_side in ("BULL", "BEAR")
             and _next_side != _last_side
         )
+        # A stopped condor/fly means the pin failed. The next directional
+        # vertical is a NEW trade (the surviving side of the tape), not a
+        # churn of the symmetric book. Same at every DTE.
+        try:
+            _pri_last = int(state.get("last_exit_priority") or 0)
+        except (TypeError, ValueError):
+            _pri_last = 0
+        _pin_failed_to_dir = (
+            _last_side == "RANGE"
+            and _next_side in ("BULL", "BEAR")
+            and (
+                str(state.get("last_exit_reason") or "").startswith("CLOSE_STOP")
+                or _pri_last in (1, 2, 3)
+            )
+        )
         _opp_cd = float(getattr(
             self.config, "reentry_opposite_cooldown_min", 3) or 3)
         _last_act = None
@@ -297,7 +400,10 @@ class StrategyEngine:
                 continue
             if _last_act is None or _dt > _last_act:
                 _last_act = _dt
-        if _last_act is not None and open_count == 0 and total_count > 0:
+        # Anti-churn clocks apply whenever the book has ACTED today - with a
+        # second slot, an open position must not exempt a fresh re-entry
+        # of the structure that just closed.
+        if _last_act is not None and total_count > 0:
             try:
                 mins = (now_ist() - _last_act).total_seconds() / 60.0
                 _cd_need = _opp_cd if _opp_rotation else float(ENTRY_COOLDOWN_MIN)
@@ -349,7 +455,7 @@ class StrategyEngine:
         # PATCH_V45: opposite-side rotation IS the material change.
         _exit_spot = state.get("last_exit_spot")
         _exit_time = state.get("last_exit_time")
-        if _exit_spot and _exit_time and open_count == 0:
+        if _exit_spot and _exit_time:
             try:
                 _xdt = datetime.fromisoformat(str(_exit_time))
                 _since = (now_ist() - _xdt).total_seconds() / 60.0
@@ -472,7 +578,8 @@ class StrategyEngine:
                                 or _two_way_fade_ok
                                 or _opp_pm_ok
                                 or _same_side_extreme
-                                or _opp_rotation):
+                                or _opp_rotation
+                                or _pin_failed_to_dir):
                             return "NO_TRADE", (
                                 f"no_material_change_since_exit_{_moved:.0f}pts_"
                                 f"lt_{_need:.0f}pts_needed"
@@ -527,22 +634,27 @@ class StrategyEngine:
         if signals.get("price_regime") in ("OBSERVING",):
             return "NO_TRADE", "opening_range_pending"
 
-        # PATCH_V27: unresolved open-HIGH wick — defer BEAR/RANGE credit
-        # until 12:15 so the book is free for the lower-high fade (10-Sep).
-        # Do NOT block failed-break / low-fade bull puts (16-Sep scalp).
-        # (A pullback-based early unlock was measured: it let morning RANGE
-        # condors steal the book on 10-Sep / 17-Sep and cut those sessions
-        # hard. Keep the clock; fades already bypass via afternoon_high_fade.)
+        # Unresolved open-HIGH wick: defer BEAR/RANGE credit until 12:15
+        # so the book is free for the lower-high fade. Tape rule on every
+        # non-expiry session. Expiry day already waits until 10:30 and
+        # cuts entries at 13:00 — a second 12:15 clock would leave a
+        # 45-minute window and block the trend-side vertical a crash
+        # session needs (measured 2026-09-15).
         try:
             _dte_os = int(signals.get("actual_dte")) if signals.get("actual_dte") is not None else -1
         except (TypeError, ValueError):
             _dte_os = -1
+        _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
         if (
-            _dte_os >= 2
+            0 <= _dte_os <= _max_dte
+            and dte_blend(_dte_os) < 0.9
             and bool(signals.get("day_high_is_open_spike"))
             and not bool(signals.get("afternoon_low_fade"))
             and not bool(signals.get("failed_break_low"))
             and not bool(signals.get("failed_break_high"))
+            and str(signals.get("price_regime") or "") not in (
+                "DOWNTREND", "STRONG_DOWNTREND",
+            )
             and str(signals.get("final_regime") or "") in (
                 "PREMIUM_SELL_BEAR", "PREMIUM_SELL_RANGE",
             )
@@ -612,11 +724,6 @@ class StrategyEngine:
             return "NO_TRADE", (
                 f"dte_{actual_dte}_above_max_{_max_dte}_intraday_only"
             )
-        if actual_dte is not None and actual_dte >= 4:
-            if confidence not in ("HIGH", "MEDIUM"):
-                return "NO_TRADE", (
-                    f"dte_{actual_dte}_requires_medium_high_confidence"
-                )
 
         # PATCH_V12: the day-move block is measured on the side that
         # threatens the structure, not the whole range. A 250%
@@ -882,15 +989,22 @@ class StrategyEngine:
         except (TypeError, ValueError):
             _floor = 70.0 if _spike else 85.0
         _chop = bool(signals.get("choppy_detected"))
+        # An unretested open-HIGH wick created the OR; it is not a later
+        # breakout through that edge. Counting it as two-way turns a
+        # failed-reclaim dump into a low-fade / wait-for-calls tape
+        # (08-Sep: loc 0.10 at 12:15, BCS delayed to 12:36 on thinner credit).
+        _spike_hi = bool(signals.get("day_high_is_open_spike"))
         _both_sides = False
         try:
             or_h = float(signals.get("or_high") or 0.0)
             or_l = float(signals.get("or_low") or 0.0)
             dh = float(signals.get("day_high_so_far") or signals.get("day_high") or 0.0)
             dl = float(signals.get("day_low_so_far") or signals.get("day_low") or 0.0)
-            if or_h > or_l > 0 and dh > 0 and dl > 0:
+            if or_h > or_l > 0 and dh > 0 and dl > 0 and not _spike_hi:
                 _poke = max(15.0, 0.25 * (or_h - or_l))
                 _both_sides = (dh >= or_h + _poke) and (dl <= or_l - _poke)
+                if not _both_sides:
+                    _both_sides = (dh > or_h) and (dl < or_l)
         except (TypeError, ValueError):
             _both_sides = False
         _after = self._after_two_way_extreme_scalp()
@@ -898,10 +1012,12 @@ class StrategyEngine:
         # scalp / choppy-on-wide). A one-way trend day easily prints a
         # 120pt range (15-Sep) — that must NOT look like a two-way auction
         # or fade flags steal the book from the momentum substitute.
+        _chop_wide = bool(_chop and raw_rng >= 100.0 and not _spike_hi)
+        _latched = bool(signals.get("two_way_auction")) and not _spike_hi
         active = bool(
             raw_rng >= _floor
-            and (_both_sides or _after or (_chop and raw_rng >= 100.0))
-        )
+            and (_both_sides or _after or _chop_wide)
+        ) or _latched
         signals["two_way_auction"] = active
         if active:
             # OPT_V32: marking two-way must not shrink size; fades boost later.
@@ -966,6 +1082,31 @@ class StrategyEngine:
             return
         after_extreme = self._after_two_way_extreme_scalp()
         after_fb = bool(self.market_engine.state.get("last_exit_is_failed_break_scalp"))
+        # ── A fade needs a two-sided tape ────────────────────────────────
+        # Selling the session extreme is a mean-reversion trade. It is only
+        # a trade when the session has shown it reverts: both OR edges
+        # poked (two_way), or an extreme scalp already harvested. On a
+        # one-way tape a "fresh high" is continuation, and a measured
+        # trend (mature ADX at/above the trend threshold pointing INTO the
+        # extreme) is the definition of one-way. Measured 2026-09-21
+        # (DTE1): a 12:16 high fade sold 23550 calls into ADX 38 UPTREND
+        # with loc 0.87 and no two-way confirmation; the tape ran +50pts
+        # into the bell. The same veto is what keeps the engine from
+        # selling puts at a fresh low on a trend-down day.
+        _two_sided = bool(two_way or after_fb or after_extreme)
+        # The LATCHED read (same one the counter-trend entry refusal uses):
+        # it only forms on a mature ADX at/above the trend threshold and is
+        # held for displaced_tape_hold_min, so a single RANGE print inside
+        # a trend cannot open a fade window for one cycle.
+        _tr_dir, _tr_adx = 0, 0.0
+        try:
+            _latch = self._tape_displacement(signals)
+            if _latch:
+                _tr_dir = int(_latch.get("dir", 0) or 0)
+                _tr_adx = float(_latch.get("adx", 0.0) or 0.0)
+        except Exception:
+            _tr_dir, _tr_adx = 0, 0.0
+        _measured_trend = _tr_dir != 0
         # Standard afternoon high-fade: 12:15–14:00 at loc≥0.80.
         # True failed-break (16-Sep): from 10:45 at loc≥0.85.
         # Low/high-fade scalp (17-Sep): from 12:00 at loc≥0.90.
@@ -980,13 +1121,27 @@ class StrategyEngine:
         else:
             _hi_start = dtime(12, 15)
             _hi_thresh = 0.80
+        # A one-way measured uptrend is continuation — except when the
+        # session's own structure is already bearish (unfilled gap-down).
+        # That bounce into resistance is a fade, not a trend (the 15-min
+        # UPTREND label is what is being faded). Same tape at every DTE.
+        _struct_bear, _ = self._day_structure_bearish(signals)
+        _hi_trend_veto = (
+            (not _two_sided) and _measured_trend and _tr_dir > 0
+            and not _struct_bear
+        )
         if (current_time >= _hi_start and current_time <= dtime(14, 0)
-                and pos >= _hi_thresh):
+                and pos >= _hi_thresh and not _hi_trend_veto):
             signals["afternoon_high_fade"] = True
             signals["final_regime"] = "PREMIUM_SELL_BEAR"
             # OPT_V32: fade is the edge — do not size-discount it.
             signals["weekly_range_size_discount"] = 1.0
             return
+        if (current_time >= _hi_start and current_time <= dtime(14, 0)
+                and pos >= _hi_thresh and _hi_trend_veto):
+            signals["fade_vetoed_by_trend"] = (
+                f"high_fade_vetoed_one_way_uptrend_adx_{_tr_adx:.0f}"
+            )
         # Low fade: morning window ends at 12:15 so a bearish lean can
         # own the afternoon book (08-Sep 12:15 BCS). Only AFTER an
         # extreme scalp may the opposite low fade run past lunch.
@@ -1038,6 +1193,13 @@ class StrategyEngine:
                 _ds_ok, _ = self._day_structure_bearish(signals)
                 if _ds_ok:
                     return
+                # Symmetric veto: never sell puts at a fresh low on a
+                # one-way DOWN tape (see the high-fade note above).
+                if (not _two_sided) and _measured_trend and _tr_dir < 0:
+                    signals["fade_vetoed_by_trend"] = (
+                        f"low_fade_vetoed_one_way_downtrend_adx_{_tr_adx:.0f}"
+                    )
+                    return
                 signals["afternoon_low_fade"] = True
                 signals["final_regime"] = "PREMIUM_SELL_BULL"
                 signals["weekly_range_size_discount"] = 1.0
@@ -1074,27 +1236,16 @@ class StrategyEngine:
                     final_regime = "PREMIUM_SELL_BULL"
 
         if final_regime == "PREMIUM_SELL_RANGE":
-            strategy = self._resolve_range_strategy(
+            strategy, why = self._resolve_range_strategy(
                 dte, or_condition, adx_15, adx_15_mature,
                 current_time, vol_regime, signals,
             )
             if strategy == "NO_TRADE":
-                return "NO_TRADE", "two_way_auction_wait_for_extreme"
+                return "NO_TRADE", why
             reason = (
                 f"regime:{final_regime}:conf={confidence}:"
-                f"dte={dte}:or={or_condition}:adx={adx_15:.0f}"
+                f"dte={dte}:or={or_condition}:adx={adx_15:.0f}:{why}"
             )
-            if strategy == BEAR_CALL_SPREAD:
-                _, _lean_why = self._range_day_bearish_lean(signals)
-                reason += f":{_lean_why}"
-            # DTE=1 location-lean annotation: helps trace why a RANGE regime
-            # chose a directional vertical instead of the default IC.
-            if int(dte or -1) == 1 and strategy in (BULL_PUT_SPREAD, BEAR_CALL_SPREAD):
-                try:
-                    _ann_rng, _ann_loc, _, _ = self._session_range_pos(signals)
-                    reason += f":dte1_loc_lean={_ann_loc:.2f}"
-                except Exception:
-                    pass
             return strategy, reason
 
         if final_regime == "PREMIUM_SELL_BULL":
@@ -1121,7 +1272,14 @@ class StrategyEngine:
                 )
             if not signals.get("afternoon_low_fade"):
                 _tw_rng, _tw_loc, _, _ = self._session_range_pos(signals)
-                if _tw_rng >= 100.0 and _tw_loc >= 0.70:
+                # Wait for the extreme only on a CONFIRMED two-way auction.
+                # A one-way grind that has printed 100pts is an uptrend:
+                # selling puts at the high is the with-trend ticket, not a
+                # reason to stand aside (measured 2026-09-21: this wait
+                # blocked the bull put from 12:47 while the fade overlay
+                # sold calls into ADX 38 UPTREND).
+                if (bool(signals.get("two_way_auction"))
+                        and _tw_rng >= 100.0 and _tw_loc >= 0.70):
                     return "NO_TRADE", (
                         f"two_way_wait_no_puts_at_high_{_tw_loc:.2f}"
                     )
@@ -1265,6 +1423,46 @@ class StrategyEngine:
             return False, f"lean_{_ds_why}"
         return True, f"day_structure_lean_bearish:{_ds_why}"
 
+    # ── Range-regime structure selection: ONE ladder for every DTE ─────────
+    # The resolver used to branch on DTE (0 / 1 / 2+) with a different rule
+    # set in each branch, and every session that misbehaved got a new
+    # sub-branch. The book is flat by the hard exit on EVERY session, so the
+    # question the resolver answers - "what does the tape look like right
+    # now, and which structure fits it" - is the same at every DTE. What
+    # genuinely differs by DTE is ECONOMICS (theta per hour, gamma, credit
+    # per point of wing) and that lives in the parameter tables
+    # (DTE_REQUIREMENTS, MIN_CREDIT_RATIO*, stop multiples, targets, size),
+    # not in the selection ladder.
+    #
+    # Ladder (first match wins):
+    #   1. Structural bearish lean (unfilled gap-down under a call wall)
+    #      -> bear call.  Day-structure fact, not a 15-minute label.
+    #   2. Confirmed two-way auction -> sell the tested EXTREME only
+    #      (>=0.85 bear call / <=0.15 bull put), otherwise wait. Mid-range
+    #      delta-neutral structures on a swinging tape are the measured
+    #      wrong ticket.
+    #   3. Location lean (mature ADX, session range >= RANGE_LEAN_MIN_PTS):
+    #      spot in the upper part of its range -> bull put, lower -> bear
+    #      call. A single exposed side, placed AWAY from where price is
+    #      trading, carries half the gamma of a condor for the same theta.
+    #      Skipped on event days: a directional vertical pre-positions
+    #      through the print and caps the move the momentum route exists
+    #      to capture.
+    #   4. Centre of a NARROW range, flat MATURE ADX, spot at ATM, before
+    #      noon -> iron butterfly where its economics allow (DTE_REQUIREMENTS),
+    #      iron condor otherwise.
+    #   5. Otherwise -> iron condor; the structure rules and EV gate decide
+    #      whether the condor is actually buildable.
+    RANGE_LEAN_MIN_PTS   = 50.0
+    RANGE_LEAN_HI        = 0.62
+    RANGE_LEAN_LO        = 0.38
+    TWO_WAY_FADE_HI      = 0.85
+    TWO_WAY_FADE_LO      = 0.15
+    TWO_WAY_MIN_RANGE    = 85.0
+    BUTTERFLY_ADX_MAX    = 18.0
+    BUTTERFLY_ATM_DIST   = 50.0
+    CONDOR_MAX_SESSION_RANGE_PTS = 100.0
+
     def _resolve_range_strategy(
         self,
         dte:           Optional[int],
@@ -1274,131 +1472,66 @@ class StrategyEngine:
         current_time:  dtime,
         vol_regime:    str,
         signals:       dict,
-    ) -> str:
-        if dte != 0:
-            _lean, _lean_reason = self._range_day_bearish_lean(signals)
-            if _lean:
-                self.logger.info(f"Range resolution: {_lean_reason}")
-                return BEAR_CALL_SPREAD
-            # Two-way / expanding auction: never default to a pin condor.
-            # Mid-range IC on a two-way tape is the live wrong-ticket failure
-            # (session locks the single slot on a delta-neutral structure while
-            # the edge is at the extremes). Only directional verticals at the
-            # extremes are allowed; otherwise stand aside until location prints.
-            _rng, _loc, _, _ = self._session_range_pos(signals)
-            _tw = bool(signals.get("two_way_auction")) or self._after_two_way_extreme_scalp()
-            if _tw and int(dte or -1) >= 1:
-                if _rng >= 85.0 and _loc >= 0.85:
-                    self.logger.info(
-                        "Range resolution: two_way_high_prefer_bear_call"
-                    )
-                    signals["afternoon_high_fade"] = True
-                    return BEAR_CALL_SPREAD
-                if _rng >= 85.0 and _loc <= 0.15:
-                    self.logger.info(
-                        "Range resolution: two_way_low_prefer_bull_put"
-                    )
-                    signals["afternoon_low_fade"] = True
-                    return BULL_PUT_SPREAD
-                return "NO_TRADE"
+    ) -> Tuple[str, str]:
+        """Return (strategy_or_NO_TRADE, why). DTE-agnostic by design."""
+        try:
+            _dte = int(dte) if dte is not None else -1
+        except (TypeError, ValueError):
+            _dte = -1
 
-            # ── DTE=1: gamma-intensive session ──────────────────────────────
-            # One session before expiry, NIFTY options carry the full remaining
-            # gamma of the week. An Iron Condor exposes BOTH short strikes to
-            # gamma attack; when the session range has established a directional
-            # lean (spot in the upper or lower portion of its range), a single-
-            # sided vertical is strictly safer and harvests the same theta with
-            # half the directional risk.
-            #
-            # Professional NIFTY intraday premium sellers on DTE=1 use the
-            # session's price location — not OI positioning (which lags on the
-            # day before expiry as books square) — to pick the safer short:
-            #   • Spot at upper range  → Bull Put (puts decay away from spot)
-            #   • Spot at lower range  → Bear Call (calls decay away from spot)
-            #   • Spot at centre + NARROW OR + flat ADX → Iron Butterfly
-            #   • Spot at centre + MODERATE+ OR → NO_TRADE (both gamma risks)
-            #
-            # The location threshold (0.62 / 0.38) requires ADX maturity as a
-            # directional-read quality gate; below that the 5-min ADX is still
-            # warming up and the location read is noisier.
-            if int(dte or -1) == 1:
-                _d1_or = signals.get("or_condition", "MODERATE")
+        # 1. structural bearish lean
+        _lean, _lean_reason = self._range_day_bearish_lean(signals)
+        if _lean:
+            self.logger.info(f"Range resolution: {_lean_reason}")
+            return BEAR_CALL_SPREAD, _lean_reason
 
-                # ── PATCH_V15: event-day bypass ─────────────────────────────
-                # On an event day (CPI / FOMC / data release), NIFTY can move
-                # 200-400 pts in a single direction. Pre-entering a location-
-                # based vertical spread caps profit at the wing width while
-                # the REAL edge is a momentum long option that captures the
-                # full move. On event days, skip the DTE=1 location lean and
-                # fall through to IRON_CONDOR — the ADX gate will block it
-                # once the trend is confirmed, and the momentum engine then
-                # fires LONG_CALL / LONG_PUT with its required HIGH confidence,
-                # which is exactly the right quality bar for event-day entries.
-                if bool(signals.get("event_day") or signals.get("event_announced")):
-                    self.logger.info(
-                        "DTE1 RANGE: event_day detected → bypassing location "
-                        "lean, falling through to IC/momentum path"
-                    )
-                    # fall through to IRON_CONDOR → ADX gate blocks if trend
-                    # is strong → momentum fires (HIGH confidence required)
-                    pass
-                else:
-                    # NARROW/VERY_NARROW OR + very flat MATURE ADX + spot near ATM
-                    # → Iron Butterfly (same logic extended to DTE=1 gamma risk)
-                    #
-                    # PATCH_V15: require adx_15_mature before selecting IRON_BUTTERFLY.
-                    # Without maturity, ADX=0 during the warm-up period (first ~10
-                    # 5-min bars) satisfies adx_15<18 even on strong trending days,
-                    # causing premature butterfly selection before the trend is visible.
-                    # ADX must be mature so that a reading < 18 genuinely means flat.
-                    if (_d1_or in ("VERY_NARROW", "NARROW")
-                            and adx_15_mature
-                            and adx_15 < 18
-                            and current_time < dtime(12, 0)):
-                        _d1_spot = float(signals.get("spot") or 0)
-                        _d1_atm  = int(signals.get("atm_strike") or 0)
-                        if _d1_atm > 0 and abs(_d1_spot - _d1_atm) < 50:
-                            return IRON_BUTTERFLY
-                    # Location-based lean — require mature ADX as a quality gate
-                    # and enough session range to have a meaningful position read.
-                    if _rng >= 50.0 and adx_15_mature:
-                        if _loc >= 0.62:
-                            self.logger.info(
-                                f"DTE1 RANGE: loc={_loc:.2f} >= 0.62 → BULL_PUT_SPREAD"
-                                f" (puts safer, spot at upper session range)"
-                            )
-                            return BULL_PUT_SPREAD
-                        if _loc <= 0.38:
-                            self.logger.info(
-                                f"DTE1 RANGE: loc={_loc:.2f} <= 0.38 → BEAR_CALL_SPREAD"
-                                f" (calls safer, spot at lower session range)"
-                            )
-                            return BEAR_CALL_SPREAD
-                    # MODERATE/WIDE OR, neutral location, DTE=1: Iron Condor has
-                    # both shorts in the gamma fire zone without a directional edge.
-                    # Stand aside — momentum substitute is tried next.
-                    if _d1_or not in ("VERY_NARROW", "NARROW"):
-                        self.logger.info(
-                            f"DTE1 RANGE: MODERATE+ OR={_d1_or}, loc={_loc:.2f}"
-                            f" neutral → NO_TRADE (IC gamma too risky without lean)"
-                        )
-                        return "NO_TRADE"
-                # NARROW/VERY_NARROW OR + neutral location (0.38–0.62)
-                # → standard Iron Condor (handled by structure-rules ADX gate)
+        _rng, _loc, _, _ = self._session_range_pos(signals)
 
-            return IRON_CONDOR
-        if (or_condition in ("VERY_NARROW", "NARROW") and
-                adx_15 < 20 and
-                current_time < dtime(12, 0)):
+        # 2. two-way auction: extremes only
+        _tw = bool(signals.get("two_way_auction")) or self._after_two_way_extreme_scalp()
+        if _tw:
+            if _rng >= self.TWO_WAY_MIN_RANGE and _loc >= self.TWO_WAY_FADE_HI:
+                self.logger.info("Range resolution: two_way_high_prefer_bear_call")
+                signals["afternoon_high_fade"] = True
+                return BEAR_CALL_SPREAD, f"two_way_high_fade_loc_{_loc:.2f}"
+            if _rng >= self.TWO_WAY_MIN_RANGE and _loc <= self.TWO_WAY_FADE_LO:
+                self.logger.info("Range resolution: two_way_low_prefer_bull_put")
+                signals["afternoon_low_fade"] = True
+                return BULL_PUT_SPREAD, f"two_way_low_fade_loc_{_loc:.2f}"
+            return "NO_TRADE", f"two_way_auction_wait_for_extreme_loc_{_loc:.2f}"
+
+        _event = bool(signals.get("event_day") or signals.get("event_announced"))
+
+        # 3. location lean (needs a mature trend read and a real range)
+        if (not _event) and adx_15_mature and _rng >= self.RANGE_LEAN_MIN_PTS:
+            if _loc >= self.RANGE_LEAN_HI:
+                self.logger.info(
+                    f"Range resolution: loc={_loc:.2f} >= {self.RANGE_LEAN_HI}"
+                    f" -> BULL_PUT_SPREAD (puts sit away from price)"
+                )
+                return BULL_PUT_SPREAD, f"range_location_lean_{_loc:.2f}"
+            if _loc <= self.RANGE_LEAN_LO:
+                self.logger.info(
+                    f"Range resolution: loc={_loc:.2f} <= {self.RANGE_LEAN_LO}"
+                    f" -> BEAR_CALL_SPREAD (calls sit away from price)"
+                )
+                return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
+
+        # 4. pinned centre of a narrow range -> butterfly where its theta
+        #    per hour pays for the ATM straddle's gamma (DTE_REQUIREMENTS)
+        if (or_condition in ("VERY_NARROW", "NARROW")
+                and adx_15_mature
+                and adx_15 < self.BUTTERFLY_ADX_MAX
+                and current_time < dtime(12, 0)):
             spot       = float(signals.get("spot") or 0)
             atm_strike = int(signals.get("atm_strike") or 0)
-            if atm_strike > 0 and abs(spot - atm_strike) < 50:
-                return IRON_BUTTERFLY
-        _lean0, _lean_reason0 = self._range_day_bearish_lean(signals)
-        if _lean0:
-            self.logger.info(f"Range resolution: {_lean_reason0}")
-            return BEAR_CALL_SPREAD
-        return IRON_CONDOR
+            _ib_lo, _ib_hi = DTE_REQUIREMENTS.get(IRON_BUTTERFLY, (0, 1))
+            if (atm_strike > 0 and abs(spot - atm_strike) < self.BUTTERFLY_ATM_DIST
+                    and _ib_lo <= _dte <= _ib_hi):
+                return IRON_BUTTERFLY, f"pinned_narrow_range_adx_{adx_15:.0f}"
+
+        # 5. default delta-neutral structure
+        return IRON_CONDOR, "range_default_condor"
 
     # ═══════════════════════════════════════════════════════════════════
     # PATCH_V13: tape evidence, entry/exit symmetry, session price memory
@@ -1686,19 +1819,19 @@ class StrategyEngine:
             atm_strike = int(signals.get("atm_strike") or 0)
             if atm_strike > 0 and abs(spot - atm_strike) > 50:
                 return False, f"butterfly_spot_too_far_from_atm_{atm_strike:.0f}"
-            if dte not in (0, 1):
-                return False, f"butterfly_requires_dte_0_or_1_not_{dte}"
-            if dte == 0 and current_time >= dtime(12, 0):
-                return False, "butterfly_too_late_after_12:00_on_0dte"
+            _ib_lo, _ib_hi = DTE_REQUIREMENTS.get(IRON_BUTTERFLY, (0, 1))
+            if dte is None or not (_ib_lo <= int(dte) <= _ib_hi):
+                return False, f"butterfly_requires_dte_{_ib_lo}_to_{_ib_hi}_not_{dte}"
+            # An ATM straddle sold after noon is all gamma and no theta on
+            # any near-dated series; the resolver already stops at 12:00.
+            if current_time >= dtime(12, 0):
+                return False, "butterfly_too_late_after_12:00"
             if adx_15 > 22:
                 return False, f"butterfly_blocked_adx_{adx_15:.0f}_needs_flat_below_22"
-            # PATCH_V15: on DTE=1, gamma risk is elevated; require mature ADX
-            # before committing to a pin structure so that a warming-up ADX=0
-            # during the first 10 bars cannot be mistaken for a genuinely flat
-            # market. DTE=0 is exempt because same-day butterflies are time-
-            # critical and the OR window already guards early misfires.
-            if dte == 1 and not bool(signals.get("adx_15_mature", False)):
-                return False, "butterfly_dte1_requires_mature_adx"
+            # A pin structure needs a REAL flat read: ADX 0.0 during warm-up
+            # satisfies every "< threshold" test on a trend day.
+            if not bool(signals.get("adx_15_mature", False)):
+                return False, "butterfly_requires_mature_adx"
             if signals.get("or_condition", "MODERATE") not in ("VERY_NARROW", "NARROW", "MODERATE"):
                 return False, (
                     f"butterfly_requires_moderate_or_better_not_{signals.get('or_condition')}"
@@ -1712,7 +1845,7 @@ class StrategyEngine:
             except Exception:
                 hard_exit = self.config.hard_exit_time
             mins     = self._minutes_to_time(current_time, hard_exit)
-            min_mins = 75 if dte == 0 else 90
+            min_mins = by_dte(dte if dte is not None else 2, 75.0, 90.0)
             if mins < min_mins:
                 return False, (
                     f"condor_needs_{min_mins}min_before_exit_only_{mins:.0f}min"
@@ -1728,56 +1861,36 @@ class StrategyEngine:
                 return False, "condor_banned_on_two_way_auction"
             if signals.get("or_condition") == "VERY_WIDE":
                 return False, "condor_blocked_very_wide_or"
-            # PATCH_V26: a two-way weekly tape does not pin.
-            # A 100pt+ session may sell a weekly condor ONLY as a
-            # follow-up after a confirmed failed-break scalp (16-Sep).
-            # First-print condors (17-Sep 10:35 ~Rs 650) and condors
-            # sandwiched after a two-way low fade (17-Sep 11:57 scratch)
-            # sit in an expanding auction and cap/kill the day.
-            try:
-                _ic_dte = int(dte) if dte is not None else -1
-            except (TypeError, ValueError):
-                _ic_dte = -1
-            if _ic_dte >= 2:
-                _ic_rng, _ic_loc, _, _ = self._session_range_pos(signals)
-                # PATCH_V27: an unretested open-high wick is a two-way tape
-                # even when raw range is still sub-100 (10-Sep ~92pts).
-                if bool(signals.get("day_high_is_open_spike")) and not bool(
-                    state.get("last_exit_is_failed_break_scalp")
-                ):
-                    return False, "weekly_condor_blocked_open_spike_wick"
-                if _ic_rng >= 100.0:
-                    # PATCH_V28: after a failed-break scalp on a two-way
-                    # weekly, do NOT re-enter with an iron condor. The
-                    # 16-Sep path sold IC at 11:04 at loc 0.95 (day high
-                    # after the V-recovery), locked the single-slot book,
-                    # and blocked 174 AFTERNOON_DAY_HIGH_FADE cycles that
-                    # correctly wanted a bear-call into the 13:15→13:45
-                    # selloff. Extremes on an expanding auction are
-                    # directional fades; a delta-neutral condor there is
-                    # the wrong machine. First-print two-way condors
-                    # remain banned (no failed-break).
-                    _ic_fb = bool(state.get("last_exit_is_failed_break_scalp"))
-                    if not _ic_fb:
-                        return False, (
-                            f"weekly_condor_blocked_two_way_"
-                            f"{_ic_rng:.0f}pts_no_failed_break"
-                        )
+            # ── Condor tape rules: the same at every DTE ─────────────────
+            # A condor is a PIN trade. It is refused when the session has
+            # already shown it does not pin, whatever the calendar says:
+            #   (a) an unretested open spike is an unresolved extreme;
+            #   (b) a session range at/above CONDOR_MAX_SESSION_RANGE_PTS
+            #       with no failed-break reclaim is an expanding auction
+            #       (after a failed-break the edge is the extreme fade,
+            #       not a delta-neutral structure - 16-Sep);
+            #   (c) spot at an extreme of a real range is the location
+            #       lean's ticket, not the condor's - the resolver picks
+            #       the vertical on the next cycle.
+            _ic_rng, _ic_loc, _, _ = self._session_range_pos(signals)
+            _ic_fb = bool(state.get("last_exit_is_failed_break_scalp"))
+            if bool(signals.get("day_high_is_open_spike")) and not _ic_fb:
+                return False, "condor_blocked_open_spike_wick_unresolved"
+            if _ic_rng >= self.CONDOR_MAX_SESSION_RANGE_PTS:
+                if not _ic_fb:
                     return False, (
-                        f"weekly_condor_blocked_two_way_after_failed_break_"
-                        f"{_ic_rng:.0f}pts_prefer_extreme_fade"
+                        f"condor_blocked_expanding_range_"
+                        f"{_ic_rng:.0f}pts_no_failed_break"
                     )
-            # DTE=1: belt-and-suspenders for the _resolve_range_strategy
-            # location lean. If an IC was routed here (NARROW OR, neutral
-            # location at selection time) but the session has since drifted
-            # to an extreme, block it so the resolver can pick the correct
-            # directional vertical on the next cycle.
-            if _ic_dte == 1:
-                _ic1_rng, _ic1_loc, _, _ = self._session_range_pos(signals)
-                if _ic1_rng >= 50.0 and (_ic1_loc >= 0.62 or _ic1_loc <= 0.38):
-                    return False, (
-                        f"dte1_condor_location_drift_{_ic1_loc:.2f}_prefer_vertical"
-                    )
+                return False, (
+                    f"condor_blocked_after_failed_break_"
+                    f"{_ic_rng:.0f}pts_prefer_extreme_fade"
+                )
+            if _ic_rng >= self.RANGE_LEAN_MIN_PTS and (
+                    _ic_loc >= self.RANGE_LEAN_HI or _ic_loc <= self.RANGE_LEAN_LO):
+                return False, (
+                    f"condor_location_drift_{_ic_loc:.2f}_prefer_vertical"
+                )
 
         elif strategy_name == BULL_PUT_SPREAD:
             or_high = float(signals.get("or_high") or 0)
@@ -1790,7 +1903,7 @@ class StrategyEngine:
             if or_high > 0 and or_low > 0 and not signals.get(
                     "neutral_range_vertical"):
                 or_mid    = (or_high + or_low) / 2.0
-                or_buffer = 30 if dte == 0 else 15
+                or_buffer = by_dte(dte if dte is not None else 2, 30.0, 15.0)
                 if spot < or_mid - or_buffer:
                     return False, (
                         f"bull_put_spot_{spot:.0f}_below_or_mid_{or_mid:.0f}"
@@ -1823,7 +1936,7 @@ class StrategyEngine:
             if (_px_regime in ("DOWNTREND", "STRONG_DOWNTREND")
                     and or_high > 0 and or_low > 0):
                 or_mid    = (or_high + or_low) / 2.0
-                or_buffer = 30 if dte == 0 else 15
+                or_buffer = by_dte(dte if dte is not None else 2, 30.0, 15.0)
                 if spot > or_mid + or_buffer:
                     return False, (
                         f"bear_call_spot_{spot:.0f}_above_or_mid_{or_mid:.0f}"
@@ -1858,7 +1971,9 @@ class StrategyEngine:
         opening_straddle = float(signals.get("opening_straddle_pts") or 0)
         _max_pain = float(signals.get("max_pain") or 0)
         _center_ref = spot
-        if dte == 0 and _max_pain > 0:
+        # Remaining life IS the rest of the session: pin may centre the
+        # book. Same tape rule at every DTE whose blend says "today".
+        if dte_blend(dte) >= 0.9 and _max_pain > 0:
             _mp_gap = abs(_max_pain - spot)
             _em_mp = float(signals.get("expected_move_remaining_pts") or 0.0)
             # v3.9: max pain may anchor the strike centre only when it is
@@ -1875,7 +1990,7 @@ class StrategyEngine:
         adx_15           = float(signals.get("adx_15") or 0)
         vix              = float(signals.get("vix") or 11.0)
 
-        if dte == 0:
+        if dte_blend(dte) >= 0.9:
             now_t2 = _test_time if _test_time is not None else now_ist().time()
             total_mins2   = 375.0
             elapsed_mins2 = max(0.0, (
@@ -2861,8 +2976,7 @@ class StrategyEngine:
         # anchors (0.70 -> ~0.52 on DTE1 -> 0.40). The -0.03 shave for
         # DTE>=3 is kept as measured on the twelve weekly trades.
         base_t = self.config.target_pct_for_dte(dte)
-        if dte is None or dte >= 3:
-            base_t -= 0.03
+        base_t -= by_dte(dte, 0.0, 0.03)
         # Richer implied vol means a wider distribution, so take the
         # money a little sooner.
         if vix >= 14.0:
@@ -3596,10 +3710,11 @@ class StrategyEngine:
         # v4.2: multi-day weekly wings carry vega and cost more relative
         # to their shorts than 0DTE wings; use the DTE-aware cap that the
         # adaptive wing fitter (_fit_wing_width) targets.
-        _wing_cost_cap = float(getattr(
-            self.config,
-            "wing_cost_frac_max_weekly" if actual_dte and actual_dte >= 2
-            else "wing_cost_frac_max", 0.50))
+        _wing_cost_cap = by_dte(
+            actual_dte,
+            float(getattr(self.config, "wing_cost_frac_max", 0.50)),
+            float(getattr(self.config, "wing_cost_frac_max_weekly", 0.58)),
+        )
         # An iron butterfly sells the at-the-money straddle, so its wings
         # always cost a large share of the shorts - that is the structure,
         # not a defect in it. The fly is governed by its credit/wing ratio
@@ -3680,33 +3795,39 @@ class StrategyEngine:
         credit_risk_ratio     = net_credit / structural_loss_ratio
 
         now_t3 = now_ist().time()
-        if actual_dte == 0:
-            total_mins3   = 375.0
-            elapsed_mins3 = max(0.0, (
-                datetime.combine(today_ist(), now_t3) -
-                datetime.combine(today_ist(), dtime(9, 15))
-            ).total_seconds() / 60.0)
-            mins_left3 = max(total_mins3 - elapsed_mins3, 30)
-            # v3.9: the ladder was calibrated against the premium a VIX
-            # 13.5 session pays. At VIX 11 the market sells ~0.8x of
-            # that, so a fixed-absolute ladder structurally vetoed every
-            # expiry structure (measured 2026-09-08: ratio ~0.105-0.11
-            # against a fixed 0.16 demand, all 86 surviving candidates
-            # rejected). Requirements now scale with the vol the session
-            # is actually offering, clamped at both ends.
-            _lx = (
-                float(getattr(self.config, "credit_risk_ratio_dte0_early", 0.16))
-                if mins_left3 > 180 else
-                (float(getattr(self.config, "credit_risk_ratio_dte0_mid", 0.13))
-                 if mins_left3 > 90 else
-                 float(getattr(self.config, "credit_risk_ratio_dte0_late", 0.10)))
-            )
-            _vix_l = float(signals.get("vix") or 13.5)
-            _vref  = float(getattr(self.config, "credit_ratio_vix_ref", 13.5))
-            _vs    = min(max(_vix_l / max(_vref, 1.0), 0.75), 1.15)
-            min_ratio = _lx * _vs
-        else:
-            min_ratio = 0.12
+        total_mins3   = 375.0
+        elapsed_mins3 = max(0.0, (
+            datetime.combine(today_ist(), now_t3) -
+            datetime.combine(today_ist(), dtime(9, 15))
+        ).total_seconds() / 60.0)
+        mins_left3 = max(total_mins3 - elapsed_mins3, 30)
+        _lx0 = (
+            float(getattr(self.config, "credit_risk_ratio_dte0_early", 0.16))
+            if mins_left3 > 180 else
+            (float(getattr(self.config, "credit_risk_ratio_dte0_mid", 0.13))
+             if mins_left3 > 90 else
+             float(getattr(self.config, "credit_risk_ratio_dte0_late", 0.10)))
+        )
+        _vix_l = float(signals.get("vix") or 13.5)
+        _vref  = float(getattr(self.config, "credit_ratio_vix_ref", 13.5))
+        _vs    = min(max(_vix_l / max(_vref, 1.0), 0.75), 1.15)
+        min_ratio = by_dte(actual_dte, _lx0 * _vs, 0.12)
+        # With-trend vertical: edge is the drift, not VRP richness. The
+        # expiry-morning 0.16 bar exists to reject cheap quiet-session
+        # gamma shorts; it must not veto the crash-side or grind-side
+        # credit the tape is actually offering. Same at every DTE.
+        _cr_px = str(signals.get("price_regime") or "")
+        _with_trend_credit = (
+            (strategy_name == BEAR_CALL_SPREAD
+             and _cr_px in ("DOWNTREND", "STRONG_DOWNTREND"))
+            or (strategy_name == BULL_PUT_SPREAD
+                and _cr_px in ("UPTREND", "STRONG_UPTREND"))
+        )
+        if _with_trend_credit:
+            min_ratio = min(min_ratio, float(
+                getattr(self.config, "credit_risk_ratio_dte0_late", 0.10)
+                or 0.10
+            ))
 
         if credit_risk_ratio < min_ratio:
             return {
@@ -3718,10 +3839,10 @@ class StrategyEngine:
 
         if actual_wing_pts and actual_wing_pts > 0:
             ratio     = net_credit / actual_wing_pts
-            min_ratio_wing = (
-                MIN_CREDIT_RATIO_DTE0.get(strategy_name, 0.14)
-                if actual_dte == 0
-                else MIN_CREDIT_RATIO.get(strategy_name, 0.10)
+            min_ratio_wing = by_dte(
+                actual_dte,
+                MIN_CREDIT_RATIO_DTE0.get(strategy_name, 0.14),
+                MIN_CREDIT_RATIO.get(strategy_name, 0.10),
             )
             if ratio < min_ratio_wing:
                 return {
@@ -4084,7 +4205,7 @@ class StrategyEngine:
         _wing_margin = (actual_wing_pts or 150) * C02 * 1.10
         if _fully_hedged:
             # Add-on for expiry-day margin tightening and broker buffer.
-            _addon = 0.18 if actual_dte == 0 else 0.10
+            _addon = by_dte(actual_dte, 0.18, 0.10)
             margin_per_lot = _wing_margin * (1.0 + _addon)
         else:
             _spot_ref = float(signals.get("spot") or 0) or 24000.0
@@ -4671,8 +4792,29 @@ class StrategyEngine:
         if self._count_momentum_entries() >= int(
                 getattr(cfg, "momentum_max_trades_per_day", 1)):
             return False, "momentum_daily_limit_reached", 0
-        if self._count_open_positions() > 0:
-            return False, "momentum_position_open", 0
+        _open_n = self._count_open_positions()
+        if _open_n > 0:
+            _max_slots = int(getattr(cfg, "max_concurrent_positions", 1) or 1)
+            if _open_n >= _max_slots:
+                return False, "momentum_position_open", 0
+            # A long option may ride beside an open credit vertical only on
+            # the SAME side (bull put + long call); never against it and
+            # never beside a symmetric structure.
+            _sc = self._slot_conflict(
+                LONG_CALL if direction > 0 else LONG_PUT, signals
+            )
+            if _sc:
+                return False, f"momentum_{_sc}", 0
+            _le = state.get("last_entry_time")
+            if _le:
+                try:
+                    _since = (
+                        now_ist() - datetime.fromisoformat(str(_le))
+                    ).total_seconds() / 60.0
+                    if _since < float(ENTRY_COOLDOWN_MIN):
+                        return False, "momentum_second_slot_cooldown", 0
+                except Exception:
+                    pass
         if state.get("daily_halted"):
             return False, "momentum_daily_halt", 0
         if signals.get("block_new_entries") or signals.get("circuit_breaker_suspected") \
@@ -4882,12 +5024,26 @@ class StrategyEngine:
         _eq = max((current_capital / float(cfg.starting_capital or 1.0)) ** 0.5, 0.35)
         day_cap = max(1, int(LOT_CAPS_BY_DAY.get(day_label, 3) * _eq))
         final_lots = max(1, min(int(round(sized)), day_cap))
-        # PATCH_V12: a 0DTE long-premium ticket is capped at 2 lots:
-        # the structural cap below is premium-multiple based and
-        # would let a cheap ticket size itself into a cliff.
+        # Expiry-day debit: half-budget already applies. A confirmed
+        # STRONG trend is the one 0DTE debit that should not be clipped
+        # to 2 lots — that is a crash/melt-up, not a cheap gamma ticket.
         try:
-            if int(actual_dte) == 0:
-                final_lots = min(final_lots, int(getattr(cfg, "momentum_dte0_max_lots", 2)))
+            if dte_blend(actual_dte) >= 0.9:
+                _px_m = str(signals.get("price_regime") or "")
+                _cap = int(getattr(cfg, "momentum_dte0_max_lots", 2))
+                try:
+                    _adx_m = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_m = 0.0
+                _strong_adx = _adx_m >= float(
+                    getattr(cfg, "adx_strong_threshold", 28.0)
+                )
+                if _px_m in (
+                    "STRONG_DOWNTREND", "STRONG_UPTREND",
+                    "DOWNTREND", "UPTREND",
+                ) and _strong_adx:
+                    _cap = max(_cap, 3)
+                final_lots = min(final_lots, _cap)
         except (TypeError, ValueError):
             pass
         # PATCH_V13: closing-hour clip cap (see the risk fraction above).
@@ -5394,6 +5550,18 @@ class StrategyEngine:
             )
             return {"action": "NO_TRADE", "reason": _ct_reason}
 
+        # ── second slot: the new structure must not stack the open one ──
+        _slot_reason = self._slot_conflict(strategy_name, signals)
+        if _slot_reason:
+            self._log_decision(signals, "NO_TRADE", _slot_reason)
+            self._persist_decision(
+                signals, strategy_name, _slot_reason, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _slot_reason, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _slot_reason}
+
         rules_ok, rules_reason = self._validate_entry_rules(strategy_name, signals)
         if not rules_ok:
             full_reason = f"strategy_rules_failed:{rules_reason}"
@@ -5471,6 +5639,8 @@ class StrategyEngine:
             # IC unbuildable on economics → one demotion to lean/location vertical.
             if strategy_name == IRON_CONDOR:
                 _alt_name = self._demote_condor_on_econ_fail(signals, fail_reason)
+                if _alt_name and self._slot_conflict(_alt_name, signals):
+                    _alt_name = None
                 if _alt_name:
                     _alt_reason = (
                         f"{selection_reason}:demoted_from_ic_on_{fail_reason[:80]}"
@@ -5632,8 +5802,11 @@ def _self_test() -> None:
             "opening_straddle_pts":  175.0,
             "or_computed":           True,
             "or_condition":          "NARROW",
-            "or_high":               24100.0,
-            "or_low":                24040.0,
+            # OR centred on the spot: a "pinned at ATM" fixture must not put
+            # the spot at the low of its own range (the DTE-agnostic location
+            # lean would - correctly - read that as a bear-call location).
+            "or_high":               24030.0,
+            "or_low":                23970.0,
             "or_width":              60.0,
             "choppy_detected":       False,
             "adx_15":                14.0,
@@ -5688,8 +5861,8 @@ def _self_test() -> None:
     market_engine.state.update({
         "or_computed":           True,
         "or_condition":          "NARROW",
-        "or_high":               24100.0,
-        "or_low":                24040.0,
+        "or_high":               24030.0,
+        "or_low":                23970.0,
         "entry_start":           "00:01",
         "entry_end":             "23:58",
         "hard_exit_time":        "23:59",

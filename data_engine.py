@@ -621,6 +621,8 @@ class MarketDataEngine:
                 "_straddle_open_for_summary", "_last_atm_straddle",
                 "_prev_close_for_gap", "_straddle_hist",
                 "rv_anchor_pct", "rv_anchor_date", "first_bar_close",
+                "day_open_spot",
+                "two_way_auction_latched",
                 "last_exit_is_failed_break_scalp",
                 "last_exit_is_stale_weekly",
                 "last_exit_is_regime_rotation",
@@ -3213,6 +3215,52 @@ class MarketDataEngine:
                 post_bars, orb_high, orb_low, lookback_min=10, wick_threshold=3
             )
 
+        # Latch two-way for the rest of the session. A morning CHOPPY
+        # print on a wide day (or a poke through both OR edges) is the
+        # auction; the 15-min label flipping to UPTREND at the next
+        # high does not un-print it (17-Sep).
+        try:
+            _dh_tw = float(self.state.get("day_high_so_far") or 0.0)
+            _dl_tw = float(self.state.get("day_low_so_far") or 0.0)
+            _rng_tw = (_dh_tw - _dl_tw) if (_dh_tw > _dl_tw > 0) else 0.0
+            _spike_hi = bool(self.state.get("day_high_is_open_spike"))
+            # Open-HIGH wick is the OR itself, not a later breakout through
+            # it. A dump under OR with that wick unretested is a failed
+            # reclaim (08-Sep), not a two-way auction.
+            _both_tw = (
+                (not _spike_hi)
+                and orb_high > orb_low > 0 and _dh_tw > 0 and _dl_tw > 0
+                and _dh_tw > orb_high and _dl_tw < orb_low
+            )
+            _swung_open = True
+            _open_tw = float(self.state.get("day_open_spot") or 0.0)
+            if _open_tw > 0 and _dh_tw > 0 and _dl_tw > 0:
+                _need_tw = float(
+                    getattr(self.config, "two_way_from_open_pts", 25.0) or 25.0
+                )
+                _swung_open = (
+                    (_dh_tw - _open_tw) >= _need_tw
+                    and (_open_tw - _dl_tw) >= _need_tw
+                )
+            if _spike_hi:
+                self.state["two_way_auction_latched"] = False
+            elif _rng_tw >= 85.0 and _swung_open and (
+                _both_tw or (choppy_detected and _rng_tw >= 100.0)
+            ):
+                _gap_tw = str(self.state.get("gap_direction") or "")
+                try:
+                    _pc_tw = float(self.state.get("_prev_close_for_gap") or 0.0)
+                except (TypeError, ValueError):
+                    _pc_tw = 0.0
+                _unfilled_down = (
+                    _gap_tw == "DOWN" and _pc_tw > 0 and _dh_tw > 0
+                    and _dh_tw < _pc_tw
+                )
+                if not _unfilled_down:
+                    self.state["two_way_auction_latched"] = True
+        except (TypeError, ValueError):
+            pass
+
         # ── 19. ORB price structure ───────────────────────────────────────
         orb_price_regime = self.classify_orb_price_structure(bars, orb_high, orb_low)
 
@@ -3599,6 +3647,9 @@ class MarketDataEngine:
             _expected_move_remaining = 0.0
             _expected_range_so_far = 0.0
 
+        if not self.state.get("day_open_spot") and spot and float(spot) > 0:
+            self.state["day_open_spot"] = float(spot)
+
         # ── 27. Build signals dict ────────────────────────────────────────
         # Previous close comes from gap detection's cache (populated at the
         # open, before entry hours). 0.0 = unknown, and downstream reads
@@ -3638,6 +3689,7 @@ class MarketDataEngine:
             "post_open_low_so_far":     self.state.get("post_open_low_so_far"),
             "day_high_is_open_spike":   bool(self.state.get("day_high_is_open_spike")),
             "day_low_is_open_spike":    bool(self.state.get("day_low_is_open_spike")),
+            "day_open_spot":            float(self.state.get("day_open_spot") or 0.0),
             # PATCH_V12: one-sided excursion vs priced displacement.
             "day_up_used_pct":          day_up_used_pct,
             "day_down_used_pct":        day_down_used_pct,
@@ -3653,6 +3705,7 @@ class MarketDataEngine:
             "or_computed":              bool(self.state.get("or_computed")),
             "orb_price_regime":         orb_price_regime,
             "choppy_detected":          choppy_detected,
+            "two_way_auction":          bool(self.state.get("two_way_auction_latched")),
 
             # Gap
             "gap_direction":            self.state.get("gap_direction", "FLAT"),
