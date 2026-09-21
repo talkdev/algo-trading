@@ -8,6 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
+   - [1.1 Latest change logic (v47)](#11-latest-change-logic-v47--one-tape-rule-every-dte)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -36,6 +37,26 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 - **Strict Intraday Demarcation**: All positions open after the opening stabilization period and are aggressively flattened before 15:15 IST (or configured `hard_exit_time`). Zero overnight gap or weekend jump risk is assumed.
 - **Asymmetric Regime Hierarchy**: The primary engine book is a premium seller (Iron Condor, Iron Butterfly, Bull Put Spread, Bear Call Spread). Long-premium momentum alternatives (Long Call, Long Put) operate strictly as secondary directional substitutes when sell-side structures are rejected due to strong trend displacement or expanding IV.
 - **Two-Way Auction & Mean-Reversion Preservation**: Identifies intraday auction expansions, rejecting delta-neutral pin condors in expanding sessions and transitioning into high/low extreme-fade directional credit verticals.
+
+---
+
+### 1.1 Latest change logic (v47) — one tape rule, every DTE
+
+The book is **flat by the hard exit on every session**. Overnight gap, weekend jump, and hold-to-expiry DTE discounts do not apply to strategy *selection*. Tape rules (regime → structure, fades, chase, two slots) are therefore the same at DTE 0–4. What still differs by remaining life is **economics only**, interpolated with `by_dte()` / `dte_blend()` (stops, targets, wing width, credit ratio, IV/VIX sanity, 0DTE 15:00 square-off and 10:30 listing wait).
+
+18 Sep (DTE2 two-way) and 21 Sep (DTE1 grind) were the stress sample, not date patches. Full-day signal streams vs `decide()` blockers:
+
+| Sample | Engine-wanted book | What blocked it | General rule |
+| --- | --- | --- | --- |
+| 18 Sep | Failed-low bull put, then afternoon high-fade bear call | Sequential book already correct. Same-structure stacking and unresolved open-high wait were the real blocks, not DTE. | Harvesting one extreme is **not** a two-way auction. Opposite credit waits for noon + loc ≥ 0.80 (after-extreme) or 10:45 + loc ≥ 0.85 (confirmed both-OR-sides two-way). |
+| 21 Sep | First bull put at loc 0.75 (with-trend). Second bull put at loc 0.99 | The loc 0.99 ticket was a chase into the high of a grind (−₹553 hard-exit). | After harvesting puts, refuse another put at loc ≥ 0.80 unless it is a new low-fade. Symmetric for calls at loc ≤ 0.20. |
+
+**Two concurrent tickets** (`max_concurrent_positions = 2`):
+
+- Allowed: aligned long premium beside a credit vertical, **or** the opposite *extreme* fade beside an open vertical on a confirmed two-way tape after 12:15 at loc ≥ 0.85 / ≤ 0.15, sized at 0.70×.
+- Refused: the same structure twice, a condor beside anything, opposite credit that is not an extreme fade (synthetic condor at 2× risk).
+
+Strike/wing geometry uses remaining-life (`dte_blend < 0.35` = weekly vega), not a calendar-DTE `if dte == 0 / 1 / 2` maze.
 
 ---
 
@@ -235,7 +256,7 @@ The hard gate suite enforces absolute risk parameters. It evaluates sequentially
 | 4     | `vix_spike_detected`                          | `signals.get("vix_spike_detected") == True`                                            | India VIX jumped ≥ 15% intraday; short premium tail-risk explodes.                                                             |
 | 5     | `iv_expanding_never_sell_into_rising_iv`      | `iv_behavior in ("EXPANDING", "SPIKING")` (unless extreme fade)                        | Vega expansion destroys short option credit before theta can decay.                                                             |
 | 6     | `before_entry_window` / `past_entry_window` | `current_time < trading_window_start (09:20)` or `current_time > last_entry (14:15)` | Avoids opening print auction noise and avoids late entries with insufficient theta runway.                                      |
-| 7     | `max_concurrent_positions_reached`            | `open_count >= config.max_concurrent_positions (1)`                                    | Single-position constraint preventing over-leverage and operational complexity.                                                 |
+| 7     | `max_concurrent_positions_reached`            | `open_count >= config.max_concurrent_positions (2)`                                    | Two-slot book: a second structure may sit beside an open one only when it is a different trade (aligned long premium, or opposite extreme fade on a confirmed two-way tape). Same-structure stacking is refused. |
 | 8     | `max_entries_per_day_reached`                 | `today_entries >= config.max_entries_per_day (default 2, 3 for 2-way fade)`            | Over-trading protection on choppy, non-trending sessions.                                                                       |
 | 9     | `entry_cooldown_remaining`                    | Time since last action < cooldown (`ENTRY_COOLDOWN_MIN = 10`)                          | Prevents immediate revenge entries after an exit.                                                                               |
 | 10    | `no_material_change_since_exit`               |                                                                                          | spot - last_exit_spot                                                                                                           |

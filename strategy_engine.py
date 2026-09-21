@@ -166,15 +166,101 @@ class StrategyEngine:
             return {"BEAR"}
         return set()
 
+    def _same_side_chase_refusal(
+        self, strategy_name: str, signals: dict
+    ) -> Optional[str]:
+        """Refuse re-selling the same credit side at a worse location.
+
+        After harvesting a bull put, selling puts at loc >= 0.80 is a
+        chase (the grind already paid the first ticket). After harvesting
+        a bear call, selling calls at loc <= 0.20 is the same error.
+        Opposite-extreme fades, a re-test of the same extreme, and a
+        mid-range same-side vertical are different trades. Long premium
+        is not a credit chase. Same tape rule at every DTE.
+        """
+        state = self.market_engine.state
+        last_side = str(state.get("last_exit_strategy_side") or "")
+        if last_side not in ("BULL", "BEAR"):
+            return None
+        if not state.get("last_exit_time"):
+            return None
+        if strategy_name in MOMENTUM_STRATEGIES:
+            return None
+        new_sides = self._sides_of(strategy_name)
+        if last_side == "BULL" and "BULL" in new_sides:
+            if signals.get("afternoon_low_fade"):
+                return None
+            try:
+                _rng, _loc, _, _ = self._session_range_pos(signals)
+            except Exception:
+                _loc = 0.5
+            if _loc >= 0.80:
+                return f"same_side_chase_puts_at_high_loc_{_loc:.2f}"
+            return None
+        if last_side == "BEAR" and "BEAR" in new_sides:
+            if signals.get("afternoon_high_fade"):
+                return None
+            try:
+                _rng, _loc, _, _ = self._session_range_pos(signals)
+            except Exception:
+                _loc = 0.5
+            if _loc <= 0.20:
+                return f"same_side_chase_calls_at_low_loc_{_loc:.2f}"
+            return None
+        return None
+
+    def _opposite_extreme_fade(
+        self, strategy_name: str, signals: Optional[dict]
+    ) -> bool:
+        """True when the candidate is the opposite extreme of the open book.
+
+        Concurrent opposite credit is only the professional two-extreme
+        book: confirmed two-way, afternoon, location at the tested edge.
+        Mid-range opposite credit is a synthetic condor at 2x risk.
+        """
+        if not signals:
+            return False
+        if not bool(signals.get("two_way_auction")):
+            return False
+        try:
+            now_t = now_ist().time()
+        except Exception:
+            return False
+        if now_t < dtime(12, 15):
+            return False
+        try:
+            _rng, _loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return False
+        if _rng < 85.0:
+            return False
+        open_names = self._open_strategy_names()
+        if not open_names:
+            return False
+        open_sides: set = set()
+        for o in open_names:
+            open_sides |= self._sides_of(o)
+        if strategy_name == BEAR_CALL_SPREAD and bool(
+            signals.get("afternoon_high_fade")
+        ) and _loc >= 0.85:
+            return "BULL" in open_sides and "BEAR" not in open_sides
+        if strategy_name == BULL_PUT_SPREAD and bool(
+            signals.get("afternoon_low_fade")
+        ) and _loc <= 0.15:
+            return "BEAR" in open_sides and "BULL" not in open_sides
+        return False
+
     def _slot_conflict(self, strategy_name: str, signals: Optional[dict] = None) -> Optional[str]:
         """Refuse a second structure that stacks or duplicates the book.
 
-        Two slots are for the SAME-direction book: a credit vertical plus
-        an aligned long-premium ticket (bull put + long call). Refused:
-        the same structure twice, a second symmetric structure, any
-        vertical when a condor/butterfly already covers both sides, a
-        long option against an open credit side, and opposite-side
-        credit beside an open vertical (a synthetic condor at 2x risk).
+        Two slots, same tape rule at every DTE:
+          allowed — aligned long premium beside a credit vertical, or the
+                    opposite EXTREME fade beside an open fade/vertical on a
+                    two-way / harvested tape (sized down in decide()).
+          refused — the same structure twice, a condor/butterfly beside
+                    anything, long premium against the open credit side,
+                    and opposite credit that is NOT an extreme fade
+                    (a synthetic condor at 2x risk).
         """
         open_names = self._open_strategy_names()
         if not open_names:
@@ -200,14 +286,9 @@ class StrategyEngine:
                 continue
             if new_sides & o_sides:
                 return f"slot_conflict_same_side_already_sold:{o}"
-            # Opposite credit beside an open vertical is a synthetic
-            # condor at 2x single-ticket risk. On a two-way tape the
-            # professional book fades ONE extreme, harvests, then the
-            # other — never both at full size (measured 2026-09-17:
-            # 5-lot bull put + 5-lot bear call, both trend-flipped).
-            # Two slots are for the SAME-direction book: credit vertical
-            # + aligned long premium.
             if new_sides and o_sides and not (new_sides & o_sides):
+                if self._opposite_extreme_fade(strategy_name, signals):
+                    continue
                 return f"slot_conflict_no_opposite_credit_beside_open:{o}"
         return None
 
@@ -342,10 +423,24 @@ class StrategyEngine:
                         now_ist() - datetime.fromisoformat(str(_le))
                     ).total_seconds() / 60.0
                     if _since_entry < float(ENTRY_COOLDOWN_MIN):
-                        return "NO_TRADE", (
-                            f"second_slot_cooldown_"
-                            f"{ENTRY_COOLDOWN_MIN - _since_entry:.0f}min_remaining"
+                        # Opposite extreme fade is a different trade; the
+                        # cooldown exists to stop same-signal re-fire.
+                        _open_sides: set = set()
+                        for _on in self._open_strategy_names():
+                            _open_sides |= self._sides_of(_on)
+                        _opp_fade_slot = (
+                            (bool(signals.get("afternoon_high_fade"))
+                             and "BULL" in _open_sides
+                             and "BEAR" not in _open_sides)
+                            or (bool(signals.get("afternoon_low_fade"))
+                                and "BEAR" in _open_sides
+                                and "BULL" not in _open_sides)
                         )
+                        if not _opp_fade_slot:
+                            return "NO_TRADE", (
+                                f"second_slot_cooldown_"
+                                f"{ENTRY_COOLDOWN_MIN - _since_entry:.0f}min_remaining"
+                            )
                 except Exception:
                     pass
 
@@ -533,6 +628,10 @@ class StrategyEngine:
                             if (_extreme_done and _fade_next and _opp_pair
                                     and _now_t >= dtime(12, 15)
                                     and _moved >= max(8.0, 0.20 * _need)):
+                                # Opposite fade is a new trade, but only
+                                # after a real extension past the prior
+                                # fill. Waiving the 8pt floor let a 0.81
+                                # bounce print as a high fade and stop.
                                 _opp_pm_ok = True
                         except Exception:
                             _opp_pm_ok = False
@@ -1007,16 +1106,14 @@ class StrategyEngine:
                     _both_sides = (dh > or_h) and (dl < or_l)
         except (TypeError, ValueError):
             _both_sides = False
-        _after = self._after_two_way_extreme_scalp()
-        # PATCH_V31b: require BOTH OR sides poked (or a confirmed extreme
-        # scalp / choppy-on-wide). A one-way trend day easily prints a
-        # 120pt range (15-Sep) — that must NOT look like a two-way auction
-        # or fade flags steal the book from the momentum substitute.
+        # Harvesting ONE extreme is not a two-way auction. Two-way means
+        # both OR edges poked (or choppy-on-wide). The opposite fade after
+        # a one-sided harvest is a separate clock in _apply_two_way_location.
         _chop_wide = bool(_chop and raw_rng >= 100.0 and not _spike_hi)
         _latched = bool(signals.get("two_way_auction")) and not _spike_hi
         active = bool(
             raw_rng >= _floor
-            and (_both_sides or _after or _chop_wide)
+            and (_both_sides or _chop_wide)
         ) or _latched
         signals["two_way_auction"] = active
         if active:
@@ -1112,10 +1209,13 @@ class StrategyEngine:
         # Low/high-fade scalp (17-Sep): from 12:00 at loc≥0.90.
         # PATCH_V31 two-way auction: from 10:45 at loc≥0.85 (professional
         # fade of the tested edge on a swinging tape).
-        if after_fb or two_way:
+        # Confirmed two-way (both edges) may fade from 10:45.
+        # A one-sided harvest is NOT two-way: opposite credit waits for
+        # noon so a bounce into the first extreme is not sold as a fade.
+        if two_way:
             _hi_start = dtime(10, 45)
             _hi_thresh = 0.85 if current_time < dtime(12, 15) else 0.80
-        elif after_extreme:
+        elif after_fb or after_extreme:
             _hi_start = dtime(12, 0)
             _hi_thresh = 0.90 if current_time < dtime(12, 15) else 0.80
         else:
@@ -1488,7 +1588,10 @@ class StrategyEngine:
         _rng, _loc, _, _ = self._session_range_pos(signals)
 
         # 2. two-way auction: extremes only
-        _tw = bool(signals.get("two_way_auction")) or self._after_two_way_extreme_scalp()
+        # Confirmed two-way only. A one-sided harvest must not convert the
+        # rest of the session into wait-for-extreme (that blocks the
+        # opposite fade and the with-trend vertical alike).
+        _tw = bool(signals.get("two_way_auction"))
         if _tw:
             if _rng >= self.TWO_WAY_MIN_RANGE and _loc >= self.TWO_WAY_FADE_HI:
                 self.logger.info("Range resolution: two_way_high_prefer_bear_call")
@@ -2043,9 +2146,12 @@ class StrategyEngine:
         # directional vertical is a directional-expression spread that
         # desks conventionally sell at 0.28-0.32 delta on the favoured side,
         # using the other side's OI wall as the wall being sold into.
-        _weekly_dte = bool(dte is not None and dte >= 2)
+        # Remaining-life flag: dte_blend < 0.35 is DTE >= 2 (weekly
+        # vega). DTE 0/1 use the expiry ladder. Tape rules do NOT
+        # branch here — only strike/wing economics.
+        _weekly_life = dte_blend(dte) < 0.35
         _neutral_condor = strategy_name == IRON_CONDOR
-        if _weekly_dte and _neutral_condor:
+        if _weekly_life and _neutral_condor:
             if adx_15 >= self.config.adx_strong_threshold:
                 delta_target = float(getattr(self.config,
                                              "short_delta_strong_weekly", 0.18))
@@ -2078,7 +2184,7 @@ class StrategyEngine:
             # The low-VIX delta shave is a 0DTE fast-gamma calibration;
             # on fresh weeklies the favoured-side vertical keeps the
             # canonical ~0.30 short delta.
-            if not _weekly_dte:
+            if not _weekly_life:
                 if vix < 12.0:
                     delta_target = max(delta_target - 0.02, 0.10)
                 elif vix < 14.0:
@@ -2112,7 +2218,7 @@ class StrategyEngine:
         # (the chain-implied expiry scale, roughly time-of-day invariant).
         # Weekly verticals keep the intraday band: their favoured-side
         # 0.30 delta short is an intraday-expression leg by design.
-        if _weekly_dte and _neutral_condor:
+        if _weekly_life and _neutral_condor:
             _wk_atm = min(chain.keys(), key=lambda k: abs(float(k) - float(spot)))
             _wk_qc = chain.get(float(_wk_atm), {}).get("call") or {}
             _wk_qp = chain.get(float(_wk_atm), {}).get("put") or {}
@@ -2128,7 +2234,7 @@ class StrategyEngine:
                                      "em_band_lo_weekly", 0.55)) * _wk_scale
             _band_hi = float(getattr(self.config,
                                      "em_band_hi_condor_weekly", 1.35)) * _wk_scale
-        elif _weekly_dte:
+        elif _weekly_life:
             _band_lo = float(getattr(self.config,
                                      "em_band_lo_weekly", 0.55)) * _em
             _band_hi = float(getattr(self.config,
@@ -2302,7 +2408,7 @@ class StrategyEngine:
         # PATCH_V25: 300-pt wing on dte>=2 failed-LOW so 15% scalp clears costs.
         if (signals.get("neutral_range_vertical")
                 and strategy_name == BULL_PUT_SPREAD):
-            _wing_hint = max(_wing_hint, 300 if _weekly_dte else 200)
+            _wing_hint = max(_wing_hint, 300 if _weekly_life else 200)
         if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
             _wing_hint = max(_wing_hint, 150)
         if isinstance(short_dist, (tuple, list)):
@@ -2325,7 +2431,7 @@ class StrategyEngine:
         wing = int(max(_wing_min, min(wing, _wing_max)))
         if (signals.get("neutral_range_vertical")
                 and strategy_name == BULL_PUT_SPREAD):
-            wing = int(min(max(wing, 300 if _weekly_dte else 200), _wing_max))
+            wing = int(min(max(wing, 300 if _weekly_life else 200), _wing_max))
 
         # ── v4.2: adaptive wing fit ───────────────────────────────────────
         # A fresh-weekly wing (multi-day vega) routinely costs 55-65% of a
@@ -2341,7 +2447,7 @@ class StrategyEngine:
         # table is the calibrated expiry-day behavior (do not touch it).
         # The single-sided vertical's long is risk definition priced by
         # the credit/wing ratio gates, so it never gets the fitter either.
-        if (strategy_name == IRON_CONDOR and _weekly_dte
+        if (strategy_name == IRON_CONDOR and _weekly_life
                 and short_dist and _short_dist_ref > 0):
             wing = self._fit_wing_width(
                 chain=chain, strategy_name=strategy_name,
@@ -2350,8 +2456,8 @@ class StrategyEngine:
                 dte=dte,
                 cap=float(getattr(
                     self.config,
-                    "wing_cost_frac_max_weekly" if _weekly_dte
-                    else "wing_cost_frac_max", 0.58 if _weekly_dte else 0.50)),
+                    "wing_cost_frac_max_weekly" if _weekly_life
+                    else "wing_cost_frac_max", 0.58 if _weekly_life else 0.50)),
             )
 
         if strategy_name == IRON_BUTTERFLY:
@@ -5528,6 +5634,17 @@ class StrategyEngine:
             )
             return {"action": "NO_TRADE", "reason": selection_reason}
 
+        _chase = self._same_side_chase_refusal(strategy_name, signals)
+        if _chase:
+            self._log_decision(signals, "NO_TRADE", _chase)
+            self._persist_decision(
+                signals, strategy_name, _chase, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _chase, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _chase}
+
         # ── PATCH_V13: entry/exit trend symmetry ─────────────────────────
         # The exit ladder ejects a credit vertical that a measured trend has
         # run against, and refuses a symmetric structure only when the tape
@@ -5601,6 +5718,11 @@ class StrategyEngine:
             return {"action": "NO_TRADE", "reason": _sticky}
 
         size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
+        # Second concurrent ticket (opposite extreme fade, or aligned
+        # long premium) is sized at 0.70x so peak book risk stays inside
+        # ~1.7x a single ticket, not 2x. Same at every DTE.
+        if self._count_open_positions() >= 1:
+            size_mult *= 0.70
         # v4.2: regime layer can ask for a smaller clip on fresh-weekly
         # range condors (UNCLEAR OI positioning, or elevated-but-not-strong
         # ADX): the structure is allowed but size is discounted.
