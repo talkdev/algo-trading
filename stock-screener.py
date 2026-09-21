@@ -7,8 +7,18 @@ Stage-2 buying checks apply confirmed breakout, relative strength, volume confir
 and extension filters to FINAL_QUALIFIER stocks, ranked by ENTRY_QUALITY_SCORE.
 The aligned-matrix metric interface is pure and suitable for research harnesses.
 
-All reports, candle caches, instrument-master JSON and log files are written under
-stock-data/ beside this script (never under data/, output/ or logs/).
+Position tracker: after each run every new BUYING CHECKS (CONFIRMED BREAKOUTS)
+selection is stored incrementally in a SQLite journal (stock-data/
+buying_positions.db) with the breakout-day open/high/low/close, the selection
+indicators and the entry score. On every later run the three exit rules
+(1. close below the breakout-day low, 2. close back below HH20, 3. RS20 <= 0
+and RS60 <= 0) are evaluated for each open position; a hit is reported on the
+console as "stock selected on <date> meets exit condition on <date>" and the
+position is closed in the journal. Re-runs and --as-of backfills are idempotent.
+
+All reports, candle caches, instrument-master JSON, the position database and
+log files are written under stock-data/ beside this script (never under data/,
+output/ or logs/).
 
 Credential loading: by default, env.txt is read from beside this Python file,
 not from the shell's working directory. Override with --env /path/to/env.txt.
@@ -28,6 +38,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import tempfile
 import textwrap
@@ -78,6 +89,20 @@ BUYING_SCORE_WEIGHTS = {               # ENTRY_QUALITY_SCORE component weights
     "BreakoutQuality": 0.15,
     "Extension": 0.15,
 }
+
+# Position tracker (breakout-selection journal and exit strategy) parameters
+STOCK_DB_NAME = "buying_positions.db"          # under stock-data/ beside this script
+POSITION_SCHEMA_VERSION = 1
+POSITION_STATUS_OPEN = "OPEN"
+POSITION_STATUS_EXITED = "EXITED"
+EXIT_REASON_BELOW_BREAKOUT_LOW = "BELOW_BREAKOUT_LOW"    # close < breakout-day low
+EXIT_REASON_BREAKOUT_FAILURE = "BREAKOUT_FAILURE"        # close back below HH20[T]
+EXIT_REASON_MOMENTUM_FAILURE = "MOMENTUM_FAILURE"        # RS20[T] <= 0 and RS60[T] <= 0
+EXIT_REASON_ORDER = (
+    EXIT_REASON_BELOW_BREAKOUT_LOW,
+    EXIT_REASON_BREAKOUT_FAILURE,
+    EXIT_REASON_MOMENTUM_FAILURE,
+)
 
 UNIVERSE = [
     "360ONE", "3MINDIA", "ABB", "ACC", "ACMESOLAR", "AIAENG", "APLAPOLLO", "AUBANK", "AWL", "AADHARHFC",
@@ -1154,6 +1179,490 @@ def console_buying_tables(buying_results: pd.DataFrame) -> list[tuple[str, pd.Da
 
 
 # =============================================================================
+# Position tracker: incremental SQLite journal of confirmed breakout selections
+# and exit-strategy monitoring
+# =============================================================================
+_POSITIONS_DDL = """
+CREATE TABLE IF NOT EXISTS buying_positions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol               TEXT    NOT NULL,
+    selected_date        TEXT    NOT NULL,
+    selected_open        REAL,
+    selected_high        REAL,
+    selected_low         REAL,
+    selected_close       REAL,
+    hh20_at_selection    REAL,
+    rs20_at_selection    REAL,
+    rs60_at_selection    REAL,
+    rvol20_at_selection  REAL,
+    atr14_at_selection   REAL,
+    breakout_distance    REAL,
+    close_location       REAL,
+    entry_quality_score  REAL,
+    raw_score            REAL,
+    exit_status          TEXT    NOT NULL DEFAULT 'OPEN'
+                         CHECK (exit_status IN ('OPEN', 'EXITED')),
+    exit_date            TEXT,
+    exit_reason          TEXT,
+    exit_close           REAL,
+    return_pct           REAL,
+    bars_held            INTEGER,
+    last_checked_date    TEXT,
+    last_close           REAL,
+    UNIQUE (symbol, selected_date)
+);
+CREATE INDEX IF NOT EXISTS idx_buying_positions_symbol_date
+    ON buying_positions (symbol, selected_date);
+CREATE INDEX IF NOT EXISTS idx_buying_positions_status
+    ON buying_positions (exit_status, symbol);
+CREATE TABLE IF NOT EXISTS run_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date        TEXT    NOT NULL,
+    recorded_at     TEXT    NOT NULL,
+    provisional     INTEGER NOT NULL DEFAULT 0,
+    new_selections  INTEGER NOT NULL DEFAULT 0,
+    exits           INTEGER NOT NULL DEFAULT 0,
+    open_positions  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+def finite_float(value: Any) -> float | None:
+    """Coerce a value to a finite float, or None when missing or non-finite."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def compute_exit_metrics(stock_ohlcv: pd.DataFrame | None,
+                         benchmark: pd.Series,
+                         as_of: pd.Timestamp) -> dict[str, float] | None:
+    """Exit-strategy inputs for session T using only data on or before T.
+
+    HH20[T] is the highest high of the 20 completed sessions before T (the same
+    definition the buying checks use), and RS20/RS60 are benchmark-relative
+    simple returns over the same horizons. The benchmark series must end at
+    as_of (slice it before calling). Returns None when the session-T row or any
+    required lookback value is absent, so callers report the position as
+    unchecked instead of guessing.
+    """
+    if stock_ohlcv is None or stock_ohlcv.empty:
+        return None
+    aligned = stock_ohlcv.reindex(benchmark.index)
+    aligned = aligned.loc[aligned.index <= as_of]
+    if aligned.empty or aligned.index[-1] != as_of:
+        return None
+    if len(aligned) < RS60_PERIOD + 1:
+        return None
+    close_values = aligned["close"].to_numpy(dtype=float)
+    high_values = aligned["high"].to_numpy(dtype=float)
+    close_t = float(close_values[-1])
+    if not math.isfinite(close_t) or close_t <= 0:
+        return None
+    hh_window = high_values[-HH_PERIOD - 1:-1]
+    if not np.isfinite(hh_window).all():
+        return None
+    stock_c20 = float(close_values[-RS20_PERIOD - 1])
+    stock_c60 = float(close_values[-RS60_PERIOD - 1])
+    bench_c20 = float(benchmark.iloc[-RS20_PERIOD - 1])
+    bench_c60 = float(benchmark.iloc[-RS60_PERIOD - 1])
+    bench_ct = float(benchmark.iloc[-1])
+    for value in (stock_c20, stock_c60, bench_c20, bench_c60, bench_ct):
+        if not math.isfinite(value) or value <= 0:
+            return None
+    return {
+        "close_t": close_t,
+        "hh20_t": float(hh_window.max()),
+        "rs20_t": (close_t / stock_c20 - 1.0) - (bench_ct / bench_c20 - 1.0),
+        "rs60_t": (close_t / stock_c60 - 1.0) - (bench_ct / bench_c60 - 1.0),
+    }
+
+
+def evaluate_exit_reasons(metrics: Mapping[str, float],
+                          selected_low: float | None) -> list[str]:
+    """Apply the three exit rules in priority order; any hit is an exit.
+
+    1. Exit if price closes below the breakout-day low.
+    2. BREAKOUT FAILURE: exit if Close[T] falls back below HH20[T].
+    3. MOMENTUM FAILURE: exit when RS20[T] <= 0 AND RS60[T] <= 0.
+    """
+    reasons: list[str] = []
+    close_t = metrics["close_t"]
+    if (selected_low is not None and math.isfinite(selected_low)
+            and close_t < selected_low):
+        reasons.append(EXIT_REASON_BELOW_BREAKOUT_LOW)
+    if close_t < metrics["hh20_t"]:
+        reasons.append(EXIT_REASON_BREAKOUT_FAILURE)
+    if metrics["rs20_t"] <= 0.0 and metrics["rs60_t"] <= 0.0:
+        reasons.append(EXIT_REASON_MOMENTUM_FAILURE)
+    return reasons
+
+
+def format_exit_details(metrics: Mapping[str, float],
+                        selected_low: float | None,
+                        reasons: Sequence[str]) -> list[str]:
+    """One plain-language line per triggered exit rule, in rule order."""
+    lines: list[str] = []
+    if EXIT_REASON_BELOW_BREAKOUT_LOW in reasons:
+        lines.append(f"{EXIT_REASON_BELOW_BREAKOUT_LOW}: close {metrics['close_t']:.2f} "
+                     f"closed below the breakout-day low {selected_low:.2f}")
+    if EXIT_REASON_BREAKOUT_FAILURE in reasons:
+        lines.append(f"{EXIT_REASON_BREAKOUT_FAILURE}: close {metrics['close_t']:.2f} "
+                     f"fell back below HH20 {metrics['hh20_t']:.2f}")
+    if EXIT_REASON_MOMENTUM_FAILURE in reasons:
+        lines.append(f"{EXIT_REASON_MOMENTUM_FAILURE}: RS20 {metrics['rs20_t']:+.4f} and "
+                     f"RS60 {metrics['rs60_t']:+.4f} are both non-positive")
+    return lines
+
+
+@dataclass
+class PositionTrackerResult:
+    """Outcome of one position-tracker run (selections stored, exits, open set)."""
+
+    db_path: str
+    as_of: str
+    new_selections: list[dict[str, Any]] = field(default_factory=list)
+    exited: list[dict[str, Any]] = field(default_factory=list)
+    still_open: list[dict[str, Any]] = field(default_factory=list)
+    unchecked: list[dict[str, Any]] = field(default_factory=list)
+    open_before: int = 0
+    error: str | None = None
+
+    @property
+    def open_after(self) -> int:
+        """Open positions after this run (before + fresh selections - exits)."""
+        return self.open_before + len(self.new_selections) - len(self.exited)
+
+    def to_metadata(self) -> dict[str, Any]:
+        """JSON-safe summary for the run manifest (no credentials, no NaN)."""
+        return {
+            "db_path": self.db_path,
+            "as_of": self.as_of,
+            "open_positions_before": self.open_before,
+            "open_positions_after": self.open_after,
+            "new_selections": [
+                {"symbol": s["symbol"], "selected_date": s["selected_date"],
+                 "open": s["open"], "high": s["high"], "low": s["low"], "close": s["close"],
+                 "entry_quality_score": s.get("entry_quality_score"),
+                 "raw_score": s.get("raw_score")}
+                for s in self.new_selections
+            ],
+            "exits": [
+                {"symbol": e["symbol"], "selected_date": e["selected_date"],
+                 "exit_date": e["exit_date"], "reasons": e["reasons"],
+                 "exit_close": e["exit_close"], "return_pct": e["return_pct"],
+                 "bars_held": e["bars_held"]}
+                for e in self.exited
+            ],
+            "still_open": [
+                {"symbol": s["symbol"], "selected_date": s["selected_date"],
+                 "last_checked_date": s["last_checked_date"], "last_close": s["last_close"]}
+                for s in self.still_open
+            ],
+            "unchecked": list(self.unchecked),
+            "error": self.error,
+        }
+
+
+class PositionTracker:
+    """Incremental SQLite journal of confirmed breakout selections and exits.
+
+    One row per (symbol, selected_date). Each run stores fresh BUYING CHECKS
+    selections - symbols not already held in the journal on that date - and
+    evaluates the three exit rules for every OPEN row using data through the
+    run's effective date T (never T == selection date, so a stock can only be
+    exited from the next session onward). Exited rows are retained for the
+    full history, so a later fresh breakout of the same symbol is stored as a
+    new selection. The whole run is one transaction; a failure rolls back and
+    is surfaced through PositionTrackerResult.error without aborting the
+    screen.
+    """
+
+    def __init__(self, db_path: Path | str) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._init_schema()
+
+    def close(self) -> None:
+        """Close the connection; safe to call more than once."""
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
+
+    def _init_schema(self) -> None:
+        with self._conn:
+            self._conn.executescript(_POSITIONS_DDL)
+            row = self._conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+                    (str(POSITION_SCHEMA_VERSION),))
+
+    # ---- reads ------------------------------------------------------------
+    def _open_rows(self) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            "SELECT * FROM buying_positions WHERE exit_status = ? "
+            "ORDER BY symbol, selected_date", (POSITION_STATUS_OPEN,)))
+
+    def _open_count(self) -> int:
+        return int(self._conn.execute(
+            "SELECT COUNT(*) FROM buying_positions WHERE exit_status = ?",
+            (POSITION_STATUS_OPEN,)).fetchone()[0])
+
+    def _symbol_held_on(self, symbol: str, as_of_iso: str) -> bool:
+        """True when the journal already tracks this symbol on date as_of.
+
+        Covers every row selected on or before as_of whose holding span still
+        includes as_of (open, or exited on as_of or later). This makes reruns
+        and out-of-order --as-of backfills idempotent.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM buying_positions "
+            "WHERE symbol = ? AND selected_date <= ? "
+            "AND (exit_status = ? OR exit_date IS NULL OR exit_date >= ?) LIMIT 1",
+            (symbol, as_of_iso, POSITION_STATUS_OPEN, as_of_iso)).fetchone()
+        return row is not None
+
+    # ---- writes (call inside a transaction) --------------------------------
+    def record_selections(self, as_of: pd.Timestamp,
+                          buying_results: pd.DataFrame | None,
+                          raw_ohlcv: Mapping[str, pd.DataFrame]) -> list[dict[str, Any]]:
+        """Store fresh BUYING CHECKS selections; return the newly stored rows."""
+        stored: list[dict[str, Any]] = []
+        if buying_results is None or buying_results.empty:
+            return stored
+        as_of_iso = str(as_of.date())
+        for _, row in buying_results.iterrows():
+            symbol = str(row["Symbol"])
+            if self._symbol_held_on(symbol, as_of_iso):
+                logging.debug("Position tracker: %s already held on %s; not re-stored.",
+                              symbol, as_of_iso)
+                continue
+            stock = raw_ohlcv.get(symbol)
+            if stock is None or stock.empty:
+                logging.warning("Position tracker: no OHLCV for %s; selection not stored.", symbol)
+                continue
+            day = stock.loc[stock.index == as_of]
+            if day.empty:
+                logging.warning("Position tracker: %s has no session row for %s; not stored.",
+                                symbol, as_of_iso)
+                continue
+            open_p = finite_float(day["open"].iloc[0])
+            high_p = finite_float(day["high"].iloc[0])
+            low_p = finite_float(day["low"].iloc[0])
+            close_p = finite_float(day["close"].iloc[0])
+            if not all(v is not None and v > 0 for v in (open_p, high_p, low_p, close_p)):
+                logging.warning("Position tracker: %s has invalid breakout-day OHLC on %s; not stored.",
+                                symbol, as_of_iso)
+                continue
+            entry_score = finite_float(row["ENTRY_QUALITY_SCORE"])
+            raw_score = finite_float(row["RAW_SCORE"])
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO buying_positions
+                   (symbol, selected_date, selected_open, selected_high, selected_low,
+                    selected_close, hh20_at_selection, rs20_at_selection, rs60_at_selection,
+                    rvol20_at_selection, atr14_at_selection, breakout_distance, close_location,
+                    entry_quality_score, raw_score, exit_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, as_of_iso, open_p, high_p, low_p, close_p,
+                 finite_float(row["HH20"]), finite_float(row["RS20"]), finite_float(row["RS60"]),
+                 finite_float(row["RVOL20"]), finite_float(row["ATR14"]),
+                 finite_float(row["BreakoutDistance20"]), finite_float(row["CloseLocation"]),
+                 entry_score, raw_score, POSITION_STATUS_OPEN))
+            if cur.rowcount:
+                logging.info("Position tracker: stored new breakout selection %s "
+                             "(selected %s, close %.2f).", symbol, as_of_iso, close_p)
+                stored.append({
+                    "symbol": symbol, "selected_date": as_of_iso,
+                    "open": open_p, "high": high_p, "low": low_p, "close": close_p,
+                    "entry_quality_score": entry_score, "raw_score": raw_score,
+                })
+        return stored
+
+    def check_exits(self, as_of: pd.Timestamp,
+                    benchmark: pd.Series,
+                    raw_ohlcv: Mapping[str, pd.DataFrame]) -> tuple[list[dict[str, Any]],
+                                                                    list[dict[str, Any]],
+                                                                    list[dict[str, Any]]]:
+        """Evaluate the three exit rules for every OPEN row as of session T."""
+        exited: list[dict[str, Any]] = []
+        still_open: list[dict[str, Any]] = []
+        unchecked: list[dict[str, Any]] = []
+        as_of_iso = str(as_of.date())
+        bench_t = benchmark.loc[benchmark.index <= as_of]
+        rows = self._open_rows()
+        if bench_t.empty or bench_t.index[-1] != as_of:
+            for row in rows:
+                unchecked.append({"symbol": row["symbol"],
+                                  "selected_date": row["selected_date"],
+                                  "reason": "BENCHMARK_GAP"})
+            return exited, still_open, unchecked
+        for row in rows:
+            symbol = row["symbol"]
+            selected_date = row["selected_date"]
+            if selected_date > as_of_iso:
+                # Selected after this (backfilled) session: not yet active here.
+                continue
+            if selected_date == as_of_iso:
+                # Selected this session; exit rules apply from the next session.
+                still_open.append(self._open_summary(row, checked=False))
+                continue
+            stock = raw_ohlcv.get(symbol)
+            if stock is None or stock.empty:
+                unchecked.append({"symbol": symbol, "selected_date": selected_date,
+                                  "reason": "NO_DATA"})
+                continue
+            if stock.index.max() < as_of:
+                unchecked.append({"symbol": symbol, "selected_date": selected_date,
+                                  "reason": "STALE"})
+                continue
+            metrics = compute_exit_metrics(stock, bench_t, as_of)
+            if metrics is None:
+                unchecked.append({"symbol": symbol, "selected_date": selected_date,
+                                  "reason": "DATA_GAP"})
+                continue
+            reasons = evaluate_exit_reasons(metrics, row["selected_low"])
+            close_t = metrics["close_t"]
+            bars = self._bars_held(bench_t, selected_date, as_of_iso)
+            if reasons:
+                selected_close = finite_float(row["selected_close"])
+                ret = (close_t / selected_close - 1.0) if selected_close else None
+                self._conn.execute(
+                    """UPDATE buying_positions
+                       SET exit_status = ?, exit_date = ?, exit_reason = ?, exit_close = ?,
+                           return_pct = ?, bars_held = ?, last_checked_date = ?, last_close = ?
+                       WHERE id = ? AND exit_status = ?""",
+                    (POSITION_STATUS_EXITED, as_of_iso, ";".join(reasons), close_t, ret, bars,
+                     as_of_iso, close_t, row["id"], POSITION_STATUS_OPEN))
+                logging.info("Position tracker: %s selected %s meets exit condition on %s (%s).",
+                             symbol, selected_date, as_of_iso, ", ".join(reasons))
+                exited.append({
+                    "symbol": symbol, "selected_date": selected_date, "exit_date": as_of_iso,
+                    "reasons": list(reasons),
+                    "details": format_exit_details(metrics, row["selected_low"], reasons),
+                    "exit_close": close_t, "return_pct": ret, "bars_held": bars,
+                    "last_checked_date": as_of_iso, "last_close": close_t,
+                })
+            else:
+                self._conn.execute(
+                    "UPDATE buying_positions SET last_checked_date = ?, last_close = ? "
+                    "WHERE id = ? AND exit_status = ?",
+                    (as_of_iso, close_t, row["id"], POSITION_STATUS_OPEN))
+                still_open.append(self._open_summary(row, checked=True,
+                                                     last_close=close_t, as_of_iso=as_of_iso))
+        return exited, still_open, unchecked
+
+    @staticmethod
+    def _open_summary(row: sqlite3.Row, checked: bool,
+                      last_close: float | None = None,
+                      as_of_iso: str | None = None) -> dict[str, Any]:
+        return {
+            "symbol": row["symbol"],
+            "selected_date": row["selected_date"],
+            "selected_low": row["selected_low"],
+            "selected_close": row["selected_close"],
+            "last_checked_date": as_of_iso if checked else row["last_checked_date"],
+            "last_close": last_close if checked else None,
+        }
+
+    @staticmethod
+    def _bars_held(bench_t: pd.Series, selected_iso: str, as_of_iso: str) -> int | None:
+        """Trading sessions held, selection and exit sessions inclusive."""
+        cal = bench_t.index
+        t1, t2 = pd.Timestamp(selected_iso), pd.Timestamp(as_of_iso)
+        i1, i2 = cal.searchsorted(t1), cal.searchsorted(t2)
+        if i1 >= len(cal) or i2 >= len(cal) or cal[i1] != t1 or cal[i2] != t2:
+            return None
+        return int(i2 - i1 + 1)
+
+    # ---- orchestration ------------------------------------------------------
+    def run(self, as_of: pd.Timestamp,
+            buying_results: pd.DataFrame | None,
+            raw_ohlcv: Mapping[str, pd.DataFrame],
+            benchmark: pd.Series,
+            provisional: bool = False) -> PositionTrackerResult:
+        """Store fresh selections, check exits, and journal the run atomically."""
+        as_of_iso = str(as_of.date())
+        with self._conn:
+            open_before = self._open_count()
+            new = self.record_selections(as_of, buying_results, raw_ohlcv)
+            exited, still_open, unchecked = self.check_exits(as_of, benchmark, raw_ohlcv)
+            self._conn.execute(
+                """INSERT INTO run_log
+                   (run_date, recorded_at, provisional, new_selections, exits, open_positions)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (as_of_iso, datetime.now(timezone.utc).isoformat(), int(provisional),
+                 len(new), len(exited), open_before + len(new) - len(exited)))
+        return PositionTrackerResult(
+            db_path=str(self.db_path), as_of=as_of_iso,
+            new_selections=new, exited=exited,
+            still_open=still_open, unchecked=unchecked, open_before=open_before)
+
+    def export_csv(self, path: Path) -> None:
+        """Write the full journal (open and exited rows) as a flat CSV report."""
+        columns = [
+            "symbol", "selected_date", "selected_open", "selected_high", "selected_low",
+            "selected_close", "hh20_at_selection", "rs20_at_selection", "rs60_at_selection",
+            "rvol20_at_selection", "atr14_at_selection", "breakout_distance", "close_location",
+            "entry_quality_score", "raw_score", "exit_status", "exit_date", "exit_reason",
+            "exit_close", "return_pct", "bars_held", "last_checked_date", "last_close",
+        ]
+        rows = self._conn.execute(
+            f"SELECT {', '.join(columns)} FROM buying_positions "
+            "ORDER BY selected_date, symbol, exit_date").fetchall()
+        frame = pd.DataFrame(rows, columns=columns)
+        atomic_text(path, frame.to_csv(index=False))
+
+
+def run_position_tracker(db_path: Path,
+                         as_of: pd.Timestamp,
+                         buying_results: pd.DataFrame | None,
+                         raw_ohlcv: Mapping[str, pd.DataFrame],
+                         benchmark: pd.Series,
+                         provisional: bool = False,
+                         export_path: Path | None = None) -> PositionTrackerResult:
+    """Open the journal, store fresh selections, check exits, and close.
+
+    Database failures are contained: the screen still completes and the error
+    is reported in the result (and therefore the console/Telegram sections).
+    """
+    try:
+        tracker = PositionTracker(db_path)
+    except (sqlite3.Error, OSError) as exc:
+        logging.error("Position tracker: cannot open %s: %s", db_path, exc)
+        return PositionTrackerResult(
+            db_path=str(db_path), as_of=str(as_of.date()),
+            error=f"cannot open database: {type(exc).__name__}: {exc}")
+    try:
+        result = tracker.run(as_of, buying_results, raw_ohlcv, benchmark,
+                             provisional=provisional)
+        if export_path is not None and result.error is None:
+            try:
+                tracker.export_csv(export_path)
+            except (sqlite3.Error, OSError) as exc:
+                logging.error("Position tracker: CSV export failed: %s", exc)
+        return result
+    except (sqlite3.Error, OSError) as exc:
+        logging.error("Position tracker: database failure (transaction rolled back): %s", exc)
+        return PositionTrackerResult(
+            db_path=str(db_path), as_of=str(as_of.date()),
+            error=f"{type(exc).__name__}: {exc}")
+    finally:
+        tracker.close()
+
+
+# =============================================================================
 # Output writers and final console report
 # =============================================================================
 def frozen_parameters() -> dict[str, Any]:
@@ -1228,7 +1737,8 @@ def build_universe(metrics: pd.DataFrame, diagnostics: pd.DataFrame,
 def build_run_metadata(metrics: pd.DataFrame, diagnostics: pd.DataFrame,
                        bench: pd.Series, requested: date, provisional: bool,
                        sources: Sequence[str], timestamp: datetime,
-                       buying_results: pd.DataFrame | None = None) -> dict[str, Any]:
+                       buying_results: pd.DataFrame | None = None,
+                       position_tracker: "PositionTrackerResult | None" = None) -> dict[str, Any]:
     """Build an auditable run record with no credentials and no nonstandard JSON values."""
     effective = bench.index[-1].date().isoformat()
     exclusions = [{"Symbol": str(symbol), "reason": str(row["INELIGIBLE_REASON"])}
@@ -1245,6 +1755,8 @@ def build_run_metadata(metrics: pd.DataFrame, diagnostics: pd.DataFrame,
     }
     if buying_results is not None:
         output_labels[f"buying_checks_{effective}.csv"] = {"PROVISIONAL": provisional}
+    if position_tracker is not None and position_tracker.error is None:
+        output_labels[f"positions_{effective}.csv"] = {"PROVISIONAL": provisional}
 
     meta: dict[str, Any] = {
         "as_of_requested": requested.isoformat(), "as_of_effective": effective,
@@ -1302,6 +1814,8 @@ def build_run_metadata(metrics: pd.DataFrame, diagnostics: pd.DataFrame,
                 for _, row in buying_results.iterrows()
             ] if not buying_results.empty else [],
         }
+    if position_tracker is not None:
+        meta["position_tracker"] = position_tracker.to_metadata()
     return meta
 
 
@@ -1376,6 +1890,10 @@ def console_legend() -> str:
         "    BreakoutDist : (Close - HH20) / ATR14 (requires 0.0 to 1.5 ATRs).",
         "    CloseLoc : (Close - Low) / (High - Low) on session T (breakout quality).",
         "    ENTRY_QUALITY_SCORE : Normalized 0-100 score among passing buying candidates.",
+        "  POSITION TRACKER (DB stock-data/buying_positions.db):",
+        "    Stores each new breakout selection with its breakout-day open/high/low/close.",
+        "    Exit 1: close below the breakout-day low.  Exit 2: close back below HH20.",
+        "    Exit 3: RS20 <= 0 and RS60 <= 0 (momentum failure).",
         "  Example: +5.00 pp means 5 percentage points ahead of NIFTY 500.",
         "  Scores are comparisons, not probabilities or promises of future gains.",
         "  Console: % / pp. CSV and JSON: returns remain decimal fractions.",
@@ -1384,8 +1902,9 @@ def console_legend() -> str:
 
 def console_report(metadata: Mapping[str, Any], metrics: pd.DataFrame | None = None,
                    aborted: str | None = None, out_dir: Path | None = None,
-                   buying_results: pd.DataFrame | None = None) -> None:
-    """The only application print site: displays only the two requested stock selection tables."""
+                   buying_results: pd.DataFrame | None = None,
+                   position_tracker: "PositionTrackerResult | None" = None) -> None:
+    """The only application print site: selection tables and the position tracker."""
     divider = "-" * 88
     if aborted:
         print("\n" + divider)
@@ -1422,6 +1941,62 @@ def console_report(metadata: Mapping[str, Any], metrics: pd.DataFrame | None = N
                 print("\n" + title)
                 print(divider)
                 print(table.to_string(index=False, justify="right"))
+
+    if position_tracker is not None:
+        print("\n" + divider)
+        print(f"POSITION TRACKER | CONFIRMED BREAKOUTS | DB: {position_tracker.db_path}")
+        print(f"As of {position_tracker.as_of}")
+        print(divider)
+        if position_tracker.error:
+            print(f"\nPosition tracker error: {position_tracker.error}")
+            print()
+            return
+        if position_tracker.new_selections:
+            print(f"\nNEW SELECTIONS STORED THIS RUN ({len(position_tracker.new_selections)}):")
+            for sel in position_tracker.new_selections:
+                score = (f"{sel['entry_quality_score']:.2f}"
+                         if sel.get("entry_quality_score") is not None else "  -  ")
+                print(f"  {sel['symbol']:<12} selected {sel['selected_date']} | "
+                      f"O {sel['open']:.2f}  H {sel['high']:.2f}  L {sel['low']:.2f}  "
+                      f"C {sel['close']:.2f} | quality {score}")
+        else:
+            print("\nNEW SELECTIONS STORED THIS RUN: none.")
+
+        if position_tracker.open_before or position_tracker.exited:
+            print(f"\nEXIT STRATEGY CHECKS ({position_tracker.open_before} open position(s) "
+                  f"monitored as of {position_tracker.as_of}):")
+            if not position_tracker.exited:
+                print("  No open position met an exit condition this run.")
+            for exit_info in position_tracker.exited:
+                print(f"  {exit_info['symbol']:<12} stock selected on {exit_info['selected_date']} "
+                      f"meets exit condition on {exit_info['exit_date']}")
+                for line in exit_info["details"]:
+                    print(f"      {line}")
+                ret = (f"{exit_info['return_pct'] * 100:+.2f}%"
+                       if exit_info["return_pct"] is not None else "n/a")
+                bars = (f"{exit_info['bars_held']} session(s)"
+                        if exit_info["bars_held"] is not None else "n/a")
+                print(f"      exit close {exit_info['exit_close']:.2f} | return {ret} | held {bars}")
+        if position_tracker.still_open:
+            print(f"\nSTILL OPEN ({len(position_tracker.still_open)}):")
+            for open_pos in position_tracker.still_open:
+                checked = open_pos["last_checked_date"] or "not yet (selected this session)"
+                close = (f"{open_pos['last_close']:.2f}"
+                         if open_pos["last_close"] is not None else "  -   ")
+                stop = (f"{open_pos['selected_low']:.2f}"
+                        if open_pos["selected_low"] is not None else "  -  ")
+                margin = ""
+                if (open_pos["last_close"] is not None and open_pos["selected_low"]
+                        and open_pos["selected_low"] > 0):
+                    margin = f" | {(open_pos['last_close'] / open_pos['selected_low'] - 1.0) * 100:+.2f}% vs stop"
+                print(f"  {open_pos['symbol']:<12} selected {open_pos['selected_date']} | "
+                      f"stop {stop} | last checked {checked} | close {close}{margin}")
+        if position_tracker.unchecked:
+            print(f"\nNOT CHECKED THIS RUN ({len(position_tracker.unchecked)}):")
+            for not_checked in position_tracker.unchecked:
+                print(f"  {not_checked['symbol']:<12} selected {not_checked['selected_date']} | "
+                      f"{not_checked['reason']}")
+        print(f"\nOpen positions after this run: {position_tracker.open_after}")
     print()
 
 
@@ -1439,6 +2014,7 @@ def build_telegram_messages(
     metrics: pd.DataFrame | None = None,
     aborted: str | None = None,
     buying_results: pd.DataFrame | None = None,
+    position_tracker: "PositionTrackerResult | None" = None,
     max_chars: int = 3900,
 ) -> list[str]:
     """Compose structured, formatted Telegram messages containing readable tables."""
@@ -1495,6 +2071,38 @@ def build_telegram_messages(
                         f"<pre>{html.escape(table_str)}</pre>"
                     )
                     sections.append(txt)
+
+    # 3. Position tracker (breakout selections journal and exit strategy)
+    if position_tracker is not None:
+        lines = ["<b>3. POSITION TRACKER</b>"]
+        if position_tracker.error:
+            lines.append(f"⚠️ <pre>{html.escape(position_tracker.error)}</pre>")
+        else:
+            if position_tracker.new_selections:
+                lines.append("📌 New: " + ", ".join(
+                    f"{s['symbol']} ({s['selected_date']})" for s in position_tracker.new_selections))
+            for exit_info in position_tracker.exited:
+                lines.append(
+                    f"🚪 <b>{exit_info['symbol']}</b>: stock selected on "
+                    f"{exit_info['selected_date']} meets exit condition on {exit_info['exit_date']}"
+                )
+                for line in exit_info["details"]:
+                    lines.append(f"<i>{html.escape(line)}</i>")
+                if exit_info["return_pct"] is not None:
+                    lines.append(
+                        f"Return {exit_info['return_pct'] * 100:+.2f}% | "
+                        f"held {exit_info['bars_held']} session(s)")
+            if position_tracker.still_open:
+                lines.append("📈 Still open: " + ", ".join(
+                    s["symbol"] for s in position_tracker.still_open))
+            if position_tracker.unchecked:
+                lines.append("⚠️ Not checked: " + ", ".join(
+                    f"{u['symbol']} ({u['reason']})" for u in position_tracker.unchecked))
+            if (not position_tracker.new_selections and not position_tracker.exited
+                    and not position_tracker.still_open and not position_tracker.unchecked):
+                lines.append("No positions in the journal; nothing to monitor.")
+            lines.append(f"Open positions: {position_tracker.open_after}")
+        sections.append("\n".join(lines))
 
     # Pack sections into messages up to max_chars
     messages: list[str] = []
@@ -1579,6 +2187,7 @@ def send_telegram_report(
     metrics: pd.DataFrame | None = None,
     aborted: str | None = None,
     buying_results: pd.DataFrame | None = None,
+    position_tracker: "PositionTrackerResult | None" = None,
     session: requests.Session | None = None,
     timeout: float = 15.0,
 ) -> bool:
@@ -1590,7 +2199,8 @@ def send_telegram_report(
         return False
 
     messages = build_telegram_messages(metadata, metrics=metrics, aborted=aborted,
-                                       buying_results=buying_results)
+                                       buying_results=buying_results,
+                                       position_tracker=position_tracker)
     if not messages:
         return False
 
@@ -1640,6 +2250,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-intraday", action="store_true")
     parser.add_argument("--no-telegram", action="store_true", default=False,
                         help="Disable sending Telegram notifications even if credentials are configured.")
+    parser.add_argument("--db", type=Path, default=STOCK_DATA_ROOT / STOCK_DB_NAME,
+                        help="Position-tracker SQLite journal (default: "
+                             "stock-data/buying_positions.db beside this script).")
+    parser.add_argument("--no-position-tracking", action="store_true", default=False,
+                        help="Skip the position-tracker journal (no DB reads or writes). "
+                             "Use for pure screening or scratch --out runs.")
     parser.add_argument("--log-level", type=str.upper, default="INFO",
                         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     return parser
@@ -1725,8 +2341,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ScreenerError as error:
             # Emit an explicit unsuccessful run manifest, not success-like CSVs.
             empty_metrics = pd.DataFrame(columns=list(FLAG_COLUMNS))
+            # Exits can still be monitored when the screen itself aborts: use the
+            # data that fetched successfully and leave the rest unchecked.
+            tracker_result = None
+            if not args.no_position_tracking:
+                tracker_result = run_position_tracker(
+                    args.db, closes.index[-1], None, raw_ohlcv,
+                    benchmark.reindex(closes.index), provisional,
+                    args.out / f"positions_{closes.index[-1].date().isoformat()}.csv")
             metadata = build_run_metadata(empty_metrics, diagnostics, benchmark, requested,
-                                          provisional, sorted(client.sources), datetime.now(timezone.utc))
+                                          provisional, sorted(client.sources), datetime.now(timezone.utc),
+                                          position_tracker=tracker_result)
             metadata["status"] = "aborted"
             metadata["error"] = str(error)
             metadata["counts"]["per_flag"] = {name: None for name in FLAG_COLUMNS}
@@ -1735,11 +2360,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             metadata["output_labels"] = {
                 f"run_{metadata['as_of_effective']}.json": {"PROVISIONAL": provisional}
             }
+            if tracker_result is not None and tracker_result.error is None:
+                metadata["output_labels"][
+                    f"positions_{metadata['as_of_effective']}.csv"] = {"PROVISIONAL": provisional}
             atomic_text(args.out / f"run_{metadata['as_of_effective']}.json",
                         json.dumps(metadata, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
-            console_report(metadata, aborted=str(error), out_dir=args.out)
+            console_report(metadata, aborted=str(error), out_dir=args.out,
+                           position_tracker=tracker_result)
             if not args.no_telegram:
-                send_telegram_report(credentials, metadata, aborted=str(error))
+                send_telegram_report(credentials, metadata, aborted=str(error),
+                                     position_tracker=tracker_result)
             return 1
         aligned_bench = benchmark.reindex(closes.index)
         metrics = compute_metrics(closes, aligned_bench)
@@ -1747,14 +2377,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Stage 2: Buying checks for FINAL_QUALIFIER stocks
         buying_results = evaluate_buying_candidates(metrics, raw_ohlcv, aligned_bench)
 
+        # Position tracker: store fresh breakout selections, monitor exits.
+        tracker_result = None
+        if not args.no_position_tracking:
+            tracker_result = run_position_tracker(
+                args.db, aligned_bench.index[-1], buying_results, raw_ohlcv,
+                aligned_bench, provisional,
+                args.out / f"positions_{aligned_bench.index[-1].date().isoformat()}.csv")
+
         metadata = build_run_metadata(metrics, diagnostics, benchmark, requested,
                                       provisional, sorted(client.sources), datetime.now(timezone.utc),
-                                      buying_results=buying_results)
+                                      buying_results=buying_results, position_tracker=tracker_result)
         metadata["status"] = "success"
         write_outputs(args.out, metrics, diagnostics, benchmark, metadata, buying_results=buying_results)
-        console_report(metadata, metrics, out_dir=args.out, buying_results=buying_results)
+        console_report(metadata, metrics, out_dir=args.out, buying_results=buying_results,
+                       position_tracker=tracker_result)
         if not args.no_telegram:
-            send_telegram_report(credentials, metadata, metrics=metrics, buying_results=buying_results)
+            send_telegram_report(credentials, metadata, metrics=metrics, buying_results=buying_results,
+                                 position_tracker=tracker_result)
         return 0
     except ScreenerError as error:
         logging.error("%s", error)
