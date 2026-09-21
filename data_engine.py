@@ -24,7 +24,7 @@ from core import (
     load_config, setup_logging,
     get_nse_holidays, get_high_impact_events,
     vrp_anomaly_limit, VRP_RV_DEAD_PCT,
-    by_dte,
+    by_dte, dte_blend,
 )
 
 
@@ -1273,12 +1273,14 @@ class MarketDataEngine:
             _dte_rv = self.state.get("actual_dte", 2)
             if _dte_rv is None:
                 _dte_rv = 2
-            if _dte_rv == 0:
+            # v51: lookback continuous on life — full session near expiry,
+            # ~90 bars on fresh weeklies. No discrete dte==0/1/else table.
+            if dte_blend(_dte_rv) >= 0.9:
                 rolling = bars[bars["time"] >= "09:15:00"] if "time" in bars.columns else bars
-            elif _dte_rv == 1:
-                rolling = bars.tail(120)
             else:
-                rolling = bars.tail(90)
+                _n_lb = int(round(by_dte(_dte_rv, 240.0, 90.0)))
+                _n_lb = max(60, min(_n_lb, len(bars)))
+                rolling = bars.tail(_n_lb)
             valid   = rolling[
                 (rolling["high"] > rolling["low"]) &
                 (rolling["high"] > 0) &
@@ -1643,15 +1645,17 @@ class MarketDataEngine:
         if opening_straddle <= 0 or spot is None:
             return 0.0
         _dte = self.state.get("actual_dte", 0) or 0
-        if _dte >= 2:
-            import math as _math
-            _theta_frac = max(1.0 / max(_dte, 1), 0.10)
-            _straddle_ref = max(
-                opening_straddle * _math.sqrt(_theta_frac),
-                60.0
-            )
-        else:
-            _straddle_ref = opening_straddle
+        # v51: straddle reference scales continuously toward the
+        # remaining-life theta fraction (weekly) from the full opening
+        # straddle (expiry). Removes the dte>=2 boolean fork.
+        try:
+            _dte_i = int(_dte)
+        except (TypeError, ValueError):
+            _dte_i = 0
+        import math as _math
+        _theta_frac = max(1.0 / max(_dte_i, 1), 0.10) if _dte_i > 0 else 1.0
+        _weekly_ref = max(opening_straddle * _math.sqrt(_theta_frac), 60.0)
+        _straddle_ref = by_dte(_dte_i, opening_straddle, _weekly_ref)
         # ── v3.2: normalise by ELAPSED TIME ───────────────────────────
         # The realised range was compared against the straddle for the
         # WHOLE day. That makes the ratio meaninglessly small at 10:00
@@ -1767,15 +1771,15 @@ class MarketDataEngine:
         if opening_straddle <= 0 or spot is None:
             return 0.0, 0.0
         _dte = self.state.get("actual_dte", 0) or 0
-        if _dte >= 2:
-            import math as _math
-            _theta_frac = max(1.0 / max(_dte, 1), 0.10)
-            _straddle_ref = max(
-                opening_straddle * _math.sqrt(_theta_frac),
-                60.0
-            )
-        else:
-            _straddle_ref = opening_straddle
+        # v51: continuous life blend (same curve as day_move_used).
+        try:
+            _dte_i = int(_dte)
+        except (TypeError, ValueError):
+            _dte_i = 0
+        import math as _math
+        _theta_frac = max(1.0 / max(_dte_i, 1), 0.10) if _dte_i > 0 else 1.0
+        _weekly_ref = max(opening_straddle * _math.sqrt(_theta_frac), 60.0)
+        _straddle_ref = by_dte(_dte_i, opening_straddle, _weekly_ref)
         import math as _math_dm
         _elapsed_dm = max(0.0, (
             datetime.combine(today_ist(), now_ist().time()) -
@@ -1886,12 +1890,9 @@ class MarketDataEngine:
             _dte_now = self.state.get("actual_dte", 2)
             if _dte_now is None:
                 _dte_now = 2
-            if _dte_now == 0:
-                _ratio_lo, _ratio_hi = 0.25, 9.00
-            elif _dte_now == 1:
-                _ratio_lo, _ratio_hi = 0.35, 5.00
-            else:
-                _ratio_lo, _ratio_hi = 0.50, 3.00
+            # v51: ATM-IV vs VIX sanity band continuous on life.
+            _ratio_lo = by_dte(_dte_now, 0.25, 0.50)
+            _ratio_hi = by_dte(_dte_now, 9.00, 3.00)
             if ratio < _ratio_lo or ratio > _ratio_hi:
                 self.logger.warning(
                     f"ATM IV {atm_iv*100:.2f}% vs VIX {vix_state:.2f} "

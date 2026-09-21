@@ -1547,27 +1547,34 @@ class StrategyEngine:
     #   2. Confirmed two-way auction -> sell the tested EXTREME only,
     #      otherwise wait.
     #   3. Location lean (session range >= RANGE_LEAN_MIN_PTS):
-    #      mature ADX uses 0.62/0.38; soft tape evidence (EMA / price /
-    #      VWAP agreement) uses a tighter 0.70/0.30 so early grinds still
-    #      sell the away side without waiting for ADX maturity.
+    #      mature ADX uses 0.62/0.38; soft tape evidence (EMA / VWAP)
+    #      uses 0.65/0.35 so early grinds still sell the away side
+    #      without waiting for ADX maturity.
     #   4. True pin only: narrow OR, mature flat ADX, mid location, contained
-    #      session range, before noon -> butterfly (where DTE_REQUIREMENTS
-    #      allow) else iron condor.
+    #      session range, before noon -> butterfly (pin-life) else iron condor.
     #   5. Otherwise -> NO_TRADE wait. Never default-IC.
     RANGE_LEAN_MIN_PTS   = 50.0
     RANGE_LEAN_HI        = 0.62
     RANGE_LEAN_LO        = 0.38
-    RANGE_SOFT_LEAN_HI   = 0.70
-    RANGE_SOFT_LEAN_LO   = 0.30
+    # v51/v52: soft lean catches early grinds before a false pin.
+    # Live 21-Sep sold IC on MODERATE OR at loc mid / ADX 15; soft lean
+    # at 0.58/0.42 with EMA/VWAP evidence books the away-side vertical.
+    RANGE_SOFT_LEAN_HI   = 0.58
+    RANGE_SOFT_LEAN_LO   = 0.42
     TWO_WAY_FADE_HI      = 0.85
     TWO_WAY_FADE_LO      = 0.15
     TWO_WAY_MIN_RANGE    = 85.0
     BUTTERFLY_ADX_MAX    = 18.0
-    CONDOR_PIN_ADX_MAX   = 22.0
+    CONDOR_PIN_ADX_MAX   = 20.0
     BUTTERFLY_ATM_DIST   = 50.0
     CONDOR_MAX_SESSION_RANGE_PTS = 100.0
-    PIN_LOC_LO           = 0.38
-    PIN_LOC_HI           = 0.62
+    PIN_LOC_LO           = 0.40
+    PIN_LOC_HI           = 0.60
+    # Near-expiry pin life: dte_blend >= this ≈ DTE 0–1 (butterfly OK).
+    PIN_LIFE_MIN         = 0.35
+    # True pin needs a NARROW opening range. MODERATE was the live
+    # 16/17/21-Sep IC catch-all (selection_reason ended at adx=N with
+    # or=MODERATE) — professionals do not pin a moderate OR.
 
     def _soft_location_evidence(self, signals: dict, side: str) -> bool:
         """EMA / price-regime / VWAP agreement for an early location lean.
@@ -1615,10 +1622,7 @@ class StrategyEngine:
         signals:       dict,
     ) -> Tuple[str, str]:
         """Return (strategy_or_NO_TRADE, why). DTE-agnostic by design."""
-        try:
-            _dte = int(dte) if dte is not None else -1
-        except (TypeError, ValueError):
-            _dte = -1
+        # dte is reserved for pin-life checks (butterfly) via dte_blend only.
 
         # 1. structural bearish lean
         _lean, _lean_reason = self._range_day_bearish_lean(signals)
@@ -1680,9 +1684,10 @@ class StrategyEngine:
                     )
                     return BEAR_CALL_SPREAD, f"range_soft_location_lean_{_loc:.2f}"
 
-        # 4. true pin only — never a catch-all. Condor/fly need a contained
-        # mid-range auction with a real flat ADX read.
-        _pin_or = or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
+        # 4. true pin only — never a catch-all. Condor/fly need a NARROW
+        # opening range, mid location, and a real flat ADX read. MODERATE
+        # OR is not a pin (live 21-Sep IC at or=MODERATE adx=15).
+        _pin_or = or_condition in ("VERY_NARROW", "NARROW")
         _pin_adx = (
             adx_15_mature
             and 0.0 < adx_15 < self.CONDOR_PIN_ADX_MAX
@@ -1690,16 +1695,26 @@ class StrategyEngine:
         _pin_loc = self.PIN_LOC_LO < _loc < self.PIN_LOC_HI
         _pin_rng = _rng < self.CONDOR_MAX_SESSION_RANGE_PTS
         _pin_vol = vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+        # Soft directional grind evidence at mid-ish location still
+        # forbids a pin — sell the away side or wait.
+        _grind_away = (
+            (_loc >= self.RANGE_SOFT_LEAN_HI
+             and self._soft_location_evidence(signals, "BULL"))
+            or (_loc <= self.RANGE_SOFT_LEAN_LO
+                and self._soft_location_evidence(signals, "BEAR"))
+        )
         if (_pin_or and _pin_adx and _pin_loc and _pin_rng and _pin_vol
-                and current_time < dtime(12, 0) and not _event):
+                and current_time < dtime(12, 0) and not _event
+                and not _grind_away):
             spot       = float(signals.get("spot") or 0)
             atm_strike = int(signals.get("atm_strike") or 0)
-            _ib_lo, _ib_hi = DTE_REQUIREMENTS.get(IRON_BUTTERFLY, (0, 1))
+            # v51: butterfly eligibility is remaining *life*, not a calendar
+            # DTE row. dte_blend >= PIN_LIFE_MIN ≈ DTE 0–1 pin gamma.
             if (or_condition in ("VERY_NARROW", "NARROW")
                     and adx_15 < self.BUTTERFLY_ADX_MAX
                     and atm_strike > 0
                     and abs(spot - atm_strike) < self.BUTTERFLY_ATM_DIST
-                    and _ib_lo <= _dte <= _ib_hi):
+                    and dte_blend(dte) >= self.PIN_LIFE_MIN):
                 return IRON_BUTTERFLY, f"pinned_narrow_range_adx_{adx_15:.0f}"
             return IRON_CONDOR, f"pinned_mid_range_adx_{adx_15:.0f}"
 
@@ -1843,11 +1858,33 @@ class StrategyEngine:
         cfg = self.config
         if not bool(getattr(cfg, "counter_trend_entry_block", True)):
             return None
-        # PATCH_V26: fading a two-way day-high IS selling into a measured
-        # uptrend label. The latch was written to stop 17-Sep 09:46 BCS
-        # into a first poke; the afternoon extreme is the opposite trade.
-        if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+        # v52: fade exemption ONLY on a confirmed two-way auction.
+        # Live 21-Sep sold BEAR_CALL into UPTREND under a high-fade flag
+        # on a one-way grind (−₹261). Mean-reversion fades need both
+        # edges; otherwise fall through to the measured-trend refusal.
+        _fade = bool(
+            signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
+        )
+        if _fade and bool(signals.get("two_way_auction")):
             return None
+        # Direct price-regime veto (same at every DTE): never sell the
+        # threatened side of a labelled trend unless two-way confirmed.
+        _px = str(signals.get("price_regime") or "")
+        _tw = bool(signals.get("two_way_auction"))
+        if not _tw:
+            if (strategy_name == BEAR_CALL_SPREAD
+                    and _px in ("UPTREND", "STRONG_UPTREND")
+                    and not self._day_structure_bearish(signals)[0]):
+                return (
+                    f"counter_trend_entry_blocked:{strategy_name}:"
+                    f"price_regime_{_px}"
+                )
+            if (strategy_name == BULL_PUT_SPREAD
+                    and _px in ("DOWNTREND", "STRONG_DOWNTREND")):
+                return (
+                    f"counter_trend_entry_blocked:{strategy_name}:"
+                    f"price_regime_{_px}"
+                )
         latch = self._tape_displacement(signals)
         if not latch:
             return None
@@ -1994,9 +2031,12 @@ class StrategyEngine:
             atm_strike = int(signals.get("atm_strike") or 0)
             if atm_strike > 0 and abs(spot - atm_strike) > 50:
                 return False, f"butterfly_spot_too_far_from_atm_{atm_strike:.0f}"
-            _ib_lo, _ib_hi = DTE_REQUIREMENTS.get(IRON_BUTTERFLY, (0, 1))
-            if dte is None or not (_ib_lo <= int(dte) <= _ib_hi):
-                return False, f"butterfly_requires_dte_{_ib_lo}_to_{_ib_hi}_not_{dte}"
+            # v51: pin-life gate (same curve as the range resolver).
+            if dte is None or dte_blend(dte) < self.PIN_LIFE_MIN:
+                return False, (
+                    f"butterfly_requires_pin_life_ge_{self.PIN_LIFE_MIN}"
+                    f"_got_blend_{dte_blend(dte):.2f}_dte_{dte}"
+                )
             # An ATM straddle sold after noon is all gamma and no theta on
             # any near-dated series; the resolver already stops at 12:00.
             if current_time >= dtime(12, 0):
@@ -2007,9 +2047,9 @@ class StrategyEngine:
             # satisfies every "< threshold" test on a trend day.
             if not bool(signals.get("adx_15_mature", False)):
                 return False, "butterfly_requires_mature_adx"
-            if signals.get("or_condition", "MODERATE") not in ("VERY_NARROW", "NARROW", "MODERATE"):
+            if signals.get("or_condition", "MODERATE") not in ("VERY_NARROW", "NARROW"):
                 return False, (
-                    f"butterfly_requires_moderate_or_better_not_{signals.get('or_condition')}"
+                    f"butterfly_requires_narrow_or_not_{signals.get('or_condition')}"
                 )
 
         elif strategy_name == IRON_CONDOR:
@@ -2034,8 +2074,18 @@ class StrategyEngine:
                 return False, "condor_requires_mature_adx"
             if bool(signals.get("two_way_auction")):
                 return False, "condor_banned_on_two_way_auction"
+            # v52: pin needs a NARROW OR. MODERATE was the live IC catch-all.
+            if signals.get("or_condition") not in ("VERY_NARROW", "NARROW"):
+                return False, (
+                    f"condor_requires_narrow_or_got_{signals.get('or_condition')}"
+                )
             if signals.get("or_condition") == "VERY_WIDE":
                 return False, "condor_blocked_very_wide_or"
+            if adx_15 >= self.CONDOR_PIN_ADX_MAX:
+                return False, (
+                    f"condor_blocked_adx_{adx_15:.0f}_above_pin_max_"
+                    f"{self.CONDOR_PIN_ADX_MAX:.0f}"
+                )
             # ── Condor tape rules: the same at every DTE ─────────────────
             # A condor is a PIN trade. It is refused when the session has
             # already shown it does not pin, whatever the calendar says:
@@ -2061,10 +2111,16 @@ class StrategyEngine:
                     f"condor_blocked_after_failed_break_"
                     f"{_ic_rng:.0f}pts_prefer_extreme_fade"
                 )
+            # Soft lean thresholds: any grind evidence → vertical, not IC.
             if _ic_rng >= self.RANGE_LEAN_MIN_PTS and (
-                    _ic_loc >= self.RANGE_LEAN_HI or _ic_loc <= self.RANGE_LEAN_LO):
+                    _ic_loc >= self.RANGE_SOFT_LEAN_HI
+                    or _ic_loc <= self.RANGE_SOFT_LEAN_LO):
                 return False, (
                     f"condor_location_drift_{_ic_loc:.2f}_prefer_vertical"
+                )
+            if not (self.PIN_LOC_LO < _ic_loc < self.PIN_LOC_HI):
+                return False, (
+                    f"condor_location_not_mid_{_ic_loc:.2f}_prefer_wait_or_vertical"
                 )
 
         elif strategy_name == BULL_PUT_SPREAD:
@@ -2211,40 +2267,40 @@ class StrategyEngine:
         # chosen by delta independently, then clamped into a sanity band
         # around the expected REMAINING move so a mis-quoted greek can
         # never put a strike somewhere absurd.
-        # v4.2: fresh-weekly sessions (DTE >= 2) sell different shorts
-        # depending on the STRUCTURE: a delta-neutral condor wants ~0.20
-        # delta per side (a 0.31-0.42 delta symmetric book is short delta
-        # and tripped the wing-cost gate - measured 2026-09-09/10), while a
-        # directional vertical is a directional-expression spread that
-        # desks conventionally sell at 0.28-0.32 delta on the favoured side,
-        # using the other side's OI wall as the wall being sold into.
-        # Remaining-life flag: dte_blend < 0.35 is DTE >= 2 (weekly
-        # vega). DTE 0/1 use the expiry ladder. Tape rules do NOT
-        # branch here — only strike/wing economics.
-        _weekly_life = dte_blend(dte) < 0.35
+        # v4.2 / v51: short delta is continuous on remaining life.
+        # Condors blend expiry-day (~0.22 flat) ↔ weekly (~0.24 flat)
+        # anchors via by_dte — no boolean weekly fork. Verticals keep the
+        # directional desk ladder (config short_delta_*); VIX shave scales
+        # with near-expiry gamma weight so weeklies are not over-shaved.
         _neutral_condor = strategy_name == IRON_CONDOR
-        if _weekly_life and _neutral_condor:
+        if _neutral_condor:
             if adx_15 >= self.config.adx_strong_threshold:
-                delta_target = float(getattr(self.config,
-                                             "short_delta_strong_weekly", 0.18))
+                delta_target = by_dte(
+                    dte,
+                    float(getattr(self.config, "short_delta_strong", 0.15)),
+                    float(getattr(self.config, "short_delta_strong_weekly", 0.18)),
+                )
             elif adx_15 >= self.config.adx_trend_threshold:
-                delta_target = float(getattr(self.config,
-                                             "short_delta_trend_weekly", 0.22))
+                delta_target = by_dte(
+                    dte,
+                    float(getattr(self.config, "short_delta_trend", 0.18)),
+                    float(getattr(self.config, "short_delta_trend_weekly", 0.22)),
+                )
             else:
-                delta_target = float(getattr(self.config,
-                                             "short_delta_flat_weekly", 0.24))
-            # regime layer can force the wider strong-delta target on a
-            # RANGE tape with elevated ADX (v4.2 wide condor)
+                delta_target = by_dte(
+                    dte,
+                    float(getattr(self.config, "short_delta_flat", 0.22)),
+                    float(getattr(self.config, "short_delta_flat_weekly", 0.24)),
+                )
             if signals.get("weekly_wide_condor"):
                 delta_target = min(
                     delta_target,
-                    float(getattr(self.config,
-                                  "short_delta_strong_weekly", 0.18)),
+                    by_dte(
+                        dte,
+                        float(getattr(self.config, "short_delta_strong", 0.15)),
+                        float(getattr(self.config, "short_delta_strong_weekly", 0.18)),
+                    ),
                 )
-            if vix < 12.0:
-                delta_target = max(delta_target - 0.01, 0.10)
-            elif vix < 14.0:
-                delta_target = max(delta_target - 0.01, 0.11)
         else:
             if adx_15 >= self.config.adx_strong_threshold:
                 delta_target = float(getattr(self.config, "short_delta_strong", 0.15))
@@ -2253,14 +2309,13 @@ class StrategyEngine:
             else:
                 delta_target = float(getattr(self.config, "short_delta_flat", 0.22))
 
-            # The low-VIX delta shave is a 0DTE fast-gamma calibration;
-            # on fresh weeklies the favoured-side vertical keeps the
-            # canonical ~0.30 short delta.
-            if not _weekly_life:
-                if vix < 12.0:
-                    delta_target = max(delta_target - 0.02, 0.10)
-                elif vix < 14.0:
-                    delta_target = max(delta_target - 0.01, 0.11)
+        # Low-VIX delta shave: full on expiry gamma, none on fresh weeklies.
+        _shave_hi = by_dte(dte, 0.02, 0.0)
+        _shave_lo = by_dte(dte, 0.01, 0.0)
+        if vix < 12.0 and _shave_hi > 1e-9:
+            delta_target = max(delta_target - _shave_hi, 0.10)
+        elif vix < 14.0 and _shave_lo > 1e-9:
+            delta_target = max(delta_target - _shave_lo, 0.11)
 
         # Expected remaining move: the market's own priced expectation for
         # what is left of the session (published by data_engine).
@@ -2279,41 +2334,46 @@ class StrategyEngine:
         if _em <= 10 and spot > 0:
             _em = spot * 0.004
 
-        # v4.2: the intraday-remaining-EM band is correct for 0DTE (the
-        # option's life IS the rest of the session), but a DTE3/4 weekly
-        # CONDOR short at ~0.18-0.24 delta sits ~0.9-1.2x the expiry-horizon
-        # expected move away, and the session-remaining EM collapses toward
-        # zero through the afternoon: at 13:00 on 2026-09-09 it was 70 pts,
-        # so even a 2.10x intraday ceiling clamped the weekly shorts back to
-        # 0.37 delta and re-tripped the wing-cost gate. Weekly condors are
-        # therefore sanity-banded in the chain's OWN current ATM straddle
-        # (the chain-implied expiry scale, roughly time-of-day invariant).
-        # Weekly verticals keep the intraday band: their favoured-side
-        # 0.30 delta short is an intraday-expression leg by design.
-        if _weekly_life and _neutral_condor:
-            _wk_atm = min(chain.keys(), key=lambda k: abs(float(k) - float(spot)))
-            _wk_qc = chain.get(float(_wk_atm), {}).get("call") or {}
-            _wk_qp = chain.get(float(_wk_atm), {}).get("put") or {}
-            _wk_straddle = 0.0
-            if _wk_qc and _wk_qp:
-                _wk_straddle = (
-                    (float(_wk_qc.get("bid", 0)) + float(_wk_qc.get("ask", 0))
-                     + float(_wk_qp.get("bid", 0)) + float(_wk_qp.get("ask", 0)))
-                    / 2.0
-                )
-            _wk_scale = _wk_straddle if _wk_straddle > 20 else _em
-            _band_lo = float(getattr(self.config,
-                                     "em_band_lo_weekly", 0.55)) * _wk_scale
-            _band_hi = float(getattr(self.config,
-                                     "em_band_hi_condor_weekly", 1.35)) * _wk_scale
-        elif _weekly_life:
-            _band_lo = float(getattr(self.config,
-                                     "em_band_lo_weekly", 0.55)) * _em
-            _band_hi = float(getattr(self.config,
-                                     "em_band_hi_weekly", 2.10)) * _em
+        # v51: EM sanity band continuous on life. Condors blend session-EM
+        # (expiry) ↔ chain ATM straddle (weekly pin scale); verticals blend
+        # the lo/hi multipliers only. Removes the _weekly_life boolean maze.
+        _wk_straddle = 0.0
+        if _neutral_condor and spot > 0 and chain:
+            try:
+                _wk_atm = min(chain.keys(), key=lambda k: abs(float(k) - float(spot)))
+                _wk_qc = chain.get(float(_wk_atm), {}).get("call") or {}
+                _wk_qp = chain.get(float(_wk_atm), {}).get("put") or {}
+                if _wk_qc and _wk_qp:
+                    _wk_straddle = (
+                        (float(_wk_qc.get("bid", 0)) + float(_wk_qc.get("ask", 0))
+                         + float(_wk_qp.get("bid", 0)) + float(_wk_qp.get("ask", 0)))
+                        / 2.0
+                    )
+            except Exception:
+                _wk_straddle = 0.0
+        _lo_mult = by_dte(
+            dte,
+            float(getattr(self.config, "em_band_lo", 0.80)),
+            float(getattr(self.config, "em_band_lo_weekly", 0.55)),
+        )
+        if _neutral_condor:
+            _scale = by_dte(
+                dte, _em, _wk_straddle if _wk_straddle > 20 else _em
+            )
+            _hi_mult = by_dte(
+                dte,
+                float(getattr(self.config, "em_band_hi", 1.35)),
+                float(getattr(self.config, "em_band_hi_condor_weekly", 1.35)),
+            )
         else:
-            _band_lo = float(getattr(self.config, "em_band_lo", 0.80)) * _em
-            _band_hi = float(getattr(self.config, "em_band_hi", 1.35)) * _em
+            _scale = _em
+            _hi_mult = by_dte(
+                dte,
+                float(getattr(self.config, "em_band_hi", 1.35)),
+                float(getattr(self.config, "em_band_hi_weekly", 2.10)),
+            )
+        _band_lo = _lo_mult * _scale
+        _band_hi = _hi_mult * _scale
         # v3.7: the absolute floor is one strike step, not two.
         #
         # With v3.6's corrected expected move the EM-relative floor is
@@ -2477,10 +2537,11 @@ class StrategyEngine:
         # straddle-based hint from data_engine as a fallback, then clamped by
         # DTE so 0DTE max loss stays small where credits are small.
         _wing_hint = int(signals.get("wing_width") or 150)
-        # PATCH_V25: 300-pt wing on dte>=2 failed-LOW so 15% scalp clears costs.
+        # v51: failed-LOW wing floor continuous on life (200 expiry ↔ 300 weekly).
         if (signals.get("neutral_range_vertical")
                 and strategy_name == BULL_PUT_SPREAD):
-            _wing_hint = max(_wing_hint, 300 if _weekly_life else 200)
+            _fb_wing = int(round(by_dte(dte, 200.0, 300.0)))
+            _wing_hint = max(_wing_hint, _fb_wing)
         if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
             _wing_hint = max(_wing_hint, 150)
         if isinstance(short_dist, (tuple, list)):
@@ -2503,33 +2564,24 @@ class StrategyEngine:
         wing = int(max(_wing_min, min(wing, _wing_max)))
         if (signals.get("neutral_range_vertical")
                 and strategy_name == BULL_PUT_SPREAD):
-            wing = int(min(max(wing, 300 if _weekly_life else 200), _wing_max))
+            _fb_wing = int(round(by_dte(dte, 200.0, 300.0)))
+            wing = int(min(max(wing, _fb_wing), _wing_max))
 
-        # ── v4.2: adaptive wing fit ───────────────────────────────────────
-        # A fresh-weekly wing (multi-day vega) routinely costs 55-65% of a
-        # short priced at 0.18 delta; the old fixed 0.75-factor wing then
-        # tripped wing_cost_frac_max on EVERY condor candidate (measured
-        # 2026-09-09 11:29-13:50 and 2026-09-10 12:21-12:51: zero
-        # symmetric structures all day). Rather than weaken the gate, widen
-        # the long step by step until its quoted premium is inside the cap
-        # - the long is supposed to be cheap insurance, so let the chain
-        # itself tell us how far out to buy it. Bounded by _wing_max.
-        # Adaptive fitting is for the WEEKLY CONDOR only: the wing-cost
-        # gate it satisfies is condor-only, and the static 0DTE wing
-        # table is the calibrated expiry-day behavior (do not touch it).
-        # The single-sided vertical's long is risk definition priced by
-        # the credit/wing ratio gates, so it never gets the fitter either.
-        if (strategy_name == IRON_CONDOR and _weekly_life
+        # v51: adaptive wing fit for any non-pure-expiry condor (life weight
+        # < 0.9). Cap is continuous by_dte; 0DTE keeps the static wing table.
+        _wing_cost_cap = by_dte(
+            dte,
+            float(getattr(self.config, "wing_cost_frac_max", 0.50)),
+            float(getattr(self.config, "wing_cost_frac_max_weekly", 0.58)),
+        )
+        if (strategy_name == IRON_CONDOR and dte_blend(dte) < 0.9
                 and short_dist and _short_dist_ref > 0):
             wing = self._fit_wing_width(
                 chain=chain, strategy_name=strategy_name,
                 center_ref=_center_ref, short_dist=short_dist,
                 step=step, wing0=wing, wing_max=_wing_max,
                 dte=dte,
-                cap=float(getattr(
-                    self.config,
-                    "wing_cost_frac_max_weekly" if _weekly_life
-                    else "wing_cost_frac_max", 0.58 if _weekly_life else 0.50)),
+                cap=_wing_cost_cap,
             )
 
         if strategy_name == IRON_BUTTERFLY:
@@ -5720,9 +5772,9 @@ class StrategyEngine:
         if _rng < self.RANGE_LEAN_MIN_PTS:
             return None
         # Clear location only — soft mid-range stays flat (Sep11 protection).
-        if _loc >= max(self.RANGE_LEAN_HI, 0.70):
+        if _loc >= self.RANGE_SOFT_LEAN_HI:
             return BULL_PUT_SPREAD
-        if _loc <= min(self.RANGE_LEAN_LO, 0.30):
+        if _loc <= self.RANGE_SOFT_LEAN_LO:
             return BEAR_CALL_SPREAD
         return None
 
