@@ -1449,9 +1449,16 @@ class BacktestRunner:
 
         state = self.me.state
         state["daily_halted"] = False
-        live: Optional[dict] = None
+        # The book: every open simulated position, in entry order. The
+        # harness used to hold exactly one (`live`); MAX_CONCURRENT_POSITIONS
+        # is now honoured here the same way main.py honours it - every open
+        # position is monitored every cycle, and decide() is consulted
+        # whenever the strategy engine's own slot gates allow it.
+        book: List[dict] = []
         day_pnl = 0.0
         self._chain_by_expiry = {}  # PATCH_V12: reset per session (see _close)
+        _max_slots = max(1, int(getattr(
+            self.config, "max_concurrent_positions", 1) or 1))
 
         for capture_time in day.cycles:
             dt = day.cycle_dt(capture_time)
@@ -1494,8 +1501,9 @@ class BacktestRunner:
                 sum(self.results.daily_pnl.values())
             state["daily_pnl"] = day_pnl
 
-            # ── manage an open position first ─────────────────────────────
-            if live is not None:
+            # ── manage every open position first ──────────────────────────
+            _closed_any = False
+            for live in list(book):
                 row = self.db.query_one(
                     "SELECT * FROM positions WHERE position_id=?",
                     (live["position_id"],),
@@ -1510,21 +1518,11 @@ class BacktestRunner:
 
                 # ── PATCH_V14: mirror the live in-loop hard-exit sweep ──
                 # main.py calls perform_hard_exit_sweep() every cycle, after
-                # monitor_all_positions(). This harness never did, so the one
-                # exit path that carries the force flag was never exercised by
-                # a replay and the two were free to disagree about when the
-                # book goes flat. They did, by twenty minutes: the sweep
-                # flattened live at min(15:00, HARD_EXIT_TIME) while the
-                # ladder - and therefore every number this tool printed -
-                # honoured the position's own hard exit at 15:15, and the
-                # closing-hour entry window, defined as hard_exit minus 25
-                # minutes, opened tickets in replay that live would already
-                # have been flattening. Rs 5,711 across five sessions.
-                # Priority 7 fires on the same per-position time, so on a
-                # healthy cycle this is a no-op that PROVES the two paths
-                # agree; on a cycle where the ladder was bypassed - a failed
-                # monitor_position, a missing row - the sweep still flattens
-                # the book exactly as production would.
+                # monitor_all_positions(). Priority 7 fires on the same
+                # per-position time, so on a healthy cycle this is a no-op
+                # that PROVES the two paths agree; on a cycle where the
+                # ladder was bypassed the sweep still flattens the book
+                # exactly as production would.
                 if action == "HOLD" or str(action).startswith("TIGHTEN"):
                     _hx = self._hard_exit_of(live)
                     if dt.time() >= _hx:
@@ -1538,84 +1536,71 @@ class BacktestRunner:
                             print(f"  {trading_date} {dt:%H:%M} SWEEP  "
                                   f"hard exit {_hx:%H:%M} reached")
 
-                if action != "HOLD" and not action.startswith("TIGHTEN"):
-                    reason = ctx.get("reason_detail") or action
-                    # Capture params BEFORE _close nulls the live handle —
-                    # fade / rotation latches need the entry raw_params.
-                    _close_rp = dict(live.get("params") or {})
-                    _close_sname = str(
-                        _close_rp.get("strategy_name")
-                        or live.get("strategy_name")
-                        or ""
-                    )
-                    t = self._close(live, signals, reason, priority, day)
-                    self.results.add_trade(t)
-                    day_pnl += t.pnl_rs
-                    live = None
-                    state["daily_pnl"] = day_pnl
-                    # ── PATCH_V13: replay the LIVE close bookkeeping ──────
-                    # This block used to keep its own copy of the session
-                    # state: consecutive_stops incremented on any losing
-                    # exit, last_stop_time set, and last_stop_reason never
-                    # set at all - so the 30-minute CLOSE_STOP cooldown, the
-                    # same-signal-combo block and the two-stop halt were all
-                    # dead code in replay while being live in production.
-                    # Every number this harness printed was therefore an
-                    # upper bound on what the engine would have done, and
-                    # the difference was not theoretical: on 2026-09-09 the
-                    # replay re-entered fifteen seconds after a profit-lock
-                    # exit that live would have cooled down for ten minutes.
-                    # The live method is now called with the same reason
-                    # string monitor_all_positions() derives, so the two
-                    # paths cannot drift again.
-                    try:
-                        state["_last_monitor_spot"] = float(
-                            signals.get("spot") or 0.0)
-                    except (TypeError, ValueError):
-                        pass
-                    _live_reason = bt_exit_reason(action, priority)
-                    # PATCH_V34 parity: mirror execute_close fade tagging.
-                    # Live sets _closing_afternoon_*_fade from raw_params
-                    # before _update_state_after_close; replay used to skip
-                    # that, so last_exit_is_afternoon_*_fade stayed False
-                    # after a fade CLOSE_TARGET — breaking opposite-extreme
-                    # unlocks (canonical 2026-09-18 11:53→12:38 path).
-                    # PATCH_V45: also stash strategy side + regime-rotation.
-                    try:
-                        _rp = _close_rp
-                        if bool(_rp.get("afternoon_low_fade")):
-                            state["_closing_afternoon_low_fade"] = True
-                        if bool(_rp.get("afternoon_high_fade")):
-                            state["_closing_afternoon_high_fade"] = True
-                        if bool(_rp.get("neutral_range_vertical")) or bool(
-                            _rp.get("failed_break_scalp")
-                        ):
-                            state["_closing_failed_break_scalp"] = True
-                        if bool(_rp.get("stale_weekly_vertical")):
-                            state["_closing_stale_weekly"] = True
-                        if "regime_rotation" in str(reason or ""):
-                            state["_closing_regime_rotation"] = True
-                        state["_closing_strategy_name"] = _close_sname
-                    except Exception:
-                        pass
-                    try:
-                        with self._quiet():
-                            self.xe._update_state_after_close(
-                                _live_reason, t.pnl_rs, priority)
-                    except Exception as exc:
-                        if self.verbose:
-                            print(f"  close bookkeeping failed: {exc}")
-                    # the harness owns the day accumulator and recomputes
-                    # capital from the results ledger every cycle
-                    state = self.me.state
-                    state["daily_pnl"] = day_pnl
-                    if self.verbose:
-                        print(f"  {trading_date} {dt:%H:%M} EXIT  "
-                              f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")
-                    # v7: the block for the trade that just closed is printed
-                    # on the cycle that closed it, in its final state.
-                    self._report_trades(day)
+                if action == "HOLD" or action.startswith("TIGHTEN"):
                     continue
+
+                reason = ctx.get("reason_detail") or action
+                # Capture params BEFORE _close - fade / rotation latches
+                # need the entry raw_params.
+                _close_rp = dict(live.get("params") or {})
+                _close_sname = str(
+                    _close_rp.get("strategy_name")
+                    or live.get("strategy_name")
+                    or ""
+                )
+                t = self._close(live, signals, reason, priority, day)
+                self.results.add_trade(t)
+                day_pnl += t.pnl_rs
+                book.remove(live)
+                _closed_any = True
+                state["daily_pnl"] = day_pnl
+                # ── PATCH_V13: replay the LIVE close bookkeeping ──────────
+                # The live method is called with the same reason string
+                # monitor_all_positions() derives, so the cooldown / stop
+                # counters in replay match production.
+                try:
+                    state["_last_monitor_spot"] = float(
+                        signals.get("spot") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                _live_reason = bt_exit_reason(action, priority)
+                # PATCH_V34 / V45 parity: mirror execute_close tagging.
+                try:
+                    _rp = _close_rp
+                    if bool(_rp.get("afternoon_low_fade")):
+                        state["_closing_afternoon_low_fade"] = True
+                    if bool(_rp.get("afternoon_high_fade")):
+                        state["_closing_afternoon_high_fade"] = True
+                    if bool(_rp.get("neutral_range_vertical")) or bool(
+                        _rp.get("failed_break_scalp")
+                    ):
+                        state["_closing_failed_break_scalp"] = True
+                    if bool(_rp.get("stale_weekly_vertical")):
+                        state["_closing_stale_weekly"] = True
+                    if "regime_rotation" in str(reason or ""):
+                        state["_closing_regime_rotation"] = True
+                    state["_closing_strategy_name"] = _close_sname
+                except Exception:
+                    pass
+                try:
+                    with self._quiet():
+                        self.xe._update_state_after_close(
+                            _live_reason, t.pnl_rs, priority)
+                except Exception as exc:
+                    if self.verbose:
+                        print(f"  close bookkeeping failed: {exc}")
+                # the harness owns the day accumulator and recomputes
+                # capital from the results ledger every cycle
+                state = self.me.state
+                state["daily_pnl"] = day_pnl
+                if self.verbose:
+                    print(f"  {trading_date} {dt:%H:%M} EXIT  "
+                          f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")
+            if _closed_any:
+                # Same cycle discipline as the single-slot harness: the
+                # cycle that closed something does not also open something.
+                self._report_trades(day)
+                continue
 
             # ── daily loss halt ──────────────────────────────────────────
             # main.check_daily_loss_halt stops new entries once the session is
@@ -1631,13 +1616,13 @@ class BacktestRunner:
                     if self.verbose:
                         print(f"  {trading_date}: daily loss limit hit "
                               f"({day_pnl:,.0f}) — no further entries")
-            if state.get("daily_halted") and live is None:
+            if state.get("daily_halted") and not book:
                 self.results.add_rejection("daily_loss_halt")
                 self._report_trades(day)   # v7
                 continue
 
-            # ── otherwise consider a new entry ────────────────────────────
-            if live is None:
+            # ── otherwise consider a new entry (a free slot) ──────────────
+            if len(book) < _max_slots and not state.get("daily_halted"):
                 try:
                     with self._quiet():
                         decision = self.se.decide(signals)
@@ -1651,13 +1636,14 @@ class BacktestRunner:
                     params = decision.get("params") or {}
                     live = self._open(params, signals, day)
                     if live is not None:
+                        book.append(live)
                         state["last_entry_time"] = self.clock.now().isoformat()
                         state["entry_count"] = int(state.get("entry_count", 0)) + 1
                         if self.verbose:
                             print(f"  {trading_date} {dt:%H:%M} ENTER "
                                   f"{params.get('strategy_name')} "
                                   f"credit={live['entry_credit']:.2f} "
-                                  f"lots={live['lots']}")
+                                  f"lots={live['lots']} book={len(book)}")
                     else:
                         self.results.add_rejection("fill_unavailable")
                 else:
@@ -1690,10 +1676,10 @@ class BacktestRunner:
                     if d != trading_date
                 )
                 _eq = (self.results.starting_capital + _prior + day_pnl)
-                if live is not None:
-                    _mark = self._mark_open(live)
-                    if _mark is not None:
-                        _eq += _mark
+                if book:
+                    _marks = [self._mark_open(lv) for lv in book]
+                    if all(m is not None for m in _marks):
+                        _eq += sum(_marks)
                         self.results.mark_equity(
                             f"{trading_date} {dt:%H:%M}", _eq)
                 else:
@@ -1703,20 +1689,22 @@ class BacktestRunner:
 
             # ── v7: end of the cycle ───────────────────────────────────────
             # The book as it now stands: every trade of this session, the ones
-            # already performed and the one in progress, on every cycle.
+            # already performed and the ones in progress, on every cycle.
             self._report_trades(day)
 
         # ── forced flat at the last snapshot of the session ──────────────
-        if live is not None:
+        if book:
             self.clock.set(day.cycle_dt(day.cycles[-1]))
             self.client.point(day, day.cycles[-1])
             try:
                 with self._quiet():
                     signals = self.me.run_cycle()
             except Exception:
-                signals = {"spot": live["entry_spot"]}
-            t = self._close(live, signals, "END_OF_DATA_FORCED_FLAT", 7, day)
-            self.results.add_trade(t)
+                signals = {"spot": book[0]["entry_spot"]}
+            for live in list(book):
+                t = self._close(live, signals, "END_OF_DATA_FORCED_FLAT", 7, day)
+                self.results.add_trade(t)
+            book.clear()
             # v7: the session's last trade gets its final block too - the loop
             # above ended before this close happened.
             self._report_trades(day)
@@ -1941,6 +1929,7 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
         "waiting_for_0dte", "0dte_series")),
     ("position limits", (
         "max_concurrent", "max_entries", "position_already_open",
+        "second_slot", "slot_conflict",
         "cooldown", "consecutive")),
     # compute_params checks the contract before it builds anything, and
     # _check_hard_gates refuses a DTE above MAX_DTE_TRADEABLE before that.
@@ -1967,7 +1956,8 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
     # weekend-risk lean guard.
     ("strategy selection", (
         "day_structure", "no_strategy", "range_dte", "lean_skipped",
-        "premium_sell", "premium_buy")),
+        "premium_sell", "premium_buy", "two_way_auction_wait",
+        "two_way_wait")),
     # _counter_trend_entry_refusal(): refuse to open what the exit ladder is
     # built to eject.
     ("counter-trend symmetry", (
@@ -3007,7 +2997,20 @@ def _parallel_day_worker(job: dict) -> dict:
                 block for block in runner.final_report_lines if block
             ).strip("\n")
             pnl = float(res.daily_pnl.get(day, 0.0))
-        return {"date": day, "pnl": pnl, "report": report, "ok": True}
+            trades = [t.as_row() for t in res.trades]
+            # Top rejection buckets, so the parallel table can also say WHY a
+            # session stayed flat without re-running it sequentially.
+            rejections = [
+                (str(k), int(v)) for k, v in res.rejections.most_common(6)
+            ]
+            truncated = [
+                hhmm for (d, hhmm) in res.truncated_days if d == day
+            ]
+        return {
+            "date": day, "pnl": pnl, "report": report, "ok": True,
+            "trades": trades, "rejections": rejections,
+            "truncated": truncated[0] if truncated else "",
+        }
     except Exception as exc:
         return {
             "date": day,
@@ -3075,6 +3078,75 @@ def run_parallel_quiet(
             print()
         print(report)
         first = False
+
+    for row in ordered:
+        if not row.get("ok"):
+            print(f"  {row['date']}: replay FAILED - {row.get('error')}")
+
+    # ── compact blotter: one line per trade, every session ───────────────
+    all_trades: List[dict] = []
+    for row in ordered:
+        all_trades.extend(row.get("trades") or [])
+    if all_trades:
+        print()
+        print(hr("─"))
+        print("TRADES  (every session, in order)")
+        print(hr("─"))
+        print(f"  {'date':10s} {'dte':>3s} {'strategy':16s} {'enter':5s} "
+              f"{'exit':5s} {'lots':>4s} {'credit':>7s} {'debit':>7s} "
+              f"{'pnl':>8s}  exit reason")
+        for t in all_trades:
+            def _hhmm(v):
+                s = str(v or "")
+                return s[11:16] if len(s) >= 16 else s[:5]
+            print(
+                f"  {str(t.get('trading_date') or ''):10s} "
+                f"{str(t.get('dte') if t.get('dte') is not None else '?'):>3s} "
+                f"{str(t.get('strategy') or '')[:16]:16s} "
+                f"{_hhmm(t.get('entry_time')):5s} {_hhmm(t.get('exit_time')):5s} "
+                f"{int(t.get('lots') or 0):>4d} "
+                f"{float(t.get('entry_credit') or 0.0):>7.2f} "
+                f"{float(t.get('exit_debit') or 0.0):>7.2f} "
+                f"{float(t.get('pnl_rs') or 0.0):>8,.0f}  "
+                f"{str(t.get('exit_reason') or '')[:44]}"
+            )
+        wins = [t for t in all_trades if float(t.get("pnl_rs") or 0.0) > 0]
+        losses = [t for t in all_trades if float(t.get("pnl_rs") or 0.0) <= 0]
+        gw = sum(float(t.get("pnl_rs") or 0.0) for t in wins)
+        gl = abs(sum(float(t.get("pnl_rs") or 0.0) for t in losses))
+        pf = (gw / gl) if gl > 0 else float("inf")
+        n = len(all_trades)
+        print(
+            f"  trades={n} win_rate={100.0 * len(wins) / n:.0f}% "
+            f"expectancy=Rs {(gw - gl) / n:,.0f} profit_factor="
+            f"{'inf' if pf == float('inf') else f'{pf:.2f}'} "
+            f"avg_win=Rs {gw / len(wins) if wins else 0:,.0f} "
+            f"avg_loss=Rs {gl / len(losses) if losses else 0:,.0f}"
+        )
+    # Per-day top rejection buckets: the parallel table used to say only
+    # WHAT was made, never why a session sat out.
+    print()
+    print(hr("─"))
+    print("TOP REJECTIONS PER SESSION")
+    print(hr("─"))
+    for row in ordered:
+        rej = row.get("rejections") or []
+        tail = f"  [PARTIAL: chain ends {row['truncated']}]" if row.get("truncated") else ""
+        print(f"  {row['date']}{tail}")
+        for k, v in rej[:4]:
+            print(f"      {v:>5d}  {str(k)[:70]}")
+
+    if getattr(args, "csv", None) and all_trades:
+        import csv
+        try:
+            with open(args.csv, "w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(Trade.__slots__))
+                w.writeheader()
+                for t in all_trades:
+                    w.writerow(t)
+            print(f"\n  blotter written: {args.csv}")
+        except OSError as exc:
+            print(f"\n  could not write {args.csv}: {exc}")
 
     summary_rows = [(row["date"], float(row.get("pnl") or 0.0)) for row in ordered]
     print_daily_profit_summary(summary_rows)

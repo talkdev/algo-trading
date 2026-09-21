@@ -2289,25 +2289,79 @@ class ExecutionEngine:
                     _rot_raw.get("afternoon_high_fade")
                     or _rot_raw.get("afternoon_low_fade")
                 )
+                _rot_opp_fade = (
+                    bool(_rot_raw.get("afternoon_low_fade"))
+                    and bool(signals.get("afternoon_high_fade"))
+                ) or (
+                    bool(_rot_raw.get("afternoon_high_fade"))
+                    and bool(signals.get("afternoon_low_fade"))
+                )
+                try:
+                    _sp_r = float(signals.get("spot") or 0.0)
+                    _dh_r = float(
+                        signals.get("day_high_so_far")
+                        or signals.get("day_high") or 0.0
+                    )
+                    _dl_r = float(
+                        signals.get("day_low_so_far")
+                        or signals.get("day_low") or 0.0
+                    )
+                    _rr_r = (_dh_r - _dl_r) if (_dh_r > _dl_r > 0) else 0.0
+                    _lp_r = (
+                        (_sp_r - _dl_r) / _rr_r
+                        if _rr_r > 1.0 and _sp_r > 0 else 0.5
+                    )
+                except (TypeError, ValueError, ZeroDivisionError):
+                    _rr_r, _lp_r = 0.0, 0.5
+                _loc_high = _rr_r >= 85.0 and _lp_r >= 0.80
+                _loc_low = _rr_r >= 85.0 and _lp_r <= 0.20
+                # After fading one extreme, the other extreme of a real
+                # range is the next ticket — even if the 15-min label
+                # still says UPTREND (the label is what is being faded).
+                _open_low_at_high = (
+                    bool(_rot_raw.get("afternoon_low_fade")) and _loc_high
+                )
+                _open_high_at_low = (
+                    bool(_rot_raw.get("afternoon_high_fade")) and _loc_low
+                )
+                # A fade overlay on a ONE-WAY tape is not a regime change:
+                # rotating a with-trend vertical into that fade is selling
+                # the wrong side. Opposite-extreme rotation is only for a
+                # tagged fade that is now sitting at the other edge.
+                _rot_fade_label = bool(
+                    signals.get("afternoon_high_fade")
+                    or signals.get("afternoon_low_fade")
+                )
+                _rot_two_way = bool(signals.get("two_way_auction"))
+                _ignore_fade_rewrite = _rot_fade_label and not (
+                    _rot_two_way or _open_low_at_high or _open_high_at_low
+                )
                 _bull_to_bear = (
                     "BULL_PUT" in _rot_name
                     and (
-                        _rot_final == "PREMIUM_SELL_BEAR"
+                        (_rot_final == "PREMIUM_SELL_BEAR"
+                         and not _ignore_fade_rewrite)
                         or _rot_px in ("DOWNTREND", "STRONG_DOWNTREND")
+                        or _open_low_at_high
                     )
                 )
                 _bear_to_bull = (
                     "BEAR_CALL" in _rot_name
                     and (
-                        _rot_final == "PREMIUM_SELL_BULL"
+                        (_rot_final == "PREMIUM_SELL_BULL"
+                         and not _ignore_fade_rewrite)
                         or _rot_px in ("UPTREND", "STRONG_UPTREND")
+                        or _open_high_at_low
                     )
                 )
                 # Only rotate when the thesis is broken (underwater) or the
                 # position has already banked enough that freeing the slot
                 # is not abandoning unpaid edge. Flat morning winners must
                 # not be scratched into a midday credit that then blocks
-                # the closing-hour route (measured Sep-9).
+                # the closing-hour route (measured Sep-9) — EXCEPT a
+                # location fade, which is a different trade at the edge.
+                # A scratch (flat to modestly green/red) is the professional
+                # two-way book: do not sit a bull put through a day-high fade.
                 _underwater = (
                     entry_credit > 0 and liq_premium > entry_credit * 1.02
                 )
@@ -2315,13 +2369,30 @@ class ExecutionEngine:
                     entry_credit > 0
                     and (entry_credit - liq_premium) >= 0.15 * entry_credit
                 )
+                _fade_scratch = (
+                    (_rot_fade_label or _open_low_at_high or _open_high_at_low)
+                    and entry_credit > 0
+                    and liq_premium <= entry_credit * 1.10
+                )
+                # Two-way / fade rotation is a location trade: ADX is
+                # often mid-teens on a swinging tape. Trend rotation
+                # still needs a measured ADX.
+                _rot_trend_ok = _rot_mat and _rot_adx >= _rot_adx_need
+                _rot_loc_ok = (
+                    _rot_fade_label or _rot_two_way
+                    or _open_low_at_high or _open_high_at_low
+                )
+                _rot_hold_need = (
+                    min(_rot_min, 15.0) if _rot_loc_ok else _rot_min
+                )
                 if (
-                    (not _rot_is_fade)
+                    (not _rot_raw.get("failed_break_scalp"))
+                    and (not _rot_raw.get("neutral_range_vertical"))
+                    and ((not _rot_is_fade) or _rot_opp_fade)
                     and (_bull_to_bear or _bear_to_bull)
-                    and _rot_mat
-                    and _rot_adx >= _rot_adx_need
-                    and _rot_hold >= _rot_min
-                    and (_underwater or _banked)
+                    and (_rot_trend_ok or _rot_loc_ok)
+                    and _rot_hold >= _rot_hold_need
+                    and (_underwater or _banked or _fade_scratch)
                 ):
                     self.market_engine.state["_closing_regime_rotation"] = True
                     self.logger.info(
