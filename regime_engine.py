@@ -20,7 +20,7 @@ import pandas as pd
 
 from core import (
     Config, Database, RateLimiter, UpstoxClient,
-    ExpiryCalendar, now_ist, today_ist, dte_blend,
+    ExpiryCalendar, now_ist, today_ist, dte_blend, by_dte,
     load_config, setup_logging,
     get_high_impact_events,
     print_section, print_kv_table,
@@ -1611,6 +1611,79 @@ class RegimeClassifier:
     # FINAL REGIME DECISION TREE
     # ─────────────────────────────────────────────────────────────────────
 
+    # v51: one soft-evidence rule for every DTE — sell the away side when
+    # location + independent tape agree, even before ADX is fully mature.
+    # Clock floor 10:15 keeps the Sep17 10:02 ADX=0 loser dead.
+    SOFT_CREDIT_AFTER = time(10, 15)
+    SOFT_LOC_HI = 0.58
+    SOFT_LOC_LO = 0.42
+    SOFT_MIN_RANGE_PTS = 50.0
+
+    def _session_loc(self, signals: dict) -> Tuple[float, float]:
+        try:
+            dh = float(signals.get("day_high_so_far") or signals.get("day_high") or 0.0)
+            dl = float(signals.get("day_low_so_far") or signals.get("day_low") or 0.0)
+            spot = float(signals.get("spot") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0, 0.5
+        rng = dh - dl
+        if rng < 1.0 or spot <= 0:
+            return 0.0, 0.5
+        loc = min(max((spot - dl) / rng, 0.0), 1.0)
+        return rng, loc
+
+    def _soft_tape_agrees(self, signals: dict, side: str) -> bool:
+        """EMA / VWAP confirmation for a pre-ADX vertical.
+
+        Price-regime alone is not enough: ORB can mint UPTREND with ADX=0
+        (Sep17 10:02). Independent tape (EMA structure or VWAP side) must
+        agree. Same at every DTE.
+        """
+        price = str(signals.get("price_regime") or "")
+        ema = str(signals.get("ema_structure") or "")
+        try:
+            vd = float(signals.get("vwap_dist_pct") or 0.0)
+        except (TypeError, ValueError):
+            vd = 0.0
+        buf = abs(float(getattr(
+            self.config, "counter_trend_vwap_dist_min_pct", 0.10)))
+        if side == "BULL":
+            return (
+                price in ("UPTREND", "STRONG_UPTREND", "RANGE", "CHOPPY")
+                and (ema == "BULLISH" or vd >= buf)
+            )
+        if side == "BEAR":
+            return (
+                price in ("DOWNTREND", "STRONG_DOWNTREND", "RANGE", "CHOPPY")
+                and (ema == "BEARISH" or vd <= -buf)
+            )
+        return False
+
+    def _soft_directional_ok(
+        self,
+        signals: dict,
+        side: str,
+        current_time: time,
+    ) -> bool:
+        """Allow evidenced directional credit before ADX maturity.
+
+        Same tape rule at every DTE. Refuses event days and the open
+        noise window (before 10:15). Requires a real session range and
+        clear location on the side being sold away from.
+        """
+        if bool(signals.get("event_day") or signals.get("event_announced")):
+            return False
+        if current_time < self.SOFT_CREDIT_AFTER:
+            return False
+        _rng, _loc = self._session_loc(signals)
+        if _rng < self.SOFT_MIN_RANGE_PTS:
+            return False
+        if side == "BULL":
+            return _loc >= self.SOFT_LOC_HI and self._soft_tape_agrees(signals, "BULL")
+        if side == "BEAR":
+            return _loc <= self.SOFT_LOC_LO and self._soft_tape_agrees(signals, "BEAR")
+        return False
+
     def classify_final(
         self,
         vol:      VolatilityRegime,
@@ -1979,6 +2052,9 @@ class RegimeClassifier:
         # while ADX is 0 (17-Sep 10:02 5-lot bull put, ADX=0).
         # PATCH_V31: extreme fades already returned above; remaining
         # directional credit still needs a measured ADX.
+        # v51: soft-evidence escape after 10:15 when location + tape agree
+        # — same rule the range resolver uses, every DTE. Still blocks
+        # pure ADX=0 open noise.
         if price in (
             PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
             PriceRegime.DOWNTREND, PriceRegime.STRONG_DOWNTREND,
@@ -1987,11 +2063,23 @@ class RegimeClassifier:
                 pass  # location fade owns the book
             elif (not bool(signals.get("adx_15_mature", False))
                     or float(signals.get("adx_15") or 0.0) <= 0.0):
-                return (
-                    FinalRegime.NO_TRADE,
-                    "NO_TRADE:ADX_IMMATURE_NO_DIRECTIONAL_CREDIT",
-                    False,
+                _side = (
+                    "BULL" if price in (
+                        PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
+                    ) else "BEAR"
                 )
+                if self._soft_directional_ok(signals, _side, current_time):
+                    signals["soft_directional_pre_adx"] = True
+                    signals["weekly_range_size_discount"] = float(
+                        getattr(self.config, "soft_directional_size", 0.75)
+                    )
+                    notes_parts.append("SOFT_DIRECTIONAL_PRE_ADX")
+                else:
+                    return (
+                        FinalRegime.NO_TRADE,
+                        "NO_TRADE:ADX_IMMATURE_NO_DIRECTIONAL_CREDIT",
+                        False,
+                    )
 
         # ── Price Regime → Structure ──────────────────────────────────────
         if price == PriceRegime.RANGE:
@@ -2219,12 +2307,18 @@ class RegimeClassifier:
 
         # ── BULLISH positioning → bull put (unless spot below OR midpoint) ─
         if pos == PositioningRegime.BULLISH:
-            # PATCH_V23: RANGE-origin directional credit, every DTE.
+            # PATCH_V23 / v51: RANGE-origin directional credit, every DTE.
+            # Soft location+tape path after 10:15 replaces a hard ADX wait.
             if (not bool(signals.get("adx_15_mature", False))
                     or float(signals.get("adx_15") or 0.0) <= 0.0):
-                return (
-                    FinalRegime.NO_TRADE,
-                    "RANGE_VERTICAL_ADX_IMMATURE",
+                if not self._soft_directional_ok(signals, "BULL", current_time):
+                    return (
+                        FinalRegime.NO_TRADE,
+                        "RANGE_VERTICAL_ADX_IMMATURE",
+                    )
+                signals["soft_directional_pre_adx"] = True
+                signals["weekly_range_size_discount"] = float(
+                    getattr(self.config, "soft_directional_size", 0.75)
                 )
             # PATCH_V12: on event days a positioning read with no
             # measured trend behind it is not a directional edge.
@@ -2247,12 +2341,17 @@ class RegimeClassifier:
 
         # ── BEARISH positioning → bear call (unless spot above OR midpoint) ─
         if pos == PositioningRegime.BEARISH:
-            # PATCH_V23: RANGE-origin directional credit, every DTE.
+            # PATCH_V23 / v51: RANGE-origin directional credit, every DTE.
             if (not bool(signals.get("adx_15_mature", False))
                     or float(signals.get("adx_15") or 0.0) <= 0.0):
-                return (
-                    FinalRegime.NO_TRADE,
-                    "RANGE_VERTICAL_ADX_IMMATURE",
+                if not self._soft_directional_ok(signals, "BEAR", current_time):
+                    return (
+                        FinalRegime.NO_TRADE,
+                        "RANGE_VERTICAL_ADX_IMMATURE",
+                    )
+                signals["soft_directional_pre_adx"] = True
+                signals["weekly_range_size_discount"] = float(
+                    getattr(self.config, "soft_directional_size", 0.75)
                 )
             # PATCH_V12: on event days a positioning read with no
             # measured trend behind it is not a directional edge.

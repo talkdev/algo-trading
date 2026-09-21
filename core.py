@@ -923,6 +923,9 @@ class Config:
     # confirmation, not a prerequisite, for a delta-neutral structure;
     # trade it at this size discount.
     unclear_range_size_weekly: float = 0.75
+    # v51: size discount when directional credit is booked on soft
+    # location+tape evidence before ADX maturity (same at every DTE).
+    soft_directional_size:     float = 0.75
     # EV-gate adverse-excursion calibration for fresh weeklies: the
     # greeks-carry "stop severity" assumed an instantaneous move at
     # entry delta with a 1.25 stress factor and ZERO theta credit. The
@@ -1727,6 +1730,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         range_adx_wide_max=min(max(_get_float(env, "RANGE_ADX_WIDE_MAX", 28.0), 20.0), 40.0),
         range_adx_wide_size=min(max(_get_float(env, "RANGE_ADX_WIDE_SIZE", 0.80), 0.40), 1.00),
         unclear_range_size_weekly=min(max(_get_float(env, "UNCLEAR_RANGE_SIZE_WEEKLY", 0.75), 0.40), 1.00),
+        soft_directional_size=min(max(_get_float(env, "SOFT_DIRECTIONAL_SIZE", 0.75), 0.40), 1.00),
         ev_carry_discount_dte2p=min(max(_get_float(env, "EV_CARRY_DISCOUNT_DTE2P", 0.62), 0.40), 1.00),
         adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "300s",
         # ── v5 long-premium momentum expression ───────────────────────────
