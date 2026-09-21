@@ -26,7 +26,7 @@ env.txt
 # Generated reports and exports
 /reports/
 /backtest_results/
-
+/stock-data/*
 # Patch scripts
 patch*.py
 patch_*.py
@@ -68,6 +68,7 @@ dist/
 /data/cache/*
 /output/*
 *.pid
+
 patch.py
 # Ignore SQLite temporary/locking files everywhere
 *.db-wal

@@ -63,6 +63,11 @@
 #
 #  USAGE
 #  -----
+#     python backtest_engine.py
+#         Default: every NSE trading day from 2026-09-08 through today (IST),
+#         skipping weekends and nse_holidays.json. One child process per day,
+#         all days in parallel. Console output is ONLY the per-day trade
+#         report blocks plus the daily-profit summary table.
 #     python backtest_engine.py --audit
 #     python backtest_engine.py --from 2026-09-08 --to 2026-09-11
 #     python backtest_engine.py --from 2026-08-01 --to 2026-09-05 \
@@ -79,6 +84,7 @@ import io
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 import random
 import re
@@ -88,6 +94,7 @@ import tempfile
 import uuid
 import warnings
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -100,8 +107,14 @@ from core import (  # noqa: E402
     Config,
     Database,
     RateLimiter,
+    get_nse_holidays,
     load_config,
+    today_ist,
 )
+
+# Default quiet parallel range: every NSE trading day from this date through
+# the IST calendar day the script is launched on.
+DEFAULT_BACKTEST_START = date(2026, 9, 8)
 
 # The engine modules are imported lazily inside build_engines() so that the
 # simulated clock is installed before any of them capture a timestamp.
@@ -942,6 +955,7 @@ class BacktestRunner:
         fills: FillModel,
         verbose: bool = False,
         trade_report: Optional[str] = None,
+        cycle_reports: bool = True,
     ):
         self.store = store
         self.config = config
@@ -957,6 +971,10 @@ class BacktestRunner:
         # The reporter itself is built in _build(), where the scratch book it
         # reads exists.
         self.trade_report_mode = trade_report
+        # cycle_reports=False keeps the end-of-day final block (mode still
+        # shown as each_cycle) but skips the per-cycle spam the default
+        # parallel runner must not print.
+        self.cycle_reports = cycle_reports
         self.reporter = None
         # ── v9: the final per-day trade report ────────────────────────────
         # The per-cycle blocks are exact but unreadable as a DAY summary:
@@ -999,7 +1017,7 @@ class BacktestRunner:
         Returns how many blocks were printed. It cannot raise into the replay:
         a rendering problem must never cost a session's results.
         """
-        if self.reporter is None:
+        if self.reporter is None or not self.cycle_reports:
             return 0
         try:
             return self.reporter.report_cycle(
@@ -2899,6 +2917,170 @@ def self_test() -> int:
 #  CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
+def iter_trading_days(d_from: date, d_to: date) -> List[str]:
+    """NSE equity-derivatives sessions between d_from and d_to inclusive.
+
+    Weekends and every date listed in nse_holidays.json are excluded. The
+    holiday file is the same calendar ExpiryCalendar uses, so a day that
+    cannot be an expiry also cannot be a default backtest session.
+    """
+    if d_to < d_from:
+        return []
+    holidays = set(get_nse_holidays())
+    out: List[str] = []
+    cur = d_from
+    while cur <= d_to:
+        iso = cur.isoformat()
+        if cur.weekday() < 5 and iso not in holidays:
+            out.append(iso)
+        cur += timedelta(days=1)
+    return out
+
+
+def print_daily_profit_summary(rows: List[Tuple[str, float]]) -> None:
+    """Print the only aggregate table the default quiet runner is allowed to."""
+    print()
+    print("| Date           | Daily Profit (₹) |")
+    print("| -------------- | ---------------: |")
+    total = 0.0
+    for day, pnl in rows:
+        amount = float(pnl or 0.0)
+        total += amount
+        cell = f"₹{amount:,.0f}"
+        print(f"| {day} \t | {cell:>14} |")
+    total_cell = f"₹{total:,.0f}"
+    print(f"| Total      \t | {total_cell:>14} |")
+
+
+def _resolve_db_paths(requested: List[str]) -> List[str]:
+    """Expand --db path / directory arguments into concrete database files."""
+    db_paths: List[str] = []
+    for raw in requested:
+        pp = Path(raw).expanduser()
+        if pp.is_dir():
+            found = sorted(str(x) for x in pp.glob("*.db"))
+            if not found:
+                raise FileNotFoundError(f"No .db files under {pp}")
+            db_paths.extend(found)
+        else:
+            db_paths.append(str(pp))
+    return db_paths
+
+
+def _open_store(db_paths: List[str]):
+    if len(db_paths) > 1:
+        return MultiStore(db_paths)
+    return HistoricalStore(db_paths[0])
+
+
+def _parallel_day_worker(job: dict) -> dict:
+    """Replay a single session in a child process.
+
+    Returns the end-of-day trade-report text and that day's settled P&L.
+    All other console noise (engine dashboards, gap warnings, cycle blocks)
+    is discarded so the parent can print only what the operator asked for.
+    """
+    day = str(job["day"])
+    # Workers inherit the parent's logging config; keep them mute.
+    logging.disable(logging.CRITICAL)
+    warnings.filterwarnings("ignore")
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            config = load_config()
+            if job.get("capital") is not None:
+                import dataclasses
+                config = dataclasses.replace(
+                    config, starting_capital=float(job["capital"])
+                )
+            store = _open_store(list(job["db_paths"]))
+            runner = BacktestRunner(
+                store,
+                config,
+                FillModel(float(job["fill_edge"]), float(job["stress_exit"])),
+                verbose=False,
+                trade_report=job.get("trade_report") or "each_cycle",
+                cycle_reports=False,
+            )
+            res = runner.run([day])
+            report = "\n\n".join(
+                block for block in runner.final_report_lines if block
+            ).strip("\n")
+            pnl = float(res.daily_pnl.get(day, 0.0))
+        return {"date": day, "pnl": pnl, "report": report, "ok": True}
+    except Exception as exc:
+        return {
+            "date": day,
+            "pnl": 0.0,
+            "report": "",
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def run_parallel_quiet(
+    dates: List[str],
+    db_paths: List[str],
+    config: Config,
+    args,
+) -> int:
+    """Spawn one process per session; print trade reports then the P&L table."""
+    if not dates:
+        return 1
+
+    jobs = [
+        {
+            "day": d,
+            "db_paths": db_paths,
+            "fill_edge": float(args.fill_edge),
+            "stress_exit": float(args.stress_exit),
+            "capital": args.capital,
+            "trade_report": (
+                args.trade_report
+                or getattr(config, "trade_report_mode", "each_cycle")
+                or "each_cycle"
+            ),
+        }
+        for d in dates
+    ]
+
+    by_date: Dict[str, dict] = {}
+    # One worker per day so every session truly runs concurrently. The
+    # machine may oversubscribe; that is what the operator asked for.
+    workers = max(1, len(jobs))
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+        futures = {pool.submit(_parallel_day_worker, job): job["day"]
+                   for job in jobs}
+        for fut in as_completed(futures):
+            day = futures[fut]
+            try:
+                by_date[day] = fut.result()
+            except Exception as exc:
+                by_date[day] = {
+                    "date": day,
+                    "pnl": 0.0,
+                    "report": "",
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+
+    ordered = [by_date[d] for d in dates if d in by_date]
+    first = True
+    for row in ordered:
+        report = (row.get("report") or "").strip("\n")
+        if not report:
+            continue
+        if not first:
+            print()
+        print(report)
+        first = False
+
+    summary_rows = [(row["date"], float(row.get("pnl") or 0.0)) for row in ordered]
+    print_daily_profit_summary(summary_rows)
+    return 0 if any(r.get("ok") for r in ordered) else 1
+
+
 def install_warning_dedupe() -> None:
     """
     Print each distinct warning once instead of once per cycle.
@@ -2979,29 +3161,46 @@ def main() -> int:
     # splits. Multiple sources are served through MultiStore so the run has a
     # single ledger and a single set of period statistics.
     _requested = list(args.db) if args.db else [str(config.db_path)]
-    db_paths: List[str] = []
-    for _p in _requested:
-        _pp = Path(_p).expanduser()
-        if _pp.is_dir():
-            _found = sorted(str(x) for x in _pp.glob("*.db"))
-            if not _found:
-                print(f"\n  No .db files under {_pp}\n")
-                return 1
-            db_paths.extend(_found)
-        else:
-            db_paths.append(str(_pp))
     try:
-        store = (MultiStore(db_paths) if len(db_paths) > 1
-                 else HistoricalStore(db_paths[0]))
+        db_paths = _resolve_db_paths(_requested)
+    except FileNotFoundError as exc:
+        print(f"\n  {exc}\n")
+        return 1
+    try:
+        store = _open_store(db_paths)
     except FileNotFoundError:
         print(f"\n  No database at {', '.join(db_paths)}")
         print("  Run the engine in paper mode first, or pass --db.\n")
         return 1
-    if len(db_paths) > 1:
-        print(f"  sources           : {len(db_paths)} databases")
 
     if args.audit:
+        if len(db_paths) > 1:
+            print(f"  sources           : {len(db_paths)} databases")
         return print_audit(store)
+
+    # ── default quiet parallel mode ───────────────────────────────────────
+    # No --from/--to: every NSE trading day from 2026-09-08 through today
+    # (IST), weekends and nse_holidays.json excluded, one child process per
+    # day, console output limited to trade reports + the daily P&L table.
+    # Explicit --from/--to keeps the legacy sequential full report.
+    default_range = args.d_from is None and args.d_to is None
+    if default_range:
+        d_from = DEFAULT_BACKTEST_START
+        d_to = today_ist()
+        if isinstance(d_to, datetime):
+            d_to = d_to.date()
+        calendar = iter_trading_days(d_from, d_to)
+        available = set(store.tradable_dates(
+            d_from.isoformat(), d_to.isoformat()
+        ))
+        dates = [d for d in calendar if d in available]
+        if not dates:
+            print_audit(store)
+            return 1
+        return run_parallel_quiet(dates, db_paths, config, args)
+
+    if len(db_paths) > 1:
+        print(f"  sources           : {len(db_paths)} databases")
 
     dates = store.tradable_dates(args.d_from, args.d_to)
     if not dates:
@@ -3056,4 +3255,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     sys.exit(main())
