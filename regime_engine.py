@@ -2738,10 +2738,22 @@ class RegimeEngine:
     def _refresh_event_day(self) -> None:
         """Re-read high_impact_events.json each cycle (mtime-aware cache).
 
-        Daily reset alone is not enough: a calendar edit while the process
-        is up must arm EVENT sizing / defined-risk without a restart
-        (live 11-Sep stayed NORMAL after CPI was added to the file).
+        v60: after the first entry, honour event_day_latched from session
+        state so EVENT size/defined-risk cannot diverge from day_mode_latched.
         """
+        st = self.market_engine.state
+        if (
+            int(st.get("entry_count") or 0) > 0
+            and "event_day_latched" in st
+        ):
+            was = bool(self._event_day)
+            self._event_day = bool(st.get("event_day_latched"))
+            if self._event_day and not was:
+                self._event_name = st.get("event_name") or "LATCHED_EVENT"
+            elif not self._event_day:
+                self._event_name = ""
+            return
+
         today = today_ist()
         event_str = ExpiryCalendar.is_event_day(today)
         was = bool(self._event_day)

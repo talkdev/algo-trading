@@ -25,6 +25,7 @@ from core import (
     # engine planned. Used by execute_close() to settle a trade on its own
     # prices; the same function feeds the per-trade console report.
     realised_entry_credit,
+    realised_exit_debit,
     TradeConsoleReporter,
 )
 from data_engine import MarketDataEngine
@@ -222,7 +223,8 @@ class LiveOrderExecutor:
     _TERMINAL_BAD = {"cancelled", "canceled", "rejected", "expired", "lapsed"}
 
     def _get_fill_price(
-        self, order_id: str, fallback: float, retries: int = 8
+        self, order_id: str, fallback: float, retries: int = 8,
+        expected_qty: Optional[int] = None,
     ) -> float:
         """
         Fetch the ACTUAL fill price and verify the order really completed.
@@ -231,14 +233,9 @@ class LiveOrderExecutor:
         price the strategy *expected*, while execute_leg_entry/exit
         unconditionally reported status "FILLED". An unfilled or partially
         filled leg was therefore written into position_legs as a clean fill.
-        From that moment the engine's book no longer matched the broker's, so
-        every downstream number — position premium, unrealised P&L, the daily
-        loss halt, every exit decision — was computed on a fiction. On a
-        four-legged structure this is precisely how a "defined risk" position
-        quietly becomes a naked one, and nothing in the logs would say so.
 
-        A non-completed order now raises, which routes into the existing
-        _emergency_unwind path instead of silently corrupting the book.
+        v59: assert filled_quantity == expected_qty when provided; on timeout
+        cancel the resting order before refusing to book a phantom fill.
         """
         last_status = ""
         for attempt in range(retries):
@@ -267,6 +264,24 @@ class LiveOrderExecutor:
                             )
                     except (TypeError, ValueError):
                         pass
+                    # P59-12: missing filled_quantity is not a confirmed fill
+                    if expected_qty is not None:
+                        if filled is None:
+                            raise RuntimeError(
+                                f"order {order_id} '{status}' but "
+                                f"filled_quantity missing — refusing phantom"
+                            )
+                        try:
+                            if float(filled) + 1e-9 < float(expected_qty):
+                                raise RuntimeError(
+                                    f"order {order_id} partial fill "
+                                    f"{filled}/{expected_qty}"
+                                )
+                        except (TypeError, ValueError) as qe:
+                            raise RuntimeError(
+                                f"order {order_id} unreadable filled_quantity "
+                                f"({filled!r}): {qe}"
+                            ) from qe
                     if price and float(price) > 0:
                         return float(price)
                     raise RuntimeError(
@@ -280,6 +295,11 @@ class LiveOrderExecutor:
                     try:
                         if (float(filled) > 0 and float(pending) == 0
                                 and float(price) > 0):
+                            if expected_qty is not None and float(filled) + 1e-9 < float(expected_qty):
+                                raise RuntimeError(
+                                    f"order {order_id} partial fill "
+                                    f"{filled}/{expected_qty}"
+                                )
                             return float(price)
                     except (TypeError, ValueError):
                         pass
@@ -292,6 +312,24 @@ class LiveOrderExecutor:
                     f"(attempt {attempt + 1}/{retries}): {e}"
                 )
             time_module.sleep(1)
+
+        # v61: cancel + confirm resting entry (P59-05: cancel alone races fill).
+        if order_id:
+            try:
+                outcome = self._cancel_and_confirm(order_id, {})
+                st_out = str(outcome.get("state") or "")
+                self.logger.warning(
+                    f"entry fill timeout: cancel_confirm={st_out} "
+                    f"order={order_id} last_status={last_status}"
+                )
+                if st_out == "FILLED":
+                    price = float(outcome.get("price") or 0)
+                    if price > 0:
+                        return price
+            except Exception as ce:
+                self.logger.critical(
+                    f"could not cancel/confirm unfilled order {order_id}: {ce}"
+                )
 
         raise RuntimeError(
             f"order {order_id} did not reach a confirmed filled state "
@@ -374,7 +412,9 @@ class LiveOrderExecutor:
             self.logger.warning(
                 f"cannot reconcile order tag {tag}: {e} — treating as unresolved"
             )
-            return {"state": "UNKNOWN", "order_id": None, "tag": tag}
+            # v58: never return a truthy SUCCESS-shaped dict. Callers must not
+            # treat UNKNOWN as settled / continue fill polling with empty id.
+            return None
         if not rows:
             return None
         by_id: dict = {}
@@ -407,13 +447,32 @@ class LiveOrderExecutor:
         order_id, row = max(by_id.items(), key=lambda kv: str(kv[1].get("order_timestamp") or ""))
         status = str(row.get("status") or "").strip().lower()
         price  = float(row.get("average_price") or 0.0)
-        filled = float(row.get("filled_quantity") or 0.0)
+        try:
+            filled = float(row.get("filled_quantity")) if row.get("filled_quantity") is not None else None
+        except (TypeError, ValueError):
+            filled = None
+        try:
+            expected = int(row.get("quantity") or leg.get("qty") or leg.get("quantity") or 0)
+        except (TypeError, ValueError):
+            expected = 0
         self._dispatch_write(tag, leg, str(row.get("transaction_type") or ""),
                              int(row.get("quantity") or 0), price,
                              "RECONCILED", order_id=order_id, state="PLACED")
-        if status in self._TERMINAL_OK and price > 0:
+        qty_ok = True
+        if expected > 0:
+            if filled is None or float(filled) + 1e-9 < float(expected):
+                qty_ok = False
+        if status in self._TERMINAL_OK and price > 0 and qty_ok:
             return {"state": "FILLED", "order_id": order_id, "tag": tag,
-                    "fill_price": price, "reconciled": True}
+                    "fill_price": price, "reconciled": True,
+                    "filled_qty": filled}
+        if status in self._TERMINAL_OK and price > 0 and not qty_ok:
+            # Partial / missing qty — leave OPEN so exit ladder escalates
+            return {
+                "state": "OPEN", "order_id": order_id, "tag": tag,
+                "status": f"{status}_partial_or_qty_missing",
+                "filled_qty": filled,
+            }
         if status in self._TERMINAL_BAD:
             raise RuntimeError(
                 f"order {order_id} (tag {tag}) terminated as '{status}' after an "
@@ -452,16 +511,27 @@ class LiveOrderExecutor:
                     getattr(self.config, "reconcile_after_timeout", True)
                 ):
                     found = self._reconcile_by_tag(tag, leg)
-                    if found is not None:
+                    if found is not None and found.get("state") != "UNKNOWN":
                         settled = True
                         return found
-                    settled = True
-                    self._dispatch_write(tag, leg, transaction_type, qty,
-                                        limit_price, phase, state="NOT_PLACED",
-                                        error=e)
+                    if found is None:
+                        settled = True
+                        self._dispatch_write(tag, leg, transaction_type, qty,
+                                            limit_price, phase, state="NOT_PLACED",
+                                            error=e)
+                        raise OrderNotPlaced(
+                            f"{e} — reconciled by tag {tag}: no order at broker, "
+                            f"nothing was placed"
+                        ) from e
+                    # Unresolved history API — leave UNRESOLVED, do not proceed.
+                    settled = False
+                    self._dispatch_write(
+                        tag, leg, transaction_type, qty, limit_price, phase,
+                        state="UNRESOLVED",
+                        error=f"{e}: reconcile history unavailable",
+                    )
                     raise OrderNotPlaced(
-                        f"{e} — reconciled by tag {tag}: no order at broker, "
-                        f"nothing was placed"
+                        f"{e} — tag {tag} reconcile UNRESOLVED; not proceeding"
                     ) from e
                 settled = True
                 self._dispatch_write(tag, leg, transaction_type, qty,
@@ -488,9 +558,14 @@ class LiveOrderExecutor:
             raise
 
     def _await_fill(
-        self, order_id: str, fallback: float, wait_sec: float
+        self, order_id: str, fallback: float, wait_sec: float,
+        expected_qty: Optional[int] = None,
     ) -> dict:
-        """Short, non-raising version of _get_fill_price for the exit ladder."""
+        """Short, non-raising version of _get_fill_price for the exit ladder.
+
+        v62 / P59-11: when expected_qty is set, require filled_quantity ≥ qty
+        (missing filled is not a confirmed fill — same rule as entry).
+        """
         deadline = time_module.monotonic() + max(1.0, float(wait_sec))
         last_status = ""
         while True:
@@ -501,15 +576,53 @@ class LiveOrderExecutor:
                 ).strip().lower()
                 last_status = status or last_status
                 price  = float(details.get("average_price") or 0.0)
-                filled = float(details.get("filled_quantity") or 0.0)
+                filled_raw = details.get("filled_quantity")
                 pending = details.get("pending_quantity")
-                if status in self._TERMINAL_OK and price > 0:
-                    if pending is None or float(pending or 0) == 0:
-                        return {"state": "FILLED", "price": price, "status": status}
+                try:
+                    filled = float(filled_raw) if filled_raw is not None else None
+                except (TypeError, ValueError):
+                    filled = None
+
                 if status in self._TERMINAL_BAD:
                     return {"state": "BAD", "price": 0.0, "status": status}
-                if filled > 0 and price > 0 and (pending is None or float(pending or 0) == 0):
-                    return {"state": "FILLED", "price": price, "status": status}
+
+                qty_ok = True
+                if expected_qty is not None:
+                    if filled is None:
+                        qty_ok = False
+                    elif float(filled) + 1e-9 < float(expected_qty):
+                        qty_ok = False
+
+                pending_ok = pending is None or float(pending or 0) == 0
+                if (
+                    status in self._TERMINAL_OK
+                    and price > 0
+                    and pending_ok
+                    and qty_ok
+                ):
+                    return {
+                        "state": "FILLED",
+                        "price": price,
+                        "status": status,
+                        "filled_qty": filled,
+                    }
+                if (
+                    filled is not None
+                    and filled > 0
+                    and price > 0
+                    and pending_ok
+                    and qty_ok
+                ):
+                    return {
+                        "state": "FILLED",
+                        "price": price,
+                        "status": status,
+                        "filled_qty": filled,
+                    }
+                # Terminal OK but short/missing qty → treat as still open so
+                # cancel-confirm / escalate can run (do not book partial CLOSE).
+                if status in self._TERMINAL_OK and not qty_ok:
+                    last_status = f"{status}_partial_or_qty_missing"
             except Exception as e:
                 self.logger.debug(f"fill poll failed for {order_id}: {e}")
             if time_module.monotonic() >= deadline:
@@ -612,12 +725,16 @@ class LiveOrderExecutor:
         fill_price = float(placed.get("fill_price") or 0.0)
         if fill_price <= 0:
             fill_price = self._get_fill_price(
-                order_id, fallback=float(leg.get("exec_price", 0) or 0)
+                order_id,
+                fallback=float(leg.get("exec_price", 0) or 0),
+                expected_qty=qty,
             )
         return {
             "order_id":   order_id,
             "fill_price": fill_price,
             "status":     "FILLED",
+            "tag":        placed.get("tag"),
+            "qty":        qty,
         }
 
     def execute_leg_exit(
@@ -637,6 +754,13 @@ class LiveOrderExecutor:
             )
 
         qty              = lots * self.config.lot_size
+        # Prefer the booked leg quantity when present (partial-entry promote).
+        try:
+            _leg_qty = int(leg.get("qty") or leg.get("quantity") or 0)
+            if _leg_qty > 0:
+                qty = _leg_qty
+        except (TypeError, ValueError):
+            pass
         # Exit is reverse of entry action
         transaction_type = "BUY" if leg["action"] == "SELL" else "SELL"
         fallback         = float(leg.get("entry_price", 0) or 0)
@@ -698,7 +822,9 @@ class LiveOrderExecutor:
 
             fill_price = float(placed.get("fill_price") or 0.0)
             if fill_price <= 0:
-                outcome    = self._await_fill(order_id, fallback, wait_sec)
+                outcome    = self._await_fill(
+                    order_id, fallback, wait_sec, expected_qty=qty,
+                )
                 fill_price = float(outcome.get("price") or 0.0)
                 last_state = str(outcome.get("status") or outcome.get("state") or "")
                 if outcome.get("state") == "FILLED":
@@ -917,12 +1043,25 @@ class ExecutionEngine:
     # POSITION QUERIES
     # ─────────────────────────────────────────────────────────────────────
 
-    def _get_open_positions(self) -> List[dict]:
-        """Return all open positions for today."""
+    def _get_open_positions(self, trading_date: Optional[str] = None) -> List[dict]:
+        """Return OPEN positions.
+
+        v58: default is ALL open rows (any trading_date) so startup reconcile,
+        monitor, EOD and watchdog cannot miss prior-day leftovers. Pass
+        trading_date=today for day-scoped reports.
+        """
+        if trading_date is None:
+            return self.db.query(
+                "SELECT * FROM positions WHERE status='OPEN' "
+                "ORDER BY trading_date, entry_time"
+            )
         return self.db.query(
             "SELECT * FROM positions WHERE trading_date=? AND status='OPEN'",
-            (today_ist().isoformat(),),
+            (trading_date,),
         )
+
+    def _get_todays_open_positions(self) -> List[dict]:
+        return self._get_open_positions(today_ist().isoformat())
 
     def _get_position_legs(self, position_id: str) -> List[dict]:
         """Return all legs for a position."""
@@ -1456,12 +1595,14 @@ class ExecutionEngine:
 
     def _emergency_unwind(
         self, filled_legs: List[dict], lots: int, chain: dict
-    ) -> None:
+    ) -> bool:
         """
         Emergency unwind of partially filled entry.
-        Called when some but not all legs have been filled.
-        Logs CRITICAL if any unwind fails (manual intervention required).
+        Returns True only when every filled leg was closed (or no legs).
         """
+        if not filled_legs:
+            return True
+        all_ok = True
         for leg in filled_legs:
             try:
                 self.executor.execute_leg_exit(leg, chain, lots)
@@ -1470,46 +1611,155 @@ class ExecutionEngine:
                     f"{leg['option_type']} {leg['strike']:.0f}"
                 )
             except Exception as e:
+                all_ok = False
                 self.logger.critical(
                     f"EMERGENCY UNWIND FAILED for {leg['strike']:.0f} "
                     f"{leg['option_type']}: {e}. "
                     f"MANUAL INTERVENTION REQUIRED."
                 )
+        return all_ok
+
+    def _persist_filled_legs(
+        self, position_id: str, filled_legs: List[dict], lots: int
+    ) -> None:
+        """Write OPEN legs before promoting PENDING → OPEN (P59-06)."""
+        for fl in filled_legs:
+            fill_price = fl["fill"]["fill_price"]
+            bid        = float(fl.get("bid", 0) or 0)
+            ask        = float(fl.get("ask", 0) or 0)
+            quoted_mid = (
+                (bid + ask) / 2.0 if (bid > 0 and ask > 0)
+                else float(fl.get("exec_price", 0) or 0)
+            )
+            self.db.insert("position_legs", {
+                "position_id":          position_id,
+                "strike":               fl["strike"],
+                "option_type":          fl["option_type"],
+                "action":               fl["action"],
+                "qty":                  lots * self.config.lot_size,
+                "entry_price":          fill_price,
+                "exit_price":           None,
+                "entry_bid":            bid,
+                "entry_ask":            ask,
+                "entry_delta":          float(fl.get("delta", 0) or 0),
+                "entry_gamma":          float(fl.get("gamma", 0) or 0),
+                "entry_vega":           float(fl.get("vega",  0) or 0),
+                "entry_theta":          float(fl.get("theta", 0) or 0),
+                "entry_iv":             float(fl.get("iv",    0) or 0),
+                "entry_oi":             int(fl.get("oi",      0) or 0),
+                "exit_delta":           None,
+                "broker_order_id_entry":fl["fill"]["order_id"],
+                "broker_order_id_exit": None,
+                "quoted_mid_at_entry":  quoted_mid,
+                "quoted_mid_at_exit":   None,
+                "leg_status":           "OPEN",
+            })
 
     def execute_entry(self, params: dict, signals: dict) -> Optional[str]:
         """
         Execute all legs of a new position.
 
-        Flow:
-        1. Execute BUY legs first (defined risk), then SELL legs
-        2. On partial fill failure: emergency unwind all filled legs
-        3. Compute actual entry costs
-        4. Persist position, legs, and trade_entry to database
-        5. Update session state
-        6. Return position_id or None on failure
+        v61 Flow:
+        1. Insert PENDING_ENTRY + attach position_id BEFORE any place
+        2. Execute BUY legs first, then SELL legs
+        3. On failure: emergency unwind; ABORT only if broker flat
+        4. Persist legs WHILE PENDING, then promote to OPEN
         """
         position_id = str(uuid.uuid4())
         lots        = int(params.get("final_lots", 1) or 1)
         chain       = self.market_engine.last_chain
         filled_legs: List[dict] = []
+        now = now_ist()
+
+        # Intent-first durable draft so a crash mid-fill is recoverable.
+        try:
+            self.db.insert("positions", {
+                "position_id":              position_id,
+                "trading_date":             today_ist().isoformat(),
+                "strategy_name":            params["strategy_name"],
+                "strategy_type":            params.get("strategy_type"),
+                "selection_reason":         params.get("selection_reason"),
+                "target_expiry":            params.get("target_expiry"),
+                "actual_dte":               params.get("actual_dte"),
+                "entry_time":               now.isoformat(),
+                "entry_spot":               params.get("entry_spot"),
+                "final_lots":               lots,
+                "status":                   "PENDING_ENTRY",
+                "paper_trade":              1 if self.config.paper_trade_mode else 0,
+                "raw_params_json":          json.dumps(params, default=str),
+                "created_at":               now.isoformat(),
+                "updated_at":               now.isoformat(),
+            })
+        except Exception as e:
+            self.logger.critical(
+                f"PENDING_ENTRY insert failed — refusing to place orders: {e}"
+            )
+            return None
 
         try:
-            # Execute BUY legs first (reduces risk on partial fill)
             buy_legs  = [l for l in params["legs"] if l["action"] == "BUY"]
             sell_legs = [l for l in params["legs"] if l["action"] == "SELL"]
 
             for leg in buy_legs + sell_legs:
-                fill = self.executor.execute_leg_entry(leg, lots, chain)
-                filled_legs.append({**leg, "fill": fill})
+                leg_with_id = {**leg, "position_id": position_id}
+                fill = self.executor.execute_leg_entry(leg_with_id, lots, chain)
+                filled_legs.append({**leg_with_id, "fill": fill})
 
         except Exception as e:
             self.logger.error(f"Entry execution failed: {e}")
+            unwind_ok = True
             if filled_legs:
                 self.logger.critical(
                     f"PARTIAL FILL on entry — {len(filled_legs)}/{len(params['legs'])} "
                     f"legs filled. Attempting emergency unwind."
                 )
-                self._emergency_unwind(filled_legs, lots, chain)
+                unwind_ok = self._emergency_unwind(filled_legs, lots, chain)
+            # P59-16: never ABORT while broker still holds filled legs
+            if filled_legs and not unwind_ok:
+                try:
+                    self._persist_filled_legs(position_id, filled_legs, lots)
+                    self.db.update(
+                        "positions",
+                        {
+                            "status": "OPEN",
+                            "exit_reason": None,
+                            "selection_reason": (
+                                f"{params.get('selection_reason') or ''}:"
+                                f"PARTIAL_ENTRY_UNWIND_FAILED"
+                            )[:200],
+                            "updated_at": now_ist().isoformat(),
+                        },
+                        {"position_id": position_id},
+                    )
+                    self._alert(
+                        "CRITICAL",
+                        f"PARTIAL ENTRY {position_id[:16]} promoted OPEN "
+                        f"after unwind failure — monitor will flatten",
+                    )
+                except Exception as pe:
+                    self.logger.critical(
+                        f"partial OPEN promote failed: {pe} — "
+                        f"position {position_id} stays PENDING_ENTRY"
+                    )
+                    self._alert(
+                        "CRITICAL",
+                        f"PARTIAL ENTRY {position_id[:16]} unwind failed; "
+                        f"stays PENDING — flatten by hand",
+                    )
+                return None
+            try:
+                self.db.update(
+                    "positions",
+                    {
+                        "status": "ABORTED",
+                        "exit_reason": f"ENTRY_FAILED:{e}"[:200],
+                        "exit_time": now_ist().isoformat(),
+                        "updated_at": now_ist().isoformat(),
+                    },
+                    {"position_id": position_id},
+                )
+            except Exception as ue:
+                self.logger.critical(f"PENDING_ENTRY abort mark failed: {ue}")
             return None
 
         # Build actual fill legs
@@ -1525,9 +1775,11 @@ class ExecutionEngine:
 
         now = now_ist()
 
-        # ── Persist position ──────────────────────────────────────────────
-        self.db.insert("positions", {
-            "position_id":              position_id,
+        # P59-06: legs first (still PENDING), then promote — never OPEN w/ 0 legs
+        self._persist_filled_legs(position_id, filled_legs, lots)
+
+        # ── Promote PENDING_ENTRY → OPEN ──────────────────────────────────
+        self.db.update("positions", {
             "trading_date":             today_ist().isoformat(),
             "strategy_name":            params["strategy_name"],
             "strategy_type":            params["strategy_type"],
@@ -1570,40 +1822,8 @@ class ExecutionEngine:
             "event_name":               params.get("event_name", ""),
             "defined_risk_only":        int(bool(params.get("defined_risk_only", False))),
             "is_borderline_sell":       int(bool(params.get("is_borderline_sell", False))),
-            "created_at":               now.isoformat(),
             "updated_at":               now.isoformat(),
-        })
-
-        # ── Persist position legs ─────────────────────────────────────────
-        for fl in filled_legs:
-            fill_price = fl["fill"]["fill_price"]
-            bid        = float(fl.get("bid", 0) or 0)
-            ask        = float(fl.get("ask", 0) or 0)
-            quoted_mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else float(fl.get("exec_price", 0) or 0)
-
-            self.db.insert("position_legs", {
-                "position_id":          position_id,
-                "strike":               fl["strike"],
-                "option_type":          fl["option_type"],
-                "action":               fl["action"],
-                "qty":                  lots * self.config.lot_size,
-                "entry_price":          fill_price,
-                "exit_price":           None,
-                "entry_bid":            bid,
-                "entry_ask":            ask,
-                "entry_delta":          float(fl.get("delta", 0) or 0),
-                "entry_gamma":          float(fl.get("gamma", 0) or 0),
-                "entry_vega":           float(fl.get("vega",  0) or 0),
-                "entry_theta":          float(fl.get("theta", 0) or 0),
-                "entry_iv":             float(fl.get("iv",    0) or 0),
-                "entry_oi":             int(fl.get("oi",      0) or 0),
-                "exit_delta":           None,
-                "broker_order_id_entry":fl["fill"]["order_id"],
-                "broker_order_id_exit": None,
-                "quoted_mid_at_entry":  quoted_mid,
-                "quoted_mid_at_exit":   None,
-                "leg_status":           "OPEN",
-            })
+        }, {"position_id": position_id})
 
         # ── Persist trade entry ───────────────────────────────────────────
         self._persist_trade_entry(position_id, params, signals, actual_entry_costs_rs)
@@ -1613,6 +1833,16 @@ class ExecutionEngine:
         state["entry_count"]       = state.get("entry_count", 0) + 1
         state["consecutive_stops"] = 0
         state["last_entry_time"]   = now.isoformat()
+        # P59-07: latch calendar mode at first successful entry only
+        if not state.get("day_mode_latched"):
+            state["day_mode_latched"] = (
+                state.get("day_mode")
+                or (signals or {}).get("day_mode")
+                or "NORMAL"
+            )
+            state["event_day_latched"] = bool(
+                (signals or {}).get("event_day", params.get("event_day", False))
+            )
         self.market_engine._save_session_state()
 
         print_section(f"POSITION OPENED: {params['strategy_name']}")
@@ -1725,7 +1955,7 @@ class ExecutionEngine:
             reason = result.get("reason", "unknown")
             print_section("PRE-TRADE VALIDATION: NO_GO")
             print(f"  Reason: {reason}")
-            self.logger.warning(f"PRE_TRADE_NO_GO: {reason}")
+            self.logger.warning(f"ENTER_BLOCKED:pre_trade:{reason}")
             return None
 
         print_section("PRE-TRADE VALIDATION: GO")
@@ -1975,6 +2205,15 @@ class ExecutionEngine:
 
         legs         = self._get_position_legs(position["position_id"])
         open_legs    = [l for l in legs if l.get("leg_status") == "OPEN"]
+        # P62: OPEN with zero live legs = bookkeeping zombie (close crashed
+        # after legs were marked CLOSED, or broker flat while local OPEN).
+        if not open_legs:
+            self.logger.critical(
+                f"OPEN {position['position_id'][:16]} has 0 OPEN legs — "
+                f"finalizing local CLOSED (LEGS_ALREADY_FLAT)"
+            )
+            return self._finalize_empty_open_position(position)
+
         chain        = self.market_engine.last_chain
         current_time = now_ist().time()
         spot         = float(signals.get("spot") or 0)
@@ -3064,6 +3303,73 @@ class ExecutionEngine:
     # EXIT EXECUTION
     # ─────────────────────────────────────────────────────────────────────
 
+    def _finalize_empty_open_position(self, position: dict) -> Tuple[str, int, dict]:
+        """Heal OPEN rows whose legs are already CLOSED / missing (P62).
+
+        Never fabricates broker fills — only books what position_legs already
+        records. Returns HOLD-shaped tuple so monitor_all does not re-exit.
+        """
+        pid = position["position_id"]
+        legs = self._get_position_legs(pid) or []
+        still_open = [l for l in legs if str(l.get("leg_status") or "").upper() == "OPEN"]
+        if still_open:
+            return "HOLD", 0, {"reason_detail": "legs_reappeared"}
+
+        lots = int(position.get("final_lots", 1) or 1)
+        C02 = float(self.config.lot_size or 1)
+        entry_credit = float(position.get("entry_credit") or 0)
+        realised_credit, _ = realised_entry_credit(position, legs)
+        exit_premium, _ = realised_exit_debit(position, legs)
+        gross_pnl_pts = realised_credit - exit_premium
+        gross_pnl_rs = gross_pnl_pts * C02 * lots
+        entry_costs_rs = float(position.get("entry_costs_rupees") or 0)
+        exit_costs_rs = float(position.get("exit_costs_rupees") or 0)
+        net_pnl_rs = gross_pnl_rs - entry_costs_rs - exit_costs_rs
+        now = now_ist()
+        reason = "LEGS_ALREADY_FLAT"
+        try:
+            self.db.update(
+                "positions",
+                {
+                    "status": "CLOSED",
+                    "exit_time": now.isoformat(),
+                    "exit_reason": reason,
+                    "exit_premium": exit_premium,
+                    "gross_pnl_rupees": gross_pnl_rs,
+                    "net_pnl_rupees": net_pnl_rs,
+                    "entry_credit_realised": realised_credit,
+                    "updated_at": now.isoformat(),
+                },
+                {"position_id": pid},
+            )
+        except Exception as e:
+            self.logger.critical(f"empty-OPEN finalize failed for {pid}: {e}")
+            try:
+                self.db.update(
+                    "positions",
+                    {
+                        "status": "CLOSED",
+                        "exit_time": now.isoformat(),
+                        "exit_reason": reason,
+                        "updated_at": now.isoformat(),
+                    },
+                    {"position_id": pid},
+                )
+            except Exception as e2:
+                self.logger.critical(f"empty-OPEN force CLOSED failed: {e2}")
+                return "HOLD", 0, {"reason_detail": "finalize_failed"}
+
+        self._alert(
+            "CRITICAL",
+            f"OPEN {pid[:16]} had 0 live legs — local CLOSED as {reason} "
+            f"net≈₹{net_pnl_rs:,.0f} (verify broker flat)",
+        )
+        try:
+            self._update_state_after_close(reason, net_pnl_rs, 0)
+        except Exception as se:
+            self.logger.warning(f"state after empty-OPEN finalize: {se}")
+        return "HOLD", 0, {"reason_detail": reason, "net_pnl_rs": net_pnl_rs}
+
     def execute_close(
         self,
         position:    dict,
@@ -3088,6 +3394,11 @@ class ExecutionEngine:
             # Close SELL legs first (buy back shorts to reduce risk)
             key=lambda l: 0 if l["action"] == "SELL" else 1,
         )
+        if not open_legs:
+            # All legs already flat — settle the OPEN row instead of no-op
+            self._finalize_empty_open_position(position)
+            return
+
         lots  = int(position.get("final_lots", 1) or 1)
         chain = self.market_engine.last_chain
 
@@ -3374,6 +3685,8 @@ class ExecutionEngine:
         state["last_exit_reason"] = reason
         state["last_exit_priority"] = int(priority or 0)
         state["last_exit_pnl_rs"] = float(net_pnl_rs or 0.0)
+        # P59-14: live same-cycle reentry gate reads this flag
+        state["_closed_this_cycle"] = True
         try:
             _xspot = float(state.get("_last_monitor_spot") or 0.0)
         except (TypeError, ValueError):
@@ -3631,16 +3944,53 @@ class ExecutionEngine:
         if broker_open == 0:
             msg = (
                 f"{len(positions)} position(s) still OPEN locally after "
-                f"'{reason}' while the broker reports none: "
-                + "; ".join(detail)
-                + " — exits likely filled after their order query failed; "
-                "reconcile the book by hand (no automatic close, so P&L stays "
-                "truthful)"
+                f"'{reason}' while the broker reports none — healing local book"
             )
+            self._alert("CRITICAL", msg)
+            for position in positions:
+                try:
+                    self._heal_local_open_broker_flat(position, reason)
+                except Exception as e:
+                    self.logger.critical(
+                        f"broker-flat heal failed for "
+                        f"{position.get('position_id')}: {e}"
+                    )
+            return
         self._alert("CRITICAL", msg)
 
         if bool(getattr(self.config, "exit_all_positions_fallback", False)):
             self._exit_all_positions_fallback(reason)
+
+    def _heal_local_open_broker_flat(self, position: dict, reason: str) -> None:
+        """Broker flat, local still OPEN — close legs in DB then finalize (P62)."""
+        pid = position["position_id"]
+        legs = self._get_position_legs(pid) or []
+        for leg in legs:
+            if str(leg.get("leg_status") or "").upper() != "OPEN":
+                continue
+            # Prefer already-known exit; else entry (0 premium PnL on that leg)
+            # so we never invent a mark — operator verifies via alert.
+            exit_px = leg.get("exit_price")
+            if exit_px is None or exit_px == "":
+                exit_px = leg.get("entry_price") or 0
+            try:
+                self.db.update(
+                    "position_legs",
+                    {
+                        "leg_status": "CLOSED",
+                        "exit_price": float(exit_px or 0),
+                        "quoted_mid_at_exit": float(exit_px or 0),
+                    },
+                    {"leg_id": leg["leg_id"]},
+                )
+            except Exception as e:
+                self.logger.critical(f"leg heal failed {leg.get('leg_id')}: {e}")
+        self._finalize_empty_open_position(position)
+        self._alert(
+            "CRITICAL",
+            f"{pid[:16]} healed BROKER_ALREADY_FLAT after '{reason}' — "
+            f"verify P&L (exit marks may be entry-fallback)",
+        )
 
     def _exit_all_positions_fallback(self, reason: str) -> None:
         """Last resort: the broker's own flatten.
@@ -3773,7 +4123,11 @@ class ExecutionEngine:
                 self.close_all_positions("HARD_EXIT_15:00", force=True)
 
     def flatten_now(self, reason: str) -> None:
-        """Kill-switch entry point: cancel resting orders, then flatten."""
+        """Kill-switch entry point: cancel resting orders, then flatten.
+
+        v62: also abort/flatten PENDING_ENTRY (broker may hold fills while
+        local book has no OPEN rows — /stop must not leave that ghost).
+        """
         if not self.config.paper_trade_mode:
             try:
                 result = self.client.cancel_all_open_orders()
@@ -3782,6 +4136,54 @@ class ExecutionEngine:
             except Exception as e:
                 self.logger.warning(
                     f"cancel-all before flatten failed (continuing): {e}"
+                )
+            # PENDING_ENTRY: Exit-All by dispatch tags, then mark ABORTED
+            try:
+                pending = self.db.query(
+                    "SELECT * FROM positions WHERE status='PENDING_ENTRY'"
+                ) or []
+            except Exception:
+                pending = []
+            for pos in pending:
+                pid = str(pos.get("position_id") or "")
+                tags: list = []
+                if pid:
+                    try:
+                        rows = self.db.query(
+                            "SELECT tag FROM order_dispatch WHERE position_id=?",
+                            (pid,),
+                        ) or []
+                        tags = [str(r.get("tag") or "") for r in rows if r.get("tag")]
+                    except Exception:
+                        tags = []
+                for tag in tags or [None]:
+                    try:
+                        if tag:
+                            self.client.exit_all_positions(
+                                segment="NSE_FO", tag=tag
+                            )
+                        else:
+                            self.client.exit_all_positions(segment="NSE_FO")
+                    except Exception as e:
+                        self.logger.critical(
+                            f"PENDING flatten tag={tag} failed: {e}"
+                        )
+                try:
+                    self.db.update(
+                        "positions",
+                        {
+                            "status": "ABORTED",
+                            "exit_reason": f"FLATTEN_PENDING:{reason}"[:200],
+                            "exit_time": now_ist().isoformat(),
+                            "updated_at": now_ist().isoformat(),
+                        },
+                        {"position_id": pid},
+                    )
+                except Exception as e:
+                    self.logger.critical(f"PENDING abort on flatten failed: {e}")
+                self._alert(
+                    "CRITICAL",
+                    f"flatten_now aborted PENDING_ENTRY {pid[:16]} ({reason})",
                 )
         self.close_all_positions(reason, force=True)
 

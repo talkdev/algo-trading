@@ -128,13 +128,19 @@ class StrategyEngine:
         )
 
     def _count_open_positions(self) -> int:
+        # v60: PENDING_ENTRY reserves a slot — otherwise a slow multi-leg
+        # entry can double-fire on the next cycle while the first is still
+        # placing (concurrency saw only OPEN).
         row = self.db.query_one(
-            "SELECT COUNT(*) as cnt FROM positions WHERE trading_date=? AND status='OPEN'",
+            "SELECT COUNT(*) as cnt FROM positions WHERE trading_date=? "
+            "AND status IN ('OPEN','PENDING_ENTRY')",
             (today_ist().isoformat(),),
         )
         return row["cnt"] if row else 0
 
     def _count_today_entries(self) -> int:
+        # Successful book only — ABORTED/PENDING must not burn max_entries,
+        # but OPEN+CLOSED still count.
         row = self.db.query_one(
             "SELECT COUNT(*) as cnt FROM positions "
             "WHERE trading_date=? AND status IN ('OPEN','CLOSED')",
@@ -146,7 +152,7 @@ class StrategyEngine:
         try:
             rows = self.db.query(
                 "SELECT strategy_name FROM positions "
-                "WHERE trading_date=? AND status='OPEN'",
+                "WHERE trading_date=? AND status IN ('OPEN','PENDING_ENTRY')",
                 (today_ist().isoformat(),),
             )
         except Exception:
@@ -285,6 +291,18 @@ class StrategyEngine:
                 # long premium may only ride WITH an open credit vertical
                 if o in MOMENTUM_STRATEGIES or not (new_sides & o_sides):
                     return f"slot_conflict_long_premium_against_open:{o}"
+                # P62 / P59-09: same-side credit + debit = correlated double
+                # tape risk (Sep22 BCS+LP). Default refuse; opt-in via config.
+                if new_sides & o_sides and not bool(
+                    getattr(
+                        self.config,
+                        "allow_correlated_debit_beside_credit",
+                        False,
+                    )
+                ):
+                    return (
+                        f"slot_conflict_correlated_debit_beside_credit:{o}"
+                    )
                 continue
             if o in MOMENTUM_STRATEGIES:
                 # a credit vertical beside an open long option: same side only
@@ -359,10 +377,14 @@ class StrategyEngine:
         self._apply_two_way_location(signals, current_time)
 
         final_regime = signals.get("final_regime")
+        if signals.get("_feed_stale"):
+            return "NO_TRADE", "feed_stale_entries_blocked"
         if signals.get("block_new_entries"):
             notes = signals.get("final_regime_notes", "regime_engine_abort")
             return "NO_TRADE", f"ABORT:{notes}"
-        if final_regime in ("NO_TRADE", "ABORT", None):
+        if final_regime is None:
+            return "NO_TRADE", "regime_unavailable"
+        if final_regime in ("NO_TRADE", "ABORT"):
             notes = signals.get("final_regime_notes", "regime_engine_no_trade")
             return "NO_TRADE", str(notes) if notes else "regime_engine_no_trade"
         if state.get("daily_halted"):
@@ -376,6 +398,11 @@ class StrategyEngine:
         _loc_fade = bool(
             signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
         )
+        # v56/v57: away-side intent (mature/soft/day-structure). Intent
+        # exemptions are post-selection only — hard gates run before Intent
+        # exists (v60: do not call _intent_exempt here).
+        if not _loc_fade and self._away_side_intent(signals):
+            _loc_fade = True
         if iv_behavior == "EXPANDING" and not _loc_fade:
             return "NO_TRADE", "iv_expanding_never_sell_into_rising_iv"
         if iv_behavior == "SPIKING" and not _loc_fade:
@@ -733,7 +760,23 @@ class StrategyEngine:
 
 
         if signals.get("straddle_expanding"):
-            return "NO_TRADE", "straddle_expanding_no_sell_into_rising_iv"
+            # v55: ATM-straddle can jump 6%+ in 5 minutes when spot rolls
+            # the ATM strike on a dump/rally without a true IV expansion
+            # (live 22-Sep 10:31: straddle 86→94 while iv_change still
+            # −4% and iv_behavior=DECLINING). Only stand aside when IV
+            # itself confirms the expansion.
+            _ivb_se = str(signals.get("iv_behavior") or "")
+            try:
+                _ivchg_se = float(
+                    signals.get("iv_change_pct_from_open") or 0.0
+                )
+            except (TypeError, ValueError):
+                _ivchg_se = 0.0
+            if (
+                _ivb_se in ("EXPANDING", "SPIKING")
+                or _ivchg_se > 0.0
+            ):
+                return "NO_TRADE", "straddle_expanding_no_sell_into_rising_iv"
 
         if not signals.get("or_computed"):
             return "NO_TRADE", "opening_range_not_yet_computed"
@@ -817,6 +860,11 @@ class StrategyEngine:
         _loc_fade = bool(
             signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
         )
+        # v57: soft/mature/day-structure lean same as fade for confidence.
+        # v57: soft/mature/day-structure lean same as fade for confidence.
+        # Intent exemptions apply only after selection (v60).
+        if not _loc_fade and self._away_side_intent(signals):
+            _loc_fade = True
         if confidence in ("LOW", "NONE") and not _loc_fade:
             return "NO_TRADE", f"confidence_{confidence}_insufficient_edge_after_costs"
 
@@ -912,6 +960,10 @@ class StrategyEngine:
             _dm_range_confirmed = True
         if bool(signals.get("afternoon_high_fade")
                 or signals.get("afternoon_low_fade")):
+            _dm_range_confirmed = True
+        # v57: away-side lean IS the day-move thesis (flush to the extreme);
+        # do not ban the credit ticket the resolver is about to book.
+        if self._away_side_intent(signals):
             _dm_range_confirmed = True
         if _dm_threat >= self.config.day_move_used_block_pct and not (
             _dm_trend_confirmed or _dm_range_confirmed
@@ -1594,6 +1646,130 @@ class StrategyEngine:
     # 16/17/21-Sep IC catch-all (selection_reason ended at adx=N with
     # or=MODERATE) — professionals do not pin a moderate OR.
 
+    def _build_decision_intent(
+        self, strategy_name: str, signals: dict, selection_reason: str
+    ) -> dict:
+        """v59: Decision Contract after selection.
+
+        Secondary gates honor exemptions or supersede explicitly. Away-side
+        credit gets the Sep22 exemption set so max_pain / IV / confidence /
+        day_move cannot silently undo a booked lean.
+        """
+        away = self._away_side_intent(signals)
+        side = None
+        if strategy_name == BEAR_CALL_SPREAD and away == "BEAR":
+            side = "BEAR"
+        elif strategy_name == BULL_PUT_SPREAD and away == "BULL":
+            side = "BULL"
+        elif strategy_name == LONG_PUT and away == "BEAR":
+            side = "BEAR"
+        elif strategy_name == LONG_CALL and away == "BULL":
+            side = "BULL"
+        # P62 / P59-10: selection_reason is the durable Intent source when
+        # loc drifted after select (secondary veto must not re-derive away).
+        _sel = str(selection_reason or "").lower()
+        if side is None:
+            if strategy_name == BEAR_CALL_SPREAD and any(
+                k in _sel for k in (
+                    "soft_lean", "range_location_lean", "day_structure",
+                    "high_fade", "bearish",
+                )
+            ):
+                side = "BEAR"
+            elif strategy_name == BULL_PUT_SPREAD and any(
+                k in _sel for k in (
+                    "soft_lean", "range_location_lean", "day_structure",
+                    "low_fade", "bullish",
+                )
+            ):
+                side = "BULL"
+            elif strategy_name == LONG_PUT and "momentum" in _sel:
+                side = "BEAR"
+            elif strategy_name == LONG_CALL and "momentum" in _sel:
+                side = "BULL"
+        exemptions: List[str] = []
+        if side in ("BULL", "BEAR"):
+            exemptions = [
+                "iv", "confidence", "day_move", "max_pain", "or_mid", "early_pass",
+            ]
+        if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
+            for k in ("iv", "confidence", "day_move", "max_pain", "or_mid"):
+                if k not in exemptions:
+                    exemptions.append(k)
+        return {
+            "strategy": strategy_name,
+            "side": side,
+            "exemptions": exemptions,
+            "selection_reason": selection_reason,
+            "away": away,
+        }
+
+    def _intent_exempt(self, signals: dict, key: str) -> bool:
+        intent = signals.get("_intent") or {}
+        return key in (intent.get("exemptions") or [])
+
+    def _away_side_location_lean(self, signals: dict) -> Optional[str]:
+        """Return 'BULL'/'BEAR' when session location alone books away-side credit.
+
+        Same thresholds the range resolver uses for a mature lean (0.62/0.38)
+        on a real session range. Used by hard gates and entry rules so a
+        secondary veto cannot undo a lean the resolver just selected
+        (Sep22-class: BCS at loc 0.04 then max_pain / false IV block).
+        """
+        try:
+            rng, loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return None
+        if rng < self.RANGE_LEAN_MIN_PTS:
+            return None
+        if loc >= self.RANGE_LEAN_HI:
+            return "BULL"
+        if loc <= self.RANGE_LEAN_LO:
+            return "BEAR"
+        return None
+
+    def _away_side_intent(self, signals: dict) -> Optional[str]:
+        """v57: full away-side intent the resolver can book — mature, soft, or day-structure.
+
+        `_away_side_location_lean` alone left a Sep22-class hole: soft lean
+        (0.58/0.42 + tape) or day-structure BCS selected, then IV / confidence
+        / day_move / entry max_pain still keyed only on mature 0.62/0.38.
+        """
+        mature = self._away_side_location_lean(signals)
+        if mature:
+            return mature
+        try:
+            _ds_ok, _ = self._range_day_bearish_lean(signals)
+            if _ds_ok:
+                return "BEAR"
+        except Exception:
+            pass
+        try:
+            rng, loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return None
+        if rng < self.RANGE_LEAN_MIN_PTS:
+            return None
+        if (
+            loc >= self.RANGE_SOFT_LEAN_HI
+            and loc < self.RANGE_LEAN_HI
+            and (
+                loc >= 0.70
+                or self._soft_location_evidence(signals, "BULL")
+            )
+        ):
+            return "BULL"
+        if (
+            loc <= self.RANGE_SOFT_LEAN_LO
+            and loc > self.RANGE_LEAN_LO
+            and (
+                loc <= 0.30
+                or self._soft_location_evidence(signals, "BEAR")
+            )
+        ):
+            return "BEAR"
+        return None
+
     def _soft_location_evidence(self, signals: dict, side: str) -> bool:
         """EMA / price-regime / VWAP agreement for an early location lean.
 
@@ -1690,20 +1866,43 @@ class StrategyEngine:
             else:
                 _ext_hi = _loc >= 0.70
                 _ext_lo = _loc <= 0.30
+                # v55: until 5-min EMA/ADX can print (~10:55), soft evidence
+                # is structurally unavailable (ema=INSUFFICIENT_DATA, adx=0).
+                # Live 22-Sep 0DTE: loc=0.62 in a real 60pt range sat in
+                # range_wait_no_pin_no_lean for the first half of the
+                # 10:30–13:00 window because 0.58 still demanded EMA/VWAP.
+                # During that warm-up, mature lean thresholds (0.62/0.38)
+                # ARE location evidence — same spirit as the 0.70 extreme
+                # override, keyed on indicator readiness not on DTE.
+                _warmup = (
+                    str(signals.get("ema_structure") or "")
+                    == "INSUFFICIENT_DATA"
+                )
+                if _warmup:
+                    _ext_hi = _ext_hi or (_loc >= self.RANGE_LEAN_HI)
+                    _ext_lo = _ext_lo or (_loc <= self.RANGE_LEAN_LO)
                 if (_loc >= self.RANGE_SOFT_LEAN_HI
                         and (_ext_hi or self._soft_location_evidence(signals, "BULL"))):
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BULL_PUT_SPREAD"
+                        f"{':warmup_loc' if _warmup and _ext_hi else ''}"
                     )
-                    return BULL_PUT_SPREAD, f"range_soft_location_lean_{_loc:.2f}"
+                    return BULL_PUT_SPREAD, (
+                        f"range_soft_location_lean_{_loc:.2f}"
+                        f"{':warmup' if _warmup and _loc >= self.RANGE_LEAN_HI else ''}"
+                    )
                 if (_loc <= self.RANGE_SOFT_LEAN_LO
                         and (_ext_lo or self._soft_location_evidence(signals, "BEAR"))):
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BEAR_CALL_SPREAD"
+                        f"{':warmup_loc' if _warmup and _ext_lo else ''}"
                     )
-                    return BEAR_CALL_SPREAD, f"range_soft_location_lean_{_loc:.2f}"
+                    return BEAR_CALL_SPREAD, (
+                        f"range_soft_location_lean_{_loc:.2f}"
+                        f"{':warmup' if _warmup and _loc <= self.RANGE_LEAN_LO else ''}"
+                    )
 
         # 4. true pin only — never a catch-all. Condor/fly need a NARROW
         # opening range, mid location, and a real flat ADX read. MODERATE
@@ -1965,13 +2164,14 @@ class StrategyEngine:
             hard_exit = cfg.hard_exit_time
         _min_left = float(getattr(cfg, "momentum_late_min_minutes_left", 25))
         try:
+            _day = today_ist()
             _last = (
-                datetime.combine(date.today(), hard_exit)
-                - datetime.combine(date.today(), end)
+                datetime.combine(_day, hard_exit)
+                - datetime.combine(_day, end)
             ).total_seconds() / 60.0
             if _last < _min_left:
                 end = (
-                    datetime.combine(date.today(), hard_exit)
+                    datetime.combine(_day, hard_exit)
                     - timedelta(minutes=_min_left)
                 ).time()
         except Exception:
@@ -2156,6 +2356,13 @@ class StrategyEngine:
             # a different measurement than the one it was written for.
             if signals.get("afternoon_low_fade"):
                 return True, "entry_rules_passed"
+            # v56/v59: away-side intent OR Decision Intent owns entry rules.
+            if (
+                self._away_side_intent(signals) == "BULL"
+                or self._intent_exempt(signals, "or_mid")
+                or self._intent_exempt(signals, "early_pass")
+            ):
+                return True, "entry_rules_passed"
             if or_high > 0 and or_low > 0 and not signals.get(
                     "neutral_range_vertical"):
                 or_mid    = (or_high + or_low) / 2.0
@@ -2189,11 +2396,20 @@ class StrategyEngine:
             _px_regime = signals.get("price_regime", "")
             if signals.get("afternoon_high_fade"):
                 return True, "entry_rules_passed"
+            # v56/v59: away-side intent OR Decision Intent owns BCS rules.
+            if (
+                self._away_side_intent(signals) == "BEAR"
+                or self._intent_exempt(signals, "or_mid")
+                or self._intent_exempt(signals, "max_pain")
+            ):
+                return True, "entry_rules_passed"
             if (_px_regime in ("DOWNTREND", "STRONG_DOWNTREND")
                     and or_high > 0 and or_low > 0):
                 or_mid    = (or_high + or_low) / 2.0
                 or_buffer = by_dte(dte if dte is not None else 2, 30.0, 15.0)
-                if spot > or_mid + or_buffer:
+                if spot > or_mid + or_buffer and not self._intent_exempt(
+                    signals, "or_mid"
+                ):
                     return False, (
                         f"bear_call_spot_{spot:.0f}_above_or_mid_{or_mid:.0f}"
                         f"_by_{spot - or_mid:.0f}pts"
@@ -2207,7 +2423,12 @@ class StrategyEngine:
             # trend-side vertical for 20 minutes mid-trend).
             _mp_px = signals.get("price_regime", "")
             _mp_trend_through = _mp_px in ("DOWNTREND", "STRONG_DOWNTREND")
-            if max_pain > 0 and abs(spot - max_pain) < 25 and not _mp_trend_through:
+            if (
+                max_pain > 0
+                and abs(spot - max_pain) < 25
+                and not _mp_trend_through
+                and not self._intent_exempt(signals, "max_pain")
+            ):
                 return False, (
                     f"bear_call_spot_within_25pts_of_max_pain_{max_pain:.0f}"
                 )
@@ -4801,7 +5022,15 @@ class StrategyEngine:
         elif price in ("DOWNTREND", "STRONG_DOWNTREND"):
             direction = -1
         else:
-            return False, f"momentum_needs_trend_got_{price or 'NONE'}", 0
+            # v56/v57: extreme location OR soft/day-structure intent is a
+            # directional read when ORB still says RANGE/CHOPPY.
+            _lean = self._away_side_intent(signals)
+            if _lean == "BEAR":
+                direction = -1
+            elif _lean == "BULL":
+                direction = 1
+            else:
+                return False, f"momentum_needs_trend_got_{price or 'NONE'}", 0
 
         try:
             adx = float(signals.get("adx_15") or 0.0)
@@ -5067,7 +5296,22 @@ class StrategyEngine:
                         now_ist() - datetime.fromisoformat(str(_le))
                     ).total_seconds() / 60.0
                     if _since < float(ENTRY_COOLDOWN_MIN):
-                        return False, "momentum_second_slot_cooldown", 0
+                        # v57: aligned long beside a fresh credit IS the
+                        # second-slot design (BCS + LONG_PUT). Waiting the
+                        # full 10m after entry only delayed today's put
+                        # until ADX printed — sell cooldown must not block
+                        # the debit substitute once direction is known.
+                        _aligned_ok = False
+                        for _on in self._open_strategy_names():
+                            _sides = self._sides_of(_on)
+                            if (direction < 0 and "BEAR" in _sides
+                                    and "BULL" not in _sides):
+                                _aligned_ok = True
+                            if (direction > 0 and "BULL" in _sides
+                                    and "BEAR" not in _sides):
+                                _aligned_ok = True
+                        if not _aligned_ok:
+                            return False, "momentum_second_slot_cooldown", 0
                 except Exception:
                     pass
         if state.get("daily_halted"):
@@ -5419,9 +5663,20 @@ class StrategyEngine:
         original refusal, unaltered, as the logged reason.
         """
         signals.pop("_momentum_refuse_reason", None)
-        if signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade"):
-            signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
-            return None
+        # P59-08: fade window alone must not own the book when an open soft-
+        # lean credit already expresses that extreme (BCS @ low / BPS @ high).
+        # Sep22: afternoon_low_fade blocked aligned LONG_PUT for ~10m beside BCS.
+        _hi_fade = bool(signals.get("afternoon_high_fade"))
+        _lo_fade = bool(signals.get("afternoon_low_fade"))
+        if _hi_fade or _lo_fade:
+            _open_names = self._open_strategy_names()
+            _aligned_credit_owns = (
+                (_lo_fade and BEAR_CALL_SPREAD in _open_names)
+                or (_hi_fade and BULL_PUT_SPREAD in _open_names)
+            )
+            if not _aligned_credit_owns:
+                signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
+                return None
         # After a harvested extreme fade the session is a mean-reversion
         # book. Buying directional premium mid-day is the wipe trade
         # (canonical 2026-09-18: BPS low-fade + BCS high-fade then 14:30
@@ -5901,6 +6156,11 @@ class StrategyEngine:
             )
             return {"action": "NO_TRADE", "reason": selection_reason}
 
+        # v59: Intent contract — selection commits exemptions for secondary gates.
+        signals["_intent"] = self._build_decision_intent(
+            strategy_name, signals, selection_reason
+        )
+
         _chase = self._same_side_chase_refusal(strategy_name, signals)
         if _chase:
             # Do not re-sell the harvested side at a worse location — but
@@ -5919,19 +6179,15 @@ class StrategyEngine:
             )
             return {"action": "NO_TRADE", "reason": _chase}
 
-        # ── PATCH_V13: entry/exit trend symmetry ─────────────────────────
-        # The exit ladder ejects a credit vertical that a measured trend has
-        # run against, and refuses a symmetric structure only when the tape
-        # is not ranging. Opening either one into that same tape is a round
-        # trip paid for in advance: the entry, the ladder, the exit costs.
-        # The refusal is deliberately NOT answerable by the long-premium
-        # substitute - a measured trend against a credit structure is a
-        # reason to stand aside in the middle of the session, and the
-        # closing-hour route (which is separately gated on a strong trend, a
-        # fresh extreme, displacement and its own clock) is the only place
-        # this engine pays premium for a trend it did not see at the open.
+        # ── PATCH_V13 / v58: entry/exit trend symmetry ───────────────────
+        # Counter-trend refuses the credit structure — but the long-premium
+        # expression of the same tape must still be consulted (was silent).
         _ct_reason = self._counter_trend_entry_refusal(strategy_name, signals)
         if _ct_reason:
+            alt = self._momentum_decision(signals, _ct_reason)
+            if alt is not None:
+                return alt
+            _ct_reason = self._with_momentum_refuse(signals, _ct_reason)
             self._log_decision(signals, "NO_TRADE", _ct_reason)
             self._persist_decision(
                 signals, strategy_name, _ct_reason, None, "NO_TRADE"
@@ -5976,6 +6232,10 @@ class StrategyEngine:
                         strategy_name = _alt_name
                         selection_reason = (
                             f"{selection_reason}:demoted_from_ic_on_{rules_reason}"
+                        )
+                        # v60: rebuild Intent for the demoted structure
+                        signals["_intent"] = self._build_decision_intent(
+                            strategy_name, signals, selection_reason
                         )
                         rules_ok = True
                         rules_reason = _alt_why
@@ -6081,6 +6341,11 @@ class StrategyEngine:
                     )
                     if _alt_params.get("valid"):
                         self._clear_construct_fail()
+                        signals["_intent"] = self._build_decision_intent(
+                            _alt_name, signals, _alt_reason
+                        )
+                        if isinstance(_alt_params, dict):
+                            _alt_params["_intent"] = signals["_intent"]
                         self.logger.info(
                             f"IC construct demoted → {_alt_name} "
                             f"(was {fail_reason[:100]})"
@@ -6102,6 +6367,7 @@ class StrategyEngine:
                             "strategy_name": _alt_name,
                             "reason":        _alt_reason,
                             "params":        _alt_params,
+                            "intent":        signals.get("_intent"),
                         }
                     full_reason = (
                         f"params_invalid:{fail_reason}"
@@ -6131,6 +6397,8 @@ class StrategyEngine:
             return {"action": "NO_TRADE", "reason": full_reason}
 
         self._clear_construct_fail()
+        if isinstance(params, dict):
+            params["_intent"] = signals.get("_intent")
         self._log_decision(
             signals, "STRATEGY_SELECTED", selection_reason, strategy_name, params
         )
@@ -6145,6 +6413,7 @@ class StrategyEngine:
             "strategy_name": strategy_name,
             "reason":        selection_reason,
             "params":        params,
+            "intent":        signals.get("_intent"),
         }
 
 

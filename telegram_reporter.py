@@ -533,7 +533,15 @@ class TelegramReporter:
                 if self._thread is not None and self._thread.is_alive():
                     self._enqueue(kind, str(text))
                     return True
-            return self._deliver(kind, str(text))
+            # v59: never sync-send on the trading thread (blocks cycle →
+            # watchdog flatten). Drop + CRITICAL when the worker is down.
+            self._log(
+                "critical",
+                "Telegram worker unavailable — dropping update "
+                f"({kind}); not sending inline on trading thread",
+            )
+            self.stats["dropped"] = int(self.stats.get("dropped") or 0) + 1
+            return False
         except Exception as exc:
             self.last_error = f"{exc.__class__.__name__}: {exc}"
             self._log("warning", f"Telegram send failed: {self.last_error}")

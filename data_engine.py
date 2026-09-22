@@ -42,11 +42,20 @@ class TechnicalEngine:
     # ── Bar Resampling ────────────────────────────────────────────────────
 
     @staticmethod
-    def resample_bars(bars_1min: pd.DataFrame, interval: str) -> pd.DataFrame:
+    def resample_bars(
+        bars_1min: pd.DataFrame,
+        interval: str,
+        *,
+        drop_forming: bool = True,
+        now: Optional[datetime] = None,
+    ) -> pd.DataFrame:
         """
         Resample 1-minute bars to a higher timeframe.
         interval: pandas offset string e.g. '900s' (15min), '3600s' (60min)
         Returns DataFrame with columns: datetime, open, high, low, close, volume
+
+        v58: drop the forming (incomplete) last bucket so ADX/EMA are not
+        computed on an open bar (live wall-clock vs closed-bar replay).
         """
         if bars_1min is None or bars_1min.empty:
             return pd.DataFrame()
@@ -95,6 +104,25 @@ class TechnicalEngine:
                 .dropna(subset=["open", "close"])
             )
             resampled = resampled[resampled["open"] > 0]
+
+            if drop_forming and not resampled.empty:
+                try:
+                    _now = now or now_ist()
+                    if getattr(_now, "tzinfo", None) is not None:
+                        _now = _now.replace(tzinfo=None)
+                    _freq = pd.tseries.frequencies.to_offset(interval)
+                    _last_start = resampled.index[-1].to_pydatetime()
+                    if getattr(_last_start, "tzinfo", None) is not None:
+                        _last_start = _last_start.replace(tzinfo=None)
+                    _bucket_end = _last_start + _freq
+                    if _now < _bucket_end:
+                        if len(resampled) > 1:
+                            resampled = resampled.iloc[:-1]
+                        else:
+                            return pd.DataFrame()
+                except Exception:
+                    pass
+
             return resampled.reset_index()
 
         except Exception:
@@ -460,7 +488,7 @@ class MarketDataEngine:
                                 if isinstance(_p, (list, tuple))
                                 and len(_p) == 2
                             ]
-                        elif _k not in row or row.get(_k) in (None, 0, 0.0):
+                        elif _k not in row or row.get(_k) in (None, 0, 0.0, ""):
                             row[_k] = _v
                     except (TypeError, ValueError, IndexError):
                         continue
@@ -480,11 +508,11 @@ class MarketDataEngine:
         day_label    = ExpiryCalendar.get_day_label(today_ist())
         dte          = ExpiryCalendar.get_dte(today_ist())
 
-        # Entry window defaults (overridden by regime engine)
-        if day_label == "TUESDAY":
-            entry_start = self.config.trading_window_start.strftime("%H:%M")
-            entry_end   = self.config.tuesday_last_entry.strftime("%H:%M")
-            hard_exit   = self.config.tuesday_hard_exit.strftime("%H:%M")
+        # Fresh session: window from DTE, not weekday (v58).
+        if dte == 0:
+            entry_start = "10:30"
+            entry_end   = "13:00"
+            hard_exit   = "15:00"
         else:
             entry_start = self.config.trading_window_start.strftime("%H:%M")
             entry_end   = self.config.trading_window_last_entry.strftime("%H:%M")
@@ -632,6 +660,15 @@ class MarketDataEngine:
                 "last_exit_is_stale_weekly",
                 "last_exit_is_regime_rotation",
                 "last_exit_strategy_side",
+                # v58: fade unlocks must survive mid-session restart
+                "last_exit_is_afternoon_low_fade",
+                "last_exit_is_afternoon_high_fade",
+                "tape_displacement",
+                "session_mean_reversion_book",
+                "events_calendar_hash",
+                "events_calendar_snapshot",
+                "day_mode_latched",
+                "event_day_latched",
             ):
                 if _k not in data:
                     continue
@@ -643,7 +680,12 @@ class MarketDataEngine:
                             for _p in list(_v)[-40:]
                             if isinstance(_p, (list, tuple)) and len(_p) == 2
                         ]
-                    elif _v is None or isinstance(_v, (str, int, float)):
+                    elif _v is None or isinstance(_v, (str, int, float, bool)):
+                        _aux_out[_k] = _v
+                    elif isinstance(_v, dict) and _k in (
+                        "tape_displacement",
+                        "events_calendar_snapshot",
+                    ):
                         _aux_out[_k] = _v
                 except (TypeError, ValueError, IndexError):
                     continue
@@ -692,7 +734,12 @@ class MarketDataEngine:
         self._vix_fail_count         = 0
 
     def _close_stale_prior_day_positions(self, prior_date: Optional[str]) -> None:
-        """Mark any open positions from a prior date as stale-closed."""
+        """v58: do NOT fabricate CLOSED rows.
+
+        Status-only closes left the broker held while the DB looked flat.
+        Prior-day OPEN rows stay OPEN; MainEngine startup reconcile runs
+        execute_close / flatten against the broker.
+        """
         if not prior_date:
             return
         open_pos = self.db.query(
@@ -701,19 +748,10 @@ class MarketDataEngine:
             (prior_date,),
         )
         for pos in open_pos:
-            self.logger.warning(
-                f"Stale prior-day position: {pos['strategy_name']} "
-                f"{pos['position_id'][:16]} from {prior_date} — marking STALE_CLOSE"
-            )
-            self.db.update(
-                "positions",
-                {
-                    "status":       "CLOSED",
-                    "exit_reason":  "STALE_PRIOR_DAY_CLOSE",
-                    "exit_time":    now_ist().isoformat(),
-                    "updated_at":   now_ist().isoformat(),
-                },
-                {"position_id": pos["position_id"]},
+            self.logger.critical(
+                f"Prior-day OPEN still present: {pos['strategy_name']} "
+                f"{pos['position_id'][:16]} from {prior_date} — leaving OPEN "
+                f"for startup reconcile (no fabricate-close)"
             )
 
     # ─────────────────────────────────────────────────────────────────────
@@ -940,6 +978,38 @@ class MarketDataEngine:
         except Exception as e:
             self.logger.warning(f"Could not load candles from DB: {e}")
             return pd.DataFrame()
+
+    def _drop_forming_1m_bar(self, bars: pd.DataFrame) -> pd.DataFrame:
+        """Drop the incomplete last 1-minute candle (P62 / P59-15).
+
+        Live mid-minute often has a partial last row; MTF resample then
+        treats that minute as closed. BT with SimClock + bars_until already
+        excludes future minutes — dropping forming 1m aligns live ADX/EMA.
+        """
+        if bars is None or getattr(bars, "empty", True):
+            return bars if bars is not None else pd.DataFrame()
+        try:
+            df = bars.copy()
+            if "datetime" not in df.columns:
+                return df
+            _now = now_ist()
+            if getattr(_now, "tzinfo", None) is not None:
+                _now = _now.replace(tzinfo=None)
+            last = df["datetime"].iloc[-1]
+            if hasattr(last, "to_pydatetime"):
+                last = last.to_pydatetime()
+            if getattr(last, "tzinfo", None) is not None:
+                last = last.replace(tzinfo=None)
+            # Bar labeled HH:MM covers [HH:MM, HH:MM+1). Still forming if now
+            # is before the next minute.
+            _bar_end = last + timedelta(minutes=1)
+            if _now < _bar_end and len(df) > 1:
+                return df.iloc[:-1].copy()
+            if _now < _bar_end and len(df) == 1:
+                return df.iloc[0:0].copy()
+            return df
+        except Exception:
+            return bars
 
     def get_today_spot_bars(self) -> pd.DataFrame:
         """Return today's 1-minute candles from database."""
@@ -2929,6 +2999,10 @@ class MarketDataEngine:
         # ── 3. Intraday candles ───────────────────────────────────────────
         bars = self.fetch_and_store_intraday_candles()
 
+        # P62 / P59-15: drop the forming 1-minute bar so MTF ADX/EMA match
+        # closed-bar replay (SimClock bars_until already excludes future).
+        bars = self._drop_forming_1m_bar(bars)
+
         # Track first bar close for day_move_used computation
         today_str = today_ist().isoformat()
         if self._first_bar_date != today_str:
@@ -3487,6 +3561,34 @@ class MarketDataEngine:
         # Keep day_mode in sync with the mtime-refreshed events calendar
         # every cycle (not only on the 30-min VIX regime tick).
         self.state["day_mode"] = self._compute_day_mode(today_ist())
+        # v59: freeze calendar snapshot for forensics / replay parity.
+        try:
+            import hashlib
+            _ev = get_high_impact_events() or {}
+            _snap = {d.isoformat(): str(v) for d, v in sorted(_ev.items())}
+            _blob = json.dumps(_snap, sort_keys=True)
+            _hash = hashlib.md5(_blob.encode("utf-8")).hexdigest()
+            prev = self.state.get("events_calendar_hash")
+            if prev and prev != _hash:
+                self.logger.warning(
+                    f"events calendar hash changed mid-session "
+                    f"{str(prev)[:8]}→{_hash[:8]} — day_mode stays latched"
+                )
+            self.state["events_calendar_hash"] = _hash
+            self.state["events_calendar_snapshot"] = _snap
+            # P59-07: do NOT latch on first cycle. Latch is set at successful
+            # entry promote; until then always follow the live calendar.
+            if (
+                self.state.get("day_mode_latched")
+                and int(self.state.get("entry_count") or 0) > 0
+            ):
+                self.state["day_mode"] = self.state["day_mode_latched"]
+                if "event_day_latched" in self.state:
+                    event_day = bool(self.state["event_day_latched"])
+                    event_name = event_name if event_day else ""
+                    event_day_str = event_name
+        except Exception as _ev_err:
+            self.logger.debug(f"events snapshot skipped: {_ev_err}")
 
         # ── 26. Expiry-day (DTE 0) entry window adjustment ────────────────
         day_label  = self.state.get("day_label")
