@@ -427,14 +427,25 @@ def load_high_impact_events(path: Path = DEFAULT_EVENTS_FILE) -> Dict[date, str]
 
 
 _NSE_HOLIDAYS_CACHE: Optional[set] = None
+_NSE_HOLIDAYS_MTIME: Optional[float] = None
 _HIGH_IMPACT_EVENTS_CACHE: Optional[Dict[date, str]] = None
 _HIGH_IMPACT_EVENTS_MTIME: Optional[float] = None
 
 
 def get_nse_holidays() -> set:
-    global _NSE_HOLIDAYS_CACHE
-    if _NSE_HOLIDAYS_CACHE is None:
-        _NSE_HOLIDAYS_CACHE = load_nse_holidays()
+    """Load NSE holidays, refreshing when nse_holidays.json changes (v58)."""
+    global _NSE_HOLIDAYS_CACHE, _NSE_HOLIDAYS_MTIME
+    path = DEFAULT_HOLIDAYS_FILE
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+    if (
+        _NSE_HOLIDAYS_CACHE is None
+        or mtime != _NSE_HOLIDAYS_MTIME
+    ):
+        _NSE_HOLIDAYS_CACHE = load_nse_holidays(path)
+        _NSE_HOLIDAYS_MTIME = mtime
     return _NSE_HOLIDAYS_CACHE
 
 
@@ -1051,8 +1062,14 @@ class Config:
         # consulted. day_move is answerable too: the 125 sell-side
         # bar and the momentum chase cap are different standards,
         # and the gate's own cap arbitrates.
-        "event", "only_range_allowed", "iv_expanding", "straddle_exp",
+        "event", "only_range_allowed", "iv_expanding", "iv_spik", "straddle_exp",
         "params_invalid", "strategy_rules_failed", "day_move_used",
+        # v57: sticky construct fails and confidence hard-gates must reach
+        # the substitute (same class as pre-v56 iv_spiking dark).
+        "construct_fail", "confidence", "second_slot_cooldown",
+        # v58: previously dark refusals that must reach the substitute
+        "range_wait", "before_entry_window", "waiting_for_0dte",
+        "counter_trend", "feed_stale", "regime_unavailable",
         # PATCH_V13 (round 4): the substitute also answers TIME and
         # POST-STOP refusals.
         #
@@ -1097,22 +1114,10 @@ class Config:
     # hard stop on the clock: it must still have room to run when it is
     # bought, and it is squared off with everything else.
     momentum_late_enabled:               bool  = True
-    # Window. The start is 14:30, the boundary the regime layer ALREADY
-    # treats as the end of the tradeable sell session (NO_TRADE:PAST_14:30 /
-    # sell_regime_cutoff), so the two routes can never compete for a cycle
-    # and the new route owns exactly the hour the sell side has released.
-    # PATCH_V45: sell last-entry moved to 14:30 (was 14:00); this window
-    # still starts where sell classification ends so the routes abut
-    # rather than overlap. It is not 14:05: measured on 2026-09-09, the
-    # fifteen minutes after an early sell close still carry the MIDDAY
-    # trend reads - EMA structure BULLISH off a rally that had already
-    # peaked, ADX 24 and decaying - and a window that opens there bought
-    # a long call at 14:06 into the day's high and rode it down 100pts
-    # for -6,584. The closing hour is a different microstructure
-    # (square-off flow, expiry rolls, the closing auction); it starts when
-    # the engine says it does. The binding end is
-    # momentum_late_min_minutes_left, which keeps the rule correct on
-    # Tuesdays (15:00 hard exit) without a second clock.
+    # Window. The start must equal sell_regime_cutoff_hhmm so the routes abut
+    # (v58 closed the 14:15–14:30 dead zone when cutoff was 14:15 and late
+    # started at 14:30). PATCH_V45: not earlier than 14:30 — midday trend
+    # residue before then bought losers (2026-09-09).
     momentum_late_window_start:          str   = "14:30"
     momentum_late_window_end:            str   = "14:57"
     momentum_late_min_minutes_left:      int   = 25
@@ -1170,8 +1175,9 @@ class Config:
     credit_min_minutes_left:             float = 90.0
     afternoon_credit_after_hhmm:         str   = "13:00"
     afternoon_credit_min_minutes_left:   float = 50.0
-    # Sell-regime classification cutoff; releases before momentum_late (14:30).
-    sell_regime_cutoff_hhmm:             str   = "14:15"
+    # Sell-regime classification cutoff; MUST equal momentum_late_window_start
+    # (v58). Was 14:15 while late started 14:30 → 15m dead zone.
+    sell_regime_cutoff_hhmm:             str   = "14:30"
 
     # ══ PATCH_V13: entry/exit trend symmetry ════════════════════════════
     # The exit ladder already ejects a credit vertical that a measured trend
@@ -1274,7 +1280,13 @@ class Config:
     # open position in the segment, not only this engine's book, and the
     # tag filter only covers positions opened with tagged orders.
     exit_all_positions_fallback:   bool  = False
-    orphan_flatten_at_broker:      bool  = False
+    orphan_flatten_at_broker:      bool  = True
+    # v59: live monitor→decide same cycle; BT must match when True.
+    allow_same_cycle_reentry:      bool  = True
+    # v62 / P59-09: BCS+LONG_PUT (or BPS+LONG_CALL) stacks same-tape risk.
+    # Default refuse; set ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT=true to restore
+    # the old second-slot aligned-debit behaviour.
+    allow_correlated_debit_beside_credit: bool = False
     alert_telegram_bot_token:      str   = ""
     alert_telegram_chat_id:        str   = ""
     alert_webhook_url:             str   = ""
@@ -1788,6 +1800,29 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
                 if s.strip()
             ) or Config.momentum_block_markers
         ),
+        # v58: late window + sell cutoff (were dataclass-only; env ignored)
+        momentum_late_enabled=_get_bool(env, "MOMENTUM_LATE_ENABLED", True),
+        momentum_late_window_start=(
+            env.get("MOMENTUM_LATE_WINDOW_START", "14:30").strip() or "14:30"
+        ),
+        momentum_late_window_end=(
+            env.get("MOMENTUM_LATE_WINDOW_END", "14:57").strip() or "14:57"
+        ),
+        momentum_late_min_minutes_left=min(
+            max(_get_int(env, "MOMENTUM_LATE_MIN_MINUTES_LEFT", 25), 5), 60
+        ),
+        momentum_late_adx_min=min(
+            max(_get_float(env, "MOMENTUM_LATE_ADX_MIN", 28.0), 15.0), 60.0
+        ),
+        # v58: always equal to late window start (no 14:15–14:30 dead zone)
+        sell_regime_cutoff_hhmm=(
+            env.get("MOMENTUM_LATE_WINDOW_START", "14:30").strip() or "14:30"
+        ),
+        orphan_flatten_at_broker=_get_bool(env, "ORPHAN_FLATTEN_AT_BROKER", True),
+        allow_same_cycle_reentry=_get_bool(env, "ALLOW_SAME_CYCLE_REENTRY", True),
+        allow_correlated_debit_beside_credit=_get_bool(
+            env, "ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT", False
+        ),
         # ── v6 live execution hardening ───────────────────────────────────
         order_max_retries=min(max(_get_int(env, "ORDER_MAX_RETRIES", 0), 0), 2),
         reconcile_after_timeout=_get_bool(env, "RECONCILE_AFTER_TIMEOUT", True),
@@ -1823,7 +1858,6 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         exit_all_positions_fallback=_get_bool(
             env, "EXIT_ALL_POSITIONS_FALLBACK", False
         ),
-        orphan_flatten_at_broker=_get_bool(env, "ORPHAN_FLATTEN_AT_BROKER", False),
         alert_telegram_bot_token=env.get("TELEGRAM_BOT_TOKEN", "").strip(),
         alert_telegram_chat_id=env.get("TELEGRAM_CHAT_ID", "").strip(),
         alert_webhook_url=env.get("ALERT_WEBHOOK_URL", "").strip(),

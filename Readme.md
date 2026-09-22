@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v54)](#11-latest-change-logic-v54--live-vs-replay-continuation-gaps)
+   - [1.1 Latest change logic (v62)](#11-latest-change-logic-v62--next-level-audit-beyond-p59)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,7 +40,160 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v54) — live-vs-replay continuation gaps
+### 1.1 Latest change logic (v62) — next-level audit beyond P59
+
+**New failure chains (not in P59-01…16) closed here; open P59 items addressed:**
+
+| ID | Fix |
+|---|---|
+| P62-01 / P59-11 | Exit `_await_fill` requires `filled_quantity ≥ expected_qty`; exit uses booked leg `qty` |
+| P62-02 | OPEN with 0 live legs → `_finalize_empty_open_position` (zombie heal) |
+| P62-03 / P59-09 | Refuse correlated debit beside open same-side credit (`ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT`, default **false**) |
+| P62-04 | Broker flat + local OPEN after flatten → `_heal_local_open_broker_flat` |
+| P62-05 | `/stop` + `flatten_now` abort PENDING_ENTRY (tag Exit-All), even with zero OPEN |
+| P62-06 / P59-10 | Intent exemptions also from `selection_reason` (lean tokens), not only re-derived away |
+| P62-07 / P59-15 | Drop forming **1-minute** bar before MTF ADX/EMA (live↔BT parity) |
+
+**Restart live on v62.** Opt-in old BCS+LP stacking with `ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT=true`.
+
+---
+
+### 1.1b Prior (v61) — post-challenge broker-truth recovery
+
+**Challenge of v58–v60 found patch-introduced ghosts; v61 closes them:**
+
+| ID | Fix |
+|---|---|
+| P59-01/02/03 | `PENDING_ENTRY` reconcile is its own startup phase (runs with zero OPEN); probe **all** dispatch states; flatten via tag Exit-All — never `execute_close` with empty legs |
+| P59-04 | Orphan Exit-All when broker-filled and book is not OPEN/PENDING (v59 always sets `position_id`) |
+| P59-05 | Entry fill-timeout uses `_cancel_and_confirm` (FILLED-in-gap books the fill) |
+| P59-06 | Persist `position_legs` while still PENDING, then promote |
+| P59-07 | Latch `day_mode` only at successful entry promote (not first cycle) |
+| P59-08 | Soft-lean open BCS/BPS does not trigger `fade_owns_book` for aligned debit |
+| P59-12 | Missing `filled_quantity` on terminal status refuses phantom fill |
+| P59-14 | Live honors `ALLOW_SAME_CYCLE_REENTRY` after a close this cycle |
+| P59-16 | Unwind failure → OPEN with known legs (never ABORT while broker holds) |
+
+**Still open (do not ignore):** P59-09 correlated BCS+LONG_PUT heat; P59-10 Intent circularity; P59-11 exit qty assert; P59-15 ADX/drop_forming live↔BT asymmetry.
+
+Replay ₹ is secondary. **Restart live on v61.**
+
+---
+
+### 1.1b Prior (v60) — challenge pass hotfixes
+
+**Challenge of v58/v59 found patch-introduced ghosts:**
+
+| ID | Fix |
+|---|---|
+| N1 | `PENDING_ENTRY` counts toward open slots / slot_conflict |
+| N2 | Startup PENDING: broker-fill probe → flatten before abort |
+| N3 | Remove dead `_intent_exempt` from hard gates (Intent is post-select) |
+| N4 | Rebuild Intent on IC demotion (rules + econ) |
+| N5 | Latch `event_day` with `day_mode`; regime honours after first entry |
+| N6 | `/stop` `algo.stop` path follows `LOG_DIR` |
+
+Replay ₹ is secondary. **Restart live on v60.**
+
+---
+
+### 1.1b Prior (v59) — remaining live-reliability audit fixes
+
+**Priority:** live book truth and taking the right live trades — not replay CAGR.
+
+| Fix | What |
+|---|---|
+| Intent contract | `_build_decision_intent` after selection; secondary gates honor exemptions |
+| PENDING_ENTRY | Insert draft + `position_id` **before** place; promote to OPEN / ABORT on fail |
+| Entry settle | Assert `filled==qty`; cancel resting order on fill timeout |
+| Pre-trade in BT | `validate_pre_trade` before `_open` (same as live) |
+| Same-cycle reentry | Shared `ALLOW_SAME_CYCLE_REENTRY` (default on) — BT matches live |
+| Events snapshot | Hash + map in `aux_json`; latch `day_mode` after first entry |
+| Telegram | Never sync-send on trading thread |
+| Startup | Abort stranded `PENDING_ENTRY` rows |
+
+**Restart live** on this build.
+
+---
+
+### 1.1b Prior (v58) — audit P0/P1 permanent fixes
+
+**Goal:** stop live-fail→patch by fixing architecture findings (not another gate waiver).
+
+| ID | Fix |
+|---|---|
+| C1 | `bot_controller` `/stop` writes `logs/algo.stop`; main flattens live book then exits |
+| B1 | `_get_open_positions()` returns all OPEN; fabricate-close removed |
+| B2 | Startup scans `PLACED` orphans without `position_id`; orphan flatten default **on** |
+| B3 | Tag reconcile API failure → `None` (not truthy UNKNOWN) |
+| C2 | `sell_regime_cutoff` = `momentum_late_window_start` (14:30); both env-wired |
+| A1 | Always `decide()` in clock window; feed_stale / None regime are hard gates |
+| A3/A4 | Counter-trend consults momentum; markers for range_wait / feed_stale / … |
+| C3 | Drop forming MTF bars before ADX/EMA |
+| C4/C5 | Fade flags + tape latch in `aux_json`; holidays mtime refresh |
+| H2 | `consecutive_stops` = exit streak, not day total |
+| Init | Session window from DTE, not weekday |
+
+**Restart live** on this build.
+
+---
+
+### 1.1b Prior (v57) — proactive soft-lean + marker parity
+
+**Goal:** stop the live-fail→patch cycle by closing Sep22-class holes *before* the next session — secondary gates that undo a lean the resolver already booked, and momentum markers that leave debit dark.
+
+**Advance audit (after v56) found remaining HIGH false-positives:**
+
+1. Soft lean (0.58/0.42) / day-structure BCS selected, but IV / confidence / day_move / entry early-pass only honored mature 0.62/0.38.
+2. `construct_fail_sticky` and `confidence_*` never reached momentum (same dark class as pre-v56 `iv_spiking`).
+3. `second_slot_cooldown` blocked aligned LONG_PUT beside a fresh BCS.
+
+**v57:**
+
+1. **`_away_side_intent`:** mature lean ∪ soft lean+evidence ∪ day-structure bearish lean — used by IV / confidence / day_move waives and BPS/BCS entry early-pass.
+2. **Momentum markers:** `construct_fail`, `confidence`, `second_slot_cooldown`.
+3. **Aligned-long second-slot cooldown waive** inside `_momentum_gate` (BCS+LONG_PUT / BPS+LONG_CALL).
+
+**Do not loosen:** counter-trend, material-change, velocity, open-spike wait, pin ADX/OR, max_pain without lean.
+
+**Restart live** on this build. Replay below.
+
+---
+
+### 1.1b Prior (v56) — proactive lean vs secondary veto
+
+**Pattern that caused daily live→patch cycles:** resolver selects an away-side vertical, then a *secondary* gate (entry rule / hard gate / momentum marker) vetoes without knowing the lean existed (22-Sep: BCS at loc 0.04 → max_pain / false straddle expand).
+
+**v56 (advance audit, same at every DTE):**
+
+1. **`_away_side_location_lean`:** shared helper (loc ≥0.62 / ≤0.38 on a real range) used by hard gates + entry rules so lean intent is visible everywhere.
+2. **IV EXPANDING/SPIKING hard gate:** waives for location lean (same as afternoon fade) — otherwise extreme loc + RANGE + rising IV = structural flat.
+3. **BPS/BCS entry rules:** location lean early-passes (symmetric) — OR-mid / VWAP / max_pain cannot undo the resolver.
+4. **Momentum marker `iv_spik`:** live 15-Sep had 427× `iv_spiking` with **zero** momentum consults because only `iv_expanding` was marked.
+5. **Momentum direction from location:** when price is RANGE/CHOPPY but loc is extreme, debit direction follows the lean (puts at low / calls at high).
+
+**Restart live** after pull. Parallel replay vs `data/per_day` (fill-edge 0.25): **₹67,163** (was ₹65,969) — Sep21 +₹1,193 from earlier LONG_CALL; no regressions.
+
+---
+
+### 1.1b Prior (v55) — 0DTE warm-up lean + false IV/pin blocks
+
+**Live fact (22-Sep):**
+- Before 10:30: flat was correct (`before_entry_window_10:30` on 0DTE).
+- After 10:30: warm-up lean **did** select `BEAR_CALL_SPREAD` at loc≈0.04, then lost the day to two false blocks:
+  1. `bear_call_spot_within_25pts_of_max_pain` while dumping at the session low (away-side lean, not a mid-range pin).
+  2. `straddle_expanding_no_sell_into_rising_iv` while `iv_behavior=DECLINING` / `iv_change` still negative — ATM roll from the dump, not a vol event.
+
+**v55:**
+1. **Warm-up location lean:** while EMA is `INSUFFICIENT_DATA`, loc ≥0.62 / ≤0.38 is evidence for the away-side vertical.
+2. **Max-pain waive on extreme low lean:** BCS near max pain is allowed when session loc ≤0.38 on a real range (same intent as DOWNTREND trend-through).
+3. **Straddle-expand hard gate needs IV confirm:** only block when `iv_behavior` is EXPANDING/SPIKING or `iv_change_pct_from_open > 0`.
+
+**Restart live** so this path loads.
+
+---
+
+### 1.1c Prior (v54) — live-vs-replay continuation gaps
 
 **Live facts (DB, not guesswork):**
 - **11-Sep:** BPS filled the only slot (`max_concurrent=1` historically) → 462× `max_concurrent_positions_reached`; `day_mode=NORMAL` though CPI is on the calendar; momentum never reached the gate (`momentum_sell_side_open`).
@@ -75,7 +228,7 @@ Parallel replay vs `data/per_day` (fill-edge 0.25): **₹65,969** (same as v53 �
 
 ---
 
-### 1.1b Prior (v53) — extreme location is evidence + life-continuous p_win
+### 1.1c Prior (v53) — extreme location is evidence + life-continuous p_win
 
 **Live fact (candles, not guesswork):** on 21-Sep at 10:56 the session location was **loc=0.71** (range ≈96 pts) while live sold an IC. Soft lean required EMA/VWAP confirmation; VWAP dist was only ~+0.02, so evidence failed and an older build defaulted to IC. Professionals treat upper/lower-third location itself as the lean signal when the range is real.
 
@@ -105,7 +258,7 @@ Parallel replay vs `data/per_day` (fill-edge 0.25):
 
 ---
 
-### 1.1c Prior (v52) — live IC ban on moderate OR + fade needs two-way
+### 1.1d Prior (v52) — live IC ban on moderate OR + fade needs two-way
 
 **Live diagnosis:** 16/17/21-Sep live sold IC (MODERATE OR / ADX 0–15); 21-Sep then sold BCS into UPTREND (−₹364 day). Replay preferred verticals (+₹3,648 on 21-Sep).
 
@@ -113,7 +266,7 @@ Parallel replay vs `data/per_day` (fill-edge 0.25):
 
 ---
 
-### 1.1d Prior (v51/v50) — life-continuous construction + no default condor
+### 1.1e Prior (v51/v50) — life-continuous construction + no default condor
 
 Tape→structure DTE-agnostic; construction via `by_dte()`; never default-IC; two concurrent tickets. See git history for full notes.
 

@@ -142,6 +142,9 @@ class MainEngine:
         self._last_calibration_time  = 0.0
         self._last_status_print_time = 0.0
         self._eod_done               = False
+        # v58: bot_controller /stop writes logs/algo.stop; poll → flatten → exit.
+        self._stop_request_flatten   = False
+        self._stop_file = Path(self.config.log_dir) / "algo.stop"
 
         # ── v6 safety state ───────────────────────────────────────────────
         # Written by the main loop, read by the watchdog. Kept on the
@@ -241,21 +244,31 @@ class MainEngine:
     def _validate_session_state_integrity(self) -> None:
         today_str = today_ist().isoformat()
         state = self.market_engine.state
-        actual_stops = self.db.query(
-            "SELECT COUNT(*) as cnt FROM trade_exits "
-            "WHERE trade_id IN ("
-            "SELECT position_id FROM positions WHERE trading_date=?"
-            ") AND exit_reason='CLOSE_STOP'",
+        # v58: consecutive_stops is a streak, not a day total. Walk exits
+        # newest-first until a non-stop break; never overwrite with COUNT(*).
+        stop_rows = self.db.query(
+            "SELECT te.exit_reason, te.exit_time FROM trade_exits te "
+            "JOIN positions p ON p.position_id = te.trade_id "
+            "WHERE p.trading_date=? "
+            "ORDER BY te.exit_time DESC",
             (today_str,),
-        )
-        real_stops = actual_stops[0]["cnt"] if actual_stops else 0
+        ) or []
+        real_streak = 0
+        for row in stop_rows:
+            reason = str(row.get("exit_reason") or "")
+            if reason == "CLOSE_STOP" or reason.startswith("CLOSE_STOP"):
+                real_streak += 1
+                continue
+            # Banked / target / time exits break the streak.
+            break
         stored_stops = int(state.get("consecutive_stops", 0) or 0)
-        if stored_stops != real_stops:
+        if stored_stops != real_streak:
             self.logger.warning(
                 f"Session state integrity: consecutive_stops={stored_stops} "
-                f"but actual stop exits today={real_stops}. Correcting."
+                f"but exit streak today={real_streak}. Correcting."
             )
-            state["consecutive_stops"] = real_stops
+            state["consecutive_stops"] = real_streak
+        real_stops = real_streak  # halt logic below still uses streak
         actual_pnl_row = self.db.query_one(
             "SELECT COALESCE(SUM(net_pnl_rupees),0) as total "
             "FROM trade_exits WHERE trade_id IN ("
@@ -284,7 +297,7 @@ class MainEngine:
         state["daily_pnl"] = actual_pnl
         self.market_engine._save_session_state()
         self.logger.info(
-            f"Session state validated: stops={real_stops} "
+            f"Session state validated: stop_streak={real_stops} "
             f"halted={state.get('daily_halted')} "
             f"pnl=Rs{actual_pnl:.0f}"
         )
@@ -344,13 +357,18 @@ class MainEngine:
         is the one state where the engine and the broker can disagree about
         whether a position exists. Ask the broker, then act on the answer:
         report it always, flatten it only if that was explicitly opted into.
+
+        v58: also scan PLACED rows with no position_id (fills recorded before
+        the book insert crashed) — previously only DISPATCHED|UNRESOLVED.
         """
         if self.config.paper_trade_mode:
             return
         try:
             rows = self.db.query(
-                "SELECT * FROM order_dispatch WHERE state IN "
-                "('DISPATCHED','UNRESOLVED') ORDER BY id DESC LIMIT 50"
+                "SELECT * FROM order_dispatch WHERE "
+                "state IN ('DISPATCHED','UNRESOLVED','PLACED',"
+                "'BROKER_FILLED_UNBOOKED') "
+                "ORDER BY id DESC LIMIT 120"
             )
         except Exception as e:
             self.logger.warning(f"dispatch ledger unreadable, skipping reconcile: {e}")
@@ -379,22 +397,40 @@ class MainEngine:
                 price  = float(latest.get("average_price") or 0.0)
                 qty    = int(latest.get("filled_quantity") or latest.get("quantity") or 0)
                 action = str(latest.get("transaction_type") or row.get("transaction_type") or "")
+                pid = str(row.get("position_id") or "")
+                # P59-04: orphan = filled at broker with no OPEN book row
+                # (v59 always sets position_id, so null-id gate is dead).
+                book_open = False
+                if pid:
+                    try:
+                        prow = self.db.query_one(
+                            "SELECT status FROM positions WHERE position_id=?",
+                            (pid,),
+                        )
+                        book_open = bool(
+                            prow and str(prow.get("status") or "").upper()
+                            in ("OPEN", "PENDING_ENTRY")
+                        )
+                    except Exception:
+                        book_open = False
                 msg = (
                     f"unresolved order (tag {tag}) is FILLED at the broker: "
                     f"{action} {qty} for position "
-                    f"{row.get('position_id') or 'none'} at {price:.2f} "
-                    f"({row.get('phase')}) — the engine has no book for it"
+                    f"{pid or 'none'} at {price:.2f} "
+                    f"({row.get('phase')}) — book_open={book_open}"
                 )
                 self.logger.critical(msg)
                 self._alert("CRITICAL", msg)
-                if bool(getattr(self.config, "orphan_flatten_at_broker", False)) and \
-                        not row.get("position_id"):
+                if (
+                    bool(getattr(self.config, "orphan_flatten_at_broker", True))
+                    and not book_open
+                ):
                     try:
                         self.client.exit_all_positions(segment="NSE_FO", tag=tag)
                         self._alert(
                             "CRITICAL",
                             f"broker Exit-All-Positions dispatched for orphan "
-                            f"tag {tag}",
+                            f"tag {tag} (position_id={pid or 'none'})",
                         )
                     except Exception as e:
                         self.logger.critical(
@@ -466,17 +502,127 @@ class MainEngine:
                     f"Prior session P&L: Rs{prior_pnl:,.2f}"
                 )
 
+    def _reconcile_pending_entries_on_startup(self) -> None:
+        """v61: PENDING_ENTRY reconcile is its own phase (never gated on OPEN).
+
+        Crash mid-entry often leaves PENDING with zero OPEN — the old path
+        early-returned and never probed the broker (P59-01).
+        """
+        try:
+            pending = self.db.query(
+                "SELECT * FROM positions WHERE status='PENDING_ENTRY'"
+            ) or []
+        except Exception as e:
+            self.logger.warning(f"PENDING_ENTRY query failed: {e}")
+            return
+        if not pending:
+            return
+        self.logger.critical(
+            f"Startup: {len(pending)} PENDING_ENTRY row(s) — broker reconcile"
+        )
+        for pos in pending:
+            pid = str(pos.get("position_id") or "")
+            broker_filled = False
+            fill_tags: list = []
+            if not self.config.paper_trade_mode and pid:
+                try:
+                    # P59-03: probe EVERY dispatch state for this position_id
+                    rows = self.db.query(
+                        "SELECT * FROM order_dispatch WHERE position_id=?",
+                        (pid,),
+                    ) or []
+                    for row in rows:
+                        tag = str(row.get("tag") or "")
+                        if not tag:
+                            continue
+                        try:
+                            hist = self.client.get_order_history_by_tag(tag) or []
+                        except Exception:
+                            hist = []
+                        for h in hist:
+                            st = str(h.get("status") or "").strip().lower()
+                            if st in (
+                                "complete", "completed", "filled",
+                                "traded", "executed",
+                            ):
+                                broker_filled = True
+                                fill_tags.append(tag)
+                                break
+                except Exception as e:
+                    self.logger.warning(
+                        f"PENDING_ENTRY broker probe failed: {e}"
+                    )
+                    # Fail closed: assume possible fill → flatten path
+                    broker_filled = True
+
+            if broker_filled and not self.config.paper_trade_mode:
+                self.logger.critical(
+                    f"PENDING_ENTRY {pid[:16]} broker-filled tags={fill_tags} "
+                    f"— Exit-All by tag (no empty-leg execute_close)"
+                )
+                flat_ok = False
+                for tag in fill_tags or [None]:
+                    try:
+                        if tag:
+                            self.client.exit_all_positions(
+                                segment="NSE_FO", tag=tag
+                            )
+                        else:
+                            self.client.exit_all_positions(segment="NSE_FO")
+                        flat_ok = True
+                    except Exception as e:
+                        self.logger.critical(
+                            f"PENDING_ENTRY tag flatten failed: {e}"
+                        )
+                self._alert(
+                    "CRITICAL",
+                    f"PENDING_ENTRY {pid[:16]} had broker fills; "
+                    f"Exit-All dispatched flat_ok={flat_ok} — verify book",
+                )
+                try:
+                    self.db.update(
+                        "positions",
+                        {
+                            "status": "ABORTED",
+                            "exit_reason": "PENDING_ENTRY_BROKER_FLATTEN",
+                            "exit_time": now_ist().isoformat(),
+                            "updated_at": now_ist().isoformat(),
+                        },
+                        {"position_id": pid},
+                    )
+                except Exception as e:
+                    self.logger.critical(f"PENDING mark after flatten failed: {e}")
+            else:
+                try:
+                    self.db.update(
+                        "positions",
+                        {
+                            "status": "ABORTED",
+                            "exit_reason": "STARTUP_PENDING_ENTRY_ABORT",
+                            "exit_time": now_ist().isoformat(),
+                            "updated_at": now_ist().isoformat(),
+                        },
+                        {"position_id": pid},
+                    )
+                    self.logger.info(
+                        f"PENDING_ENTRY {pid[:16]} aborted (no broker fill)"
+                    )
+                except Exception as e:
+                    self.logger.critical(f"PENDING_ENTRY abort failed: {e}")
+
     def _reconcile_open_positions_on_startup(self) -> None:
         """
         Reconcile open positions on startup.
-        - Close stale prior-day positions
-        - Resume monitoring of today's open positions
+        v61: PENDING phase ALWAYS runs first (even when OPEN count is 0).
         """
+        # P59-01: never skip PENDING when flat
+        self._reconcile_pending_entries_on_startup()
+
         today_str      = today_ist().isoformat()
         open_positions = self.execution_engine._get_open_positions()
 
         if not open_positions:
-            self.logger.info("Startup reconciliation: no open positions found.")
+            self.logger.info("Startup reconciliation: no OPEN positions found.")
             return
 
         self.logger.info(
@@ -493,12 +639,40 @@ class MainEngine:
                     pos, "STALE_PRIOR_DAY_CLOSE", 0, {}
                 )
             else:
+                # OPEN with zero legs = promote crash mid-write (P59-06)
+                try:
+                    legs = self.execution_engine._get_position_legs(
+                        pos["position_id"]
+                    ) or []
+                    open_legs = [
+                        l for l in legs
+                        if str(l.get("leg_status") or "").upper() == "OPEN"
+                    ]
+                except Exception:
+                    open_legs = []
+                if not open_legs and not self.config.paper_trade_mode:
+                    self.logger.critical(
+                        f"OPEN {pos['position_id'][:16]} has no legs — "
+                        f"treating as PENDING broker reconcile"
+                    )
+                    try:
+                        self.db.update(
+                            "positions",
+                            {
+                                "status": "PENDING_ENTRY",
+                                "updated_at": now_ist().isoformat(),
+                            },
+                            {"position_id": pos["position_id"]},
+                        )
+                    except Exception:
+                        pass
+                    self._reconcile_pending_entries_on_startup()
+                    continue
                 self.logger.info(
                     f"Resuming today's open position: "
                     f"{pos['strategy_name']} "
                     f"{pos['position_id'][:16]}..."
                 )
-
     # ─────────────────────────────────────────────────────────────────────
     # INTRADAY HELPERS
     # ─────────────────────────────────────────────────────────────────────
@@ -982,35 +1156,40 @@ class MainEngine:
                     bool(getattr(self.config, "momentum_enabled", True)):
                 _entry_cut = max(_entry_cut, _late_cut)
 
+            # v58: always call decide() in the clock window under the flatten
+            # lock. ABORT / block_new_entries / None regime / feed_stale are
+            # hard-gate refusals inside decide() so momentum markers and refuse
+            # reasons match replay (which always calls decide when a slot is free).
+            # v61 / P59-14: honor allow_same_cycle_reentry (BT already does).
+            _closed_cycle = bool(
+                self.market_engine.state.pop("_closed_this_cycle", False)
+            )
+            _same_ok = bool(
+                getattr(self.config, "allow_same_cycle_reentry", True)
+            )
             entry_possible = (
                 acting and
                 current_time >= dtime(9, 30) and
                 current_time <= _entry_cut and
                 not self.market_engine.state.get("daily_halted") and
-                not signals.get("block_new_entries") and
                 bool(signals.get("or_computed", False)) and
-                # PATCH_V12: decide() also runs when the regime layer
-                # refused the sell side, so the long-premium momentum
-                # substitute is consulted exactly as in replay. The
-                # sell side cannot leak through: _check_hard_gates
-                # refuses every NO_TRADE regime before any structure
-                # is built, and ABORT still never reaches decide().
-                signals.get("final_regime") not in ("ABORT", None) and
-                not self._feed_stale
+                (_same_ok or not _closed_cycle)
             )
 
             if entry_possible:
                 try:
+                    if self._feed_stale:
+                        signals = dict(signals)
+                        signals["_feed_stale"] = True
                     decision = self.strategy_engine.decide(signals)
-                    if decision.get("action") == "ENTER":
+                    if decision.get("action") == "ENTER" and not self._feed_stale:
                         self.execution_engine.process_entry_decision(decision, signals)
+                    elif decision.get("action") == "ENTER" and self._feed_stale:
+                        self.logger.info(
+                            "ENTER refused this cycle: trading feed is stale (watchdog)"
+                        )
                 except Exception as e:
                     self.logger.error(f"Strategy/entry error: {e}", exc_info=True)
-            elif acting and current_time >= dtime(9, 30) and \
-                    current_time <= _entry_cut and self._feed_stale:
-                self.logger.info(
-                    "entries blocked this cycle: trading feed is stale (watchdog)"
-                )
 
         # ── Step 9: Update cycle log with P&L ────────────────────────────
         total_pnl = self.compute_total_daily_pnl()
@@ -1588,34 +1767,49 @@ class MainEngine:
     def perform_graceful_shutdown(self) -> None:
         """
         Perform graceful shutdown.
-        Saves session state. Does NOT close open positions
-        (they will be resumed on next startup).
+        v58: bot /stop (algo.stop) forces flatten of live OPEN book before exit.
+        Otherwise saves session state and leaves same-day positions for resume
+        (unless past square-off deadline).
         """
         self.logger.info("Graceful shutdown initiated.")
 
         open_positions = self.execution_engine._get_open_positions()
-        if open_positions:
+        force_flatten = bool(self._stop_request_flatten)
+        try:
+            pending_n = len(
+                self.db.query(
+                    "SELECT position_id FROM positions WHERE status='PENDING_ENTRY'"
+                ) or []
+            )
+        except Exception:
+            pending_n = 0
+        if open_positions or (force_flatten and pending_n):
             deadline = getattr(self.config, "square_off_deadline", None)
             past_deadline = (
                 isinstance(deadline, dtime)
                 and now_ist().time() >= deadline
                 and now_ist().time() <= dtime(15, 30)
             )
-            if past_deadline and not self.config.paper_trade_mode:
-                # A restart cannot resume in time to manage these, so leaving
-                # them for "the next start" means handing them to the broker's
-                # own 15:20 square-off at a penalty. Flatten instead.
+            if (
+                (force_flatten or past_deadline)
+                and not self.config.paper_trade_mode
+            ):
+                why = (
+                    "STOP_REQUEST_FLATTEN"
+                    if force_flatten
+                    else "SHUTDOWN_AFTER_DEADLINE"
+                )
                 self.logger.critical(
-                    f"Shutdown past {deadline:%H:%M} with "
-                    f"{len(open_positions)} open position(s): flattening before exit."
+                    f"Shutdown flatten ({why}): "
+                    f"{len(open_positions or [])} open + {pending_n} PENDING."
                 )
                 self._alert(
                     "CRITICAL",
-                    f"shutdown past the square-off deadline with "
-                    f"{len(open_positions)} open position(s) — flattening now",
+                    f"shutdown flattening open={len(open_positions or [])} "
+                    f"pending={pending_n} ({why})",
                 )
                 try:
-                    self.execution_engine.flatten_now("SHUTDOWN_AFTER_DEADLINE")
+                    self.execution_engine.flatten_now(why)
                 except Exception as e:
                     self.logger.critical(
                         f"shutdown flatten failed: {e} — positions remain at the "
@@ -1625,7 +1819,7 @@ class MainEngine:
                         "CRITICAL",
                         f"SHUTDOWN FLATTEN FAILED: {e} — flatten by hand now",
                     )
-            else:
+            elif open_positions:
                 self.logger.info(
                     f"Shutdown: {len(open_positions)} open position(s) will remain "
                     f"open. Engine will resume monitoring on next start."
@@ -1639,6 +1833,12 @@ class MainEngine:
                     )
 
         self.market_engine._save_session_state()
+        # Clear stop request so a restart does not immediately re-flatten.
+        try:
+            if self._stop_file.exists():
+                self._stop_file.unlink()
+        except OSError:
+            pass
         self.logger.info(
             f"Session state saved. "
             f"entry_count={self.market_engine.state.get('entry_count', 0)}, "
@@ -1962,6 +2162,18 @@ class MainEngine:
         # ── Main loop ─────────────────────────────────────────────────────
         try:
             while self.running:
+                # v58: bot_controller /stop → logs/algo.stop
+                try:
+                    if self._stop_file.exists():
+                        self.logger.critical(
+                            "Stop request file found — graceful flatten + exit"
+                        )
+                        self._stop_request_flatten = True
+                        self.running = False
+                        break
+                except OSError:
+                    pass
+
                 loop_start   = now_ist()
                 current_time = loop_start.time()
                 now_mono     = time_module.monotonic()
@@ -2033,6 +2245,13 @@ class MainEngine:
                     )
 
                 self._sleep(max(0.2, 1.0 - loop_duration))
+
+            # v58: stop-file break exits the while without KeyboardInterrupt —
+            # still must flatten + save before finally.
+            if self._stop_request_flatten:
+                self.perform_graceful_shutdown()
+                self.running = False
+                return
 
         except KeyboardInterrupt:
             self.logger.info("Shutdown signal received.")

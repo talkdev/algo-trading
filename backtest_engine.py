@@ -1597,10 +1597,12 @@ class BacktestRunner:
                     print(f"  {trading_date} {dt:%H:%M} EXIT  "
                           f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")
             if _closed_any:
-                # Same cycle discipline as the single-slot harness: the
-                # cycle that closed something does not also open something.
-                self._report_trades(day)
-                continue
+                # v59: match live — monitor then decide same cycle when configured.
+                if not bool(getattr(
+                    self.config, "allow_same_cycle_reentry", True
+                )):
+                    self._report_trades(day)
+                    continue
 
             # ── daily loss halt ──────────────────────────────────────────
             # main.check_daily_loss_halt stops new entries once the session is
@@ -1634,6 +1636,24 @@ class BacktestRunner:
 
                 if decision.get("action") == "ENTER":
                     params = decision.get("params") or {}
+                    # v59: same pre-trade veto live uses (parity with
+                    # ExecutionEngine.process_entry_decision).
+                    try:
+                        with self._quiet():
+                            go, result = self.xe.validate_pre_trade(
+                                params, signals
+                            )
+                    except Exception as exc:
+                        go, result = "NO_GO", {"reason": f"pre_trade_error:{exc}"}
+                    if go != "GO":
+                        self.results.add_rejection(
+                            f"pre_trade:{result.get('reason', 'unknown')}"
+                        )
+                        self._report_trades(day)
+                        continue
+                    params = result if isinstance(result, dict) and result.get(
+                        "legs"
+                    ) else params
                     live = self._open(params, signals, day)
                     if live is not None:
                         book.append(live)

@@ -1,6 +1,8 @@
+import asyncio
 import os
 import sys
 import subprocess
+import time
 import psutil
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -13,6 +15,7 @@ STOCK_SCREENER_SCRIPT = os.path.join(BASE_DIR, "stock-screener.py")
 BASE_DIR2 = r"C:\Users\Administrator\Desktop\algo-trading\logs"
 LOG_FILE = os.path.join(BASE_DIR2, "algo.log")
 PID_FILE = os.path.join(BASE_DIR2, "algo.pid")
+STOP_FILE = os.path.join(BASE_DIR2, "algo.stop")  # overridden after env load
 
 def load_env_config(filepath):
     """Parses env.txt line-by-line, ignoring comments and stripping quotes."""
@@ -46,6 +49,17 @@ env_vars = load_env_config(ENV_FILE)
 
 BOT_TOKEN = env_vars.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env_vars.get("TELEGRAM_CHAT_ID")
+
+# v60: /stop file must match MainEngine(config.log_dir)/algo.stop
+_log_dir = (env_vars.get("LOG_DIR") or "").strip()
+if _log_dir:
+    _log_path = _log_dir if os.path.isabs(_log_dir) else os.path.join(BASE_DIR, _log_dir)
+    STOP_FILE = os.path.join(_log_path, "algo.stop")
+    LOG_FILE = os.path.join(_log_path, "algo.log")
+    PID_FILE = os.path.join(_log_path, "algo.pid")
+    BASE_DIR2 = _log_path
+else:
+    STOP_FILE = os.path.join(BASE_DIR2, "algo.stop")
 
 try:
     ALLOWED_USER_ID = int(env_vars.get("ALLOWED_USER_ID", 0))
@@ -88,7 +102,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/set VALUE` - Update UPSTOX_ACCESS_TOKEN\n\n"
         "*Process Execution:*\n"
         "• `/run` - Launch `main.py` in the background\n"
-        "• `/stop` - Terminate running `main.py` process tree\n"
+        "• `/stop` - Graceful stop (flatten live book, then exit)\n"
         "• `/status` - Check process state and recent output\n"
         "• `/logs [N]` - View last N lines of output (default: 20)\n\n"
         "*Screeners:*\n"
@@ -229,32 +243,92 @@ async def run_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop_algo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v58: request graceful flatten+exit; only force-kill after timeout."""
     if not is_authorized(update):
         return
 
     proc = get_active_process()
     if not proc:
+        if os.path.exists(STOP_FILE):
+            try:
+                os.remove(STOP_FILE)
+            except OSError:
+                pass
         await update.message.reply_text("ℹ️ No active `main.py` process found.")
         return
 
     try:
-        parent = psutil.Process(proc.pid)
+        os.makedirs(BASE_DIR2, exist_ok=True)
+        with open(STOP_FILE, "w", encoding="utf-8") as f:
+            f.write(f"flatten\nrequested_at={time.time()}\n")
+    except OSError as e:
+        await update.message.reply_text(
+            f"❌ Could not write stop request:\n`{e}`", parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(
+        "🛑 Stop requested — waiting up to 120s for graceful flatten + exit…",
+        parse_mode="Markdown",
+    )
+
+    parent = psutil.Process(proc.pid)
+    deadline = time.time() + 120.0
+    while time.time() < deadline:
+        await asyncio.sleep(2.0)
+        if not parent.is_running() or parent.status() == psutil.STATUS_ZOMBIE:
+            if os.path.exists(PID_FILE):
+                try:
+                    os.remove(PID_FILE)
+                except OSError:
+                    pass
+            if os.path.exists(STOP_FILE):
+                try:
+                    os.remove(STOP_FILE)
+                except OSError:
+                    pass
+            await update.message.reply_text(
+                "✅ Process exited after graceful stop.", parse_mode="Markdown"
+            )
+            return
+
+    # Still alive — last resort. Prefer terminate over kill so Windows can
+    # still deliver CTRL_BREAK if the process group handles it.
+    try:
         for child in parent.children(recursive=True):
-            child.terminate()
+            try:
+                child.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
         parent.terminate()
-        parent.wait(timeout=5)
-
+        try:
+            parent.wait(timeout=10)
+            msg = (
+                "⚠️ Graceful stop timed out; process terminated after 120s. "
+                "Verify the broker book is flat."
+            )
+        except psutil.TimeoutExpired:
+            parent.kill()
+            msg = (
+                "⚠️ Force-killed after graceful stop timeout. "
+                "MANUAL BROKER FLATTEN REQUIRED if any F&O qty remains."
+            )
         if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-
-        await update.message.reply_text("🛑 Process terminated cleanly.", parse_mode="Markdown")
-    except psutil.TimeoutExpired:
-        parent.kill()
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-        await update.message.reply_text("⚠️ Process force-killed (SIGKILL).", parse_mode="Markdown")
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
+        if os.path.exists(STOP_FILE):
+            try:
+                os.remove(STOP_FILE)
+            except OSError:
+                pass
+        await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to stop process:\n`{str(e)}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Failed to stop process:\n`{str(e)}` — check broker book by hand.",
+            parse_mode="Markdown",
+        )
 
 
 async def status_algo(update: Update, context: ContextTypes.DEFAULT_TYPE):
