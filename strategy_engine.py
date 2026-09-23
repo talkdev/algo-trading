@@ -3654,6 +3654,7 @@ class StrategyEngine:
         legs:            Optional[List[dict]] = None,
         stop_premium:    Optional[float] = None,
         barrier_pull_pts: float = 0.0,
+        location_edge:    bool = False,
     ) -> Tuple[bool, str]:
         """
         Expected value of the structure, in premium points, over the intended
@@ -4136,6 +4137,12 @@ class StrategyEngine:
             net_credit * float(getattr(self.config, "min_ev_frac_of_credit", 0.03)),
             friction * float(getattr(self.config, "min_ev_frac_of_friction", 0.35)),
         )
+        # Away-side / with-trend location leans: the tape IS the edge.
+        # Pure VRP EV often prints a few tenths negative on quiet DTE0
+        # credits (Sep22 BCS @10:37 ev≈-0.4) while live books the lean
+        # and harvests. Allow a one-friction cushion below zero.
+        if location_edge:
+            min_ev = min(min_ev, -float(friction))
 
         _detail = (
             f"p_win={p_win:.2f},p_tail={p_tail:.3f},"
@@ -4426,7 +4433,27 @@ class StrategyEngine:
             (strategy_name == BEAR_CALL_SPREAD and _away == "BEAR")
             or (strategy_name == BULL_PUT_SPREAD and _away == "BULL")
         )
-        if _with_trend_credit or _away_side_credit:
+        # Only RANGE location leans get the thin-credit floor. A directional
+        # PREMIUM_SELL_* with-trend vertical that ALSO sits at an extreme
+        # location must still clear the late richness bar — otherwise
+        # Sep17-class 10:06 BPS (UPTREND + upper loc) slips through at
+        # credit_risk≈0.05 and mean-reverts into a lock-labelled loss.
+        _sel_l = str(selection_reason or "").lower()
+        _range_loc_lean = any(
+            k in _sel_l
+            for k in (
+                "range_soft_location_lean",
+                "range_location_lean",
+                "soft_location",
+                "soft_lean",
+            )
+        ) or ":warmup" in _sel_l
+        if _away_side_credit and _range_loc_lean:
+            min_ratio = min(min_ratio, float(
+                getattr(self.config, "credit_risk_ratio_away_side", 0.04)
+                or 0.04
+            ))
+        elif _with_trend_credit or _away_side_credit:
             min_ratio = min(min_ratio, float(
                 getattr(self.config, "credit_risk_ratio_dte0_late", 0.10)
                 or 0.10
@@ -4440,6 +4467,8 @@ class StrategyEngine:
                 ),
             }
 
+        _location_edge = bool(_away_side_credit and _range_loc_lean)
+
         if actual_wing_pts and actual_wing_pts > 0:
             ratio     = net_credit / actual_wing_pts
             min_ratio_wing = by_dte(
@@ -4447,6 +4476,10 @@ class StrategyEngine:
                 MIN_CREDIT_RATIO_DTE0.get(strategy_name, 0.14),
                 MIN_CREDIT_RATIO.get(strategy_name, 0.10),
             )
+            # Quiet DTE0 away-side premiums sit a tick under the 0.11
+            # wing ratio (Sep22 10:40 credit_ratio≈0.106).
+            if _location_edge:
+                min_ratio_wing = min(min_ratio_wing, 0.09)
             if ratio < min_ratio_wing:
                 return {
                     "valid": False,
@@ -4553,6 +4586,7 @@ class StrategyEngine:
             entry_costs_pts, total_slippage, signals,
             legs=validated_legs, stop_premium=_stop_premium_pre,
             barrier_pull_pts=price_stop_pts,
+            location_edge=_location_edge,
         )
         if not ev_ok:
             return {"valid": False, "reason": f"ev_gate:{ev_reason}"}

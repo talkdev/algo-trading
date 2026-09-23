@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v65f)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
+   - [1.1 Latest change logic (v65g)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,7 +40,7 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v65 → v65f) — backtest is a data pump into MainEngine
+### 1.1 Latest change logic (v65 → v65g) — backtest is a data pump into MainEngine
 
 **Architecture rule:** do **not** maintain a second trading loop. Replay feeds historical DB cycles into the **same** live path:
 
@@ -88,13 +88,27 @@ Same timestamps, structures, lots, and exit reasons. Residual P&L delta is FillM
 | Counter-trend map | Live Sep21 BCS @13:35 `price=UPTREND` adx=23 → HARD_EXIT −₹261 | `_map_regime`: refuse measured UPTREND BCS unless confirmed two-way high fade (plus existing counter-trend gate) |
 | Primary DB | `nifty_algo_v3.db` SQLite-corrupt (`COUNT(*)` / audit failed); looked like empty install | See durability + restore below |
 
+**v65g — Sep8–22 signal-stream hunt (location-edge credit only):**
+
+Per-day MainEngine pump vs live books. Live mistakes already refused on current code: immature IC (Sep16/17/21), counter-trend BCS (Sep21), debit HWM giveback (Sep22 LP → replay `CLOSE_TARGET` ~+₹10k). Remaining hole: live Sep22 soft-lean BCS @10:37 was selected then killed by `credit_risk≈0.049` / `ev≈−0.4` / wing `credit_ratio` floors.
+
+| Gate | Fix (generic) |
+|---|---|
+| `credit_risk_ratio` | `credit_risk_ratio_away_side` (default **0.04**) only when selection is a **range location lean** (`range_soft_location_lean` / `range_location_lean` / warmup) — not plain with-trend `PREMIUM_SELL_*` (that path regresses Sep17 10:06 BPS −₹2k) |
+| EV | Location-edge credits may clear down to `−friction` (tape is the edge) |
+| Wing `credit_ratio` | Location-edge DTE0 floor eased to **0.09** |
+
+Replay after fix: Sep22 BCS @10:37:39 + LONG_PUT stack; Sep17 back to +₹5,905; Sep11/16/18/21 unchanged vs pre-v65g winners. Flat live days (08–10, 15): bot ran but refused (EV / wing-cost IC / IV expand) — not halt state.
+
+**Restart live on v65g.**
+
 **Primary DB durability & restore:**
 
 - Live `Database`: `synchronous=FULL`, 60s busy timeout, WAL checkpoint on close + after each chain-snapshot burst; startup refuses a primary that fails `quick_check` / chain `COUNT(*)` (message points at restore).
 - `python restore_primary_db.py` — quarantine corrupt primary, merge all usable `data/per_day/*.db` shards, `integrity_check`, atomic replace. Re-run after new live sessions + `split_db_per_day.py`.
 - `backtest_engine.py` with no `--db`: if primary has no usable chain snapshots, **auto-falls back** to `data/per_day/` (still prefers a healthy primary).
 
-**Restart live on v65f** so the running process matches this code (and restart after any primary restore).
+**Restart live on v65g** so the running process matches this code (and restart after any primary restore).
 
 ---
 

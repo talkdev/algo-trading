@@ -881,6 +881,10 @@ class Config:
     credit_risk_ratio_dte0_early: float = 0.16
     credit_risk_ratio_dte0_mid:   float = 0.13
     credit_risk_ratio_dte0_late:  float = 0.10
+    # Away-side / with-trend verticals: edge is location (or trend), not
+    # VRP richness. Sep22 live BCS @10:37 printed credit_risk≈0.049 —
+    # the late 0.10 floor still vetoed the same lean in replay.
+    credit_risk_ratio_away_side:  float = 0.04
     credit_ratio_vix_ref:         float = 13.5
     # v3.3: EV-gate honesty bounds. The vendor 0DTE IV stamp may not
     # dominate the straddle-implied sigma, and the ATM IV stamp may not
@@ -1789,6 +1793,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         credit_risk_ratio_dte0_early=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_EARLY", 0.16), 0.05), 0.40),
         credit_risk_ratio_dte0_mid=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_MID", 0.13), 0.05), 0.40),
         credit_risk_ratio_dte0_late=min(max(_get_float(env, "CREDIT_RISK_RATIO_DTE0_LATE", 0.10), 0.04), 0.40),
+        credit_risk_ratio_away_side=min(max(_get_float(env, "CREDIT_RISK_RATIO_AWAY_SIDE", 0.04), 0.02), 0.20),
         credit_ratio_vix_ref=min(max(_get_float(env, "CREDIT_RATIO_VIX_REF", 13.5), 10.0), 20.0),
         # v3.3: EV-gate honesty bounds and minimum edge
         iv_sigma_cap_ratio=min(max(_get_float(env, "IV_SIGMA_CAP_RATIO", 1.15), 1.00), 2.00),
