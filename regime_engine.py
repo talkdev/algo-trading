@@ -1311,20 +1311,31 @@ class RegimeClassifier:
         # not supported by the volume-weighted average price is noise,
         # and calling it a trend makes the engine sell the WRONG side.
         # This is the logic that was stranded inside the docstring.
-        if not adx_15_mature or adx_15 <= 0:
+        if not adx_15_mature:
+            # Immature: ORB must be confirmed by VWAP on the SAME side.
+            # Accepting NEUTRAL/UNKNOWN here minted false morning trends
+            # (Sep17: ORB poke → UPTREND → BPS at 10:27 into a day that
+            # was still chopping; live stayed flat until RANGE IC).
             _vwap_s = signals.get("vwap_signal", "UNKNOWN")
             if orb_structure == "UPTREND":
-                if adx_15 >= adx_trend:
-                    return PriceRegime.UPTREND
-                if _vwap_s in ("BULLISH", "BULLISH_EXTENDED",
-                               "NEUTRAL", "UNKNOWN"):
+                if _vwap_s in ("BULLISH", "BULLISH_EXTENDED"):
                     return PriceRegime.UPTREND
                 return PriceRegime.RANGE
             if orb_structure == "DOWNTREND":
-                if adx_15 >= adx_trend:
+                if _vwap_s in ("BEARISH", "BEARISH_EXTENDED"):
                     return PriceRegime.DOWNTREND
-                if _vwap_s in ("BEARISH", "BEARISH_EXTENDED",
-                               "NEUTRAL", "UNKNOWN"):
+                return PriceRegime.RANGE
+            if orb_structure == "CHOPPY":
+                return PriceRegime.CHOPPY
+            return PriceRegime.RANGE
+        if adx_15 <= 0:
+            _vwap_s = signals.get("vwap_signal", "UNKNOWN")
+            if orb_structure == "UPTREND":
+                if _vwap_s in ("BULLISH", "BULLISH_EXTENDED"):
+                    return PriceRegime.UPTREND
+                return PriceRegime.RANGE
+            if orb_structure == "DOWNTREND":
+                if _vwap_s in ("BEARISH", "BEARISH_EXTENDED"):
                     return PriceRegime.DOWNTREND
                 return PriceRegime.RANGE
             if orb_structure == "CHOPPY":
@@ -1621,11 +1632,30 @@ class RegimeClassifier:
 
     def _session_loc(self, signals: dict) -> Tuple[float, float]:
         try:
-            dh = float(signals.get("day_high_so_far") or signals.get("day_high") or 0.0)
-            dl = float(signals.get("day_low_so_far") or signals.get("day_low") or 0.0)
             spot = float(signals.get("spot") or 0.0)
         except (TypeError, ValueError):
+            spot = 0.0
+        highs, lows = [], []
+        for key in ("day_high_so_far", "day_high", "or_high"):
+            try:
+                v = float(signals.get(key) or 0.0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v > 0:
+                highs.append(v)
+        for key in ("day_low_so_far", "day_low", "or_low"):
+            try:
+                v = float(signals.get(key) or 0.0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v > 0:
+                lows.append(v)
+        if spot > 0:
+            highs.append(spot)
+            lows.append(spot)
+        if not highs or not lows:
             return 0.0, 0.5
+        dh, dl = max(highs), min(lows)
         rng = dh - dl
         if rng < 1.0 or spot <= 0:
             return 0.0, 0.5
@@ -1672,19 +1702,29 @@ class RegimeClassifier:
         clear location on the side being sold away from.
         """
         if bool(signals.get("event_day") or signals.get("event_announced")):
-            return False
+            # Defined-risk event days may still use soft directional when
+            # conviction is HIGH (BPS/BCS are defined risk). Blanket refuse
+            # forced ONLY_RANGE / immature dead-ends and weak momentum fills.
+            _cl = signals.get("confidence_level")
+            _cl_s = getattr(_cl, "value", None) or str(_cl or "")
+            if str(_cl_s).upper() != "HIGH":
+                return False
         if current_time < self.SOFT_CREDIT_AFTER:
             return False
         _rng, _loc = self._session_loc(signals)
         if _rng < self.SOFT_MIN_RANGE_PTS:
             return False
         if side == "BULL":
-            return _loc >= self.SOFT_LOC_HI and (
-                _loc >= 0.70 or self._soft_tape_agrees(signals, "BULL")
+            # Extreme location alone used to skip tape agreement and could
+            # sell puts into a bearish EMA (live Sep18 11:05 CHOPPY BPS
+            # while ema_structure=BEARISH). Location gates the side; tape
+            # must still agree.
+            return _loc >= self.SOFT_LOC_HI and self._soft_tape_agrees(
+                signals, "BULL"
             )
         if side == "BEAR":
-            return _loc <= self.SOFT_LOC_LO and (
-                _loc <= 0.30 or self._soft_tape_agrees(signals, "BEAR")
+            return _loc <= self.SOFT_LOC_LO and self._soft_tape_agrees(
+                signals, "BEAR"
             )
         return False
 
@@ -2036,19 +2076,43 @@ class RegimeClassifier:
             )
 
         # ── Event Day Rules ───────────────────────────────────────────────
+        # DEFINED_RISK_ONLY means no undefined risk — not "iron condor only".
+        # Forcing ONLY_RANGE blocked measured bull/bear verticals (live Sep11
+        # BPS into UPTREND made money) and left the session to weak momentum
+        # substitutes (replay LONG_CALL −₹912). Same rule every DTE/event.
         if event_day and self.config.defined_risk_only_on_event:
             notes_parts.append("EVENT:DEFINED_RISK_ONLY")
-            # Only allow RANGE regime on event day, and only with HIGH confidence
-            if price != PriceRegime.RANGE:
-                return (
-                    FinalRegime.NO_TRADE,
-                    " | ".join(notes_parts + ["EVENT:ONLY_RANGE_ALLOWED"]),
-                    False,
-                )
             if conf != ConfidenceLevel.HIGH:
                 return (
                     FinalRegime.NO_TRADE,
                     " | ".join(notes_parts + ["EVENT:REQUIRES_HIGH_CONFIDENCE"]),
+                    False,
+                )
+            try:
+                _ev_adx = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _ev_adx = 0.0
+            _ev_trend = float(
+                getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+            )
+            _measured_dir = (
+                price in (
+                    PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
+                    PriceRegime.DOWNTREND, PriceRegime.STRONG_DOWNTREND,
+                )
+                and _ev_adx >= _ev_trend
+            )
+            if price == PriceRegime.RANGE:
+                pass  # fall through to range tree
+            elif _measured_dir:
+                notes_parts.append("EVENT:DEFINED_RISK_DIRECTIONAL")
+                # fall through — strategy layer builds BPS/BCS (defined risk)
+            else:
+                return (
+                    FinalRegime.NO_TRADE,
+                    " | ".join(
+                        notes_parts + ["EVENT:ONLY_RANGE_OR_MEASURED_TREND"]
+                    ),
                     False,
                 )
 
@@ -2067,23 +2131,40 @@ class RegimeClassifier:
                 pass  # location fade owns the book
             elif (not bool(signals.get("adx_15_mature", False))
                     or float(signals.get("adx_15") or 0.0) <= 0.0):
-                _side = (
-                    "BULL" if price in (
-                        PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
-                    ) else "BEAR"
+                try:
+                    _prev_adx = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _prev_adx = 0.0
+                _strong_need = float(
+                    getattr(self.config, "adx_strong_threshold", 40.0) or 40.0
                 )
-                if self._soft_directional_ok(signals, _side, current_time):
+                # Strong immature preview (≈ live adaptive morning ADX) may
+                # underwrite defined-risk directional credit. Weak previews
+                # (e.g. 25–30) must not — that sold Sep17 puts into chop.
+                if _prev_adx >= _strong_need:
                     signals["soft_directional_pre_adx"] = True
                     signals["weekly_range_size_discount"] = float(
                         getattr(self.config, "soft_directional_size", 0.75)
                     )
-                    notes_parts.append("SOFT_DIRECTIONAL_PRE_ADX")
+                    notes_parts.append("ADX_PREVIEW_STRONG_DIRECTIONAL")
                 else:
-                    return (
-                        FinalRegime.NO_TRADE,
-                        "NO_TRADE:ADX_IMMATURE_NO_DIRECTIONAL_CREDIT",
-                        False,
+                    _side = (
+                        "BULL" if price in (
+                            PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
+                        ) else "BEAR"
                     )
+                    if self._soft_directional_ok(signals, _side, current_time):
+                        signals["soft_directional_pre_adx"] = True
+                        signals["weekly_range_size_discount"] = float(
+                            getattr(self.config, "soft_directional_size", 0.75)
+                        )
+                        notes_parts.append("SOFT_DIRECTIONAL_PRE_ADX")
+                    else:
+                        return (
+                            FinalRegime.NO_TRADE,
+                            "NO_TRADE:ADX_IMMATURE_NO_DIRECTIONAL_CREDIT",
+                            False,
+                        )
 
         # ── Price Regime → Structure ──────────────────────────────────────
         if price == PriceRegime.RANGE:
@@ -2392,14 +2473,19 @@ class RegimeClassifier:
         dte    = signals.get("actual_dte")
         adx_15 = float(signals.get("adx_15") or 0.0)
 
-        # PATCH_V12: DTE 2 flows through the standard trend path (see
-        # _classify_range note — the exception was calibrated on a
-        # mislabelled DTE1 event Friday). The remaining discipline is
-        # for event days, where an unmeasured 'trend' is usually an
-        # ORB poke on zero information (measured 2026-09-11 09:47:
-        # adx 0, max-size bear call into a CPI rally, -Rs 3,924).
-        if signals.get("event_day") and not signals.get("adx_15_mature"):
-            return FinalRegime.NO_TRADE, "EVENT_TREND_NEEDS_MEASURED_ADX"
+        # Event days need a MEASURED trend: an unmeasured ORB poke is not
+        # a directional edge (Sep11 09:47 adx0 max-size BCS → −₹3.9k).
+        # Immature Wilder may still publish a strong preview ADX — that
+        # counts; a zero/weak preview does not.
+        if signals.get("event_day"):
+            _need = float(
+                getattr(self.config, "adx_strong_threshold", 40.0) or 40.0
+            )
+            _measured = bool(signals.get("adx_15_mature")) or (
+                adx_15 >= _need
+            )
+            if not _measured:
+                return FinalRegime.NO_TRADE, "EVENT_TREND_NEEDS_MEASURED_ADX"
 
         # Positioning conflict: BULLISH positioning in downtrend
         if pos == PositioningRegime.BULLISH:
@@ -2446,11 +2532,17 @@ class RegimeClassifier:
         dte    = signals.get("actual_dte")
         adx_15 = float(signals.get("adx_15") or 0.0)
 
-        # PATCH_V12: DTE 2 flows through the standard trend path (see
-        # _classify_range note). Event days need a MEASURED trend:
-        # an unmeasured ORB poke is not a directional edge.
-        if signals.get("event_day") and not signals.get("adx_15_mature"):
-            return FinalRegime.NO_TRADE, "EVENT_TREND_NEEDS_MEASURED_ADX"
+        # Event days need a MEASURED trend: strong preview ADX counts;
+        # ORB-only poke on ADX≈0 does not (see _classify_downtrend).
+        if signals.get("event_day"):
+            _need = float(
+                getattr(self.config, "adx_strong_threshold", 40.0) or 40.0
+            )
+            _measured = bool(signals.get("adx_15_mature")) or (
+                adx_15 >= _need
+            )
+            if not _measured:
+                return FinalRegime.NO_TRADE, "EVENT_TREND_NEEDS_MEASURED_ADX"
 
         # Positioning conflict: BEARISH positioning in uptrend
         if pos == PositioningRegime.BEARISH:

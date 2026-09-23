@@ -81,14 +81,17 @@ EXIT_REASON_MAP = {
 
 class PaperOrderExecutor:
     """
-    Simulates order execution for paper trading.
-    Uses mid-price for fills (no real slippage simulation — slippage
-    is modelled separately in transaction cost computation).
+    Simulates order execution for paper trading / DB replay.
+
+    v64: optional FillModel (same as backtest_engine) so paper and replay
+    share one fill policy. Without it, entry uses strategy exec_price and
+    exit uses full bid/ask (legacy paper behaviour).
     """
 
-    def __init__(self, config: Config, logger):
+    def __init__(self, config: Config, logger, fill_model=None):
         self.config  = config
         self.logger  = logger
+        self.fill_model = fill_model
         self._counter = 0
 
     def _next_order_id(self) -> str:
@@ -98,9 +101,21 @@ class PaperOrderExecutor:
     def execute_leg_entry(
         self, leg: dict, lots: int, chain: dict
     ) -> dict:
-        """Simulate entry fill. Uses exec_price from strategy params."""
+        """Simulate entry fill."""
         order_id   = self._next_order_id()
         fill_price = float(leg.get("exec_price", 0) or 0)
+        if self.fill_model is not None and chain:
+            strike   = float(leg.get("strike", 0) or 0)
+            opt_type = str(leg.get("option_type", ""))
+            opt = (chain.get(strike) or {}).get(opt_type) or {}
+            quoted = {
+                "bid": float(opt.get("bid") or 0),
+                "ask": float(opt.get("ask") or 0),
+                "ltp": float(opt.get("ltp") or 0),
+            }
+            px = self.fill_model.price(quoted, str(leg.get("action") or "SELL"))
+            if px is not None and px > 0:
+                fill_price = float(px)
 
         self.logger.info(
             f"[PAPER] ENTRY: {leg['action']} {leg['option_type'].upper()} "
@@ -116,12 +131,7 @@ class PaperOrderExecutor:
     def execute_leg_exit(
         self, leg: dict, chain: dict, lots: int
     ) -> dict:
-        """
-        Simulate exit fill.
-        For SELL legs (buying back): use ask price.
-        For BUY legs (selling): use bid price.
-        Falls back to entry price if chain unavailable.
-        """
+        """Simulate exit fill (reverse of entry action)."""
         order_id   = self._next_order_id()
         strike     = float(leg.get("strike", 0))
         opt_type   = str(leg.get("option_type", ""))
@@ -132,14 +142,23 @@ class PaperOrderExecutor:
         bid = float(opt.get("bid", 0) or 0)
         ask = float(opt.get("ask", 0) or 0)
         ltp = float(opt.get("ltp", 0) or 0)
+        close_action = "BUY" if action == "SELL" else "SELL"
 
-        # Exit is the reverse of entry action
-        if action == "SELL":
-            # Buying back: pay ask
-            fill_price = ask if ask > 0 else (ltp if ltp > 0 else entry_price)
-        else:
-            # Selling: receive bid
-            fill_price = bid if bid > 0 else (ltp if ltp > 0 else entry_price)
+        fill_price = 0.0
+        if self.fill_model is not None:
+            px = self.fill_model.price(
+                {"bid": bid, "ask": ask, "ltp": ltp},
+                close_action,
+                urgent=bool(leg.get("_urgent_exit")),
+            )
+            if px is not None and px > 0:
+                fill_price = float(px)
+
+        if fill_price <= 0:
+            if action == "SELL":
+                fill_price = ask if ask > 0 else (ltp if ltp > 0 else entry_price)
+            else:
+                fill_price = bid if bid > 0 else (ltp if ltp > 0 else entry_price)
 
         self.logger.info(
             f"[PAPER] EXIT: close {action} {opt_type.upper()} "
@@ -937,6 +956,7 @@ class ExecutionEngine:
         cal_engine:     CalibrationEngine,
         client:         UpstoxClient,
         logger,
+        fill_model=None,
     ):
         self.config        = config
         self.db            = db
@@ -950,11 +970,15 @@ class ExecutionEngine:
         self.notifier      = (
             AlertNotifier(config) if not config.paper_trade_mode else None
         )
+        self._chain_by_expiry: dict = {}
+        self.fill_model = fill_model
 
         self._ensure_extra_columns()
 
         if config.paper_trade_mode:
-            self.executor = PaperOrderExecutor(config, logger)
+            self.executor = PaperOrderExecutor(
+                config, logger, fill_model=fill_model
+            )
             logger.info("ExecutionEngine: PAPER TRADE mode.")
         else:
             self.executor = LiveOrderExecutor(
@@ -963,6 +987,26 @@ class ExecutionEngine:
             logger.warning(
                 "ExecutionEngine: LIVE TRADING mode — REAL ORDERS WILL BE PLACED."
             )
+
+    def _chain_for_position(self, position: dict) -> dict:
+        """v64: mark/exit on the position's own expiry chain (live≡BT).
+
+        Crossing a Tuesday 0DTE listing must not reprice a weekly book on
+        the wrong series (measured 2026-09-08 in BT; same risk live).
+        """
+        chain = self.market_engine.last_chain or {}
+        try:
+            _cache = getattr(self, "_chain_by_expiry", None) or {}
+            _want = str(position.get("target_expiry") or "")[:10]
+            if _want and _want in _cache:
+                return _cache[_want]
+            _ax = self.market_engine.state.get("actual_expiry")
+            if _want and _ax is not None and str(_ax)[:10] != _want:
+                # Wrong active series and no cache — refuse to invent marks
+                return {}
+        except Exception:
+            pass
+        return chain
 
     # ─────────────────────────────────────────────────────────────────────
     # ALERTING
@@ -1011,6 +1055,8 @@ class ExecutionEngine:
             ("positions", "entry_credit_realised",   "REAL"),
             ("positions", "profit_lock_activated",   "INTEGER DEFAULT 0"),
             ("positions", "profit_lock_stop_level",  "REAL"),
+            # Debit HWM: best mid value seen while long; drives fat-winner trail.
+            ("positions", "peak_debit_value",        "REAL"),
             ("positions", "exit_priority",           "INTEGER"),
             ("positions", "price_stop_level_call",   "REAL"),
             ("positions", "price_stop_level_put",    "REAL"),
@@ -1833,6 +1879,12 @@ class ExecutionEngine:
         state["entry_count"]       = state.get("entry_count", 0) + 1
         state["consecutive_stops"] = 0
         state["last_entry_time"]   = now.isoformat()
+        # Momentum daily cap: count fills only (not decide()-time selects).
+        _sname = str(params.get("strategy_name") or "")
+        if _sname in ("LONG_CALL", "LONG_PUT"):
+            state["momentum_entries"] = int(
+                state.get("momentum_entries", 0) or 0
+            ) + 1
         # P59-07: latch calendar mode at first successful entry only
         if not state.get("day_mode_latched"):
             state["day_mode_latched"] = (
@@ -2021,9 +2073,47 @@ class ExecutionEngine:
         lock   = float(raw.get("profit_lock_trigger") or
                        (entry_value * (1.0 + float(getattr(cfg, "momentum_lock_trigger", 0.25)))))
         rt_cost = self._round_trip_cost_pts(open_legs, chain)
+        activated = bool(position.get("profit_lock_activated"))
+        locked    = position.get("profit_lock_stop_level")
 
-        # ── D1: premium stop ─────────────────────────────────────────────
+        # ── D1: premium stop / trail breach ───────────────────────────────
+        # Once the profit lock has armed, the raised stop_premium IS the
+        # trail. Hitting it is a give-back exit (CLOSE_TARGET), not a
+        # failed-thesis loss stop — operators must not confuse the two.
+        # Live Sep22 LONG_PUT: profit_lock_activated=1 with free-trade
+        # stop_premium set, but profit_lock_stop_level null → D1 fell
+        # through to CLOSE_STOP and spent the stop budget on a managed
+        # trail exit. If the lock is armed, the active stop IS the trail.
         if stop > 0 and value <= stop:
+            _trail_lvl = None
+            if activated:
+                try:
+                    _trail_lvl = (
+                        float(locked)
+                        if locked is not None
+                        else float(stop)
+                    )
+                except (TypeError, ValueError):
+                    _trail_lvl = float(stop) if stop else None
+            if (
+                activated
+                and _trail_lvl is not None
+                and value <= float(_trail_lvl) + 1e-9
+            ):
+                self.logger.info(
+                    f"DEBIT TRAIL GIVE-BACK: {position['strategy_name']} "
+                    f"value={value:.2f} <= lock={float(_trail_lvl):.2f} "
+                    f"(entry {entry_value:.2f})"
+                )
+                return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+                    "reason_detail": (
+                        f"momentum_lock_given_back_{value:.2f}"
+                        f"<={float(_trail_lvl):.2f}"
+                    ),
+                    "locked_level": float(_trail_lvl),
+                    "current_premium": current_premium,
+                    "liquidation_premium": liq_premium,
+                }
             self.logger.warning(
                 f"DEBIT PREMIUM STOP: {position['strategy_name']} "
                 f"value={value:.2f} <= stop={stop:.2f} (entry {entry_value:.2f})"
@@ -2034,23 +2124,20 @@ class ExecutionEngine:
                 "liquidation_premium": liq_premium,
             }
 
-        # ── D2: profit lock, ratcheted upward on the mid ─────────────────
-        activated = bool(position.get("profit_lock_activated"))
-        locked    = position.get("profit_lock_stop_level")
-        # PATCH_V12: trend-persist hold. A momentum ticket exists to
-        # ride a trend; banking it on a fixed give-back fraction
-        # while the thesis is still alive converts 1.7R+ winners
-        # into +15% scalps (measured 11-Sep: call spiked +38% by
-        # noon, stopped at +18% at 12:12 ahead of an afternoon
-        # rally; 15-Sep: put ran +31%, stopped at +15% at 13:19
-        # ahead of the waterfall). While the thesis lives — mature
-        # ADX above the death line, price still trend-side or
-        # merely napping (never opposed), spot still holding the
-        # breakout side of the opening-range mid — the ratchet locks
-        # only the free trade. The ride ends at the closing
-        # flatten, the breakeven stop, or the trend break, whichever
-        # comes first. Entry/exit asymmetry is deliberate:
-        # conviction (24) to enter, thesis-death (15) to abandon.
+        # ── D2: high-water-mark profit management ────────────────────────
+        # Wrong approaches (both failed Sep22 LONG_PUT):
+        #   * Clamp trail to breakeven while "trend persist" → held through
+        #     ₹13k peak at 14:01, gave it all back, CLOSE_STOP −₹912.
+        #   * Loose mid-trail from first modest green → exited +₹1.3k at
+        #     12:05 and never saw the afternoon peak.
+        # Correct shape:
+        #   Phase A (runner): after +lock_trigger, stop = free-trade only.
+        #     Do NOT trail mid-move — that is how +₹1.3k / +₹8.7k scalp-outs
+        #     miss the real peak.
+        #   Phase B (fat winner): only once HWM open gain ≥ large_frac of
+        #     entry (default 1.0 → HWM ≥ 2× entry). Then trail from the
+        #     stored peak, giving back only giveback_frac of peak open gain
+        #     (default 0.20 → keep ~80% of the peak).
         _persist = False
         try:
             _sig = signals or {}
@@ -2060,7 +2147,11 @@ class ExecutionEngine:
             elif "CALL" in _sname:
                 _dir = 1
             else:
-                _dir = int(raw.get("momentum_direction") or position.get("momentum_direction") or 0)
+                _dir = int(
+                    raw.get("momentum_direction")
+                    or position.get("momentum_direction")
+                    or 0
+                )
             _px = str(_sig.get("price_regime") or "")
             _adx = float(_sig.get("adx_15") or 0.0)
             _mat = bool(_sig.get("adx_15_mature", False))
@@ -2077,39 +2168,75 @@ class ExecutionEngine:
                 or (_dir < 0 and spot <= _ormid)
             )
             _death = float(getattr(cfg, "momentum_trend_death_adx", 15.0))
-            _persist = bool(_dir != 0 and _trend_side_ok and _brk_ok and _mat and _adx >= _death)
+            _persist = bool(
+                _dir != 0 and _trend_side_ok and _brk_ok and _mat and _adx >= _death
+            )
         except Exception:
             _persist = False
-        if value_mid >= lock:
-            keep = float(getattr(cfg, "momentum_lock_keep_frac", 0.50))
-            new_level = max(
-                value_mid - max(value_mid - entry_value, 0.0) * keep,
-                entry_value + rt_cost,
-            )
-            if _persist:
-                # Ride: lock only the free trade, never bank into strength.
-                new_level = min(new_level, entry_value + rt_cost)
+
+        try:
+            prev_hwm = float(position.get("peak_debit_value") or 0.0)
+        except (TypeError, ValueError):
+            prev_hwm = 0.0
+        hwm = max(prev_hwm, float(value_mid or 0.0))
+        be_level = entry_value + rt_cost
+        large_frac = float(getattr(cfg, "momentum_hwm_large_frac", 1.00))
+        giveback = float(getattr(cfg, "momentum_hwm_giveback_frac", 0.20))
+        large_frac = min(max(large_frac, 0.30), 2.0)
+        giveback = min(max(giveback, 0.05), 0.50)
+        fat_hwm = entry_value * (1.0 + large_frac)
+
+        new_level = None
+        ratchet_reason = None
+        if hwm >= fat_hwm - 1e-9:
+            peak_gain = max(hwm - entry_value, 0.0)
+            new_level = hwm - peak_gain * giveback
+            new_level = max(new_level, be_level)
+            ratchet_reason = "momentum_hwm_trail"
+        elif value_mid >= lock or activated:
+            # Runner: free-trade floor only — do not scalp modest greens.
+            new_level = be_level
+            ratchet_reason = "momentum_free_trade"
+
+        if new_level is not None:
             cur_level = float(locked or 0.0)
-            if not activated or new_level > cur_level:
+            raised = (not activated) or (new_level > cur_level + 1e-9)
+            hwm_up = hwm > prev_hwm + 1e-9
+            if raised or hwm_up or not activated:
+                _lock_out = max(new_level, cur_level) if activated else new_level
                 self.db.update(
                     "positions",
                     {
+                        "peak_debit_value":       hwm,
                         "profit_lock_activated":  1,
-                        "profit_lock_stop_level": new_level,
-                        "stop_premium":           max(stop, new_level),
+                        "profit_lock_stop_level": _lock_out,
+                        "stop_premium":           max(stop, _lock_out),
                         "updated_at":             now_ist().isoformat(),
                     },
                     {"position_id": position["position_id"]},
                 )
                 return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, {
-                    "reason_detail": "momentum_profit_lock_ratchet",
-                    "new_level": new_level,
+                    "reason_detail": ratchet_reason or "momentum_profit_lock",
+                    "new_level": _lock_out,
+                    "peak_debit_value": hwm,
+                    "fat_winner": hwm >= fat_hwm - 1e-9,
                 }
-            if value <= new_level:
+            if value <= float(locked or new_level):
                 return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
                     "reason_detail": "momentum_lock_given_back",
-                    "locked_level": new_level,
+                    "locked_level": float(locked or new_level),
+                    "peak_debit_value": hwm,
                 }
+        elif hwm > prev_hwm + 1e-9:
+            # Still underwater / not armed — just remember the peak.
+            self.db.update(
+                "positions",
+                {
+                    "peak_debit_value": hwm,
+                    "updated_at": now_ist().isoformat(),
+                },
+                {"position_id": position["position_id"]},
+            )
 
         # ── D3: planned target ───────────────────────────────────────────
         # PATCH_V12: no fixed targets into a living trend (see D2).
@@ -2593,6 +2720,29 @@ class ExecutionEngine:
                         or _open_high_at_low
                     )
                 )
+                # Two-way / fade rotation is a location trade: ADX is
+                # often mid-teens on a swinging tape. Trend rotation
+                # still needs a measured ADX.
+                _rot_trend_ok = _rot_mat and _rot_adx >= _rot_adx_need
+                _rot_loc_ok = (
+                    _rot_fade_label or _rot_two_way
+                    or _open_low_at_high or _open_high_at_low
+                )
+                _rot_hold_need = (
+                    min(_rot_min, 15.0) if _rot_loc_ok else _rot_min
+                )
+                # v63: IC/fly has no directional side — rotate when a measured
+                # trend develops and the pin is underwater (free the slot for
+                # the correct vertical/debit). Live 21-Sep IC sat through
+                # UPTREND for ~2m then stopped; BT booked LONG_CALL instead.
+                _ic_to_trend = (
+                    ("CONDOR" in _rot_name or "BUTTERFLY" in _rot_name)
+                    and _rot_px in (
+                        "UPTREND", "STRONG_UPTREND",
+                        "DOWNTREND", "STRONG_DOWNTREND",
+                    )
+                    and _rot_trend_ok
+                )
                 # Only rotate when the thesis is broken (underwater) or the
                 # position has already banked enough that freeing the slot
                 # is not abandoning unpaid edge. Flat morning winners must
@@ -2613,24 +2763,17 @@ class ExecutionEngine:
                     and entry_credit > 0
                     and liq_premium <= entry_credit * 1.10
                 )
-                # Two-way / fade rotation is a location trade: ADX is
-                # often mid-teens on a swinging tape. Trend rotation
-                # still needs a measured ADX.
-                _rot_trend_ok = _rot_mat and _rot_adx >= _rot_adx_need
-                _rot_loc_ok = (
-                    _rot_fade_label or _rot_two_way
-                    or _open_low_at_high or _open_high_at_low
-                )
-                _rot_hold_need = (
-                    min(_rot_min, 15.0) if _rot_loc_ok else _rot_min
-                )
+                # IC rotation: only when underwater (do not scratch a working pin)
+                _ic_rotate = _ic_to_trend and _underwater
                 if (
                     (not _rot_raw.get("failed_break_scalp"))
                     and (not _rot_raw.get("neutral_range_vertical"))
                     and ((not _rot_is_fade) or _rot_opp_fade)
-                    and (_bull_to_bear or _bear_to_bull)
-                    and (_rot_trend_ok or _rot_loc_ok)
-                    and _rot_hold >= _rot_hold_need
+                    and (_bull_to_bear or _bear_to_bull or _ic_rotate)
+                    and (_rot_trend_ok or _rot_loc_ok or _ic_rotate)
+                    and _rot_hold >= (
+                        min(_rot_min, 20.0) if _ic_rotate else _rot_hold_need
+                    )
                     and (_underwater or _banked or _fade_scratch)
                 ):
                     self.market_engine.state["_closing_regime_rotation"] = True
@@ -2689,12 +2832,36 @@ class ExecutionEngine:
         # previously the engine would sit through it.
         if entry_credit > 0 and stop_premium > 0:
             if current_premium >= stop_premium:
+                # When the stop was moved by the profit lock, hitting it is a
+                # give-back bank (CLOSE_TARGET), not a hard stop. Checking
+                # premium-stop HERE (before Priority 4) used to mis-label
+                # locked winners as CLOSE_STOP and spend the stop budget
+                # (Sep11 BPS locked then "stopped" +₹89 instead of banking).
+                if profit_lock_activated:
+                    return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+                        "reason_detail": (
+                            f"profit_lock_stop_hit_mid_"
+                            f"{current_premium:.2f}>={stop_premium:.2f}"
+                        ),
+                        "current_premium": current_premium,
+                        "profit_lock_stop": stop_premium,
+                    }
                 return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
                     "reason_detail": f"premium_stop_{current_premium:.2f}>={stop_premium:.2f}",
                     "current_premium": current_premium,
                     "stop_premium": stop_premium,
                 }
             if liq_premium >= stop_premium * 1.20:
+                if profit_lock_activated:
+                    return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+                        "reason_detail": (
+                            f"profit_lock_stop_hit_liq_"
+                            f"{liq_premium:.2f}>={stop_premium * 1.20:.2f}"
+                        ),
+                        "current_premium": current_premium,
+                        "liquidation_premium": liq_premium,
+                        "profit_lock_stop": stop_premium,
+                    }
                 return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
                     "reason_detail": (
                         f"liquidation_stop_{liq_premium:.2f}>="
@@ -2858,6 +3025,21 @@ class ExecutionEngine:
             except (TypeError, ValueError):
                 pass
 
+            # Symmetric pin structures rarely print vertical-class decay
+            # intraday (live Sep16/17 IC ~7–11% of credit to the bell,
+            # lock never armed, was_exit_late). Arm earlier so the trail
+            # and the soft P6 ladder below can harvest a real pin print.
+            try:
+                _s_sym = str(position.get("strategy_name") or "")
+            except Exception:
+                _s_sym = ""
+            if _s_sym in ("IRON_CONDOR", "IRON_BUTTERFLY"):
+                _sym_lock = float(
+                    getattr(self.config, "profit_lock_pct_symmetric", 0.10)
+                    or 0.10
+                )
+                lock_thresh = min(lock_thresh, max(0.06, _sym_lock))
+
             # ── v10 [T1]: the give-back is now DTE-aware and RATCHETS ──────
             # Two defects, both measured on the recorded sessions.
             #
@@ -2892,6 +3074,21 @@ class ExecutionEngine:
             _keep_frac = min(max(_keep_frac, 0.05), 0.90)
             _rt_cost = self._round_trip_cost_pts(open_legs, chain)
             _stop_floor = max(entry_credit - _rt_cost, 0.05)
+            _max_gb = None
+            try:
+                _max_gb = self.config.profit_lock_max_giveback_pts_for_dte(
+                    actual_dte
+                )
+            except AttributeError:
+                _max_gb = None
+
+            def _trail_stop(_liq: float, _achieved: float) -> float:
+                # Fractional keep, then optional near-expiry point cap so a
+                # deep peak cannot unlock more give-back than max_gb pts.
+                _gb = (1.0 - _keep_frac) * _achieved
+                if _max_gb is not None:
+                    _gb = min(_gb, float(_max_gb))
+                return min(_liq + _gb, _stop_floor)
 
             def _persist_lock(_lvl: float) -> None:
                 self.db.update(
@@ -2925,8 +3122,7 @@ class ExecutionEngine:
                 # a locked trade cannot finish red. The time-target ladder
                 # (P6) and the 15:20 hard exit bound the ride.
                 _achieved = entry_credit - liq_premium
-                new_stop = liq_premium + (1.0 - _keep_frac) * _achieved
-                new_stop = min(new_stop, _stop_floor)
+                new_stop = _trail_stop(liq_premium, _achieved)
                 _persist_lock(new_stop)
                 self.logger.info(
                     f"PRIORITY 4 PROFIT LOCK: {position['strategy_name']} "
@@ -2959,15 +3155,12 @@ class ExecutionEngine:
                 except (TypeError, ValueError):
                     _stop_now = 0.0
                 _achieved_now = entry_credit - liq_premium
-                # profit locked in by the current stop, inverted from its own
-                # definition: stop = credit - keep_frac x achieved
-                _locked_now = (
-                    (entry_credit - _stop_now) / _keep_frac
-                    if _keep_frac > 0 else 0.0
-                )
-                if _achieved_now > _locked_now + 1e-9:
-                    _cand = liq_premium + (1.0 - _keep_frac) * _achieved_now
-                    _cand = min(_cand, _stop_floor)
+                if _achieved_now > 0:
+                    # Recompute the stop from the live mark. Do NOT invert
+                    # stop→locked via keep_frac alone: when a near-expiry
+                    # point cap is binding, that inversion overstates the
+                    # locked peak and can skip a real ratchet.
+                    _cand = _trail_stop(liq_premium, _achieved_now)
                     # monotone: a trail only ever moves in our favour.
                     # v41: for a SOLD structure "in our favour" is a LOWER
                     # stop premium (stop = credit - keep_frac x achieved
@@ -2985,8 +3178,8 @@ class ExecutionEngine:
                         self.logger.info(
                             f"PRIORITY 4 PROFIT LOCK RATCHET: "
                             f"{position['strategy_name']} achieved "
-                            f"{_achieved_now:.2f}pts > locked {_locked_now:.2f}"
-                            f"pts — stop {_stop_now:.2f} -> {_cand:.2f}pts"
+                            f"{_achieved_now:.2f}pts — stop {_stop_now:.2f} "
+                            f"-> {_cand:.2f}pts"
                         )
 
             # If profit lock is active, check if we've given back too much
@@ -3068,6 +3261,15 @@ class ExecutionEngine:
             # the rungs land between them (44/41/36/33/29/24%) instead of
             # inheriting the DTE4 ladder. A rung is live once the weekly
             # anchor has one (12:00), except on expiry day itself.
+            #
+            # v65f: DTE1 (Mon / holiday-shifted Fri) was still blending
+            # toward the expiry ladder, so the 12:00 bar sat near ~40%
+            # while lock arms at 22%. Measured Sep11: peak liq ~13.57
+            # (~25% of credit) never reached the ~41% time target; the
+            # only exit was a wide lock give-back for scraps, and the
+            # open slot blocked a same-direction re-entry. DTE1 now uses
+            # a lock-anchored ladder that can harvest a lock-class peak
+            # after noon without demanding expiry-day gamma.
             _ladder_expiry = [
                 (dtime(11, 30), 0.50),
                 (dtime(12, 30), 0.42),
@@ -3079,6 +3281,30 @@ class ExecutionEngine:
                 (dtime(13, 0),  0.32),
                 (dtime(14, 0),  0.24),
             ]
+            try:
+                _dte_i = int(actual_dte) if actual_dte is not None else 2
+            except (TypeError, ValueError):
+                _dte_i = 2
+            _lock_arm = float(
+                self.config.profit_lock_pct_for_dte(actual_dte)
+            )
+            _ladder_dte1 = [
+                # After noon, harvest near the lock-arm print. Demanding
+                # lock_arm+3pp left Sep11 sitting through a ~18-20%
+                # fill-model peak until the 13:00 rung; the open slot
+                # then missed the live-class same-direction re-entry.
+                (dtime(12, 0),  min(0.40, max(0.15, _lock_arm - 0.04))),
+                (dtime(13, 0),  min(0.32, max(0.12, _lock_arm - 0.06))),
+                (dtime(14, 0),  min(0.24, max(0.10, _lock_arm - 0.08))),
+            ]
+            # Pin/condor: modest premium decay is the whole edge. Vertical
+            # ladders (40/32/24) never fire on a settled IC (Sep16/17 held
+            # ~10% winners to HARD_EXIT). Soft rungs bank a pin print.
+            _ladder_symmetric = [
+                (dtime(12, 0),  0.12),
+                (dtime(13, 0),  0.10),
+                (dtime(14, 0),  0.08),
+            ]
 
             def _step(_ladder, _t):
                 _v = None
@@ -3087,20 +3313,33 @@ class ExecutionEngine:
                         _v = _p
                 return _v
 
-            _w_dte = dte_blend(actual_dte)
-            time_targets = []
-            for _tt in sorted({t for t, _ in _ladder_expiry} |
-                              {t for t, _ in _ladder_weekly}):
-                _pe = _step(_ladder_expiry, _tt)
-                _pw = _step(_ladder_weekly, _tt)
-                if _w_dte >= 1.0 - 1e-9:
-                    _p = _pe
-                elif _pw is None:
-                    _p = None
-                else:
-                    _p = by_dte(actual_dte, _pe if _pe is not None else _pw, _pw)
-                if _p is not None:
-                    time_targets.append((_tt, float(_p)))
+            try:
+                _s_for_ladder = str(position.get("strategy_name") or "")
+            except Exception:
+                _s_for_ladder = ""
+            if _s_for_ladder in ("IRON_CONDOR", "IRON_BUTTERFLY"):
+                time_targets = list(_ladder_symmetric)
+            elif _dte_i == 1:
+                time_targets = list(_ladder_dte1)
+            else:
+                _w_dte = dte_blend(actual_dte)
+                time_targets = []
+                for _tt in sorted({t for t, _ in _ladder_expiry} |
+                                  {t for t, _ in _ladder_weekly}):
+                    _pe = _step(_ladder_expiry, _tt)
+                    _pw = _step(_ladder_weekly, _tt)
+                    if _w_dte >= 1.0 - 1e-9:
+                        _p = _pe
+                    elif _pw is None:
+                        _p = None
+                    else:
+                        _p = by_dte(
+                            actual_dte,
+                            _pe if _pe is not None else _pw,
+                            _pw,
+                        )
+                    if _p is not None:
+                        time_targets.append((_tt, float(_p)))
 
             # ── v3.1 [F1]: the ladder was inverted by a min() ──────────
             # These are PREMIUM LEVELS the position must fall BELOW to take
@@ -3400,14 +3639,18 @@ class ExecutionEngine:
             return
 
         lots  = int(position.get("final_lots", 1) or 1)
-        chain = self.market_engine.last_chain
+        chain = self._chain_for_position(position)
+        urgent = int(priority or 0) in (1, 2, 3, 7)
 
         exit_legs_info: List[dict] = []
         exit_premium = 0.0
 
         try:
             for leg in open_legs:
-                fill = self.executor.execute_leg_exit(leg, chain, lots)
+                leg_x = dict(leg)
+                if urgent:
+                    leg_x["_urgent_exit"] = True
+                fill = self.executor.execute_leg_exit(leg_x, chain, lots)
                 exit_price = float(fill["fill_price"])
 
                 # Get quoted mid at exit for slippage analysis
@@ -3626,6 +3869,15 @@ class ExecutionEngine:
         if bool(_rp.get("afternoon_high_fade")
                 or position.get("afternoon_high_fade")):
             self.market_engine.state["_closing_afternoon_high_fade"] = True
+        # v64: same tags monitor sets on harvest paths — hard-exit / EOD
+        # closes of these tickets must still latch session_mean_reversion.
+        if bool(_rp.get("neutral_range_vertical")
+                or _rp.get("failed_break_scalp")):
+            self.market_engine.state["_closing_failed_break_scalp"] = True
+        if bool(_rp.get("stale_weekly_vertical")):
+            self.market_engine.state["_closing_stale_weekly"] = True
+        if "regime_rotation" in str(reason or ""):
+            self.market_engine.state["_closing_regime_rotation"] = True
 
         # PATCH_V45: stash strategy name for side classification in
         # _update_state_after_close (which does not receive the position).

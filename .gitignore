@@ -65,6 +65,9 @@ dist/
 # Ignore database files directly inside /data/
 # Example: data/nifty_algo_v3.db
 /data/*.db
+/data/*.py
+/data/*.txt
+/data/*.json
 /data/cache/*
 /output/*
 *.pid

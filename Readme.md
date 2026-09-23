@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v62)](#11-latest-change-logic-v62--next-level-audit-beyond-p59)
+   - [1.1 Latest change logic (v65)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,7 +40,73 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v62) — next-level audit beyond P59
+### 1.1 Latest change logic (v65) — backtest is a data pump into MainEngine
+
+**Architecture rule:** do **not** maintain a second trading loop. Replay feeds historical DB cycles into the **same** live path:
+
+```text
+HistoricalStore → SimClock.set → ReplayClient.point → MainEngine.run_one_cycle()
+```
+
+| Layer | Live | Replay |
+|---|---|---|
+| Orchestration | `MainEngine.run_one_cycle()` | **identical** (`MainEngine.for_replay`) |
+| Indicators / regime / decide / monitor / entry / exit / state / P&L | live engines | **identical** |
+| Broker I/O | UpstoxClient | `ReplayClient` (DB snapshots) |
+| Fills | PaperOrderExecutor or live | PaperOrderExecutor + `FillModel` |
+| Clock | wall `now_ist` | `SimClock` (also patches `main.now_ist`) |
+
+**Sep22 proof (live book vs MainEngine pump):**
+
+| | Entry | Exit | Lots | Exit reason | P&L ₹ |
+|---|---|---|---|---|---|
+| LIVE BCS | 10:37:54 | 11:46:38 | 5 | CLOSE_TARGET | +3,425 |
+| REPLAY BCS | 10:37:54 | 11:46:38 | 5 | CLOSE_TARGET | +3,448 |
+| LIVE LONG_PUT | 10:56:15 | 14:14:56 | 3 | CLOSE_STOP | −912 |
+| REPLAY LONG_PUT | 10:56:15 | 14:14:56 | 3 | CLOSE_STOP | −902 |
+
+Same timestamps, structures, lots, and exit reasons. Residual P&L delta is FillModel edge vs live fills — not a second decision engine.
+
+**Also in v65 (parity fixes that feed the live path):** sticky soft-lean max_pain; straddle 5-min lookback (`[-1]`); 1m forming drop + keep partial 5m ADX; `momentum_entries` only on fill; historical correlated debit allowed in replay.
+
+**v65b — momentum debit HWM (general):** Long premium no longer (a) clamps the lock to breakeven under “trend persist” nor (b) scalps modest greens with a mid-trail. Track `peak_debit_value`. Phase A after +lock_trigger: free-trade stop only. Phase B only once HWM open gain ≥ `momentum_hwm_large_frac` (default **1.0** = 2× entry — must not arm mid-trend): trail from the peak giving back only `momentum_hwm_giveback_frac` (default 0.20 → keep ~80% of peak open gain). Sep22 LONG_PUT peaked ~₹13k at 14:01; old BE clamp → −₹912; loose early trail → +₹1.3k; +80% Phase-B → +₹8.7k at 13:55 (still early); 2× HWM trail targets ~₹10k after the real peak.
+
+**v65d — replay fidelity + false morning trends:** (1) Backtest no longer force-enables `allow_correlated_debit_beside_credit` (was inventing LONG_* beside credits on days live never stacked). Hunt enables it only when the live book itself shows overlap. (2) Immature price regime: ORB breakout needs same-side VWAP (not NEUTRAL/UNKNOWN) — stops false morning UPTREND → early verticals into chop.
+
+**v65e — morning ADX preview + DTE1 lock arming + lock-hit label:** (1) Immature directional credit may underwrite on **strong** ADX preview (≥ `adx_strong_threshold`, default 40) — matches live adaptive morning prints (Sep11 BPS @10:22 adx≈46) without reopening weak-preview Sep17 chop. (2) Profit-lock **arming** on DTE1+ uses the weekly 22% bar (not the ~29% sqrt-life blend toward expiry 40%). (3) When a profit-locked stop is hit, exit is `CLOSE_TARGET` (not `CLOSE_STOP`) — Priority-3 premium-stop used to fire first and mis-label locked winners as hard stops.
+
+**Restart live on v65e** so the running process matches this code.
+
+---
+
+### 1.1b Prior (v64) — live≡BT execution parity
+
+**Why prior DB-replay patches still missed live failures:** replay ran `decide()` + `monitor_position()` but invented fills/books in `_open`/`_close`. Superseded by v65 MainEngine pump.
+
+| ID | Divergence | Fix |
+|---|---|---|
+| P64-01 | BT custom `_open`/`_close` ≠ live execute path | (v65) removed — `run_one_cycle` owns entry/exit |
+| P64-02 | Paper fills ignored FillModel / urgency | `PaperOrderExecutor(fill_model=…)` |
+| P64-03 | Exit marks on wrong expiry series | `execute_close` uses `_chain_for_position` |
+
+---
+
+### 1.1c Prior (v63) — missed entries & edge quality
+
+**Live book vs replay gap (Sep21–22 census):** IC @ adx=15/MODERATE OR → stop −₹886; then 189× `after_credit_stop` while UPTREND (BT LONG_CALL +₹3.6k missed); BCS @13:35 into UPTREND → HARD_EXIT −₹261.
+
+| ID | Goal | Fix |
+|---|---|---|
+| P63-01 | Missed debit after IC stop | Soften `after_credit_stop`: RANGE/OTHER stops skip one-way proof; let momentum gate choose side |
+| P63-02 | Missed re-entry after IC stop | Waive `no_material_change` after losing IC/RANGE stop when measured trend |
+| P63-03 | IC sits through trend | Regime-rotate underwater IC/fly on mature UPTREND/DOWNTREND (free slot) |
+| P63-04 | Bad late credit | Counter-trend: mature UPTREND beats day-structure exemption for BCS |
+
+Does not re-open correlated debit (v62).
+
+---
+
+### 1.1c Prior (v62) — next-level audit beyond P59
 
 **New failure chains (not in P59-01…16) closed here; open P59 items addressed:**
 
@@ -1019,42 +1085,27 @@ Total Margin = Margin per Lot × Lots ≤ Capital × 0.80
 
 ### 15. Event-Driven Backtest Engine CLI & Replay Architecture
 
-`backtest_engine.py` provides a deterministic, tick/1-minute event-driven historical replay harness that runs the identical `StrategyEngine`, `RegimeEngine`, and `MarketDataEngine` instances as live trading.
+`backtest_engine.py` is a **data pump**, not a second trading engine (v65).
 
-#### 1. Harness Simulation Architecture:
+#### 1. Harness edges only:
 
-- **`SimClock`**: Stand-in for `core.now_ist()` and `core.today_ist()`. Injects simulated naive datetimes into `core`, `data_engine`, `regime_engine`, `strategy_engine`, `execution_engine`, and `calibration_engine` namespaces.
-- **`HistoricalStore` & `MultiStore`**: Read-only SQLite interfaces. `MultiStore` routes across multi-day splits (`nifty_algo_YYYY-MM-DD.db`), allowing rolling Sharpe, Sortino, and multi-session maximum drawdown calculations.
-- **`DaySlice`**: Ingests 1-minute OHLCV bars and multi-expiry chain snapshots (`by_time_exp`), preventing chain collision across Tuesday weekly and far-dated series.
-- **`ReplayClient`**: Intercepts all broker API requests (`get_ltp`, order placement), feeding stored snapshots to `MarketDataEngine` while raising fatal exceptions if broker endpoints are reached.
-- **`FillModel`**: Two-sided spread-aware execution simulation:
-  ```text
+- **`SimClock`**: Patches `now_ist` / `today_ist` on `core`, **`main`**, and all engine modules; no-ops `sleep`.
+- **`ReplayClient`**: Serves recorded LTP / candles / option chain; broker place/cancel raises.
+- **`FillModel` + paper executor**: Only simulated edge (bid/ask).
+- **`MainEngine.for_replay(...)`**: Same `run_one_cycle()` as live (scratch DB, paper mode, Telegram stub).
 
-  ```
-
-Price_SELL = bid + (mid - bid) · (edge) / (0.5)
-
-```
-  ```text
-Price_BUY = ask - (ask - mid) · (edge) / (0.5)
-```
-
-  On urgent exits (priority stops 1, 2, 3, 7), edge ≤ftarrow edge · stress_mult (default 0.25 × 0.50 = 0.125).
-
-#### 2. Replay Cycle Lifecycle (`run_day`):
+#### 2. Replay cycle (`run_day`):
 
 For each recorded snapshot in `day.cycles`:
 
 1. `SimClock.set(capture_dt)`
 2. `ReplayClient.point(day, capture_time)`
-3. `MarketDataEngine.run_cycle()` → Updates indicators, rolling VWAP, and ATM straddles.
-4. `BacktestRunner._classify()` → Calls `regime.process_signals()` and merges regime snapshot.
-5. Exit Evaluation on Active Position:
-   - Evaluates Hard Exits (`_hard_exit_of`), Profit Targets, Dynamic Trail Stops, Proximity Triggers, and Delta Breaches on the **position's original expiry chain** (preventing false Tuesday 0DTE pricing).
-   - If exit triggers: Executes `_close()`, logs `Trade`, records rupee P&L, commissions, slippage, and marks cooldowns.
-6. Entry Evaluation (`StrategyEngine.decide`):
-   - If flat: Calls `se.decide(signals)`. If `action == "ENTER"`, executes `_open()`, deducting statutory fees and slippage.
-7. Logs rejection bucket to `res.reason_log` for the sequential entry funnel.
+3. **`MainEngine.run_one_cycle()`** — live monitor / hard-exit / decide / `process_entry_decision` / P&L
+4. Harvest CLOSED rows from the scratch book into `Results`
+
+No parallel `decide()` / `monitor_position()` / `entry_possible` reimplementation.
+
+#### 3. CLI (unchanged):
 
 #### 3. CLI Command Line Reference:
 
