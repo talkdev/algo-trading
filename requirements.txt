@@ -13,3 +13,8 @@ urllib3
 # Telegram bot controller
 python-telegram-bot
 psutil
+
+# Google Drive backup (split_db_per_day.py post-split upload)
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
