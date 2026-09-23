@@ -75,6 +75,45 @@ if not BOT_TOKEN or not ALLOWED_USER_ID:
 def is_authorized(update: Update) -> bool:
     return update.effective_user.id == ALLOWED_USER_ID
 
+
+def _is_bot_controller_process(proc: psutil.Process) -> bool:
+    """True if this process is running bot_controller.py (not main.py / others)."""
+    try:
+        cmdline = proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    if not cmdline:
+        return False
+    joined = " ".join(cmdline).lower().replace("/", "\\")
+    return "bot_controller.py" in joined
+
+
+def kill_other_bot_controller_instances() -> list[int]:
+    """
+    Kill every other running bot_controller.py so only this process remains.
+    Used when Task Scheduler (or a manual relaunch) leaves duplicates polling Telegram.
+    """
+    me = os.getpid()
+    killed: list[int] = []
+    for proc in psutil.process_iter(["pid"]):
+        pid = proc.info["pid"]
+        if pid == me:
+            continue
+        if not _is_bot_controller_process(proc):
+            continue
+        try:
+            print(f"Killing duplicate bot_controller.py PID {pid}")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                proc.kill()
+            killed.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            print(f"Could not kill PID {pid}: {exc}")
+    return killed
+
+
 def get_active_process():
     """Checks if the script process recorded in algo.pid is still running."""
     if not os.path.exists(PID_FILE):
@@ -400,4 +439,9 @@ def main():
 
 
 if __name__ == "__main__":
+    killed = kill_other_bot_controller_instances()
+    if killed:
+        print(f"Removed {len(killed)} duplicate bot_controller instance(s): {killed}")
+        # Brief pause so Telegram getUpdates lock from the old process can clear
+        time.sleep(2)
     main()
