@@ -686,6 +686,33 @@ class StrategyEngine:
                             str(state.get("last_exit_reason") or "").startswith("CLOSE_STOP")
                             or _pri_x in (1, 2, 3)
                         )
+                        # v63: after IC/RANGE losing stop, a measured trend
+                        # IS the material change (spot may still be near the
+                        # stop print). Waive so the correct vertical/debit
+                        # can fire (21-Sep missed LONG_CALL while waiting
+                        # for 28pts after IC stop into UPTREND).
+                        _after_sym_stop_trend = False
+                        try:
+                            _side_x = str(state.get("last_exit_strategy_side") or "")
+                            _pnl_x = float(state.get("last_exit_pnl_rs") or 0.0)
+                            _pr_x = str(signals.get("price_regime") or "")
+                            _adx_x = float(signals.get("adx_15") or 0.0)
+                            _after_sym_stop_trend = (
+                                _after_stop
+                                and _pnl_x < 0.0
+                                and _side_x in ("RANGE", "OTHER", "")
+                                and bool(signals.get("adx_15_mature", False))
+                                and _adx_x >= float(
+                                    getattr(self.config, "adx_trend_threshold", 20.0)
+                                    or 20.0
+                                )
+                                and _pr_x in (
+                                    "UPTREND", "STRONG_UPTREND",
+                                    "DOWNTREND", "STRONG_DOWNTREND",
+                                )
+                            )
+                        except Exception:
+                            _after_sym_stop_trend = False
                         try:
                             _sr, _sloc, _, _ = self._session_range_pos(signals)
                             _hi = bool(signals.get("afternoon_high_fade"))
@@ -712,7 +739,8 @@ class StrategyEngine:
                                 or _opp_pm_ok
                                 or _same_side_extreme
                                 or _opp_rotation
-                                or _pin_failed_to_dir):
+                                or _pin_failed_to_dir
+                                or _after_sym_stop_trend):
                             return "NO_TRADE", (
                                 f"no_material_change_since_exit_{_moved:.0f}pts_"
                                 f"lt_{_need:.0f}pts_needed"
@@ -760,23 +788,15 @@ class StrategyEngine:
 
 
         if signals.get("straddle_expanding"):
-            # v55: ATM-straddle can jump 6%+ in 5 minutes when spot rolls
-            # the ATM strike on a dump/rally without a true IV expansion
-            # (live 22-Sep 10:31: straddle 86→94 while iv_change still
-            # −4% and iv_behavior=DECLINING). Only stand aside when IV
-            # itself confirms the expansion.
-            _ivb_se = str(signals.get("iv_behavior") or "")
-            try:
-                _ivchg_se = float(
-                    signals.get("iv_change_pct_from_open") or 0.0
-                )
-            except (TypeError, ValueError):
-                _ivchg_se = 0.0
-            if (
-                _ivb_se in ("EXPANDING", "SPIKING")
-                or _ivchg_se > 0.0
-            ):
-                return "NO_TRADE", "straddle_expanding_no_sell_into_rising_iv"
+            # Hard sell stand-aside while ATM straddle is up >6% vs the
+            # ~5-min-ago reference (data_engine uses most-recent sample
+            # ≥270s old). Paired with the hist fix: expand clears once the
+            # lookback reaches the post-spike plateau, matching Sep22 live
+            # entry @10:37:54. Do not IV-qualify here — live morning blocks
+            # fired with DECLINING IV on ATM roll; soft-lean sticky max_pain
+            # covers residual Intent races. Momentum has its own ADX
+            # continuation exemption.
+            return "NO_TRADE", "straddle_expanding_no_sell_into_rising_iv"
 
         if not signals.get("or_computed"):
             return "NO_TRADE", "opening_range_not_yet_computed"
@@ -1445,9 +1465,26 @@ class StrategyEngine:
             # sell the side of the book the day's structure contradicts.
             _ds_ok, _ds_why = self._day_structure_bearish(signals)
             if _ds_ok and not signals.get("afternoon_low_fade"):
-                return "NO_TRADE", (
-                    f"day_structure_contradicts_bull_premium:{_ds_why}"
+                # Strong measured uptrend overrides an unfilled gap-down
+                # structure veto. Without this, a real morning trend is
+                # blocked while weaker substitutes fill the book (Sep11:
+                # live BPS adx~46 worked; replay gap veto → flat / bad debit).
+                try:
+                    _adx_ds = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_ds = 0.0
+                _strong_ds = float(
+                    getattr(self.config, "adx_strong_threshold", 40.0) or 40.0
                 )
+                _px_ds = str(signals.get("price_regime") or "")
+                _trend_overrides = (
+                    _px_ds in ("UPTREND", "STRONG_UPTREND")
+                    and _adx_ds >= _strong_ds
+                )
+                if not _trend_overrides:
+                    return "NO_TRADE", (
+                        f"day_structure_contradicts_bull_premium:{_ds_why}"
+                    )
             if not signals.get("afternoon_low_fade"):
                 _tw_rng, _tw_loc, _, _ = self._session_range_pos(signals)
                 # Wait for the extreme only on a CONFIRMED two-way auction.
@@ -1469,6 +1506,27 @@ class StrategyEngine:
             return BULL_PUT_SPREAD, reason
 
         if final_regime == "PREMIUM_SELL_BEAR":
+            # Never sell calls into a measured uptrend unless a confirmed
+            # two-way high fade owns the tape. Live Sep21 BCS @13:35 with
+            # price=UPTREND adx=23 / conf=MEDIUM held to HARD_EXIT (−₹261).
+            _px_b = str(signals.get("price_regime") or "")
+            _fade_hi = bool(signals.get("afternoon_high_fade"))
+            _tw_b = bool(signals.get("two_way_auction"))
+            try:
+                _adx_b = float(adx_15 or 0.0)
+            except (TypeError, ValueError):
+                _adx_b = 0.0
+            _mature_up = (
+                _px_b in ("UPTREND", "STRONG_UPTREND")
+                and bool(adx_15_mature)
+                and _adx_b >= float(
+                    getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+                )
+            )
+            if _mature_up and not (_fade_hi and _tw_b):
+                return "NO_TRADE", (
+                    f"no_calls_into_measured_uptrend_{_px_b}_adx_{_adx_b:.0f}"
+                )
             # PATCH_V31: never sell calls at the day low on a two-way tape
             # (10-Sep printed RANGE_BEARISH_SPOT_BELOW_OR_MID at loc≤0.10).
             if not signals.get("afternoon_high_fade"):
@@ -1671,14 +1729,16 @@ class StrategyEngine:
         if side is None:
             if strategy_name == BEAR_CALL_SPREAD and any(
                 k in _sel for k in (
-                    "soft_lean", "range_location_lean", "day_structure",
+                    "soft_lean", "soft_location", "range_location_lean",
+                    "range_soft_location_lean", "day_structure",
                     "high_fade", "bearish",
                 )
             ):
                 side = "BEAR"
             elif strategy_name == BULL_PUT_SPREAD and any(
                 k in _sel for k in (
-                    "soft_lean", "range_location_lean", "day_structure",
+                    "soft_lean", "soft_location", "range_location_lean",
+                    "range_soft_location_lean", "day_structure",
                     "low_fade", "bullish",
                 )
             ):
@@ -1776,9 +1836,20 @@ class StrategyEngine:
         Mature ADX is ideal; until it prints, professional books still sell
         the away side of a grind when independent tape reads agree. Side is
         'BULL' (sell puts / upper loc) or 'BEAR' (sell calls / lower loc).
+
+        v64: INSUFFICIENT_DATA / empty EMA is not evidence — RANGE+vwap
+        alone previously returned True during warmup and soft-leaned into
+        adx=0 entries that live cycle_log never took.
         """
         price = str(signals.get("price_regime") or "")
         ema = str(signals.get("ema_structure") or "")
+        if ema in ("", "INSUFFICIENT_DATA"):
+            # No MTF structure yet: only a clear price-regime trend counts.
+            if side == "BULL":
+                return price in ("UPTREND", "STRONG_UPTREND")
+            if side == "BEAR":
+                return price in ("DOWNTREND", "STRONG_DOWNTREND")
+            return False
         try:
             vd = float(signals.get("vwap_dist_pct") or 0.0)
         except (TypeError, ValueError):
@@ -1864,16 +1935,18 @@ class StrategyEngine:
                     )
                     return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
             else:
+                # Immature ADX: soft-lean the away side when location is a
+                # true extreme OR when warmup (no EMA yet) treats mature lean
+                # thresholds as location evidence — same rule live used on
+                # 2026-09-22 (BCS @10:37 loc=0.08, selection_reason
+                # range_soft_location_lean_0.08:warmup, 5 lots).
+                #
+                # v64 removed this and replay stayed flat
+                # (range_wait_no_pin_no_lean) while live booked +₹3.4k.
+                # Soft EMA/VWAP evidence still required for NON-extreme
+                # soft-band leans; extremes and warmup threshold leans do not.
                 _ext_hi = _loc >= 0.70
                 _ext_lo = _loc <= 0.30
-                # v55: until 5-min EMA/ADX can print (~10:55), soft evidence
-                # is structurally unavailable (ema=INSUFFICIENT_DATA, adx=0).
-                # Live 22-Sep 0DTE: loc=0.62 in a real 60pt range sat in
-                # range_wait_no_pin_no_lean for the first half of the
-                # 10:30–13:00 window because 0.58 still demanded EMA/VWAP.
-                # During that warm-up, mature lean thresholds (0.62/0.38)
-                # ARE location evidence — same spirit as the 0.70 extreme
-                # override, keyed on indicator readiness not on DTE.
                 _warmup = (
                     str(signals.get("ema_structure") or "")
                     == "INSUFFICIENT_DATA"
@@ -1882,7 +1955,8 @@ class StrategyEngine:
                     _ext_hi = _ext_hi or (_loc >= self.RANGE_LEAN_HI)
                     _ext_lo = _ext_lo or (_loc <= self.RANGE_LEAN_LO)
                 if (_loc >= self.RANGE_SOFT_LEAN_HI
-                        and (_ext_hi or self._soft_location_evidence(signals, "BULL"))):
+                        and (_ext_hi or self._soft_location_evidence(
+                            signals, "BULL"))):
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BULL_PUT_SPREAD"
@@ -1893,7 +1967,8 @@ class StrategyEngine:
                         f"{':warmup' if _warmup and _loc >= self.RANGE_LEAN_HI else ''}"
                     )
                 if (_loc <= self.RANGE_SOFT_LEAN_LO
-                        and (_ext_lo or self._soft_location_evidence(signals, "BEAR"))):
+                        and (_ext_lo or self._soft_location_evidence(
+                            signals, "BEAR"))):
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BEAR_CALL_SPREAD"
@@ -2089,15 +2164,36 @@ class StrategyEngine:
             return None
         # Direct price-regime veto (same at every DTE): never sell the
         # threatened side of a labelled trend unless two-way confirmed.
+        # v63: day-structure bearish may allow a morning BCS into a bounce,
+        # but a *mature* UPTREND is measured tape — never sell calls into it
+        # (live 21-Sep BCS @13:35 into UPTREND adx=23 → HARD_EXIT −₹261).
         _px = str(signals.get("price_regime") or "")
         _tw = bool(signals.get("two_way_auction"))
         if not _tw:
-            if (strategy_name == BEAR_CALL_SPREAD
-                    and _px in ("UPTREND", "STRONG_UPTREND")
-                    and not self._day_structure_bearish(signals)[0]):
+            try:
+                _adx_ct = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_ct = 0.0
+            _mature_trend = (
+                bool(signals.get("adx_15_mature", False))
+                and _adx_ct >= float(
+                    getattr(cfg, "adx_trend_threshold", 20.0) or 20.0
+                )
+            )
+            _ds_bear = False
+            try:
+                _ds_bear = bool(self._day_structure_bearish(signals)[0])
+            except Exception:
+                _ds_bear = False
+            if (
+                strategy_name == BEAR_CALL_SPREAD
+                and _px in ("UPTREND", "STRONG_UPTREND")
+                and (not _ds_bear or _mature_trend)
+            ):
                 return (
                     f"counter_trend_entry_blocked:{strategy_name}:"
                     f"price_regime_{_px}"
+                    f"{':mature_uptrend' if _mature_trend else ''}"
                 )
             if (strategy_name == BULL_PUT_SPREAD
                     and _px in ("DOWNTREND", "STRONG_DOWNTREND")):
@@ -2396,39 +2492,62 @@ class StrategyEngine:
             _px_regime = signals.get("price_regime", "")
             if signals.get("afternoon_high_fade"):
                 return True, "entry_rules_passed"
-            # v56/v59: away-side intent OR Decision Intent owns BCS rules.
-            if (
+            # v65: do NOT blanket-pass all BCS rules on away-side intent.
+            # That waived max_pain and let replay enter at 10:31 while live
+            # cycle_log still refused (bear_call_spot_within_25pts_of_max_pain).
+            # or_mid may still be waived; max_pain uses Intent + soft sticky.
+            _skip_or_mid = (
                 self._away_side_intent(signals) == "BEAR"
                 or self._intent_exempt(signals, "or_mid")
-                or self._intent_exempt(signals, "max_pain")
-            ):
-                return True, "entry_rules_passed"
+            )
             if (_px_regime in ("DOWNTREND", "STRONG_DOWNTREND")
-                    and or_high > 0 and or_low > 0):
+                    and or_high > 0 and or_low > 0
+                    and not _skip_or_mid):
                 or_mid    = (or_high + or_low) / 2.0
                 or_buffer = by_dte(dte if dte is not None else 2, 30.0, 15.0)
-                if spot > or_mid + or_buffer and not self._intent_exempt(
-                    signals, "or_mid"
-                ):
+                if spot > or_mid + or_buffer:
                     return False, (
                         f"bear_call_spot_{spot:.0f}_above_or_mid_{or_mid:.0f}"
                         f"_by_{spot - or_mid:.0f}pts"
                     )
             max_pain = float(signals.get("max_pain") or 0)
-            # PATCH_V12 (round 2): pin risk is a range-tape
-            # phenomenon. A tape printing a confirmed downtrend is
-            # TRENDING THROUGH max pain, not pinning to it (measured
-            # 2026-09-15: STRONG_DOWNTREND, mature ADX 33, spot
-            # falling through 23350 — the veto blocked the
-            # trend-side vertical for 20 minutes mid-trend).
             _mp_px = signals.get("price_regime", "")
             _mp_trend_through = _mp_px in ("DOWNTREND", "STRONG_DOWNTREND")
+            _mp_gap = abs(spot - max_pain) if max_pain > 0 else 0.0
+            _exempt = self._intent_exempt(signals, "max_pain")
+            # Soft/warmup leans: Intent may waive max_pain only after spot
+            # has moved ≥10pts since the last max_pain refuse (live Sep22:
+            # refuse @10:31 spot 23426, enter @10:37 spot 23413).
+            _sel = str(
+                (signals.get("_intent") or {}).get("selection_reason") or ""
+            ).lower()
+            _soft = (
+                "soft_location" in _sel
+                or "soft_lean" in _sel
+                or ":warmup" in _sel
+            )
+            if _exempt and _soft:
+                # Soft/warmup Intent never auto-waives on first max_pain hit —
+                # require a prior refuse latch + ≥10pt spot move (live Sep22:
+                # latch @10:31 spot 23426, enter @10:37 spot 23413).
+                try:
+                    _last = float(
+                        self.market_engine.state.get("_max_pain_block_spot") or 0
+                    )
+                except (TypeError, ValueError):
+                    _last = 0.0
+                if _last <= 0 or abs(float(spot) - _last) < 10.0:
+                    _exempt = False
             if (
                 max_pain > 0
-                and abs(spot - max_pain) < 25
+                and _mp_gap < 25
                 and not _mp_trend_through
-                and not self._intent_exempt(signals, "max_pain")
+                and not _exempt
             ):
+                try:
+                    self.market_engine.state["_max_pain_block_spot"] = float(spot)
+                except Exception:
+                    pass
                 return False, (
                     f"bear_call_spot_within_25pts_of_max_pain_{max_pain:.0f}"
                 )
@@ -4286,10 +4405,11 @@ class StrategyEngine:
         _vref  = float(getattr(self.config, "credit_ratio_vix_ref", 13.5))
         _vs    = min(max(_vix_l / max(_vref, 1.0), 0.75), 1.15)
         min_ratio = by_dte(actual_dte, _lx0 * _vs, 0.12)
-        # With-trend vertical: edge is the drift, not VRP richness. The
-        # expiry-morning 0.16 bar exists to reject cheap quiet-session
-        # gamma shorts; it must not veto the crash-side or grind-side
-        # credit the tape is actually offering. Same at every DTE.
+        # Location / trend credit: edge is the tape lean, not VRP richness.
+        # The expiry-morning 0.16 bar rejects cheap quiet-session gamma
+        # shorts; it must not veto away-side soft leans (Sep22 live BCS
+        # @10:37 range_soft_location_lean_0.08) or with-trend verticals.
+        # Same relief at every DTE.
         _cr_px = str(signals.get("price_regime") or "")
         _with_trend_credit = (
             (strategy_name == BEAR_CALL_SPREAD
@@ -4297,7 +4417,16 @@ class StrategyEngine:
             or (strategy_name == BULL_PUT_SPREAD
                 and _cr_px in ("UPTREND", "STRONG_UPTREND"))
         )
-        if _with_trend_credit:
+        _away = None
+        try:
+            _away = self._away_side_intent(signals)
+        except Exception:
+            _away = None
+        _away_side_credit = (
+            (strategy_name == BEAR_CALL_SPREAD and _away == "BEAR")
+            or (strategy_name == BULL_PUT_SPREAD and _away == "BULL")
+        )
+        if _with_trend_credit or _away_side_credit:
             min_ratio = min(min_ratio, float(
                 getattr(self.config, "credit_risk_ratio_dte0_late", 0.10)
                 or 0.10
@@ -5037,6 +5166,12 @@ class StrategyEngine:
         except (TypeError, ValueError):
             adx = 0.0
 
+        # Debit expression needs an honest Wilder. Immature preview ADX is
+        # for credit directional confirmation only — using it to buy premium
+        # minted early losers (Sep17 LONG_CALL −₹6.8k class).
+        if not bool(signals.get("adx_15_mature", False)):
+            return False, "momentum_adx_immature", 0
+
         if str(signals.get("confidence_level") or "") not in ("HIGH", "MEDIUM"):
             # Live 2026-09-15: 647 IV-EXPANDING/SPIKING cycles were through
             # the OR on a DOWNTREND with ADX≈98 but confidence stuck at LOW
@@ -5066,6 +5201,20 @@ class StrategyEngine:
                 and adx >= 40.0
             ):
                 return False, "momentum_event_day_needs_high_confidence", 0
+        # Event-day long premium: require a stronger ADX than the normal
+        # debit bar so a marginal print cannot replace a blocked credit
+        # book (Sep11 CPI: LONG_CALL at ADX=24 → −₹912).
+        if signals.get("event_day"):
+            _ev_m_adx = float(getattr(cfg, "momentum_event_adx_min", 32.0))
+            if adx < _ev_m_adx:
+                _br_e2 = str(block_reason or "").lower()
+                if not (
+                    (("iv_expand" in _br_e2) or ("iv_spik" in _br_e2))
+                    and adx >= 40.0
+                ):
+                    return False, (
+                        f"momentum_event_adx_{adx:.0f}_below_{_ev_m_adx:.0f}"
+                    ), 0
 
         # PATCH_V13: the closing hour pays premium out of a session that is
         # nearly over, so it demands a MEASURED-STRONG trend - the same bar
@@ -5761,37 +5910,57 @@ class StrategyEngine:
                     "momentum_skipped_two_way_auction"
                 )
                 return None
-        # PATCH_V30 / v54: after a protective *losing* stop on a credit
+        # PATCH_V30 / v54 / v63: after a protective *losing* stop on a credit
         # vertical, do not chase into chop (17-Sep proximity stop → LONG_CALL).
         # But on a measured one-way tape the stop IS the trend telling you
         # which debit to buy (live 21-Sep: IC CLOSE_STOP → 189 cycles of
         # momentum_skipped_after_credit_stop while UPTREND continued).
+        # v63: IC/RANGE/OTHER stops must not require one_way proof first —
+        # the symmetric structure has no "continuation side"; let the gate
+        # pick direction. Vertical (BULL/BEAR) stops still need one_way.
         try:
             _pri = int(_st.get("last_exit_priority") or 0)
         except (TypeError, ValueError):
             _pri = 0
         _after_credit_cont = False
         if _pri in (1, 2, 3) and float(_st.get("last_exit_pnl_rs") or 0.0) < 0.0:
-            try:
-                _adx_c = float(signals.get("adx_15") or 0.0)
-            except (TypeError, ValueError):
-                _adx_c = 0.0
-            _pr_c = str(signals.get("price_regime") or "")
-            _one_way_c = (
-                not bool(signals.get("two_way_auction"))
-                and not self._after_two_way_extreme_scalp()
-                and not bool(signals.get("choppy_detected"))
-                and _adx_c >= float(
-                    getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
-                )
-                and _pr_c in ("UPTREND", "DOWNTREND")
-            )
-            if not _one_way_c:
+            _last_side_pre = str(_st.get("last_exit_strategy_side") or "")
+            _sym_stop = _last_side_pre in ("RANGE", "OTHER", "")
+            if bool(signals.get("choppy_detected")) and not _sym_stop:
                 signals["_momentum_refuse_reason"] = (
                     "momentum_skipped_after_credit_stop"
                 )
                 return None
-            _after_credit_cont = True
+            if _sym_stop:
+                # Condor/fly stop into a developing trend: only stand down
+                # on chop; otherwise let _momentum_gate choose the side.
+                if bool(signals.get("choppy_detected")):
+                    signals["_momentum_refuse_reason"] = (
+                        "momentum_skipped_after_credit_stop_choppy"
+                    )
+                    return None
+                _after_credit_cont = False
+            else:
+                try:
+                    _adx_c = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_c = 0.0
+                _pr_c = str(signals.get("price_regime") or "")
+                _one_way_c = (
+                    not bool(signals.get("two_way_auction"))
+                    and not self._after_two_way_extreme_scalp()
+                    and not bool(signals.get("choppy_detected"))
+                    and _adx_c >= float(
+                        getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
+                    )
+                    and _pr_c in ("UPTREND", "DOWNTREND")
+                )
+                if not _one_way_c:
+                    signals["_momentum_refuse_reason"] = (
+                        "momentum_skipped_after_credit_stop"
+                    )
+                    return None
+                _after_credit_cont = True
         try:
             ok, why, direction = self._momentum_gate(signals, block_reason)
         except Exception as exc:                      # never lose the day to
@@ -5893,8 +6062,9 @@ class StrategyEngine:
         self.market_engine.finalize_cycle_log(
             f"STRATEGY_SELECTED:{strat_name}", None, self._count_open_positions()
         )
-        state = self.market_engine.state
-        state["momentum_entries"] = int(state.get("momentum_entries", 0) or 0) + 1
+        # Do NOT bump momentum_entries here — decide() can fire every cycle
+        # without a fill (parity, validate NO_GO, rejected order). Cap is
+        # enforced from the positions ledger + increment in execute_entry.
         return {
             "action":        "ENTER",
             "strategy_name": strat_name,

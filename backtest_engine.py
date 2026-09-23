@@ -1,65 +1,40 @@
 #!/usr/bin/env python3
 # ============================================================================
 #  backtest_engine.py
-#  Event-driven replay simulator for the NIFTY intraday options engine
+#  DB replay driver for the NIFTY intraday options engine
 # ============================================================================
 #
-#  WHY THIS EXISTS
-#  ---------------
-#  The repository already contains backtest.py, but that is a REPORTER: it
-#  reads trades that were actually executed and summarises them. It cannot
-#  answer "what would this change have done", because it has no counterfactual
-#  price path — the trades in the table are the only trades it knows about.
+#  ARCHITECTURE (v65)
+#  ------------------
+#  Backtest is a **data pump into the live engine**, not a parallel trading
+#  engine. For every historical cycle timestamp:
 #
-#  That gap is why every audit of this engine ends in an argument rather than a
-#  measurement. Thresholds get changed on the strength of reasoning, and the
-#  next audit produces different reasoning. Nothing converges, because nothing
-#  is ever scored.
+#      HistoricalStore → SimClock.set → ReplayClient.point
+#          → MainEngine.run_one_cycle()     # identical live path
 #
-#  This file closes the gap. It replays the option_chain_snapshot and
-#  intraday_candles tables the live engine has already been writing on every
-#  cycle, drives the REAL decision code with them, simulates fills from the
-#  recorded bid/ask, and reports what actually happened.
+#  REAL — executed, not reimplemented:
+#     MainEngine.run_one_cycle() and everything it calls:
+#       MarketDataEngine, RegimeEngine, StrategyEngine.decide,
+#       ExecutionEngine.monitor / entry / exit / state / P&L
 #
-#  WHAT IS REAL AND WHAT IS SIMULATED
-#  ----------------------------------
-#  REAL — imported and executed, not reimplemented:
-#     MarketDataEngine.run_cycle()      signal construction, every indicator
-#     RegimeClassifier / regime engine  regime + confidence + sizing multiplier
-#     StrategyEngine.decide()           gates, strike selection, EV, sizing
-#     ExecutionEngine.monitor_position()the full 7-priority exit ladder
-#     StrategyEngine._compute_costs()   brokerage, STT, exchange, GST, stamp
-#  If you change any of those, the backtest changes with them. That is the
-#  entire point: it measures the engine, not a model of the engine.
+#  SIMULATED — only the unavoidable edges:
+#     * Broker fills → PaperOrderExecutor + FillModel (bid/ask edge)
+#     * Wall-clock   → SimClock (now_ist / today_ist) + sleep no-op
 #
-#  SIMULATED — and therefore assumptions you can and should argue with:
-#     * FILLS. A limit order is assumed to fill at a configurable point
-#       between the touch and the mid (--fill-edge), inside the recorded
-#       bid/ask of that snapshot. Real fills depend on queue position and
-#       on size; this does not model either.
-#     * EXIT URGENCY. Stop-driven exits pay a wider crossing than target
-#       exits (--stress-exit), because they do in life.
-#     * NO PARTIAL FILLS, NO REJECTIONS, NO LATENCY. Every order is assumed
-#       to fill completely at the snapshot price. Real execution loses money
-#       here that this harness will not show you.
-#     * SNAPSHOT GRANULARITY. The engine is only as fast as the recorded
-#       cadence. If snapshots are 45 seconds apart, so is the simulated
-#       monitoring loop, and intra-snapshot excursions are invisible. A stop
-#       that would have been hit and recovered between two snapshots is
-#       never seen. This biases results OPTIMISTIC.
+#  Do NOT add a second decide/monitor/entry_possible loop here. If replay
+#  diverges from live, fix the live path or the I/O adapters above.
+#
+#  Caveats that remain (honest about optimism):
+#     * No partial fills / rejects / latency — every paper order fills.
+#     * Snapshot cadence bounds the monitoring loop (intra-snapshot invisible).
 #
 #  READ THIS BEFORE BELIEVING ANY NUMBER IT PRINTS
 #  -----------------------------------------------
 #  1. A backtest over the same data used to choose the thresholds is not
-#     evidence. It is a restatement of the choice. Hold out dates, or fit on
-#     one period and measure on another. The tool prints a warning whenever
-#     the sample is too small for the distinction to matter.
+#     evidence. Hold out dates, or fit on one period and measure on another.
 #  2. Snapshot data only exists for sessions the engine was actually running.
-#     Run --audit first; it will tell you exactly what you have.
-#  3. The most valuable output here is NOT the P&L. It is the REJECTION
-#     CENSUS: which gate blocked entry, how often, and with what margin. That
-#     is what tells you whether the engine is mis-calibrated or the market
-#     simply was not offering the trade.
+#     Run --audit first.
+#  3. The rejection census is as important as P&L.
 #
 #  USAGE
 #  -----
@@ -68,6 +43,8 @@
 #         skipping weekends and nse_holidays.json. One child process per day,
 #         all days in parallel. Console output is ONLY the per-day trade
 #         report blocks plus the daily-profit summary table.
+#         If config.db_path is empty/corrupt, auto-falls back to data/per_day/.
+#     python backtest_engine.py --db data/per_day
 #     python backtest_engine.py --audit
 #     python backtest_engine.py --from 2026-09-08 --to 2026-09-11
 #     python backtest_engine.py --from 2026-08-01 --to 2026-09-05 \
@@ -141,7 +118,7 @@ class SimClock:
     """
 
     MODULES = (
-        "core", "data_engine", "regime_engine", "strategy_engine",
+        "core", "main", "data_engine", "regime_engine", "strategy_engine",
         "execution_engine", "calibration_engine",
     )
 
@@ -171,6 +148,31 @@ class SimClock:
                 if hasattr(mod, attr):
                     self._installed.append((mod, attr, getattr(mod, attr)))
                     setattr(mod, attr, fn)
+        # Wall-clock waits are meaningless under replay; paper fills are
+        # instantaneous. No-op sleep so live _await_fill paths cannot stall.
+        import time as _time_mod
+        if not any(m is _time_mod and a == "sleep" for m, a, _ in self._installed):
+            self._installed.append((_time_mod, "sleep", _time_mod.sleep))
+            setattr(_time_mod, "sleep", lambda _s=0: None)
+        # main.py binds time_module.sleep at import — patch that too.
+        try:
+            import main as _main_mod
+            if hasattr(_main_mod, "time_module"):
+                tm = _main_mod.time_module
+                if not any(m is tm and a == "sleep" for m, a, _ in self._installed):
+                    self._installed.append((tm, "sleep", tm.sleep))
+                    setattr(tm, "sleep", lambda _s=0: None)
+        except Exception:
+            pass
+        try:
+            import execution_engine as _xe_mod
+            if hasattr(_xe_mod, "time_module"):
+                tm = _xe_mod.time_module
+                if not any(m is tm and a == "sleep" for m, a, _ in self._installed):
+                    self._installed.append((tm, "sleep", tm.sleep))
+                    setattr(tm, "sleep", lambda _s=0: None)
+        except Exception:
+            pass
 
     def uninstall(self) -> None:
         for mod, attr, original in reversed(self._installed):
@@ -1032,10 +1034,16 @@ class BacktestRunner:
 
     # -- engine wiring ----------------------------------------------------
     def _build(self):
-        import data_engine, regime_engine, strategy_engine, execution_engine
-        import calibration_engine
+        """Wire SimClock + ReplayClient into the LIVE MainEngine.
 
-        self.clock.install()
+        Backtest is a data pump: historical snapshots drive
+        ``MainEngine.run_one_cycle()`` — the same orchestration live uses.
+        No parallel decide/monitor/entry_possible loop.
+        """
+        from dataclasses import replace as _dc_replace
+        import main as main_mod  # must be in sys.modules before install
+
+        self.clock.install()  # patches core + main.now_ist + engines
 
         fd, self._scratch = tempfile.mkstemp(prefix="bt_", suffix=".db")
         os.close(fd)
@@ -1046,38 +1054,42 @@ class BacktestRunner:
         logger.setLevel(logging.ERROR if not self.verbose else logging.INFO)
         logger.propagate = False
 
+        cfg = self.config
+        # Respect caller's correlated-debit flag. Forcing True invented
+        # second-slot LONG_* beside credits on days live never stacked them
+        # (Sep11 BPS + LONG_CALL). Opt-in only via config / hunt when the
+        # live book itself shows an overlapping credit+debit.
+        cfg = _dc_replace(cfg, paper_trade_mode=True)
+        self.config = cfg
+
         client = ReplayClient(self.clock)
-        rl = RateLimiter(self.config.rate_limits)
-
-        me = data_engine.MarketDataEngine(self.config, db, client, rl, logger)
-        ce = calibration_engine.CalibrationEngine(db, self.config, logger)
-        se = strategy_engine.StrategyEngine(self.config, db, me, ce, logger)
-        xe = execution_engine.ExecutionEngine(
-            self.config, db, me, ce, client, logger
+        engine = main_mod.MainEngine.for_replay(
+            config=cfg,
+            db=db,
+            client=client,
+            fill_model=self.fills,
+            logger=logger,
+            trade_report_source="BACKTEST",
         )
-        rg = regime_engine.RegimeEngine(self.config, db, me, logger)
+        if self.trade_report_mode is not None:
+            engine.trade_reporter.set_mode(self.trade_report_mode)
 
-        # The engine narrates every cycle to stdout: a 40-line dashboard from
-        # the data engine and a decision block from the strategy engine. Over a
-        # 20-session replay that is tens of thousands of lines of noise around
-        # the one table that matters, so both are muted unless --verbose.
         if not self.verbose:
-            me._print_cycle_dashboard = lambda *_a, **_k: None
+            engine.market_engine._print_cycle_dashboard = lambda *_a, **_k: None
+            engine._print_cycle_footer = lambda *_a, **_k: None
+            if not self.cycle_reports:
+                engine._print_trade_report = lambda *_a, **_k: None
 
-        self.db, self.client, self.me, self.se, self.xe = db, client, me, se, xe
-        self.regime = rg
-        self.merge_regime = getattr(regime_engine, "merge_regime_into_signals", None)
-
-        # v7: the same per-trade console block the live engine prints, driven
-        # off the scratch book this runner writes. It reads positions /
-        # position_legs, which is why _open() and _close() now persist the
-        # exit the way the live execute_close() does: without it a closed
-        # replay trade had no exit time, no exit price and no P&L anywhere in
-        # the database, and the block could only have been a reconstruction.
-        self.reporter = core.TradeConsoleReporter(
-            db, self.config, logger, source="BACKTEST"
-        )
-        self.reporter.set_mode(self.trade_report_mode)
+        self.engine = engine
+        self.db = db
+        self.client = client
+        # Convenience aliases used by reports / self-tests / parity helpers.
+        self.me = engine.market_engine
+        self.se = engine.strategy_engine
+        self.xe = engine.execution_engine
+        self.regime = engine.regime_engine
+        self.reporter = engine.trade_reporter
+        self._harvested_pids: set = set()
 
     def _teardown(self):
         try:
@@ -1091,332 +1103,109 @@ class BacktestRunner:
             except OSError:
                 pass
 
-    # -- regime step ------------------------------------------------------
-    def _classify(self, signals: dict) -> dict:
-        """
-        Run the real regime layer exactly as main.run_one_cycle does:
-        process_signals() then merge_regime_into_signals(). Without this the
-        strategy engine sees no final_regime and refuses every entry, which is
-        an artefact of the harness rather than a decision by the engine.
-        """
+    def _harvest_closed(self, trading_date: str) -> None:
+        """Pull newly CLOSED rows from the live book into Results."""
+        rows = self.db.query(
+            "SELECT * FROM positions WHERE trading_date=? AND status='CLOSED' "
+            "ORDER BY entry_time",
+            (trading_date,),
+        ) or []
+        for row in rows:
+            pid = str(row.get("position_id") or "")
+            if not pid or pid in self._harvested_pids:
+                continue
+            self._harvested_pids.add(pid)
+            t = self._trade_from_position_row(row, trading_date)
+            if t is not None:
+                self.results.add_trade(t)
+
+    def _trade_from_position_row(
+        self, row: dict, trading_date: str
+    ) -> Optional[Trade]:
         try:
-            with self._quiet():
-                snapshot = self.regime.process_signals(signals)
-            if self.merge_regime is not None:
-                return self.merge_regime(signals, snapshot)
+            et = str(row.get("entry_time") or "")
+            xt = str(row.get("exit_time") or "")
+            entry_hhmmss = et[11:19] if len(et) >= 19 else et
+            exit_hhmmss = xt[11:19] if len(xt) >= 19 else xt
+            entry_credit = float(
+                row.get("entry_credit_realised")
+                or row.get("entry_credit")
+                or 0
+            )
+            exit_debit = float(row.get("exit_premium") or 0)
+            costs = (
+                float(row.get("entry_costs_rupees") or 0)
+                + float(row.get("exit_costs_rupees") or 0)
+            )
+            pnl = float(row.get("net_pnl_rupees") or 0)
+            lots = int(row.get("final_lots") or 1)
+            held = 0
+            try:
+                if et and xt:
+                    e_dt = datetime.fromisoformat(et.replace("Z", ""))
+                    x_dt = datetime.fromisoformat(xt.replace("Z", ""))
+                    if e_dt.tzinfo:
+                        e_dt = e_dt.replace(tzinfo=None)
+                    if x_dt.tzinfo:
+                        x_dt = x_dt.replace(tzinfo=None)
+                    held = int((x_dt - e_dt).total_seconds() / 60)
+            except Exception:
+                held = 0
+            return Trade(
+                trading_date=trading_date,
+                strategy=row.get("strategy_name"),
+                regime=row.get("final_regime_at_entry"),
+                confidence=row.get("confidence_at_entry"),
+                dte=row.get("actual_dte"),
+                entry_time=entry_hhmmss,
+                exit_time=exit_hhmmss,
+                lots=lots,
+                entry_credit=round(entry_credit, 2),
+                exit_debit=round(exit_debit, 2),
+                gross_pts=round(entry_credit - exit_debit, 2),
+                costs_rs=round(costs, 2),
+                pnl_rs=round(pnl, 2),
+                exit_reason=str(row.get("exit_reason") or ""),
+                exit_priority=int(row.get("exit_priority") or 0),
+                entry_spot=round(float(row.get("entry_spot") or 0), 1),
+                exit_spot=round(float(row.get("exit_spot") or 0), 1),
+                strikes="",
+                wing=None,
+                held_min=held,
+            )
         except Exception as exc:
             if self.verbose:
-                print(f"  regime layer failed: {exc}")
-        return signals
+                print(f"  harvest failed: {exc}")
+            return None
 
-    # -- entry ------------------------------------------------------------
-    def _open(self, params: dict, signals: dict, day: DaySlice) -> Optional[dict]:
-        chain = self.me.last_chain or {}
-        legs_spec = params.get("legs") or []
-        lots = int(params.get("final_lots") or 1)
-        filled = []
-        for leg in legs_spec:
-            k = float(leg["strike"])
-            q = (chain.get(k) or {}).get(leg["option_type"]) or {}
-            px = self.fills.price(q, leg["action"])
-            if px is None or px <= 0:
-                return None
-            filled.append({
-                "strike": k,
-                "option_type": leg["option_type"],
-                "action": leg["action"],
-                "exec_price": px,
-                "bid": float(q.get("bid") or 0),
-                "ask": float(q.get("ask") or 0),
-                "delta": float(q.get("delta") or 0),
-                "gamma": float(q.get("gamma") or 0),
-                "vega": float(q.get("vega") or 0),
-                "theta": float(q.get("theta") or 0),
-                "iv": float(q.get("iv") or 0),
-                "oi": int(q.get("oi") or 0),
-            })
-
-        credit = sum(
-            f["exec_price"] if f["action"] == "SELL" else -f["exec_price"]
-            for f in filled
-        )
-        entry_costs = self.se._compute_costs(filled, lots, "ENTRY")["total_rupees"]
-
-        pid = f"BT_{uuid.uuid4().hex[:12]}"
-        now = self.clock.now()
-        self.db.insert("positions", {
-            "position_id": pid,
-            "trading_date": day.trading_date,
-            "strategy_name": params.get("strategy_name") or "UNKNOWN",
-            "strategy_type": params.get("strategy_type"),
-            "selection_reason": params.get("selection_reason"),
-            "target_expiry": params.get("target_expiry"),
-            "actual_dte": params.get("actual_dte"),
-            "entry_time": now.isoformat(),
-            "entry_spot": params.get("entry_spot"),
-            "entry_vix": params.get("entry_vix"),
-            "entry_credit": credit,
-            "gross_credit": params.get("gross_credit"),
-            "opening_straddle_at_entry": params.get("opening_straddle_at_entry"),
-            "entry_costs_rupees": entry_costs,
-            "stop_premium": params.get("stop_premium"),
-            "target_premium": params.get("target_premium"),
-            "price_stop_pts": params.get("price_stop_pts"),
-            "price_stop_level_call": params.get("price_stop_level_call"),
-            "price_stop_level_put": params.get("price_stop_level_put"),
-            "hard_exit_time": params.get("hard_exit_time"),
-            "final_lots": lots,
-            "max_loss_per_lot": params.get("max_loss_per_lot"),
-            "total_max_risk": params.get("total_max_risk"),
-            # v7: the live execute_entry() persists this and the console
-            # report needs it to say what a credit structure commits; without
-            # it the replay book could only fall back to total_max_risk.
-            "estimated_margin": params.get("estimated_margin"),
-            "status": "OPEN",
-            "last_known_premium": credit,
-            "profit_lock_activated": 0,
-            "paper_trade": 1,
-            "raw_params_json": json.dumps(params, default=str),
-            "final_regime_at_entry": params.get("final_regime_at_entry"),
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
-        })
-        for f in filled:
-            self.db.insert("position_legs", {
-                "position_id": pid,
-                "strike": f["strike"],
-                "option_type": f["option_type"],
-                "action": f["action"],
-                "qty": lots * self.config.lot_size,
-                "entry_price": f["exec_price"],
-                "entry_bid": f["bid"],
-                "entry_ask": f["ask"],
-                "entry_delta": f["delta"],
-                "entry_gamma": f["gamma"],
-                "entry_vega": f["vega"],
-                "entry_theta": f["theta"],
-                "entry_iv": f["iv"],
-                "entry_oi": f["oi"],
-                "quoted_mid_at_entry": (f["bid"] + f["ask"]) / 2.0,
-                "leg_status": "OPEN",
-            })
-
-        return {
-            "position_id": pid,
-            "lots": lots,
-            "entry_credit": credit,
-            "entry_costs": entry_costs,
-            "entry_time": now,
-            "entry_spot": float(signals.get("spot") or 0),
-            "filled": filled,
-            "params": params,
-            "signals_at_entry": {
-                "final_regime": signals.get("final_regime"),
-                "confidence_level": signals.get("confidence_level"),
-                "actual_dte": signals.get("actual_dte"),
-            },
-        }
-
-    # -- exit -------------------------------------------------------------
-    def _close(self, live: dict, signals: dict, reason: str, priority: int,
-               day: DaySlice) -> Trade:
-        # PATCH_V12: price the exit on the POSITION's expiry chain,
-        # not the active one. The runner snapshots every active chain
-        # per cycle (see run_day), so a weekly spread held across a
-        # Tuesday 0DTE listing exits on its own last-known quotes
-        # instead of the 0DTE lottery tickets (measured 2026-09-08:
-        # exit debit 0.93 on the wrong series turned ~Rs 750 of decay
-        # into Rs 8,993).
-        chain = self.me.last_chain or {}
+    def _ingest_rejections(self, trading_date: str) -> None:
+        """Census NO_TRADE reasons from the live strategy_decisions table."""
         try:
-            _pos_exp = str((live.get("params") or {}).get("target_expiry") or "")[:10]
-            _by_exp = getattr(self, "_chain_by_expiry", None) or {}
-            if _pos_exp and _pos_exp in _by_exp:
-                chain = _by_exp[_pos_exp]
+            rows = self.db.query(
+                "SELECT action, reason FROM strategy_decisions "
+                "WHERE trading_date=?",
+                (trading_date,),
+            ) or []
         except Exception:
-            pass
-        urgent = priority in (1, 2, 3, 7)
-        exit_legs = []
-        debit = 0.0
-        for f in live["filled"]:
-            q = (chain.get(f["strike"]) or {}).get(f["option_type"]) or {}
-            close_action = "BUY" if f["action"] == "SELL" else "SELL"
-            px = self.fills.price(q, close_action, urgent=urgent)
-            if px is None or px <= 0:
-                px = f["exec_price"]
-            _bid = float(q.get("bid") or 0)
-            _ask = float(q.get("ask") or 0)
-            exit_legs.append({
-                "action": close_action,
-                "option_type": f["option_type"],
-                "strike": f["strike"],
-                "exec_price": px,
-                # recorded for the same reason the live book records
-                # quoted_mid_at_exit: slippage against the touch is only
-                # measurable if the touch at exit was written down.
-                "quoted_mid": ((_bid + _ask) / 2.0)
-                              if (_bid > 0 and _ask > 0) else px,
-            })
-            debit += px if close_action == "BUY" else -px
-
-        lots = live["lots"]
-        exit_costs = self.se._compute_costs(exit_legs, lots, "EXIT")["total_rupees"]
-        gross_pts = live["entry_credit"] - debit
-        costs = live["entry_costs"] + exit_costs
-        pnl = gross_pts * self.config.lot_size * lots - costs
-
-        now = self.clock.now()
-        # v7: write the exit into the book the way the live execute_close()
-        # does. The replay used to flip two status flags and discard the rest,
-        # so a closed trade in the scratch database had no exit time, no exit
-        # reason, no P&L and no exit price on any leg - nothing that reads the
-        # book (the per-trade console report, an audit of a replay, any future
-        # reporter pointed at a saved run) could tell how the trade ended or
-        # what it made. Results/Trade still carries exactly the same numbers,
-        # so no replayed P&L moves: this is bookkeeping parity, not a change
-        # to the simulation.
-        _gross_rs = gross_pts * self.config.lot_size * lots
-        self.db.update(
-            "positions",
-            {
-                "status":            "CLOSED",
-                "exit_time":         now.isoformat(),
-                "exit_reason":       reason,
-                "exit_priority":     priority,
-                "exit_premium":      round(debit, 4),
-                "gross_pnl_rupees":  round(_gross_rs, 2),
-                "exit_costs_rupees": exit_costs,
-                "net_pnl_rupees":    round(pnl, 2),
-                "last_known_premium": round(debit, 4),
-                "updated_at":        now.isoformat(),
-            },
-            {"position_id": live["position_id"]},
-        )
-        for f, xl in zip(live["filled"], exit_legs):
-            self.db.execute(
-                "UPDATE position_legs SET leg_status='CLOSED', exit_price=?, "
-                "quoted_mid_at_exit=? WHERE position_id=? AND strike=? AND "
-                "option_type=?",
-                (xl["exec_price"], xl["quoted_mid"], live["position_id"],
-                 f["strike"], f["option_type"]),
-            )
-
-        strikes = "/".join(
-            f"{f['action'][0]}{f['option_type'][0].upper()}{f['strike']:.0f}"
-            for f in live["filled"]
-        )
-        return Trade(
-            trading_date=day.trading_date,
-            strategy=live["params"].get("strategy_name"),
-            regime=live["signals_at_entry"].get("final_regime"),
-            confidence=live["signals_at_entry"].get("confidence_level"),
-            dte=live["signals_at_entry"].get("actual_dte"),
-            entry_time=live["entry_time"].strftime("%H:%M:%S"),
-            exit_time=now.strftime("%H:%M:%S"),
-            lots=lots,
-            entry_credit=round(live["entry_credit"], 2),
-            exit_debit=round(debit, 2),
-            gross_pts=round(gross_pts, 2),
-            costs_rs=round(costs, 2),
-            pnl_rs=round(pnl, 2),
-            exit_reason=reason,
-            exit_priority=priority,
-            entry_spot=round(live["entry_spot"], 1),
-            exit_spot=round(float(signals.get("spot") or 0), 1),
-            strikes=strikes,
-            wing=live["params"].get("wing_width"),
-            held_min=int((now - live["entry_time"]).total_seconds() / 60),
-        )
-
-    # -- PATCH_V14: parity with the live in-loop hard-exit sweep ───────────
-    def _hard_exit_of(self, live: dict) -> dtime:
-        """The square-off time the simulated position was WRITTEN with.
-
-        Read from the same column the live sweep reads
-        (positions.hard_exit_time), cached per position: the harness has at
-        most one open at a time, so this is one query per entry, not one per
-        cycle.
-        """
-        cache = getattr(self, "_hx_cache", None)
-        if cache is None:
-            cache = {}
-            self._hx_cache = cache
-        pid = live.get("position_id")
-        if pid in cache:
-            return cache[pid]
-        raw = ""
-        try:
-            row = self.db.query_one(
-                "SELECT hard_exit_time FROM positions WHERE position_id=?",
-                (pid,),
-            )
-            raw = str((row or {}).get("hard_exit_time") or "").strip()
-        except Exception:
-            raw = ""
-        hx = None
-        for cand, fmt in ((raw[:8], "%H:%M:%S"), (raw[:5], "%H:%M")):
-            try:
-                hx = datetime.strptime(cand, fmt).time()
-                break
-            except Exception:
+            return
+        for r in rows:
+            act = str(r.get("action") or "")
+            reason = str(r.get("reason") or "")
+            if act.startswith("STRATEGY_SELECTED") or act == "ENTER":
                 continue
-        if hx is None:
-            try:
-                cfg = self.config.hard_exit_time
-                hx = cfg if isinstance(cfg, dtime) else dtime(15, 0)
-            except Exception:
-                hx = dtime(15, 0)
-        cache[pid] = hx
-        return hx
-
-    def _position_chain(self, live: dict) -> dict:
-        """The chain the position would be priced on (its own expiry)."""
-        chain = self.me.last_chain or {}
-        try:
-            _pos_exp = str(
-                (live.get("params") or {}).get("target_expiry") or "")[:10]
-            _by_exp = getattr(self, "_chain_by_expiry", None) or {}
-            if _pos_exp and _pos_exp in _by_exp:
-                chain = _by_exp[_pos_exp]
-        except Exception:
-            pass
-        return chain
-
-    def _mark_open(self, live: dict) -> Optional[float]:
-        """Unrealised P&L of the open position in rupees, or None.
-
-        Read-only: the same liquidation pricing and the same cost model
-        _close() would apply to this cycle's chain, with no book writes. None
-        means this cycle's quotes cannot price the position - the sample is
-        skipped rather than carried forward at a stale mark, because a stale
-        mark is precisely what makes a drawdown read smaller than it was.
-        """
-        chain = self._position_chain(live)
-        debit, exit_legs = 0.0, []
-        for f in live["filled"]:
-            q = (chain.get(f["strike"]) or {}).get(f["option_type"]) or {}
-            close_action = "BUY" if f["action"] == "SELL" else "SELL"
-            px = self.fills.price(q, close_action, urgent=False)
-            if px is None or px <= 0:
-                return None
-            exit_legs.append({
-                "action": close_action,
-                "option_type": f["option_type"],
-                "strike": f["strike"],
-                "exec_price": px,
-            })
-            debit += px if close_action == "BUY" else -px
-        try:
-            exit_costs = self.se._compute_costs(
-                exit_legs, live["lots"], "EXIT")["total_rupees"]
-        except Exception:
-            exit_costs = 0.0
-        gross_pts = live["entry_credit"] - debit
-        return (gross_pts * self.config.lot_size * live["lots"]
-                - (live["entry_costs"] + exit_costs))
+            if not reason:
+                continue
+            self.results.add_rejection(reason)
 
     # -- one session ------------------------------------------------------
     def run_day(self, trading_date: str) -> None:
+        """Replay one session by pumping DB cycles into MainEngine.run_one_cycle().
+
+        Architecture::
+
+            HistoricalStore cycle → SimClock.set → ReplayClient.point
+            → MainEngine.run_one_cycle()   # identical live path
+        """
         day = self.store.load_day(trading_date)
         if len(day.cycles) < 5:
             if self.verbose:
@@ -1425,13 +1214,8 @@ class BacktestRunner:
 
         self.results.days.append(trading_date)
         self.results._cur_day = trading_date
+        self._harvested_pids = set()
 
-        # ── truncated-capture guard ───────────────────────────────────────
-        # If the last recorded snapshot is earlier than the latest square-off
-        # any session can carry (15:00, 0DTE) the day is a PARTIAL capture:
-        # whatever is open at the last cycle is force-flattened on a mark that
-        # the real session never printed, and every entry window after it is
-        # silently missing. Say so, loudly, and remember it for the report.
         try:
             _last_hhmm = str(day.cycles[-1])[11:16]
         except Exception:
@@ -1447,18 +1231,14 @@ class BacktestRunner:
                 f"--dates {trading_date})."
             )
 
-        state = self.me.state
-        state["daily_halted"] = False
-        # The book: every open simulated position, in entry order. The
-        # harness used to hold exactly one (`live`); MAX_CONCURRENT_POSITIONS
-        # is now honoured here the same way main.py honours it - every open
-        # position is monitored every cycle, and decide() is consulted
-        # whenever the strategy engine's own slot gates allow it.
-        book: List[dict] = []
-        day_pnl = 0.0
-        self._chain_by_expiry = {}  # PATCH_V12: reset per session (see _close)
-        _max_slots = max(1, int(getattr(
-            self.config, "max_concurrent_positions", 1) or 1))
+        engine = self.engine
+        st = engine.market_engine.state
+        st["current_capital"] = (
+            self.results.starting_capital
+            + sum(self.results.daily_pnl.values())
+        )
+        st["daily_pnl"] = 0.0
+        st["daily_halted"] = False
 
         for capture_time in day.cycles:
             dt = day.cycle_dt(capture_time)
@@ -1467,210 +1247,48 @@ class BacktestRunner:
 
             try:
                 with self._quiet():
-                    signals = self.me.run_cycle()
+                    engine.run_one_cycle()
             except Exception as exc:
                 if self.verbose:
-                    print(f"  {trading_date} {dt:%H:%M}: run_cycle failed: {exc}")
-                self._report_trades(day)   # v7: a cycle is a cycle
+                    print(
+                        f"  {trading_date} {dt:%H:%M}: "
+                        f"run_one_cycle failed: {exc}"
+                    )
                 continue
-            # reset_if_new_day() rebinds MarketDataEngine.state to a fresh
-            # dict on day rollover (including the first cycle, when the
-            # clock jumps from its January init to the replay date). The
-            # handle captured before the loop would silently detach, so
-            # every cooldown / halt / stop counter the harness writes
-            # would land in a dead dict the strategy never reads —
-            # replayed sessions then re-entered instantly with no
-            # cooldown. Re-fetch the live handle every cycle.
-            state = self.me.state
-            self.results.cycles += 1
 
-            signals = self._classify(signals)
-            # PATCH_V12: snapshot the active chain per expiry for
-            # honest exit pricing (see _close).
+            self.results.cycles += 1
             try:
-                _cb = getattr(self, "_chain_by_expiry", None)
-                if _cb is None:
-                    _cb = {}
-                    self._chain_by_expiry = _cb
-                _ax = self.me.state.get("actual_expiry") or signals.get("active_expiry")
-                if _ax and self.me.last_chain:
-                    _cb[str(_ax)[:10]] = dict(self.me.last_chain)
+                day_pnl = float(engine.compute_total_daily_pnl() or 0)
+                st = engine.market_engine.state
+                st["current_capital"] = (
+                    self.results.starting_capital
+                    + sum(
+                        v for d, v in self.results.daily_pnl.items()
+                        if d != trading_date
+                    )
+                    + day_pnl
+                )
             except Exception:
                 pass
-            state["current_capital"] = self.results.starting_capital + \
-                sum(self.results.daily_pnl.values())
-            state["daily_pnl"] = day_pnl
 
-            # ── manage every open position first ──────────────────────────
-            _closed_any = False
-            for live in list(book):
-                row = self.db.query_one(
-                    "SELECT * FROM positions WHERE position_id=?",
-                    (live["position_id"],),
-                )
-                try:
-                    with self._quiet():
-                        action, priority, ctx = self.xe.monitor_position(row, signals)
-                except Exception as exc:
-                    if self.verbose:
-                        print(f"  monitor_position failed: {exc}")
-                    action, priority, ctx = "HOLD", 0, {}
-
-                # ── PATCH_V14: mirror the live in-loop hard-exit sweep ──
-                # main.py calls perform_hard_exit_sweep() every cycle, after
-                # monitor_all_positions(). Priority 7 fires on the same
-                # per-position time, so on a healthy cycle this is a no-op
-                # that PROVES the two paths agree; on a cycle where the
-                # ladder was bypassed the sweep still flattens the book
-                # exactly as production would.
-                if action == "HOLD" or str(action).startswith("TIGHTEN"):
-                    _hx = self._hard_exit_of(live)
-                    if dt.time() >= _hx:
-                        action, priority = "HARD_EXIT_15:00", 7
-                        ctx = {
-                            "reason_detail": f"hard_exit_sweep_{_hx:%H:%M}",
-                            "hard_exit_time": f"{_hx:%H:%M}",
-                            "current_time": f"{dt:%H:%M:%S}",
-                        }
-                        if self.verbose:
-                            print(f"  {trading_date} {dt:%H:%M} SWEEP  "
-                                  f"hard exit {_hx:%H:%M} reached")
-
-                if action == "HOLD" or action.startswith("TIGHTEN"):
-                    continue
-
-                reason = ctx.get("reason_detail") or action
-                # Capture params BEFORE _close - fade / rotation latches
-                # need the entry raw_params.
-                _close_rp = dict(live.get("params") or {})
-                _close_sname = str(
-                    _close_rp.get("strategy_name")
-                    or live.get("strategy_name")
-                    or ""
-                )
-                t = self._close(live, signals, reason, priority, day)
-                self.results.add_trade(t)
-                day_pnl += t.pnl_rs
-                book.remove(live)
-                _closed_any = True
-                state["daily_pnl"] = day_pnl
-                # ── PATCH_V13: replay the LIVE close bookkeeping ──────────
-                # The live method is called with the same reason string
-                # monitor_all_positions() derives, so the cooldown / stop
-                # counters in replay match production.
-                try:
-                    state["_last_monitor_spot"] = float(
-                        signals.get("spot") or 0.0)
-                except (TypeError, ValueError):
-                    pass
-                _live_reason = bt_exit_reason(action, priority)
-                # PATCH_V34 / V45 parity: mirror execute_close tagging.
-                try:
-                    _rp = _close_rp
-                    if bool(_rp.get("afternoon_low_fade")):
-                        state["_closing_afternoon_low_fade"] = True
-                    if bool(_rp.get("afternoon_high_fade")):
-                        state["_closing_afternoon_high_fade"] = True
-                    if bool(_rp.get("neutral_range_vertical")) or bool(
-                        _rp.get("failed_break_scalp")
-                    ):
-                        state["_closing_failed_break_scalp"] = True
-                    if bool(_rp.get("stale_weekly_vertical")):
-                        state["_closing_stale_weekly"] = True
-                    if "regime_rotation" in str(reason or ""):
-                        state["_closing_regime_rotation"] = True
-                    state["_closing_strategy_name"] = _close_sname
-                except Exception:
-                    pass
-                try:
-                    with self._quiet():
-                        self.xe._update_state_after_close(
-                            _live_reason, t.pnl_rs, priority)
-                except Exception as exc:
-                    if self.verbose:
-                        print(f"  close bookkeeping failed: {exc}")
-                # the harness owns the day accumulator and recomputes
-                # capital from the results ledger every cycle
-                state = self.me.state
-                state["daily_pnl"] = day_pnl
-                if self.verbose:
-                    print(f"  {trading_date} {dt:%H:%M} EXIT  "
-                          f"{t.exit_reason[:34]:34s} pnl={t.pnl_rs:>10,.0f}")
-            if _closed_any:
-                # v59: match live — monitor then decide same cycle when configured.
-                if not bool(getattr(
-                    self.config, "allow_same_cycle_reentry", True
-                )):
-                    self._report_trades(day)
-                    continue
-
-            # ── daily loss halt ──────────────────────────────────────────
-            # main.check_daily_loss_halt stops new entries once the session is
-            # down max_daily_loss_pct of day-start capital. Without mirroring
-            # it here the simulation keeps trading through days the live
-            # engine would have shut off, which flatters bad days.
-            if not state.get("daily_halted"):
-                day_start = state["current_capital"] - day_pnl
-                if day_start > 0 and (max(0.0, -day_pnl) / day_start) >= \
-                        self.config.max_daily_loss_pct:
-                    state["daily_halted"] = True
-                    self.results.halted_days.append(trading_date)
-                    if self.verbose:
-                        print(f"  {trading_date}: daily loss limit hit "
-                              f"({day_pnl:,.0f}) — no further entries")
-            if state.get("daily_halted") and not book:
-                self.results.add_rejection("daily_loss_halt")
-                self._report_trades(day)   # v7
-                continue
-
-            # ── otherwise consider a new entry (a free slot) ──────────────
-            if len(book) < _max_slots and not state.get("daily_halted"):
-                try:
-                    with self._quiet():
-                        decision = self.se.decide(signals)
-                except Exception as exc:
-                    if self.verbose:
-                        print(f"  decide() failed: {exc}")
-                    self._report_trades(day)   # v7
-                    continue
-
-                if decision.get("action") == "ENTER":
-                    params = decision.get("params") or {}
-                    # v59: same pre-trade veto live uses (parity with
-                    # ExecutionEngine.process_entry_decision).
-                    try:
-                        with self._quiet():
-                            go, result = self.xe.validate_pre_trade(
-                                params, signals
-                            )
-                    except Exception as exc:
-                        go, result = "NO_GO", {"reason": f"pre_trade_error:{exc}"}
-                    if go != "GO":
-                        self.results.add_rejection(
-                            f"pre_trade:{result.get('reason', 'unknown')}"
-                        )
-                        self._report_trades(day)
-                        continue
-                    params = result if isinstance(result, dict) and result.get(
-                        "legs"
-                    ) else params
-                    live = self._open(params, signals, day)
-                    if live is not None:
-                        book.append(live)
-                        state["last_entry_time"] = self.clock.now().isoformat()
-                        state["entry_count"] = int(state.get("entry_count", 0)) + 1
-                        if self.verbose:
-                            print(f"  {trading_date} {dt:%H:%M} ENTER "
-                                  f"{params.get('strategy_name')} "
-                                  f"credit={live['entry_credit']:.2f} "
-                                  f"lots={live['lots']} book={len(book)}")
-                    else:
-                        self.results.add_rejection("fill_unavailable")
-                else:
-                    self.results.add_rejection(decision.get("reason", "unknown"))
-
-            # ── PATCH_V14: log a change in the session parameters ─────────
             try:
+                _prior = sum(
+                    v for d, v in self.results.daily_pnl.items()
+                    if d != trading_date
+                )
+                _eq = (
+                    self.results.starting_capital
+                    + _prior
+                    + float(engine.compute_total_daily_pnl() or 0)
+                )
+                self.results.mark_equity(f"{trading_date} {dt:%H:%M}", _eq)
+            except Exception:
+                pass
+
+            self._harvest_closed(trading_date)
+
+            try:
+                state = engine.market_engine.state
                 _sig = (
                     state.get("day_label"), state.get("day_mode"),
                     state.get("actual_dte"), state.get("hard_exit_time"),
@@ -1685,53 +1303,29 @@ class BacktestRunner:
             except Exception:
                 pass
 
-            # ── PATCH_V14: sample the marked-to-market equity path ────────
-            # Realised P&L of the earlier sessions, plus this session's, plus
-            # the open position marked on this cycle's own chain. Flat cycles
-            # are sampled too, so the path is continuous and a drawdown that
-            # opened and closed inside one trade is still visible.
-            try:
-                _prior = sum(
-                    v for d, v in self.results.daily_pnl.items()
-                    if d != trading_date
-                )
-                _eq = (self.results.starting_capital + _prior + day_pnl)
-                if book:
-                    _marks = [self._mark_open(lv) for lv in book]
-                    if all(m is not None for m in _marks):
-                        _eq += sum(_marks)
-                        self.results.mark_equity(
-                            f"{trading_date} {dt:%H:%M}", _eq)
-                else:
-                    self.results.mark_equity(f"{trading_date} {dt:%H:%M}", _eq)
-            except Exception:
-                pass
-
-            # ── v7: end of the cycle ───────────────────────────────────────
-            # The book as it now stands: every trade of this session, the ones
-            # already performed and the ones in progress, on every cycle.
-            self._report_trades(day)
-
-        # ── forced flat at the last snapshot of the session ──────────────
-        if book:
+        # End-of-data: live EOD close if anything still OPEN.
+        open_rows = self.db.query(
+            "SELECT position_id FROM positions WHERE trading_date=? "
+            "AND status='OPEN'",
+            (trading_date,),
+        ) or []
+        if open_rows:
             self.clock.set(day.cycle_dt(day.cycles[-1]))
             self.client.point(day, day.cycles[-1])
             try:
                 with self._quiet():
-                    signals = self.me.run_cycle()
-            except Exception:
-                signals = {"spot": book[0]["entry_spot"]}
-            for live in list(book):
-                t = self._close(live, signals, "END_OF_DATA_FORCED_FLAT", 7, day)
-                self.results.add_trade(t)
-            book.clear()
-            # v7: the session's last trade gets its final block too - the loop
-            # above ended before this close happened.
-            self._report_trades(day)
+                    engine.market_engine.run_cycle()
+                    engine.execution_engine.close_all_positions(
+                        "END_OF_DATA_FORCED_FLAT", force=True
+                    )
+            except Exception as exc:
+                if self.verbose:
+                    print(f"  end-of-data flatten failed: {exc}")
+            self._harvest_closed(trading_date)
 
-        # ── PATCH_V14: pin what this replay believed about the session ─────
+        self._ingest_rejections(trading_date)
+
         try:
-            _st = self.me.state
             _plog = self.results.replay_session_path.get(trading_date) or [
                 (None, (None,) * len(SESSION_PARITY_FIELDS))]
             self.results.replay_sessions[trading_date] = dict(
@@ -1739,13 +1333,80 @@ class BacktestRunner:
         except Exception:
             pass
 
-        # ── v9: pin the session's closing state for the end-of-run report ──
-        # The last simulated clock time and the session's own last chain: the
-        # final per-day report marks a still-open leg against the same day it
-        # traded, never against the next session's (or a missing) chain.
         self._day_finals[trading_date] = (
-            self.clock.now(), dict(self.me.last_chain or {})
+            self.clock.now(),
+            dict(engine.market_engine.last_chain or {}),
         )
+
+    # -- legacy helpers (compat; trading path is run_one_cycle) --
+    def _classify(self, signals: dict) -> dict:
+        """Deprecated: regime runs inside MainEngine.run_one_cycle."""
+        return signals
+
+    def _open(self, params: dict, signals: dict, day: DaySlice) -> Optional[dict]:
+        """Self-test helper: live execute_entry into the scratch book."""
+        try:
+            with self._quiet():
+                pid = self.xe.execute_entry(params, signals)
+        except Exception as exc:
+            if self.verbose:
+                print(f"  _open failed: {exc}")
+            return None
+        if not pid:
+            return None
+        row = self.db.query_one(
+            "SELECT * FROM positions WHERE position_id=?", (pid,)
+        )
+        if not row:
+            return None
+        return {
+            "position_id": pid,
+            "lots": int(row.get("final_lots") or 1),
+            "entry_credit": float(row.get("entry_credit") or 0),
+            "entry_costs": float(row.get("entry_costs_rupees") or 0),
+            "entry_spot": float(row.get("entry_spot") or 0),
+            "entry_time": self.clock.now(),
+            "params": params,
+            "signals_at_entry": dict(signals),
+            "filled": [],
+        }
+
+    def _close(
+        self,
+        live: dict,
+        signals: dict,
+        reason: str,
+        priority: int,
+        day: DaySlice,
+        *,
+        action: Optional[str] = None,
+    ) -> Trade:
+        """Self-test helper: live execute_close then harvest Trade."""
+        row = self.db.query_one(
+            "SELECT * FROM positions WHERE position_id=?",
+            (live["position_id"],),
+        )
+        if not row:
+            raise RuntimeError(f"_close: missing {live['position_id']}")
+        try:
+            with self._quiet():
+                self.xe.execute_close(
+                    dict(row),
+                    str(action or reason),
+                    int(priority or 0),
+                    {},
+                )
+        except Exception as exc:
+            if self.verbose:
+                print(f"  _close failed: {exc}")
+        row2 = self.db.query_one(
+            "SELECT * FROM positions WHERE position_id=?",
+            (live["position_id"],),
+        ) or row
+        t = self._trade_from_position_row(dict(row2), day.trading_date)
+        if t is None:
+            raise RuntimeError("_close harvest failed")
+        return t
 
     # -- v9: final per-day trade report -------------------------------------
     def _render_final_day_reports(self, dates: List[str]) -> None:
@@ -1825,18 +1486,21 @@ def print_audit(store: HistoricalStore) -> int:
         print("""
   No option_chain_snapshot rows found.
 
-  This is expected on a fresh install: the table is written by
-  MarketDataEngine.run_cycle(), so it only fills up on sessions the engine has
-  actually run. Until then there is nothing to replay and no way to measure
-  whether any threshold in this engine is right.
+  Usual causes:
+    1. Fresh install — the live engine has not recorded a session yet.
+    2. Primary DB corrupt / empty while per-day shards exist under
+       data/per_day/ (re-run with no args; the harness falls back automatically,
+       or pass --db data/per_day).
+    3. Pointed at the wrong file — check DB_PATH / --db.
 
-  To start collecting, run the engine in paper mode through live sessions:
+  To collect new sessions:
 
       PAPER_TRADE_MODE=true python main.py
 
-  Each session writes ~450 chain snapshots and ~375 one-minute bars. Come back
-  when you have 20+ sessions; fewer than that cannot separate a real edge from
-  noise at this trade frequency.
+  Each session writes ~450 chain snapshots and ~375 one-minute bars. After a
+  crash that leaves the primary DB unreadable, rebuild shards with:
+
+      python split_db_per_day.py --force
 """)
         return 1
 
@@ -2977,6 +2641,85 @@ def _resolve_db_paths(requested: List[str]) -> List[str]:
     return db_paths
 
 
+def _db_has_chain_snapshots(path: str) -> bool:
+    """True when path is readable and holds at least one chain snapshot.
+
+    Corrupt / locked / empty primary DBs return False so the harness can
+    fall back to per-day shards instead of printing a false 'fresh install'
+    audit. A bare `SELECT 1 ... LIMIT 1` can succeed on a partially-corrupt
+    file while the GROUP BY / COUNT(*) the audit needs still raises
+    'database disk image is malformed' — probe with that heavier query.
+    """
+    p = Path(path)
+    if not p.is_file() or p.stat().st_size <= 0:
+        return False
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            # Full-table COUNT(*) is what fails on the half-corrupt primary
+            # (LIMIT 1 / first-day GROUP BY can still succeed). Prefer that
+            # probe so we fall back to per_day shards.
+            row = con.execute(
+                "SELECT COUNT(*) FROM option_chain_snapshot"
+            ).fetchone()
+            return row is not None and int(row[0] or 0) > 0
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+
+def _per_day_shard_dir(config) -> Path:
+    """Canonical location of split_db_per_day.py output."""
+    primary = Path(getattr(config, "db_path", "") or "")
+    if primary.parent.name:
+        candidate = primary.parent / "per_day"
+        if candidate.is_dir():
+            return candidate
+    try:
+        from core import BASE_DIR
+        return Path(BASE_DIR) / "data" / "per_day"
+    except Exception:
+        return Path("data") / "per_day"
+
+
+def _default_replay_sources(config) -> List[str]:
+    """Pick the live DB when usable; otherwise the per-day shard directory.
+
+    Live sessions keep writing to config.db_path. When that file is empty
+    (fresh install) or SQLite-corrupt (disk full / crash mid-write), the
+    operator still has self-contained session shards under data/per_day/
+    from split_db_per_day.py. Default `python backtest_engine.py` must
+    find those without requiring a manual --db every time.
+    """
+    primary = str(Path(config.db_path).expanduser())
+    if _db_has_chain_snapshots(primary):
+        return [primary]
+
+    shard_dir = _per_day_shard_dir(config)
+    shards: List[str] = []
+    if shard_dir.is_dir():
+        for p in sorted(shard_dir.glob("*.db")):
+            if _db_has_chain_snapshots(str(p)):
+                shards.append(str(p))
+    if shards:
+        why = (
+            "missing or empty"
+            if not Path(primary).is_file()
+            else "unreadable or corrupt"
+        )
+        print(
+            f"  [backtest] primary DB has no usable option_chain_snapshot "
+            f"({why}): {primary}"
+        )
+        print(
+            f"  [backtest] falling back to {len(shards)} session shard(s) "
+            f"under {shard_dir}"
+        )
+        return shards
+    return [primary]
+
+
 def _open_store(db_paths: List[str]):
     if len(db_paths) > 1:
         return MultiStore(db_paths)
@@ -3252,12 +2995,29 @@ def main() -> int:
     # PATCH_V14: --db takes one path, several, or a directory of per-day
     # splits. Multiple sources are served through MultiStore so the run has a
     # single ledger and a single set of period statistics.
-    _requested = list(args.db) if args.db else [str(config.db_path)]
+    # When --db is omitted, prefer config.db_path only if it still has readable
+    # chain snapshots; otherwise fall back to data/per_day shards (primary DB
+    # is often empty on a fresh clone or SQLite-corrupt after a crash).
+    if args.db:
+        _requested = list(args.db)
+    else:
+        _requested = _default_replay_sources(config)
     try:
         db_paths = _resolve_db_paths(_requested)
     except FileNotFoundError as exc:
         print(f"\n  {exc}\n")
         return 1
+    # Drop unreadable files from an expanded directory so one corrupt shard
+    # cannot wipe a multi-day run.
+    if len(db_paths) > 1:
+        usable = [p for p in db_paths if _db_has_chain_snapshots(p)]
+        skipped = len(db_paths) - len(usable)
+        if skipped:
+            print(
+                f"  [backtest] skipped {skipped} empty/unreadable .db "
+                f"file(s) in the source list"
+            )
+        db_paths = usable or db_paths
     try:
         store = _open_store(db_paths)
     except FileNotFoundError:

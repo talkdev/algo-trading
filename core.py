@@ -993,6 +993,10 @@ class Config:
     # bar a real intraday trend often never prints; 24 + OR-break
     # + VWAP proof is the professional confirmation stack.
     momentum_adx_min:              float = 24.0
+    # Event-day debit substitute: higher bar than momentum_adx_min so a
+    # marginal long cannot fill the slot a defined-risk credit vertical
+    # should own (Sep11 CPI LONG_CALL at ADX=24 → −₹912).
+    momentum_event_adx_min:        float = 32.0
     momentum_or_break_frac:        float = 0.15
     momentum_vwap_buffer_pts:      float = 8.0
     # Do not chase a move that has already spent the day's priced range.
@@ -1013,6 +1017,19 @@ class Config:
     momentum_stop_frac:            float = 0.35
     momentum_lock_trigger:         float = 0.25
     momentum_lock_keep_frac:       float = 0.50
+    # Debit high-water-mark protection (replaces persist→breakeven clamp):
+    #   Phase A: once +lock_trigger, stop → free-trade (BE+costs) so runners
+    #            can develop (do NOT scalp early).
+    #   Phase B: once HWM open gain ≥ hwm_large_frac of entry, trail from
+    #            peak and only give back hwm_giveback_frac of peak open gain
+    #            (default keep 80% of the peak). Sep22 LONG_PUT peaked ~₹13k
+    #            at 14:01; BE-clamp → −₹912; early loose trail → +₹1.3k at
+    #            12:05 and missed the peak. HWM trail exits near the peak.
+    # Phase-B unlock: HWM must be this fraction above entry (1.0 = 2× entry)
+    # before the tight trail engages. Too low (e.g. 0.80) arms mid-trend and
+    # scalp-exits before the real peak (Sep22 LP: +₹8.7k at 13:55, missed 14:01).
+    momentum_hwm_large_frac:       float = 1.00
+    momentum_hwm_giveback_frac:    float = 0.20
     momentum_target_frac:          float = 0.60
     momentum_final_window_min:     int   = 45
     # Sizing: the debit route risks the stop, not the notional, and the
@@ -1062,7 +1079,7 @@ class Config:
         # consulted. day_move is answerable too: the 125 sell-side
         # bar and the momentum chase cap are different standards,
         # and the gate's own cap arbitrates.
-        "event", "only_range_allowed", "iv_expanding", "iv_spik", "straddle_exp",
+        "event", "only_range_allowed", "only_range_or_measured", "iv_expanding", "iv_spik", "straddle_exp",
         "params_invalid", "strategy_rules_failed", "day_move_used",
         # v57: sticky construct fails and confidence hard-gates must reach
         # the substitute (same class as pre-v56 iv_spiking dark).
@@ -1220,6 +1237,9 @@ class Config:
     # ladder and is not affected.
     profit_lock_pct_dte1plus_after_1330: float = 0.15
     profit_lock_pct_dte1plus_after_1415: float = 0.10
+    # Iron condor / butterfly: pin trades rarely print 22%+ same-day decay.
+    # Live Sep16/17 held ~7–11% winners to HARD_EXIT with lock never armed.
+    profit_lock_pct_symmetric:           float = 0.10
     # Trail give-back once armed: stop = credit - keep_frac x peak achieved.
     # v41: the ratchet that re-tightens this as profit grows was inverted
     # (compared in the bought-option direction) and had never fired, so
@@ -1234,6 +1254,15 @@ class Config:
     # gamma gives back 95% of a peak inside 40 minutes (2026-09-08).
     profit_lock_keep_frac_dte0:          float = 0.65
     profit_lock_keep_frac_dte1plus:      float = 0.35
+    # Near-expiry (DTE0/1) premium can print a deep peak then snap back
+    # several points inside one retrace. Cap the unlocked give-back in
+    # points so a 25%+ peak cannot leak ~half its open gain while the
+    # fractional keep still leaves enough leash at arming to survive
+    # normal noise (flat keep=0.55 stopped Sep11 BPS four minutes after
+    # arm). Weeklies (DTE2+) stay uncapped — their slower tape needs the
+    # wider fractional leash (measured Sep10).
+    profit_lock_max_giveback_pts_dte0:   float = 2.0
+    profit_lock_max_giveback_pts_dte1:   float = 2.0
 
     # ── v6: live execution hardening ──────────────────────────────────
     # The replay harness has its own fill model, so nothing below can move
@@ -1388,11 +1417,45 @@ class Config:
         return by_dte(dte, 1.0, self.ev_carry_discount_dte2p)
 
     def profit_lock_pct_for_dte(self, dte: Optional[int]) -> float:
-        return by_dte(dte, self.profit_lock_pct_dte0, self.profit_lock_pct_dte1plus)
+        # Arming bar only: DTE0 keeps the noisy 40% print. DTE1+ uses the
+        # weekly 22% bar — blending DTE1 toward expiry (→~29%) left morning
+        # winners unlocked on holiday-shifted Fridays (Sep11 peak ~22% at
+        # 11:45 never armed; lock finally engaged after 13:30 and stopped
+        # out for scraps). Trail keep_frac still blends; near-expiry also
+        # caps unlocked give-back in points (see max_giveback helpers).
+        try:
+            _d = int(dte) if dte is not None else 2
+        except (TypeError, ValueError):
+            _d = 2
+        if _d <= 0:
+            return float(self.profit_lock_pct_dte0)
+        return float(self.profit_lock_pct_dte1plus)
 
     def profit_lock_keep_frac_for_dte(self, dte: Optional[int]) -> float:
         return by_dte(dte, self.profit_lock_keep_frac_dte0,
                       self.profit_lock_keep_frac_dte1plus)
+
+    def profit_lock_max_giveback_pts_for_dte(
+        self, dte: Optional[int]
+    ) -> Optional[float]:
+        """Point cap on unlocked give-back, or None when uncapped."""
+        try:
+            _d = int(dte) if dte is not None else 2
+        except (TypeError, ValueError):
+            _d = 2
+        if _d <= 0:
+            v = getattr(self, "profit_lock_max_giveback_pts_dte0", None)
+        elif _d == 1:
+            v = getattr(self, "profit_lock_max_giveback_pts_dte1", None)
+        else:
+            return None
+        try:
+            _v = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+        if _v is None or _v <= 0:
+            return None
+        return _v
 
     def __repr__(self) -> str:
         def mask(s: str) -> str:
@@ -1766,6 +1829,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 0),  # PATCH_V12: was 1
         momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 4),
         momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 24.0), 15.0), 60.0),  # PATCH_V12: was 30.0
+        momentum_event_adx_min=min(max(_get_float(env, "MOMENTUM_EVENT_ADX_MIN", 32.0), 24.0), 60.0),
         momentum_or_break_frac=min(max(_get_float(env, "MOMENTUM_OR_BREAK_FRAC", 0.15), 0.0), 1.00),
         momentum_vwap_buffer_pts=min(max(_get_float(env, "MOMENTUM_VWAP_BUFFER_PTS", 8.0), 0.0), 60.0),
         momentum_day_move_max_pct=min(max(_get_float(env, "MOMENTUM_DAY_MOVE_MAX_PCT", 200.0), 10.0), 400.0),  # PATCH_V12: was 90.0
@@ -1776,6 +1840,8 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_stop_frac=min(max(_get_float(env, "MOMENTUM_STOP_FRAC", 0.35), 0.10), 0.70),
         momentum_lock_trigger=min(max(_get_float(env, "MOMENTUM_LOCK_TRIGGER", 0.25), 0.05), 1.00),
         momentum_lock_keep_frac=min(max(_get_float(env, "MOMENTUM_LOCK_KEEP_FRAC", 0.50), 0.10), 0.95),
+        momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 1.00), 0.30), 2.00),
+        momentum_hwm_giveback_frac=min(max(_get_float(env, "MOMENTUM_HWM_GIVEBACK_FRAC", 0.20), 0.05), 0.50),
         momentum_target_frac=min(max(_get_float(env, "MOMENTUM_TARGET_FRAC", 0.60), 0.10), 3.00),
         momentum_final_window_min=_get_int(env, "MOMENTUM_FINAL_WINDOW_MIN", 45),
         momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
@@ -2865,25 +2931,86 @@ class Database:
     Thread-safe SQLite database wrapper.
     Uses WAL mode for concurrent read/write.
     Auto-initialises schema and runs migrations on startup.
+
+    Durability: synchronous=FULL + WAL checkpoint on close. NORMAL was
+    enough to lose pages on hard kill / power loss and left
+    nifty_algo_v3.db with a malformed btree (see restore_primary_db.py).
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, skip_integrity_check: bool = False):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        if self.db_path.exists() and not skip_integrity_check:
+            self._assert_file_healthy(self.db_path)
         self._conn = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
-            timeout=30,
+            timeout=60,
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        # FULL: every commit reaches the disk before returning. Slightly
+        # slower writes; prevents the half-corrupt primary we hit in prod.
+        self._conn.execute("PRAGMA synchronous=FULL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._conn.execute("PRAGMA busy_timeout=5000;")
-        self._conn.execute("PRAGMA cache_size=-8000;")  # 8MB cache
+        self._conn.execute("PRAGMA busy_timeout=60000;")
+        self._conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache
+        self._conn.execute("PRAGMA temp_store=MEMORY;")
         self._init_schema()
         self._run_migrations()
+
+    @staticmethod
+    def _assert_file_healthy(path: Path) -> None:
+        """Refuse to open a primary that cannot COUNT chain rows.
+
+        A bare SELECT 1 can succeed on a half-corrupt btree; the audit /
+        restore path needs a full scan. Fail loudly so the operator runs
+        restore_primary_db.py instead of writing into a broken file.
+        """
+        try:
+            if path.stat().st_size < 4096:
+                return  # brand-new / empty file — schema init will populate
+        except OSError:
+            return
+        try:
+            con = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, timeout=30
+            )
+            try:
+                has_chain = con.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='option_chain_snapshot' "
+                    "LIMIT 1"
+                ).fetchone()
+                if not has_chain:
+                    return  # schema not initialised yet
+                # quick_check is cheaper than integrity_check and still
+                # catches the btree damage that made COUNT(*) fail.
+                q = con.execute("PRAGMA quick_check").fetchone()
+                if q and str(q[0]) != "ok":
+                    raise sqlite3.DatabaseError(
+                        f"quick_check failed: {q[0]}"
+                    )
+                # Confirm the hot table is readable end-to-end.
+                con.execute(
+                    "SELECT COUNT(*) FROM option_chain_snapshot"
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise sqlite3.DatabaseError(
+                    f"Database {path} is unreadable/corrupt ({exc}). "
+                    f"Quarantine it and rebuild with: "
+                    f"python restore_primary_db.py"
+                ) from exc
+            finally:
+                con.close()
+        except sqlite3.DatabaseError:
+            raise
+        except sqlite3.Error as exc:
+            raise sqlite3.DatabaseError(
+                f"Database {path} cannot be opened ({exc}). "
+                f"Rebuild with: python restore_primary_db.py"
+            ) from exc
 
     # ── Schema & Migrations ───────────────────────────────────────────────
 
@@ -3343,10 +3470,24 @@ class Database:
         return None
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Flush WAL and close the database connection."""
         with self._lock:
             try:
+                # Truncate checkpoint so a crash after close cannot leave
+                # an orphan -wal that disagrees with a restored primary.
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
                 self._conn.close()
+            except Exception:
+                pass
+
+    def checkpoint(self) -> None:
+        """Push WAL pages into the main file (call after heavy write bursts)."""
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception:
                 pass
 

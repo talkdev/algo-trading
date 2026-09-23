@@ -2807,6 +2807,13 @@ class MarketDataEngine:
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     rows,
                 )
+                # Push WAL pages after each chain burst so a hard kill cannot
+                # leave the primary btree half-written (root cause of the
+                # 2026-09 corrupt nifty_algo_v3.db).
+                try:
+                    self.db.checkpoint()
+                except Exception:
+                    pass
             except Exception as e:
                 self.logger.debug(f"Chain snapshot persist error: {e}")
 
@@ -2999,8 +3006,12 @@ class MarketDataEngine:
         # ── 3. Intraday candles ───────────────────────────────────────────
         bars = self.fetch_and_store_intraday_candles()
 
-        # P62 / P59-15: drop the forming 1-minute bar so MTF ADX/EMA match
-        # closed-bar replay (SimClock bars_until already excludes future).
+        # P59-15 / Sep22: drop the incomplete last 1-minute row so MTF does
+        # not treat a live mid-minute stub as closed. Higher-TF resample
+        # keeps partial buckets (drop_forming=False below) so once the
+        # 10:55 1m bar is closed, the open 10:55 5m bucket is visible and
+        # adx_5 matures at ~10:56 — matching live LONG_PUT timing. Full
+        # higher-TF drop_forming would hold ADX=0 until 11:00 and miss it.
         bars = self._drop_forming_1m_bar(bars)
 
         # Track first bar close for day_move_used computation
@@ -3348,8 +3359,17 @@ class MarketDataEngine:
         orb_price_regime = self.classify_orb_price_structure(bars, orb_high, orb_low)
 
         # ── 20. Technical indicators ──────────────────────────────────────
-        df15 = TechnicalEngine.resample_bars(bars, self.config.mtf_resample_15)
-        df60 = TechnicalEngine.resample_bars(bars, self.config.mtf_resample_60)
+        # P59-15 / Sep22: live process printed forming-bucket ADX (50.48 at
+        # 10:56) and entered LONG_PUT. Closed-bar drop_forming made replay
+        # ADX=0 and missed the trade. Keep higher-TF forming buckets so
+        # replay matches the running live book; re-enable drop_forming
+        # together with a live restart once both sides share one build.
+        df15 = TechnicalEngine.resample_bars(
+            bars, self.config.mtf_resample_15, drop_forming=False
+        )
+        df60 = TechnicalEngine.resample_bars(
+            bars, self.config.mtf_resample_60, drop_forming=False
+        )
         # v3.2: the engine's whole trend filter ran on 15-minute bars.
         # calculate_adx() needs 2*period+1 bars before it returns
         # anything: with period 14 that is 29 fifteen-minute bars =
@@ -3363,7 +3383,9 @@ class MarketDataEngine:
         # A 5-minute series gives 75 bars per session, so a Wilder ADX
         # can genuinely mature inside the trading day.
         df5 = TechnicalEngine.resample_bars(
-            bars, getattr(self.config, "adx_fast_resample", "300s")
+            bars,
+            getattr(self.config, "adx_fast_resample", "300s"),
+            drop_forming=False,
         )
 
         _adx_min_15 = max(8, min(self.config.min_bars_for_adx, 10))
@@ -3392,20 +3414,33 @@ class MarketDataEngine:
         _ADX5_PERIOD = 10
         adx_5        = 0.0
         adx_5_mature = False
+        adx_5_preview = 0.0
         _period_5    = _ADX5_PERIOD
         if not df5.empty and len(df5) >= 2 * _ADX5_PERIOD + 1:
             adx_5 = TechnicalEngine.calculate_adx(df5, _ADX5_PERIOD)
             adx_5_mature = bool(adx_5 > 0.0)
+        elif not df5.empty and len(df5) >= max(8, _adx_min_15):
+            # Immature preview: shorten Wilder so 2*period+1 fits the bars
+            # we have (fixed period-10 needs ~21×5m ≈ 10:55). Live Sep11
+            # printed ~46 at 10:22; publishing 0 until then made every
+            # morning gate blind. Preview never sets adx_15_mature.
+            _n5 = len(df5)
+            _period_prev = max(5, min(_ADX5_PERIOD, (_n5 - 1) // 2))
+            if _n5 >= 2 * _period_prev + 1:
+                adx_5_preview = float(
+                    TechnicalEngine.calculate_adx(df5, _period_prev) or 0.0
+                )
 
         # The effective reading every downstream gate consumes: the
         # 15-minute value when it is genuinely mature, otherwise the
-        # fast-series value once THAT is mature, otherwise 0.0
-        # (unknown). Publishing an immature print as a number made
-        # every ADX gate a coin flip before ~11:00.
+        # fast-series value once THAT is mature, otherwise an immature
+        # preview (still mature=False), otherwise 0.0 (unknown).
         if adx_15_mature and adx_15_raw > 0.0:
             adx_15 = adx_15_raw
         elif adx_5_mature:
             adx_15 = adx_5
+        elif adx_5_preview > 0.0:
+            adx_15 = adx_5_preview
         else:
             adx_15 = 0.0
         adx_15_mature = bool(adx_15_mature or adx_5_mature)
@@ -3933,12 +3968,25 @@ class MarketDataEngine:
         _now_ts = now_ist()
         if atm_straddle > 0:
             _straddle_hist.append((_now_ts.timestamp(), atm_straddle))
-            _straddle_hist = [(t, v) for t, v in _straddle_hist if _now_ts.timestamp() - t <= 600]
+            _straddle_hist = [
+                (t, v) for t, v in _straddle_hist
+                if _now_ts.timestamp() - t <= 600
+            ]
             self.state["_straddle_hist"] = _straddle_hist
-            _old5 = [(t, v) for t, v in _straddle_hist if _now_ts.timestamp() - t >= 270]
+            # Reference ≈5 minutes ago: most recent sample that is at least
+            # 270s old (not the oldest in the 10-min window — that kept
+            # expand stuck True through Sep22 10:37 live entry while s5
+            # reported the ~10-min-ago trough).
+            _old5 = [
+                (t, v) for t, v in _straddle_hist
+                if _now_ts.timestamp() - t >= 270
+            ]
             if _old5:
-                _straddle_5min_ago = _old5[0][1]
-                if _straddle_5min_ago > 0 and atm_straddle > _straddle_5min_ago * 1.06:
+                _straddle_5min_ago = _old5[-1][1]
+                if (
+                    _straddle_5min_ago > 0
+                    and atm_straddle > _straddle_5min_ago * 1.06
+                ):
                     _straddle_expanding = True
         signals["straddle_expanding"] = _straddle_expanding
         signals["straddle_5min_ago"] = _straddle_5min_ago

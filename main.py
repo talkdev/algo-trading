@@ -13,7 +13,7 @@ import time as time_module
 import traceback
 from datetime import datetime, date, time as dtime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from core import (
     Config, Database, RateLimiter, UpstoxClient,
@@ -72,23 +72,40 @@ class MainEngine:
     - Calibration: every calibration_interval_sec (3600s) + at startup + EOD
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        config: Optional[Config] = None,
+        db: Optional[Database] = None,
+        client: Any = None,
+        fill_model: Any = None,
+        replay_mode: bool = False,
+        logger: Any = None,
+        trade_report_source: str = "TRADE ENGINE",
+    ):
         # ── Load configuration ────────────────────────────────────────────
-        self.config = load_config()
+        self.config = config if config is not None else load_config()
+        self.replay_mode = bool(replay_mode)
 
         # ── Initialise database ───────────────────────────────────────────
-        self.db = Database(self.config.db_path)
+        self.db = db if db is not None else Database(self.config.db_path)
 
         # ── Initialise logging ────────────────────────────────────────────
         import logging
-        log_level = getattr(logging, self.config.log_level.upper(), logging.INFO)
-        self.logger = setup_logging(self.db, self.config.log_dir, level=log_level)
+        if logger is not None:
+            self.logger = logger
+        else:
+            log_level = getattr(logging, self.config.log_level.upper(), logging.INFO)
+            self.logger = setup_logging(self.db, self.config.log_dir, level=log_level)
 
         # ── Initialise API client ─────────────────────────────────────────
         self.rate_limiter = RateLimiter(self.config.rate_limits)
-        self.client = UpstoxClient(
-            self.config, self.rate_limiter, self.db, self.logger
-        )
+        if client is not None:
+            self.client = client
+        else:
+            self.client = UpstoxClient(
+                self.config, self.rate_limiter, self.db, self.logger
+            )
 
         # ── Initialise sub-engines ────────────────────────────────────────
         self.market_engine = MarketDataEngine(
@@ -105,33 +122,26 @@ class MainEngine:
         )
         self.execution_engine = ExecutionEngine(
             self.config, self.db, self.market_engine, self.cal_engine,
-            self.client, self.logger
+            self.client, self.logger, fill_model=fill_model
         )
 
         # ── v7: per-trade console report ─────────────────────────────────
-        # Prints the lifecycle block for every trade of the session, on every
-        # cycle: entry legs and fills, exit legs (or the current mark while
-        # the trade is still in progress), status, investment and profit. It
-        # reads the persisted book, so it can only report what the engine
-        # actually did. Config: TRADE_REPORT_ENABLED / TRADE_REPORT_MODE
-        # (each_cycle | on_change | off) / TRADE_REPORT_MAX_PER_CYCLE.
         self.trade_reporter = TradeConsoleReporter(
-            self.db, self.config, self.logger, source="TRADE ENGINE"
+            self.db, self.config, self.logger, source=trade_report_source
         )
 
-        # ── v8: Telegram lifecycle updates ───────────────────────────────
-        # Shares the console reporter, so Trade-<n> on a phone is the same
-        # trade as Trade-<n> on the screen, and the block is rendered by one
-        # piece of code from the persisted book. Disabled quietly when
-        # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not in env.txt.
-        self.telegram = TelegramReporter(
-            self.db, self.config, self.logger,
-            console=self.trade_reporter, source="TRADE ENGINE",
-        )
-        self._started_at    = now_ist()
-        self._start_mode    = telegram_start_mode()
-        # The last cycle's signals, so a heartbeat taken between cycles - or
-        # before the first one - can still name the current regime.
+        # ── v8: Telegram — disabled in replay (no network, no process noise)
+        if self.replay_mode:
+            self.telegram = _ReplayTelegramStub()
+            self._started_at = now_ist()
+            self._start_mode = "replay"
+        else:
+            self.telegram = TelegramReporter(
+                self.db, self.config, self.logger,
+                console=self.trade_reporter, source="TRADE ENGINE",
+            )
+            self._started_at = now_ist()
+            self._start_mode = telegram_start_mode()
         self._last_signals: dict = {}
 
         # ── Loop state ────────────────────────────────────────────────────
@@ -142,20 +152,14 @@ class MainEngine:
         self._last_calibration_time  = 0.0
         self._last_status_print_time = 0.0
         self._eod_done               = False
-        # v58: bot_controller /stop writes logs/algo.stop; poll → flatten → exit.
         self._stop_request_flatten   = False
         self._stop_file = Path(self.config.log_dir) / "algo.stop"
 
         # ── v6 safety state ───────────────────────────────────────────────
-        # Written by the main loop, read by the watchdog. Kept on the
-        # instance rather than in session_state so a crash cannot leave a
-        # stale flag that blocks entries on the next day.
         self._last_cycle_ok_mono   = time_module.monotonic()
         self._last_cycle_ok_at     = now_ist()
         self._feed_stale           = False
         self._feed_stale_alerted   = False
-        # RLock so the same thread can nest a halt flatten inside a guarded
-        # cycle; other threads (the watchdog) are still excluded.
         self._flatten_lock         = threading.RLock()
         self._halt_action_done     = False
         self._soft_halt_alerted    = False
@@ -166,9 +170,36 @@ class MainEngine:
         self._watchdog_failures     = 0
         self._signal_received       = None
 
-        # ── Signal handlers ───────────────────────────────────────────────
-        signal.signal(signal.SIGINT,  self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        # Replay must not steal SIGINT from the parent CLI / harness.
+        if not self.replay_mode:
+            signal.signal(signal.SIGINT,  self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+
+    @classmethod
+    def for_replay(
+        cls,
+        config: Config,
+        db: Database,
+        client: Any,
+        fill_model: Any = None,
+        logger: Any = None,
+        trade_report_source: str = "BACKTEST",
+    ) -> "MainEngine":
+        """Build the live engine wired for DB replay.
+
+        Same `run_one_cycle()` path as production. Only the I/O edges differ:
+        `client` is a ReplayClient, `db` is a scratch book, fills go through
+        PaperOrderExecutor + FillModel. No second decide/monitor loop.
+        """
+        return cls(
+            config=config,
+            db=db,
+            client=client,
+            fill_model=fill_model,
+            replay_mode=True,
+            logger=logger,
+            trade_report_source=trade_report_source,
+        )
 
     # ─────────────────────────────────────────────────────────────────────
     # SIGNAL HANDLING
@@ -2283,6 +2314,26 @@ class MainEngine:
                 self.logger.debug(f"telegram shutdown error: {e}")
 
         self.db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPLAY ADAPTERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ReplayTelegramStub:
+    """No-op Telegram surface so run_one_cycle never hits the network."""
+
+    def describe(self) -> str:
+        return "Telegram: disabled (replay)"
+
+    def __getattr__(self, _name: str):
+        def _noop(*_a, **_k):
+            return None
+        return _noop
+
+
+# Alias used by the backtest redesign brief / docs.
+TradingEngine = MainEngine
 
 
 # ─────────────────────────────────────────────────────────────────────────────
