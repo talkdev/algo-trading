@@ -1091,6 +1091,12 @@ class Config:
         # v58: previously dark refusals that must reach the substitute
         "range_wait", "before_entry_window", "waiting_for_0dte",
         "counter_trend", "feed_stale", "regime_unavailable",
+        # v65m: hard credit-into-trend refuses must reach the debit
+        # substitute (Sep23: hard_invariant_no_calls_into_UPTREND left
+        # LONG_CALL dark for 450 cycles after BPS harvest).
+        "hard_invariant", "no_calls_into", "no_puts_into",
+        "unfinished_high", "unfinished_low", "sticky_no_calls",
+        "sticky_no_puts",
         # PATCH_V13 (round 4): the substitute also answers TIME and
         # POST-STOP refusals.
         #

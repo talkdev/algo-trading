@@ -218,8 +218,13 @@ class MainEngine:
 
     def _print_startup_banner(self) -> None:
         """Print startup configuration banner."""
+        # Build stamp: operator must see this matches tests/test_live_invariants.py
+        # after every restart. Bump when hard-invariant policy changes.
+        _engine_build = "v65m6-pain-center-short"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
+            "Engine Build":          _engine_build,
+            "Hard Invariant":        "no credit into labelled threatened trend",
             "Mode":                  "PAPER TRADE" if self.config.paper_trade_mode
                                      else "*** LIVE TRADING ***",
             "Starting Capital":      f"Rs{self.config.starting_capital:,.0f}",

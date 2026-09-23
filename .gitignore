@@ -17,6 +17,7 @@ env.txt
 .env.*
 *.token
 *.secret
+token.json
 gdrive_credentials.json
 gdrive_token.json
 *-service-account.json
@@ -71,10 +72,16 @@ dist/
 /data/*.db
 /data/*.py
 /data/*.txt
+/data/_roi_runs/*/*.json
+/data/_hunt_runs/*/*.json
+/data/_live_dumps/*/*.json
 /data/*.json
-/data/cache/*
+/data/*.out
+/data/*.err
+/data/baseline/cache/*
 /output/*
 *.pid
+/tests/
 
 patch.py
 # Ignore SQLite temporary/locking files everywhere
@@ -87,3 +94,6 @@ patch.py
 # even though /data/*.db is ignored.
 !/data/per_day/
 !/data/per_day/*.db
+# Oversized daily DB (GitHub 100MB limit) - keep local only
+data/per_day/nifty_algo_2026-09-23.db
+

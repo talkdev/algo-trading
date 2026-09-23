@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v65g)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
+   - [1.1 Latest change logic (v65h)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,7 +40,7 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v65 → v65g) — backtest is a data pump into MainEngine
+### 1.1 Latest change logic (v65 → v65h) — backtest is a data pump into MainEngine
 
 **Architecture rule:** do **not** maintain a second trading loop. Replay feeds historical DB cycles into the **same** live path:
 
@@ -100,7 +100,29 @@ Per-day MainEngine pump vs live books. Live mistakes already refused on current 
 
 Replay after fix: Sep22 BCS @10:37:39 + LONG_PUT stack; Sep17 back to +₹5,905; Sep11/16/18/21 unchanged vs pre-v65g winners. Flat live days (08–10, 15): bot ran but refused (EV / wing-cost IC / IV expand) — not halt state.
 
-**Restart live on v65g.**
+**Restart live on v65h.**
+
+**v65h — Sep23 BCS into UPTREND (signal-stream hunt 22–23):**
+
+Live 23-Sep booked `BEAR_CALL_SPREAD` @11:13 with `price=UPTREND` adx=21 (still OPEN at partial cut). Two generic holes:
+
+| Hole | Fix |
+|---|---|
+| `no_calls_into_measured_uptrend` required `adx_15_mature` | Refuse on UPTREND + `adx ≥ adx_trend_threshold` (mature flag may lag) |
+| Fade ∧ two_way exemption | Self-waived after in-map two-way loc set the fade; now only **day-structure bearish** may sell calls into an UPTREND label. Fade exemption in `_counter_trend_entry_refusal` is RANGE-only |
+
+Sep22 unchanged (soft-lean BCS + HWM LONG_PUT). Restart live on **v65h**.
+
+### 1.1d Live-hardening SOP (stop the patch treadmill)
+
+Past failures (Sep21→22→23) came from reactive day patches with self-waiving exemptions. New rule of work:
+
+1. **Hard invariants first** — `_hard_credit_into_trend_refusal()` is the single source of truth (map + counter-trend). No fade/two-way carve-out may reopen a labelled UPTREND BCS / DOWNTREND BPS.
+2. **Escape-hatch tests before claiming a fix** — `python tests/test_live_invariants.py` (Sep21/23 live tickets as fixtures). If the live escape is not a failing test first, do not ship a gate change.
+3. **Hunt first divergence of decision**, not end-of-day P&L. Replay blotter wins are not proof live will refuse the next bad entry.
+4. **Deploy proof** — restart the live process and confirm PID start time ≥ fix time; banner must show `Engine Build = v65h-invariant`. Preflight: `python preflight_live.py` before `python main.py`.
+5. **No new exemption** that is set by the same function that checks it (circular waiver).
+6. **Inherited bad opens** — entry invariants do not close positions opened under old code; manage/flatten under the exit ladder / operator risk rules.
 
 **Primary DB durability & restore:**
 
@@ -108,7 +130,7 @@ Replay after fix: Sep22 BCS @10:37:39 + LONG_PUT stack; Sep17 back to +₹5,905;
 - `python restore_primary_db.py` — quarantine corrupt primary, merge all usable `data/per_day/*.db` shards, `integrity_check`, atomic replace. Re-run after new live sessions + `split_db_per_day.py`.
 - `backtest_engine.py` with no `--db`: if primary has no usable chain snapshots, **auto-falls back** to `data/per_day/` (still prefers a healthy primary).
 
-**Restart live on v65g** so the running process matches this code (and restart after any primary restore).
+**Restart live on v65h** so the running process matches this code (and restart after any primary restore).
 
 ---
 

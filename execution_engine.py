@@ -3943,6 +3943,11 @@ class ExecutionEngine:
             _xspot = float(state.get("_last_monitor_spot") or 0.0)
         except (TypeError, ValueError):
             _xspot = 0.0
+        if _xspot <= 0:
+            try:
+                _xspot = float(state.get("spot") or 0.0)
+            except (TypeError, ValueError):
+                _xspot = 0.0
         if _xspot > 0:
             state["last_exit_spot"] = _xspot
 

@@ -665,6 +665,8 @@ class MarketDataEngine:
                 "last_exit_is_afternoon_high_fade",
                 "tape_displacement",
                 "session_mean_reversion_book",
+                "session_no_calls_after_uptrend_refuse",
+                "session_no_puts_after_downtrend_refuse",
                 "events_calendar_hash",
                 "events_calendar_snapshot",
                 "day_mode_latched",
