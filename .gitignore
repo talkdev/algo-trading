@@ -17,6 +17,10 @@ env.txt
 .env.*
 *.token
 *.secret
+gdrive_credentials.json
+gdrive_token.json
+*-service-account.json
+/Misc/
 
 # Logs
 /logs/

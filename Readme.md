@@ -8,7 +8,7 @@
 ### Table of Contents
 
 1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v65)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
+   - [1.1 Latest change logic (v65f)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
 2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
@@ -40,7 +40,7 @@ The system is an institutional-grade, cost-aware, intraday options trading and b
 
 ---
 
-### 1.1 Latest change logic (v65) — backtest is a data pump into MainEngine
+### 1.1 Latest change logic (v65 → v65f) — backtest is a data pump into MainEngine
 
 **Architecture rule:** do **not** maintain a second trading loop. Replay feeds historical DB cycles into the **same** live path:
 
@@ -75,7 +75,26 @@ Same timestamps, structures, lots, and exit reasons. Residual P&L delta is FillM
 
 **v65e — morning ADX preview + DTE1 lock arming + lock-hit label:** (1) Immature directional credit may underwrite on **strong** ADX preview (≥ `adx_strong_threshold`, default 40) — matches live adaptive morning prints (Sep11 BPS @10:22 adx≈46) without reopening weak-preview Sep17 chop. (2) Profit-lock **arming** on DTE1+ uses the weekly 22% bar (not the ~29% sqrt-life blend toward expiry 40%). (3) When a profit-locked stop is hit, exit is `CLOSE_TARGET` (not `CLOSE_STOP`) — Priority-3 premium-stop used to fire first and mis-label locked winners as hard stops.
 
-**Restart live on v65e** so the running process matches this code.
+**v65f — Sep8–22 live-class hunt + primary DB restore (generic, no date patches):**
+
+| Area | Failure | Fix |
+|---|---|---|
+| DTE1 P6 ladder | Holiday-shifted Fri (calendar DTE1) still demanded ~40% time-target; Sep11 peak ~18–25% never harvested → lock giveback scraps | Lock-anchored DTE1 ladder: noon ≈ `lock_arm−4pp`, then looser afternoon rungs |
+| Near-expiry trail | Fractional keep alone unlocked ~half a deep peak (stop stuck ~2+ pts above HWM liq) | `profit_lock_max_giveback_pts_dte0/dte1` (default **2.0**); DTE2+ uncapped |
+| Soft directional | `loc≥0.70` skipped tape agreement → puts into bearish EMA (live Sep18 CHOPPY path) | Soft directional **always** requires `_soft_tape_agrees` |
+| Away-side credit | Late BCS refused on credit_risk just under weekly min (Sep22-class) | Away-side / with-trend credit may use late `credit_risk_ratio` floor |
+| Debit lock label | `profit_lock_activated=1` but null `profit_lock_stop_level` → D1 fell through to `CLOSE_STOP` (stop budget) | Armed debit trail hit → `CLOSE_TARGET` using lock level or `stop_premium` |
+| IC / butterfly harvest | Live Sep16/17 IC ~7–11% of credit to HARD_EXIT, lock never armed, `was_exit_late` | `profit_lock_pct_symmetric` (default **0.10**) + soft P6 ladder 12%/10%/8% for IC/fly |
+| Counter-trend map | Live Sep21 BCS @13:35 `price=UPTREND` adx=23 → HARD_EXIT −₹261 | `_map_regime`: refuse measured UPTREND BCS unless confirmed two-way high fade (plus existing counter-trend gate) |
+| Primary DB | `nifty_algo_v3.db` SQLite-corrupt (`COUNT(*)` / audit failed); looked like empty install | See durability + restore below |
+
+**Primary DB durability & restore:**
+
+- Live `Database`: `synchronous=FULL`, 60s busy timeout, WAL checkpoint on close + after each chain-snapshot burst; startup refuses a primary that fails `quick_check` / chain `COUNT(*)` (message points at restore).
+- `python restore_primary_db.py` — quarantine corrupt primary, merge all usable `data/per_day/*.db` shards, `integrity_check`, atomic replace. Re-run after new live sessions + `split_db_per_day.py`.
+- `backtest_engine.py` with no `--db`: if primary has no usable chain snapshots, **auto-falls back** to `data/per_day/` (still prefers a healthy primary).
+
+**Restart live on v65f** so the running process matches this code (and restart after any primary restore).
 
 ---
 
@@ -1105,14 +1124,16 @@ For each recorded snapshot in `day.cycles`:
 
 No parallel `decide()` / `monitor_position()` / `entry_possible` reimplementation.
 
-#### 3. CLI (unchanged):
-
 #### 3. CLI Command Line Reference:
 
 ```bash
-python3 backtest_engine.py [OPTIONS]
+python backtest_engine.py [OPTIONS]
+python restore_primary_db.py          # rebuild primary from data/per_day
+python split_db_per_day.py [--force]  # refresh shards; then backs up primary db/wal/shm to Google Drive day folder
 ```
 
+- After every successful `split_db_per_day.py` run (not `--verify-only` / `--skip-gdrive-backup`): checkpoint WAL, upload `nifty_algo_v3.db` + `-wal` + `-shm` into Drive folder `1UyOCpw6VwW8yva5Qd88qbb8MAk-jXRDt` under a `YYYY-MM-DD` day folder; same-day re-runs replace a file only when local MD5 differs. **Auth:** OAuth user account (put desktop client secrets at `Misc/gdrive_credentials.json`, one browser sign-in → `Misc/gdrive_token.json`). Service accounts cannot upload into normal My Drive (no storage quota); use a Shared Drive + `GDRIVE_USE_SERVICE_ACCOUNT=true` if you insist on SA.
+- Default (no `--db`): use `config.db_path` when it has readable `option_chain_snapshot` rows; otherwise fall back to every usable `data/per_day/*.db` shard (corrupt/empty primary no longer looks like a “fresh install”).
 - `--db [PATHS ...]`: Path to one or more SQLite database files, or a directory containing `nifty_algo_YYYY-MM-DD.db` files.
 - `--from YYYY-MM-DD`: Start date filter (inclusive).
 - `--to YYYY-MM-DD`: End date filter (inclusive).
@@ -1130,6 +1151,8 @@ python3 backtest_engine.py [OPTIONS]
   - `each_cycle`: Prints trade mark-to-market status on every evaluation cycle.
   - `on_change`: Prints trade only on entry, exit, or significant P&L change.
   - `off`: Suppresses per-trade logging, outputting only the final audit.
+
+**Ops note:** after a crash that leaves `data/nifty_algo_v3.db` unreadable, run `python restore_primary_db.py` (shards under `data/per_day/` are the source of truth). Keep shards current with `python split_db_per_day.py` after healthy live sessions.
 
 #### 4. Diagnostic Funnel Architecture (`STAGE_ORDER`):
 
