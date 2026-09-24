@@ -1398,6 +1398,10 @@ class Config:
     # resolved (RANGE may trade; directional BEAR still waits for fade/clock).
     open_spike_pullback_pts:           float = 30.0
     open_spike_fade_min_range_pts:     float = 70.0
+    # Earlier release of open_spike_wait when tape retests the upper zone
+    # (lower-high geography), not when sitting at session lows.
+    open_spike_lower_high_after_hhmm:  str   = "10:45"
+    open_spike_lower_high_loc_min:     float = 0.70
 
     # ── v44: horizon-blended accessors (single source for every DTE-keyed
     # risk quantity; see dte_blend() at module level). Each returns the

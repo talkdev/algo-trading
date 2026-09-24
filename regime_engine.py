@@ -1668,6 +1668,13 @@ class RegimeClassifier:
         Price-regime alone is not enough: ORB can mint UPTREND with ADX=0
         (Sep17 10:02). Independent tape (EMA structure or VWAP side) must
         agree. Same at every DTE.
+
+        When EMA is still INSUFFICIENT_DATA (common until ~11:00 on the
+        5m/15m stack), require only a same-sign VWAP lean at half the
+        normal buffer. Live 2026-09-24 spent the whole morning in
+        RANGE_VERTICAL_ADX_IMMATURE with loc≈0.17 BEARISH and
+        vwap_dist≈−0.085 — full 0.10% buffer blocked an evidenced soft
+        BEAR while EMA had nothing to say yet.
         """
         price = str(signals.get("price_regime") or "")
         ema = str(signals.get("ema_structure") or "")
@@ -1677,6 +1684,9 @@ class RegimeClassifier:
             vd = 0.0
         buf = abs(float(getattr(
             self.config, "counter_trend_vwap_dist_min_pct", 0.10)))
+        _ema_ready = ema in ("BULLISH", "BEARISH", "NEUTRAL", "MIXED")
+        if not _ema_ready:
+            buf = max(0.04, 0.5 * buf)
         if side == "BULL":
             return (
                 price in ("UPTREND", "STRONG_UPTREND", "RANGE", "CHOPPY")
@@ -1756,6 +1766,21 @@ class RegimeClassifier:
         dte          = signals.get("actual_dte")
         spot         = float(signals.get("spot") or 0.0)
         notes_parts: List[str] = []
+
+        # Soft-tape / location helpers read price_regime from signals. The
+        # enum `price` is authoritative here; the signals key is often still
+        # unset until process_signals writes the confirmed snapshot back
+        # (live 2026-09-24: soft BEAR had loc/vd/time all green but
+        # price_regime=None → tape always False → RANGE_VERTICAL_ADX_IMMATURE
+        # all morning).
+        if not signals.get("price_regime"):
+            signals["price_regime"] = getattr(price, "value", None) or str(price)
+        if not signals.get("positioning_regime"):
+            signals["positioning_regime"] = getattr(pos, "value", None) or str(pos)
+        if not signals.get("vol_regime"):
+            signals["vol_regime"] = getattr(vol, "value", None) or str(vol)
+        if not signals.get("confidence_level"):
+            signals["confidence_level"] = getattr(conf, "value", None) or str(conf)
 
         if event_day:
             notes_parts.append(f"EVENT:{event_name}")
@@ -2168,7 +2193,9 @@ class RegimeClassifier:
 
         # ── Price Regime → Structure ──────────────────────────────────────
         if price == PriceRegime.RANGE:
-            final, note = self._classify_range(vol, pos, conf, signals)
+            final, note = self._classify_range(
+                vol, pos, conf, signals, current_time=current_time,
+            )
             notes_parts.append(note)
             return final, " | ".join(notes_parts), False
 
@@ -2190,6 +2217,7 @@ class RegimeClassifier:
         pos:     PositioningRegime,
         conf:    ConfidenceLevel,
         signals: dict,
+        current_time: Optional[time] = None,
     ) -> Tuple[FinalRegime, str]:
         """
         Classify final regime when price is RANGE.
@@ -2200,7 +2228,8 @@ class RegimeClassifier:
         adx_15       = float(signals.get("adx_15") or 0.0)
         spot         = float(signals.get("spot") or 0.0)
         max_pain     = float(signals.get("max_pain") or 0.0)
-        current_time = now_ist().time()
+        # Prefer the classify_final clock (sim clock in BT, wall in live).
+        current_time = current_time if current_time is not None else now_ist().time()
         r_str        = float(signals.get("resistance_strength") or 0.0)
 
         # PATCH_V23: failed-break vertical for every tradeable DTE.
@@ -2948,6 +2977,33 @@ class RegimeEngine:
         if new_regime.final_regime == self._current_regime.final_regime:
             self._pending_regime = None
             self._pending_count  = 0
+            return new_regime
+
+        # Leaving ADX-immature / soft-blocked NO_TRADE into defined-risk
+        # premium sell: confirm immediately. Persistence here only delayed
+        # the first valid vertical after Wilder finally printed (live
+        # 2026-09-24 10:59 mature→PREMIUM_SELL_BEAR still showed
+        # RANGE_VERTICAL_ADX_IMMATURE for the pending window, then the
+        # partial session ended). Whipsaw risk is low: immature NO_TRADE
+        # is not a traded regime.
+        _cur_notes = str(
+            getattr(self._current_regime, "final_regime_notes", "") or ""
+        ).upper()
+        _leave_immature = (
+            self._current_regime.final_regime == FinalRegime.NO_TRADE.value
+            and (
+                "ADX_IMMATURE" in _cur_notes
+                or "SOFT_DIRECTIONAL" in _cur_notes
+            )
+            and str(new_regime.final_regime or "").startswith("PREMIUM_SELL")
+        )
+        if _leave_immature:
+            self._pending_regime = None
+            self._pending_count = 0
+            self.logger.info(
+                f"Regime confirmed immediately (leave ADX-immature NO_TRADE): "
+                f"{new_regime.final_regime}"
+            )
             return new_regime
 
         # New regime candidate

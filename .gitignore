@@ -68,19 +68,10 @@ dist/
 
 # Ignore database files directly inside /data/
 # Example: data/nifty_algo_v3.db
-/data/*.db
-/data/*.py
-/data/*.txt
-/data/_roi_runs/*/*.json
-/data/_hunt_runs/*/*.json
-/data/_live_dumps/*/*.json
-/data/*.json
-/data/*.out
-/data/*.err
-/data/baseline/cache/*
+/data/*
+
 /output/*
 *.pid
-/tests/
 
 patch.py
 # Ignore SQLite temporary/locking files everywhere
@@ -95,6 +86,8 @@ patch.py
 !/data/per_day/*.db
 # Oversized daily DB (GitHub 100MB limit) - keep local only
 data/per_day/nifty_algo_2026-09-23.db
+data/per_day/nifty_algo_2026-09-24.db
+data/per_day/nifty_algo_2026-09-24.swap.db
 
 # Misc: ignore by default (notes, credentials); allow registrar scripts only
 /Misc/**

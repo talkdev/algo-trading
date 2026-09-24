@@ -841,12 +841,23 @@ class StrategyEngine:
         if signals.get("price_regime") in ("OBSERVING",):
             return "NO_TRADE", "opening_range_pending"
 
-        # Unresolved open-HIGH wick: defer BEAR/RANGE credit until 12:15
-        # so the book is free for the lower-high fade. Tape rule on every
-        # non-expiry session. Expiry day already waits until 10:30 and
-        # cuts entries at 13:00 — a second 12:15 clock would leave a
-        # 45-minute window and block the trend-side vertical a crash
-        # session needs (measured 2026-09-15).
+        # Unresolved open-HIGH wick: defer BEAR/RANGE credit until a
+        # lower-high is evidenced, or until 12:15 / afternoon_high_fade.
+        # Tape rule on every non-expiry session. Expiry day already waits
+        # until 10:30 and cuts entries at 13:00 — a second 12:15 clock
+        # would leave a 45-minute window and block the trend-side
+        # vertical a crash session needs (measured 2026-09-15).
+        #
+        # Do NOT carve out "already at lows": soft BEAR after an open-high
+        # spike still competes with the lower-high fade book (replay
+        # 2026-09-10/23: early BCS at 10:15 wiped baseline afternoon
+        # verticals). Regime may soft-unlock; this gate only defers entry.
+        #
+        # v65m7b: "unresolved" is not wall-clock alone. A lower-high is
+        # evidenced when, after 10:45, location sits in the UPPER zone
+        # (loc>=0.70) of the session range — i.e. the tape is retesting
+        # the post-spike area where a fade/BCS belongs. Morning dumps at
+        # loc≈0.17 stay deferred (Sep24 soft BEAR at lows).
         try:
             _dte_os = int(signals.get("actual_dte")) if signals.get("actual_dte") is not None else -1
         except (TypeError, ValueError):
@@ -873,7 +884,27 @@ class StrategyEngine:
                 ).time()
             except Exception:
                 _os_until = dtime(12, 15)
-            if current_time < _os_until and not signals.get("afternoon_high_fade"):
+            _os_rng, _os_loc, _, _ = self._session_range_pos(signals)
+            try:
+                _lh_after = datetime.strptime(
+                    str(getattr(self.config, "open_spike_lower_high_after_hhmm", "10:45")),
+                    "%H:%M",
+                ).time()
+            except Exception:
+                _lh_after = dtime(10, 45)
+            _lh_loc = float(
+                getattr(self.config, "open_spike_lower_high_loc_min", 0.70) or 0.70
+            )
+            _lower_high_ready = (
+                current_time >= _lh_after
+                and _os_rng >= 50.0
+                and _os_loc >= _lh_loc
+            )
+            if (
+                current_time < _os_until
+                and not signals.get("afternoon_high_fade")
+                and not _lower_high_ready
+            ):
                 return "NO_TRADE", "open_spike_wait_unresolved_lower_high"
         if signals.get("chain_stale"):
             return "NO_TRADE", "chain_stale_cannot_validate_strikes"
