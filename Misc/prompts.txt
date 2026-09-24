@@ -678,6 +678,13 @@ Maintain a balanced trade-off between CAGR, win rate, expectancy, profit factor,
 
 do you want to do additional troubleshooting and fixing to make the engine not fail in live market?
 
+did you apply general, robust logic across the engine DTEs or rather added date-tied patch.?
+
+
+
+do not react to single-day failures instead of using the replay pump to hunt live-class bugs ahead of the next session. Scan all days starting 8th till today for giveback, exit, and live-vs-replay mismatches now.
+Provide rootcause,fixes you applied in easy language. never ever apply date-tied patch instead fix the engine logic for all market scenarios for all days.
+If multi-day hunt run fails then fix it and re-run it untill you are able to achieve your goal finding live trade bugs and fix them.
 
 
 
@@ -712,3 +719,29 @@ Existing results:
 Maintain a balanced trade-off between CAGR, win rate, expectancy, profit factor, Sharpe/Sortino, maximum drawdown, risk-reward ratio, trade frequency, turnover, and OOS/walk-forward robustness. Penalize excessive drawdown, low trade count, overfitting, parameter sensitivity, and regime-dependent instability. Prioritize robust, repeatable risk-adjusted alpha over maximum historical profit.
 
 
+
+
+
+
+Do not hallucinate.
+Continue the live-trading bug hunt using the replay pump. Perform engine tuning by individually verifying each day's signal stream.
+Also run whatever you plan to run must be in parallel as independent OS process for all days. Because your all script runs are taking infinite number of time because you do not run each day in parallel as a separate OS process in in new console.
+MANDATORY: Tune the engine and gate graphs and paths instead of adding date-tied patches.
+Baseline:
+| Date           | Daily Profit (₹) |
+| -------------- | ---------------: |
+| 2026-09-08     |         ₹2,861 |
+| 2026-09-09     |         ₹5,553 |
+| 2026-09-10     |         ₹4,055 |
+| 2026-09-11     |         ₹9,897 |
+| 2026-09-15     |        ₹14,583 |
+| 2026-09-16     |         ₹4,274 |
+| 2026-09-17     |         ₹1,489 |
+| 2026-09-18     |         ₹1,687 |
+| 2026-09-21     |         ₹6,905 |
+| 2026-09-22     |         ₹3,487 |
+| 2026-09-23     |         ₹5,386 |
+| 2026-09-24     |             ₹0 |
+| Total          |        ₹60,179 |
+
+Final report format: Failure → Root Cause → Fix Applied → Regression Result → Trading/P&L Impact for each days & delta.
