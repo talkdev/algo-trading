@@ -220,7 +220,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m7b-spike-lower-high"
+        _engine_build = "v65m7f-warmup-extreme-only"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,

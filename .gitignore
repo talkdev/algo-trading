@@ -79,15 +79,6 @@ patch.py
 *.db-shm
 *.db-journal
 
-# IMPORTANT:
-# Keep the smaller daily databases under /data/per_day/
-# even though /data/*.db is ignored.
-!/data/per_day/
-!/data/per_day/*.db
-# Oversized daily DB (GitHub 100MB limit) - keep local only
-data/per_day/nifty_algo_2026-09-23.db
-data/per_day/nifty_algo_2026-09-24.db
-data/per_day/nifty_algo_2026-09-24.swap.db
 
 # Misc: ignore by default (notes, credentials); allow registrar scripts only
 /Misc/**

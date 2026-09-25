@@ -2740,8 +2740,15 @@ class RegimeClassifier:
             conflict_reduction *= 0.75
 
         # UNCLEAR positioning
+        # When the range resolver already set weekly_range_size_discount
+        # (e.g. RANGE_UNCLEAR_POS_STRONG_SELL clip at unclear_range_size_weekly),
+        # that discount IS the unclear-size policy. Applying the generic
+        # ×0.50 on top double-crushes HIGH-confidence STRONG_SELL midweek
+        # tickets (live 2026-09-25: day 0.55 × 0.50 × 0.75 → ~0.21 schedule
+        # before lots floor). Same rule at every DTE.
         if pos == PositioningRegime.UNCLEAR:
-            conflict_reduction *= 0.50
+            if signals.get("weekly_range_size_discount") is None:
+                conflict_reduction *= 0.50
 
         # Borderline sell
         if borderline_sell:

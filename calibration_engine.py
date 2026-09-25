@@ -365,6 +365,27 @@ class CalibrationEngine:
             notes=row.get("notes", ""),
         )
 
+        # Heal stuck DTE2+ positive-feedback cage (legacy hard-cap 0.35 on
+        # Wed/Thu/Fri). Positive midweek evidence must not permanently
+        # half-size the book vs NIFTY_2026 defaults.
+        _healed = False
+        for _attr, _floor in (
+            ("day_size_wednesday", float(d.day_size_wednesday)),
+            ("day_size_thursday",  float(d.day_size_thursday)),
+            ("day_size_friday",    float(d.day_size_friday)),
+        ):
+            _cur = float(getattr(state, _attr) or 0.0)
+            if 0.0 < _cur <= 0.35 + 1e-9:
+                setattr(state, _attr, _floor)
+                _healed = True
+        if _healed:
+            self.logger.info(
+                "Healed day_size cage → "
+                f"W={state.day_size_wednesday:.2f} "
+                f"T={state.day_size_thursday:.2f} "
+                f"F={state.day_size_friday:.2f}"
+            )
+
         # Life-blended VRP anchors (display / legacy fields; live gate uses
         # get_vrp_sell_for_dte → by_dte continuously).
         state.vrp_sell_dte0     = vrp_sell * by_dte(0, 0.75, 1.10)
@@ -975,32 +996,50 @@ class CalibrationEngine:
             if len(dte2_pnls) >= 5:
                 dte2_wr = sum(1 for p in dte2_pnls if p > 0) / len(dte2_pnls)
                 avg_pnl_2 = sum(dte2_pnls) / len(dte2_pnls)
+                # Per-weekday ceilings = NIFTY_2026 defaults (same as day_size
+                # table). Positive DTE2+ feedback must climb toward those
+                # ceilings — never a hard 0.35 cage. That cage permanently
+                # half-sized HIGH-confidence midweek credit vs the config
+                # book (live sized Thu at 0.35 → 2 lots while replay at
+                # default 0.65 → 5 lots on the same BCS).
+                _dte2_ceil = {
+                    "day_size_wednesday": float(d.day_size_wednesday),
+                    "day_size_thursday":  float(d.day_size_thursday),
+                    "day_size_friday":    float(d.day_size_friday),
+                }
                 if avg_pnl_2 < 0:
                     for attr in ["day_size_wednesday", "day_size_thursday", "day_size_friday"]:
                         old_v = getattr(state, attr)
                         setattr(state, attr, max(old_v * 0.80, 0.15))
                     self.logger.info(
                         f"  DTE2+ feedback: wr={dte2_wr:.1%} avg=Rs{avg_pnl_2:.0f} "
-                        f"negative -> reducing Wed/Thu/Fri sizes"
+                        f"negative -> reducing Wed/Thu/Fri sizes "
+                        f"(W={state.day_size_wednesday:.2f} "
+                        f"T={state.day_size_thursday:.2f} "
+                        f"F={state.day_size_friday:.2f})"
                     )
                 elif avg_pnl_2 > 0 and dte2_wr >= 0.60:
                     for attr in ["day_size_wednesday", "day_size_thursday", "day_size_friday"]:
-                        old_v = getattr(state, attr)
-                        setattr(state, attr, min(old_v * 1.05, 0.35))
+                        old_v = float(getattr(state, attr))
+                        setattr(
+                            state,
+                            attr,
+                            round(min(old_v * 1.05, _dte2_ceil[attr]), 2),
+                        )
                     self.logger.info(
                         f"  DTE2+ feedback: wr={dte2_wr:.1%} avg=Rs{avg_pnl_2:.0f} "
-                        f"positive -> slightly increasing Wed/Thu/Fri sizes"
+                        f"positive -> raising Wed/Thu/Fri toward defaults "
+                        f"(W={state.day_size_wednesday:.2f} "
+                        f"T={state.day_size_thursday:.2f} "
+                        f"F={state.day_size_friday:.2f})"
                     )
+                else:
                     self.logger.info(
-                        f"  DTE1 feedback: wr={dte1_wr:.1%} low → "
-                        f"Monday size {old:.2f} → {state.day_size_monday:.2f}"
-                    )
-                elif shrunk_wr >= 0.65:
-                    old = state.day_size_monday
-                    state.day_size_monday = min(state.day_size_monday * 1.10, 0.70)
-                    self.logger.info(
-                        f"  DTE1 feedback: wr={dte1_wr:.1%} high → "
-                        f"Monday size {old:.2f} → {state.day_size_monday:.2f}"
+                        f"  DTE2+ feedback: wr={dte2_wr:.1%} avg=Rs{avg_pnl_2:.0f} "
+                        f"stable -> Wed/Thu/Fri unchanged "
+                        f"(W={state.day_size_wednesday:.2f} "
+                        f"T={state.day_size_thursday:.2f} "
+                        f"F={state.day_size_friday:.2f})"
                     )
 
         except Exception as e:
