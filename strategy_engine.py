@@ -1996,36 +1996,34 @@ class StrategyEngine:
                     )
                     return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
             else:
-                # Immature ADX: soft-lean the away side when location is a
-                # true extreme OR when warmup (no EMA yet) treats mature lean
-                # thresholds as location evidence — same rule live used on
-                # 2026-09-22 (BCS @10:37 loc=0.08, selection_reason
-                # range_soft_location_lean_0.08:warmup, 5 lots).
-                #
-                # v64 removed this and replay stayed flat
-                # (range_wait_no_pin_no_lean) while live booked +₹3.4k.
-                # Soft EMA/VWAP evidence still required for NON-extreme
-                # soft-band leans; extremes and warmup threshold leans do not.
+                # Immature ADX: soft-lean the away side only on a TRUE
+                # extreme (>=0.70 / <=0.30) or when EMA/VWAP tape agrees.
+                # Warmup (EMA INSUFFICIENT_DATA) must NOT promote the mild
+                # mature-lean band (0.38/0.62) into an evidence-free entry —
+                # that fired live 2026-09-25 BCS at loc=0.36:warmup into a
+                # RANGE book that then ground against the short calls.
+                # True extremes still enter without EMA (Sep22 loc=0.08
+                # already qualifies as <=0.30; the mild-band widening was
+                # never required for that ticket).
                 _ext_hi = _loc >= 0.70
                 _ext_lo = _loc <= 0.30
                 _warmup = (
                     str(signals.get("ema_structure") or "")
                     == "INSUFFICIENT_DATA"
                 )
-                if _warmup:
-                    _ext_hi = _ext_hi or (_loc >= self.RANGE_LEAN_HI)
-                    _ext_lo = _ext_lo or (_loc <= self.RANGE_LEAN_LO)
                 if (_loc >= self.RANGE_SOFT_LEAN_HI
                         and (_ext_hi or self._soft_location_evidence(
                             signals, "BULL"))):
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BULL_PUT_SPREAD"
-                        f"{':warmup_loc' if _warmup and _ext_hi else ''}"
+                        f"{':extreme' if _ext_hi else ''}"
+                        f"{':warmup' if _warmup else ''}"
                     )
                     return BULL_PUT_SPREAD, (
                         f"range_soft_location_lean_{_loc:.2f}"
-                        f"{':warmup' if _warmup and _loc >= self.RANGE_LEAN_HI else ''}"
+                        f"{':extreme' if _ext_hi else ''}"
+                        f"{':warmup' if _warmup else ''}"
                     )
                 if (_loc <= self.RANGE_SOFT_LEAN_LO
                         and (_ext_lo or self._soft_location_evidence(
@@ -2033,11 +2031,13 @@ class StrategyEngine:
                     self.logger.info(
                         f"Range resolution: soft lean loc={_loc:.2f} "
                         f"-> BEAR_CALL_SPREAD"
-                        f"{':warmup_loc' if _warmup and _ext_lo else ''}"
+                        f"{':extreme' if _ext_lo else ''}"
+                        f"{':warmup' if _warmup else ''}"
                     )
                     return BEAR_CALL_SPREAD, (
                         f"range_soft_location_lean_{_loc:.2f}"
-                        f"{':warmup' if _warmup and _loc <= self.RANGE_LEAN_LO else ''}"
+                        f"{':extreme' if _ext_lo else ''}"
+                        f"{':warmup' if _warmup else ''}"
                     )
 
         # 4. true pin only — never a catch-all. Condor/fly need a NARROW
@@ -6830,11 +6830,10 @@ class StrategyEngine:
                 size_mult = max(size_mult, float(_weekly_discount or 1.0), 0.90) * _boost
             except (TypeError, ValueError):
                 size_mult = max(size_mult, 0.90) * 1.05
-        elif _weekly_discount:
-            try:
-                size_mult = size_mult * float(_weekly_discount)
-            except (TypeError, ValueError):
-                pass
+        # weekly_range_size_discount is already folded into
+        # signals['size_multiplier'] by regime compute_size (PATCH_V23).
+        # Do NOT multiply again here — that double-crushed unclear / soft
+        # directional clips on every DTE.
         params    = self.compute_params(
             strategy_name, selection_reason, signals, size_mult
         )
