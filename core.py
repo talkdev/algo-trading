@@ -3746,7 +3746,23 @@ class UpstoxClient:
                     maybe_delivered=(category == "order"),
                 )
 
-            resp.raise_for_status()
+            # Upstox answers some "nothing to do" order cases as HTTP 400
+            # with UDAPI1109 in the body. raise_for_status() would turn that
+            # into a bare "400 Client Error" and drop the body, so cancel_all
+            # could not recognise the noop (live FEED_STALE flatten noise).
+            if resp.status_code >= 400:
+                body_txt = resp.text or ""
+                raise UpstoxAPIError(
+                    f"HTTP {resp.status_code} on {endpoint_key}: "
+                    f"{body_txt[:300]}",
+                    status_code=resp.status_code,
+                    response_body=body_txt,
+                    maybe_delivered=(
+                        category == "order"
+                        and resp.status_code in (500, 502, 503, 504)
+                    ),
+                )
+
             data = resp.json()
             self.db.log_api_call(
                 category, endpoint_key, method, status_code, elapsed_ms
@@ -4091,7 +4107,14 @@ class UpstoxClient:
                 "DELETE", "cancel_all_orders", category="order", params=params
             )
         except UpstoxAPIError as e:
-            if "UDAPI1109" in str(e.response_body or "") or "No open or pending" in str(e):
+            body = str(e.response_body or "")
+            msg = str(e)
+            if (
+                "UDAPI1109" in body
+                or "UDAPI1109" in msg
+                or "No open or pending" in body
+                or "No open or pending" in msg
+            ):
                 return {"status": "noop", "order_ids": [], "errors": []}
             raise
         body = data or {}
