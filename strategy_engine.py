@@ -1522,6 +1522,28 @@ class StrategyEngine:
             )
             if _hard_u:
                 return "NO_TRADE", _hard_u
+            # RANGE-origin OR-mid short-circuit with price still RANGE:
+            # defer to range resolution (symmetric with BEAR path).
+            _px_u = str(signals.get("price_regime") or "")
+            if (
+                _px_u == "RANGE"
+                and not bool(signals.get("afternoon_low_fade"))
+                and not bool(signals.get("neutral_range_vertical"))
+            ):
+                strategy, why = self._resolve_range_strategy(
+                    dte, or_condition, adx_15, adx_15_mature,
+                    current_time, vol_regime, signals,
+                )
+                if strategy == "NO_TRADE":
+                    return "NO_TRADE", (
+                        f"range_origin_bull_deferred:{why}"
+                    )
+                reason = (
+                    f"regime:{final_regime}:conf={confidence}:"
+                    f"dte={dte}:or={or_condition}:adx={adx_15:.0f}:"
+                    f"price={_px_u}:deferred_range:{why}"
+                )
+                return strategy, reason
             # ── PATCH_V13: the day's own structure vetoes selling the
             # downside. A gap-down that has NOT been filled, with spot still
             # under the previous close and a call wall above it, is a heavy
@@ -1588,6 +1610,31 @@ class StrategyEngine:
             )
             if _hard_b:
                 return "NO_TRADE", _hard_b
+            # RANGE-origin OR-mid / positioning short-circuit still prints
+            # price=RANGE. Blind BCS here skipped range soft-lean evidence
+            # (Sep25 10:49 RANGE_BEARISH_SPOT_BELOW_OR_MID). Fade / failed-
+            # break tickets already set their flags — keep those. Else
+            # resolve as a range book so location+tape gates apply.
+            _px_b = str(signals.get("price_regime") or "")
+            if (
+                _px_b == "RANGE"
+                and not bool(signals.get("afternoon_high_fade"))
+                and not bool(signals.get("neutral_range_vertical"))
+            ):
+                strategy, why = self._resolve_range_strategy(
+                    dte, or_condition, adx_15, adx_15_mature,
+                    current_time, vol_regime, signals,
+                )
+                if strategy == "NO_TRADE":
+                    return "NO_TRADE", (
+                        f"range_origin_bear_deferred:{why}"
+                    )
+                reason = (
+                    f"regime:{final_regime}:conf={confidence}:"
+                    f"dte={dte}:or={or_condition}:adx={adx_15:.0f}:"
+                    f"price={_px_b}:deferred_range:{why}"
+                )
+                return strategy, reason
             # PATCH_V31: never sell calls at the day low on a two-way tape
             # (10-Sep printed RANGE_BEARISH_SPOT_BELOW_OR_MID at loc≤0.10).
             if not signals.get("afternoon_high_fade"):
@@ -1977,68 +2024,76 @@ class StrategyEngine:
         _event = bool(signals.get("event_day") or signals.get("event_announced"))
 
         # 3. location lean — sell the away side of a real session range.
-        # Mature ADX: standard thresholds. Soft evidence: EMA/VWAP, OR a
-        # clear extreme location (>=0.70 / <=0.30). Live 21-Sep printed
-        # loc=0.71 with vwap_dist only +0.02 — VWAP lag must not veto the
-        # away-side vertical while a false pin waits.
+        # Mature mild band (0.62/0.38) needs trend-level ADX + non-UNCLEAR
+        # positioning. Soft/extreme path is separate (not an else-dump): EMA
+        # evidence also requires non-UNCLEAR. Live Sep25 failures:
+        #   10:35 soft 0.36:warmup, 10:56 mature 0.38+UNCLEAR+EMA,
+        #   12:31 mature-flag adx=11 loc=0.62 under UNCLEAR.
         if (not _event) and _rng >= self.RANGE_LEAN_MIN_PTS:
-            if adx_15_mature:
-                if _loc >= self.RANGE_LEAN_HI:
+            _adx_trend = float(
+                getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+            )
+            _pos = str(signals.get("positioning_regime") or "")
+            _pos_ok_bull = _pos in ("BULLISH", "RANGE", "STRONG_RANGE")
+            _pos_ok_bear = _pos in ("BEARISH", "RANGE", "STRONG_RANGE")
+            _warmup = (
+                str(signals.get("ema_structure") or "")
+                == "INSUFFICIENT_DATA"
+            )
+            if _warmup:
+                _ext_hi = _loc >= 0.70 and _pos in ("RANGE", "STRONG_RANGE")
+                _ext_lo = _loc <= 0.30 and _pos in ("RANGE", "STRONG_RANGE")
+            else:
+                _ext_hi = _loc >= 0.70 and _pos_ok_bull
+                _ext_lo = _loc <= 0.30 and _pos_ok_bear
+
+            if (adx_15_mature and adx_15 >= _adx_trend):
+                if _loc >= self.RANGE_LEAN_HI and _pos_ok_bull:
                     self.logger.info(
                         f"Range resolution: loc={_loc:.2f} >= {self.RANGE_LEAN_HI}"
                         f" -> BULL_PUT_SPREAD (puts sit away from price)"
                     )
                     return BULL_PUT_SPREAD, f"range_location_lean_{_loc:.2f}"
-                if _loc <= self.RANGE_LEAN_LO:
+                if _loc <= self.RANGE_LEAN_LO and _pos_ok_bear:
                     self.logger.info(
                         f"Range resolution: loc={_loc:.2f} <= {self.RANGE_LEAN_LO}"
                         f" -> BEAR_CALL_SPREAD (calls sit away from price)"
                     )
                     return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
-            else:
-                # Immature ADX: soft-lean the away side only on a TRUE
-                # extreme (>=0.70 / <=0.30) or when EMA/VWAP tape agrees.
-                # Warmup (EMA INSUFFICIENT_DATA) must NOT promote the mild
-                # mature-lean band (0.38/0.62) into an evidence-free entry —
-                # that fired live 2026-09-25 BCS at loc=0.36:warmup into a
-                # RANGE book that then ground against the short calls.
-                # True extremes still enter without EMA (Sep22 loc=0.08
-                # already qualifies as <=0.30; the mild-band widening was
-                # never required for that ticket).
-                _ext_hi = _loc >= 0.70
-                _ext_lo = _loc <= 0.30
-                _warmup = (
-                    str(signals.get("ema_structure") or "")
-                    == "INSUFFICIENT_DATA"
+
+            # Soft / extreme lean — evidence never unlocks UNCLEAR OI.
+            _ev_bull = (
+                _pos_ok_bull
+                and self._soft_location_evidence(signals, "BULL")
+            )
+            _ev_bear = (
+                _pos_ok_bear
+                and self._soft_location_evidence(signals, "BEAR")
+            )
+            if _loc >= self.RANGE_SOFT_LEAN_HI and (_ext_hi or _ev_bull):
+                self.logger.info(
+                    f"Range resolution: soft lean loc={_loc:.2f} "
+                    f"-> BULL_PUT_SPREAD"
+                    f"{':extreme' if _ext_hi else ''}"
+                    f"{':warmup' if _warmup else ''}"
                 )
-                if (_loc >= self.RANGE_SOFT_LEAN_HI
-                        and (_ext_hi or self._soft_location_evidence(
-                            signals, "BULL"))):
-                    self.logger.info(
-                        f"Range resolution: soft lean loc={_loc:.2f} "
-                        f"-> BULL_PUT_SPREAD"
-                        f"{':extreme' if _ext_hi else ''}"
-                        f"{':warmup' if _warmup else ''}"
-                    )
-                    return BULL_PUT_SPREAD, (
-                        f"range_soft_location_lean_{_loc:.2f}"
-                        f"{':extreme' if _ext_hi else ''}"
-                        f"{':warmup' if _warmup else ''}"
-                    )
-                if (_loc <= self.RANGE_SOFT_LEAN_LO
-                        and (_ext_lo or self._soft_location_evidence(
-                            signals, "BEAR"))):
-                    self.logger.info(
-                        f"Range resolution: soft lean loc={_loc:.2f} "
-                        f"-> BEAR_CALL_SPREAD"
-                        f"{':extreme' if _ext_lo else ''}"
-                        f"{':warmup' if _warmup else ''}"
-                    )
-                    return BEAR_CALL_SPREAD, (
-                        f"range_soft_location_lean_{_loc:.2f}"
-                        f"{':extreme' if _ext_lo else ''}"
-                        f"{':warmup' if _warmup else ''}"
-                    )
+                return BULL_PUT_SPREAD, (
+                    f"range_soft_location_lean_{_loc:.2f}"
+                    f"{':extreme' if _ext_hi else ''}"
+                    f"{':warmup' if _warmup else ''}"
+                )
+            if _loc <= self.RANGE_SOFT_LEAN_LO and (_ext_lo or _ev_bear):
+                self.logger.info(
+                    f"Range resolution: soft lean loc={_loc:.2f} "
+                    f"-> BEAR_CALL_SPREAD"
+                    f"{':extreme' if _ext_lo else ''}"
+                    f"{':warmup' if _warmup else ''}"
+                )
+                return BEAR_CALL_SPREAD, (
+                    f"range_soft_location_lean_{_loc:.2f}"
+                    f"{':extreme' if _ext_lo else ''}"
+                    f"{':warmup' if _warmup else ''}"
+                )
 
         # 4. true pin only — never a catch-all. Condor/fly need a NARROW
         # opening range, mid location, and a real flat ADX read. MODERATE

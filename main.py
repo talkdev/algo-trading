@@ -220,7 +220,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m7f-warmup-extreme-only"
+        _engine_build = "v65m7o-lean-unclear-and-trend"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,
@@ -2039,10 +2039,31 @@ class MainEngine:
                 self._alert("WARNING", msg)
             if force > 0 and idle >= force:
                 if live:
-                    self._watchdog_flatten(
-                        f"FEED_STALE_{idle:.0f}s: no completed cycle for "
-                        f"{force:.0f}s while positions were open"
-                    )
+                    # Message historically said "while positions were open" but
+                    # the gate never checked the book — flat-book FEED_STALE
+                    # still called flatten_now → cancel_all 400 noise
+                    # (live 2026-09-25 12:22, book already flat after the
+                    # 11:34 FEED_STALE exit). Only force-exit when risk is on.
+                    try:
+                        _open = bool(
+                            self.execution_engine._get_open_positions()
+                        )
+                    except Exception as _e:
+                        self.logger.warning(
+                            f"watchdog open-position check failed ({_e}); "
+                            f"assuming open and flattening"
+                        )
+                        _open = True
+                    if _open:
+                        self._watchdog_flatten(
+                            f"FEED_STALE_{idle:.0f}s: no completed cycle for "
+                            f"{force:.0f}s while positions were open"
+                        )
+                    elif self._watchdog_failures == 0:
+                        self.logger.critical(
+                            f"WATCHDOG: stale {idle:.0f}s past force-exit "
+                            f"but book is flat — skip flatten"
+                        )
                 elif self._watchdog_failures == 0:
                     self.logger.critical(
                         f"WATCHDOG: stale {idle:.0f}s past the force-exit "
