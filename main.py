@@ -160,6 +160,9 @@ class MainEngine:
         self._last_cycle_ok_at     = now_ist()
         self._feed_stale           = False
         self._feed_stale_alerted   = False
+        # v65m7q / #6: a slow but RUNNING cycle must not look like a dead feed.
+        self._cycle_in_progress    = False
+        self._cycle_started_mono   = 0.0
         self._flatten_lock         = threading.RLock()
         self._halt_action_done     = False
         self._soft_halt_alerted    = False
@@ -220,7 +223,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m7o-lean-unclear-and-trend"
+        _engine_build = "v65m7q-cycle-alive-watchdog"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,
@@ -748,6 +751,8 @@ class MainEngine:
         self._eod_done              = False
         self._feed_stale            = False
         self._feed_stale_alerted    = False
+        self._cycle_in_progress     = False
+        self._cycle_started_mono    = 0.0
         self._watchdog_next_flatten = 0.0
         self._watchdog_last_alert   = 0.0
         self._watchdog_failures     = 0
@@ -1079,24 +1084,42 @@ class MainEngine:
         Execute one complete trading cycle.
         Called every regime_calc_interval_sec (default 45s).
         """
+        # v65m7q / #6: mark alive for watchdog; phase-time slow cycles.
+        _cyc_t0 = time_module.monotonic()
+        self._cycle_in_progress = True
+        self._cycle_started_mono = _cyc_t0
+        _cyc_phase = "start"
         current_time = now_ist().time()
 
-        # ── Step 1: Reset if new day ──────────────────────────────────────
-        self._reset_daily_state_if_new_day()
-        self.market_engine.reset_if_new_day()
-
-        # ── Step 2: Market data cycle ─────────────────────────────────────
-        signals = self.market_engine.run_cycle()
-
-        # ── Step 3: Regime classification ────────────────────────────────
         try:
-            regime_snapshot = self.regime_engine.process_signals(signals)
-            signals = merge_regime_into_signals(signals, regime_snapshot)
-        except Exception as e:
-            self.logger.error(f"Regime engine error: {e}", exc_info=True)
-            # Continue without regime — signals will have None for regime fields
+            # ── Step 1: Reset if new day ──────────────────────────────────────
+            _cyc_phase = "day_reset"
+            self._reset_daily_state_if_new_day()
+            self.market_engine.reset_if_new_day()
+
+            # ── Step 2: Market data cycle ─────────────────────────────────────
+            _cyc_phase = "market_data"
+            signals = self.market_engine.run_cycle()
+
+            # ── Step 3: Regime classification ────────────────────────────────
+            _cyc_phase = "regime"
+            try:
+                regime_snapshot = self.regime_engine.process_signals(signals)
+                signals = merge_regime_into_signals(signals, regime_snapshot)
+            except Exception as e:
+                self.logger.error(f"Regime engine error: {e}", exc_info=True)
+                # Continue without regime — signals will have None for regime fields
+        except Exception:
+            _elapsed = time_module.monotonic() - _cyc_t0
+            if _elapsed >= 60.0:
+                self.logger.warning(
+                    f"CYCLE_SLOW {_elapsed:.0f}s phase={_cyc_phase} (aborted)"
+                )
+            self._cycle_in_progress = False
+            raise
 
         # ── Step 4: Update cycle log + market snapshot with regime outputs ─
+        _cyc_phase = "cycle_log"
         try:
             latest_cycle = self.db.query_one(
                 "SELECT cycle_id FROM cycle_log "
@@ -1149,128 +1172,133 @@ class MainEngine:
         except Exception as _cle:
             self.logger.debug(f"Cycle log regime update error: {_cle}")
 
-        # ── Step 5-8: guarded against the watchdog's flatten ──────────────
-        # Monitoring, the hard-exit sweep and any new entry run under the
-        # flatten lock, so the watchdog can never be exiting the same leg at
-        # the same moment: two live orders on one leg is the failure mode
-        # every other part of this path exists to prevent.
-        with self._flatten_gate() as acting:
-            # ── Step 5: Monitor open positions ──────────────────────────────
-            # IMPORTANT: positions are ALWAYS monitored regardless of regime
-            # ABORT only blocks new entries - never closes existing positions
-            if acting:
-                self.execution_engine.monitor_all_positions(signals)
-
-                # ── Step 6: Hard exit sweep ─────────────────────────────────
-                self.execution_engine.perform_hard_exit_sweep()
-
-            # ── Step 7: Daily loss halt check ───────────────────────────────
-            # The halt action takes the flatten lock re-entrantly, so a flatten
-            # started here is serialised with the cycle exactly like the sweep.
-            self.check_daily_loss_halt()
-
-            # ── Step 8: Strategy decision and entry ─────────────────────────
-            # PATCH_V13: the outer entry window extends to the closing-hour
-            # route's own cut. Nothing about the sell side changes - it still
-            # cannot enter after trading_window_last_entry (14:00, refused by
-            # _check_hard_gates) and the regime layer still refuses every new
-            # position after 14:30. What the extra minutes buy is that
-            # decide() RUNS, so the long-premium closing-hour ticket is
-            # considered in production exactly as it is in replay: the
-            # harness calls decide() on every cycle it is flat, and a live
-            # engine that stopped asking at 14:30 would silently drop the
-            # route the replay is measuring.
-            try:
-                _late_cut = datetime.strptime(
-                    str(getattr(self.config, "momentum_late_window_end", "14:57")),
-                    "%H:%M",
-                ).time()
-            except Exception:
-                _late_cut = dtime(14, 57)
-            _entry_cut = dtime(14, 30)
-            if bool(getattr(self.config, "momentum_late_enabled", True)) and \
-                    bool(getattr(self.config, "momentum_enabled", True)):
-                _entry_cut = max(_entry_cut, _late_cut)
-
-            # v58: always call decide() in the clock window under the flatten
-            # lock. ABORT / block_new_entries / None regime / feed_stale are
-            # hard-gate refusals inside decide() so momentum markers and refuse
-            # reasons match replay (which always calls decide when a slot is free).
-            # v61 / P59-14: honor allow_same_cycle_reentry (BT already does).
-            _closed_cycle = bool(
-                self.market_engine.state.pop("_closed_this_cycle", False)
-            )
-            _same_ok = bool(
-                getattr(self.config, "allow_same_cycle_reentry", True)
-            )
-            entry_possible = (
-                acting and
-                current_time >= dtime(9, 30) and
-                current_time <= _entry_cut and
-                not self.market_engine.state.get("daily_halted") and
-                bool(signals.get("or_computed", False)) and
-                (_same_ok or not _closed_cycle)
-            )
-
-            if entry_possible:
-                try:
-                    if self._feed_stale:
-                        signals = dict(signals)
-                        signals["_feed_stale"] = True
-                    decision = self.strategy_engine.decide(signals)
-                    if decision.get("action") == "ENTER" and not self._feed_stale:
-                        self.execution_engine.process_entry_decision(decision, signals)
-                    elif decision.get("action") == "ENTER" and self._feed_stale:
-                        self.logger.info(
-                            "ENTER refused this cycle: trading feed is stale (watchdog)"
-                        )
-                except Exception as e:
-                    self.logger.error(f"Strategy/entry error: {e}", exc_info=True)
-
-        # ── Step 9: Update cycle log with P&L ────────────────────────────
-        total_pnl = self.compute_total_daily_pnl()
         try:
-            latest_cycle = self.db.query_one(
-                "SELECT cycle_id FROM cycle_log "
-                "WHERE trading_date=? ORDER BY cycle_id DESC LIMIT 1",
-                (today_ist().isoformat(),),
-            )
-            if latest_cycle:
-                self.db.update(
-                    "cycle_log",
-                    {"daily_pnl_net": total_pnl},
-                    {"cycle_id": latest_cycle["cycle_id"]},
+            # ── Step 5-8: guarded against the watchdog's flatten ──────────────
+            # Monitoring, the hard-exit sweep and any new entry run under the
+            # flatten lock, so the watchdog can never be exiting the same leg at
+            # the same moment: two live orders on one leg is the failure mode
+            # every other part of this path exists to prevent.
+            _cyc_phase = "monitor_entry"
+            with self._flatten_gate() as acting:
+                # ── Step 5: Monitor open positions ──────────────────────────
+                # IMPORTANT: positions are ALWAYS monitored regardless of regime
+                # ABORT only blocks new entries - never closes existing positions
+                if acting:
+                    self.execution_engine.monitor_all_positions(signals)
+
+                    # ── Step 6: Hard exit sweep ─────────────────────────────
+                    self.execution_engine.perform_hard_exit_sweep()
+
+                # ── Step 7: Daily loss halt check ───────────────────────────
+                # The halt action takes the flatten lock re-entrantly, so a
+                # flatten started here is serialised with the cycle exactly
+                # like the sweep.
+                self.check_daily_loss_halt()
+
+                # ── Step 8: Strategy decision and entry ─────────────────────
+                try:
+                    _late_cut = datetime.strptime(
+                        str(getattr(self.config, "momentum_late_window_end", "14:57")),
+                        "%H:%M",
+                    ).time()
+                except Exception:
+                    _late_cut = dtime(14, 57)
+                _entry_cut = dtime(14, 30)
+                if bool(getattr(self.config, "momentum_late_enabled", True)) and \
+                        bool(getattr(self.config, "momentum_enabled", True)):
+                    _entry_cut = max(_entry_cut, _late_cut)
+
+                # v58: always call decide() in the clock window under the flatten
+                # lock. ABORT / block_new_entries / None regime / feed_stale are
+                # hard-gate refusals inside decide() so momentum markers and
+                # refuse reasons match replay.
+                # v61 / P59-14: honor allow_same_cycle_reentry (BT already does).
+                _closed_cycle = bool(
+                    self.market_engine.state.pop("_closed_this_cycle", False)
                 )
-        except Exception as _ple:
-            self.logger.debug(f"Cycle log P&L update error: {_ple}")
+                _same_ok = bool(
+                    getattr(self.config, "allow_same_cycle_reentry", True)
+                )
+                entry_possible = (
+                    acting and
+                    current_time >= dtime(9, 30) and
+                    current_time <= _entry_cut and
+                    not self.market_engine.state.get("daily_halted") and
+                    bool(signals.get("or_computed", False)) and
+                    (_same_ok or not _closed_cycle)
+                )
 
-        # ── Step 10: Print cycle footer ───────────────────────────────────
-        _atm_iv_none = self.market_engine.state.get("_atm_iv_none_cycles", 0)
-        _vrp_none = self.market_engine.state.get("_vrp_none_cycles", 0)
-        if _atm_iv_none >= 3:
-            self.logger.critical(
-                f"SIGNAL HEALTH: ATM IV None for {_atm_iv_none} cycles — "
-                f"VRP computation degraded"
-            )
-        if _vrp_none >= 3:
-            self.logger.critical(
-                f"SIGNAL HEALTH: VRP None for {_vrp_none} cycles — "
-                f"vol regime defaulting to NEUTRAL"
-            )
-        self._print_cycle_footer(signals, total_pnl)
+                if entry_possible:
+                    try:
+                        if self._feed_stale:
+                            signals = dict(signals)
+                            signals["_feed_stale"] = True
+                        decision = self.strategy_engine.decide(signals)
+                        if decision.get("action") == "ENTER" and not self._feed_stale:
+                            self.execution_engine.process_entry_decision(
+                                decision, signals
+                            )
+                        elif decision.get("action") == "ENTER" and self._feed_stale:
+                            self.logger.info(
+                                "ENTER refused this cycle: trading feed is "
+                                "stale (watchdog)"
+                            )
+                    except Exception as e:
+                        self.logger.error(
+                            f"Strategy/entry error: {e}", exc_info=True
+                        )
 
-        # ── Step 11: Per-trade console report (v7) ────────────────────────
-        # Every trade of the session - the ones already performed and the one
-        # in progress - in the operator's fixed format. Printed after the
-        # cycle summary so the bottom of the screen always holds the newest
-        # state of the book.
-        self._print_trade_report()
+            # ── Step 9: Update cycle log with P&L ────────────────────────
+            _cyc_phase = "footer"
+            total_pnl = self.compute_total_daily_pnl()
+            try:
+                latest_cycle = self.db.query_one(
+                    "SELECT cycle_id FROM cycle_log "
+                    "WHERE trading_date=? ORDER BY cycle_id DESC LIMIT 1",
+                    (today_ist().isoformat(),),
+                )
+                if latest_cycle:
+                    self.db.update(
+                        "cycle_log",
+                        {"daily_pnl_net": total_pnl},
+                        {"cycle_id": latest_cycle["cycle_id"]},
+                    )
+            except Exception as _ple:
+                self.logger.debug(f"Cycle log P&L update error: {_ple}")
 
-        self.loop_count += 1
+            # ── Step 10: Print cycle footer ───────────────────────────────
+            _atm_iv_none = self.market_engine.state.get("_atm_iv_none_cycles", 0)
+            _vrp_none = self.market_engine.state.get("_vrp_none_cycles", 0)
+            if _atm_iv_none >= 3:
+                self.logger.critical(
+                    f"SIGNAL HEALTH: ATM IV None for {_atm_iv_none} cycles — "
+                    f"VRP computation degraded"
+                )
+            if _vrp_none >= 3:
+                self.logger.critical(
+                    f"SIGNAL HEALTH: VRP None for {_vrp_none} cycles — "
+                    f"vol regime defaulting to NEUTRAL"
+                )
+            self._print_cycle_footer(signals, total_pnl)
 
-        # ── Step 12: Telegram trade updates (v8) ──────────────────────────
-        # After the counter, so the message reports the cycle it belongs to.
-        self._telegram_after_cycle(signals, total_pnl)
+            # ── Step 11: Per-trade console report (v7) ────────────────────
+            self._print_trade_report()
+
+            self.loop_count += 1
+
+            # ── Step 12: Telegram trade updates (v8) ──────────────────────
+            self._telegram_after_cycle(signals, total_pnl)
+
+            _cyc_elapsed = time_module.monotonic() - _cyc_t0
+            if _cyc_elapsed >= 60.0:
+                self.logger.warning(
+                    f"CYCLE_SLOW {_cyc_elapsed:.0f}s phase={_cyc_phase} "
+                    f"(feed_stale={bool(getattr(self, '_feed_stale', False))})"
+                )
+        finally:
+            self._cycle_in_progress = False
+            self._last_cycle_ok_mono = time_module.monotonic()
+            self._last_cycle_ok_at = now_ist()
 
     def _print_cycle_footer(self, signals: dict, total_pnl: float) -> None:
         """Print concise cycle summary to console."""
@@ -2025,8 +2053,35 @@ class MainEngine:
         force    = self._watchdog_sec("feed_force_exit_sec", 120.0)
         live     = not self.config.paper_trade_mode
 
+        # v65m7q / #6: live Sep25 printed 80–170s "Main loop iteration took"
+        # while a cycle was still running; watchdog treated that as dead feed
+        # and FEED_STALE-flattened the morning BCS (−₹336). While a cycle is
+        # in progress, measure stuck-time from cycle START, not from last
+        # completed cycle — and do not degrade/force until the in-progress
+        # budget is exceeded (default: force + 60s).
+        _in_cyc = bool(getattr(self, "_cycle_in_progress", False))
+        if _in_cyc and self._cycle_started_mono > 0:
+            idle = time_module.monotonic() - self._cycle_started_mono
+            _in_budget = max(force + 60.0, 180.0) if force > 0 else 180.0
+            if idle < _in_budget:
+                if self._feed_stale:
+                    self._feed_stale = False
+                    self.logger.info(
+                        f"WATCHDOG: cycle in progress ({idle:.0f}s) — "
+                        f"clearing false feed_stale"
+                    )
+                _skip_feed_stale = True
+            else:
+                _skip_feed_stale = False
+                self.logger.critical(
+                    f"WATCHDOG: cycle in progress stuck {idle:.0f}s "
+                    f"(budget {_in_budget:.0f}s) — treating as hung"
+                )
+        else:
+            _skip_feed_stale = False
+
         # ── Feed / loop liveness ──────────────────────────────────────────
-        if degrade > 0 and idle >= degrade:
+        if (not _skip_feed_stale) and degrade > 0 and idle >= degrade:
             if not self._feed_stale:
                 self._feed_stale = True
                 msg = (

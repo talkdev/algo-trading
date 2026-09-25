@@ -933,11 +933,11 @@ class Config:
     # structure, do not re-spam the same reject every cycle. Hold the
     # refusal until the auction key changes or this clock expires, so
     # live either prints a buildable ticket or one clear construct_fail.
-    construct_fail_hold_min:   float = 15.0
-    # After this many consecutive identical economics rejects for the
-    # same auction key, latch the sticky construct_fail (1 = latch on
-    # first reject — matches Sep9/10 live wing_cost loops).
-    construct_fail_latch_after: int = 1
+    construct_fail_hold_min:   float = 10.0
+    # v65m7p: latch after 2 identical rejects (was 1). Single-reject sticky
+    # over-suppressed re-probes when geometry flickered; Sep9/10 wing_cost
+    # spam still latches on the second identical miss within the auction.
+    construct_fail_latch_after: int = 2
     # Sticky-latch EV only when the reported EV is this deep (pts) or
     # worse. Mild near-miss EV must keep re-probing (latching all EV
     # blocked Sep11/15 winners). Sep8 live printed ev≈-36 for 91 cycles.
@@ -1132,6 +1132,11 @@ class Config:
         # momentum gate because slot_conflict returned without consulting
         # the substitute.
         "slot_conflict", "same_side_chase",
+        # Open-HIGH wick defers BEAR/RANGE credit until LH / 12:15. That is a
+        # sell-expression clock, not a trend refusal — day-structure bearish
+        # dumps at the lows still need the aligned LONG_PUT (Sep24: 243
+        # open_spike_wait cycles with structure lean while ADX matured).
+        "open_spike_wait", "unresolved_lower_high",
     )
 
     # ══ PATCH_V13: closing-hour trend continuation ══════════════════════
@@ -1830,8 +1835,8 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         em_band_hi_weekly=min(max(_get_float(env, "EM_BAND_HI_WEEKLY", 2.10), 1.20), 3.00),
         em_band_hi_condor_weekly=min(max(_get_float(env, "EM_BAND_HI_CONDOR_WEEKLY", 1.35), 0.80), 2.00),
         wing_cost_frac_max_weekly=min(max(_get_float(env, "WING_COST_FRAC_MAX_WEEKLY", 0.58), 0.30), 0.80),
-        construct_fail_hold_min=min(max(_get_float(env, "CONSTRUCT_FAIL_HOLD_MIN", 15.0), 1.0), 60.0),
-        construct_fail_latch_after=min(max(_get_int(env, "CONSTRUCT_FAIL_LATCH_AFTER", 1), 1), 5),
+        construct_fail_hold_min=min(max(_get_float(env, "CONSTRUCT_FAIL_HOLD_MIN", 10.0), 1.0), 60.0),
+        construct_fail_latch_after=min(max(_get_int(env, "CONSTRUCT_FAIL_LATCH_AFTER", 2), 1), 5),
         construct_fail_deep_ev_pts=max(min(_get_float(env, "CONSTRUCT_FAIL_DEEP_EV_PTS", -10.0), -1.0), -100.0),
         range_adx_wide_max=min(max(_get_float(env, "RANGE_ADX_WIDE_MAX", 28.0), 20.0), 40.0),
         range_adx_wide_size=min(max(_get_float(env, "RANGE_ADX_WIDE_SIZE", 0.80), 0.40), 1.00),

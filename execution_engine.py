@@ -431,9 +431,10 @@ class LiveOrderExecutor:
             self.logger.warning(
                 f"cannot reconcile order tag {tag}: {e} — treating as unresolved"
             )
-            # v58: never return a truthy SUCCESS-shaped dict. Callers must not
-            # treat UNKNOWN as settled / continue fill polling with empty id.
-            return None
+            # v65m7p / #39: history API failure must NOT look like "no order".
+            # Returning None made callers settle as NOT_PLACED while a live
+            # order may still exist (lost-POST hole). UNKNOWN keeps UNRESOLVED.
+            return {"state": "UNKNOWN", "tag": tag, "order_id": ""}
         if not rows:
             return None
         by_id: dict = {}
@@ -2743,6 +2744,16 @@ class ExecutionEngine:
                     )
                     and _rot_trend_ok
                 )
+                # Extreme fade while an IC still owns both sides: free the
+                # slot. loc_high/low already require session rng≥85; do not
+                # also require two_way (Sep25: open-spike cleared two_way
+                # while loc≤0.22 from 12:49 — IC sat green). Only fires on
+                # CONDOR/BUTTERFLY so one-way BCS days are untouched.
+                _ic_to_fade = (
+                    ("CONDOR" in _rot_name or "BUTTERFLY" in _rot_name)
+                    and _rot_fade_label
+                    and (_loc_high or _loc_low)
+                )
                 # Only rotate when the thesis is broken (underwater) or the
                 # position has already banked enough that freeing the slot
                 # is not abandoning unpaid edge. Flat morning winners must
@@ -2763,8 +2774,13 @@ class ExecutionEngine:
                     and entry_credit > 0
                     and liq_premium <= entry_credit * 1.10
                 )
-                # IC rotation: only when underwater (do not scratch a working pin)
-                _ic_rotate = _ic_to_trend and _underwater
+                # IC→trend: only when underwater. IC→two-way fade: banked or
+                # scratch is enough — the pin already collected; the extreme
+                # is a different trade.
+                _ic_rotate = (
+                    (_ic_to_trend and _underwater)
+                    or (_ic_to_fade and (_banked or _fade_scratch or _underwater))
+                )
                 if (
                     (not _rot_raw.get("failed_break_scalp"))
                     and (not _rot_raw.get("neutral_range_vertical"))
