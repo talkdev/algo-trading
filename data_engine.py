@@ -3992,6 +3992,12 @@ class MarketDataEngine:
                     _straddle_expanding = True
         signals["straddle_expanding"] = _straddle_expanding
         signals["straddle_5min_ago"] = _straddle_5min_ago
+        # v65m7q: when expand clears, drop sticky max_pain latch so Intent
+        # soft-lean can re-probe (Sep22-class refuse→enter race after expand).
+        _prev_exp = bool(self.state.get("_prev_straddle_expanding"))
+        if _prev_exp and not _straddle_expanding:
+            self.state.pop("_max_pain_block_spot", None)
+        self.state["_prev_straddle_expanding"] = _straddle_expanding
         self._save_session_state()
         self._persist_cycle_log(signals)
         self._persist_option_chain_snapshot(chain, expiry, signals)

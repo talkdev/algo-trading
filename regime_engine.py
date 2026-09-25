@@ -1985,7 +1985,7 @@ class RegimeClassifier:
                     # Low fades are a morning product (≤12:15). After lunch
                     # the bearish lean / high-fade book owns the tape;
                     # strategy_engine unlocks a post-scalp low fade only.
-                    if _fade_t >= time(12, 15):
+                    if _fade_t >= time(12, 15) and not _two_way:
                         pass
                     elif _struct_bear:
                         pass
@@ -2386,6 +2386,9 @@ class RegimeClassifier:
             # classify_final Hard Block 3; the missing gate let
             # NEUTRAL/RANGE/RANGE through - caught by the module self-test).
             # Directional verticals (BULLISH/BEARISH paths below) are exempt.
+            # Do NOT fall through to PREMIUM_SELL_RANGE on NEUTRAL: soft lean
+            # under lean-only minted Sep25 10:13 BPS −₹2.1k (NEUTRAL vol,
+            # no VRP edge). Pin stays blocked; wait for fade/positioning.
             if vol not in (VolatilityRegime.SELL_PREMIUM,
                            VolatilityRegime.STRONG_SELL_PREMIUM):
                 return (

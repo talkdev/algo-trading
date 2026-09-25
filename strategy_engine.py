@@ -600,10 +600,17 @@ class StrategyEngine:
                                  or signals.get("afternoon_high_fade")
                                  or signals.get("afternoon_low_fade"))
                     )
+                    _range_to_tw_fade = (
+                        _last_side == "RANGE"
+                        and _fade_next
+                        and bool(signals.get("two_way_auction"))
+                        and current_time >= dtime(12, 0)
+                    )
                     if not ((_fb_only and _range_next)
                             or (_fb_only and _fade_next)
                             or (_stale_done and _fade_next)
                             or _two_way_fade
+                            or _range_to_tw_fade
                             or _opp_rotation):
                         return "NO_TRADE", (
                             f"entry_cooldown_{_cd_need - mins:.0f}min_remaining"
@@ -673,6 +680,30 @@ class StrategyEngine:
                             _extreme_done and _fade_next
                             and _moved >= max(25.0, 0.40 * _need)
                         )
+                        _range_to_tw_fade_ok = False
+                        try:
+                            _sr_r, _sloc_r, _, _ = self._session_range_pos(signals)
+                            _at_ext = (
+                                (bool(signals.get("afternoon_high_fade"))
+                                 and _sloc_r >= 0.80)
+                                or (bool(signals.get("afternoon_low_fade"))
+                                    and _sloc_r <= 0.20)
+                            )
+                            _move_ok = (
+                                current_time >= dtime(12, 15)
+                                or _moved >= max(8.0, 0.20 * _need)
+                            )
+                            _range_to_tw_fade_ok = (
+                                _last_side == "RANGE"
+                                and _fade_next
+                                and bool(signals.get("two_way_auction"))
+                                and current_time >= dtime(12, 0)
+                                and _sr_r >= 85.0
+                                and _at_ext
+                                and _move_ok
+                            )
+                        except Exception:
+                            _range_to_tw_fade_ok = False
                         # PATCH_V33: after 12:15, an opposite extreme fade
                         # on a confirmed two-way/fade scalp is location-
                         # defined. 18-Sep printed fade_hi from 12:36 with
@@ -700,10 +731,6 @@ class StrategyEngine:
                             if (_extreme_done and _fade_next and _opp_pair
                                     and _now_t >= dtime(12, 15)
                                     and _moved >= max(8.0, 0.20 * _need)):
-                                # Opposite fade is a new trade, but only
-                                # after a real extension past the prior
-                                # fill. Waiving the 8pt floor let a 0.81
-                                # bounce print as a high fade and stop.
                                 _opp_pm_ok = True
                         except Exception:
                             _opp_pm_ok = False
@@ -724,11 +751,6 @@ class StrategyEngine:
                             str(state.get("last_exit_reason") or "").startswith("CLOSE_STOP")
                             or _pri_x in (1, 2, 3)
                         )
-                        # v63: after IC/RANGE losing stop, a measured trend
-                        # IS the material change (spot may still be near the
-                        # stop print). Waive so the correct vertical/debit
-                        # can fire (21-Sep missed LONG_CALL while waiting
-                        # for 28pts after IC stop into UPTREND).
                         _after_sym_stop_trend = False
                         try:
                             _side_x = str(state.get("last_exit_strategy_side") or "")
@@ -774,6 +796,7 @@ class StrategyEngine:
                                 or (_fb_only and _fade_next)
                                 or (_stale_done and _fade_next)
                                 or _two_way_fade_ok
+                                or _range_to_tw_fade_ok
                                 or _opp_pm_ok
                                 or _same_side_extreme
                                 or _opp_rotation
@@ -1346,6 +1369,19 @@ class StrategyEngine:
             return
         after_extreme = self._after_two_way_extreme_scalp()
         after_fb = bool(self.market_engine.state.get("last_exit_is_failed_break_scalp"))
+        _ic_open = any(
+            ("CONDOR" in str(n) or "BUTTERFLY" in str(n))
+            for n in (self._open_strategy_names() or [])
+        )
+        _wide_pin = False
+        if _ic_open:
+            try:
+                _wr, _, _, _ = self._session_range_pos(signals)
+                _wide_pin = _wr >= float(
+                    getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
+                )
+            except Exception:
+                _wide_pin = False
         # ── A fade needs a two-sided tape ────────────────────────────────
         # Selling the session extreme is a mean-reversion trade. It is only
         # a trade when the session has shown it reverts: both OR edges
@@ -1357,7 +1393,9 @@ class StrategyEngine:
         # with loc 0.87 and no two-way confirmation; the tape ran +50pts
         # into the bell. The same veto is what keeps the engine from
         # selling puts at a fresh low on a trend-down day.
-        _two_sided = bool(two_way or after_fb or after_extreme)
+        # Wide pin: IC/fly still open on a ≥85pt session is already a
+        # mean-reversion book — allow the extreme without two_way latch.
+        _two_sided = bool(two_way or after_fb or after_extreme or _wide_pin)
         # The LATCHED read (same one the counter-trend entry refusal uses):
         # it only forms on a mature ADX at/above the trend threshold and is
         # held for displaced_tape_hold_min, so a single RANGE print inside
@@ -1410,15 +1448,17 @@ class StrategyEngine:
                 f"high_fade_vetoed_one_way_uptrend_adx_{_tr_adx:.0f}"
             )
         # Low fade: morning window ends at 12:15 so a bearish lean can
-        # own the afternoon book (08-Sep 12:15 BCS). Only AFTER an
-        # extreme scalp may the opposite low fade run past lunch.
+        # own the afternoon book (08-Sep 12:15 BCS). AFTER an extreme
+        # scalp OR on a confirmed two-way auction, the opposite low fade
+        # runs through 14:00 (Sep25 afternoon put fade). Wide pin
+        # (_wide_pin) already computed above.
         _lo_end = dtime(12, 15)
-        if after_extreme:
+        if after_extreme or two_way or _wide_pin:
             _lo_end = dtime(14, 0)
         if current_time >= dtime(10, 45) and current_time < _lo_end:
             if after_extreme:
                 _lo_thresh = 0.15
-            elif two_way:
+            elif two_way or _wide_pin:
                 _lo_thresh = 0.20
             else:
                 _lo_thresh = 0.22
@@ -1610,6 +1650,11 @@ class StrategyEngine:
             )
             if _hard_b:
                 return "NO_TRADE", _hard_b
+            _mid_b = self._mid_range_fade_into_grind_refusal(
+                BEAR_CALL_SPREAD, signals
+            )
+            if _mid_b:
+                return "NO_TRADE", _mid_b
             # RANGE-origin OR-mid / positioning short-circuit still prints
             # price=RANGE. Blind BCS here skipped range soft-lean evidence
             # (Sep25 10:49 RANGE_BEARISH_SPOT_BELOW_OR_MID). Fade / failed-
@@ -2256,12 +2301,13 @@ class StrategyEngine:
 
         Soft ADX + confirmed two-way + afternoon_high_fade + loc at the
         day high unlocks BEAR_CALL even if price_regime still prints
-        UPTREND for a cycle (full-session Sep23 BCS @loc≈0.98 adx≈21
-        finished +₹690 at hard exit; the same ticket was force-flat on
-        a partial shard). Strong ADX / missing two-way stay refused.
+        UPTREND for a cycle (Sep17 12:07–12:15 loc≥0.95 adx≈24 → BCS
+        +₹4.4k). Pre-noon pins are continuation risk — waiving them
+        stole Sep23's 11:12 LONG_CALL (+₹4.8k) for a scratch BCS.
+
+        Strong ADX / missing two-way / pre-noon stay refused.
         """
         _strong = float(getattr(self.config, "adx_strong_threshold", 28.0) or 28.0)
-        # Soft trend only — at/above strong ADX the high is a grind, not a fade.
         if adx >= _strong:
             return False
         if loc < 0.95:
@@ -2272,7 +2318,56 @@ class StrategyEngine:
             return False
         if str(signals.get("price_regime") or "") == "STRONG_UPTREND":
             return False
+        try:
+            from core import now_ist
+            if now_ist().time() < dtime(12, 0):
+                return False
+        except Exception:
+            return False
         return True
+
+    def _mid_range_fade_into_grind_refusal(
+        self,
+        strategy_name: str,
+        signals: dict,
+    ) -> Optional[str]:
+        """Refuse mid-session high-fade calls into a bull grind.
+
+        `afternoon_high_fade` can latch from fade_pos after open-wick
+        excision while `_session_range_pos` is still mid-range. Selling
+        calls there into EMA-bull / VWAP+ is the Sep18 live BCS that
+        rode a grind to HARD_EXIT (−₹200). Session loc≥0.70 keeps
+        near-high fades (Sep10 BCS ~high zone); only true mid-range
+        disagreements with fade_pos are refused. Extreme pinned fades
+        (`_extreme_high_call_fade_ok` at 0.95) stay open.
+
+        No symmetric low-fade twin: refusing mid low-fade puts on Sep10
+        starved the afternoon high-fade BCS (+₹3k) because the low-fade
+        latch kept the bull map path busy with NO_TRADE.
+        """
+        if strategy_name != BEAR_CALL_SPREAD:
+            return None
+        if not bool(signals.get("afternoon_high_fade")):
+            return None
+        try:
+            _rng, _loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return None
+        if _rng < float(getattr(self, "RANGE_LEAN_MIN_PTS", 50.0) or 50.0):
+            return None
+        if _loc >= 0.70:
+            return None
+        try:
+            _vd = float(signals.get("vwap_dist_pct") or 0.0)
+        except (TypeError, ValueError):
+            _vd = 0.0
+        _ema = str(signals.get("ema_structure") or "")
+        if _ema == "BULLISH" and _vd > 0.0:
+            return (
+                f"mid_high_fade_into_bull_grind_loc_{_loc:.2f}"
+                f"_vwap_{_vd:+.2f}"
+            )
+        return None
 
     def _hard_credit_into_trend_refusal(
         self,
@@ -2317,6 +2412,11 @@ class StrategyEngine:
                     "session_no_calls_after_uptrend_refuse", None
                 )
                 return None
+            if self._extreme_high_call_fade_ok(signals, _adx, _loc):
+                self.market_engine.state.pop(
+                    "session_no_calls_after_uptrend_refuse", None
+                )
+                return None
             # Sticky: once calls are refused into a labelled uptrend, a
             # one-cycle RANGE flicker must not re-open the sell.
             self.market_engine.state["session_no_calls_after_uptrend_refuse"] = True
@@ -2340,14 +2440,18 @@ class StrategyEngine:
                 _struct_bear = bool(self._day_structure_bearish(signals)[0])
             except Exception:
                 _struct_bear = False
+            _fade_hi = self._extreme_high_call_fade_ok(signals, _adx, _loc)
             if (
                 _struct_bear
+                or _fade_hi
                 or _adx < _thr
                 or _loc < 0.70
             ):
                 self.market_engine.state.pop(
                     "session_no_calls_after_uptrend_refuse", None
                 )
+                if _fade_hi or _struct_bear:
+                    return None
             else:
                 return (
                     f"hard_invariant_sticky_no_calls_after_uptrend_"
@@ -2369,13 +2473,15 @@ class StrategyEngine:
         # Unfinished extreme grind without a prior labelled-trend refuse:
         # spot pinned near the high/low with ADX still trending and no
         # bearish day-structure / extreme-fade waiver. Mid-range fades
-        # (Sep18 loc≈0.59) pass.
+        # (Sep18 loc≈0.59) pass. Soft-ADX pinned high fade is the waiver.
         if strategy_name == BEAR_CALL_SPREAD and _loc >= 0.90:
             try:
                 _struct_bear = bool(self._day_structure_bearish(signals)[0])
             except Exception:
                 _struct_bear = False
-            if not _struct_bear:
+            if not _struct_bear and not self._extreme_high_call_fade_ok(
+                signals, _adx, _loc
+            ):
                 return (
                     f"hard_invariant_no_calls_into_unfinished_high_"
                     f"loc_{_loc:.2f}_adx_{_adx:.0f}"
@@ -2408,13 +2514,21 @@ class StrategyEngine:
         if not bool(getattr(cfg, "counter_trend_entry_block", True)):
             return None
 
-        # Hard invariant first — cannot be waived by fade/two_way.
+        # Mid-loc fade into with-grind EMA/VWAP — before the two-way fade
+        # exemption, which otherwise green-lights Sep18-class BCS.
+        _mid_fade = self._mid_range_fade_into_grind_refusal(
+            strategy_name, signals
+        )
+        if _mid_fade:
+            return f"counter_trend_entry_blocked:{strategy_name}:{_mid_fade}"
+
+        # Hard invariant first — extreme high-fade waiver lives inside it.
         _hard = self._hard_credit_into_trend_refusal(strategy_name, signals)
         if _hard:
             return f"counter_trend_entry_blocked:{strategy_name}:{_hard}"
 
-        # Fade exemption ONLY on confirmed two-way AND non-trend price
-        # labels (RANGE etc.). Labelled trends already handled above.
+        # Fade exemption: confirmed two-way + non-trend labels, OR the
+        # pinned soft-ADX high-fade waiver (label may still print UPTREND).
         _fade = bool(
             signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
         )
@@ -2427,6 +2541,17 @@ class StrategyEngine:
             )
         ):
             return None
+        if strategy_name == BEAR_CALL_SPREAD:
+            try:
+                _adx_ct = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_ct = 0.0
+            try:
+                _, _loc_ct, _, _ = self._session_range_pos(signals)
+            except Exception:
+                _loc_ct = 0.5
+            if self._extreme_high_call_fade_ok(signals, _adx_ct, float(_loc_ct)):
+                return None
 
         latch = self._tape_displacement(signals)
         if not latch:
@@ -5208,6 +5333,9 @@ class StrategyEngine:
             "profit_lock_stop_level": None,
             "stop_at_breakeven":      False,
             # PATCH_V25: exit ladder harvests failed-LOW as a scalp.
+            # Afternoon low fades stay on this scalp path: untagging them
+            # (census_fadeNoScalp) lifted Sep25 fade hold but wiped
+            # Sep10/17/18 (held fades into HARD_EXIT / give-back).
             "failed_break_scalp":     bool(
                 (signals.get("neutral_range_vertical")
                  and strategy_name == BULL_PUT_SPREAD)
