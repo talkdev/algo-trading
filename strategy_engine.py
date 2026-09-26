@@ -148,6 +148,59 @@ class StrategyEngine:
         )
         return row["cnt"] if row else 0
 
+    def _db_stop_streak(self, trading_date: Optional[str] = None) -> int:
+        """Consecutive CLOSE_STOP streak from today's exits (newest first).
+
+        Memory `session_state.consecutive_stops` can be poisoned by a self-test
+        or a partial write with no matching trade_exits (live 2026-09-08 sat
+        dark on `2_consecutive_stops_halt` with zero positions). The halt gate
+        must trust the blotter, not the latch alone.
+        """
+        day = trading_date or today_ist().isoformat()
+        try:
+            rows = self.db.query(
+                "SELECT te.exit_reason FROM trade_exits te "
+                "JOIN positions p ON p.position_id = te.trade_id "
+                "WHERE p.trading_date=? "
+                "ORDER BY te.exit_time DESC",
+                (day,),
+            ) or []
+        except Exception:
+            return int(self.market_engine.state.get("consecutive_stops", 0) or 0)
+        streak = 0
+        for row in rows:
+            reason = str(row.get("exit_reason") or "")
+            if reason == "CLOSE_STOP" or reason.startswith("CLOSE_STOP"):
+                streak += 1
+                continue
+            break
+        return streak
+
+    def _sync_stop_streak(self) -> int:
+        """Reconcile in-memory consecutive_stops to the DB blotter streak."""
+        state = self.market_engine.state
+        real = self._db_stop_streak()
+        stored = int(state.get("consecutive_stops", 0) or 0)
+        if stored != real:
+            self.logger.warning(
+                f"stop_streak_resync: memory={stored} blotter={real} — "
+                f"trusting blotter (clears phantom halt latch)"
+            )
+            state["consecutive_stops"] = real
+            if real == 0:
+                state["last_stop_time"] = None
+                state["last_stop_reason"] = ""
+                state["last_stop_signal_combo"] = ""
+                if state.get("daily_halted") and real < 2:
+                    # Only clear halt when it was stop-budget based; durable
+                    # risk_halt / loss-limit halts are owned by MainEngine.
+                    pass
+            try:
+                self.market_engine._save_session_state()
+            except Exception:
+                pass
+        return real
+
     def _open_strategy_names(self) -> List[str]:
         try:
             rows = self.db.query(
@@ -807,7 +860,10 @@ class StrategyEngine:
                                 f"lt_{_need:.0f}pts_needed"
                             )
 
-        if state.get("consecutive_stops", 0) >= 2:
+        # Halt / same-combo / cooldown must use blotter streak, not a latch
+        # that can be written without any CLOSED row (Sep08 phantom halt).
+        _stop_streak = self._sync_stop_streak()
+        if _stop_streak >= 2:
             return "NO_TRADE", "2_consecutive_stops_halt"
 
         last_stop_reason = state.get("last_stop_reason", "")
@@ -818,11 +874,11 @@ class StrategyEngine:
         )
         if (last_stop_reason == "CLOSE_STOP" and
                 last_stop_combo == current_combo and
-                state.get("consecutive_stops", 0) >= 1):
+                _stop_streak >= 1):
             return "NO_TRADE", f"same_signal_combo_caused_last_stop:{current_combo}"
 
         last_stop_time = state.get("last_stop_time")
-        if last_stop_time and last_stop_reason:
+        if last_stop_time and last_stop_reason and _stop_streak >= 1:
             iv_extra = 20 if iv_behavior in ("EXPANDING", "SPIKING") else 0
             required = STOP_COOLDOWN_MAP.get(last_stop_reason, 30) + iv_extra
             try:

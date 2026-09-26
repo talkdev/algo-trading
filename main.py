@@ -307,6 +307,32 @@ class MainEngine:
                 f"but exit streak today={real_streak}. Correcting."
             )
             state["consecutive_stops"] = real_streak
+        if real_streak == 0:
+            # Phantom latch cleanup: self-test / partial writes used to leave
+            # last_stop_* and a -₹1000 capital dent with zero positions
+            # (live 2026-09-08 → all-day 2_consecutive_stops_halt).
+            if state.get("last_stop_time") or state.get("last_stop_reason"):
+                state["last_stop_time"] = None
+                state["last_stop_reason"] = ""
+                state["last_stop_signal_combo"] = ""
+            npos_row = self.db.query_one(
+                "SELECT COUNT(*) AS cnt FROM positions WHERE trading_date=?",
+                (today_str,),
+            )
+            npos = int((npos_row or {}).get("cnt") or 0)
+            try:
+                start_cap = float(self.config.starting_capital)
+                cur_cap = float(state.get("current_capital") or start_cap)
+            except (TypeError, ValueError):
+                start_cap = cur_cap = float(self.config.starting_capital)
+            if npos == 0 and abs(float(state.get("daily_pnl") or 0.0)) < 1e-9:
+                # Capital moved with no blotter — restore day-start capital.
+                if abs(cur_cap - start_cap) >= 1.0:
+                    self.logger.warning(
+                        f"Session state integrity: current_capital={cur_cap:.0f} "
+                        f"with zero positions/pnl — restoring {start_cap:.0f}"
+                    )
+                    state["current_capital"] = start_cap
         real_stops = real_streak  # halt logic below still uses streak
         actual_pnl_row = self.db.query_one(
             "SELECT COALESCE(SUM(net_pnl_rupees),0) as total "
