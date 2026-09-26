@@ -928,7 +928,25 @@ class StrategyEngine:
                 and not signals.get("afternoon_high_fade")
                 and not _lower_high_ready
             ):
-                return "NO_TRADE", "open_spike_wait_unresolved_lower_high"
+                # Structure-bearish dump already at the lows: deferring to
+                # 12:15 only protects the lower-high fade book. When location
+                # is already ≤0.15 with day-structure bearish after 11:30,
+                # the sell-call vertical IS the structure lean (Sep24 BCS
+                # waited until 12:19 → baseline ₹1,931 at 11:32). Still
+                # blocks soft mid-morning knives at loc≈0.20 (10/23 wipe).
+                _struct_lo = False
+                try:
+                    _ds_b, _ = self._day_structure_bearish(signals)
+                    _struct_lo = (
+                        _ds_b
+                        and current_time >= dtime(11, 30)
+                        and _os_loc <= 0.15
+                        and _os_rng >= 50.0
+                    )
+                except Exception:
+                    _struct_lo = False
+                if not _struct_lo:
+                    return "NO_TRADE", "open_spike_wait_unresolved_lower_high"
         if signals.get("chain_stale"):
             return "NO_TRADE", "chain_stale_cannot_validate_strikes"
 
@@ -1578,6 +1596,12 @@ class StrategyEngine:
                     return "NO_TRADE", (
                         f"range_origin_bull_deferred:{why}"
                     )
+                # Deferred range must not flip the premium map side
+                # (enter-contract: bull map → BCS is opposite-side credit).
+                if strategy == BEAR_CALL_SPREAD:
+                    return "NO_TRADE", (
+                        f"range_origin_bull_deferred_no_bear_call:{why}"
+                    )
                 reason = (
                     f"regime:{final_regime}:conf={confidence}:"
                     f"dte={dte}:or={or_condition}:adx={adx_15:.0f}:"
@@ -1673,6 +1697,12 @@ class StrategyEngine:
                 if strategy == "NO_TRADE":
                     return "NO_TRADE", (
                         f"range_origin_bear_deferred:{why}"
+                    )
+                # Deferred range must not flip the premium map side
+                # (enter-contract Sep18: PREMIUM_SELL_BEAR → BPS soft-lean).
+                if strategy == BULL_PUT_SPREAD:
+                    return "NO_TRADE", (
+                        f"range_origin_bear_deferred_no_bull_put:{why}"
                     )
                 reason = (
                     f"regime:{final_regime}:conf={confidence}:"
@@ -1810,6 +1840,16 @@ class StrategyEngine:
         _ds_ok, _ds_why = self._day_structure_bearish(signals)
         if not _ds_ok:
             return False, f"lean_{_ds_why}"
+        # Exit-giveback stream (Sep09): day-structure BCS entered at
+        # 09:45 with adx=0 / immature → weak ROI 6.6%. Structure is
+        # slow, but the credit ticket still needs a real ADX print —
+        # same floor the pin / mature location leans already use.
+        try:
+            _adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx = 0.0
+        if (not bool(signals.get("adx_15_mature"))) or _adx < 12.0:
+            return False, f"lean_adx_immature_{_adx:.1f}"
         return True, f"day_structure_lean_bearish:{_ds_why}"
 
     # ── Range-regime structure selection: ONE ladder for every DTE ─────────
@@ -2341,6 +2381,10 @@ class StrategyEngine:
         disagreements with fade_pos are refused. Extreme pinned fades
         (`_extreme_high_call_fade_ok` at 0.95) stay open.
 
+        EMA must include TRANSITIONAL: requiring strict BULLISH let the
+        Sep18 12:59 BCS slip through at loc≈0.58 / VWAP+ when structure
+        flickered off BULLISH for one bar (stream dig + probe).
+
         No symmetric low-fade twin: refusing mid low-fade puts on Sep10
         starved the afternoon high-fade BCS (+₹3k) because the low-fade
         latch kept the bull map path busy with NO_TRADE.
@@ -2362,10 +2406,10 @@ class StrategyEngine:
         except (TypeError, ValueError):
             _vd = 0.0
         _ema = str(signals.get("ema_structure") or "")
-        if _ema == "BULLISH" and _vd > 0.0:
+        if _ema in ("BULLISH", "TRANSITIONAL") and _vd > 0.0:
             return (
                 f"mid_high_fade_into_bull_grind_loc_{_loc:.2f}"
-                f"_vwap_{_vd:+.2f}"
+                f"_vwap_{_vd:+.2f}_ema_{_ema}"
             )
         return None
 
