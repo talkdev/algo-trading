@@ -3443,6 +3443,10 @@ class MarketDataEngine:
             adx_15 = adx_5
         elif adx_5_preview > 0.0:
             adx_15 = adx_5_preview
+            # Live signals_json published the preview on adx_5 as well
+            # (same number as adx_15). Leaving adx_5=0 made the stream
+            # lie to anything that reads the fast series directly.
+            adx_5 = adx_5_preview
         else:
             adx_15 = 0.0
         adx_15_mature = bool(adx_15_mature or adx_5_mature)
