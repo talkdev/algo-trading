@@ -948,6 +948,46 @@ class Results:
 #  THE SIMULATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
+def load_calibration_as_of(
+    paths: List[str], trading_date: Optional[str]
+) -> Optional[dict]:
+    """Latest valid calibration_state row strictly before session open.
+
+    Per-day shards may hold a later-week row (Sep8 shard ends at Sep21).
+    Using that on Sep8 is lookahead. No row → caller leaves Tier-0 defaults.
+    """
+    cutoff = f"{trading_date}T09:15:00" if trading_date else None
+    best: Optional[dict] = None
+    best_at = ""
+    for pth in paths:
+        if not pth or not Path(pth).is_file():
+            continue
+        try:
+            con = sqlite3.connect(f"file:{pth}?mode=ro", uri=True)
+            con.row_factory = sqlite3.Row
+            if cutoff:
+                row = con.execute(
+                    "SELECT * FROM calibration_state WHERE is_valid=1 "
+                    "AND calibrated_at < ? ORDER BY calibrated_at DESC LIMIT 1",
+                    (cutoff,),
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT * FROM calibration_state WHERE is_valid=1 "
+                    "ORDER BY calibrated_at DESC LIMIT 1"
+                ).fetchone()
+            con.close()
+        except sqlite3.Error:
+            continue
+        if not row:
+            continue
+        d = {k: row[k] for k in row.keys() if k != "id"}
+        at = str(d.get("calibrated_at") or "")
+        if at > best_at:
+            best, best_at = d, at
+    return best
+
+
 class BacktestRunner:
 
     def __init__(
@@ -1048,6 +1088,19 @@ class BacktestRunner:
         fd, self._scratch = tempfile.mkstemp(prefix="bt_", suffix=".db")
         os.close(fd)
         db = Database(Path(self._scratch))
+        # Scratch book is empty. Live confidence/vol thresholds come from
+        # calibration_state. Seed the latest valid row as-of the session
+        # (never a later-day row) so RegimeClassifier sees the live mix.
+        _seed_day = None
+        _pending = getattr(self, "_pending_dates", None) or []
+        if _pending:
+            _seed_day = str(_pending[0])
+        _cal = load_calibration_as_of(self._calibration_source_paths(), _seed_day)
+        if _cal:
+            try:
+                db.insert("calibration_state", _cal)
+            except Exception:
+                pass
 
         logger = logging.getLogger("backtest_engine")
         logger.handlers = [logging.NullHandler()]
@@ -1090,6 +1143,27 @@ class BacktestRunner:
         self.regime = engine.regime_engine
         self.reporter = engine.trade_reporter
         self._harvested_pids: set = set()
+
+    def _calibration_source_paths(self) -> List[str]:
+        paths: List[str] = []
+        store = self.store
+        if hasattr(store, "stores"):
+            paths.extend(str(s.path) for s in store.stores if getattr(s, "path", None))
+        elif getattr(store, "path", None):
+            paths.append(str(store.path))
+        try:
+            primary = str(Path(self.config.db_path).expanduser())
+            if primary not in paths:
+                paths.append(primary)
+        except Exception:
+            pass
+        shard_dir = _per_day_shard_dir(self.config)
+        if shard_dir.is_dir():
+            for p in sorted(shard_dir.glob("*.db")):
+                sp = str(p)
+                if sp not in paths:
+                    paths.append(sp)
+        return paths
 
     def _teardown(self):
         try:
@@ -1457,6 +1531,7 @@ class BacktestRunner:
 
     # -- driver -----------------------------------------------------------
     def run(self, dates: List[str]) -> Results:
+        self._pending_dates = list(dates)
         self._build()
         try:
             for d in dates:
