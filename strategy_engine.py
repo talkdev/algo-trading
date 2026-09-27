@@ -5785,7 +5785,12 @@ class StrategyEngine:
             # tape has already proven the breakout. Narrow: sell refused for
             # IV, ADX at/above 40, price in a with-trend label.
             _br = str(block_reason or "").lower()
-            _iv_sell = ("iv_expand" in _br) or ("iv_spik" in _br)
+            _iv_sell = (
+                ("iv_expand" in _br)
+                or ("iv_spik" in _br)
+                or ("straddle_expl" in _br)
+                or bool(signals.get("straddle_exploded"))
+            )
             _trend_ok = (
                 (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
                 or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
@@ -5802,7 +5807,12 @@ class StrategyEngine:
             # sell refusal and a measured ADX is the long-put tape.
             _br_e = str(block_reason or "").lower()
             if not (
-                (("iv_expand" in _br_e) or ("iv_spik" in _br_e))
+                (
+                    ("iv_expand" in _br_e)
+                    or ("iv_spik" in _br_e)
+                    or ("straddle_expl" in _br_e)
+                    or bool(signals.get("straddle_exploded"))
+                )
                 and adx >= 40.0
             ):
                 return False, "momentum_event_day_needs_high_confidence", 0
@@ -5814,7 +5824,12 @@ class StrategyEngine:
             if adx < _ev_m_adx:
                 _br_e2 = str(block_reason or "").lower()
                 if not (
-                    (("iv_expand" in _br_e2) or ("iv_spik" in _br_e2))
+                    (
+                        ("iv_expand" in _br_e2)
+                        or ("iv_spik" in _br_e2)
+                        or ("straddle_expl" in _br_e2)
+                        or bool(signals.get("straddle_exploded"))
+                    )
                     and adx >= 40.0
                 ):
                     return False, (
@@ -5947,7 +5962,19 @@ class StrategyEngine:
         if _vx > 0 and _pvx > 0:
             _gap = (_vx / _pvx - 1.0) * 100.0
             if _gap > float(getattr(cfg, "momentum_vix_gap_max_pct", 12.0)):
-                return False, f"momentum_vix_gap_{_gap:.0f}pct", 0
+                # Overnight VIX gap is not "buying a top" when the session
+                # itself just exploded the straddle on a measured trend
+                # (Sep24: prev 10.36 → 12.32 = 19% fail while ADX≈40 dump).
+                _iv_cont_gap = (
+                    bool(signals.get("straddle_exploded"))
+                    or str(signals.get("iv_behavior") or "")
+                    in ("EXPANDING", "SPIKING")
+                ) and adx >= 40.0 and (
+                    (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+                    or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+                )
+                if not _iv_cont_gap:
+                    return False, f"momentum_vix_gap_{_gap:.0f}pct", 0
 
         # ── freshness: a day that has already spent its priced range is
         #    not a breakout, it is the trade everyone is already in ───────

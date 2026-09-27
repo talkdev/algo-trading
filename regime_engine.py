@@ -3117,22 +3117,15 @@ class RegimeEngine:
         day_type     = ExpiryCalendar.get_day_type(today_d, dte=dte)
         day_label    = ExpiryCalendar.get_day_label(today_d)
 
-        # Straddle explosion check (before vol classification)
+        # Straddle explosion refuses NEW short premium. It must not erase
+        # the classified tape: live 2026-09-24 13:44 overwrote DOWNTREND /
+        # BEARISH / ADX≈40 / IV SPIKING with RANGE + confidence NONE, so
+        # 207 cycles of momentum_confidence_NONE_insufficient ran while
+        # spot dumped another 50pts. Classify first; overlay the sell block.
         straddle = float(signals.get("atm_straddle_price") or 0.0)
-        if self._check_straddle_explosion(straddle):
-            # Straddle explosion → NO_TRADE (not ABORT — positions still managed)
-            return self._build_snapshot(
-                ts, trading_date, day_type, dte, day_label,
-                VolatilityRegime.NEUTRAL,
-                PriceRegime.RANGE,
-                PositioningRegime.UNCLEAR,
-                ConfidenceLevel.NONE,
-                0.0,
-                0.0, 0.0, 1.0,
-                FinalRegime.NO_TRADE,
-                "NO_TRADE:STRADDLE_EXPLOSION",
-                False, False, signals,
-            )
+        exploded = self._check_straddle_explosion(straddle)
+        if exploded:
+            signals["straddle_exploded"] = True
 
         # ── Classify four dimensions ──────────────────────────────────────
         prev_day_vix_close = self.market_engine.state.get("prev_day_vix_close")
@@ -3167,6 +3160,19 @@ class RegimeEngine:
             effective_vol, price, pos, conf, signals,
             self._event_day, borderline_sell,
         )
+
+        if exploded:
+            if final in (
+                FinalRegime.PREMIUM_SELL_RANGE,
+                FinalRegime.PREMIUM_SELL_BULL,
+                FinalRegime.PREMIUM_SELL_BEAR,
+            ):
+                final = FinalRegime.NO_TRADE
+            if "STRADDLE_EXPLOSION" not in str(notes or ""):
+                notes = (
+                    f"{notes}|NO_TRADE:STRADDLE_EXPLOSION"
+                    if notes else "NO_TRADE:STRADDLE_EXPLOSION"
+                )
 
         return self._build_snapshot(
             ts, trading_date, day_type, dte, day_label,
@@ -3315,6 +3321,8 @@ class RegimeEngine:
         signals["defined_risk_only"]   = confirmed.defined_risk_only
         signals["is_calibrated"]       = confirmed.is_calibrated
         signals["calibration_tier"]    = confirmed.calibration_tier
+        if signals.get("straddle_exploded"):
+            signals["straddle_exploded"] = True
 
         return confirmed
 
