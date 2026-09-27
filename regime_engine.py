@@ -984,6 +984,24 @@ class RegimeClassifier:
             return float(v2)
         return default
 
+    def _signal_weight(self, cal_attr: str, default: float = 1.0) -> float:
+        """Signal-blend weight. Never borrow a threshold (ADX, VRP, OI wall).
+
+        Uncalibrated `_t('signal_weight_price', 'adx_trend_threshold', 1.0)`
+        returned 20, so open-print confidence collapsed to ~0.11 NONE while
+        the same tape with unit weights scores ~0.31 LOW (live cycle_log).
+        """
+        if self.cal and self.cal.is_calibrated:
+            v = getattr(self.cal, cal_attr, None)
+            if v is not None:
+                try:
+                    w = float(v)
+                except (TypeError, ValueError):
+                    return default
+                if w > 0:
+                    return w
+        return default
+
     # ─────────────────────────────────────────────────────────────────────
     # VOLATILITY REGIME
     # ─────────────────────────────────────────────────────────────────────
@@ -1531,12 +1549,13 @@ class RegimeClassifier:
         if vol in (VolatilityRegime.ABORT, VolatilityRegime.BUY_OPTIONS):
             return ConfidenceLevel.NONE, 0.0
 
-        # Signal weights from calibration
-        w_vrp  = self._t("signal_weight_vrp",          "vrp_sell_threshold_default", 1.0)
-        w_price = self._t("signal_weight_price",        "adx_trend_threshold",        1.0)
-        w_pos  = self._t("signal_weight_positioning",   "oi_wall_strong",             1.0)
-        w_iv   = self._t("signal_weight_iv_behavior",   "vrp_fair_threshold_default", 1.0)
-        w_or   = self._t("signal_weight_or_condition",  "vrp_sell_threshold_default", 1.0)
+        # Signal weights from calibration. Unit defaults when uncalibrated —
+        # do not reuse VRP/ADX/OI threshold knobs as mix weights.
+        w_vrp   = self._signal_weight("signal_weight_vrp")
+        w_price = self._signal_weight("signal_weight_price")
+        w_pos   = self._signal_weight("signal_weight_positioning")
+        w_iv    = self._signal_weight("signal_weight_iv_behavior")
+        w_or    = self._signal_weight("signal_weight_or_condition")
 
         # Normalise weights so they don't all need to be 1.0
         # Use actual calibration values if available
