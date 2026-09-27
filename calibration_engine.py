@@ -1002,6 +1002,10 @@ class CalibrationEngine:
                 # half-sized HIGH-confidence midweek credit vs the config
                 # book (live sized Thu at 0.35 → 2 lots while replay at
                 # default 0.65 → 5 lots on the same BCS).
+                # `d` was never bound in this function — NameError was
+                # swallowed by the outer except, so DTE2+ size adaptation
+                # never ran after the first midweek sample.
+                d = NIFTY_2026_DEFAULTS
                 _dte2_ceil = {
                     "day_size_wednesday": float(d.day_size_wednesday),
                     "day_size_thursday":  float(d.day_size_thursday),

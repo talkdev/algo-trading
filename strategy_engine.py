@@ -1027,7 +1027,32 @@ class StrategyEngine:
                     )
                 except Exception:
                     _struct_lo = False
-                if not _struct_lo:
+                # Confirmed dump under an unretested open-HIGH wick:
+                # selling calls is the structure, not a lower-high fade.
+                # The loc>=0.70 retest never arrives on a one-way dump, so
+                # the wait kept the only credit dark (replay 24-Sep 10:26
+                # PREMIUM_SELL_BEAR adx≈27 vd≈−0.12 sat until 11:32).
+                # Still refuse mid-location knives (loc>0.15) and soft ADX.
+                _dump_ready = False
+                try:
+                    _adx_os = float(signals.get("adx_15") or 0.0)
+                    _vd_os = float(signals.get("vwap_dist_pct") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_os = 0.0
+                    _vd_os = 0.0
+                _adx_tr = float(
+                    getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+                )
+                _dump_ready = (
+                    current_time >= dtime(10, 15)
+                    and _os_loc <= 0.20
+                    and _os_rng >= 50.0
+                    and _vd_os <= -0.08
+                    and _adx_os >= _adx_tr
+                    and str(signals.get("final_regime") or "")
+                    == "PREMIUM_SELL_BEAR"
+                )
+                if not _struct_lo and not _dump_ready:
                     return "NO_TRADE", "open_spike_wait_unresolved_lower_high"
         if signals.get("chain_stale"):
             return "NO_TRADE", "chain_stale_cannot_validate_strikes"
