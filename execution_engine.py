@@ -3500,6 +3500,34 @@ class ExecutionEngine:
 
         return "HOLD", 0, {"current_premium": current_premium}
 
+    def _vol_explosion_hurts_position(self, position: dict, signals: dict) -> bool:
+        """True when an ATM-straddle explosion is against this book.
+
+        Symmetric shorts are always hurt. Directional credit is hurt only
+        when spot has moved into the short (BPS in a dump, BCS in a rally).
+        Long premium benefits from the vol event. Live 2026-09-24 flattened
+        a winning BCS (entry 23198 → 23120 dump) at +₹744 and then wiped
+        the debit path — the explosion was put-vol, not call-vol.
+        """
+        name = str(position.get("strategy_name") or "").upper()
+        if name in ("LONG_CALL", "LONG_PUT"):
+            return False
+        if name in ("IRON_CONDOR", "IRON_BUTTERFLY"):
+            return True
+        try:
+            spot = float(signals.get("spot") or 0.0)
+            entry = float(position.get("entry_spot") or 0.0)
+        except (TypeError, ValueError):
+            return True
+        if spot <= 0.0 or entry <= 0.0:
+            return True
+        buf = 5.0
+        if name == "BULL_PUT_SPREAD":
+            return spot < entry - buf
+        if name == "BEAR_CALL_SPREAD":
+            return spot > entry + buf
+        return True
+
     def monitor_all_positions(self, signals: dict) -> None:
         """
         Monitor all open positions and execute exits as needed.
@@ -3522,12 +3550,26 @@ class ExecutionEngine:
             _open_straddle = float(self.market_engine.state.get("_straddle_open_for_regime") or 0)
             if (_cur_straddle > 0 and _open_straddle > 0 and
                     _cur_straddle > _open_straddle * 1.18):
-                self.logger.warning(
-                    f"STRADDLE EXPLOSION EXIT: straddle {_cur_straddle:.0f} > "
-                    f"1.18x opening {_open_straddle:.0f} — closing all positions"
-                )
-                self.close_all_positions("STRADDLE_EXPLOSION_EXIT")
-                return
+                _hurt = [
+                    p for p in _open
+                    if self._vol_explosion_hurts_position(p, signals)
+                ]
+                if _hurt:
+                    self.logger.warning(
+                        f"STRADDLE EXPLOSION EXIT: straddle {_cur_straddle:.0f} > "
+                        f"1.18x opening {_open_straddle:.0f} — closing "
+                        f"{len(_hurt)} hurt position(s), keeping "
+                        f"{len(_open) - len(_hurt)} with-move credit(s)"
+                    )
+                    for _pos in _hurt:
+                        try:
+                            self.execute_close(_pos, "STRADDLE_EXPLOSION_EXIT")
+                        except Exception as _exc:
+                            self.logger.critical(
+                                f"explosion close failed for "
+                                f"{_pos.get('position_id')}: {_exc}"
+                            )
+                    return
         for position in self._get_open_positions():
             action, priority, context = self.monitor_position(position, signals)
 
