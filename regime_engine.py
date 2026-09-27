@@ -1317,7 +1317,43 @@ class RegimeClassifier:
             return PriceRegime.OBSERVING
 
         # ── Step 2: CHOPPY ────────────────────────────────────────────────
+        # Fake-breakout chop is a stand-aside only while price is still
+        # inside the opening range. A mature ADX print that has already
+        # broken OR with VWAP on the same side is a trend, not chop.
+        # Replay 2026-09-24 sat in CHOPPY/RANGE (ADX 27, then 40) for the
+        # whole dump; momentum and with-move debit never saw DOWNTREND
+        # until 13:44 — after the credit was done.
         if choppy:
+            _vwap_ch = signals.get("vwap_signal", "UNKNOWN")
+            _event_ch = bool(
+                signals.get("event_day") or signals.get("event_announced")
+            )
+            _through_dn = (
+                (not _event_ch)
+                and adx_15_mature
+                and adx_15 >= adx_trend
+                and or_low > 0
+                and spot < or_low - 20
+                and _vwap_ch in ("BEARISH", "BEARISH_EXTENDED")
+            )
+            _through_up = (
+                (not _event_ch)
+                and adx_15_mature
+                and adx_15 >= adx_trend
+                and or_high > 0
+                and spot > or_high + 20
+                and _vwap_ch in ("BULLISH", "BULLISH_EXTENDED")
+            )
+            if _through_dn:
+                if (adx_15 > adx_strong and ema_structure == "BEARISH"
+                        and spot < or_low - 100):
+                    return PriceRegime.STRONG_DOWNTREND
+                return PriceRegime.DOWNTREND
+            if _through_up:
+                if (adx_15 > adx_strong and ema_structure == "BULLISH"
+                        and spot > or_high + 100):
+                    return PriceRegime.STRONG_UPTREND
+                return PriceRegime.UPTREND
             return PriceRegime.CHOPPY
 
         # ── Step 3: ADX maturity ──────────────────────────────────────────

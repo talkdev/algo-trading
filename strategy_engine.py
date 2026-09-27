@@ -404,13 +404,19 @@ class StrategyEngine:
                         except (TypeError, ValueError):
                             _adx = 0.0
                         _mature = bool(signals.get("adx_15_mature"))
-                    # Stack bar is a clear strong trend (45), not the
-                    # STRONG label at 40 and not momentum_adx_min (24).
-                    # Crossing 40 for one cycle stacked a 3-lot debit
-                    # beside an open credit and replaced a later
-                    # full-size sequential debit.
+                    # Stack debit beside same-side credit once ADX is a
+                    # strong trend. The old 45 bar sat above the 15-min
+                    # print a dump actually produces (Sep24 peaked 39.8
+                    # while BCS was still open, so LONG_PUT never stacked).
+                    # Floor at 36 on normal sessions; event days keep 45
+                    # so a CPI tease cannot replace a later full-size
+                    # sequential debit (Sep11 11:31 2-lot vs 12:00 3-lot).
+                    _event_stack = bool(
+                        (signals or {}).get("event_day")
+                        or (signals or {}).get("event_announced")
+                    )
                     _need = max(
-                        45.0,
+                        45.0 if _event_stack else 36.0,
                         float(
                             getattr(self.config, "adx_strong_threshold", 28.0)
                             or 28.0
@@ -5930,28 +5936,18 @@ class StrategyEngine:
         # it left live 2026-09-15 dark for 647 IV-hot through-OR cycles.
         # OR + VWAP already proved above; require ADX at/above strong.
         _ivb = str(signals.get("iv_behavior") or "")
-        if _ivb in ("EXPANDING", "SPIKING"):
-            _adx_strong_iv = float(getattr(cfg, "adx_strong_threshold", 28.0))
-            _iv_cont = (
-                adx >= max(40.0, _adx_strong_iv)
-                and (
-                    (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
-                    or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
-                )
-            )
-            if not _iv_cont:
-                return False, "momentum_iv_expanding_no_chase", 0
-        if signals.get("straddle_expanding"):
-            _adx_strong_iv = float(getattr(cfg, "adx_strong_threshold", 28.0))
-            _st_cont = (
-                adx >= max(40.0, _adx_strong_iv)
-                and (
-                    (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
-                    or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
-                )
-            )
-            if not _st_cont:
-                return False, "momentum_straddle_expanding", 0
+        # Buying IV expansion is a vol-top only when there is no trend
+        # label. Once price is already DOWNTREND/UPTREND the expansion
+        # IS the continuation (Sep24: ADX 39.8 DOWNTREND + SPIKING died
+        # on a hardcoded 40 floor and never bought the dump).
+        _trend_aligned = (
+            (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+            or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+        )
+        if _ivb in ("EXPANDING", "SPIKING") and not _trend_aligned:
+            return False, "momentum_iv_expanding_no_chase", 0
+        if signals.get("straddle_expanding") and not _trend_aligned:
+            return False, "momentum_straddle_expanding", 0
         if signals.get("spot_velocity_block"):
             return False, "momentum_spot_velocity_too_fast", 0
         try:
