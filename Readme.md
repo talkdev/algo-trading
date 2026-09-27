@@ -1,46 +1,54 @@
-
 # NIFTY Intraday Algorithmic Options Trading Engine & Backtest Framework
 
 ## Architecture Overview & Technical Reference Manual
+
+**Current build:** `v65m7q-cycle-alive-watchdog`  
+**Hard invariant:** never open credit into a labelled threatened trend  
+**Live entry point:** `python main.py`  
+**Replay:** `python backtest_engine.py` (same `MainEngine.run_one_cycle()`)
 
 ---
 
 ### Table of Contents
 
-1. [Executive Summary &amp; Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Latest change logic (v65h)](#11-latest-change-logic-v65--backtest-is-a-data-pump-into-mainengine)
-2. [Module Architecture &amp; Import Dependency Graph](#2-module-architecture--import-dependency-graph)
-3. [Engine Initialization, Data Structures &amp; State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
+1. [Executive Summary & Core Design Philosophy](#1-executive-summary--core-design-philosophy)
+   - [1.1 Current build (v65m7q)](#11-current-build-v65m7q--backtest-is-a-data-pump-into-mainengine)
+   - [1.2 Live-hardening SOP](#12-live-hardening-sop)
+2. [Module Architecture & Import Dependency Graph](#2-module-architecture--import-dependency-graph)
+3. [Engine Initialization, Data Structures & State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
 4. [Master Pipeline Lifecycle: `decide()`](#4-master-pipeline-lifecycle-decide)
 5. [Hard Gate Validation Engine (`_check_hard_gates`)](#5-hard-gate-validation-engine-_check_hard_gates)
-6. [Regime Classification &amp; Regime-to-Strategy Mapping](#6-regime-classification--regime-to-strategy-mapping)
-7. [Range Strategy Resolution &amp; Two-Way Extreme Fading Logic](#7-range-strategy-resolution--two-way-extreme-fading-logic)
+6. [Regime Classification & Regime-to-Strategy Mapping](#6-regime-classification--regime-to-strategy-mapping)
+7. [Range Strategy Resolution & Two-Way Extreme Fading Logic](#7-range-strategy-resolution--two-way-extreme-fading-logic)
 8. [Strategy Entry Rule Validation (`_validate_entry_rules`)](#8-strategy-entry-rule-validation-_validate_entry_rules)
-9. [Mathematical Parameter Computation &amp; Leg Construction (`compute_params`)](#9-mathematical-parameter-computation--leg-construction-compute_params)
+9. [Mathematical Parameter Computation & Leg Construction (`compute_params`)](#9-mathematical-parameter-computation--leg-construction-compute_params)
 10. [Cost, Slippage, and Margin Architecture](#10-cost-slippage-and-margin-architecture)
-11. [Rigorous Expected Value (EV) Gate Model (`_compute_ev_gate`)](#11-rigorous-expected-value-ev-gate-model-_compute_ev_gate)
-12. [DTE Mechanics &amp; Continuous Sqrt-Life Interpolation (`by_dte`)](#12-dte-mechanics--continuous-sqrt-life-interpolation-by_dte)
-13. [Long-Premium Momentum Alternative Route (`_momentum_decision` &amp; `compute_momentum_params`)](#13-long-premium-momentum-alternative-route-_momentum_decision--compute_momentum_params)
-14. [Dominant Structures, Position Sizing, and Risk Allocation](#14-dominant-structures-position-sizing-and-risk-allocation)
-15. [Event-Driven Backtest Engine CLI &amp; Replay Architecture](#15-event-driven-backtest-engine-cli--replay-architecture)
-16. [Comprehensive Decision &amp; Rejection Census Dictionary](#16-comprehensive-decision--rejection-census-dictionary)
+11. [Expected Value (EV) Gate Model (`_compute_ev_gate`)](#11-expected-value-ev-gate-model-_compute_ev_gate)
+12. [DTE Mechanics & Continuous Sqrt-Life Interpolation (`by_dte`)](#12-dte-mechanics--continuous-sqrt-life-interpolation-by_dte)
+13. [Long-Premium Momentum Alternative Route](#13-long-premium-momentum-alternative-route-_momentum_decision--compute_momentum_params)
+14. [Exit Ladder, Profit Lock, and Debit HWM](#14-exit-ladder-profit-lock-and-debit-hwm)
+15. [Dominant Structures, Position Sizing, and Risk Allocation](#15-dominant-structures-position-sizing-and-risk-allocation)
+16. [Live Operations, Telegram, and Durability](#16-live-operations-telegram-and-durability)
+17. [Event-Driven Backtest Engine CLI & Replay Architecture](#17-event-driven-backtest-engine-cli--replay-architecture)
+18. [Decision & Rejection Census Dictionary](#18-decision--rejection-census-dictionary)
 
 ---
 
 ### 1. Executive Summary & Core Design Philosophy
 
-The system is an institutional-grade, cost-aware, intraday options trading and backtesting engine engineered specifically for NIFTY 50 index weekly and near-dated options traded on the National Stock Exchange of India (NSE).
+The system is a cost-aware, intraday NIFTY 50 options engine for NSE weekly / near-dated contracts. One decision path serves both live trading and historical replay.
 
-#### Core Tenets:
+#### Core Tenets
 
-- **Cost-Aware Structural Edge**: Every candidate option structure must clear realistic round-trip institutional friction (exchange STT, SEBI turnover fees, stamp duty, GST, broker order fees, and bid-ask slippage). Edge is never assumed; expected edge must exceed realistic round-trip costs by explicit mathematical hurdles.
-- **Strict Intraday Demarcation**: All positions open after the opening stabilization period and are aggressively flattened before 15:15 IST (or configured `hard_exit_time`). Zero overnight gap or weekend jump risk is assumed.
-- **Asymmetric Regime Hierarchy**: The primary engine book is a premium seller (Iron Condor, Iron Butterfly, Bull Put Spread, Bear Call Spread). Long-premium momentum alternatives (Long Call, Long Put) operate strictly as secondary directional substitutes when sell-side structures are rejected due to strong trend displacement or expanding IV.
-- **Two-Way Auction & Mean-Reversion Preservation**: Identifies intraday auction expansions, rejecting delta-neutral pin condors in expanding sessions and transitioning into high/low extreme-fade directional credit verticals.
+- **Cost-aware structural edge.** Every candidate structure must clear realistic round-trip friction (STT, exchange, SEBI, stamp, GST, brokerage, bid-ask slippage). Edge is never assumed.
+- **Strict intraday demarcation.** Positions open after the session window (DTE-dependent) and flatten before the hard exit (15:15 IST weekly, 15:00 on 0DTE) — five minutes before the broker 15:20 F&O RMS sweep.
+- **Asymmetric book.** The primary book is a premium seller (Iron Condor, Iron Butterfly, Bull Put Spread, Bear Call Spread). Long Call / Long Put exist only as a **substitute** when the sell-side is refused (or as an aligned second-slot debit when that env is enabled).
+- **Two-way auction preservation.** Expanding sessions reject mid-range pins and fade confirmed extremes instead.
+- **Hard credit-into-trend invariant.** `_hard_credit_into_trend_refusal()` is the single source of truth: no BCS into labelled UPTREND / no BPS into labelled DOWNTREND once ADX is at the trend threshold. Waivers are day-structure bearish or a pinned high-extreme fade — never a self-set circular exemption.
 
 ---
 
-### 1.1 Latest change logic (v65 → v65h) — backtest is a data pump into MainEngine
+### 1.1 Current build (v65m7q) — backtest is a data pump into MainEngine
 
 **Architecture rule:** do **not** maintain a second trading loop. Replay feeds historical DB cycles into the **same** live path:
 
@@ -52,1231 +60,704 @@ HistoricalStore → SimClock.set → ReplayClient.point → MainEngine.run_one_c
 |---|---|---|
 | Orchestration | `MainEngine.run_one_cycle()` | **identical** (`MainEngine.for_replay`) |
 | Indicators / regime / decide / monitor / entry / exit / state / P&L | live engines | **identical** |
-| Broker I/O | UpstoxClient | `ReplayClient` (DB snapshots) |
-| Fills | PaperOrderExecutor or live | PaperOrderExecutor + `FillModel` |
-| Clock | wall `now_ist` | `SimClock` (also patches `main.now_ist`) |
+| Broker I/O | `UpstoxClient` | `ReplayClient` (DB snapshots) |
+| Fills | `PaperOrderExecutor` or live | `PaperOrderExecutor` + `FillModel` |
+| Clock | wall `now_ist` | `SimClock` (patches `core` / `main` / engines) |
+| Telegram | `TelegramReporter` (daemon thread) | stub |
 
-**Sep22 proof (live book vs MainEngine pump):**
+Startup banner must show:
 
-| | Entry | Exit | Lots | Exit reason | P&L ₹ |
-|---|---|---|---|---|---|
-| LIVE BCS | 10:37:54 | 11:46:38 | 5 | CLOSE_TARGET | +3,425 |
-| REPLAY BCS | 10:37:54 | 11:46:38 | 5 | CLOSE_TARGET | +3,448 |
-| LIVE LONG_PUT | 10:56:15 | 14:14:56 | 3 | CLOSE_STOP | −912 |
-| REPLAY LONG_PUT | 10:56:15 | 14:14:56 | 3 | CLOSE_STOP | −902 |
+```text
+Engine Build = v65m7q-cycle-alive-watchdog
+Hard Invariant = no credit into labelled threatened trend
+```
 
-Same timestamps, structures, lots, and exit reasons. Residual P&L delta is FillModel edge vs live fills — not a second decision engine.
+#### What this build owns (v65h → v65m7q)
 
-**Also in v65 (parity fixes that feed the live path):** sticky soft-lean max_pain; straddle 5-min lookback (`[-1]`); 1m forming drop + keep partial 5m ADX; `momentum_entries` only on fill; historical correlated debit allowed in replay.
-
-**v65b — momentum debit HWM (general):** Long premium no longer (a) clamps the lock to breakeven under “trend persist” nor (b) scalps modest greens with a mid-trail. Track `peak_debit_value`. Phase A after +lock_trigger: free-trade stop only. Phase B only once HWM open gain ≥ `momentum_hwm_large_frac` (default **1.0** = 2× entry — must not arm mid-trend): trail from the peak giving back only `momentum_hwm_giveback_frac` (default 0.20 → keep ~80% of peak open gain). Sep22 LONG_PUT peaked ~₹13k at 14:01; old BE clamp → −₹912; loose early trail → +₹1.3k; +80% Phase-B → +₹8.7k at 13:55 (still early); 2× HWM trail targets ~₹10k after the real peak.
-
-**v65d — replay fidelity + false morning trends:** (1) Backtest no longer force-enables `allow_correlated_debit_beside_credit` (was inventing LONG_* beside credits on days live never stacked). Hunt enables it only when the live book itself shows overlap. (2) Immature price regime: ORB breakout needs same-side VWAP (not NEUTRAL/UNKNOWN) — stops false morning UPTREND → early verticals into chop.
-
-**v65e — morning ADX preview + DTE1 lock arming + lock-hit label:** (1) Immature directional credit may underwrite on **strong** ADX preview (≥ `adx_strong_threshold`, default 40) — matches live adaptive morning prints (Sep11 BPS @10:22 adx≈46) without reopening weak-preview Sep17 chop. (2) Profit-lock **arming** on DTE1+ uses the weekly 22% bar (not the ~29% sqrt-life blend toward expiry 40%). (3) When a profit-locked stop is hit, exit is `CLOSE_TARGET` (not `CLOSE_STOP`) — Priority-3 premium-stop used to fire first and mis-label locked winners as hard stops.
-
-**v65f — Sep8–22 live-class hunt + primary DB restore (generic, no date patches):**
-
-| Area | Failure | Fix |
-|---|---|---|
-| DTE1 P6 ladder | Holiday-shifted Fri (calendar DTE1) still demanded ~40% time-target; Sep11 peak ~18–25% never harvested → lock giveback scraps | Lock-anchored DTE1 ladder: noon ≈ `lock_arm−4pp`, then looser afternoon rungs |
-| Near-expiry trail | Fractional keep alone unlocked ~half a deep peak (stop stuck ~2+ pts above HWM liq) | `profit_lock_max_giveback_pts_dte0/dte1` (default **2.0**); DTE2+ uncapped |
-| Soft directional | `loc≥0.70` skipped tape agreement → puts into bearish EMA (live Sep18 CHOPPY path) | Soft directional **always** requires `_soft_tape_agrees` |
-| Away-side credit | Late BCS refused on credit_risk just under weekly min (Sep22-class) | Away-side / with-trend credit may use late `credit_risk_ratio` floor |
-| Debit lock label | `profit_lock_activated=1` but null `profit_lock_stop_level` → D1 fell through to `CLOSE_STOP` (stop budget) | Armed debit trail hit → `CLOSE_TARGET` using lock level or `stop_premium` |
-| IC / butterfly harvest | Live Sep16/17 IC ~7–11% of credit to HARD_EXIT, lock never armed, `was_exit_late` | `profit_lock_pct_symmetric` (default **0.10**) + soft P6 ladder 12%/10%/8% for IC/fly |
-| Counter-trend map | Live Sep21 BCS @13:35 `price=UPTREND` adx=23 → HARD_EXIT −₹261 | `_map_regime`: refuse measured UPTREND BCS unless confirmed two-way high fade (plus existing counter-trend gate) |
-| Primary DB | `nifty_algo_v3.db` SQLite-corrupt (`COUNT(*)` / audit failed); looked like empty install | See durability + restore below |
-
-**v65g — Sep8–22 signal-stream hunt (location-edge credit only):**
-
-Per-day MainEngine pump vs live books. Live mistakes already refused on current code: immature IC (Sep16/17/21), counter-trend BCS (Sep21), debit HWM giveback (Sep22 LP → replay `CLOSE_TARGET` ~+₹10k). Remaining hole: live Sep22 soft-lean BCS @10:37 was selected then killed by `credit_risk≈0.049` / `ev≈−0.4` / wing `credit_ratio` floors.
-
-| Gate | Fix (generic) |
+| Area | Behaviour |
 |---|---|
-| `credit_risk_ratio` | `credit_risk_ratio_away_side` (default **0.04**) only when selection is a **range location lean** (`range_soft_location_lean` / `range_location_lean` / warmup) — not plain with-trend `PREMIUM_SELL_*` (that path regresses Sep17 10:06 BPS −₹2k) |
-| EV | Location-edge credits may clear down to `−friction` (tape is the edge) |
-| Wing `credit_ratio` | Location-edge DTE0 floor eased to **0.09** |
+| Cycle-alive watchdog | A slow but **running** cycle must not look like a dead feed. `MainEngine` marks `_cycle_in_progress` and phase-times `run_one_cycle()` (Sep25 live printed 80–170s iterations). |
+| Construct-fail latch | Latch after **2** identical economics rejects (`construct_fail_latch_after=2`). Single-reject sticky over-suppressed re-probes. Deep-EV latch only when EV ≤ `construct_fail_deep_ev_pts` (−10 pts). |
+| Broker history truth | History API failure must **not** look like “no order” (v65m7p). |
+| Hard invariant → debit | `hard_invariant` / `no_calls_into` / `no_puts_into` / unfinished-extreme / sticky tokens are momentum-block markers so a refused credit can still consult LONG_CALL / LONG_PUT. |
+| Extreme fade pin | Only the **matching** extreme is pinned (a low-location BCS must not inherit a high-fade flag). |
+| Fade flags on FLAT | Location-derived fade flags must not permanently latch when the tape is FLAT. |
+| Sticky max-pain | When IV expand clears, drop the sticky max-pain latch so Intent can re-evaluate. Soft/warmup BCS still needs a prior refuse + ≥10 pt spot move before max-pain is waived. |
+| Open-spike wait | “Unresolved” is not wall-clock alone — a lower-high / pullback can resolve the wick before 12:15. |
+| Range-origin map | `PREMIUM_SELL_BULL` / `PREMIUM_SELL_BEAR` with `price=RANGE` defer to `_resolve_range_strategy` so location+tape evidence applies (and cannot flip to the opposite vertical). |
+| Sticky trend refuse | After a labelled UPTREND BCS refuse (or DOWNTREND BPS refuse), a one-cycle RANGE flicker does not re-open that credit. |
+| Unfinished extremes | BCS at loc ≥ 0.90 / BPS at loc ≤ 0.10 refused unless day-structure / extreme-fade waiver applies. |
+| Mid-range fade | Mid-location fade into a with-grind EMA/VWAP is refused (Sep18-class). |
 
-Replay after fix: Sep22 BCS @10:37:39 + LONG_PUT stack; Sep17 back to +₹5,905; Sep11/16/18/21 unchanged vs pre-v65g winners. Flat live days (08–10, 15): bot ran but refused (EV / wing-cost IC / IV expand) — not halt state.
+#### Still true from v65–v65h (do not regress)
 
-**Restart live on v65h.**
+- Replay is a MainEngine pump (not a second `decide()` / `_open` / `_close`).
+- Debit HWM: Phase A after `momentum_lock_trigger` is free-trade only; Phase B trail only once HWM open gain ≥ `momentum_hwm_large_frac` (default **1.0** = 2× entry), giving back `momentum_hwm_giveback_frac` (0.20).
+- Replay does **not** force `allow_correlated_debit_beside_credit` (default **false**).
+- Immature ORB breakout needs same-side VWAP (not NEUTRAL/UNKNOWN).
+- Immature directional credit may underwrite on strong ADX preview (≥ `adx_strong_threshold`).
+- Profit-lock **arming** on DTE1+ uses the weekly 22% bar (not a ~29% blend). Armed lock-hit = `CLOSE_TARGET`.
+- DTE1 lock-anchored P6 ladder; near-expiry give-back capped at `profit_lock_max_giveback_pts_dte0/dte1` (2.0 pts). IC/fly arm at `profit_lock_pct_symmetric` (0.10).
+- Location-edge credits: `credit_risk_ratio_away_side` (0.04); EV may clear down to −friction; DTE0 wing `credit_ratio` eased to 0.09 on that path only.
+- Soft directional always requires `_soft_tape_agrees`. Soft lean at loc ≥ 0.70 / ≤ 0.30 can book without VWAP lag veto.
 
-**v65h — Sep23 BCS into UPTREND (signal-stream hunt 22–23):**
+#### Prior (v50–v64) — superseded, do not treat as current
 
-Live 23-Sep booked `BEAR_CALL_SPREAD` @11:13 with `price=UPTREND` adx=21 (still OPEN at partial cut). Two generic holes:
+Those passes closed live book-truth (PENDING_ENTRY, orphan flatten, Intent, fill qty), tape/lean visibility, and the first MainEngine pump. The long per-version hunt tables (v50–v64) live in git history. **Do not** follow “restart on v61/v62/v65h” banners or the old `v65h-invariant` stamp.
 
-| Hole | Fix |
-|---|---|
-| `no_calls_into_measured_uptrend` required `adx_15_mature` | Refuse on UPTREND + `adx ≥ adx_trend_threshold` (mature flag may lag) |
-| Fade ∧ two_way exemption | Self-waived after in-map two-way loc set the fade; now only **day-structure bearish** may sell calls into an UPTREND label. Fade exemption in `_counter_trend_entry_refusal` is RANGE-only |
-
-Sep22 unchanged (soft-lean BCS + HWM LONG_PUT). Restart live on **v65h**.
-
-### 1.1d Live-hardening SOP (stop the patch treadmill)
-
-Past failures (Sep21→22→23) came from reactive day patches with self-waiving exemptions. New rule of work:
-
-1. **Hard invariants first** — `_hard_credit_into_trend_refusal()` is the single source of truth (map + counter-trend). No fade/two-way carve-out may reopen a labelled UPTREND BCS / DOWNTREND BPS.
-2. **Escape-hatch tests before claiming a fix** — `python tests/test_live_invariants.py` (Sep21/23 live tickets as fixtures). If the live escape is not a failing test first, do not ship a gate change.
-3. **Hunt first divergence of decision**, not end-of-day P&L. Replay blotter wins are not proof live will refuse the next bad entry.
-4. **Deploy proof** — restart the live process and confirm PID start time ≥ fix time; banner must show `Engine Build = v65h-invariant`. Preflight: `python preflight_live.py` before `python main.py`.
-5. **No new exemption** that is set by the same function that checks it (circular waiver).
-6. **Inherited bad opens** — entry invariants do not close positions opened under old code; manage/flatten under the exit ladder / operator risk rules.
-
-**Primary DB durability & restore:**
-
-- Live `Database`: `synchronous=FULL`, 60s busy timeout, WAL checkpoint on close + after each chain-snapshot burst; startup refuses a primary that fails `quick_check` / chain `COUNT(*)` (message points at restore).
-- `python restore_primary_db.py` — quarantine corrupt primary, merge all usable `data/per_day/*.db` shards, `integrity_check`, atomic replace. Re-run after new live sessions + `split_db_per_day.py`.
-- `backtest_engine.py` with no `--db`: if primary has no usable chain snapshots, **auto-falls back** to `data/per_day/` (still prefers a healthy primary).
-
-**Restart live on v65h** so the running process matches this code (and restart after any primary restore).
+Replay P&L tables printed in older README revisions are **not** a live guarantee. Hunt the first decision divergence, not end-of-day ₹.
 
 ---
 
-### 1.1b Prior (v64) — live≡BT execution parity
+### 1.2 Live-hardening SOP
 
-**Why prior DB-replay patches still missed live failures:** replay ran `decide()` + `monitor_position()` but invented fills/books in `_open`/`_close`. Superseded by v65 MainEngine pump.
-
-| ID | Divergence | Fix |
-|---|---|---|
-| P64-01 | BT custom `_open`/`_close` ≠ live execute path | (v65) removed — `run_one_cycle` owns entry/exit |
-| P64-02 | Paper fills ignored FillModel / urgency | `PaperOrderExecutor(fill_model=…)` |
-| P64-03 | Exit marks on wrong expiry series | `execute_close` uses `_chain_for_position` |
-
----
-
-### 1.1c Prior (v63) — missed entries & edge quality
-
-**Live book vs replay gap (Sep21–22 census):** IC @ adx=15/MODERATE OR → stop −₹886; then 189× `after_credit_stop` while UPTREND (BT LONG_CALL +₹3.6k missed); BCS @13:35 into UPTREND → HARD_EXIT −₹261.
-
-| ID | Goal | Fix |
-|---|---|---|
-| P63-01 | Missed debit after IC stop | Soften `after_credit_stop`: RANGE/OTHER stops skip one-way proof; let momentum gate choose side |
-| P63-02 | Missed re-entry after IC stop | Waive `no_material_change` after losing IC/RANGE stop when measured trend |
-| P63-03 | IC sits through trend | Regime-rotate underwater IC/fly on mature UPTREND/DOWNTREND (free slot) |
-| P63-04 | Bad late credit | Counter-trend: mature UPTREND beats day-structure exemption for BCS |
-
-Does not re-open correlated debit (v62).
+1. **Hard invariants first.** `_hard_credit_into_trend_refusal()` is the single source of truth (map + counter-trend). No fade/two-way carve-out may reopen a labelled UPTREND BCS / DOWNTREND BPS except the documented waivers inside that function.
+2. **No circular waiver.** Do not set an exemption in the same function that checks it.
+3. **Hunt first divergence of decision**, not EOD P&L. Replay blotter wins are not proof live will refuse the next bad entry.
+4. **Deploy proof.** Restart the live process; banner must show `v65m7q-cycle-alive-watchdog`. Confirm PID start time ≥ fix time.
+5. **Inherited bad opens.** Entry invariants do not close positions opened under old code; manage/flatten under the exit ladder.
+6. **Sanity before live:** `python verify_all.py` (module self-tests + static pre-flight). There is no `preflight_live.py` or `tests/test_live_invariants.py` in this tree.
 
 ---
-
-### 1.1c Prior (v62) — next-level audit beyond P59
-
-**New failure chains (not in P59-01…16) closed here; open P59 items addressed:**
-
-| ID | Fix |
-|---|---|
-| P62-01 / P59-11 | Exit `_await_fill` requires `filled_quantity ≥ expected_qty`; exit uses booked leg `qty` |
-| P62-02 | OPEN with 0 live legs → `_finalize_empty_open_position` (zombie heal) |
-| P62-03 / P59-09 | Refuse correlated debit beside open same-side credit (`ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT`, default **false**) |
-| P62-04 | Broker flat + local OPEN after flatten → `_heal_local_open_broker_flat` |
-| P62-05 | `/stop` + `flatten_now` abort PENDING_ENTRY (tag Exit-All), even with zero OPEN |
-| P62-06 / P59-10 | Intent exemptions also from `selection_reason` (lean tokens), not only re-derived away |
-| P62-07 / P59-15 | Drop forming **1-minute** bar before MTF ADX/EMA (live↔BT parity) |
-
-**Restart live on v62.** Opt-in old BCS+LP stacking with `ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT=true`.
-
----
-
-### 1.1b Prior (v61) — post-challenge broker-truth recovery
-
-**Challenge of v58–v60 found patch-introduced ghosts; v61 closes them:**
-
-| ID | Fix |
-|---|---|
-| P59-01/02/03 | `PENDING_ENTRY` reconcile is its own startup phase (runs with zero OPEN); probe **all** dispatch states; flatten via tag Exit-All — never `execute_close` with empty legs |
-| P59-04 | Orphan Exit-All when broker-filled and book is not OPEN/PENDING (v59 always sets `position_id`) |
-| P59-05 | Entry fill-timeout uses `_cancel_and_confirm` (FILLED-in-gap books the fill) |
-| P59-06 | Persist `position_legs` while still PENDING, then promote |
-| P59-07 | Latch `day_mode` only at successful entry promote (not first cycle) |
-| P59-08 | Soft-lean open BCS/BPS does not trigger `fade_owns_book` for aligned debit |
-| P59-12 | Missing `filled_quantity` on terminal status refuses phantom fill |
-| P59-14 | Live honors `ALLOW_SAME_CYCLE_REENTRY` after a close this cycle |
-| P59-16 | Unwind failure → OPEN with known legs (never ABORT while broker holds) |
-
-**Still open (do not ignore):** P59-09 correlated BCS+LONG_PUT heat; P59-10 Intent circularity; P59-11 exit qty assert; P59-15 ADX/drop_forming live↔BT asymmetry.
-
-Replay ₹ is secondary. **Restart live on v61.**
-
----
-
-### 1.1b Prior (v60) — challenge pass hotfixes
-
-**Challenge of v58/v59 found patch-introduced ghosts:**
-
-| ID | Fix |
-|---|---|
-| N1 | `PENDING_ENTRY` counts toward open slots / slot_conflict |
-| N2 | Startup PENDING: broker-fill probe → flatten before abort |
-| N3 | Remove dead `_intent_exempt` from hard gates (Intent is post-select) |
-| N4 | Rebuild Intent on IC demotion (rules + econ) |
-| N5 | Latch `event_day` with `day_mode`; regime honours after first entry |
-| N6 | `/stop` `algo.stop` path follows `LOG_DIR` |
-
-Replay ₹ is secondary. **Restart live on v60.**
-
----
-
-### 1.1b Prior (v59) — remaining live-reliability audit fixes
-
-**Priority:** live book truth and taking the right live trades — not replay CAGR.
-
-| Fix | What |
-|---|---|
-| Intent contract | `_build_decision_intent` after selection; secondary gates honor exemptions |
-| PENDING_ENTRY | Insert draft + `position_id` **before** place; promote to OPEN / ABORT on fail |
-| Entry settle | Assert `filled==qty`; cancel resting order on fill timeout |
-| Pre-trade in BT | `validate_pre_trade` before `_open` (same as live) |
-| Same-cycle reentry | Shared `ALLOW_SAME_CYCLE_REENTRY` (default on) — BT matches live |
-| Events snapshot | Hash + map in `aux_json`; latch `day_mode` after first entry |
-| Telegram | Never sync-send on trading thread |
-| Startup | Abort stranded `PENDING_ENTRY` rows |
-
-**Restart live** on this build.
-
----
-
-### 1.1b Prior (v58) — audit P0/P1 permanent fixes
-
-**Goal:** stop live-fail→patch by fixing architecture findings (not another gate waiver).
-
-| ID | Fix |
-|---|---|
-| C1 | `bot_controller` `/stop` writes `logs/algo.stop`; main flattens live book then exits |
-| B1 | `_get_open_positions()` returns all OPEN; fabricate-close removed |
-| B2 | Startup scans `PLACED` orphans without `position_id`; orphan flatten default **on** |
-| B3 | Tag reconcile API failure → `None` (not truthy UNKNOWN) |
-| C2 | `sell_regime_cutoff` = `momentum_late_window_start` (14:30); both env-wired |
-| A1 | Always `decide()` in clock window; feed_stale / None regime are hard gates |
-| A3/A4 | Counter-trend consults momentum; markers for range_wait / feed_stale / … |
-| C3 | Drop forming MTF bars before ADX/EMA |
-| C4/C5 | Fade flags + tape latch in `aux_json`; holidays mtime refresh |
-| H2 | `consecutive_stops` = exit streak, not day total |
-| Init | Session window from DTE, not weekday |
-
-**Restart live** on this build.
-
----
-
-### 1.1b Prior (v57) — proactive soft-lean + marker parity
-
-**Goal:** stop the live-fail→patch cycle by closing Sep22-class holes *before* the next session — secondary gates that undo a lean the resolver already booked, and momentum markers that leave debit dark.
-
-**Advance audit (after v56) found remaining HIGH false-positives:**
-
-1. Soft lean (0.58/0.42) / day-structure BCS selected, but IV / confidence / day_move / entry early-pass only honored mature 0.62/0.38.
-2. `construct_fail_sticky` and `confidence_*` never reached momentum (same dark class as pre-v56 `iv_spiking`).
-3. `second_slot_cooldown` blocked aligned LONG_PUT beside a fresh BCS.
-
-**v57:**
-
-1. **`_away_side_intent`:** mature lean ∪ soft lean+evidence ∪ day-structure bearish lean — used by IV / confidence / day_move waives and BPS/BCS entry early-pass.
-2. **Momentum markers:** `construct_fail`, `confidence`, `second_slot_cooldown`.
-3. **Aligned-long second-slot cooldown waive** inside `_momentum_gate` (BCS+LONG_PUT / BPS+LONG_CALL).
-
-**Do not loosen:** counter-trend, material-change, velocity, open-spike wait, pin ADX/OR, max_pain without lean.
-
-**Restart live** on this build. Replay below.
-
----
-
-### 1.1b Prior (v56) — proactive lean vs secondary veto
-
-**Pattern that caused daily live→patch cycles:** resolver selects an away-side vertical, then a *secondary* gate (entry rule / hard gate / momentum marker) vetoes without knowing the lean existed (22-Sep: BCS at loc 0.04 → max_pain / false straddle expand).
-
-**v56 (advance audit, same at every DTE):**
-
-1. **`_away_side_location_lean`:** shared helper (loc ≥0.62 / ≤0.38 on a real range) used by hard gates + entry rules so lean intent is visible everywhere.
-2. **IV EXPANDING/SPIKING hard gate:** waives for location lean (same as afternoon fade) — otherwise extreme loc + RANGE + rising IV = structural flat.
-3. **BPS/BCS entry rules:** location lean early-passes (symmetric) — OR-mid / VWAP / max_pain cannot undo the resolver.
-4. **Momentum marker `iv_spik`:** live 15-Sep had 427× `iv_spiking` with **zero** momentum consults because only `iv_expanding` was marked.
-5. **Momentum direction from location:** when price is RANGE/CHOPPY but loc is extreme, debit direction follows the lean (puts at low / calls at high).
-
-**Restart live** after pull. Parallel replay vs `data/per_day` (fill-edge 0.25): **₹67,163** (was ₹65,969) — Sep21 +₹1,193 from earlier LONG_CALL; no regressions.
-
----
-
-### 1.1b Prior (v55) — 0DTE warm-up lean + false IV/pin blocks
-
-**Live fact (22-Sep):**
-- Before 10:30: flat was correct (`before_entry_window_10:30` on 0DTE).
-- After 10:30: warm-up lean **did** select `BEAR_CALL_SPREAD` at loc≈0.04, then lost the day to two false blocks:
-  1. `bear_call_spot_within_25pts_of_max_pain` while dumping at the session low (away-side lean, not a mid-range pin).
-  2. `straddle_expanding_no_sell_into_rising_iv` while `iv_behavior=DECLINING` / `iv_change` still negative — ATM roll from the dump, not a vol event.
-
-**v55:**
-1. **Warm-up location lean:** while EMA is `INSUFFICIENT_DATA`, loc ≥0.62 / ≤0.38 is evidence for the away-side vertical.
-2. **Max-pain waive on extreme low lean:** BCS near max pain is allowed when session loc ≤0.38 on a real range (same intent as DOWNTREND trend-through).
-3. **Straddle-expand hard gate needs IV confirm:** only block when `iv_behavior` is EXPANDING/SPIKING or `iv_change_pct_from_open > 0`.
-
-**Restart live** so this path loads.
-
----
-
-### 1.1c Prior (v54) — live-vs-replay continuation gaps
-
-**Live facts (DB, not guesswork):**
-- **11-Sep:** BPS filled the only slot (`max_concurrent=1` historically) → 462× `max_concurrent_positions_reached`; `day_mode=NORMAL` though CPI is on the calendar; momentum never reached the gate (`momentum_sell_side_open`).
-- **21-Sep:** IC stopped −₹886 at 11:58 into ADX≈32 UPTREND → **189×** `momentum_skipped_after_credit_stop`; later `two_way_wait` at loc 0.81 blocked LONG_CALL; `market_snapshots.final_regime` was **NULL on 1486/1486** rows (persisted before regime enrichment).
-
-**v54 (same at every DTE):**
-
-1. **After losing credit stop → one-way continuation:** allow long-premium when ADX ≥ strong + UPTREND/DOWNTREND and not two-way/chop; align debit to the side that beat the vertical (BCS→calls, BPS→puts; IC/RANGE free). Still block choppy chase (17-Sep).
-2. **False two-way tightened:** require meaningful poke past *both* OR edges (drop 1pt fallback); clear latch when measured one-way owns the tape; measured one-way may answer `two_way_wait` / two-way auction with debit.
-3. **`entry_cooldown` is a sell-expression marker** so post-stop continuation reaches the momentum gate.
-4. **Event calendar:** reload `high_impact_events.json` on mtime; refresh `day_mode` / `event_day` every cycle (not process-lifetime freeze).
-5. **Snapshot regimes:** after regime merge, patch the latest `market_snapshots` row (cycle_log already did this).
-
-**v53 kept:** extreme loc evidence, IC ADX∈[12,20), continuous `p_win`.
-
-Parallel replay vs `data/per_day` (fill-edge 0.25): **₹65,969** (same as v53 — no regression). Live gaps above were already expressed correctly in replay (11-Sep LONG_CALL, 21-Sep BPS+LONG_CALL); v54 makes the live path able to take them.
-
-| Date           | Daily Profit (₹) | vs v53 |
-| -------------- | ---------------: | -----: |
-| 2026-09-08     |         ₹2,861 |      — |
-| 2026-09-09     |         ₹8,764 |      — |
-| 2026-09-10     |         ₹4,581 |      — |
-| 2026-09-11     |        ₹17,181 |      — |
-| 2026-09-15     |        ₹12,526 |      — |
-| 2026-09-16     |         ₹6,608 |      — |
-| 2026-09-17     |         ₹7,810 |      — |
-| 2026-09-18     |         ₹1,720 |      — |
-| 2026-09-21     |         ₹3,917 |      — |
-| Total          |        ₹65,969 |      — |
-
-19 trades, 100% win rate. Restart live on this build so post-stop continuation, event calendar refresh, and snapshot regime persistence take effect.
-
----
-
-### 1.1c Prior (v53) — extreme location is evidence + life-continuous p_win
-
-**Live fact (candles, not guesswork):** on 21-Sep at 10:56 the session location was **loc=0.71** (range ≈96 pts) while live sold an IC. Soft lean required EMA/VWAP confirmation; VWAP dist was only ~+0.02, so evidence failed and an older build defaulted to IC. Professionals treat upper/lower-third location itself as the lean signal when the range is real.
-
-**v53 (same at every DTE):**
-
-1. **Extreme location is evidence:** soft lean at ≥0.58 / ≤0.42 still prefers EMA/VWAP, but **loc ≥0.70 / ≤0.30 alone** books the away-side vertical (no VWAP lag veto). Same rule in regime soft-directional path.
-2. **IC flat-ADX floor:** pin requires mature ADX in **[12, 20)** — closes live 16-Sep (ADX 10) and 17-Sep (ADX 0) IC selections.
-3. **EV `p_win` prior:** removed the 7×5 DTE×OR table; OR-width anchors blend with `by_dte(expiry, weekly)` only.
-4. **v52 pin/fade guards kept:** MODERATE OR cannot pin; fade exemption needs `two_way_auction`; counter-trend price-regime veto.
-
-Parallel replay vs `data/per_day` (fill-edge 0.25):
-
-| Date           | Daily Profit (₹) | vs v52 |
-| -------------- | ---------------: | -----: |
-| 2026-09-08     |         ₹2,861 |      — |
-| 2026-09-09     |         ₹8,764 |      — |
-| 2026-09-10     |         ₹4,581 |      — |
-| 2026-09-11     |        ₹17,181 |      — |
-| 2026-09-15     |        ₹12,526 |      — |
-| 2026-09-16     |         ₹6,608 |      — |
-| 2026-09-17     |         ₹7,810 |  +₹2,018 (earlier lean BCS) |
-| 2026-09-18     |         ₹1,720 |      — |
-| 2026-09-21     |         ₹3,917 |   +₹269 (BPS 10:08 vs 10:55) |
-| Total          |        ₹65,969 |  +₹2,287 |
-
-19 trades, 100% win rate. Live path: at loc 0.71 the book now takes BPS instead of IC; ADX&lt;12 cannot pin.
-
----
-
-### 1.1d Prior (v52) — live IC ban on moderate OR + fade needs two-way
-
-**Live diagnosis:** 16/17/21-Sep live sold IC (MODERATE OR / ADX 0–15); 21-Sep then sold BCS into UPTREND (−₹364 day). Replay preferred verticals (+₹3,648 on 21-Sep).
-
-**v52:** pin OR = NARROW only; soft lean 0.58/0.42; fade exemption only if `two_way_auction`; price-regime counter-trend veto. Replay held ₹63,682.
-
----
-
-### 1.1e Prior (v51/v50) — life-continuous construction + no default condor
-
-Tape→structure DTE-agnostic; construction via `by_dte()`; never default-IC; two concurrent tickets. See git history for full notes.
-
----
-
 
 ### 2. Module Architecture & Import Dependency Graph
-
-The trading suite is decoupled into specialized components that interact through validated dictionaries, immutable state snapshots, and standardized database schemas.
 
 ```
                   ┌───────────────────────────────┐
                   │           main.py             │
-                  │      (Production Driver)      │
+                  │   Live / replay orchestrator  │
+                  │     MainEngine.run_one_cycle  │
                   └──────────────┬────────────────┘
                                  │
-                   ┌─────────────┴──────────────┐
-                   │                            │
-                   ▼                            ▼
-        ┌───────────────────────┐    ┌───────────────────────┐
-        │   bot_controller.py   │    │  backtest_engine.py   │
-        │  (Live Market Loop)   │    │ (Historical Replay CLI│
-        └──────────┬────────────┘    └──────────┬────────────┘
-                   │                            │
-                   ├────────────────────────────┤
-                   ▼                            ▼
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+   ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+   │ bot_controller  │ │ backtest_engine │ │ telegram_reporter│
+   │ Telegram /start │ │ SimClock +      │ │ daemon sender   │
+   │ /stop → algo.stop│ │ ReplayClient    │ │ (live only)     │
+   └─────────────────┘ └────────┬────────┘ └─────────────────┘
+                                │
+                                ▼
         ┌───────────────────────────────────────────────┐
         │              strategy_engine.py               │
-        │   - StrategyEngine (Hard Gates, decide(),     │
-        │     Param Computation, EV Gate, Momentum)     │
+        │   Hard gates, Intent, map, EV, momentum       │
         └───────┬───────────────────────────────┬───────┘
                 │                               │
                 ▼                               ▼
     ┌───────────────────────┐       ┌───────────────────────┐
-    │   regime_engine.py    │       │    data_engine.py     │
-    │ - RegimeEngine        │       │ - MarketDataEngine    │
-    │ - RegimeClassifier    │       │ - Upstox Data Poller  │
-    │ - CalibrationEngine   │       │ - Live Bar Aggregator │
+    │   regime_engine.py    │       │  calibration_engine.py│
+    │  4-tier classifier    │       │  rolling 20-session   │
+    │  size_multiplier      │       │  Bayesian shrinkage   │
     └───────────┬───────────┘       └───────────┬───────────┘
                 │                               │
                 ▼                               ▼
-    ┌───────────────────────────────────────────────────┐
-    │                      core.py                      │
-    │ - Config, Database, ExpiryCalendar                │
-    │ - UpstoxClient, RateLimiter, AlertNotifier        │
-    │ - IST Clock Helpers (now_ist, today_ist, by_dte)  │
-    └───────────────────────────────────────────────────┘
+    ┌───────────────────────┐       ┌───────────────────────┐
+    │  execution_engine.py  │       │    data_engine.py     │
+    │  PENDING→OPEN, 7-pri  │       │  1m/5m/15m bars,      │
+    │  exit, profit lock,   │       │  chain, Greeks, OR    │
+    │  flatten / orphans    │       │                       │
+    └───────────┬───────────┘       └───────────┬───────────┘
+                │                               │
+                └───────────────┬───────────────┘
+                                ▼
+                    ┌───────────────────────┐
+                    │        core.py        │
+                    │ Config, Database,     │
+                    │ ExpiryCalendar,       │
+                    │ UpstoxClient, by_dte  │
+                    └───────────────────────┘
 ```
 
-#### Key Module Roles & Imports:
+#### Key module roles
 
-1. **`core.py`**:
-   - `Config`: Central dataclass with 150+ operational parameters, thresholds, risk budgets, and DTE-dependent curves.
-   - `Database`: SQLite persistence layer enforcing write-ahead logging (WAL), table creation, execution audit, and cycle logs.
-   - `ExpiryCalendar`: Derives true NSE weekly Tuesday/Thursday expiries, bank holidays, and calculates integer DTE (`actual_dte`).
-   - `RateLimiter` & `UpstoxClient`: Institutional API interaction with exponential backoff and payload validation.
-   - `now_ist()`, `today_ist()`, `by_dte()`: Timezone-aware date/time functions locked strictly to Indian Standard Time (Asia/Kolkata, UTC+05:30).
-2. **`data_engine.py`**:
-   - `MarketDataEngine`: Ingests ticks, generates 1-minute and 15-minute OHLCV candles, computes intraday indicators (EMA 9/21, VWAP, Supertrend, ADX 14/15, Parkinson Realized Volatility), processes option chains, computes synthetic strike Greeks (Black-76 / Black-Scholes), strike bid/ask spreads, and tracks ATM straddle prices.
-3. **`regime_engine.py`**:
-   - `RegimeClassifier` & `RegimeEngine`: Four-tier hierarchical classification:
-     - Volatility Regime (`classify_volatility`): `SELL_PREMIUM`, `STRONG_SELL_PREMIUM`, `BUY_VOLATILITY`, `NEUTRAL`, `CAUTION`.
-     - Price Regime (`classify_price`): `UPTREND`, `STRONG_UPTREND`, `DOWNTREND`, `STRONG_DOWNTREND`, `RANGE_BOUND`, `BREAKOUT_EXPANSION`, `OBSERVING`.
-     - Positioning Regime (`classify_positioning`): `BULL_BIAS`, `BEAR_BIAS`, `PINNED`, `UNCLEAR`.
-     - Final Regime (`classify_final`): Synthesis yielding `PREMIUM_SELL_RANGE`, `PREMIUM_SELL_BULL`, `PREMIUM_SELL_BEAR`, `MOMENTUM_BUY_CALL`, `MOMENTUM_BUY_PUT`, or `NO_TRADE`.
-   - `CalibrationEngine`: Runs rolling 20-session Bayesian shrinkage calibration against historical distribution metrics (VIX, VRP, OI, PCR, Skew, Day Ranges).
-4. **`strategy_engine.py`**:
-   - Consumes `signals` dict produced by `RegimeEngine` and `MarketDataEngine`. Executes hard gates, assigns strategy structures, solves wing-fit delta strikes, prices slippage and institutional charges, evaluates the barrier EV model, handles the momentum alternative fallback, and outputs executable order specifications.
-5. **`execution_engine.py`**:
-   - Manages state machines for active orders, parent-child leg orders, bracket orders, trail tracking, delta breach monitors, proximity alerts, and emergency unwinds.
-6. **`backtest_engine.py`**:
-   - High-fidelity historical tick/1-minute replay simulator with synthetic fill models, bid/ask spread consumption, margin-aware execution, and portfolio performance metrics.
+1. **`main.py` — production driver.** Instantiates every engine, runs the cycle (`regime_calc_interval_sec` default **15**), watchdog, `/stop` flatten, daily halt, Telegram lifecycle, trade console report. `MainEngine.for_replay()` is the backtest entry. Paper is the default (`PAPER_TRADE_MODE`); live requires `LIVE_RATES_VERIFIED`.
+2. **`bot_controller.py` — operator remote.** Telegram `/start` `/stop` (writes `logs/algo.stop`). It is **not** the trading loop.
+3. **`core.py`.** `Config` (env.txt + defaults), SQLite `Database` (WAL + `synchronous=FULL` + `quick_check` on open), `ExpiryCalendar` (NIFTY **weekly Tuesday** expiry; Monday if Tuesday is a holiday), `UpstoxClient`, `now_ist` / `today_ist` / `by_dte` / `dte_blend`.
+4. **`data_engine.py`.** Spot / VIX / chain ingest, 1-minute bars, 5-minute fast ADX (`adx_fast_resample=300s`), 15-minute MTF (EMA 9/21, ADX 14, VWAP, Parkinson RV). **No Supertrend; no synthetic Black-76/BS Greeks** — deltas/IV come from the broker chain. Drops the **forming 1-minute bar** before MTF. Session windows from **DTE**, not weekday.
+5. **`calibration_engine.py`.** Live `CalibrationEngine` used by `MainEngine` and injected into `StrategyEngine` / `ExecutionEngine`. Rolling ~20-session shrinkage on VIX / VRP / OI / PCR / skew / day-range. `regime_engine.py` still contains a second `CalibrationEngine` class that `RegimeEngine` constructs internally — live threshold updates are pushed from the `main.py` instance.
+6. **`regime_engine.py`.** Four-tier classification → `final_regime` + `size_multiplier`. Does **not** emit `MOMENTUM_BUY_*` — those are strategy-layer substitutes.
+7. **`strategy_engine.py`.** Hard gates, Intent, map, range resolver, hard invariant, entry rules, strike/EV/sizing, momentum substitute.
+8. **`execution_engine.py`.** Place / reconcile / monitor / flatten. 7-priority exit ladder, debit HWM, PENDING_ENTRY, orphan Exit-All.
+9. **`backtest_engine.py`.** Historical pump + `FillModel` + blotter / audit / `--test`.
+10. **`telegram_reporter.py`.** Start / heartbeat / order / close / stop. Own daemon thread — never sync-send on the trading thread.
+11. **`split_db_per_day.py`.** Live primary → `data/per_day/*.db` shards for replay.
+12. **`verify_all.py`.** Module self-tests + static pre-flight (does not start the live loop).
+13. **`upstox_token.py`.** OAuth token refresh.
+
+`restore_primary_db.py` is **not** in this tree. A corrupt/empty primary is handled by `Database` refusing a failed `quick_check`, and by `backtest_engine.py` falling back to `data/per_day/` when `--db` is omitted.
 
 ---
 
 ### 3. Engine Initialization, Data Structures & State Mechanics
 
-#### `StrategyEngine.__init__` Lifecycle:
+#### `StrategyEngine.__init__`
 
 ```python
 class StrategyEngine:
     def __init__(self, config: Config, database: Database,
-                 market_engine: MarketDataEngine, logger):
-        self.config = config
-        self.db = database
-        self.market_engine = market_engine
-        self.logger = logger
-        self.cal_engine = CalibrationEngine(database, config, logger)
-        self.calendar = ExpiryCalendar(
-            holidays_file=getattr(config, "holidays_file", "nse_holidays.json")
-        )
-        self._ensure_tables()
-        self._session_prices: List[Tuple[dtime, float]] = []
+                 market_engine: MarketDataEngine,
+                 cal_engine: CalibrationEngine, logger):
+        ...
         self._construct_fail_counts: Dict[str, int] = {}
+        # session price memory for late momentum lives on the instance
+        # as _v13_price_hist (filled by _note_price)
 ```
 
-#### Persistent State Store (`market_engine.state`):
+`CalibrationEngine` is injected (it is **not** constructed inside `StrategyEngine`). `ExpiryCalendar` is used via `core` helpers, not stored as `self.calendar`.
 
-The engine relies on an in-memory state dictionary synchronized continuously with SQLite:
+#### Persistent session state (`market_engine.state`)
 
-- `entry_count`: Number of completed structure entries today.
-- `consecutive_stops`: Consecutive stop-loss breaches recorded in current session (triggers halt if ≥ 2).
-- `last_stop_time`, `last_stop_reason`, `last_stop_combo`: Fingerprints of the last stopped position.
-- `last_exit_time`, `last_exit_spot`, `last_exit_strategy`: Exact exit timestamps and spot prices to enforce time cooldowns (`ENTRY_COOLDOWN_MIN = 10`) and distance hurdles.
-- `session_high`, `session_low`: Dynamic intraday extreme prices.
-- `session_mean_reversion_book`: Boolean flag set after a completed high/low fade scalp.
-- `construct_fail`: Latch tracking repeated economic/structural leg failures on static auction prints (`_sticky_construct_reason`).
-- `displaced_tape`: Trend displacement latch (`_tape_displacement`) preventing single-cycle regime flip whipsaws.
+- `entry_count`, `entry_start` / `entry_end` / `hard_exit_time` (DTE-derived)
+- `consecutive_stops` — **exit streak from `trade_exits` blotter** (resync via `_sync_stop_streak`; memory latch alone cannot halt)
+- `last_stop_time`, `last_stop_reason`, `last_stop_signal_combo`
+- `last_exit_time`, `last_exit_spot`, `last_exit_strategy`, `last_exit_strategy_side`, `last_exit_is_regime_rotation`, `last_exit_is_failed_break_scalp`
+- `last_entry_time`
+- `session_high` / `session_low`, `session_mean_reversion_book`
+- `day_mode` / `event_day` (events file reloaded on mtime)
+- `session_no_calls_after_uptrend_refuse` / `session_no_puts_after_downtrend_refuse`
+- `construct_fail` sticky key + `_max_pain_block_spot`
+- `displaced_tape` latch
+- `daily_halted`
 
-#### Database Persistence Schema:
+#### Open-slot accounting
 
-Table `strategy_decisions` records every evaluation cycle:
+`PENDING_ENTRY` **counts** toward `max_concurrent_positions`. Successful `OPEN`+`CLOSED` count toward `max_entries_per_day`. Aborted/pending drafts do not burn the daily entry cap.
 
-- `timestamp`: ISO-8601 IST string.
-- `strategy_name`: Assigned strategy or `NONE` / `NO_TRADE`.
-- `action`: `ENTER`, `NO_TRADE`, `HOLD`, `EXIT`.
-- `reason`: Machine-readable rejection token or acceptance tag.
-- `regime`, `confidence`, `spot`, `vix`: Market context snapshot.
-- `dte`: Days to expiry at evaluation moment.
-- `params_json`: Complete JSON dump of legs, credit, strikes, stops, targets, margin, and EV breakdown.
+#### Database
+
+- WAL + `PRAGMA synchronous=FULL`, 60s busy timeout, WAL checkpoint on close and after chain-snapshot bursts.
+- Startup `PRAGMA quick_check`; a failed primary is refused (do not trade on a corrupt file).
+- `strategy_decisions` stores every cycle (`action`, `strategy_name`, `reason`, `params_json`, `signals_json`).
+- After regime merge, `MainEngine` patches the latest `cycle_log` **and** `market_snapshots` row (snapshots are written *before* enrichment).
 
 ---
 
 ### 4. Master Pipeline Lifecycle: `decide()`
 
-The `decide(signals: dict) -> dict` method is the top-level entry point called every cycle (typically every 1 to 3 minutes).
+Called from `MainEngine.run_one_cycle()` whenever the clock is inside the entry cut (09:30 … late-momentum end 14:57) and the flatten lock is held. ABORT / feed_stale / None regime are **hard-gate** refusals inside `decide()`, so momentum markers still fire.
 
 ```
-                            [ signals: dict ]
-                                    │
-                                    ▼
-                         _note_price(signals)
-                                    │
-                                    ▼
-                         _check_hard_gates()
-                                    │
-                    ┌───────────────┴───────────────┐
-                 [Fails]                         [Passes]
-                    │                               │
-                    ▼                               ▼
-       _momentum_decision(reason)        _map_regime_to_strategy()
-          ┌─────────┴─────────┐                     │
-      [Allowed]           [Blocked]                 ▼
-          │                   │          _counter_trend_entry_refusal()
-          ▼                   ▼                     │
-    Return ENTER        Return NO_TRADE             ▼
-     (Long Px)          (Persist Gate)    _validate_entry_rules()
-                                                    │
-                                                    ▼
-                                          _sticky_construct_reason()
-                                                    │
-                                                    ▼
-                                          compute_params()
-                                                    │
-                                    ┌───────────────┴───────────────┐
-                                 [Fails]                         [Passes]
-                                    │                               │
-                                    ▼                               ▼
-                      Condor Demotion to Vertical?            Return ENTER
-                                    │                         (Credit Structure)
-                      _momentum_decision(fail)
-                                    │
-                             Return Decision
+                         [ signals ]
+                              │
+                              ▼
+                       _note_price()
+                              │
+                              ▼
+                    _check_hard_gates()
+                 ┌────────────┴────────────┐
+              fail                      pass
+                 │                         │
+                 ▼                         ▼
+        _momentum_decision()     _map_regime_to_strategy()
+                 │                         │
+                 │              _build_decision_intent()
+                 │                         │
+                 │              _same_side_chase_refusal()
+                 │                         │
+                 │              _counter_trend_entry_refusal()
+                 │                         │
+                 │              _slot_conflict()
+                 │                         │
+                 │              _validate_entry_rules()
+                 │                    │
+                 │         IC pin fail → demote to evidenced vertical
+                 │                         │
+                 │              _sticky_construct_reason()
+                 │                         │
+                 │              compute_params()
+                 │                    │
+                 │         IC econ fail → one demotion
+                 │                         │
+                 └──────────┬──────────────┘
+                            ▼
+                     ENTER / NO_TRADE
+                    (persist + cycle_log)
 ```
 
-#### Execution Steps:
+Every NO_TRADE path consults `_momentum_decision` before returning. Intent is rebuilt on IC demotion.
 
-1. **Price Memory Registration (`_note_price`)**: Appends current `(current_time, spot)` to `self._session_prices` for closing-hour velocity and displacement calculations.
-2. **Hard Gate Sweep (`_check_hard_gates`)**: Evaluates global session, time, volatility, and risk gates. If tripped:
-   - Queries `_momentum_decision(signals, gate_reason)`. If momentum passes, returns long-premium `ENTER`.
-   - Otherwise appends momentum rejection reason via `_with_momentum_refuse`, persists to database, and returns `NO_TRADE`.
-3. **Regime to Strategy Mapping (`_map_regime_to_strategy`)**: Maps `final_regime` to target strategy structure.
-4. **Counter-Trend Entry Symmetry (`_counter_trend_entry_refusal`)**: Verifies that a credit spread is not entering against an intraday directional displacement.
-5. **Strategy-Specific Entry Rules (`_validate_entry_rules`)**: Validates delta constraints, pin vetoes, and opening range boundaries.
-6. **Sticky Construct Check (`_sticky_construct_reason`)**: Prevents continuous order building when the auction is stationary and previously failed economics.
-7. **Parameter Computation & EV Gating (`compute_params`)**: Selects strikes, builds legs, calculates round-trip friction, applies EV barrier simulation, and checks risk budgets.
-   - **Condor Demotion (`_demote_condor_on_econ_fail`)**: If an Iron Condor fails economics on wing geometry (`wing_cost` or `condor_weak_side`), checks for bearish lean or afternoon fade evidence. If present, immediately demotes to `BEAR_CALL_SPREAD` or `BULL_PUT_SPREAD`. If parameters pass, returns `ENTER`.
-   - **Momentum Substitution**: If parameters are invalid, passes the structural failure token to `_momentum_decision`.
-8. **Final Decision Dispatch**: Persists decision, updates state, and returns action payload:
-   ```json
-   {
-     "action": "ENTER",
-     "strategy_name": "BEAR_CALL_SPREAD",
-     "reason": "regime:PREMIUM_SELL_BEAR:conf=HIGH:dte=1:or=NARROW:adx=24",
-     "params": { ... }
-   }
-   ```
+#### `MainEngine.run_one_cycle()` (live = replay)
+
+1. Day reset  
+2. `MarketDataEngine.run_cycle()`  
+3. `RegimeEngine.process_signals` + `merge_regime_into_signals`  
+4. Patch `cycle_log` / `market_snapshots`  
+5. `monitor_all_positions` (always — ABORT never skips exits)  
+6. `perform_hard_exit_sweep`  
+7. `check_daily_loss_halt`  
+8. `decide()` → `process_entry_decision`  
+9. Daily P&L + console trade report  
+
+Cycle interval default: `regime_calc_interval_sec = 15` (`REGIME_CALC_INTERVAL_SEC`). The outer loop also allows decide() from **09:30** through the late-momentum end (**14:57**); sell-side clocks inside `decide()` still use the DTE window.
 
 ---
 
 ### 5. Hard Gate Validation Engine (`_check_hard_gates`)
 
-The hard gate suite enforces absolute risk parameters. It evaluates sequentially:
+Evaluated in order. Session clocks come from `state` (DTE-set), not the static README 09:20/14:15 of older builds.
 
-| Order | Hard Gate Identifier                            | Trigger Condition                                                                        | Rationale & Protection                                                                                                          |
-| ----- | ----------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | `regime_engine_abort`                         | `signals.get("block_new_entries")` or `final_regime in ("NO_TRADE", "ABORT", None)`  | Upstream regime classifier detected corrupted data, news halt, or unclassifiable tape.                                          |
-| 2     | `daily_loss_limit_reached_or_halted`          | `state.get("daily_halted") == True`                                                    | Session P&L breached maximum cumulative capital loss limit (`daily_loss_limit_pct`).                                          |
-| 3     | `circuit_breaker_suspected`                   | `signals.get("circuit_breaker_suspected") == True`                                     | Spot index halted or tick dispersion indicates exchange-wide circuit filter.                                                    |
-| 4     | `vix_spike_detected`                          | `signals.get("vix_spike_detected") == True`                                            | India VIX jumped ≥ 15% intraday; short premium tail-risk explodes.                                                             |
-| 5     | `iv_expanding_never_sell_into_rising_iv`      | `iv_behavior in ("EXPANDING", "SPIKING")` (unless extreme fade)                        | Vega expansion destroys short option credit before theta can decay.                                                             |
-| 6     | `before_entry_window` / `past_entry_window` | `current_time < trading_window_start (09:20)` or `current_time > last_entry (14:15)` | Avoids opening print auction noise and avoids late entries with insufficient theta runway.                                      |
-| 7     | `max_concurrent_positions_reached`            | `open_count >= config.max_concurrent_positions (2)`                                    | Two-slot book: a second structure may sit beside an open one only when it is a different trade (aligned long premium, or opposite extreme fade on a confirmed two-way tape). Same-structure stacking is refused. |
-| 8     | `max_entries_per_day_reached`                 | `today_entries >= config.max_entries_per_day (default 2, 3 for 2-way fade)`            | Over-trading protection on choppy, non-trending sessions.                                                                       |
-| 9     | `entry_cooldown_remaining`                    | Time since last action < cooldown (`ENTRY_COOLDOWN_MIN = 10`)                          | Prevents immediate revenge entries after an exit.                                                                               |
-| 10    | `no_material_change_since_exit`               |                                                                                          | spot - last_exit_spot                                                                                                           |
-| 11    | `2_consecutive_stops_halt`                    | `state.get("consecutive_stops") >= 2`                                                  | Kills the engine for the rest of the day after two failed stops.                                                                |
-| 12    | `same_signal_combo_caused_last_stop`          | Current regime/signal tuple matches last stop signature                                  | Prevents repeating identical failed theses.                                                                                     |
-| 13    | `stop_cooldown_remaining`                     | Time since last stop < STOP_COOLDOWN_MAP (30 to 45 min)                                  | Enforces emotional/tape reset period after a stop-out (`CLOSE_STOP: 30m, CLOSE_ADX: 45m, CLOSE_VWAP: 20m, CLOSE_DELTA: 30m`). |
-| 14    | `spot_velocity_too_fast`                      | 5-minute spot displacement > threshold (e.g. 50 pts)                                     | Prevents selling credit in front of an aggressive price locomotive.                                                             |
-| 15    | `straddle_expanding`                          | ATM straddle price expanding > 5% over rolling 15 min                                    | Direct proxy for implied volatility repricing against the short seller.                                                         |
-| 16    | `opening_range_pending`                       | `or_computed == False` or `price_regime == "OBSERVING"`                              | Opening 15-minute range must resolve before structural bounds exist.                                                            |
-| 17    | `open_spike_wait`                             | `day_high_is_open_spike == True` and `current_time < 12:15`                          | Opening wick creates false range tops; must wait for afternoon confirmation.                                                    |
-| 18    | `chain_stale`                                 | Options snapshot timestamp > 120 seconds old                                             | Protects against quote staleness, broken feeds, and phantom fills.                                                              |
-| 19    | `expiry_day_waiting_for_0dte`                 | Tuesday session where 0DTE chain is not yet loaded                                       | Prevents accidental execution on weekly contracts on expiry morning.                                                            |
-| 20    | `confidence_insufficient`                     | `confidence_level in ("LOW", "NONE")` (unless extreme fade)                            | Cost friction requires minimum statistical edge.                                                                                |
-| 21    | `dte_above_max` / `dte_requires_confidence` | DTE > max_dte (4) or DTE ≥ 4 with confidence ≠ HIGH                                    | Protects against zero-theta far-dated contracts.                                                                                |
-| 22    | `day_move_used_no_edge`                       | Range move consumed ≥ 75% of opening straddle                                           | Expected remaining intraday price movement is exhausted.                                                                        |
-| 23    | `insufficient_minutes_before_exit`            | Mins to hard exit < required (50 to 90 min)                                              | Must allow adequate time for theta decay to outpace friction.                                                                   |
-| 24    | `wide_or_dangerous`                           | `or_condition in ("WIDE", "VERY_WIDE")` without confirmed trend                        | Volatile open creates high failure rate for range structures.                                                                   |
+| # | Token / family | Trigger | Notes |
+|---|---|---|---|
+| 1 | `feed_stale_entries_blocked` | `signals["_feed_stale"]` | Watchdog / degrade |
+| 2 | `ABORT:…` / `regime_unavailable` / `regime_engine_no_trade` | `block_new_entries`, `final_regime` None / `NO_TRADE` / `ABORT` | Upstream halt |
+| 3 | `daily_loss_limit_reached_or_halted` | `daily_halted` | Default action **flatten** (`daily_halt_action`) |
+| 4 | `circuit_breaker_suspected` | flag | Exchange halt / tick explosion |
+| 5 | `vix_spike_detected` | flag | India VIX spike (abort_vix_spike_pct default 15%) |
+| 6 | `iv_expanding_never_sell_into_rising_iv` / `iv_spiking` | `iv_behavior` EXPANDING/SPIKING | Waived for afternoon fade **or** `_away_side_intent` |
+| 7 | `before_entry_window_*` / `past_entry_window_*` | clock vs `entry_start`/`entry_end` | **0DTE: 10:30–13:00.** Weekly: **09:45–14:15** |
+| 8 | `max_concurrent_positions_reached` | OPEN+PENDING ≥ `max_concurrent_positions` (**2**) | Second ticket must be a different trade |
+| 9 | `max_entries_per_day_N_reached` | OPEN+CLOSED ≥ **3** | +1 extra (cap 4) on live two-way fade |
+| 10 | `second_slot_cooldown_*` | open book + < 10 min since last **entry** | Opposite extreme fade exempt |
+| 11 | `entry_cooldown_*` | < 10 min since last **act** (entry or exit) | Opposite rotation: `reentry_opposite_cooldown_min` (3) |
+| 12 | `no_material_change_since_exit_*` | spot move < max(0.12% , 15 pts) | Opposite rotation uses 0.25× |
+| 13 | `2_consecutive_stops_halt` | blotter streak ≥ 2 | Banked `CLOSE_TARGET` is **not** a stop |
+| 14 | `same_signal_combo_caused_last_stop` | same regime/signal fingerprint | |
+| 15 | `stop_cooldown_*` | `STOP_COOLDOWN_MAP` | CLOSE_STOP 30m, CLOSE_ADX 45m, CLOSE_VWAP 20m, CLOSE_DELTA 30m |
+| 16 | `spot_velocity_too_fast` | 5-min displacement vs `spot_velocity_pct` (0.14%) | Two-way + matching fade exempt |
+| 17 | `straddle_expanding_no_sell_into_rising_iv` | ATM straddle up >6% vs ~5-min lookback (`[-1]`) | **No IV confirm** — do not qualify on EXPANDING/SPIKING (live morning blocks fired with DECLINING IV on ATM roll) |
+| 18 | `opening_range_not_yet_computed` / `opening_range_pending` | `or_computed` false / `price_regime==OBSERVING` | Separate tokens |
+| 19 | `open_spike_wait_unresolved_lower_high` | open-HIGH wick, before resolve / 12:15 | Pullback 30 pts or LH loc ≥ 0.70 after 10:45 |
+| 20 | `chain_stale_cannot_validate_strikes` | chain age > 120s | |
+| 21 | `expiry_day_waiting_for_0dte` | Tuesday morning, 0DTE chain not loaded | |
+| 22 | `confidence_*_insufficient_*` | LOW/NONE | Extreme fade / away-side intent can waive |
+| 23 | `dte_X_above_max_4_*` / `dte_requires_confidence` | DTE > 4, or DTE ≥ 4 needs HIGH | |
+| 24 | `day_move_used_*_no_edge` | range / straddle ≥ `day_move_used_block_pct` | `day_move_range_factor` converts range→displacement |
+| 25 | `only_Xmin_before_hard_exit_need_Y` | < 90 min (morning) / < 50 min after 13:00 | `afternoon_credit_after_hhmm=13:00` |
+| 26 | `wide_or_*_dangerous_to_sell_premium` | WIDE / VERY_WIDE without confirmed trend | |
+
+Intent exemptions are **post-selection** (v60). Hard gates must not call `_intent_exempt`.
 
 ---
 
 ### 6. Regime Classification & Regime-to-Strategy Mapping
 
-The mapping from multi-dimensional market signals into candidate option strategies is performed by `_map_regime_to_strategy`:
+#### Actual enum values (README previously listed obsolete names)
+
+**Volatility:** `STRONG_SELL_PREMIUM`, `SELL_PREMIUM`, `BORDERLINE_SELL`, `NEUTRAL`, `BUY_OPTIONS`, `ABORT`  
+**Price:** `STRONG_UPTREND`, `UPTREND`, `RANGE`, `DOWNTREND`, `STRONG_DOWNTREND`, `CHOPPY`, `OBSERVING`  
+**Positioning:** `STRONG_RANGE`, `RANGE`, `BULLISH`, `BEARISH`, `UNCLEAR`  
+**Final:** `PREMIUM_SELL_RANGE`, `PREMIUM_SELL_BULL`, `PREMIUM_SELL_BEAR`, `NO_TRADE`, `ABORT`  
+**Confidence:** `HIGH`, `MEDIUM`, `LOW`, `NONE`
+
+There is **no** `MOMENTUM_BUY_CALL` / `MOMENTUM_BUY_PUT` final regime. Long premium is a strategy-layer substitute.
+
+ADX defaults: trend **20**, strong **28**. Immature ADX: directional credit needs a **strong preview** or wait (`NO_TRADE:ADX_IMMATURE_NO_DIRECTIONAL_CREDIT`). Immature ORB UPTREND/DOWNTREND requires same-side VWAP.
+
+Sell-regime cutoff: **14:30** (`sell_regime_cutoff_hhmm` = `momentum_late_window_start`). After that the classifier is NO_TRADE and only the late-momentum route can buy.
+
+#### `_map_regime_to_strategy`
 
 ```
-               [ final_regime (from RegimeEngine) ]
-                                 │
-     ┌───────────────────────────┼───────────────────────────┐
-     ▼                           ▼                           ▼
-PREMIUM_SELL_RANGE       PREMIUM_SELL_BULL           PREMIUM_SELL_BEAR
-     │                           │                           │
-     ▼                           ▼                           ▼
-_resolve_range_strategy()   BULL_PUT_SPREAD             BEAR_CALL_SPREAD
-     │
-     ├─ Structural bearish lean ────────────────────► BEAR_CALL_SPREAD
-     ├─ Two-Way Auction at Range High (loc ≥ 0.85) ──► BEAR_CALL_SPREAD
-     ├─ Two-Way Auction at Range Low (loc ≤ 0.15) ───► BULL_PUT_SPREAD
-     ├─ Location lean (soft 0.65/0.35 or mature 0.62/0.38) ► vertical
-     ├─ True pin (narrow OR, mature flat ADX, mid loc) ► fly / condor
-     └─ Otherwise ──────────────────────────────────► NO_TRADE wait
+PREMIUM_SELL_RANGE  →  _resolve_range_strategy()
+PREMIUM_SELL_BULL   →  hard invariant → (if price=RANGE: defer to range)
+                       → day-structure bearish veto (unless ADX ≥ strong UPTREND)
+                       → two_way_wait_no_puts_at_high
+                       → BULL_PUT_SPREAD
+PREMIUM_SELL_BEAR   →  hard invariant → mid-range fade-into-grind
+                       → (if price=RANGE: defer to range)
+                       → two_way_wait_no_calls_at_low
+                       → BEAR_CALL_SPREAD
 ```
 
-#### Directional Trend Overrides:
-
-- **`PREMIUM_SELL_BULL`**: Spot is in confirmed uptrend (above VWAP, Supertrend Bullish, EMA 9 > 21). Maps to **`BULL_PUT_SPREAD`** (credit put spread sold below support).
-- **`PREMIUM_SELL_BEAR`**: Spot is in confirmed downtrend (below VWAP, Supertrend Bearish, EMA 9 < 21). Maps to **`BEAR_CALL_SPREAD`** (credit call spread sold above resistance).
-- **Two-Way Auction Positioning Override (`PATCH_V31`)**: If `signals["two_way_auction"]` is true and session range ≥ 85 points:
-  - If range location ≥ 0.80: Overrides `final_regime` to `PREMIUM_SELL_BEAR` (High Fade).
-  - If range location ≤ 0.20: Overrides `final_regime` to `PREMIUM_SELL_BULL` (Low Fade).
+Two-way overlay (range ≥ 85 pts, no fade flag yet): loc ≥ 0.80 → force BEAR / loc ≤ 0.20 → force BULL.
 
 ---
 
 ### 7. Range Strategy Resolution & Two-Way Extreme Fading Logic
 
-Range-bound markets are resolved via `_resolve_range_strategy` with a **single DTE-agnostic ladder** (v50/v51). A condor is a pin trade, never the default. Construction economics after selection are continuous on life (`by_dte`).
+`_resolve_range_strategy` is DTE-agnostic. A condor is a **pin**, never the default.
 
-#### Ladder (first match wins):
+#### Ladder (first match wins)
 
-1. **Structural bearish lean** (`_range_day_bearish_lean`) → `BEAR_CALL_SPREAD` when an unfilled gap-down sits under a call wall (weekend-risk / Friday stays delta-neutral).
-2. **Confirmed two-way auction** → fade the tested extreme only (`loc ≥ 0.85` bear call / `loc ≤ 0.15` bull put when range ≥ 85 pts); mid-range returns `NO_TRADE`.
-3. **Location lean** on session range ≥ 50 pts:
-   - Mature ADX: `loc ≥ 0.62` → bull put; `loc ≤ 0.38` → bear call.
-   - Soft: `0.58 / 0.42` with EMA/VWAP, **or loc ≥0.70 / ≤0.30 alone** (v53 — VWAP lag must not veto).
-4. **True pin only** — **NARROW / VERY_NARROW OR only** (not MODERATE), mature ADX in [12, 20), mid location (0.40–0.60), contained range (&lt;100 pts), sell-premium vol, before noon, no soft-lean grind → iron butterfly when `dte_blend ≥ 0.35` else iron condor.
-5. **Otherwise → `NO_TRADE` wait.** Never `range_default_condor`.
+1. **Structural bearish lean** (`_range_day_bearish_lean`) → `BEAR_CALL_SPREAD` (unfilled gap-down under a call wall). Friday / weekend-risk stays delta-neutral.
+2. **Confirmed two-way auction** (range ≥ 85 pts): loc ≥ 0.85 → BCS, loc ≤ 0.15 → BPS; otherwise `two_way_auction_wait_for_extreme`.
+3. **Location lean** (range ≥ 50 pts, not event day):
+   - Mature ADX ≥ trend (20) + non-UNCLEAR positioning: loc ≥ **0.62** → BPS, loc ≤ **0.38** → BCS.
+   - Soft **0.58 / 0.42** with `_soft_location_evidence` (EMA/VWAP tape agree), **or loc ≥ 0.70 / ≤ 0.30 alone** (warmup uses RANGE/STRONG_RANGE positioning).
+4. **True pin only** — NARROW / VERY_NARROW OR, mature ADX in **[12, 20)**, loc (0.40, 0.60), session range < 100 pts, sell-premium vol, **before 12:00**, no grind-away: butterfly if `dte_blend ≥ 0.35` and ADX < 18 and |spot−ATM| < 50; else condor.
+5. **Else `range_wait_no_pin_no_lean`.** Never `range_default_condor`.
 
-#### Two-Way Auction Extreme Resolution:
+Location:
 
-On volatile range sessions where the index swings between extremes without a persistent trend:
+```text
+loc = (spot - eff_lo) / (eff_hi - eff_lo)
+```
 
-- Selling an Iron Condor in the middle of the range guarantees testing one or both wings.
-- The engine calculates session range position via `_fade_range_pos(signals)`:
-  ```text
-  loc = (spot - eff_lo) / (eff_hi - eff_lo)
-  ```
-  (Where `eff_hi` and `eff_lo` remove open-spike wicks when the spike gap ≥ 15 pts).
-- Confirmed two-way (both OR edges poked, or choppy-on-wide) may fade from 10:45; one-sided harvests wait for noon before opposite credit.
-
-#### Iron Butterfly / Condor Pin Spec:
-
-- Butterfly: pin-life (`dte_blend ≥ 0.35` ≈ DTE 0–1), `VERY_NARROW`/`NARROW` OR only, ADX_15 &lt; 18, `|spot − ATM| < 50`, before 12:00.
-- Condor pin: same narrow-OR / mid-location (0.40–0.60) / contained-range / sell-premium gates with ADX_15 &lt; 20. Soft-lean location forbids pin.
-- Pin-gate failure demotes to an evidenced vertical (clear location / fade / day-structure lean), not a blind substitute.
+`eff_hi` / `eff_lo` strip open-spike wicks when the spike gap ≥ 15 pts.
 
 ---
 
 ### 8. Strategy Entry Rule Validation (`_validate_entry_rules`)
 
-Before strike construction, `_validate_entry_rules` runs structural checks tailored to the chosen strategy:
+#### Iron Butterfly
 
-#### 1. Iron Butterfly Rules:
-- Must have pin-life (`dte_blend ≥ 0.35`).
-- On 0DTE, entry after 12:00 IST is forbidden.
-- Spot must be within 50 points of ATM strike.
-- ADX_15 must be ≤ 22.
-- Opening range condition cannot be `WIDE` or `VERY_WIDE`.
+- `dte_blend ≥ 0.35`; after 12:00 forbidden (any DTE); |spot−ATM| ≤ 50; ADX ≤ 22 **and mature**; OR NARROW / VERY_NARROW.
 
-#### 2. Iron Condor Rules:
-- **Runway Gate**: Minutes to hard exit must be ≥ 75 min (on 0DTE) or ≥ 90 min (on DTE ≥ 1).
-- **Momentum Gate**: ADX_15 must be below `adx_strong_threshold` (default 25) and ADX_15 must be mature.
-- **Two-Way Veto**: Banned on confirmed two-way expanding auctions.
-- **Opening Wick Veto**: If day high was set on the 09:15-09:30 open spike, weekly condor is blocked (high probability of afternoon re-test).
-- **Opening Range Mid-Positioning**: On 0DTE, condors cannot be entered if spot is too close to opening range boundaries. Spot must be centered:
-  ```text
-OR_low + 30 < spot < OR_high - 30
-```
+#### Iron Condor
 
-#### 3. Bull Put Spread Rules:
+- Runway ≥ `by_dte(dte, 75, 90)` minutes to hard exit.
+- ADX mature and in [12, `CONDOR_PIN_ADX_MAX` 20); ADX < `adx_strong_threshold` (28).
+- OR NARROW / VERY_NARROW only; banned on two-way; banned on unresolved open-spike wick; banned if session range ≥ 100 pts; banned if loc at soft-lean extremes; loc must be mid (0.40–0.60).
 
-- **Location Check**: Spot cannot be deeply below Opening Range Midpoint (spot ≥ OR_mid - 30 on 0DTE, -15 on DTE ≥ 1).
-- **VWAP Support**: Spot cannot be more than 30 points below VWAP (unless taking a thesis-driven failed-break reclaim vertical).
-- **Resistance Distance**: Spot cannot be within 20 points below a major session resistance ceiling.
+Pin-gate failure **demotes** to an evidenced vertical before momentum.
 
-#### 4. Bear Call Spread Rules:
+#### Bull Put Spread
 
-- **Location Check**: Spot cannot be deeply above Opening Range Midpoint (spot ≤ OR_mid + 30 on 0DTE, +15 on DTE ≥ 1).
-- **VWAP Resistance**: Spot cannot be more than 30 points above VWAP.
-- **Support Distance**: Spot cannot be within 20 points above a major session support floor.
-- **Max Pain Magnet Veto**: If spot is within 25 points of Max Pain, selling a Bear Call spread is vetoed unless the market is in a confirmed strong downtrend.
+- Afternoon low fade / away-side BULL Intent / `or_mid` / `early_pass` → pass.
+- Else spot ≥ OR mid − `by_dte(30, 15)`; spot not > 30 pts below VWAP (failed-break reclaim exempt).
+
+#### Bear Call Spread
+
+- Afternoon high fade → pass.
+- Away-side BEAR Intent waives **OR-mid only**, not max-pain.
+- OR-mid veto applies on DOWNTREND/STRONG_DOWNTREND (not RANGE).
+- Max pain: veto if |spot − max_pain| < 25 unless trend-through downtrend or Intent `max_pain`. Soft/warmup Intent requires a prior refuse latch **and** ≥ 10 pt spot move.
 
 ---
 
 ### 9. Mathematical Parameter Computation & Leg Construction (`compute_params`)
 
-`compute_params(strategy_name, selection_reason, signals, size_mult)` is the core quantitative builder:
-
 ```
-                      Target Strategy & Signals
-                                  │
-                                  ▼
-                     Delta-Primary Strike Solver
-                     (_select_strikes & chain)
-                                  │
-                                  ▼
-                       Leg Validation & Pricing
-                    (_build_validated_legs & bid/ask)
-                                  │
-                                  ▼
-                   Gross Credit & Net Credit Engine
-                     (Deduct Costs & Slippage)
-                                  │
-                                  ▼
-                    Structural Economic Sanity Checks
-                     (Wing Ratios, Credit Ratios)
-                                  │
-                                  ▼
-                      Target & Stop Loss Sizing
-                     (DTE-Dependent Dynamic Multipliers)
-                                  │
-                                  ▼
-                   Expected Value (EV) Barrier Engine
-                         (_compute_ev_gate)
-                                  │
-                                  ▼
-                    Capital Allocation & Lot Sizing
-                    (Risk Budget, Margin, Lot Caps)
-                                  │
-                                  ▼
-                       Valid Parameter Package
+strategy + signals → _select_strikes → _build_validated_legs
+  → net credit after costs/slippage → wing / credit-risk / friction
+  → target & stop (by_dte) → _compute_ev_gate → lot sizing
 ```
 
-#### 1. Delta-Primary Strike Selection Engine (`_select_strikes`):
+#### Strike deltas (actual Config)
 
-The engine targets precise option deltas matched to DTE and volatility:
+| Book | Flat | Trend | Strong |
+|---|---|---|---|
+| Near-dated | 0.32 | 0.30 | 0.28 |
+| Weekly DTE ≥ 2 | 0.24 | 0.22 | 0.18 |
 
-- **Target Delta Assignment**:
-  - Weekly (DTE ≥ 2) Condors: Targets Δ ≈ 0.18 (if strong ADX) or Δ ≈ 0.20 (flat).
-  - 0DTE / Near-dated: Targets Δ ≈ 0.22 - 0.25 (shaved down by 0.01-0.02 if VIX < 14).
-  - Directional Verticals: Retains canonical Δ ≈ 0.28 - 0.32 on the favoured side.
-- **Expected Move Bounds Clamping**:
-  Short strikes are clamped within an Expected Move (EM) band:
-  ```text
+EM band: near-dated 0.80–1.35 × EM; weekly 0.55–2.10 × EM (condor weekly hi 1.35 × weekly ATM straddle). Fade shorts sit ≥ 80 pts outside the tested extreme.
 
-  ```
+Wing factor / max width via `by_dte` (factor 0.50→0.62, max 250→450 pts). Weekly wing-cost cap **0.58** (`wing_cost_frac_max_weekly`); near-dated **0.50**.
 
-[band_lo, band_hi] = [em_band_lo × EM, em_band_hi × EM]
+#### Construction prices (`_get_exec_price`)
 
-```
-  (Weekly bounds: 0.55 × EM to 1.35 × EM for condors; up to 2.10 × EM for verticals).
-- **Extreme-Fade Strike Cushioning**:
-  - Failed-break verticals pin the short beyond the tested extreme plus cushion (≥ 80 pts).
-  - High/Low fades pin the short strike at least 80 pts outside the confirmed extreme, bumping one strike step further if nearest rounding lands within the proximity stop band.
-- **Adaptive Wing Width Fitting (`_fit_wing_width`)**:
-  - On weekly condors (DTE ≥ 2), multi-day vega makes protective wings expensive. The engine widens the wing step-by-step from base width up to wing_max until long premium ≤ wing_cost_frac_max_weekly (50%).
-  - Wing factor is interpolated via continuous sqrt-life:
-    ```text
-wing_factor = by_dte(DTE, 0.50, 0.62)
-```
-
-    ```text
-wing_max = round≤ft((by_dte(DTE, 250.0, 450.0)) / (step)) × step
-
-```
-    (Interpolates from 250 pts on 0DTE to 450 pts on DTE ≥ 2).
-
-#### 2. Pricing & Validation (`_build_validated_legs`):
-For every leg:
-- Validates bid > 0, ask > 0, and spread ≤ spread_max_pts.
-- Execution Price Model:
-  ```text
-Exec Price_SELL = bid + fill_edge × (ask - bid)
-```
+Live/paper **construction** is conservative quote-edge, not a Config `fill_edge`:
 
 ```text
-Exec Price_BUY = ask - fill_edge × (ask - bid)
+SELL = bid (else LTP, else ask)
+BUY  = ask (else LTP, else bid)
 ```
 
-  (Default `fill_edge` = 0.25, meaning conservative execution paying 25% away from the quote edge toward the mid).
+`fill_edge` exists only on the **replay** `FillModel` (`--fill-edge`, default 0.25). Spread gate uses `spread_abs_tolerance` (0.85) so cheap wings are not rejected on a 0.10 tick.
 
-#### 3. Dynamic Stop Loss & Profit Target Geometry:
+#### Target & stop
 
-The stop and target are mathematically tied to net credit received and DTE via `by_dte`:
-
-- **Target Fraction (`_get_target_pct`)**:
-  - Base target interpolated via `config.target_pct_for_dte(actual_dte)`:
-    ```text
-
-    ```
-
-target_pct = by_dte(DTE, 0.70, 0.40)
-
-```
-    (Yields ≈ 0.70 on 0DTE, ≈ 0.52 on 1DTE, 0.40 on DTE ≥ 2, shaved by -0.03 for DTE ≥ 3, and shaved further by -0.035 to -0.07 on elevated VIX ≥ 12).
-- **Stop Loss Multiplier (`stop_mult_for_dte`)**:
-  - Base stop multiplier interpolated via `config.stop_mult_for_dte(actual_dte)`:
-    ```text
-stop_mult = by_dte(DTE, 1.60, 1.70)
-```
-
-    (Yields 1.60× on 0DTE, ≈ 1.66× on 1DTE, 1.70× on DTE ≥ 2, capped at structural wing loss).
+- Target: `target_pct_for_dte` = `by_dte(0.70, 0.40)` (VIX shave on elevated VIX).
+- Stop: `stop_mult_for_dte` = `by_dte(1.60, 1.70)` of net credit, capped at wing loss.
 
 ---
 
 ### 10. Cost, Slippage, and Margin Architecture
 
-Trading NIFTY options intraday is economically fatal if costs are ignored. The engine prices real-world exchange frictions at the per-order and statutory level:
+#### Statutory & brokerage (`_compute_costs`) — **Budget 2026 rates**
 
-#### 1. Statutory & Brokerage Costs (`_compute_costs`):
+| Item | Default | Env |
+|---|---|---|
+| Brokerage | ₹20 / order | `BROKERAGE_PER_ORDER` |
+| STT (options sell / exercise) | **0.15%** of premium | `STT_OPTIONS_SELL` (was 0.10% pre-Apr 2026; override for old-tape replay) |
+| Exchange txn | **0.03553%** | `EXCHANGE_TXN_RATE` |
+| SEBI | ₹10 / crore (`1e-6`) | `SEBI_RATE` |
+| Stamp (buy) | 0.003% | `STAMP_DUTY_BUY_OPTIONS` |
+| GST | 18% on (brokerage + exchange + SEBI) | hardcoded |
 
-- **Brokerage**: Flat ₹20 per executed order leg.
-- **STT (Securities Transaction Tax)**: 0.0625% on sell-side option turnover (on premium).
-- **Exchange Turnover Charges**: 0.05% on premium turnover.
-- **SEBI Turnover Fee**: ₹10 per crore turnover.
-- **Stamp Duty**: 0.003% on buy-side turnover.
-- **GST**: 18% levied on (Brokerage + Exchange Turnover Charges + SEBI Fees).
+Older README 0.0625% STT / 0.05% exchange is **wrong**.
 
-#### 2. Realistic Spread-Aware Slippage (`_compute_slippage`):
-
-Slippage is not an abstract percentage; it depends on the actual bid-ask spreads of the selected strikes:
-
-```text
-Slippage_entry = sum(legs) (ask_i - bid_i) / (2) × entry_slippage_mult (0.35)
-```
+#### Slippage
 
 ```text
-Slippage_exit_stressed = sum(legs) (ask_i - bid_i) / (2) × exit_slippage_mult (2.25)
+entry = Σ half-spread × entry_slippage_mult (0.35)
+exit (stress) = Σ half-spread × exit_slippage_mult (2.25)
 ```
 
-The stressed exit multiplier models liquidity evaporation during emergency stop triggers.
+#### Economic checks (actual hurdles)
 
-#### 3. Institutional Structural Economic Checks:
-
-Before advancing to EV calculations, the structure must clear strict cost ratios:
-
-1. **Net Credit Positive**: Net Credit = Gross Credit - Entry Costs - Entry Slippage > 0.
-2. **Friction Ceiling**: Round-trip friction cannot exceed 35% of net credit.
-3. **Brokerage Burden**: Brokerage cannot exceed 20% of net credit at target size.
-4. **Wing Cost Dominance**: Long protective wing premium cannot exceed 50% (`wing_cost_frac_max`) of short premium sold (Iron Condors only).
-5. **Credit-to-Wing Ratio**:
-   ```text
-
-   ```
-
-Net Credit / Wing Width >=
-    MIN_CREDIT_RATIO_DTE0[strat]  (for 0DTE: 0.13 IC, 0.18 Fly, 0.11 Verticals)
-    MIN_CREDIT_RATIO[strat]       (for DTE >= 1: 0.10 IC, 0.15 Fly, 0.08 Verticals)
-
-```
-6. **Profit vs Friction**: Expected profit (Net Credit × Target %) must be at least 1.75× total round-trip friction.
+1. Net credit > 0.  
+2. Round-trip friction ≤ **28%** of net credit (`max_friction_frac_of_credit`).  
+3. Brokerage ≤ **15%** of net credit (`max_brokerage_frac_of_credit`).  
+4. Wing cost ≤ 50% near-dated / 58% weekly of short premium (condors).  
+5. Credit / wing ≥ `MIN_CREDIT_RATIO[_DTE0]`; location-edge may use `credit_risk_ratio_away_side` **0.04**; DTE0 time ladder 0.16 / 0.13 / 0.10.  
+6. Target pts ≥ **1.25×** round-trip friction (`min_target_over_friction`).
 
 ---
 
-### 11. Rigorous Expected Value (EV) Gate Model (`_compute_ev_gate`)
+### 11. Expected Value (EV) Gate Model (`_compute_ev_gate`)
 
-The EV engine implements a continuous-time barrier probability model blended with market deltas and empirical priors.
-
-```
-
-       ┌───────────────────────────┐   ┌───────────────────────────┐   ┌───────────────────────────┐
-       │   Empirical OR Prior      │   │   Barrier / GBM Model     │   │   Market Quoted Delta     │
-       │   (p_win_prior by DTE)    │   │   (p_win_model via sigma) │   │   (p_mkt = 1 - max|delta|)│
-       └─────────────┬─────────────┘   └─────────────┬─────────────┘   └─────────────┬─────────────┘
-                     │                               │                               │
-                     │ (Weight = 0.30)               │ (Weight = 0.40)               │ (Weight = 0.30)
-                     └───────────────────────┬───────┴───────────────────────────────┘
-                                             │
-                                             ▼
-                                  Blended Win Probability
-                                          (p_win)
-                                             │
-                                             ▼
-                               Three-Outcome Expectancy Model
-                               [ Win, Stop-Loss, Tail Jump ]
-                                             │
-                                             ▼
-                                    Net Expectancy (EV)
-                                             │
-                         ┌───────────────────┴───────────────────┐
-                         ▼                                       ▼
-                   EV ≥ Threshold                          EV < Threshold
-                      [ PASS ]                                [ REJECT ]
-
-```
-
-#### 1. Three-Outcome Expectancy Equation:
-Intraday short option books do not have a binary payoff. They experience three distinct path resolutions:
-1. **Target Win**: Position hits profit target cleanly (p_win_eff).
-2. **Stop Loss**: Position triggers the premium/spot stop (p_stop).
-3. **Tail Loss / Jump**: Position suffers a fast volatility jump or gap through the stop toward the wing (p_tail).
-
-```text
-EV = p_win_eff · (Reward - Friction_calm) - p_stop · (Stop Loss + Friction_stressed) - p_tail · (Tail Loss + Friction_stressed)
-```
-
-Where:
-
-- Tail Loss = Stop Loss + 0.30 × \max(Wing Loss - Stop Loss, 0).
-- p_tail = config.gamma_tail_prob_for_dte(DTE) = by_dte(DTE, 0.055, 0.020) (clamped ≤ 0.20, scaled 1.8× on wide OR and 1.5× on strong ADX).
-- p_win_eff = p_win · (1 - p_tail).
-- p_stop = 1 - p_win_eff - p_tail.
-
-#### 2. Tri-Partite Win Probability (p_win) Formulation:
+Three-way blend (weights 0.40 model / 0.30 prior / 0.30 market delta; reclaim verticals tilt toward market).
 
 ```text
 p_win = w_m · p_win_model + w_p · p_win_prior + w_k · p_mkt
+EV = p_win_eff·(Reward − friction_calm) − p_stop·(Stop + friction_stress)
+     − p_tail·(Tail + friction_stress)
 ```
 
-(Default weights: w_m = 0.40, w_p = 0.30, w_k = 0.30; on thesis reclaim verticals: w_m = 0.25, w_p = 0.20, w_k = 0.55).
-
-- **Barrier Model (p_win_model)**:
-  Uses the true short strike distance b = |strike - spot| - barrier_pull_pts.
-  ```text
-
-  ```
-
-σ_{pts} = \min(σ_{iv}, σ_{straddle} × 1.15)
-
-```
-  ```text
-z = (b) / (σ_{pts)}
-```
-
-```text
-p_touch = sum_{b in barriers} 2 · Φ(-z)
-```
-
-- *Max Pain Magnet Adjustment*: If DTE == 0 and spot is within 0.5 × σ_{pts} of Max Pain, p_touch is discounted by 15% (p_touch ≤ftarrow p_touch × 0.85).
-
-```text
-p_win_model = clamp(1.0 - p_touch, 0.20, 0.93)
-```
-
-- **Market Delta Prior (p_mkt)**:
-  ```text
-
-  ```
-
-p_mkt = 1.0 - \max(|Δ_{short_legs}|)
-
-```
-- **Empirical Table Prior (p_win_prior)**:
-  Indexed by DTE and Opening Range Condition (`VERY_NARROW`, `NARROW`, `MODERATE`, `WIDE`, `VERY_WIDE`), adjusted by smoothed VRP bonus (+0.05 if VRP > 3.5 pp).
-
-#### 3. EV Rejection Threshold:
-```text
-Min EV = \max(Net Credit × 0.03, Friction × 0.35)
-```
-
-If EV < Min EV, the parameter package is marked `valid: False` with `ev_gate:ev_X_below_min_Y`.
+- Tail = stop + 0.30 × max(wing − stop, 0).  
+- `p_tail` = `gamma_tail_prob_for_dte` = `by_dte(0.055, 0.025)` (scaled on wide OR / strong ADX).  
+- `p_win_prior` is **life-continuous**: OR-width anchors blended with `by_dte` (expiry 0.72…0.44, weekly 0.64…0.38). **No 7×5 DTE×OR table.** VRP / STRONG_SELL bonuses apply; clamp [0.30, 0.90].  
+- `p_mkt` = 1 − max(|short Δ|).  
+- Barrier σ = min(σ_iv, σ_straddle × 1.15); 0DTE max-pain within 0.5σ cuts p_touch 15%.  
+- Min EV = max(net credit × 0.03, friction × 0.35). Location-edge credits may clear down to −friction.  
+- DTE ≥ 2 carry uses `ev_carry_discount_dte2p` (0.62).
 
 ---
 
 ### 12. DTE Mechanics & Continuous Sqrt-Life Interpolation (`by_dte`)
 
-In early versions of the engine, DTE logic was bifurcated into rigid step functions (`if dte == 0: ... else: ...`), which caused severe discontinuities on Monday (1DTE) and Friday (2DTE). Modern engine architecture solves this via **continuous square-root remaining-life interpolation** implemented in `core.by_dte`.
-
-#### Sqrt-Life Interpolation Mathematical Formulation:
-
-Option life is parameterized by its time variance sqrt(T). With market session life anchors defined as:
-
-- Life_expiry = 0.5 sessions (sqrt(0.5) ≈ 0.7071)
-- Life_weekly = 2.5 sessions (sqrt(2.5) ≈ 1.5811)
-
-For any integer or floating DTE:
-
 ```text
 life = DTE + 0.5
+w = (√2.5 − √life) / (√2.5 − √0.5)     # clamp [0, 1]
+by_dte(DTE, V_expiry, V_weekly) = V_weekly + w · (V_expiry − V_weekly)
 ```
 
-```text
-w = \frac{sqrt(2.5) - sqrt(life)}{sqrt(2.5) - sqrt(0.5)} = \frac{1.5811 - sqrt(DTE + 0.5)}{0.8740},   w in [0.0, 1.0]
-```
+| | 0DTE | 1DTE | ≥ 2DTE |
+|---|---|---|---|
+| `dte_blend` w | 1.00 | ≈ 0.41 | 0.00 |
+| Session window | 10:30–13:00, hard exit **15:00** | 09:45–14:15, hard exit **15:15** | same as 1DTE |
+| Tradeable | Fly, IC, BPS, BCS, **momentum** (half risk, 2-lot cap) | IC, BPS, BCS, momentum | same; DTE 3–4 needs HIGH confidence |
+| Target % | 0.70 | ≈ 0.52 | 0.40 (VIX shave DTE ≥ 3) |
+| Stop × credit | 1.60 | ≈ 1.66 | 1.70 |
+| Δ close | 0.45 | blend | **0.30** (`delta_close_dte1p`) |
+| Lock arm | 40% | **22% weekly bar** (not blended) | 22%; after 13:30 → 15%; after 14:15 → 10%; IC/fly 10% |
+| Lock keep | 0.65 | blend | 0.35 |
+| Give-back cap | 2.0 pts | 2.0 pts | uncapped |
+| Credit/wing min | IC 0.13, Fly 0.18, Vert 0.11 | IC 0.10, Fly 0.15, Vert 0.08 | same |
+| p_tail | 0.055 | blend | 0.025 |
+| Momentum | allowed (`momentum_min_dte=0`) | allowed | allowed |
 
-```text
-by_dte(DTE, V_expiry, V_weekly) = V_weekly + w · (V_expiry - V_weekly)
-```
-
-Evaluating weights:
-
-- **0DTE**: w = 1.0 → Exact expiry-day parameter.
-- **1DTE**: w ≈ 0.41 → Smoothly interpolates 41% towards expiry anchor.
-- **≥ 2DTE**: w = 0.0 → Exact weekly anchor.
-
-#### Comprehensive DTE Interpolation Matrix:
-
-| Operational Parameter / Behavior          | 0DTE (Expiry Tuesday)                            | 1DTE (Monday)                    | 2DTE (Friday)                        | 3DTE / 4DTE (Wed / Thu)                       | Function / Mechanism                      |
-| ----------------------------------------- | ------------------------------------------------ | -------------------------------- | ------------------------------------ | --------------------------------------------- | ----------------------------------------- |
-| **Interpolation Weight (w)**        | 1.00                                             | ≈ 0.41                          | 0.00                                 | 0.00                                          | `core.dte_blend(dte)`                   |
-| **Tradeable Universe**              | Iron Butterfly, Iron Condor, Bull Put, Bear Call | Iron Condor, Bull Put, Bear Call | Iron Condor, Bull Put, Bear Call     | Iron Condor, Bull Put, Bear Call (Restricted) | `DTE_REQUIREMENTS`                      |
-| **Max DTE Tradeable Gate**          | Permitted                                        | Permitted                        | Permitted                            | Permitted up to 4; rejected if > 4            | `_check_hard_gates`                     |
-| **Confidence Level Requirement**    | LOW/MEDIUM/HIGH (or Extreme Fade)                | MEDIUM / HIGH                    | MEDIUM / HIGH                        | HIGH only (`confidence == "HIGH"`)          | `_check_hard_gates`                     |
-| **Gamma Tail Probability (p_tail)** | 0.055 (5.5%)                                     | ≈ 0.035 (3.5%)                  | 0.020 (2.0%)                         | 0.020 (2.0%)                                  | `config.gamma_tail_prob_for_dte(dte)`   |
-| **Credit-to-Wing Ratio Minimum**    | IC: 0.13, Fly: 0.18, Vert: 0.11                  | IC: 0.10, Fly: 0.15, Vert: 0.08  | IC: 0.10, Fly: 0.15, Vert: 0.08      | IC: 0.10, Fly: 0.15, Vert: 0.08               | `MIN_CREDIT_RATIO[_DTE0]`               |
-| **Wing Cost Fraction Cap**          | 0.50 (`wing_cost_frac_max`)                    | 0.50                             | 0.50 (`wing_cost_frac_max_weekly`) | 0.50                                          | Condors only; bypassed on verticals       |
-| **Target Net Credit \%**            | 0.70 (70%)                                       | ≈ 0.52 (52%)                    | 0.40 (40%)                           | 0.37 (37%, -0.03 shave)                       | `config.target_pct_for_dte(dte)`        |
-| **Stop Loss Multiple**              | 1.60× net credit                                | ≈ 1.66× net credit             | 1.70× net credit                    | 1.70× net credit                             | `config.stop_mult_for_dte(dte)`         |
-| **Delta Close Threshold**           | Δ ≥ 0.45                                       | ≈ 0.48                          | Δ ≥ 0.50                           | Δ ≥ 0.50                                    | `config.delta_close_for_dte(dte)`       |
-| **EV Carry Discount**               | 1.00 (No theta carry credit)                     | ≈ 0.78                          | 0.65 (`ev_carry_discount_dte2p`)   | 0.65                                          | `config.ev_carry_discount_for_dte(dte)` |
-| **Wing Factor & Max Wing Width**    | Factor: 0.50, Max: 250 pts                       | Factor: ≈ 0.57, Max: ≈ 370 pts | Factor: 0.62, Max: 450 pts           | Factor: 0.62, Max: 450 pts                    | Adaptive wing clamping via`by_dte`      |
-| **Margin Add-on Buffer**            | +18% broker tightening                           | +10% buffer                      | +10% buffer                          | +10% buffer                                   | Fully hedged lot margin model             |
-| **Opening Range Buffer**            | ± 30 pts from OR mid                            | ± 15 pts from OR mid            | ± 15 pts from OR mid                | ± 15 pts from OR mid                         | `_validate_entry_rules`                 |
-| **Max Pain Pinning Bonus**          | Active in EV model (15% touch cut)               | Inactive (0%)                    | Inactive (0%)                        | Inactive (0%)                                 | 0DTE afternoon magnetism                  |
-| **Momentum Substitute Option**      | **Strictly Forbidden** (0DTE gamma cliff)  | Permitted if sell-side blocked   | Permitted if sell-side blocked       | Permitted if sell-side blocked                | `_momentum_gate`                        |
+NIFTY weekly expiry is **Tuesday** (holiday → Monday). `ExpiryCalendar.get_dte` is actual trading-day DTE, not weekday arithmetic.
 
 ---
 
 ### 13. Long-Premium Momentum Alternative Route (`_momentum_decision` & `compute_momentum_params`)
 
-When market conditions invalidate short premium selling, the engine evaluates the Long-Premium Momentum Alternative:
+Momentum **never** runs unprompted. It answers sell-side refusals whose reason matches `momentum_block_markers` (economic fails, IV, event, time, post-stop, slot_conflict, hard_invariant, open_spike_wait, construct_fail, …).
 
-#### 1. Substitution Pre-Conditions (`_momentum_gate`):
+#### Gate (current, not the old “0DTE forbidden” rule)
 
-1. **Sell-Side Refusal Required**: Momentum never runs independently as an unprompted buyer. It executes strictly as a substitute when the sell-side strategy was refused with valid refusal markers (`momentum_block_markers`).
-2. **0DTE Ban**: DTE == 0 is strictly blocked due to explosive afternoon theta decay. Requires DTE in [1, 4].
-3. **No Mean-Reversion Overlap**: Blocked if session has completed a two-way extreme fade scalp (`session_mean_reversion_book`).
-4. **Strong Trend Alignment**:
-   - Morning Route (< 14:00 IST): Requires confirmed `price_regime` in `UPTREND`, `STRONG_UPTREND`, `DOWNTREND`, or `STRONG_DOWNTREND`. Requires ADX_15 ≥ 25 and spot breaking the opening range boundary.
-   - Closing-Hour Route (≥ 14:00 IST): Controlled by `_in_late_momentum_window`. Requires EMA 9/21 alignment, fresh session high/low extreme within 30 min, and tape displacement > 35 pts.
-5. **No Volatility Top**: India VIX gap ≤ 12% and IV behavior not spiking.
+- Enabled; DTE in **[0, 4]**. 0DTE uses `momentum_dte0_risk_frac=0.50` and `momentum_dte0_max_lots=2`.
+- Blocked if `session_mean_reversion_book` (two-way fade already owns the day).
+- Morning: price in UPTREND/DOWNTREND (or strong), fast ADX ≥ `momentum_adx_min` **24**, OR break + VWAP proof. Event-day debit needs ADX ≥ **32**.
+- Location lean on RANGE/CHOPPY: debit follows the lean (puts at the low, calls at the high).
+- After a losing credit stop: one-way continuation allowed when ADX is strong and the tape is not two-way/chop; side aligns to what beat the vertical (BCS→calls, BPS→puts; IC/RANGE free).
+- Late window **14:30–14:57**, ADX ≥ 28, VWAP displacement, fresh extreme, half-risk, max 4 lots, ≥ 25 min to hard exit.
+- VIX gap ≤ 12%; do not chase SPIKING IV. Day-move cap 200% of priced range.
+- Aligned debit beside an open credit is **off** (`allow_correlated_debit_beside_credit=false`) unless env-enabled; second-slot debit cap 3 lots.
 
-#### 2. Momentum Strike Selection & Economics (`compute_momentum_params`):
+#### Economics
 
-- Direction: +1 → **`LONG_CALL`**, -1 → **`LONG_PUT`**.
-- Delta Target: Delta ≈ 0.45 - 0.55 (slightly In-The-Money or exact At-The-Money, maximizing gamma while controlling spread friction).
-- **Hard Edge Hurdle**:
-  ```text
-
-  ```
-
-Expected Capture = Option Premium × momentum_target_frac (0.35)
-
-```
-  ```text
-Expected Capture ≥ Friction × 2.0
-```
-
-  If the target profit does not cover twice the round-trip ticket costs, the momentum trade is aborted.
-
-- **Stop Loss & Target Structure**:
-  - Stop Loss: Premium drops by 20% to 25%.
-  - Profit Target: Premium gains 35% to 45%.
-  - Spot Invalidation Backstop: Opposite side of intraday VWAP.
+- Δ target ≈ 0.45–0.55 ATM/ITM.  
+- Capture = premium × `momentum_target_frac` (0.60) must clear 2× friction.  
+- Stop 35% of premium; lock trigger +25%; spot invalidation = opposite VWAP.  
+- Max 1 momentum ticket / day (`momentum_max_trades_per_day`).  
+- `momentum_entries` increment **only on fill**.
 
 ---
 
-### 14. Dominant Structures, Position Sizing, and Risk Allocation
+### 14. Exit Ladder, Profit Lock, and Debit HWM
 
-#### 1. Dominant Strategy Structures:
+`ExecutionEngine.monitor_position` never closes on a regime **label** change. Priority order:
 
-- **`IRON_CONDOR`**: Primary range harvester on quiet/normal sessions (DTE ≥ 0). 4 legs (Short OTM Put + Long Far OTM Put, Short OTM Call + Long Far OTM Call). Delta-neutral.
-- **`IRON_BUTTERFLY`**: 0DTE pin harvester on very narrow morning sessions. 4 legs (Short ATM Put + Long Wing Put, Short ATM Call + Long Wing Call).
-- **`BULL_PUT_SPREAD`**: Bullish trend structure or Two-Way Auction Low Fade. 2 legs (Short OTM Put + Long Lower OTM Put). Net credit.
-- **`BEAR_CALL_SPREAD`**: Bearish trend structure or Two-Way Auction High Fade. 2 legs (Short OTM Call + Long Higher OTM Call). Net credit.
-- **`LONG_CALL` / `LONG_PUT`**: Intraday momentum substitutes on trend expansion days (DTE in [1, 4]). 1 leg (Long ATM/Slightly ITM option). Net debit.
+| Pri | Name | Typical reason | Notes |
+|---|---|---|---|
+| 1 | Delta breach | `CLOSE_STOP` | Short Δ vs `delta_close_for_dte` |
+| 2 | Spot proximity | `CLOSE_STOP` | Gap-fraction on 0DTE (`prox_gap_frac_dte0=0.70`) |
+| 2.5 | Trend-flip (verticals) | `CLOSE_STOP` | Measured trend against the short |
+| 3 | Price / premium stop | `CLOSE_STOP` | **If profit-lock armed → `CLOSE_TARGET`** |
+| 4 | Profit lock | arm / ratchet | DTE0 40%; DTE1+ 22% (clock steps 15%/10%); IC/fly 10% |
+| 5 | Cheap buyback | `CLOSE_TARGET` | Short ≤ `cheap_buyback_pts` (**5.0**) after 13:00 |
+| 6 | Time target | `CLOSE_TARGET` | DTE1 lock-anchored ladder; IC/fly 12/10/8 |
+| 7 | Hard exit | `HARD_EXIT_15:00` | 15:00 0DTE / 15:15 weekly |
 
-#### 2. Position Sizing Equations (`_estimate_lots` & `compute_params`):
+**Credit lock:** stop = credit − keep_frac × peak; near-expiry unlocked give-back capped at 2 pts.  
+**Debit HWM:** Phase A free-trade after +25%; Phase B trail from peak once 2× entry, keep ~80% of peak open gain. Hitting the armed debit trail is `CLOSE_TARGET`.  
+**Banked exits are not stops** (`banked_exit_is_not_a_stop`) — they do not spend the two-stop halt budget.
 
-Sizing uses a multi-tiered constraint model:
-
-- **Stop Efficacy Blend**:
-  ```text
-
-  ```
-
-Structural Loss per Lot = efficacy · Stop Loss + (1 - efficacy) · Wing Loss
-
-```
-  (Where `efficacy` defaults to 0.55, hard-capped at 0.80; on failed-break Bull Put verticals `efficacy` is locked at 0.80).
-- **Risk Budget**:
-  ```text
-Max Risk = Current Capital × max_risk_per_trade_pct (0.006)
-```
-
-```text
-Raw Lots = (Max Risk) / (Structural Loss per Lot)
-```
-
-```text
-Sized Lots = Raw Lots × size_mult
-```
-
-- **Minimum Economic Fraction (`_min_frac = 0.60`)**:
-  - If Sized Lots < 0.60: Triggers minimum-ticket affordability check. If Raw Lots ≥ 1.0 on clear setup with non-unclear positioning, clips to 1 lot. Otherwise rejects: `risk_budget_allows_only_X_lots_below_min_0.60`.
-- **Fixed-Cost Amortization Floor (`v3.10 [G6]`)**:
-  - On HIGH-confidence setups with thin gross capture, if final_lots == 1 but Raw Lots ≥ 1.5 (and non-event day), sizes up to \min(round(raw_lots), day_cap, 3) so fixed order brokerage is amortized.
-- **Daily Day Cap Table (`LOT_CAPS_BY_DAY`) Scaled by Equity**:
-  ```text
-
-  ```
-
-Day Cap = \max(1, floor( LOT_CAPS_BY_DAY[day] × sqrt(Capital / Starting Capital) ))
-
-```
-  ```python
-  LOT_CAPS_BY_DAY = {
-      "MONDAY":    8,
-      "TUESDAY":   10,
-      "WEDNESDAY": 6,
-      "THURSDAY":  6,
-      "FRIDAY":    5,
-  }
-```
-
-- **Capital Margin Constraint**:
-  ```text
-
-  ```
-
-Wing Margin per Lot = Wing Width × Lot Size (65) × 1.10 × (1 + addon)
-
-```
-  ```text
-Total Margin = Margin per Lot × Lots ≤ Capital × 0.80
-```
+Regime rotation can free a slot on a mature opposite trend after `regime_rotation_min_hold_min` (25).
 
 ---
 
-### 15. Event-Driven Backtest Engine CLI & Replay Architecture
+### 15. Dominant Structures, Position Sizing, and Risk Allocation
 
-`backtest_engine.py` is a **data pump**, not a second trading engine (v65).
+| Strategy | Role | Legs |
+|---|---|---|
+| `IRON_CONDOR` | True pin only | 4 |
+| `IRON_BUTTERFLY` | Near-expiry pin | 4 |
+| `BULL_PUT_SPREAD` | With-trend / low fade / location lean | 2 |
+| `BEAR_CALL_SPREAD` | With-trend / high fade / location lean | 2 |
+| `LONG_CALL` / `LONG_PUT` | Momentum substitute | 1 |
 
-#### 1. Harness edges only:
+#### Sizing
 
-- **`SimClock`**: Patches `now_ist` / `today_ist` on `core`, **`main`**, and all engine modules; no-ops `sleep`.
-- **`ReplayClient`**: Serves recorded LTP / candles / option chain; broker place/cancel raises.
-- **`FillModel` + paper executor**: Only simulated edge (bid/ask).
-- **`MainEngine.for_replay(...)`**: Same `run_one_cycle()` as live (scratch DB, paper mode, Telegram stub).
+```text
+StructuralLoss/lot = efficacy × Stop + (1 − efficacy) × Wing     # efficacy 0.55 (0.80 failed-break)
+MaxRisk = Capital × max_risk_per_trade_pct                       # default 2.0%
+RawLots = MaxRisk / StructuralLoss
+SizedLots = RawLots × size_mult
+```
 
-#### 2. Replay cycle (`run_day`):
+- `size_mult` from regime; second concurrent ticket × 0.70; extreme fade × 1.05–1.15; soft directional 0.75; weekly unclear range 0.75.  
+- Floor `min_lots_fraction=0.60`. HIGH-confidence amortization may size up to amortize ₹20×legs brokerage.  
+- `LOT_CAPS_BY_DAY`: Mon 8 / Tue 10 / Wed 6 / Thu 6 / Fri 5, scaled by √(capital / starting).  
+- Margin: wing × 65 × 1.10 × (1+addon) × lots ≤ 80% capital. 0DTE addon +18%.  
+- Defaults: starting capital **₹10,00,000**, daily loss **8%**, per-trade **2%** (clamped so 3 trades cannot exceed the daily halt). `FORCE_LOTS` can pin size after gates.  
+- Event days: `event_size_multiplier`, defined-risk only; weekday `day_size_*` must **not** fall back to the event multiplier.
 
-For each recorded snapshot in `day.cycles`:
+---
 
-1. `SimClock.set(capture_dt)`
-2. `ReplayClient.point(day, capture_time)`
-3. **`MainEngine.run_one_cycle()`** — live monitor / hard-exit / decide / `process_entry_decision` / P&L
-4. Harvest CLOSED rows from the scratch book into `Results`
+### 16. Live Operations, Telegram, and Durability
 
-No parallel `decide()` / `monitor_position()` / `entry_possible` reimplementation.
+#### Run
 
-#### 3. CLI Command Line Reference:
+```bash
+python main.py                 # live or paper (PAPER_TRADE_MODE in env.txt)
+python bot_controller.py       # Telegram remote
+python verify_all.py           # module tests + static pre-flight
+python upstox_token.py         # refresh access token
+```
+
+- `PAPER_TRADE_MODE=true` uses `PaperOrderExecutor` + optional `FillModel`.  
+- Live orders: place **once** (`order_max_retries=0`), reconcile by tag (`order_tag_prefix=nav6`). Exits escalate as LIMIT + market-protection (2%); no MARKET/SL-M for options.  
+- `/stop` writes `{LOG_DIR}/algo.stop`. Main flattens (tag Exit-All, including PENDING_ENTRY) then exits.  
+- Watchdog: poll 5s; feed degrade 45s / force-exit 120s; square-off deadline **15:18**. A cycle in progress is **alive**.  
+- Soft halt at 50% of daily loss (alert); hard halt **flattens**.  
+- Startup: PENDING_ENTRY reconcile (probe all dispatch states; flatten via tag — never `execute_close` with empty legs); orphan PLACED without `position_id` flattened (`orphan_flatten_at_broker=true`); OPEN with 0 legs → `_finalize_empty_open_position`; broker flat + local OPEN → `_heal_local_open_broker_flat`.  
+- `ALLOW_SAME_CYCLE_REENTRY` default **true** (live = BT).  
+- Lot size default **65** — verify against the current NSE series.
+
+#### Telegram (`telegram_reporter.py`)
+
+Five message types: started, heartbeat every 15 min, order placed, order closed, engine stopped. Own daemon thread; `telegram_min_gap_sec=3.5`. Token / chat from `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`.
+
+#### Console trade report (v7)
+
+Same 84-column block in live and replay, from the persisted book + current chain. Modes: `each_cycle` (default), `on_change`, `off`.
+
+#### Config & secrets
+
+- `env.txt` overrides OS env; unknowns ignored. Token-only file uses code defaults.  
+- Holidays: `nse_holidays.json`. Events: `high_impact_events.json` (mtime reload).  
+- Dependencies: `requirements.txt` (numpy, pandas, requests, python-telegram-bot, psutil, Google API clients).
+
+#### Primary DB
+
+- Path default `data/nifty_algo_v3.db`.  
+- After healthy sessions: `python split_db_per_day.py` (optional `--force`, `--verify-only`, `--dates`, `--include-global`).  
+- **No** Google Drive upload in the current `split_db_per_day.py`.  
+- Replay without `--db`: use primary if it has `option_chain_snapshot` rows; else every usable `data/per_day/*.db` shard.
+
+---
+
+### 17. Event-Driven Backtest Engine CLI & Replay Architecture
+
+Harness edges only: `SimClock`, `ReplayClient`, `FillModel`, scratch `Database`, Telegram stub. No parallel `decide()` / `monitor_position()` / `_open` / `_close`.
 
 ```bash
 python backtest_engine.py [OPTIONS]
-python restore_primary_db.py          # rebuild primary from data/per_day
-python split_db_per_day.py [--force]  # refresh shards; then backs up primary db/wal/shm to Google Drive day folder
+python split_db_per_day.py [--force] [--verify-only] [--dates YYYY-MM-DD ...]
+python verify_all.py
 ```
 
-- After every successful `split_db_per_day.py` run (not `--verify-only` / `--skip-gdrive-backup`): checkpoint WAL, upload `nifty_algo_v3.db` + `-wal` + `-shm` into Drive folder `1UyOCpw6VwW8yva5Qd88qbb8MAk-jXRDt` under a `YYYY-MM-DD` day folder; same-day re-runs replace a file only when local MD5 differs. **Auth:** OAuth user account (put desktop client secrets at `Misc/gdrive_credentials.json`, one browser sign-in → `Misc/gdrive_token.json`). Service accounts cannot upload into normal My Drive (no storage quota); use a Shared Drive + `GDRIVE_USE_SERVICE_ACCOUNT=true` if you insist on SA.
-- Default (no `--db`): use `config.db_path` when it has readable `option_chain_snapshot` rows; otherwise fall back to every usable `data/per_day/*.db` shard (corrupt/empty primary no longer looks like a “fresh install”).
-- `--db [PATHS ...]`: Path to one or more SQLite database files, or a directory containing `nifty_algo_YYYY-MM-DD.db` files.
-- `--from YYYY-MM-DD`: Start date filter (inclusive).
-- `--to YYYY-MM-DD`: End date filter (inclusive).
-- `--capital AMOUNT`: Override starting capital (default: ₹500,000).
-- `--fill-edge FLOAT`: Execution pricing model edge:
-  - `0.0`: Pessimistic (pay full ask / sell full bid).
-  - `0.25`: Conservative institutional default (pays 25% away from quote edge toward mid).
-  - `0.5`: Mid-price execution.
-- `--stress-exit FLOAT`: Edge retained during emergency stops (default: 0.50).
-- `--csv PATH`: Output path for the completed trade blotter CSV.
-- `--audit`: Inspect database coverage, candle continuity, chain depth, and exit without running simulation.
-- `--test`: Run internal unit and harness regression test suite.
-- `--verbose`: Enable cycle-by-cycle logging to console.
-- `--trade-report {each_cycle, on_change, off}`: Trade reporting verbosity:
-  - `each_cycle`: Prints trade mark-to-market status on every evaluation cycle.
-  - `on_change`: Prints trade only on entry, exit, or significant P&L change.
-  - `off`: Suppresses per-trade logging, outputting only the final audit.
+| Flag | Meaning |
+|---|---|
+| (no `--db`) | Healthy primary, else `data/per_day/` |
+| `--db PATH [PATH ...]` | File(s) or a directory of `nifty_algo_YYYY-MM-DD.db` |
+| `--from` / `--to` | Inclusive date filter |
+| `--capital` | Override starting capital (default ₹10,00,000) |
+| `--fill-edge` | 0.0 full spread / **0.25** default / 0.5 mid |
+| `--stress-exit` | Edge retained on urgent exits (default 0.50) |
+| `--csv` | Blotter path |
+| `--audit` | Coverage only |
+| `--test` | Harness self-test |
+| `--verbose` | Cycle log |
+| `--trade-report {each_cycle,on_change,off}` | Overrides `TRADE_REPORT_MODE` |
 
-**Ops note:** after a crash that leaves `data/nifty_algo_v3.db` unreadable, run `python restore_primary_db.py` (shards under `data/per_day/` are the source of truth). Keep shards current with `python split_db_per_day.py` after healthy live sessions.
+Hunt correlated-debit overlap only when the **live** book itself stacked; do not force the env in replay.
 
-#### 4. Diagnostic Funnel Architecture (`STAGE_ORDER`):
-
-The funnel categorizes rejections strictly in the order `decide()` evaluates them:
-
-1. `safety interlocks`: Account drawdown halts, VIX spikes, circuit filters, day move exhausted.
-2. `entry window`: Time < 09:20, time > 14:15, runway to hard exit < 50-90 min.
-3. `position limits`: Max concurrent positions (1), daily entry count, cooldowns, consecutive stops.
-4. `contract / DTE`: DTE > 4, missing expiry resolution.
-5. `regime verdict`: Upstream regime rejects (vol neutral, choppy, observing, event restriction).
-6. `strategy selection`: Day structure bearish vetoes, lean skips.
-7. `counter-trend symmetry`: Counter-trend entry refusal against measured trend displacement.
-8. `structure rules`: Butterfly delta/spot buffer, condor mature ADX, put/call spread VWAP alignment.
-9. `structure build`: Leg pricing, gross/net credit, wing cost dominance, credit-risk ratio, margin, sizing.
-10. `EV gate`: Tri-partite continuous-time barrier expected value hurdle.
+`--audit` / verbose funnel uses `STAGE_ORDER`: safety interlocks → entry window → position limits → contract/DTE → regime verdict → strategy selection → counter-trend symmetry → structure rules → structure build → EV gate. Unclassified tokens are reported, not folded into EV.
 
 ---
 
-### 16. Comprehensive Decision & Rejection Census Dictionary
+### 18. Decision & Rejection Census Dictionary
 
-The engine produces structured rejection tokens. The following dictionary maps tokens to exact root causes:
+#### Hard gates (representative)
 
-#### 1. Hard Gate Tokens:
+- `feed_stale_entries_blocked`, `regime_unavailable`, `ABORT:…`
+- `daily_loss_limit_reached_or_halted`, `circuit_breaker_suspected`, `vix_spike_detected`
+- `iv_expanding_never_sell_into_rising_iv`, `iv_spiking`
+- `before_entry_window_10:30` / `before_entry_window_09:45`, `past_entry_window_13:00` / `past_entry_window_14:15`
+- `max_concurrent_positions_reached`, `max_entries_per_day_N_reached`
+- `second_slot_cooldown_Xmin_remaining`, `entry_cooldown_Xmin_remaining`
+- `no_material_change_since_exit_*`, `2_consecutive_stops_halt`
+- `same_signal_combo_caused_last_stop`, `stop_cooldown_Xmin_remaining`
+- `spot_velocity_too_fast`, `straddle_expanding_no_sell_into_rising_iv`
+- `opening_range_not_yet_computed`, `opening_range_pending`, `open_spike_wait_unresolved_lower_high`
+- `chain_stale_cannot_validate_strikes`, `expiry_day_waiting_for_0dte`
+- `confidence_*_insufficient_*`, `dte_X_above_max_4_*`
+- `day_move_used_*_no_edge`, `only_Xmin_before_hard_exit_need_Y`
+- `wide_or_*_dangerous_to_sell_premium`
 
-- `daily_loss_limit_reached_or_halted`: Intraday drawdown exceeded maximum daily loss threshold.
-- `circuit_breaker_suspected`: Spot index movement halted or exceeded maximum velocity safety bound.
-- `vix_spike_detected`: India VIX jumped ≥ 15% intraday.
-- `iv_expanding_never_sell_into_rising_iv`: Implied volatility expanding rapidly; short premium prohibited.
-- `before_entry_window_09:20`: Current clock time before trading start window.
-- `past_entry_window_14:15`: Current clock time past last allowable entry window.
-- `max_concurrent_positions_reached`: An active position is already open in the single-slot engine.
-- `max_entries_per_day_2_reached`: Session trade count ceiling met.
-- `entry_cooldown_Xmin_remaining`: Cooldown period active following prior trade closure.
-- `no_material_change_since_exit_Xpts_lt_Ypts_needed`: Spot price has not moved far enough from last exit price.
-- `2_consecutive_stops_halt`: Engine disabled for remainder of day following two consecutive stopped trades.
-- `same_signal_combo_caused_last_stop`: Refusing entry on identical signal signature that caused prior stop.
-- `stop_cooldown_Xmin_remaining`: Cooldown active following a stopped trade.
-- `spot_velocity_too_fast`: Spot moved too many index points over rolling 5 minutes.
-- `straddle_expanding_no_sell_into_rising_iv`: ATM straddle price expanding; premium selling prohibited.
-- `opening_range_pending`: 15-minute opening range bar incomplete.
-- `open_spike_wait_unresolved_lower_high`: Morning spike high unconfirmed; waiting until 12:15 IST.
-- `chain_stale_cannot_validate_strikes`: Option chain timestamp older than 120 seconds.
-- `confidence_LOW_insufficient_edge_after_costs`: Statistical confidence too low to overcome cost friction.
-- `dte_X_above_max_4_intraday_only`: Expiry date beyond 4 trading sessions.
-- `day_move_used_Xpct_of_opening_straddle_no_edge`: Intraday move exhausted expected range.
-- `only_Xmin_before_hard_exit_need_Y`: Remaining session minutes insufficient for theta decay.
-- `wide_or_VERY_WIDE_dangerous_to_sell_premium`: High opening volatility makes range structures dangerous.
+#### Map / invariant / range
 
-#### 2. Strategy Entry Rule Tokens:
+- `hard_invariant_no_calls_into_UPTREND_adx_X` / `hard_invariant_no_puts_into_DOWNTREND_adx_X`
+- `hard_invariant_sticky_no_calls_after_uptrend_*` / `hard_invariant_sticky_no_puts_after_downtrend_*`
+- `hard_invariant_no_calls_into_unfinished_high_*` / `hard_invariant_no_puts_into_unfinished_low_*`
+- `day_structure_contradicts_bull_premium:*`
+- `two_way_wait_no_puts_at_high_*` / `two_way_wait_no_calls_at_low_*` / `two_way_auction_wait_for_extreme_loc_*`
+- `range_location_lean_*` / `range_soft_location_lean_*` / `range_wait_no_pin_no_lean_*`
+- `range_origin_bull_deferred:*` / `range_origin_bear_deferred:*`
+- `counter_trend_entry_blocked:*` / `slot_conflict:*` / `same_side_chase:*`
 
-- `butterfly_spot_too_far_from_atm_X`: Spot deviated > 50 pts from ATM strike.
-- `butterfly_requires_dte_0_or_1_not_X`: Iron Butterfly attempted on DTE ≥ 2.
-- `butterfly_too_late_after_12:00_on_0dte`: Iron Butterfly attempted in afternoon session.
-- `butterfly_blocked_adx_X_needs_flat_below_22`: Market trend too strong for pin strategy.
-- `condor_needs_Xmin_before_exit_only_Ymin`: Iron Condor runway below required minimum.
-- `condor_blocked_strong_adx_X`: Iron Condor attempted with ADX ≥ 25.
-- `condor_requires_mature_adx`: ADX calculation has not accumulated sufficient 15-min bars.
-- `condor_banned_on_two_way_auction`: Iron Condor attempted on expanding two-way session.
-- `weekly_condor_blocked_open_spike_wick`: Weekly condor blocked by unconfirmed opening wick.
-- `put_spread_spot_X_below_or_mid_Y`: Bull Put spread spot too deep below opening range center.
-- `put_spread_spot_X_below_vwap_Y`: Bull Put spread spot more than 30 pts below VWAP.
-- `call_spread_spot_X_above_or_mid_Y`: Bear Call spread spot too deep above opening range center.
-- `call_spread_spot_X_above_vwap_Y`: Bear Call spread spot more than 30 pts above VWAP.
-- `bear_call_spot_X_near_max_pain_Y`: Bear Call spread blocked by Max Pain magnet below.
+#### Entry rules
 
-#### 3. Parameter & Structural Economics Tokens:
+- `butterfly_spot_too_far_from_atm_*`, `butterfly_requires_pin_life_ge_*`, `butterfly_too_late_after_12:00`
+- `butterfly_blocked_adx_*`, `butterfly_requires_mature_adx`, `butterfly_requires_narrow_or_*`
+- `condor_needs_*min_before_exit_*`, `condor_blocked_strong_adx_*`, `condor_requires_mature_flat_adx`
+- `condor_banned_on_two_way_auction`, `condor_requires_narrow_or_got_*`
+- `condor_blocked_open_spike_wick_unresolved`, `condor_blocked_expanding_range_*`
+- `condor_location_drift_*` / `condor_location_not_mid_*`
+- `bull_put_spot_*_below_or_mid_*`, `bull_put_spot_below_vwap_*`
+- `bear_call_spot_*_above_or_mid_*`, `bear_call_spot_within_25pts_of_max_pain_*`
 
-- `chain_only_X_strikes`: Incomplete chain snapshot with fewer than 10 strikes.
-- `gross_credit_X_non_positive`: Structure yields zero or negative gross premium.
-- `net_credit_X_non_positive_after_costs`: Gross credit completely consumed by entry friction.
-- `net_credit_Xpts_friction_Ypts_is_Zpct_gt_35pct`: Friction consumes more than 35% of net credit.
-- `brokerage_Xpts_at_Ylots_is_Zpct_gt_20pct`: Brokerage order fees consume more than 20% of credit.
-- `X_wing_costs_Ypct_of_short_premium_gt_70pct`: Long protective wing is too expensive relative to short leg.
-- `credit_risk_ratio_X_below_min_Y`: Net credit divided by wing width fails minimum threshold.
-- `target_Xpts_below_Yx_roundtrip_friction`: Profit target does not clear required friction multiple.
-- `ev_gate:ev_Xpts_below_min_Ypts`: Net continuous expected value falls below mathematical hurdle.
-- `risk_budget_allows_only_X_lots_below_min_1`: Sizing algorithm cannot allocate at least 1 full lot within risk limits.
-- `construct_fail_sticky:X`: Structural rejection latched; suppressing redundant computations until auction moves.
+#### Economics
 
-#### 4. Momentum Alternative Tokens:
+- `gross_credit_*_non_positive`, `net_credit_*_non_positive_after_costs`
+- `net_credit_*_friction_*_gt_28pct` (threshold is 28%, not 35%)
+- `brokerage_*_gt_15pct`
+- `*_wing_costs_*pct_of_short_premium_*`
+- `credit_risk_ratio_*_below_min_*`
+- `target_*_below_*x_roundtrip_friction`
+- `ev_gate:ev_*_below_min_*`
+- `risk_budget_allows_only_*_lots_below_min_0.60`
+- `construct_fail_sticky:*`
 
-- `momentum_disabled`: Long-premium substitute disabled in configuration.
-- `momentum_sell_side_open`: Momentum rejected because sell-side structure was not cleanly blocked.
-- `momentum_dte_0_below_min`: Long premium rejected on 0DTE due to theta cliff.
-- `momentum_needs_trend_got_RANGE_BOUND`: Momentum requires confirmed directional price regime.
-- `momentum_adx_X_below_min`: Trend strength insufficient (ADX < 25).
-- `momentum_call_at_or_below_vwap`: Long Call rejected because spot is below VWAP.
-- `momentum_put_at_or_above_vwap`: Long Put rejected because spot is above VWAP.
-- `momentum_iv_expanding_no_chase`: Buying premium blocked because IV is already spiking.
-- `momentum_day_move_used_Xpct_exhausted`: Directional move has already consumed available intraday range.
-- `momentum_expected_capture_Xpts_below_Yx_friction`: Long option target gain does not cover twice round-trip execution friction.
+#### Momentum
+
+- `momentum_disabled`, `momentum_sell_side_open`, `momentum_dte_0_*` (economics / size — **not** a hard ban)
+- `momentum_needs_trend_got_*`, `momentum_adx_*_below_min`
+- `momentum_call_at_or_below_vwap`, `momentum_put_at_or_above_vwap`
+- `momentum_iv_expanding_no_chase`, `momentum_day_move_used_*`
+- `momentum_expected_capture_*_below_*x_friction`
+- `momentum_before_entry_window_*`, `momentum_late_*`
+
+---
+
+### Appendix — Default knobs operators actually hit
+
+| Knob | Default | Env |
+|---|---|---|
+| Paper mode | from env | `PAPER_TRADE_MODE` |
+| Capital | ₹10,00,000 | `STARTING_CAPITAL` |
+| Daily loss / per-trade | 8% / 2% | `MAX_DAILY_LOSS_PCT` / `MAX_RISK_PER_TRADE_PCT` |
+| Concurrent / entries | 2 / 3 | `MAX_CONCURRENT_POSITIONS` / `MAX_ENTRIES_PER_DAY` |
+| Correlated debit beside credit | **false** | `ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT` |
+| Same-cycle reentry | true | `ALLOW_SAME_CYCLE_REENTRY` |
+| Force lots | off | `FORCE_LOTS` |
+| ADX trend / strong | 20 / 28 | `ADX_TREND_THRESHOLD` / `ADX_STRONG_THRESHOLD` |
+| Weekly window | 09:45–14:15 / 15:15 | `TRADING_WINDOW_*` / `HARD_EXIT_TIME` |
+| 0DTE window | 10:30–13:00 / 15:00 | set by DTE in `data_engine` |
+| Late momentum | 14:30–14:57 | `MOMENTUM_LATE_WINDOW_*` |
+| Lot size / strike step | 65 / 50 | `NIFTY_LOT_SIZE` / `NIFTY_STRIKE_STEP` |
