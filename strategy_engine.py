@@ -382,8 +382,13 @@ class StrategyEngine:
                 # long premium may only ride WITH an open credit vertical
                 if o in MOMENTUM_STRATEGIES or not (new_sides & o_sides):
                     return f"slot_conflict_long_premium_against_open:{o}"
-                # P62 / P59-09: same-side credit + debit = correlated double
-                # tape risk (Sep22 BCS+LP). Default refuse; opt-in via config.
+                # Same-side credit + debit is correlated tape risk. The
+                # config flag still force-allows it. Otherwise the slot
+                # rule must read the same ADX the momentum path already
+                # used: a mature print at/above momentum_adx_min is the
+                # signal stream saying the trend is real. Immature /
+                # preview ADX stays refused so a morning 5-min tease
+                # cannot stack a debit on the first credit.
                 if new_sides & o_sides and not bool(
                     getattr(
                         self.config,
@@ -391,9 +396,30 @@ class StrategyEngine:
                         False,
                     )
                 ):
-                    return (
-                        f"slot_conflict_correlated_debit_beside_credit:{o}"
+                    _adx = 0.0
+                    _mature = False
+                    if signals:
+                        try:
+                            _adx = float(signals.get("adx_15") or 0.0)
+                        except (TypeError, ValueError):
+                            _adx = 0.0
+                        _mature = bool(signals.get("adx_15_mature"))
+                    # Stack bar is a clear strong trend (45), not the
+                    # STRONG label at 40 and not momentum_adx_min (24).
+                    # Crossing 40 for one cycle stacked a 3-lot debit
+                    # beside an open credit and replaced a later
+                    # full-size sequential debit.
+                    _need = max(
+                        45.0,
+                        float(
+                            getattr(self.config, "adx_strong_threshold", 28.0)
+                            or 28.0
+                        ),
                     )
+                    if not (_mature and _adx >= _need):
+                        return (
+                            f"slot_conflict_correlated_debit_beside_credit:{o}"
+                        )
                 continue
             if o in MOMENTUM_STRATEGIES:
                 # a credit vertical beside an open long option: same side only
@@ -2167,9 +2193,7 @@ class StrategyEngine:
         # 3. location lean — sell the away side of a real session range.
         # Mature mild band (0.62/0.38) needs trend-level ADX + non-UNCLEAR
         # positioning. Soft/extreme path is separate (not an else-dump): EMA
-        # evidence also requires non-UNCLEAR. Live Sep25 failures:
-        #   10:35 soft 0.36:warmup, 10:56 mature 0.38+UNCLEAR+EMA,
-        #   12:31 mature-flag adx=11 loc=0.62 under UNCLEAR.
+        # evidence also requires non-UNCLEAR.
         if (not _event) and _rng >= self.RANGE_LEAN_MIN_PTS:
             _adx_trend = float(
                 getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
@@ -2238,7 +2262,7 @@ class StrategyEngine:
 
         # 4. true pin only — never a catch-all. Condor/fly need a NARROW
         # opening range, mid location, and a real flat ADX read. MODERATE
-        # OR is not a pin (live 21-Sep IC at or=MODERATE adx=15).
+        # OR is not a pin.
         _pin_or = or_condition in ("VERY_NARROW", "NARROW")
         _pin_adx = (
             adx_15_mature
@@ -2247,8 +2271,6 @@ class StrategyEngine:
         _pin_loc = self.PIN_LOC_LO < _loc < self.PIN_LOC_HI
         _pin_rng = _rng < self.CONDOR_MAX_SESSION_RANGE_PTS
         _pin_vol = vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
-        # Soft directional grind evidence at mid-ish location still
-        # forbids a pin — sell the away side or wait.
         _grind_away = (
             (_loc >= self.RANGE_SOFT_LEAN_HI
              and self._soft_location_evidence(signals, "BULL"))
@@ -2260,8 +2282,6 @@ class StrategyEngine:
                 and not _grind_away):
             spot       = float(signals.get("spot") or 0)
             atm_strike = int(signals.get("atm_strike") or 0)
-            # v51: butterfly eligibility is remaining *life*, not a calendar
-            # DTE row. dte_blend >= PIN_LIFE_MIN ≈ DTE 0–1 pin gamma.
             if (or_condition in ("VERY_NARROW", "NARROW")
                     and adx_15 < self.BUTTERFLY_ADX_MAX
                     and atm_strike > 0
