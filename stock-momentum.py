@@ -1,1840 +1,1362 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+r"""
+VAM-AF v2.0 -- SINGLE-FILE NSE swing SCREENER. Python 3.10+; standard library only.
+No pip packages, helper Python files, trading engine, orders, sizing or holdings.
+
+INSTALL / INPUTS
+---------------
+Save this file as C:\Users\Administrator\Desktop\algo-trading\stock-momentum.py.
+It reads ONLY the existing env.txt beside it and stock-data\universe.json.
+Strategy defaults are in Config below, not config.json. Paths are script-relative.
+env.txt contains UPSTOX_ACCESS_TOKEN=your_current_real_token; the API key/secret
+may remain there but are not needed for market-data GET requests. No OAuth/token
+refresh is automated. Duplicate token entries are rejected; optional Bearer prefix
+is normalized. No secrets or raw profile payloads are logged. Protect env.txt.
+
+universe.json is {"exchange":"NSE", "segment":"NSE_EQ", "count":500,
+"symbols":[...uppercase NSE symbols...]}. count must match array length. Original
+500-symbol and revised 498-symbol files both work. The user-maintained list is not
+a verified current official Nifty 500 list. No automatic symbol substitutions.
+
+COMMANDS (Command Prompt or PowerShell from the project folder)
+--------------------------------------------------------------
+py -3 stock-momentum.py --open-report
+py -3 stock-momentum.py --check-universe --refresh-instruments
+py -3 stock-momentum.py --ignore-market-regime --open-report
+py -3 stock-momentum.py --allow-previous-session --open-report
+py -3 stock-momentum.py --as-of 2026-09-25
+py -3 stock-momentum.py --strict-universe
+py -3 stock-momentum.py --diagnose
+py -3 stock-momentum.py --show
+py -3 stock-momentum.py --history
+py -3 stock-momentum.py --version
+
+WHAT v2 FIXES
+-------------
+1. Universe preflight prints each unresolved, ambiguous, duplicate-key or non-EQ
+   symbol BEFORE downloading stock candles. Same-day cache is refreshed once if
+   mappings fail. Default: exclude these symbols explicitly and rank the mapped
+   EQ subset only if at least 95% of input symbols resolve. Report coverage and all
+   exclusions in console, SQLite run metadata, HTML and excluded_stocks.csv.
+   --strict-universe restores fail-on-any-exclusion, immediately. No guesswork
+   aliases or BE/BZ inclusion. Unknown/data/API failures during candle fetching
+   still fail early and preserve the last valid selections.
+2. Market regime is ALWAYS measured as Nifty close > SMA50. Never edit it to True.
+   --ignore-market-regime is a separate explicit research override, labeled
+   FILTER BYPASSED in reports and recorded independently in SQLite. OFF without
+   bypass produces zero selected stocks, but ranked_candidates.csv is available.
+3. Expected sessions use the Upstox NSE market-timings API, including holidays
+   and special sessions. Before configured 18:00 IST cutoff use a prior completed
+   session. Require market close + 30 minutes as well, for special late sessions.
+   If today's DAILY historical bar is missing after these gates, request the
+   documented V3 INTRADAY endpoint with days/1 for today's daily bar and merge
+   ONLY the exact current session into history. No fabricated date or minute-bar
+   aggregation. Source is recorded per stock and in benchmark metadata.
+   Provider daily-bar finality is not independently guaranteed by these buffers.
+4. No silent older-session fallback. Missing expected-session data records
+   WAITING_DATA and retains prior selections. Retry later or deliberately pass
+   --allow-previous-session, which labels any fallback and enforces a 4-calendar-
+   day maximum lag relative to expected session. --as-of always requires an exact
+   session and cannot be combined with fallback. Past --as-of is checked against
+   benchmark candles directly; it cannot rewind newer published state.
+5. Detailed sanitized HTTP errors distinguish 401/403 and structured API errors
+   from HTML/non-JSON gateway responses. GETs are paced and retry 429/5xx/network
+   failures; authentication failure aborts immediately. No redirects forward tokens.
+6. Every scan saves diagnostics, including preflight/date failures. No long 500-
+   stock scan just to discover mapping errors. Version and input path are printed.
+
+STRATEGY
+--------
+Default top 15 eligible stocks, strict ADT > INR 250,000,000 (25 crore).
+Stock close > SMA50; 20-session return > 0; Nifty close > SMA50 unless bypassed.
+VAM = (close / close_20_sessions_ago - 1) / (sample stddev of 20 daily log
+returns * sqrt(252)). Sample stddev uses ddof=1; 20 returns need 21 closes.
+At least 50 aligned completed sessions required with default parameters.
+ATR = simple mean of 20 true ranges, informational only (not Wilder's ATR).
+ADT = mean(close * volume), an approximation rather than reported traded value.
+Tie scores use symbol ascending; never force 15 stocks when fewer qualify.
+Contiguous short histories (e.g. IPOs) are excluded; missing/gapped/stale stock
+sessions or invalid OHLCV block publication. No forward-fill or mixed-date ranks.
+A >25% absolute daily price jump in the required window is excluded for corporate-
+action review. No independent split/dividend/demerger adjustments are performed.
+This heuristic can reject legitimate moves and cannot catch every corporate action.
+No profitability/backtest claim. Research candidates are not buy/sell instructions.
+
+STORAGE / REPORTS (all automatically generated under stock-data)
+---------------------------------------------------------------
+momentum.sqlite3: compatible with previous version; DO NOT DELETE your history.
+reports/dashboard.html: self-contained selected list, filter status, scope/history.
+reports/selected_stocks.csv: latest successful selected snapshot.
+reports/ranked_candidates.csv: eligible stock ranks BEFORE the market gate;
+  NOT selected stocks or holdings. Useful when actual market regime is OFF.
+reports/excluded_stocks.csv: latest attempt's explicit universe mapping exclusions.
+reports/new_additions.csv: additions in latest successful scan only.
+reports/discovery_history.csv: permanent first discoveries and re-entries.
+reports/latest.json, scan_NNNNNN.json: state and per-run audit including data source.
+logs/screener.log, cache/instruments.json, screener.lock: runtime support outputs.
+Reports are static; refresh after a scan or use --show to rebuild from SQLite.
+If report export fails (e.g. file locked in Excel), close it and --show. SQLite
+is authoritative; report failure does not erase a successful selection commit.
+
+DISCOVERY HISTORY
+-----------------
+First-ever selected instrument key => FIRST_DISCOVERY. After absence, returning
+key => RE_ENTRY. Original first-discovery timestamp never resets. Same selection
+rerun/rank change => no duplicate event. Actual IST observation time is separate
+from signal date. Regime-off, bypass toggles or changing the effective universe
+can change membership and hence produce later re-entries. Failed/pending scans
+never count as removals. A symbol change with same key is not a new discovery.
+Persisted config_json includes runtime coverage, expected session and source.
+The schema is backward compatible. Back up DB with scans stopped, or SQLite's
+online backup API; do not copy only a live WAL database's main file.
+
+Exit codes: 0 success, 2 failure, 3 waiting for required data, 130 interrupted.
+Schedule after 18:15 IST; allow 20+ minutes if today's bars need two requests each.
+GET request pacing defaults to 1.1 seconds; other apps also consume account limits.
+An OS lock prevents overlap. No local credentials are embedded in this script.
+
+Official API references:
+https://upstox.com/developer/api-documentation/v3/get-historical-candle-data/
+https://upstox.com/developer/api-documentation/v3/get-intra-day-candle-data/
+https://upstox.com/developer/api-documentation/get-market-timings/
+https://upstox.com/developer/api-documentation/instruments/
 """
-dual_momentum_screener.py -- Dual Momentum Screener for NSE cash equities (v1.0)
-================================================================================
 
-WHAT THIS IS
 
-    This is a SCREENER ONLY.
-      * It places NO orders.
-      * It connects to NO broker execution API (no Zerodha, no Upstox, no Kite,
-        no SmartAPI -- nothing. Broker credentials in env.txt are NOT read or
-        used here; they belong to the order-execution side of the repo).
-      * It has NO trade engine, NO backtester and NO portfolio simulation.
-      * It has NO stop-loss / position-sizing logic.
-    It fetches NSE daily OHLCV via yfinance, computes dual-momentum signals,
-    ranks the survivors and prints + exports a candidate watchlist. Nothing more.
-    The order path (if any) lives in other files, entirely separate from this one.
-
-DUAL MOMENTUM IN THREE SENTENCES
-
-    1. RELATIVE STRENGTH (RS) ranks every stock in the universe against the rest
-       of the universe using its 12-1 month return, so a candidate must be a
-       genuine cross-sectional leader, not merely a stock that went up.
-    2. ABSOLUTE MOMENTUM (AM) checks each stock against a cash/risk-free hurdle
-       (here: the hardcoded 6.5% annual Indian T-bill proxy), so a leader is only
-       tradable if it is beating cash over the same window.
-    3. The MARKET REGIME filter (Nifty 50 above a rising 200-SMA, plus an India
-       VIX overlay) decides whether the whole long book should be switched on;
-       a candidate must pass RS AND AM AND the regime to appear in the output.
-
-NSE-SPECIFIC THRESHOLDS AND WHY THEY ARE SET THIS WAY
-
-    * 12-1 momentum window (RS_LOOKBACK_MONTHS=12, RS_SKIP_MONTHS=1)
-      The most recent month is SKIPPED because short-horizon returns in Indian
-      equities show strong mean reversion / reversal (a stock that spiked last
-      month tends to give some back). Standard academic momentum is the return
-      from t-12 to t-1 months.
-    * 200-SMA regime confirmation (REGIME_MA_PERIOD=200, REGIME_REQUIRE_RISING)
-      ~200 trading days is roughly one year of NSE sessions. Long-only momentum
-      suffers its worst drawdowns when it keeps buying leaders into a falling
-      index, so we require Nifty 50 to be above its 200-SMA AND for that 200-SMA
-      to itself be rising over the last 20 sessions.
-    * India VIX overlay (USE_VIX_FILTER, VIX_MAX=25)
-      NSE momentum crashes cluster in high-volatility regimes. A smoothed VIX
-      above 25 is treated as RISK-OFF so the screener stops surfacing fresh
-      longs during panic phases. VIX_SMOOTH_DAYS=5 removes single-day spikes.
-    * Volatility-adjusted ranking (USE_VOL_ADJUSTED_RS)
-      Raw 12-1 return can be dominated by one erratic, illiquid mid-cap. Ranking
-      on momentum/volatility penalises erratic movers and favours smooth trends,
-      which translates into tighter, more tradable charts.
-    * MAX_ANNUALIZED_VOL=0.60 is a HARD FILTER
-      60% annualised vol is extremely high for an NSE cash equity. Stocks above
-      it are usually recent listings, circuit-locked counters or post-corporate-
-      action artefacts, and their position sizing becomes impractical.
-    * MIN_ADV_CR=5.0 (Rs 5 crore of 20-day average daily traded value)
-      Keeps the candidate liquid enough for retail/mid-size tickets without
-      moving the price. MIN_PRICE=20 excludes penny stocks whose tick size and
-      spreads distort returns. MIN_HISTORY_TRADING_DAYS=250 guarantees a full
-      year of history exists before the 12-1 window is even computed.
-
-HOW TO RUN
-
-    python dual_momentum_screener.py                     # whole universe.json
-    python dual_momentum_screener.py --top 10 --rs-floor 70
-    python dual_momentum_screener.py --refresh --csv my_picks.csv
-    python dual_momentum_screener.py --selftest          # offline unit checks
-    python dual_momentum_screener.py --no-vol-adjust --quiet
-
-HOW THE UNIVERSE IS DEFINED (universe.json is the single source of truth)
-
-    Every run screens the symbols listed in universe.json, key "symbols" --
-    plain NSE trading symbols WITHOUT the ".NS" suffix. Edit that JSON array to
-    add/remove names; no code change is needed, duplicates are removed and file
-    order is preserved. Nothing is scraped at runtime.
-
-    WHERE THE FILE IS FOUND (first hit wins):
-      1. --universe-file PATH, or the UNIVERSE_FILE env variable / CONFIG key
-      2. <script directory>/universe.json      <-- normal repo layout, e.g.
-         C:\\Users\\Administrator\\Desktop\\algo-trading\\stock-data\\universe.json
-         sitting next to this script
-      3. <current working directory>/universe.json
-      4. <cwd>/stock-data/universe.json, <script dir>/../stock-data/universe.json
-    If no candidate exists the run stops with exit code 3 and prints every path
-    it looked in.
-
-    --universe can only SUBSET that file, never replace or extend it:
-        json      (default) -> the whole file; "nifty500" is an alias
-        nifty200            -> first 200 entries of the file, in file order
-        nifty50             -> entries of the file that are also NIFTY_50 members
-    The NIFTY_50 list below is therefore only a membership mask for that last
-    subset; it never adds symbols that are absent from the JSON file.
-
-    Keep RISK_FREE_RATE_ANNUAL current by editing CONFIG when the 3-month
-    T-bill yield moves materially (it is hardcoded on purpose -- never fetched).
-
-DISCLAIMER
-
-    Past momentum performance does not guarantee future results. This tool is a
-    ranking aid for research, not investment advice. Verify every candidate
-    against corporate actions, liquidity and your own risk limits before acting.
-"""
-
-# =============================================================================
-# IMPORTS -- strictly limited to the approved dependency set.
-# =============================================================================
 import argparse
+from contextlib import contextmanager
 import csv
+from dataclasses import dataclass, asdict, replace
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from email.utils import parsedate_to_datetime
+import gzip
+import html
+from http.client import HTTPException
+import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
+from pathlib import Path
+import re
+import sqlite3
+import statistics
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, build_opener, HTTPRedirectHandler, getproxies
+import webbrowser
 
-import numpy as np
-import pandas as pd
-
-try:
-    import yfinance as yf            # market data only -- never used for orders
-except Exception:                    # pragma: no cover - environment dependent
-    yf = None
-
-try:
-    import requests                  # optional; retry/session helper only
-except Exception:                    # pragma: no cover - environment dependent
-    requests = None
+# India has no DST; fixed UTC+05:30 avoids a tzdata installation on Windows.
+IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+VERSION = "2.0.0"
 
 
-# =============================================================================
-# CONFIG -- every tunable parameter lives here, and every one is used below.
-# =============================================================================
-CONFIG = {
-    # ---- Universe -----------------------------------------------------------
-    # universe.json is ALWAYS the source of symbols; UNIVERSE_SOURCE can only
-    # subset it ("json" = whole file; "nifty500" is an alias for the same thing).
-    "UNIVERSE_SOURCE": "json",            # "json" | "nifty50" | "nifty200" | "nifty500"
-    "UNIVERSE_JSON": "universe.json",     # repo file stock-data/universe.json
-    # Optional explicit path to the universe file (absolute or relative to the
-    # CWD). Empty = auto-detect: script dir first, then CWD, then repo layouts.
-    # Overridable with --universe-file PATH or the UNIVERSE_FILE env variable.
-    "UNIVERSE_FILE": "",
-    "MIN_PRICE": 20.0,                    # Rs  -- exclude penny stocks
-    "MIN_ADV_CR": 5.0,                    # Rs crore -- 20-day avg daily value
-    "MIN_HISTORY_TRADING_DAYS": 250,      # ~12 months of trading days
-
-    # ---- Relative Strength (RS) --------------------------------------------
-    "RS_LOOKBACK_MONTHS": 12,
-    "RS_SKIP_MONTHS": 1,                  # 12-1 window (skip reversal month)
-    "RS_MIN_RATING": 80,                  # 0-100 rating floor
-    "RS_TOP_DECILE": True,                # refine to RS >= 90 when possible
-    "MIN_PICKS_FOR_DECILE": 10,           # else fall back to RS_MIN_RATING
-
-    # ---- Absolute Momentum (AM) --------------------------------------------
-    "AM_LOOKBACK_MONTHS": 12,
-    "AM_USE_RISK_FREE": True,
-    "RISK_FREE_RATE_ANNUAL": 0.065,       # 3M T-bill proxy -- update manually!
-    "RISK_FREE_RATE_UPDATE_HINT": "3-month Indian T-bill yield; review quarterly",
-
-    # ---- Volatility-adjusted momentum --------------------------------------
-    "VOL_LOOKBACK_DAYS": 20,              # ~1 month of daily returns
-    "USE_VOL_ADJUSTED_RS": True,
-    "MAX_ANNUALIZED_VOL": 0.60,           # hard filter for NSE mid-caps
-
-    # ---- Market regime filter (Nifty 50) -----------------------------------
-    "REGIME_MA_PERIOD": 200,
-    "REGIME_REQUIRE_RISING": True,
-    "REGIME_SLOPE_LOOKBACK": 20,
-
-    # ---- VIX risk overlay ---------------------------------------------------
-    "USE_VIX_FILTER": True,
-    "VIX_MAX": 25.0,
-    "VIX_SMOOTH_DAYS": 5,                 # simple MA on India VIX closes
-
-    # ---- Data quality -------------------------------------------------------
-    "MAX_DATA_STALENESS_DAYS": 5,         # reject if last bar older than this
-    "YF_BATCH_SIZE": 50,                  # tickers per yfinance call
-    "YF_RETRY_ATTEMPTS": 3,
-    "YF_RETRY_SLEEP_SEC": 2.0,
-    "DATA_PERIOD": "2y",                  # yfinance period (2y > 12-1 window)
-    "DATA_INTERVAL": "1d",
-
-    # ---- Caching ------------------------------------------------------------
-    "CACHE_DIR": ".cache_dual_momentum",
-    "CACHE_TTL_HOURS": 12,                # ignore cache older than this
-    "CACHE_VERSION": "v2",                # bump to invalidate old cache files
-
-    # ---- Output -------------------------------------------------------------
-    "OUTPUT_TOP_N": 30,
-    "OUTPUT_CSV": "dual_momentum_picks.csv",
-    "VERBOSE": True,
-}
-
-# -----------------------------------------------------------------------------
-# Fixed constants (not tunables)
-# -----------------------------------------------------------------------------
-IST = timezone(timedelta(hours=5, minutes=30))   # Asia/Kolkata, no tz database
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BENCHMARK_TICKERS = ["^NSEI", "^INDIAVIX", "GOLDBEES.NS", "LIQUIDBEES.NS"]
-BENCHMARK_SET = set(BENCHMARK_TICKERS)
-NIFTY_TICKER = "^NSEI"          # Nifty 50 index
-VIX_TICKER = "^INDIAVIX"        # India VIX
-TRADING_DAYS_PER_YEAR = 252     # NSE trading days used for annualisation
-NIFTY_50_MIN_EXPECTED = 200     # warn below this many unique symbols
-UNIVERSE_SOURCE_DEFAULT = "json"  # always screen the universe.json file
-BENCHMARKS_IN_DATA = ("^NSEI", "^INDIAVIX", "GOLDBEES.NS", "LIQUIDBEES.NS")
-
-# Populated by get_universe() so the report can state which file was screened.
-UNIVERSE_INFO = {"path": None, "file_count": 0, "mode": None, "count": 0}
-
-# Exactly 50 unique Nifty 50 constituents (fixed reference list, no duplicates).
-NIFTY_50 = [
-    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
-    "HINDUNILVR", "SBIN", "BHARTIARTL", "BAJFINANCE", "KOTAKBANK",
-    "LT", "AXISBANK", "ASIANPAINT", "MARUTI", "TATASTEEL",
-    "WIPRO", "HCLTECH", "ITC", "VBL", "SUNPHARMA",
-    "TATAMOTORS", "POWERGRID", "NTPC", "TITAN", "ULTRACEMCO",
-    "NESTLEIND", "BAJAJFINSV", "TATACONSUM", "CIPLA", "M&M",
-    "HINDALCO", "JSWSTEEL", "GRASIM", "SHREECEM", "EICHERMOT",
-    "HEROMOTOCO", "ADANIENT", "ADANIPORTS", "COALINDIA", "ONGC",
-    "BPCL", "DRREDDY", "DIVISLAB", "APOLLOHOSP", "BRITANNIA",
-    "TECHM", "INDUSINDBK", "BAJAJ-AUTO", "SBILIFE", "HDFCLIFE",
-]
-
-# Exact CSV column order required by the spec.
-CSV_COLUMNS = [
-    "rank", "symbol", "close", "ret_12_1_pct", "vol_pct", "rs_rating",
-    "am_ok", "adv_cr", "regime_ok", "run_date",
-]
-
-# Rejection counters are printed in this fixed order (labels are exact).
-REJECT_ORDER = [
-    "price < MIN_PRICE",
-    "ADV < MIN_ADV_CR",
-    "vol too high",
-    "no momentum",
-    "history too short",
-    "stale data",
-    "RS < floor",
-    "AM fail",
-    "regime off",
-]
-
-# Module-level registry so fetch_daily_data() can report funnel counts to
-# run_screener() without changing its required return type (dict of frames).
-FETCH_STATS = {"requested": 0, "downloaded": 0, "history_passed": 0, "stale": 0}
+# ============================================================================
+# STRATEGY SETTINGS AND CALCULATIONS
+# ============================================================================
 
 
-# =============================================================================
-# SMALL UTILITIES
-# =============================================================================
-def now_ist():
-    """Current aware datetime in IST (Asia/Kolkata) using a fixed offset."""
-    return datetime.now(IST)
 
 
-def log(msg, cfg=None):
-    """Print unless --quiet disabled verbosity (VERBOSE flag)."""
-    if cfg is not None and not cfg.get("VERBOSE", True):
-        return
-    print(msg)
-    try:
-        sys.stdout.flush()
-    except Exception:
-        pass
+class DataError(ValueError):
+    """Incomplete/unreliable data: must not replace last good selections."""
 
 
-def safe_float(x):
-    """Return a finite float or None. Never raises."""
-    try:
-        v = float(x)
-    except Exception:
+class DataPending(DataError):
+    """Required completed-session data has not arrived. Retain previous results."""
+
+
+@dataclass(frozen=True)
+class Config:
+    top_n: int = 15
+    momentum_days: int = 20
+    volatility_days: int = 20
+    sma_days: int = 50
+    liquidity_days: int = 20
+    atr_days: int = 20
+    min_adt_inr: float = 250_000_000
+    annualization_days: int = 252
+    benchmark_key: str = "NSE_INDEX|Nifty 50"
+    history_calendar_days: int = 240
+    eod_ready_ist: str = "18:00"
+    max_benchmark_age_days: int = 4
+    request_interval_seconds: float = 1.1
+    request_timeout_seconds: float = 30
+    retries: int = 3
+    max_abs_daily_return: float = 0.25
+    strict_universe: bool = False
+    min_universe_coverage: float = 0.95
+    ignore_market_regime: bool = False
+    allow_previous_session: bool = False
+    refresh_instruments: bool = False
+
+    @property
+    def required_bars(self):
+        return max(self.sma_days, self.momentum_days + 1,
+                   self.volatility_days + 1, self.liquidity_days, self.atr_days + 1)
+
+    def validate(self):
+        cfg = self
+        for name in ("top_n", "momentum_days", "volatility_days", "sma_days",
+                     "liquidity_days", "atr_days", "annualization_days",
+                     "history_calendar_days", "max_benchmark_age_days"):
+            value = getattr(cfg, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if cfg.volatility_days < 2 or not 1 <= cfg.top_n <= 500:
+            raise ValueError("volatility_days >= 2 and top_n in 1..500 required")
+        for name in ("min_adt_inr", "request_interval_seconds", "request_timeout_seconds", "max_abs_daily_return"):
+            value = getattr(cfg, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if cfg.request_interval_seconds < 1.0:
+            raise ValueError("Use request_interval_seconds >= 1.0 for conservative pacing")
+        if type(cfg.retries) is not int or not 0 <= cfg.retries <= 8:
+            raise ValueError("retries must be in 0..8")
+        if cfg.history_calendar_days < cfg.required_bars * 2 or cfg.history_calendar_days > 3650:
+            raise ValueError("history_calendar_days must be >= 2 * required_bars and <= 3650")
+        ready = dt_time.fromisoformat(cfg.eod_ready_ist)
+        if ready.tzinfo or ready < dt_time(16, 0):
+            raise ValueError("eod_ready_ist must be a local time at/after 16:00")
+        if not isinstance(cfg.benchmark_key, str) or not cfg.benchmark_key.startswith("NSE_INDEX|"):
+            raise ValueError("benchmark_key must identify an NSE index")
+        for name in ("strict_universe", "ignore_market_regime", "allow_previous_session", "refresh_instruments"):
+            if type(getattr(cfg, name)) is not bool:
+                raise ValueError(f"{name} must be true or false")
+        if not isinstance(cfg.min_universe_coverage, (int, float)) or not 0 < cfg.min_universe_coverage <= 1:
+            raise ValueError("min_universe_coverage must be in (0, 1]")
+        return cfg
+
+    def dictionary(self):
+        return asdict(self)
+
+
+def load_universe(path):
+    obj = json.loads(path.read_text(encoding="utf-8-sig"))
+    values = obj.get("symbols")
+    if obj.get("exchange") != "NSE" or obj.get("segment") != "NSE_EQ":
+        raise ValueError("Universe must use exchange NSE and segment NSE_EQ")
+    if not isinstance(values, list) or not values:
+        raise ValueError("universe.symbols must be a nonempty JSON array")
+    if any(not isinstance(s, str) or not s or s != s.strip().upper() for s in values):
+        raise ValueError("Symbols must be nonempty uppercase strings without surrounding whitespace")
+    if len(values) != len(set(values)):
+        raise ValueError("Duplicate universe symbols; correct universe.json")
+    if obj.get("count") != len(values):
+        raise ValueError(f"Universe count must equal symbols length ({len(values)})")
+    return values
+
+
+def completed_cutoff(now, cfg):
+    now = now.astimezone(IST)
+    # No guesses about holidays: actual benchmark candles determine session dates.
+    return now.date() if now.time() >= dt_time.fromisoformat(cfg.eod_ready_ist) else now.date() - timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class Bar:
+    day: date
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+def parse_candles(raw, cutoff):
+    if not isinstance(raw, list):
+        raise DataError("Candles must be an array")
+    by_day = {}
+    for row in raw:
+        try:
+            if len(row) < 6:
+                raise ValueError()
+            stamp = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                raise ValueError()
+            day = stamp.astimezone(IST).date()
+            if day > cutoff:
+                continue
+            o, h, l, c, v = map(float, row[1:6])
+            if not all(math.isfinite(x) for x in (o, h, l, c, v)):
+                raise ValueError()
+            if min(o, h, l, c) <= 0 or v < 0 or l > min(o, c) or h < max(o, c) or h < l:
+                raise ValueError()
+            bar = Bar(day, o, h, l, c, v)
+            if day in by_day and by_day[day] != bar:
+                raise DataError(f"Conflicting duplicate candles on {day}")
+            by_day[day] = bar
+        except (TypeError, ValueError, IndexError, AttributeError) as exc:
+            if isinstance(exc, DataError):
+                raise
+            raise DataError("Invalid candle timestamp/OHLCV") from None
+    return sorted(by_day.values(), key=lambda b: b.day)
+
+
+def assess(symbol, key, bars, benchmark_bars, cfg):
+    """Return metrics and exclusion reasons; data-integrity errors raise DataError."""
+    if not bars:
+        raise DataError("No completed candles")
+    if bars[-1].day != benchmark_bars[-1].day:
+        raise DataError(f"Stale stock candle: {bars[-1].day}; benchmark: {benchmark_bars[-1].day}")
+    expected = [b.day for b in benchmark_bars[-cfg.required_bars:]]
+    observed = [b.day for b in bars[-cfg.required_bars:]]
+    result = {"symbol": symbol, "instrument_key": key, "as_of": bars[-1].day.isoformat()}
+    if len(bars) < cfg.required_bars:
+        # Only a contiguous short suffix counts as insufficient listing/history.
+        if observed != expected[-len(observed):]:
+            raise DataError("Missing sessions in short stock history")
+        return {**result, "eligible": False, "reasons": ["insufficient_history"]}
+    if observed != expected:
+        raise DataError("Stock sessions do not match benchmark sessions; no forward filling")
+    bars = bars[-cfg.required_bars:]
+    closes = [b.close for b in bars]
+    daily_simple = [b / a - 1 for a, b in zip(closes, closes[1:])]
+    ret = closes[-1] / closes[-cfg.momentum_days - 1] - 1
+    log_returns = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+    vol = statistics.stdev(log_returns[-cfg.volatility_days:]) * math.sqrt(cfg.annualization_days)
+    sma = statistics.mean(closes[-cfg.sma_days:])
+    adt = statistics.mean(b.close * b.volume for b in bars[-cfg.liquidity_days:])
+    trs = [max(b.high - b.low, abs(b.high - prev.close), abs(b.low - prev.close))
+           for prev, b in zip(bars, bars[1:])]
+    atr = statistics.mean(trs[-cfg.atr_days:])
+    reasons = []
+    if adt <= cfg.min_adt_inr:
+        reasons.append("liquidity_not_above_threshold")
+    if closes[-1] <= sma:
+        reasons.append("close_not_above_sma")
+    if ret <= 0:
+        reasons.append("nonpositive_absolute_return")
+    if vol <= 1e-12:
+        reasons.append("zero_or_negligible_volatility")
+    if any(abs(r) > cfg.max_abs_daily_return for r in daily_simple):
+        reasons.append("large_price_jump_review_corporate_actions")
+    return {**result, "close": closes[-1], "sma": sma, "momentum_return": ret,
+            "annual_volatility": vol, "vam": ret / vol if vol > 1e-12 else None,
+            "adt_inr": adt, "atr": atr, "eligible": not reasons, "reasons": reasons}
+
+
+def rank_candidates(metrics):
+    rows = [dict(m) for m in metrics if m.get("eligible")]
+    rows.sort(key=lambda r: (-r["vam"], r["symbol"]))
+    for i, row in enumerate(rows, 1):
+        row["rank"] = i
+    return rows
+
+
+# ============================================================================
+# STANDARD-LIBRARY HTTP TRANSPORT
+# ============================================================================
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Never forward a bearer token through a redirected request."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
-    if not math.isfinite(v):
-        return None
-    return v
 
 
-def _stable_hash(text):
-    """
-    Deterministic 64-bit FNV-1a hash (hex string).
+class _Response:
+    def __init__(self, status_code, headers, content):
+        self.status_code = status_code
+        self.headers = headers
+        self.content = content
 
-    Used for the cache filename because Python's built-in hash() is randomised
-    per process (PYTHONHASHSEED) and would produce a new cache file each run.
-    hashlib is deliberately NOT imported -- it is outside the approved imports.
-    """
-    h = 0xcbf29ce484222325
-    for byte in str(text).encode("utf-8"):
-        h ^= byte
-        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return format(h, "016x")
+    def json(self):
+        return json.loads(self.content)
 
 
-class StderrCapture(object):
-    """
-    Minimal write sink used to keep yfinance's per-ticker "delisted / no data"
-    chatter off the console. The captured text is summarised by the caller and
-    the real sys.stderr is always restored afterwards. Pure `sys` -- the logging
-    or contextlib modules are deliberately not imported.
-    """
-
+class _HttpSession:
+    """Small standard-library GET transport; no third-party requests dependency."""
     def __init__(self):
-        self.chunks = []
+        self.opener = build_opener(_NoRedirect())
 
-    def write(self, text):
-        if text:
-            self.chunks.append(str(text))
-        return len(text) if text else 0
-
-    def flush(self):
-        pass
-
-    def summary(self, max_names=8):
-        """Condense captured text into short, useful lines."""
-        blob = "".join(self.chunks)
-        lines = [ln.strip() for ln in blob.replace("\r", "\n").split("\n")
-                 if ln.strip()]
-        if not lines:
-            return ""
-        delisted = []
-        for line in lines:
-            if "delisted" not in line and "No data found" not in line:
-                continue
-            name = line.split(":")[0].lstrip("$ ").strip()
-            # Only keep clean ticker-like names; yfinance also dumps summary
-            # lines such as "Failed downloads: ['X.NS']" which are not names.
-            if (not name or " " in name or "[" in name or "'" in name
-                    or "Failed downloads" in name):
-                continue
-            if name not in delisted:
-                delisted.append(name)
-        if delisted:
-            shown = ", ".join(delisted[:max_names])
-            more = "" if len(delisted) <= max_names else \
-                " (+%d more)" % (len(delisted) - max_names)
-            return "no data for %d ticker(s): %s%s" % (len(delisted), shown, more)
-        return lines[0][:180]
-
-
-def resolve_path(path, cfg=None):
-    """
-    Resolve a CONFIG path. Absolute paths are returned unchanged; relative paths
-    are resolved against the directory containing this script so that
-    `python stock-data/dual_momentum_screener.py` behaves identically from any
-    working directory. (OUTPUT_CSV is additionally mirrored to the CWD by
-    run_screener, per spec: "CSV path is resolved relative to the CWD".)
-    """
-    if not path:
-        return path
-    if os.path.isabs(path):
-        return path
-    return os.path.normpath(os.path.join(SCRIPT_DIR, path))
-
-
-def load_env_file(cfg=None):
-    """
-    Load KEY=VALUE pairs from env.txt (repo convention, also .env) if present.
-
-    Implementation detail: this is a tiny built-in parser -- python-dotenv is
-    NOT an approved dependency. Values already present in os.environ win, so
-    shell exports always override the file. Broker keys are loaded for the rest
-    of the repo but are intentionally unused by this screener.
-    """
-    loaded = {}
-    candidates = [
-        resolve_path("env.txt", cfg),
-        resolve_path(os.path.join(os.getcwd(), "env.txt"), cfg),
-        resolve_path(".env", cfg),
-        os.path.join(os.getcwd(), ".env"),
-    ]
-    for path in candidates:
-        if not path or not os.path.isfile(path):
-            continue
+    def get(self, url, headers, timeout, allow_redirects=False):
+        if allow_redirects:
+            raise ValueError("Redirects are disabled for credential safety")
+        req = Request(url, headers=headers, method="GET")
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                for raw in fh:
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, _, value = line.partition("=")
-                    key = key.strip()
-                    value = value.strip().strip('"').strip("'")
-                    if not key:
-                        continue
-                    loaded[key] = value
-                    if key not in os.environ:
-                        os.environ[key] = value
-        except Exception as exc:
-            log("WARNING: could not read env file %s (%s)" % (path, exc), cfg)
+            with self.opener.open(req, timeout=timeout) as response:
+                return _Response(response.status, response.headers, response.read())
+        except HTTPError as exc:
+            # HTTP errors are structured responses; NEVER log their raw body.
+            with exc:
+                return _Response(exc.code, exc.headers, exc.read())
+
+    def close(self):
+        pass  # every urllib response is closed by its context manager
+
+
+
+
+
+# ============================================================================
+# CREDENTIAL LOADING AND UPSTOX MARKET DATA
+# ============================================================================
+
+MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+
+
+class ApiError(RuntimeError):
+    def __init__(self, message, status_code=None, details=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.details = details or {}
+
+
+
+class AuthError(ApiError):
+    pass
+
+
+def read_token(root):
+    """Read only UPSTOX_ACCESS_TOKEN from local env.txt; never execute its contents."""
+    env_path = root / "env.txt"
+    if not env_path.is_file():
+        raise ValueError(f"Missing {env_path}; keep your existing env.txt beside this script")
+    token = ""
+    token_entries = 0
+    for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
-        break   # first existing file wins
-    return loaded
-
-
-# =============================================================================
-# PART 4 -- UNIVERSE
-# =============================================================================
-def _universe_file_candidates(cfg):
-    """
-    Build the ordered list of places the universe file is looked for.
-
-    Precedence:
-      1. explicit override -- CONFIG["UNIVERSE_FILE"] or the UNIVERSE_FILE
-         environment variable (also settable from env.txt). Relative values are
-         tried against the CWD and then against the script directory.
-      2. CONFIG["UNIVERSE_JSON"] resolved against the script directory -- this is
-         what makes the standard Windows layout work, e.g.
-         C:\\Users\\Administrator\\Desktop\\algo-trading\\stock-data\\dual_momentum_screener.py
-         + ...\\stock-data\\universe.json
-      3. CONFIG["UNIVERSE_JSON"] resolved against the current working directory.
-      4. A few conventional repo layouts: <cwd>/stock-data/<name>,
-         <script dir>/<name>, <script dir>/../stock-data/<name>,
-         <cwd>/../stock-data/<name>.
-    Returns (explicit_paths, auto_paths) -- de-duplicated, normalised paths that
-    may or may not exist.
-    """
-    base_name = os.path.basename(cfg["UNIVERSE_JSON"])
-
-    explicit_paths = []
-    explicit = cfg.get("UNIVERSE_FILE") or os.environ.get("UNIVERSE_FILE")
-    if explicit:
-        expanded = os.path.expanduser(str(explicit).strip())
-        if os.path.isabs(expanded):
-            explicit_paths.append(expanded)
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != "UPSTOX_ACCESS_TOKEN":
+            continue
+        token_entries += 1
+        if token_entries > 1:
+            raise ValueError("Multiple UPSTOX_ACCESS_TOKEN entries in env.txt; keep exactly one current token")
+        value = value.strip()
+        if value.startswith(("'", '"')):
+            end = value.find(value[0], 1)
+            if end < 0:
+                raise ValueError("Unclosed quote for UPSTOX_ACCESS_TOKEN in env.txt")
+            tail = value[end + 1:].strip()
+            if tail and not tail.startswith("#"):
+                raise ValueError("Unexpected text after quoted UPSTOX_ACCESS_TOKEN in env.txt")
+            value = value[1:end]
         else:
-            explicit_paths.append(os.path.join(os.getcwd(), expanded))
-            explicit_paths.append(os.path.join(SCRIPT_DIR, expanded))
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        token = value.strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()  # send exactly one Bearer prefix
+    if len(token) < 20 or token.lower() in ("your_access_token", "your_current_real_token", "replace_me"):
+        raise ValueError("UPSTOX_ACCESS_TOKEN is missing/placeholder; update your local env.txt")
+    if any(ch.isspace() for ch in token):
+        raise ValueError("UPSTOX_ACCESS_TOKEN must not contain whitespace")
+    return token
 
-    cfg_path = cfg["UNIVERSE_JSON"]
-    auto_paths = [
-        resolve_path(cfg_path, cfg),                                  # script dir
-        os.path.join(os.getcwd(), cfg_path),                          # cwd
-        os.path.join(os.getcwd(), "stock-data", base_name),           # cwd/stock-data
-        os.path.join(SCRIPT_DIR, base_name),                          # script dir/name
-        os.path.join(SCRIPT_DIR, os.pardir, "stock-data", base_name),
-        os.path.join(os.getcwd(), os.pardir, "stock-data", base_name),
-    ]
 
-    def _dedupe(paths):
-        seen = set()
-        ordered = []
-        for path in paths:
+def atomic_json(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def safe_error_text(value, token):
+    """Redact credentials/identifiers before logging allowlisted API error fields."""
+    if not isinstance(value, (str, int)):
+        return ""
+    text = str(value)
+    if token:
+        for secret in (token, quote(token, safe="")):
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)bearer\s+[^\s\"',;<>]+", "Bearer [REDACTED]", text)
+    text = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?", "[REDACTED JWT]", text)
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[REDACTED EMAIL]", text)
+    text = re.sub(r"[A-Za-z0-9_./+=-]{64,}", "[REDACTED LONG VALUE]", text)
+    return " ".join(text.split())[:400]
+
+
+def response_error_details(response, token):
+    """Never return raw HTML, success payloads, request headers or profile fields."""
+    details = {"response_kind": "non-JSON", "errors": []}
+    raw = getattr(response, "content", b"")
+    try:
+        obj = response.json()
+        details["response_kind"] = "JSON"
+    except (ValueError, TypeError, UnicodeError):
+        obj = None
+        if isinstance(raw, bytes) and (b"<html" in raw[:2048].lower() or b"<!doctype html" in raw[:2048].lower()):
+            details["response_kind"] = "HTML"
+    if isinstance(obj, dict):
+        errors = obj.get("errors", [])
+        if isinstance(errors, dict):
+            errors = [errors]
+        if not isinstance(errors, list):
+            errors = []
+        for error in [obj] + errors[:5]:
+            if not isinstance(error, dict):
+                continue
+            code = safe_error_text(error.get("errorCode", error.get("error_code", "")), token)
+            message = safe_error_text(error.get("message", ""), token)
+            if code or message:
+                details["errors"].append({"code": code, "message": message})
+    return details
+
+
+def http_failure_message(response, url, details):
+    endpoint = urlsplit(url).path  # current call sites contain no secret/query in path
+    parts = [f"HTTP {response.status_code} on {endpoint}", f"response={details['response_kind']}"]
+    for error in details["errors"]:
+        parts.append((error["code"] + ": " + error["message"]).strip(": "))
+    if response.status_code == 401:
+        parts.append("Unauthorized for this request; inspect the API error code")
+    elif response.status_code == 403:
+        parts.append("Forbidden; this alone does not prove that the token is invalid")
+    if not details["errors"]:
+        parts.append("No structured API error supplied; raw response omitted for privacy")
+    return " | ".join(parts)
+
+
+class Upstox:
+    def __init__(self, token, cfg, data_dir):
+        self.cfg = cfg
+        self.data_dir = data_dir
+        self.session = _HttpSession()
+        self.token = token
+        self.next_request = 0.0
+        self.instrument_cache_used = False
+        self.current_day_ready = False
+        self.bar_sources = {}
+
+    def close(self):
+        self.session.close()
+
+    def get(self, url, authenticated=True):
+        headers = {"Accept": "application/json", "Content-Type": "application/json",
+                   "User-Agent": "VAM-AF-NSE-Screener/2.0 (Python urllib)"}
+        if authenticated:
+            headers["Authorization"] = f"Bearer {self.token}"
+        for attempt in range(self.cfg.retries + 1):
+            time.sleep(max(0, self.next_request - time.monotonic()))
+            self.next_request = time.monotonic() + self.cfg.request_interval_seconds
             try:
-                norm = os.path.normpath(path)
-            except Exception:
+                response = self.session.get(url, headers=headers,
+                                            timeout=self.cfg.request_timeout_seconds,
+                                            allow_redirects=False)
+            except (URLError, OSError, HTTPException):
+                # No raw exceptions/response bodies: they can expose sensitive request data.
+                if attempt == self.cfg.retries:
+                    raise ApiError("Market-data network request failed after retries") from None
+                time.sleep(min(2 ** attempt, 30))
                 continue
-            if norm in seen:
+            if response.status_code in (401, 403):
+                details = response_error_details(response, self.token)
+                raise AuthError(http_failure_message(response, url, details), response.status_code, details)
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt == self.cfg.retries:
+                    details = response_error_details(response, self.token)
+                    raise ApiError(http_failure_message(response, url, details) + " | retries exhausted",
+                                   response.status_code, details)
+                delay = 2 ** attempt
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    try:
+                        delay = max(delay, parsedate_to_datetime(retry_after).timestamp() - time.time())
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+                # Never retry earlier than requested. Long delays abort this run instead.
+                if delay > 300:
+                    raise ApiError("Rate limited; Retry-After > 300 seconds. Retry the screener later")
+                time.sleep(delay)
                 continue
-            seen.add(norm)
-            ordered.append(norm)
-        return ordered
+            if response.status_code != 200:
+                details = response_error_details(response, self.token)
+                raise ApiError(http_failure_message(response, url, details), response.status_code, details)
+            return response
+        raise ApiError("Unreachable retry state")
 
-    return _dedupe(explicit_paths), _dedupe(auto_paths)
-
-
-def _universe_file_path(cfg):
-    """
-    Locate the universe JSON file.
-
-    An explicit --universe-file / UNIVERSE_FILE path wins; if it is missing a
-    warning is printed and auto-detection continues, so a typo is visible rather
-    than silently ignored. Returns (path, all_searched_paths); path is None when
-    nothing exists.
-    """
-    explicit_paths, auto_paths = _universe_file_candidates(cfg)
-    if explicit_paths:
-        for path in explicit_paths:
-            if os.path.isfile(path):
-                return path, explicit_paths + auto_paths
-        log("WARNING: the universe file you specified was not found (%s); "
-            "falling back to auto-detection."
-            % (cfg.get("UNIVERSE_FILE") or os.environ.get("UNIVERSE_FILE")), cfg)
-    for path in auto_paths:
-        if os.path.isfile(path):
-            return path, explicit_paths + auto_paths
-    return None, explicit_paths + auto_paths
-
-
-def _load_universe_json(cfg):
-    """
-    Read universe.json -- THE SINGLE SOURCE OF TRUTH for stock symbols.
-
-    Returns (symbols, path) where symbols is a de-duplicated, upper-cased list of
-    NSE trading symbols WITHOUT the ".NS" suffix (entries saved with the suffix
-    are tolerated). Nothing is scraped or fetched: this is a local file read.
-    Returns ([], path_or_None) when the file is missing or unusable.
-    """
-    path, _ = _universe_file_path(cfg)
-    if path is None:
-        return [], None
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except Exception as exc:
-        log("ERROR: could not parse universe file %s (%s)." % (path, exc), cfg)
-        return [], path
-
-    symbols = payload.get("symbols", []) if isinstance(payload, dict) else payload
-    if not isinstance(symbols, list):
-        log("ERROR: %s does not contain a 'symbols' list." % path, cfg)
-        return [], path
-
-    clean = []
-    seen = set()
-    for sym in symbols:
-        s = str(sym).strip().upper()
-        if not s or s.startswith("^") or s.startswith("#"):
-            continue                  # skip indices / comment placeholders
-        if s.endswith(".NS"):
-            s = s[:-3]                # tolerate symbols saved with the suffix
-        if s not in seen:
-            seen.add(s)
-            clean.append(s)
-    return clean, path
-
-
-def get_universe(cfg):
-    """
-    Return the NSE symbols (WITHOUT the ".NS" suffix) to screen.
-
-    The universe ALWAYS comes from universe.json -- every symbol screened is one
-    that is written in that file, and every symbol written in that file is
-    screened. UNIVERSE_SOURCE never introduces a symbol of its own; it can only
-    subset the file:
-
-        "json" | "nifty500" : the entire file (default; nifty500 is an alias)
-        "nifty200"          : the first 200 entries of the file, in file order
-        "nifty50"           : entries of the file that are also NIFTY_50 members
-
-    A missing/empty/unreadable universe file is a fatal configuration error: the
-    screener refuses to run against some other list rather than silently
-    screening something the user did not ask for.
-    """
-    mode = str(cfg.get("UNIVERSE_SOURCE", UNIVERSE_SOURCE_DEFAULT)).strip().lower()
-    if mode not in ("json", "nifty50", "nifty200", "nifty500"):
-        log("WARNING: unknown UNIVERSE_SOURCE '%s' -- using the full universe "
-            "file." % mode, cfg)
-        mode = "json"
-
-    symbols, path = _load_universe_json(cfg)
-
-    if not symbols:
-        if path is None:
-            _, searched = _universe_file_path(cfg)
-            print("ERROR: universe file \"%s\" was not found. Looked in:"
-                  % cfg["UNIVERSE_JSON"])
-            for candidate in searched[:8]:
-                print("         %s" % candidate)
-        else:
-            print("ERROR: universe file found but unusable: %s" % path)
-        print("       The screener always screens the symbols listed in "
-              "\"%s\"." % cfg["UNIVERSE_JSON"])
-        print("       Put the file next to this script (e.g. "
-              "<repo>\\stock-data\\universe.json) or point at it explicitly "
-              "with --universe-file PATH.")
-        raise SystemExit(3)
-
-    nifty50_set = set(NIFTY_50)
-    if mode in ("json", "nifty500"):
-        universe = list(symbols)
-    elif mode == "nifty200":
-        universe = symbols[:200]
-        print("NOTE: UNIVERSE_SOURCE=nifty200 -- first 200 entries of %s."
-              % os.path.basename(path))
-    else:  # nifty50
-        universe = [s for s in symbols if s in nifty50_set]
-        print("NOTE: UNIVERSE_SOURCE=nifty50 -- %d of %d file entries are "
-              "NIFTY_50 members." % (len(universe), len(symbols)))
-
-    # Recorded for the report header (and for the self-test).
-    UNIVERSE_INFO["path"] = path
-    UNIVERSE_INFO["file_count"] = len(symbols)
-    UNIVERSE_INFO["mode"] = mode
-    UNIVERSE_INFO["count"] = len(universe)
-
-    print("Universe file: %s" % path)
-    print("Universe: %d unique symbols loaded." % len(universe))
-    if len(universe) < NIFTY_50_MIN_EXPECTED:
-        print("WARNING: universe has fewer than %d unique symbols (%d). "
-              "Check %s." % (NIFTY_50_MIN_EXPECTED, len(universe),
-                             os.path.basename(path)))
-    return universe
-
-
-# =============================================================================
-# PART 5 -- DATA FETCHING (CACHE + RETRY, NEVER RAISES)
-# =============================================================================
-def _todays_bar():
-    """Today's IST date (used for staleness maths)."""
-    return now_ist().date()
-
-
-def _cache_file_path(tickers, cfg):
-    """Cache path keyed on (universe, period, interval, cache version)."""
-    key = "|".join([
-        cfg["CACHE_VERSION"],
-        cfg["DATA_PERIOD"],
-        cfg["DATA_INTERVAL"],
-        ",".join(sorted(tickers)),
-    ])
-    cache_dir = resolve_path(cfg["CACHE_DIR"], cfg)
-    return os.path.join(cache_dir, "daily_data_%s.pkl" % _stable_hash(key))
-
-
-def _cache_is_fresh(path, cfg):
-    """True if the cache file exists and is younger than CACHE_TTL_HOURS."""
-    try:
-        if not os.path.isfile(path):
-            return False
-        age_hours = (time.time() - os.path.getmtime(path)) / 3600.0
-        return age_hours < float(cfg["CACHE_TTL_HOURS"])
-    except Exception:
-        return False
-
-
-def _normalise_frame(raw):
-    """
-    Convert one ticker's raw yfinance frame into [open, high, low, close,
-    volume] with numeric dtypes and a DatetimeIndex. Returns None if unusable.
-    """
-    if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
-        return None
-
-    df = raw.copy()
-    rename = {}
-    for col in df.columns:
-        name = str(col).strip().lower().replace("_", " ")
-        if name in ("open", "high", "low", "close", "volume"):
-            rename[col] = name
-        elif name == "adj close":        # only relevant if close is absent
-            rename[col] = "adj close"
-    df = df.rename(columns=rename)
-
-    if "close" not in df.columns and "adj close" in df.columns:
-        df["close"] = df["adj close"]
-
-    wanted = ["open", "high", "low", "close", "volume"]
-    for col in wanted:
-        if col not in df.columns:
-            df[col] = np.nan
-    df = df[wanted]
-
-    for col in wanted:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["close"])
-    if df.empty:
-        return None
-
-    if not isinstance(df.index, pd.DatetimeIndex):
+    def instruments(self, refresh=False):
+        path = self.data_dir / "cache" / "instruments.json"
+        today = datetime.now(IST).date().isoformat()
+        self.instrument_cache_used = False
+        if path.is_file() and not (refresh or self.cfg.refresh_instruments):
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                if saved["date"] == today and isinstance(saved["instruments"], list) and saved["instruments"]:
+                    self.instrument_cache_used = True
+                    return saved["instruments"]
+            except (ValueError, KeyError):
+                pass
+        content = self.get(MASTER_URL, authenticated=False).content
         try:
-            df.index = pd.to_datetime(df.index)
-        except Exception:
-            return None
-    df = df[~df.index.isna()]
-    df = df.sort_index()
-    return df if not df.empty else None
+            if content[:2] == b"\x1f\x8b":
+                content = gzip.decompress(content)
+            rows = json.loads(content)
+            if not isinstance(rows, list) or not rows:
+                raise ValueError()
+        except (ValueError, OSError, EOFError):
+            raise DataError("Invalid instrument master response") from None
+        atomic_json(path, {"date": today, "instruments": rows})
+        return rows
 
+    def candle_payload(self, url, cutoff):
+        response = self.get(url)
+        try:
+            obj = response.json()
+            if obj.get("status") != "success":
+                raise ValueError()
+            raw = obj["data"]["candles"]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise DataError("Invalid candle API response") from None
+        return parse_candles(raw, cutoff)
 
-def _extract_batch_frames(raw, batch):
-    """Pull per-ticker frames out of a yfinance download result."""
-    out = {}
-    if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
-        return out
+    def history(self, key, cutoff):
+        start = cutoff - timedelta(days=self.cfg.history_calendar_days)
+        encoded = quote(key, safe="")
+        url = f"https://api.upstox.com/v3/historical-candle/{encoded}/days/1/{cutoff}/{start}"
+        bars = self.candle_payload(url, cutoff)
+        self.bar_sources[key] = "historical_v3"
+        now = datetime.now(IST)
+        # Use the documented DAILY intraday endpoint, not a made-up aggregation
+        # of minute LTPs. Only fetch today's bar after calendar-confirmed close,
+        # 30-minute buffer, AND the configured EOD cutoff.
+        if (cutoff == now.date() and self.current_day_ready
+                and now.time() >= dt_time.fromisoformat(self.cfg.eod_ready_ist)
+                and (not bars or bars[-1].day < cutoff)):
+            today_url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded}/days/1"
+            today_bars = self.candle_payload(today_url, cutoff)
+            today_bars = [bar for bar in today_bars if bar.day == cutoff]
+            if today_bars:
+                bars = sorted([bar for bar in bars if bar.day != cutoff] + today_bars, key=lambda bar: bar.day)
+                self.bar_sources[key] = "historical_v3+intraday_daily_v3_after_close"
+        return bars
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        level0 = set(str(c) for c in raw.columns.get_level_values(0))
-        level1 = set(str(c) for c in raw.columns.get_level_values(1))
-        for ticker in batch:
-            try:
-                if ticker in level0:
-                    sub = raw[ticker]
-                elif ticker in level1:      # newer "Price"/"Ticker" layouts
-                    sub = raw.xs(ticker, axis=1, level=1)
-                else:
+    def timing_end(self, day):
+        response = self.get(f"https://api.upstox.com/v2/market/timings/{day}", authenticated=False)
+        try:
+            obj = response.json()
+            if obj.get("status") != "success" or not isinstance(obj["data"], list):
+                raise ValueError()
+            ends = []
+            for row in obj["data"]:
+                if not isinstance(row, dict):
+                    raise ValueError()
+                if row.get("exchange") != "NSE":
                     continue
-                frame = _normalise_frame(sub)
-                if frame is not None:
-                    out[ticker] = frame
-            except Exception:
+                opening = datetime.fromtimestamp(float(row["start_time"]) / 1000, IST)
+                closing = datetime.fromtimestamp(float(row["end_time"]) / 1000, IST)
+                if opening.date() != day or closing.date() != day or closing <= opening:
+                    raise ValueError()
+                ends.append(closing)
+            return max(ends) if ends else None
+        except (ValueError, KeyError, TypeError, AttributeError, OverflowError, OSError):
+            raise DataError(f"Invalid NSE market timings for {day}; cannot verify completed session") from None
+
+    def expected_session(self, cutoff, now):
+        # Consult exchange timings, including holidays and special weekend/evening
+        # sessions. No assumption that every weekday is a trading day.
+        for offset in range(15):
+            day = cutoff - timedelta(days=offset)
+            closing = self.timing_end(day)
+            if closing is None:
                 continue
-    else:
-        # Single-ticker flat frame: yfinance drops the ticker level entirely.
-        if len(batch) == 1:
-            frame = _normalise_frame(raw)
-            if frame is not None:
-                out[batch[0]] = frame
-        else:
-            # Flat frame with a multi-ticker request is ambiguous -- ignore it.
-            return out
-    return out
+            ready_at = max(closing + timedelta(minutes=30),
+                           datetime.combine(day, dt_time.fromisoformat(self.cfg.eod_ready_ist), IST))
+            if now >= ready_at:
+                self.current_day_ready = day == now.date()
+                return day
+        raise DataError("No completed NSE session found in 15 days of market timings")
 
 
-def preflight_network(cfg):
-    """
-    Optional reachability probe before the download loop (uses `requests` when
-    installed; the screener runs fine without it).
-
-    This ONLY checks that Yahoo Finance is reachable so an offline run fails
-    fast with a clear message instead of 11 silent empty batches. The response
-    body is discarded -- no data is parsed here and no other host is contacted.
-    Returns True/False/None (None = not checked).
-    """
-    if requests is None:
-        return None
-    probe_url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI"
-    try:
-        resp = requests.get(probe_url, params={"range": "1d", "interval": "1d"},
-                            timeout=8)
-        ok = int(getattr(resp, "status_code", 0)) < 500
-        if not ok:
-            log("WARNING: market data host returned HTTP %s; downloads may fail."
-                % getattr(resp, "status_code", "?"), cfg)
-        return ok
-    except Exception as exc:
-        log("WARNING: no connectivity to the market data host (%s). "
-            "Continuing -- yfinance failures will be logged and skipped."
-            % exc, cfg)
-        return False
+EXCLUSION_REASONS = {"unresolved_symbol", "non_eq_series", "ambiguous_symbol", "duplicate_instrument"}
 
 
-def _download_batch(batch, cfg):
-    """
-    Download one batch with retries. Returns dict of frames (possibly empty).
-    NEVER raises: yfinance errors are logged and swallowed.
-    """
-    if yf is None:
-        return {}
-    attempts = max(1, int(cfg["YF_RETRY_ATTEMPTS"]))
-    sleep_s = float(cfg["YF_RETRY_SLEEP_SEC"])
-    for attempt in range(1, attempts + 1):
-        # yfinance chatters to stderr about delisted/empty tickers; capture that
-        # and print a one-line digest instead of hundreds of raw lines.
-        real_stderr = sys.stderr
-        capture = StderrCapture()
-        try:
-            sys.stderr = capture
-            raw = yf.download(
-                tickers=" ".join(batch),
-                period=cfg["DATA_PERIOD"],
-                interval=cfg["DATA_INTERVAL"],
-                auto_adjust=True,          # split/bonus adjusted prices
-                group_by="ticker",
-                threads=True,
-                progress=False,
-            )
-            frames = _extract_batch_frames(raw, batch)
-            if frames:
-                missing = [t for t in batch if t not in frames]
-                if missing:
-                    note = capture.summary()
-                    log("  %d/%d tickers returned data%s"
-                        % (len(frames), len(batch),
-                           (" -- " + note) if note else ""), cfg)
-                return frames
-            note = capture.summary()
-            log("  batch attempt %d/%d returned no usable rows (size %d)%s"
-                % (attempt, attempts, len(batch),
-                   (" -- " + note) if note else ""), cfg)
-        except Exception as exc:
-            log("  yfinance error on attempt %d/%d: %s"
-                % (attempt, attempts, exc), cfg)
-        finally:
-            sys.stderr = real_stderr
-        if attempt < attempts:
-            time.sleep(sleep_s)
-    log("  WARNING: batch of %d symbols failed after %d attempts -- skipped."
-        % (len(batch), attempts), cfg)
-    return {}
-
-
-def _to_yf_ticker(symbol):
-    """
-    Map a plain NSE trading symbol to its Yahoo Finance ticker.
-
-    NSE cash equities on Yahoo carry the ".NS" suffix (RELIANCE -> RELIANCE.NS).
-    Indices ("^NSEI") and already-suffixed tickers ("GOLDBEES.NS") pass through.
-    """
-    s = str(symbol).strip()
-    if not s:
-        return s
-    if s.startswith("^") or "." in s:
-        return s
-    return s + ".NS"
-
-
-def fetch_daily_data(symbols, cfg, refresh=False):
-    """
-    Fetch daily OHLCV for `symbols` plus the fixed benchmark tickers.
-
-    Returns {symbol: DataFrame[open, high, low, close, volume]}. Uses a pickle
-    cache under CACHE_DIR unless refresh=True or the cache is older than
-    CACHE_TTL_HOURS. Must NEVER raise on a yfinance failure -- it logs, skips and
-    continues. Equity symbols are filtered for history length and staleness;
-    benchmark tickers are exempt (they are needed for the regime filter).
-    """
-    global FETCH_STATS
-
-    tickers = []
-    seen = set()
-    for sym in list(symbols) + list(BENCHMARK_TICKERS):
-        ticker = _to_yf_ticker(sym)          # RELIANCE -> RELIANCE.NS
-        if ticker not in seen:
-            seen.add(ticker)
-            tickers.append(ticker)
-
-    FETCH_STATS = {"requested": 0, "downloaded": 0, "history_passed": 0,
-                   "stale": 0, "dropped_history": 0}
-    FETCH_STATS["requested"] = len(
-        [s for s in symbols if _to_yf_ticker(s) not in BENCHMARK_SET])
-
-    cache_path = _cache_file_path(tickers, cfg)
-    data = {}
-    cached_stats = None
-
-    # ---- 1/2. Cache path -----------------------------------------------------
-    if not refresh and _cache_is_fresh(cache_path, cfg):
-        try:
-            cached = pd.read_pickle(cache_path)
-            if isinstance(cached, dict) and cached:
-                if isinstance(cached.get("data"), dict):
-                    # Current format: frames + funnel stats from the fetch run.
-                    data = cached["data"]
-                    cached_stats = cached.get("stats")
-                else:
-                    data = cached               # legacy plain-dict cache
-                log("Cache hit: %s (%d symbols, TTL %sh)"
-                    % (os.path.basename(cache_path), len(data),
-                       cfg["CACHE_TTL_HOURS"]), cfg)
-        except Exception as exc:
-            log("WARNING: cache unreadable (%s) -- refetching." % exc, cfg)
-            data = {}
-            cached_stats = None
-
-    # ---- 3/4. Download ------------------------------------------------------
-    if not data:
-        if yf is None:
-            log("ERROR: yfinance is not installed. Run: pip install yfinance",
-                cfg)
-            return {}
-        batch_size = max(1, int(cfg["YF_BATCH_SIZE"]))
-        batches = [tickers[i:i + batch_size]
-                   for i in range(0, len(tickers), batch_size)]
-        preflight_network(cfg)
-        log("Downloading %d tickers in %d batch(es) of up to %d ..."
-            % (len(tickers), len(batches), batch_size), cfg)
-        for idx, batch in enumerate(batches, start=1):
-            log("  batch %d/%d (%d tickers)" % (idx, len(batches), len(batch)),
-                cfg)
-            frames = _download_batch(batch, cfg)
-            for ticker, frame in frames.items():
-                data[ticker] = frame
-
-    # ---- 5/6. Quality filters ----------------------------------------------
-    min_hist = int(cfg["MIN_HISTORY_TRADING_DAYS"])
-    max_stale = int(cfg["MAX_DATA_STALENESS_DAYS"])
-    today = _todays_bar()
-
-    kept = {}
-    dropped_history = 0
-    dropped_stale = 0
-    if cached_stats:
-        # Reuse the funnel numbers recorded when the cache was written, so a
-        # cache hit reports the same breakdown as the original download.
-        dropped_history = int(cached_stats.get("dropped_history", 0))
-        dropped_stale = int(cached_stats.get("stale", 0))
-    else:
-        # Symbols yfinance never returned (delisted, renamed, bad ticker) are
-        # counted with the history failures so the funnel stays additive.
-        never_arrived = [t for t in tickers
-                         if t not in BENCHMARK_SET and t not in data]
-        dropped_history += len(never_arrived)
-        if never_arrived:
-            log("  no data returned for %d symbol(s): %s"
-                % (len(never_arrived), ", ".join(never_arrived[:15]) +
-                   ("" if len(never_arrived) <= 15 else " ...")), cfg)
-
-    for ticker, frame in data.items():
-        is_bench = ticker in BENCHMARK_SET
-        if not is_bench:
-            if frame is None or len(frame) < min_hist:
-                dropped_history += 1
-                continue
-            if not is_fresh(frame, max_stale, today):
-                dropped_stale += 1
-                continue
-        kept[ticker] = frame
-
-    equity_kept = len([t for t in kept if t not in BENCHMARK_SET])
-    downloaded = (int(cached_stats.get("downloaded", 0)) if cached_stats
-                  else len([t for t in data if t not in BENCHMARK_SET]))
-    FETCH_STATS["downloaded"] = downloaded
-    FETCH_STATS["history_passed"] = equity_kept
-    FETCH_STATS["stale"] = dropped_stale
-    FETCH_STATS["dropped_history"] = dropped_history
-
-    # ---- 7. Persist cache (frames + funnel stats) ---------------------------
-    try:
-        cache_dir = os.path.dirname(cache_path)
-        if cache_dir and not os.path.isdir(cache_dir):
-            os.makedirs(cache_dir, exist_ok=True)
-        pd.to_pickle({
-            "data": kept,
-            "stats": {
-                "downloaded": len([t for t in kept if t not in BENCHMARK_SET]),
-                "history_passed": equity_kept,
-                "dropped_history": dropped_history,
-                "stale": dropped_stale,
-            },
-        }, cache_path)
-        log("Cache written: %s" % os.path.basename(cache_path), cfg)
-    except Exception as exc:
-        log("WARNING: could not write cache (%s) -- continuing." % exc, cfg)
-
-    # ---- 8. Report ----------------------------------------------------------
-    print("Fetched %d symbols, %d passed history + staleness filter."
-          % (downloaded, equity_kept))
-    if dropped_history or dropped_stale:
-        log("  (dropped: %d too little history / no data, %d stale)"
-            % (dropped_history, dropped_stale), cfg)
-    return kept
-
-
-# =============================================================================
-# PART 6 -- INDICATOR FUNCTIONS (all return None/False on bad input, no raises)
-# =============================================================================
-def _month_end_resample(close):
-    """
-    Monthly last-price series. Tries the modern 'ME' alias first and falls back
-    to the legacy 'M' alias so the code works across pandas versions.
-    """
-    if close is None or len(close) == 0:
-        return None
-    series = close
-    if not isinstance(series, pd.Series):
-        try:
-            series = pd.Series(series)
-        except Exception:
-            return None
-    if not isinstance(series.index, pd.DatetimeIndex):
-        try:
-            series.index = pd.to_datetime(series.index)
-        except Exception:
-            return None
-    series = pd.to_numeric(series, errors="coerce").dropna()
-    if series.empty:
-        return None
-    for rule in ("ME", "M"):          # pandas >=2.2 uses "ME"; older accepts "M"
-        try:
-            out = series.resample(rule).last()
-            if out is not None and len(out) > 0:
-                return out
-        except Exception:
+def resolve_symbols(master, symbols):
+    matches, seen_series = {}, {}
+    for row in master:
+        if not isinstance(row, dict):
+            raise DataError("Invalid instrument master record")
+        if row.get("segment") != "NSE_EQ":
             continue
-    return None
-
-
-def momentum_12_1(close, lookback_months, skip_months):
-    """
-    Compute the 12-1 momentum return (lookback_months / skip_months configurable).
-
-    Steps:
-      1. Convert close to a monthly series using resample(...).last().
-      2. end_price   = monthly.iloc[-1 - skip_months]
-      3. start_price = monthly.iloc[-1 - skip_months - lookback_months]
-      4. Return (end_price / start_price) - 1.
-    Returns None on short/NaN series or a non-positive start price. Never raises.
-    """
-    try:
-        lookback_months = int(lookback_months)
-        skip_months = int(skip_months)
-        if lookback_months <= 0 or skip_months < 0:
-            return None
-        monthly = _month_end_resample(close)
-        if monthly is None:
-            return None
-        needed = lookback_months + skip_months + 1      # inclusive endpoints
-        if len(monthly) < needed:
-            return None
-        end_idx = -1 - skip_months
-        start_idx = -1 - skip_months - lookback_months
-        if abs(start_idx) > len(monthly):
-            return None
-        end_price = safe_float(monthly.iloc[end_idx])
-        start_price = safe_float(monthly.iloc[start_idx])
-        if end_price is None or start_price is None or start_price <= 0:
-            return None
-        return (end_price / start_price) - 1.0
-    except Exception:
-        return None
-
-
-def realized_vol(close, lookback_days):
-    """
-    Annualised realised volatility from daily log returns.
-      1. log_ret = log(close / close.shift(1))
-      2. take the last `lookback_days` returns (drop NaN)
-      3. return std(ddof=1) * sqrt(252)
-    Returns None if fewer than `lookback_days` returns are available. No raises.
-    """
-    try:
-        lookback_days = int(lookback_days)
-        if lookback_days < 2 or close is None:
-            return None
-        series = pd.to_numeric(pd.Series(close).astype("float64"),
-                               errors="coerce")
-        if len(series.dropna()) < lookback_days + 1:
-            return None
-        log_ret = np.log(series / series.shift(1)).replace([np.inf, -np.inf],
-                                                           np.nan).dropna()
-        if len(log_ret) < lookback_days:
-            return None
-        window = log_ret.tail(lookback_days)
-        if len(window) < 2:
-            return None
-        value = float(window.std(ddof=1)) * math.sqrt(TRADING_DAYS_PER_YEAR)
-        return value if math.isfinite(value) else None
-    except Exception:
-        return None
-
-
-def sma(series, period):
-    """Simple moving average via series.rolling(period).mean()."""
-    try:
-        period = int(period)
-        if period <= 0:
-            return pd.Series(dtype="float64")
-        s = pd.to_numeric(pd.Series(series).astype("float64"), errors="coerce")
-        return s.rolling(period).mean()
-    except Exception:
-        return pd.Series(dtype="float64")
-
-
-def rs_rating(returns_series):
-    """
-    Cross-sectional percentile rating (1-100) via rank(pct=True) * 100.
-    NaN inputs propagate as NaN. Never raises.
-    """
-    try:
-        s = pd.to_numeric(pd.Series(returns_series).astype("float64"),
-                          errors="coerce")
-        if s.empty:
-            return s
-        rated = s.rank(pct=True, na_option="keep") * 100.0
-        rated = rated.where(s.notna())      # NaN in -> NaN out
-        return rated
-    except Exception:
-        return pd.Series(dtype="float64")
-
-
-def above_200sma_rising(close, ma_period, slope_lookback):
-    """
-    True if last_close > SMA(ma_period)[-1]
-    AND SMA(ma_period)[-1] > SMA(ma_period)[-1 - slope_lookback].
-    False on short/NaN series. If REGIME_REQUIRE_RISING is disabled by the
-    caller, only the above-SMA half is applied (see _market_regime).
-    """
-    try:
-        ma_period = int(ma_period)
-        slope_lookback = int(slope_lookback)
-        if close is None or len(close) < ma_period + slope_lookback + 1:
-            return False
-        series = pd.to_numeric(pd.Series(close).astype("float64"),
-                               errors="coerce")
-        if len(series.dropna()) < ma_period + slope_lookback + 1:
-            return False
-        ma = sma(series, ma_period)
-        last_close = safe_float(series.iloc[-1])
-        last_ma = safe_float(ma.iloc[-1])
-        prev_idx = -1 - slope_lookback
-        if abs(prev_idx) > len(ma):
-            return False
-        prev_ma = safe_float(ma.iloc[prev_idx])
-        if last_close is None or last_ma is None or prev_ma is None:
-            return False
-        if not (last_close > last_ma):
-            return False
-        return bool(last_ma > prev_ma)
-    except Exception:
-        return False
-
-
-def is_fresh(df, max_staleness_days, today=None):
-    """
-    True if the last bar in df is within `max_staleness_days` calendar days of
-    today (IST). False on empty/NaN-index frames. Never raises.
-    """
-    try:
-        if df is None or len(df) == 0:
-            return False
-        last = df.index[-1]
-        if isinstance(last, datetime):
-            last_date = last.date() if last.tzinfo is None else last.astimezone(IST).date()
+        symbol, series, key = row.get("trading_symbol"), row.get("instrument_type"), row.get("instrument_key")
+        if not isinstance(symbol, str):
+            continue
+        seen_series.setdefault(symbol, set()).add(str(series))
+        if series == "EQ" and isinstance(key, str) and key.startswith("NSE_EQ|"):
+            matches.setdefault(symbol, set()).add(key)
+    resolved, issues, used_keys = {}, [], set()
+    for symbol in symbols:
+        keys = matches.get(symbol, set())
+        if len(keys) == 1:
+            key = next(iter(keys))
+            if key in used_keys:
+                issues.append({"symbol": symbol, "reason": "duplicate_instrument",
+                               "detail": "Same instrument key already mapped under another input symbol; no double counting"})
+            else:
+                resolved[symbol] = key
+                used_keys.add(key)
+        elif len(keys) > 1:
+            issues.append({"symbol": symbol, "reason": "ambiguous_symbol",
+                           "detail": "Multiple EQ instrument keys; no guessed mapping"})
+        elif symbol in seen_series:
+            issues.append({"symbol": symbol, "reason": "non_eq_series",
+                           "detail": "Available series: " + ", ".join(sorted(seen_series[symbol])) + "; this screener accepts EQ only"})
         else:
-            last_date = pd.Timestamp(last).date()
-        ref = today if today is not None else now_ist().date()
-        return (ref - last_date).days <= int(max_staleness_days)
-    except Exception:
-        return False
+            detail = "No exact NSE_EQ / EQ match in the current master; check universe.json"
+            suggestion = {"HEG": "HEGAM", "ABBOTIND": "ABBOTINDIA"}.get(symbol)
+            if suggestion and suggestion in matches:
+                detail += f". Possible correction: {suggestion}; review corporate actions before changing it (not auto-substituted)"
+            issues.append({"symbol": symbol, "reason": "unresolved_symbol", "detail": detail})
+    return resolved, issues
 
 
-# =============================================================================
-# PART 7 -- SCREENER PIPELINE
-# =============================================================================
-def _market_regime(data, cfg):
-    """
-    Compute the market regime from Nifty 50 (^NSEI) and India VIX (^INDIAVIX).
+def universe_preflight(client, symbols, cfg):
+    master = client.instruments()
+    resolved, issues = resolve_symbols(master, symbols)
+    if issues and getattr(client, "instrument_cache_used", False):
+        print("Refreshing cached instrument master once before classifying exclusions...")
+        resolved, issues = resolve_symbols(client.instruments(refresh=True), symbols)
+    for issue in issues:
+        print(f"EXCLUDED {issue['symbol']}: {issue['reason']} - {issue['detail']}")
+    ratio = len(resolved) / len(symbols)
+    print(f"Universe: {len(resolved)}/{len(symbols)} mapped ({ratio:.1%}); {len(issues)} explicit exclusions")
+    return resolved, issues, ratio
 
-    Returns (regime_ok, details_dict). Never raises.
-    """
-    details = {
-        "nifty_close": None, "nifty_sma": None, "nifty_rising": None,
-        "vix_value": None, "vix_ok": None, "ma_ok": None,
-    }
-    ma_period = int(cfg["REGIME_MA_PERIOD"])
-    slope = int(cfg["REGIME_SLOPE_LOOKBACK"])
 
-    nifty = data.get(NIFTY_TICKER)
-    if nifty is None or nifty.empty or "close" not in nifty.columns:
-        print("Market regime: RISK-OFF (Nifty 50 data unavailable)")
-        regime_ok = False
-    else:
-        nifty_close = nifty["close"]
-        # above_200sma_rising() returns False if REGIME_REQUIRE_RISING data is
-        # insufficient; here we additionally allow pure above-SMA mode when
-        # REGIME_REQUIRE_RISING is switched off in CONFIG.
-        regime_ok = above_200sma_rising(nifty_close, ma_period, slope)
-        if not cfg["REGIME_REQUIRE_RISING"]:
-            try:
-                ma = sma(nifty_close, ma_period)
-                lc = safe_float(pd.to_numeric(nifty_close, errors="coerce").iloc[-1])
-                lm = safe_float(ma.iloc[-1])
-                regime_ok = bool(lc is not None and lm is not None and lc > lm)
-            except Exception:
-                regime_ok = False
-        details["nifty_close"] = safe_float(
-            pd.to_numeric(nifty_close, errors="coerce").iloc[-1])
-        details["nifty_sma"] = safe_float(sma(nifty_close, ma_period).iloc[-1])
-        details["ma_ok"] = regime_ok
-        details["nifty_rising"] = cfg["REGIME_REQUIRE_RISING"]
-        # Purely informational: is the last close above the 200-SMA?
+def enforce_universe_policy(resolved, issues, ratio, cfg):
+    if not resolved:
+        raise DataError("No instruments resolved; check the universe/master")
+    if issues and cfg.strict_universe:
+        raise DataError(f"Strict-universe mode: {len(issues)} exclusions. Stopped BEFORE stock candle downloads")
+    if ratio < cfg.min_universe_coverage:
+        raise DataError(f"Mapped coverage {ratio:.1%} below required {cfg.min_universe_coverage:.1%}; scan not published")
+
+
+# ============================================================================
+# PERSISTENT SQLITE SELECTIONS AND DISCOVERIES
+# ============================================================================
+
+@contextmanager
+def process_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    acquired = False
+    try:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
         try:
-            details["above_ma"] = bool(
-                details["nifty_close"] is not None and
-                details["nifty_sma"] is not None and
-                details["nifty_close"] > details["nifty_sma"])
-        except Exception:
-            details["above_ma"] = None
-
-    vix_ok = True
-    if cfg["USE_VIX_FILTER"]:
-        vix = data.get(VIX_TICKER)
-        if vix is None or vix.empty or "close" not in vix.columns:
-            vix_ok = False
-            print("Market regime: RISK-OFF (VIX data unavailable)")
-        else:
-            try:
-                vix_series = pd.to_numeric(vix["close"], errors="coerce")
-                vix_smoothed = vix_series.rolling(int(cfg["VIX_SMOOTH_DAYS"])).mean()
-                vix_clean = vix_smoothed.dropna()
-                if vix_clean.empty:
-                    vix_ok = False
-                else:
-                    details["vix_value"] = safe_float(vix_clean.iloc[-1])
-                    vix_ok = bool(details["vix_value"] is not None and
-                                  details["vix_value"] < float(cfg["VIX_MAX"]))
-            except Exception:
-                vix_ok = False
-    details["vix_ok"] = vix_ok
-
-    return bool(regime_ok and vix_ok), details
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RuntimeError("Another screener/report process is running") from None
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
-def _stock_metrics(frame, cfg):
-    """
-    Per-stock metrics + reject reason for one symbol.
-    Returns (metrics_dict_or_None, reject_reason_or_None).
-    """
-    close = frame["close"]
-    volume = frame["volume"]
+class Store:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path, timeout=30)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS runs (
+          id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
+          requested_cutoff TEXT NOT NULL, as_of TEXT, status TEXT NOT NULL,
+          regime_on INTEGER, benchmark_close REAL, benchmark_sma REAL,
+          config_json TEXT NOT NULL, universe_json TEXT NOT NULL,
+          issues_json TEXT NOT NULL DEFAULT '[]', error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS candidates (
+          run_id INTEGER NOT NULL REFERENCES runs(id), symbol TEXT NOT NULL,
+          instrument_key TEXT NOT NULL, rank INTEGER NOT NULL, metrics_json TEXT NOT NULL,
+          PRIMARY KEY(run_id, instrument_key)
+        );
+        CREATE TABLE IF NOT EXISTS selections (
+          run_id INTEGER NOT NULL REFERENCES runs(id), symbol TEXT NOT NULL,
+          instrument_key TEXT NOT NULL, rank INTEGER NOT NULL, metrics_json TEXT NOT NULL,
+          PRIMARY KEY(run_id, instrument_key)
+        );
+        CREATE TABLE IF NOT EXISTS discoveries (
+          instrument_key TEXT PRIMARY KEY, first_symbol TEXT NOT NULL,
+          first_discovered_at TEXT NOT NULL, first_signal_date TEXT NOT NULL,
+          first_run_id INTEGER NOT NULL REFERENCES runs(id)
+        );
+        CREATE TABLE IF NOT EXISTS addition_events (
+          id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
+          instrument_key TEXT NOT NULL, symbol TEXT NOT NULL,
+          event_type TEXT NOT NULL CHECK(event_type IN ('FIRST_DISCOVERY','RE_ENTRY')),
+          discovered_at TEXT NOT NULL, signal_date TEXT NOT NULL,
+          UNIQUE(run_id, instrument_key)
+        );
+        CREATE INDEX IF NOT EXISTS runs_status ON runs(status, id);
+        CREATE VIEW IF NOT EXISTS current_selected AS
+          SELECT s.*, d.first_discovered_at, d.first_signal_date
+          FROM selections s JOIN discoveries d USING(instrument_key)
+          WHERE s.run_id=(SELECT MAX(id) FROM runs WHERE status='SUCCESS');
+        """)
 
-    momentum = momentum_12_1(close, cfg["RS_LOOKBACK_MONTHS"], cfg["RS_SKIP_MONTHS"])
-    if momentum is None:
-        return None, "no momentum"
+    def close(self):
+        self.db.close()
 
-    last_close = safe_float(close.iloc[-1])
-    if last_close is None or last_close < float(cfg["MIN_PRICE"]):
-        return None, "price < MIN_PRICE"
+    def recover_interrupted(self, now):
+        # Caller must hold process lock, so no other legitimate run is active.
+        with self.db:
+            self.db.execute("UPDATE runs SET status='FAILED', finished_at=?, error='Interrupted before atomic publication' WHERE status='RUNNING'", (now,))
 
-    # 20-day average daily traded value in Rs crore: mean(close*volume)/1e7.
+    def start(self, now, cutoff, cfg, symbols):
+        with self.db:
+            return self.db.execute("""INSERT INTO runs(started_at,requested_cutoff,status,config_json,universe_json)
+              VALUES (?,?,'RUNNING',?,?)""", (now, cutoff, json.dumps(cfg), json.dumps(symbols))).lastrowid
+
+    def latest(self):
+        row = self.db.execute("SELECT * FROM runs WHERE status='SUCCESS' ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def set_context(self, run_id, context):
+        with self.db:
+            row = self.db.execute("SELECT config_json FROM runs WHERE id=?", (run_id,)).fetchone()
+            cfg = json.loads(row[0])
+            cfg["runtime"] = context
+            self.db.execute("UPDATE runs SET config_json=? WHERE id=?", (json.dumps(cfg), run_id))
+
+    def finish_failure(self, run_id, now, issues, error, as_of=None, status="FAILED"):
+        if status not in ("FAILED", "WAITING_DATA"):
+            raise ValueError("Invalid failure status")
+        with self.db:
+            self.db.execute("UPDATE runs SET status=?,finished_at=?,issues_json=?,error=?,as_of=? WHERE id=?",
+                            (status, now, json.dumps(issues), error, as_of, run_id))
+
+    def publish(self, run_id, now, as_of, regime_on, benchmark_close, benchmark_sma,
+                candidates, top_n, issues, filter_bypassed=False):
+        previous = self.latest()
+        if previous and as_of < previous["as_of"]:
+            raise ValueError("Refusing to replace current state with an older signal date")
+        selected = candidates[:top_n] if (regime_on or filter_bypassed) else []
+        # Short transaction; any exception rolls back snapshots AND events.
+        with self.db:
+            # Store the override independently from the actual market measurement.
+            cfg_row = self.db.execute("SELECT config_json FROM runs WHERE id=?", (run_id,)).fetchone()
+            stored_cfg = json.loads(cfg_row[0])
+            stored_cfg["ignore_market_regime"] = bool(filter_bypassed)
+            self.db.execute("UPDATE runs SET config_json=? WHERE id=?", (json.dumps(stored_cfg), run_id))
+            old_keys = {r[0] for r in self.db.execute("SELECT instrument_key FROM current_selected")}
+            for table, rows in (("candidates", candidates), ("selections", selected)):
+                self.db.executemany(f"INSERT INTO {table} VALUES (?,?,?,?,?)", [
+                    (run_id, r["symbol"], r["instrument_key"], r["rank"], json.dumps(r, allow_nan=False)) for r in rows])
+            for row in selected:
+                key = row["instrument_key"]
+                if key in old_keys:
+                    continue
+                first = self.db.execute("SELECT 1 FROM discoveries WHERE instrument_key=?", (key,)).fetchone() is None
+                if first:
+                    self.db.execute("INSERT INTO discoveries VALUES (?,?,?,?,?)",
+                                    (key, row["symbol"], now, as_of, run_id))
+                self.db.execute("""INSERT INTO addition_events
+                  (run_id,instrument_key,symbol,event_type,discovered_at,signal_date) VALUES (?,?,?,?,?,?)""",
+                  (run_id, key, row["symbol"], "FIRST_DISCOVERY" if first else "RE_ENTRY", now, as_of))
+            self.db.execute("""UPDATE runs SET status='SUCCESS',finished_at=?,as_of=?,regime_on=?,
+              benchmark_close=?,benchmark_sma=?,issues_json=? WHERE id=?""",
+              (now, as_of, int(regime_on), benchmark_close, benchmark_sma, json.dumps(issues), run_id))
+        return selected
+
+    def report_data(self):
+        latest = self.latest()
+        last_attempt = self.db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        selected = []
+        for row in self.db.execute("SELECT * FROM current_selected ORDER BY rank"):
+            selected.append({**json.loads(row["metrics_json"]), "first_discovered_at": row["first_discovered_at"],
+                             "first_signal_date": row["first_signal_date"]})
+        events = [dict(r) for r in self.db.execute("""SELECT e.*, d.first_discovered_at, d.first_signal_date
+          FROM addition_events e JOIN discoveries d USING(instrument_key) ORDER BY e.id DESC""")]
+        candidates = []
+        if latest:
+            candidates = [json.loads(r[0]) for r in self.db.execute(
+                "SELECT metrics_json FROM candidates WHERE run_id=? ORDER BY rank", (latest["id"],))]
+        return {"latest_success": latest, "last_attempt": dict(last_attempt) if last_attempt else None,
+                "selected": selected, "events": events, "candidates": candidates}
+
+
+# ============================================================================
+# HTML, CSV AND CONSOLE REPORTS
+# ============================================================================
+
+SELECT_FIELDS = ["rank", "symbol", "instrument_key", "as_of", "close", "sma", "momentum_return",
+                 "annual_volatility", "vam", "adt_inr", "atr", "first_discovered_at", "first_signal_date",
+                 "candle_source", "market_regime_on", "market_filter_bypassed"]
+EVENT_FIELDS = ["id", "run_id", "symbol", "instrument_key", "event_type", "discovered_at", "signal_date",
+                "first_discovered_at", "first_signal_date"]
+
+
+def atomic_text(path, text):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def csv_text(rows, fields):
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        # Defensive spreadsheet formula protection for editable symbols.
+        safe = {k: ("'" + v if isinstance(v, str) and v.startswith(("=", "+", "-", "@")) else v)
+                for k, v in row.items()}
+        writer.writerow(safe)
+    return out.getvalue()
+
+
+def esc(value):
+    return html.escape(str(value))
+
+
+def table(headers, rows):
+    head = "".join(f"<th>{esc(h)}</th>" for h in headers)
+    body = "".join("<tr>" + "".join(f"<td>{esc(c)}</td>" for c in row) + "</tr>" for row in rows)
+    if not body:
+        body = f'<tr><td colspan="{len(headers)}" class="muted">No records.</td></tr>'
+    return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+
+def run_regime_label(run):
+    if not run:
+        return "NO VALID SCAN YET"
+    actual = run["benchmark_close"] > run["benchmark_sma"]
+    cfg = json.loads(run["config_json"])
+    label = "ON" if actual else "OFF"
+    if cfg.get("ignore_market_regime", False):
+        return f"FILTER BYPASSED (actual regime {label})"
+    if bool(run["regime_on"]) != actual:
+        return f"LEGACY FLAG INCONSISTENT (actual regime {label}); rerun current script"
+    return f"REGIME {label}"
+
+
+def run_scope(run):
+    if not run:
+        return "No published scan"
+    context = json.loads(run["config_json"]).get("runtime", {})
+    text = f"Universe: {context.get('resolved_count', '?')}/{context.get('universe_count', '?')} mapped; {context.get('excluded_count', '?')} exclusions"
+    text += f" | expected session: {context.get('expected_session', run['as_of'])} | signal: {run['as_of']}"
+    if context.get("prior_session_used"):
+        text += " | PRIOR-SESSION FALLBACK EXPLICITLY ENABLED"
+    return text
+
+
+def write_reports(store, data_dir):
+    data = store.report_data()
+    report_dir = data_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    latest = data["latest_success"]
+    attempt = data["last_attempt"]
+    events = data["events"]
+    additions = [e for e in events if latest and e["run_id"] == latest["id"]]
+    data["new_additions_last_success"] = additions
+    data["report_generated_at"] = datetime.now(IST).isoformat(timespec="seconds")
+    atomic_json(report_dir / "latest.json", data)
+    atomic_text(report_dir / "selected_stocks.csv", csv_text(data["selected"], SELECT_FIELDS))
+    atomic_text(report_dir / "new_additions.csv", csv_text(additions, EVENT_FIELDS))
+    atomic_text(report_dir / "discovery_history.csv", csv_text(events, EVENT_FIELDS))
+    cfg = json.loads(latest["config_json"]) if latest else {}
+    status = run_regime_label(latest)
+    failure = ""
+    if attempt and attempt["status"] != "SUCCESS":
+        failure = f'<div class="alert">Latest attempt #{attempt["id"]}: {esc(attempt["status"])} — {esc(attempt["error"] or "in progress")}. Selections below are from the last successful scan, not this attempt.</div>'
+    session = latest["as_of"] if latest else "—"
+    cutoff = latest["requested_cutoff"] if latest else "—"
+    benchmark = f'{latest["benchmark_close"]:,.2f} / {latest["benchmark_sma"]:,.2f}' if latest else "—"
+    rows = [[r["rank"], r["symbol"], f'{r["close"]:,.2f}', f'{r["momentum_return"]:.2%}',
+             f'{r["annual_volatility"]:.2%}', f'{r["vam"]:.4f}', f'{r["adt_inr"] / 1e7:.2f}',
+             f'{r["atr"]:.2f}', r["first_discovered_at"]] for r in data["selected"]]
+    event_headers = ["Symbol", "Event", "Discovered at (IST)", "Signal date", "First discovered (IST)", "Run"]
+    def event_rows(items):
+        return [[e["symbol"], e["event_type"], e["discovered_at"], e["signal_date"], e["first_discovered_at"], e["run_id"]] for e in items]
+    issues = json.loads(attempt["issues_json"]) if attempt else []
+    exclusions = [i for i in issues if i.get("reason") in EXCLUSION_REASONS]
+    atomic_text(report_dir / "excluded_stocks.csv", csv_text(exclusions, ["symbol", "reason", "detail"]))
+    atomic_text(report_dir / "ranked_candidates.csv", csv_text(data["candidates"], SELECT_FIELDS))
+    issue_rows = [[i.get("symbol", "BENCHMARK"), i.get("reason", ""), i.get("detail", "")] for i in issues]
+    page = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VAM-AF · NSE Swing Screener</title><style>
+:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;background:#0d1421;color:#e4ebf5;font:15px system-ui,Segoe UI,sans-serif}}main{{max-width:1440px;margin:auto;padding:40px 28px}}.eyebrow{{color:#55d6b7;letter-spacing:.16em;font-size:12px;font-weight:700}}h1{{font-size:34px;margin:10px 0}}h2{{font-size:20px;margin:0 0 8px}}p,.muted{{color:#9caec4;line-height:1.6}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin:28px 0}}.card,section{{background:#141f30;border:1px solid #28394e;border-radius:12px;padding:22px}}.card strong{{display:block;font-size:21px;margin:10px 0;color:#6de6c7}}section{{margin:20px 0}}.scroll{{overflow:auto}}table{{border-collapse:collapse;width:100%;font-size:13px;margin-top:18px;white-space:nowrap}}th{{text-align:left;color:#97b1ce;font-size:11px;text-transform:uppercase;letter-spacing:.05em}}th,td{{padding:13px 12px;border-bottom:1px solid #29394e}}tbody tr:hover{{background:#1b2c42}}.alert{{background:#422c1e;border:1px solid #a7713e;border-radius:10px;padding:18px;line-height:1.6;margin-top:22px}}.badge{{display:inline-block;background:#213c3b;color:#6de6c7;padding:6px 12px;border-radius:20px;font-size:12px}}footer{{font-size:12px;color:#8194ad;line-height:1.7}}code{{color:#bdd4ed}}summary{{cursor:pointer;color:#bdd4ed}}
+</style></head><body><main><div class="eyebrow">NSE CASH EQUITIES / DAILY SIGNALS</div>
+<h1>Volatility-Adjusted Momentum</h1><p>Absolute-filter swing screener · Read-only market data · No orders or position management</p><span class="badge">{esc(status)}</span><p>{esc(run_scope(latest))}</p>{failure}
+<div class="cards"><div class="card">Signal session<strong>{esc(session)}</strong>Requested cutoff: {esc(cutoff)}</div>
+<div class="card">Selected stocks<strong>{len(data["selected"])} / {cfg.get("top_n", 15)}</strong>Liquidity &gt; ₹{cfg.get("min_adt_inr", 250000000) / 1e7:g} crore ADT</div>
+<div class="card">Nifty 50 close / SMA<strong>{benchmark}</strong>Strictly above SMA required</div>
+<div class="card">Additions in last valid scan<strong>{len(additions)}</strong>{len(events)} lifetime addition events</div></div>
+<section><h2>Selected stocks</h2><p>Latest successful snapshot, not holdings. First-discovery timestamps never reset. An enforced regime-off scan has no selected stocks. An explicit bypass is labeled above; eligible stock ranks remain available in ranked_candidates.csv.</p>
+{table(["Rank", "Symbol", "Close ₹", f'{cfg.get("momentum_days",20)}D return', "Annual vol.", "VAM", "ADT ₹ crore", "ATR ₹", "First discovered (IST)"], rows)}</section>
+<section><h2>New additions · last successful scan</h2><p>FIRST_DISCOVERY means first-ever selection. RE_ENTRY means a return after absence. Re-running an unchanged selection adds no duplicate events.</p>{table(event_headers, event_rows(additions))}</section>
+<section><h2>Discovery history · all dates</h2><p>Permanent separate list of every first discovery and re-entry, newest first. Discovery time is when this screener observed selection; signal date is the candle date.</p>{table(event_headers, event_rows(events))}</section>
+<section><details><summary>Latest attempt diagnostics ({len(issues)})</summary>{table(["Symbol", "Reason", "Detail"], issue_rows)}</details></section>
+<footer>Report generated: {esc(data["report_generated_at"])} · Last successful completion: {esc(latest["finished_at"] if latest else "none")}<br>
+This is a static report; rerun the screener or use --show to refresh. Expected sessions use Upstox NSE market timings. Dates are never relabeled. Current-session daily bars may come from the daily intraday endpoint only after confirmed close and the configured buffer; provider finality is not independently guaranteed.<br>
+API candle adjustment status is not assumed. Verify corporate actions, listings, liquidity and data quality independently. This is a research screener, not investment advice or a backtested performance claim.</footer>
+</main></body></html>'''
+    atomic_text(report_dir / "dashboard.html", page)
+    return data, report_dir / "dashboard.html"
+
+
+def print_report(data, full_history=False):
+    latest = data["latest_success"]
+    attempt = data["last_attempt"]
+    if attempt and attempt["status"] != "SUCCESS":
+        print(f'WARNING: Latest attempt #{attempt["id"]} {attempt["status"]}: {attempt["error"]}')
+        print("Previous successful selections, if any, are retained.")
+    if latest:
+        print(f'\nSignal date: {latest["as_of"]} | requested cutoff: {latest["requested_cutoff"]} | '
+              f'{run_regime_label(latest)} | run #{latest["id"]}')
+        print(run_scope(latest))
+        print(f'Completed at: {latest["finished_at"]}')
+    else:
+        print("No successful scan stored yet.")
+    print("\nSELECTED STOCKS")
+    print(f'{"Rank":<6}{"Symbol":<16}{"VAM":>10}{"Return":>11}{"ADT(cr)":>12}  First discovered (IST)')
+    for r in data["selected"]:
+        print(f'{r["rank"]:<6}{r["symbol"]:<16}{r["vam"]:>10.4f}{r["momentum_return"]:>10.2%}{r["adt_inr"]/1e7:>12.2f}  {r["first_discovered_at"]}')
+    if not data["selected"]:
+        print("(none)")
+    print("\nNEW ADDITIONS - LAST SUCCESSFUL SCAN")
+    for event in data["new_additions_last_success"]:
+        print(f'{event["symbol"]:<16} {event["event_type"]:<16} {event["discovered_at"]}  signal={event["signal_date"]}')
+    if not data["new_additions_last_success"]:
+        print("(none)")
+    if full_history:
+        print("\nALL DISCOVERY / RE-ENTRY EVENTS (permanent history)")
+        for event in data["events"]:
+            print(f'{event["symbol"]:<16} {event["event_type"]:<16} {event["discovered_at"]}  signal={event["signal_date"]}')
+        if not data["events"]:
+            print("(none)")
+    else:
+        print(f'\nPermanent history: {len(data["events"])} events; see dashboard.html, discovery_history.csv or --history.')
+
+
+# ============================================================================
+# END-TO-END SCAN AND COMMAND LINE
+# ============================================================================
+
+def now_ist():
+    return datetime.now(IST).isoformat(timespec="seconds")
+
+
+def configure_logging(data_dir):
+    folder = data_dir / "logs"
+    folder.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("vam")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = RotatingFileHandler(folder / "screener.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        # Explicit IST log timestamp, independent of host timezone.
+        formatter = logging.Formatter("%(asctime)s IST %(levelname)s %(message)s")
+        formatter.converter = lambda timestamp: datetime.fromtimestamp(timestamp, IST).timetuple()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+
+def scan(root, data_dir, store, cfg, symbols, cutoff, exact_date, logger):
+    run_id = store.start(now_ist(), cutoff.isoformat(), cfg.dictionary(), symbols)
+    client = None
+    issues, metrics, ranked, as_of = [], [], [], None
+    context = {"version": VERSION, "universe_count": len(symbols), "excluded_count": 0,
+               "resolved_count": 0, "filter_bypassed": cfg.ignore_market_regime}
+    status, failure_message = "RUNNING", None
     try:
-        recent = pd.DataFrame({"c": pd.to_numeric(close, errors="coerce"),
-                               "v": pd.to_numeric(volume, errors="coerce")}).tail(20)
-        trad_value = (recent["c"] * recent["v"]).mean() / 1e7
-        adv_cr = safe_float(trad_value)
-    except Exception:
-        adv_cr = None
-    if adv_cr is None or adv_cr < float(cfg["MIN_ADV_CR"]):
-        return None, "ADV < MIN_ADV_CR"
+        client = Upstox(read_token(root), cfg, data_dir)
+        print(f'Run #{run_id}: {len(symbols)} input symbols; cutoff {cutoff}; ADT > INR {cfg.min_adt_inr:,.0f}')
+        resolved, mapping_issues, coverage = universe_preflight(client, symbols, cfg)
+        issues.extend(mapping_issues)
+        context.update(resolved_count=len(resolved), excluded_count=len(mapping_issues), coverage=coverage)
+        store.set_context(run_id, context)
+        enforce_universe_policy(resolved, mapping_issues, coverage, cfg)
+        if mapping_issues:
+            print("WARNING: ranking uses the explicitly reduced universe. No symbols were auto-renamed; universe.json is unchanged.")
+        now = datetime.now(IST)
+        # An explicit past date is verified by an exact matching daily benchmark
+        # candle. For auto/current-date mode, consult the market timing calendar.
+        if exact_date and cutoff < now.date():
+            expected = cutoff
+            context["calendar_source"] = "explicit_past_session_requires_exact_benchmark"
+        else:
+            expected = client.expected_session(cutoff, now)
+            context["calendar_source"] = "upstox_market_timings"
+            if exact_date and expected != cutoff:
+                raise DataPending(f"Requested {cutoff} is not a completed NSE session according to market timings")
+        context["expected_session"] = expected.isoformat()
+        print(f"Expected completed NSE session: {expected} (requested cutoff: {cutoff})")
+        benchmark = client.history(cfg.benchmark_key, expected)
+        if not benchmark:
+            raise DataPending(f"No benchmark daily candles returned for requested session {expected}")
+        signal_day = benchmark[-1].day
+        as_of = signal_day.isoformat()
+        if signal_day > expected:
+            raise DataError("Benchmark returned a future session; refusing to publish")
+        if signal_day < expected:
+            detail = f"Expected {expected}; latest available benchmark candle is {signal_day}"
+            if exact_date or not cfg.allow_previous_session:
+                raise DataPending(detail + ". No stale-date substitution made. Retry after provider publication, "
+                                  "or explicitly use --allow-previous-session for an older-session research scan")
+            if (expected - signal_day).days > cfg.max_benchmark_age_days:
+                raise DataPending(detail + "; exceeds the configured fallback age limit")
+            context["prior_session_used"] = True
+            issues.append({"symbol": "BENCHMARK", "reason": "explicit_prior_session_fallback", "detail": detail})
+            print("WARNING: PRIOR-SESSION FALLBACK ENABLED. " + detail)
+        else:
+            context["prior_session_used"] = False
+        if len(benchmark) < cfg.required_bars:
+            raise DataError(f"Benchmark needs at least {cfg.required_bars} completed daily candles")
+        previous = store.latest()
+        if previous and as_of < previous["as_of"]:
+            raise DataError("Older signal date cannot replace current selections; historical backfill is not supported")
+        close = benchmark[-1].close
+        sma = statistics.mean(b.close for b in benchmark[-cfg.sma_days:])
+        regime_on = close > sma  # actual measurement: NEVER force this to True
+        context.update(actual_regime_on=regime_on, benchmark_close=close, benchmark_sma=sma,
+                       benchmark_source=getattr(client, "bar_sources", {}).get(cfg.benchmark_key, "historical_v3"))
+        print(f'Nifty 50: close {close:.2f}; SMA{cfg.sma_days} {sma:.2f}; actual regime {"ON" if regime_on else "OFF"}')
+        if cfg.ignore_market_regime:
+            print("WARNING: MARKET FILTER BYPASSED by explicit option; actual regime is unchanged. Research-only override.")
+        elif not regime_on:
+            print("Market filter is OFF: selected list will be empty. Stock candidates will still be ranked for research.")
+        for index, (symbol, key) in enumerate(resolved.items(), 1):
+            try:
+                bars = client.history(key, signal_day)
+                result = assess(symbol, key, bars, benchmark, cfg)
+                result["candle_source"] = getattr(client, "bar_sources", {}).get(key, "historical_v3")
+                result["market_regime_on"] = regime_on
+                result["market_filter_bypassed"] = cfg.ignore_market_regime
+                metrics.append(result)
+                if not result["eligible"]:
+                    issues.append({"symbol": symbol, "reason": ", ".join(result["reasons"])})
+            except (ApiError, DataError) as exc:
+                issues.append({"symbol": symbol, "reason": "data_error", "detail": str(exc)})
+                print(f"DATA ERROR {symbol}: {exc}", file=sys.stderr)
+                # Mapping exclusions are an explicit policy; HTTP/data failures
+                # are not. Fail early instead of publishing biased partial ranks.
+                raise
+            if index % 25 == 0 or index == len(resolved):
+                print(f"Fetched {index}/{len(resolved)} mapped stocks; universe exclusions: {len(mapping_issues)}; data errors: 0", flush=True)
+        ranked = rank_candidates(metrics)
+        context.update(eligible_count=len(ranked), processed_count=len(metrics))
+        store.set_context(run_id, context)
+        store.publish(run_id, now_ist(), as_of, regime_on, close, sma, ranked, cfg.top_n, issues,
+                      filter_bypassed=cfg.ignore_market_regime)
+        status = "SUCCESS"
+        logger.info("Run %s SUCCESS signal=%s actual_regime=%s bypass=%s mapped=%s/%s", run_id, as_of,
+                    regime_on, cfg.ignore_market_regime, len(resolved), len(symbols))
+        return 0
+    except DataPending as exc:
+        status, failure_message = "WAITING_DATA", str(exc)
+        store.set_context(run_id, context)
+        store.finish_failure(run_id, now_ist(), issues, failure_message, as_of, status=status)
+        print(f"WAITING FOR DATA: {failure_message}", file=sys.stderr)
+        logger.warning("Run %s WAITING_DATA: %s", run_id, failure_message)
+        return 3
+    except (ApiError, DataError, ValueError, OSError) as exc:
+        status, failure_message = "FAILED", str(exc)
+        store.set_context(run_id, context)
+        store.finish_failure(run_id, now_ist(), issues, failure_message, as_of)
+        logger.error("Run %s FAILED: %s", run_id, failure_message)
+        print(f"SCAN FAILED: {failure_message}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        status, failure_message = "FAILED", "Interrupted by user"
+        store.finish_failure(run_id, now_ist(), issues, failure_message, as_of)
+        print("Interrupted. Previous selection retained.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        status, failure_message = "FAILED", f"Unexpected {type(exc).__name__}; previous selection retained"
+        store.finish_failure(run_id, now_ist(), issues, failure_message, as_of)
+        logger.error("Run %s FAILED: %s", run_id, failure_message)
+        print(failure_message, file=sys.stderr)
+        return 2
+    finally:
+        if client:
+            client.close()
+        # Always leave a diagnostic audit, including early preflight/date failures.
+        # Audit export failure must NOT undo a committed SQLite selection.
+        try:
+            atomic_json(data_dir / "reports" / f"scan_{run_id:06d}.json",
+                        {"run_id": run_id, "status": status, "signal_date": as_of,
+                         "context": context, "issues": issues, "metrics": metrics,
+                         "ranked_candidates": ranked, "error": failure_message})
+        except OSError:
+            print("WARNING: Could not export per-run audit; SQLite remains authoritative. Close locked files and retry --show.", file=sys.stderr)
 
-    vol_ann = realized_vol(close, int(cfg["VOL_LOOKBACK_DAYS"]))
-    if vol_ann is None or vol_ann > float(cfg["MAX_ANNUALIZED_VOL"]):
-        return None, "vol too high"
 
-    return {
-        "symbol": None,
-        "momentum": momentum,
-        "vol_ann": vol_ann,
-        "adv_cr": adv_cr,
-        "last_close": last_close,
-    }, None
-
-
-def run_screener(cfg, refresh=False):
-    """
-    Full pipeline (steps 1-10). Prints progress, the candidate table, the
-    rejection breakdown and exports OUTPUT_CSV. Places no orders. Never raises
-    on market-data failures -- it degrades to "no candidates" and reports why.
-    """
-    started = time.time()
-    run_dt = now_ist()
-    run_date_iso = run_dt.strftime("%Y-%m-%d")
-    rejects = {label: 0 for label in REJECT_ORDER}
-    rejects["history too short"] = 0
-    rejects["stale data"] = 0
-
-    log("=" * 60, cfg)
-    log(" STEP 1/10  Universe + data", cfg)
-    symbols = get_universe(cfg)
-    data = fetch_daily_data(symbols, cfg, refresh=refresh)
-    equity_data = {t: f for t, f in data.items() if t not in BENCHMARK_SET}
-    rejects["history too short"] = int(FETCH_STATS.get("dropped_history", 0))
-    rejects["stale data"] = int(FETCH_STATS.get("stale", 0))
-    log(" STEP 1/10  done: %d of %d symbols usable"
-        % (len(equity_data), len(symbols)), cfg)
-
-    log(" STEP 2/10  Market regime (^NSEI, ^INDIAVIX)", cfg)
-    regime_ok, reg = _market_regime(data, cfg)
-
-    log(" STEP 3/10  Per-stock metrics", cfg)
+def diagnose_api(root, data_dir):
+    """Four small read-only probes. Never writes selections or prints profile data."""
+    cfg = Config().validate()
+    token = read_token(root)
+    client = Upstox(token, cfg, data_dir)
+    cutoff = completed_cutoff(datetime.now(IST), cfg)
+    start = cutoff - timedelta(days=14)
+    index = quote(cfg.benchmark_key, safe="")
+    # Fixed liquid-equity identifier is only a connectivity probe, not a universe override.
+    equity = quote("NSE_EQ|INE002A01018", safe="")
+    probes = [
+        ("PROFILE", "https://api.upstox.com/v2/user/profile"),
+        ("V3_NIFTY50", f"https://api.upstox.com/v3/historical-candle/{index}/days/1/{cutoff}/{start}"),
+        ("V3_RELIANCE", f"https://api.upstox.com/v3/historical-candle/{equity}/days/1/{cutoff}/{start}"),
+        ("V2_NIFTY50_COMPARISON", f"https://api.upstox.com/v2/historical-candle/{index}/day/{cutoff}/{start}"),
+    ]
+    print("API DIAGNOSTICS - read-only; no selection/database changes")
+    print(f"Script: {Path(__file__).resolve()}")
+    print(f"Env file: {(root / 'env.txt').resolve()}")
+    print(f"Python: {sys.version.split()[0]} | executable: {sys.executable}")
+    print(f"Proxy configured for HTTP(S): {bool(set(getproxies()) & {'http', 'https', 'all'})} (addresses not shown)")
+    print("Token loaded locally; credentials and profile payload will NOT be printed or saved.")
+    print("V2 is a legacy comparison only; production screening still uses V3.\n")
     rows = []
-    for ticker, frame in equity_data.items():
-        symbol = ticker[:-3] if ticker.endswith(".NS") else ticker
-        metrics, reason = _stock_metrics(frame, cfg)
-        if metrics is None:
-            rejects[reason] = rejects.get(reason, 0) + 1
-            continue
-        metrics["symbol"] = symbol
-        rows.append(metrics)
-
-    if not rows:
-        print("No symbols produced valid metrics -- nothing to rank.")
-        _print_reject_breakdown(cfg, rejects)
-        _print_post_run_notes(cfg, regime_ok, 0)
-        return
-
-    df = pd.DataFrame(rows)[["symbol", "momentum", "vol_ann", "adv_cr",
-                             "last_close"]]
-
-    log(" STEP 4/10  Relative Strength rating (%d survivors)"
-        % len(df), cfg)
-    # IMPORTANT: the rating is computed over the FULL survivor cross-section,
-    # BEFORE any RS floor / AM filter, so percentiles are not distorted.
-    if cfg["USE_VOL_ADJUSTED_RS"]:
-        rs_raw = df["momentum"] / df["vol_ann"]
-        rs_raw = rs_raw.replace([np.inf, -np.inf], np.nan)
+    try:
+        for name, url in probes:
+            row = {"probe": name}
+            try:
+                response = client.get(url)
+                row["http_status"] = response.status_code
+                try:
+                    obj = response.json()
+                    if not isinstance(obj, dict) or obj.get("status") != "success":
+                        raise ValueError()
+                    if name == "PROFILE":
+                        if not isinstance(obj.get("data"), dict):
+                            raise ValueError()
+                        row["ok"] = True
+                        row["result"] = "Profile endpoint accepted this token. Personal data omitted."
+                    else:
+                        candles = obj["data"]["candles"]
+                        parsed = parse_candles(candles, cutoff)
+                        row["ok"] = bool(parsed)
+                        row["candle_count"] = len(parsed)
+                        row["latest_candle_date"] = parsed[-1].day.isoformat() if parsed else None
+                        row["result"] = (f"Valid completed candles: {len(parsed)}; latest: {row['latest_candle_date']}"
+                                         if parsed else "HTTP accepted, but no completed candles returned")
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    row["ok"] = False
+                    row["result"] = "HTTP 200 but unexpected/invalid payload; contents omitted for privacy"
+            except ApiError as exc:
+                row.update(ok=False, http_status=exc.status_code, result=str(exc), details=exc.details)
+            print(f"{name}: HTTP {row['http_status']} | {row['result']}")
+            rows.append(row)
+    finally:
+        client.close()
+    by_name = {row["probe"]: row for row in rows}
+    profile = by_name["PROFILE"]
+    v3 = by_name["V3_NIFTY50"]
+    if profile["ok"] and not v3["ok"]:
+        conclusion = ("Token was accepted by the profile endpoint. The V3 candle request failed separately; "
+                      "inspect its HTTP/API error instead of assuming global token invalidity.")
+    elif v3["ok"]:
+        conclusion = "V3 benchmark probe passed. Try the full scan; diagnostic success does not validate all 500 stocks."
     else:
-        rs_raw = df["momentum"]
-    df["rs_rating"] = rs_rating(rs_raw)
-
-    log(" STEP 5/10  Absolute Momentum flag", cfg)
-    if cfg["AM_USE_RISK_FREE"]:
-        # Hurdle for the same horizon as the momentum window: (1+rf)^(t/12)-1.
-        am_threshold = ((1.0 + float(cfg["RISK_FREE_RATE_ANNUAL"])) **
-                        (float(cfg["AM_LOOKBACK_MONTHS"]) / 12.0)) - 1.0
-    else:
-        am_threshold = 0.0
-    df["am_ok"] = df["momentum"] > am_threshold
-
-    log(" STEP 6/10  Final filter (RS >= %s, AM, regime=%s)"
-        % (cfg["RS_MIN_RATING"], "ON" if regime_ok else "OFF"), cfg)
-    above_floor = df[df["rs_rating"] >= float(cfg["RS_MIN_RATING"])]
-    rejects["RS < floor"] += int(len(df) - len(above_floor))
-    pass_am = above_floor[above_floor["am_ok"]]
-    rejects["AM fail"] += int(len(above_floor) - len(pass_am))
-
-    if regime_ok:
-        final = pass_am.copy()
-    else:
-        rejects["regime off"] += int(len(pass_am))
-        final = pass_am.iloc[0:0].copy()
-
-    if cfg["RS_TOP_DECILE"] and len(final) > 0:
-        top_decile = final[final["rs_rating"] >= 90]
-        if len(top_decile) >= int(cfg["MIN_PICKS_FOR_DECILE"]):
-            final = top_decile
-        else:
-            print("Top-decile filter disabled (only %d stocks >= 90)."
-                  % len(top_decile))
-
-    log(" STEP 7/10  Ranking", cfg)
-    final = final.sort_values(by=["rs_rating", "momentum"],
-                              ascending=[False, False]).reset_index(drop=True)
-    total_passed = int(len(final))
-
-    log(" STEP 8/10  Output (top %d)" % int(cfg["OUTPUT_TOP_N"]), cfg)
-    output_rows = final.head(int(cfg["OUTPUT_TOP_N"])).reset_index(drop=True)
-
-    _print_report_header(cfg, run_dt, symbols, len(equity_data), regime_ok, reg,
-                         total_passed)
-    _print_candidate_table(cfg, output_rows)
-    _print_benchmark_context(cfg, data)
-
-    log(" STEP 9/10  Rejection breakdown", cfg)
-    _print_reject_breakdown(cfg, rejects)
-
-    written = _write_csv(cfg, output_rows, regime_ok, run_date_iso)
-
-    log(" STEP 10/10 Post-run sanity", cfg)
-    _print_post_run_notes(cfg, regime_ok, total_passed)
-
-    if written:
-        print("Exported %d rows -> %s" % (len(output_rows), written))
-    else:
-        print("WARNING: could not export %s" % cfg["OUTPUT_CSV"])
-    print("=" * 60)
-    log("Done in %.1f s" % (time.time() - started), cfg)
+        conclusion = ("No successful V3 benchmark probe. Compare the error codes and response types above; "
+                      "these results alone may not distinguish token scope, account permission, service or network rejection.")
+    print("\n" + conclusion)
+    print("An HTML/non-JSON 403 may be an intermediary/gateway rejection, not a structured Upstox token error.")
+    result = {"checked_at": now_ist(), "probes": rows, "conclusion": conclusion}
+    destination = data_dir / "reports" / "api_diagnostics.json"
+    with process_lock(data_dir / "screener.lock"):
+        atomic_json(destination, result)
+    print(f"Sanitized diagnostics: {destination}")
+    print("Review before sharing. Do NOT share env.txt, a token, or raw profile/HTTP response data.")
+    return 0 if v3["ok"] else 2
 
 
-# =============================================================================
-# PART 8 -- OUTPUT FORMATTING / CSV
-# =============================================================================
-_TABLE_WIDTHS = [3, 12, 9, 8, 7, 4, 3, 9]
-_TABLE_HEAD = ["#", "SYMBOL", "CLOSE", "12-1M%", "VOL%", "RS", "AM", "ADV(Cr)"]
+def config_from_args(args):
+    # Preserve editable Config defaults; a supplied CLI flag explicitly enables it.
+    names = ("ignore_market_regime", "allow_previous_session", "strict_universe", "refresh_instruments")
+    overrides = {name: True for name in names if getattr(args, name, False)}
+    return replace(Config(), **overrides).validate()
 
 
-def _table_line(values, numeric):
-    """Build one fixed-width table line (shared by header and data rows)."""
-    parts = []
-    for idx, width in enumerate(_TABLE_WIDTHS):
-        value = values[idx]
-        if numeric[idx]:
-            text = str(value).rjust(width)
-        else:
-            text = str(value).ljust(width)
-        parts.append(text[:width])
-    return "  " + "  ".join(parts)
-
-
-def _print_report_header(cfg, run_dt, symbols, fetched, regime_ok, reg,
-                         total_passed):
-    """Header block (format per spec)."""
-    universe_label = "%s (%d symbols)" % (
-        os.path.basename(UNIVERSE_INFO.get("path") or
-                         cfg.get("UNIVERSE_JSON", "universe.json")),
-        int(UNIVERSE_INFO.get("file_count") or len(symbols)))
-    if UNIVERSE_INFO.get("mode") in ("nifty50", "nifty200"):
-        universe_label += " -- subset: %s" % UNIVERSE_INFO["mode"]
-    print("")
-    print("  " + "=" * 60)
-    print("   DUAL MOMENTUM SCREENER  (NSE | long-only | v1.0)")
-    print("  " + "=" * 60)
-    print("   Run time           : %s" % run_dt.strftime("%Y-%m-%d %H:%M IST"))
-
-    regime_bits = []
-    if reg.get("nifty_close") is not None and reg.get("nifty_sma") is not None:
-        relay = ">" if reg.get("above_ma") else "<"
-        regime_bits.append("Nifty %s %s 200SMA %s"
-                           % (format(reg["nifty_close"], ",.0f"), relay,
-                              format(reg["nifty_sma"], ",.0f")))
-        # Slope of the 200-SMA over REGIME_SLOPE_LOOKBACK sessions.
-        if cfg["REGIME_REQUIRE_RISING"]:
-            regime_bits.append("rising" if reg.get("ma_ok") else "not rising")
-    elif reg.get("nifty_close") is not None:
-        regime_bits.append("Nifty %s" % format(reg["nifty_close"], ",.0f"))
-    if cfg["USE_VIX_FILTER"] and reg.get("vix_value") is not None:
-        regime_bits.append("VIX %.1f" % reg["vix_value"])
-    regime_note = ("   (" + ", ".join(regime_bits) + ")") if regime_bits else ""
-
-    print("   Universe           : %s" % universe_label)
-    print("   Symbols fetched    : %d / %d" % (fetched, len(symbols)))
-    print("   History filter     : %d passed"
-          % int(FETCH_STATS.get("history_passed", fetched)))
-    print("   Market regime      : %s%s"
-          % ("RISK-ON " if regime_ok else "RISK-OFF", regime_note))
-    print("   Risk-free rate     : %.2f%% annual"
-          % (float(cfg["RISK_FREE_RATE_ANNUAL"]) * 100.0))
-    print("   RS window          : %d-%d months (%s)"
-          % (int(cfg["RS_LOOKBACK_MONTHS"]), int(cfg["RS_SKIP_MONTHS"]),
-             "vol-adjusted" if cfg["USE_VOL_ADJUSTED_RS"] else "raw"))
-    print("   RS floor           : %d" % int(cfg["RS_MIN_RATING"]))
-    print("   Passed all filters : %d stocks" % total_passed)
-    print("")
-
-
-def _print_candidate_table(cfg, rows):
-    """Formatted candidate table, at most OUTPUT_TOP_N rows."""
-    top_n = int(cfg["OUTPUT_TOP_N"])
-    print("  TOP %d DUAL MOMENTUM CANDIDATES (LONG)" % top_n)
-    print("")
-    print(_table_line(_TABLE_HEAD, [False] * len(_TABLE_HEAD)).rstrip())
-    print("  " + "-" * (sum(_TABLE_WIDTHS) + 2 * (len(_TABLE_WIDTHS) - 1)))
-    for i in range(len(rows)):
-        row = rows.iloc[i]
-        print(_table_line([
-            "%d" % (i + 1),
-            str(row["symbol"]),
-            "%.2f" % float(row["last_close"]),
-            "%.1f" % (float(row["momentum"]) * 100.0),
-            "%.1f" % (float(row["vol_ann"]) * 100.0),
-            "%.0f" % float(row["rs_rating"]),
-            "YES",      # only am_ok rows survive the Step 6 filter
-            "%.1f" % float(row["adv_cr"]),
-        ], [True, False, True, True, True, True, True, True]))
-    if len(rows) == 0:
-        print("  (no candidates passed all filters)")
-    print("")
-
-
-def _print_benchmark_context(cfg, data):
-    """
-    Informational only: GOLDBEES (gold proxy) and LIQUIDBEES (cash proxy) are
-    fetched as per spec Part 2 but do NOT influence scoring in v1.0.
-    """
-    lines = []
-    for ticker in ("GOLDBEES.NS", "LIQUIDBEES.NS"):
-        frame = data.get(ticker)
-        if frame is not None and len(frame) > 0:
-            last = safe_float(frame["close"].iloc[-1])
-            if last is not None:
-                lines.append("%s %.2f" % (ticker, last))
-    if lines:
-        print("  BENCHMARK CONTEXT (informational, not used in scoring)")
-        print("    " + " | ".join(lines))
-        print("")
-
-
-def _print_reject_breakdown(cfg, rejects):
-    """Rejection counters in the fixed spec order."""
-    print("  REJECTION BREAKDOWN")
-    for label in REJECT_ORDER:
-        print("    %-23s: %d" % (label, int(rejects.get(label, 0))))
-    print("")
-
-
-def _print_post_run_notes(cfg, regime_ok, total_passed):
-    """Step 10 sanity notes."""
-    if not regime_ok:
-        print("NOTE: RISK-OFF regime. Candidates should be treated as "
-              "watchlist only, not entries.")
-    if total_passed < 5:
-        print("WARNING: fewer than 5 candidates passed. Consider loosening "
-              "filters or waiting for a stronger regime.")
-
-
-def _write_csv(cfg, rows, regime_ok, run_date_iso):
-    """
-    Write the candidate rows (exact column order) and return the path written.
-    The CSV is written to the CWD-resolved OUTPUT_CSV path, and additionally
-    mirrored next to this script when running from elsewhere, so the file is
-    easy to find either way.
-    """
-    csv_path = cfg["OUTPUT_CSV"]
-    if not os.path.isabs(csv_path):
-        csv_path = os.path.join(os.getcwd(), csv_path)
-    csv_path = os.path.normpath(csv_path)
-
-    regime_flag = "YES" if regime_ok else "NO"
+def main(root=None):
+    root = Path(root).resolve() if root is not None else Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description="VAM-AF NSE swing screener; GET-only API; never places orders.")
+    parser.add_argument("--show", action="store_true", help="Regenerate/show saved selections without API access")
+    parser.add_argument("--history", action="store_true", help="Display ALL discovery/re-entry events offline (implies --show)")
+    parser.add_argument("--open-report", action="store_true", help="Open local HTML dashboard after scan/show")
+    parser.add_argument("--as-of", type=date.fromisoformat, metavar="YYYY-MM-DD", help="Exact completed session; cannot rewind current state")
+    parser.add_argument("--diagnose", action="store_true", help="Probe API access without scanning or modifying selections; sanitized output only")
+    parser.add_argument("--ignore-market-regime", action="store_true", help="Research override; explicitly labeled BYPASSED, never changes actual regime")
+    parser.add_argument("--allow-previous-session", action="store_true", help="Explicitly permit a recent older benchmark session if the expected session is unavailable")
+    parser.add_argument("--strict-universe", action="store_true", help="Fail before candle downloads if any input symbol cannot be mapped")
+    parser.add_argument("--refresh-instruments", action="store_true", help="Refresh the public instrument master instead of using same-day cache")
+    parser.add_argument("--check-universe", action="store_true", help="Resolve/list symbols only; no selection/database changes")
+    parser.add_argument("--version", action="version", version=f"VAM-AF {VERSION}")
+    args = parser.parse_args()
+    if args.as_of and args.allow_previous_session:
+        parser.error("--as-of requires an exact session; do not combine it with --allow-previous-session")
+    scan_flags = args.ignore_market_regime or args.allow_previous_session or args.strict_universe or args.refresh_instruments
+    if (args.show or args.history or args.diagnose) and (scan_flags or args.check_universe):
+        parser.error("Scan options cannot be combined with --show/--history/--diagnose")
+    if args.check_universe and (args.as_of or args.ignore_market_regime or args.allow_previous_session or args.open_report):
+        parser.error("--check-universe only supports --strict-universe and --refresh-instruments")
+    if args.diagnose and (args.show or args.history or args.as_of or args.open_report):
+        parser.error("Use --diagnose by itself")
+    if args.as_of and (args.show or args.history):
+        parser.error("--as-of cannot be used with offline --show/--history")
+    print(f"VAM-AF {VERSION} | script: {Path(__file__).resolve()}")
+    data_dir = root / "stock-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    logger = configure_logging(data_dir)
+    store = None
     try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(CSV_COLUMNS)
-            for i in range(len(rows)):
-                row = rows.iloc[i]
-                writer.writerow([
-                    i + 1,
-                    str(row["symbol"]),
-                    "%.2f" % float(row["last_close"]),
-                    "%.2f" % (float(row["momentum"]) * 100.0),
-                    "%.2f" % (float(row["vol_ann"]) * 100.0),
-                    "%.2f" % float(row["rs_rating"]),
-                    "YES",                      # only am_ok rows survive
-                    "%.2f" % float(row["adv_cr"]),
-                    regime_flag,
-                    run_date_iso,
-                ])
-    except Exception as exc:
-        print("WARNING: CSV write failed (%s)" % exc)
-        return None
-
-    # Mirror into the repo folder too (helps when run from another CWD).
-    try:
-        mirror = resolve_path(cfg["OUTPUT_CSV"], cfg)
-        if os.path.abspath(mirror) != os.path.abspath(csv_path):
-            with open(mirror, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(CSV_COLUMNS)
-                for i in range(len(rows)):
-                    row = rows.iloc[i]
-                    writer.writerow([
-                        i + 1, str(row["symbol"]),
-                        "%.2f" % float(row["last_close"]),
-                        "%.2f" % (float(row["momentum"]) * 100.0),
-                        "%.2f" % (float(row["vol_ann"]) * 100.0),
-                        "%.2f" % float(row["rs_rating"]),
-                        "YES", "%.2f" % float(row["adv_cr"]),
-                        regime_flag, run_date_iso,
-                    ])
-    except Exception:
-        pass
-    return csv_path
-
-
-# =============================================================================
-# PART 10 -- SELF-TEST (NO NETWORK)
-# =============================================================================
-def _rising_monthly_series(months=14, monthly_growth=0.01, start=100.0):
-    """
-    Monthly-indexed, monthly-stepped price series with compounding growth.
-    Using month-end timestamps makes the resample step a no-op so the expected
-    return can be computed analytically.
-    """
-    idx = pd.date_range(end="2026-09-30", periods=months, freq="ME")
-    values = [start * ((1.0 + monthly_growth) ** i) for i in range(months)]
-    return pd.Series(values, index=idx)
-
-
-def run_selftest():
-    """
-    Offline unit checks (synthetic data only, NO network). Prints PASS/FAIL per
-    check and returns 0 if everything passed, else 1.
-    """
-    print("Running dual momentum screener self-test (no network required) ...")
-    print("")
-    results = []
-
-    def check(name, passed, detail=""):
-        status = "PASS" if passed else "FAIL"
-        results.append(bool(passed))
-        line = "  [%s] %s" % (status, name)
-        if detail:
-            line += "  -- %s" % detail
-        print(line)
-
-    def quiet_call(fn, *args, **kwargs):
-        """Call fn with stdout swallowed so its progress prints stay out of the
-        self-test report (restores stdout even if fn raises)."""
-        real_stdout = sys.stdout
-        try:
-            sys.stdout = StderrCapture()
-            return fn(*args, **kwargs)
-        finally:
-            sys.stdout = real_stdout
-
-    # 1. Linearly (compounding) rising monthly series -> expected return.
-    try:
-        growth = 0.01
-        series = _rising_monthly_series(14, growth)
-        expected = ((1.0 + growth) ** 12) - 1.0        # 12 months, skip the last
-        got = momentum_12_1(series, 12, 1)
-        ok = got is not None and abs(got - expected) <= 0.005
-        check("momentum_12_1 rising series", ok,
-              "got %.4f expected %.4f" % (got if got is not None else float("nan"),
-                                          expected))
-    except Exception as exc:
-        check("momentum_12_1 rising series", False, "exception: %s" % exc)
-
-    # 2. Flat series -> approximately zero.
-    try:
-        flat = _rising_monthly_series(14, 0.0)
-        got = momentum_12_1(flat, 12, 1)
-        ok = got is not None and abs(got) < 1e-9
-        check("momentum_12_1 flat series ~ 0", ok, "got %r" % got)
-    except Exception as exc:
-        check("momentum_12_1 flat series ~ 0", False, "exception: %s" % exc)
-
-    # 3. Too-short series -> None.
-    try:
-        short = _rising_monthly_series(10, 0.01)       # needs 14 months
-        got = momentum_12_1(short, 12, 1)
-        check("momentum_12_1 short series -> None", got is None, "got %r" % got)
-    except Exception as exc:
-        check("momentum_12_1 short series -> None", False, "exception: %s" % exc)
-
-    # 4. Constant daily log return -> ~0 realised vol.
-    try:
-        prices = pd.Series([100.0 * (1.001 ** i) for i in range(40)])
-        vol = realized_vol(prices, 20)
-        ok = vol is not None and abs(vol) < 1e-6
-        check("realized_vol constant return ~ 0", ok, "got %r" % vol)
-    except Exception as exc:
-        check("realized_vol constant return ~ 0", False, "exception: %s" % exc)
-
-    # 5. rs_rating on 5 values -> within [1, 100], strictly increasing.
-    try:
-        raw = pd.Series([0.1, 0.2, 0.3, 0.4, 0.5])
-        rated = rs_rating(raw)
-        in_range = bool(((rated >= 1.0) & (rated <= 100.0)).all())
-        increasing = bool(all(rated.iloc[i] < rated.iloc[i + 1]
-                              for i in range(len(rated) - 1)))
-        check("rs_rating range + monotonic", in_range and increasing,
-              "values %s" % [round(float(v), 2) for v in rated])
-    except Exception as exc:
-        check("rs_rating range + monotonic", False, "exception: %s" % exc)
-
-    # 6. above_200sma_rising: True on a 250-bar rise, False on a 250-bar fall.
-    try:
-        up = pd.Series(np.linspace(100.0, 349.0, 250))
-        down = pd.Series(np.linspace(349.0, 100.0, 250))
-        res_up = above_200sma_rising(up, 200, 20)
-        res_down = above_200sma_rising(down, 200, 20)
-        check("above_200sma_rising up/down", res_up is True and res_down is False,
-              "up=%s down=%s" % (res_up, res_down))
-    except Exception as exc:
-        check("above_200sma_rising up/down", False, "exception: %s" % exc)
-
-    # 7. Synthetic 400-bar stock frame -> valid momentum_12_1.
-    try:
-        idx = pd.bdate_range(end="2026-09-28", periods=400)
-        prices = pd.Series(np.linspace(100.0, 260.0, 400), index=idx)
-        frame = pd.DataFrame({"open": prices, "high": prices, "low": prices,
-                              "close": prices, "volume": 1_000_000.0})
-        got = momentum_12_1(frame["close"], 12, 1)
-        check("synthetic 400-bar frame momentum", got is not None,
-              "got %r" % got)
-    except Exception as exc:
-        check("synthetic 400-bar frame momentum", False, "exception: %s" % exc)
-
-    # 8. is_fresh: today -> True, 30 days ago -> False.
-    try:
-        today = now_ist().date()
-        idx_today = pd.DatetimeIndex([pd.Timestamp(today)])
-        idx_old = pd.DatetimeIndex([pd.Timestamp(today - timedelta(days=30))])
-        fresh = pd.DataFrame({"close": [100.0]}, index=idx_today)
-        old = pd.DataFrame({"close": [100.0]}, index=idx_old)
-        ok = (is_fresh(fresh, 5, today) is True and
-              is_fresh(old, 5, today) is False)
-        check("is_fresh today/30 days old", ok,
-              "today=%s old=%s" % (is_fresh(fresh, 5, today),
-                                   is_fresh(old, 5, today)))
-    except Exception as exc:
-        check("is_fresh today/30 days old", False, "exception: %s" % exc)
-
-    # 9. 90th percentile of a 100-stock universe -> rating >= 90.
-    try:
-        raw = pd.Series(np.arange(1.0, 101.0))
-        rated = rs_rating(raw)
-        p90 = float(rated.iloc[89])          # 90th value of 100
-        check("rs_rating 90th percentile >= 90", p90 >= 90.0,
-              "got %.2f" % p90)
-    except Exception as exc:
-        check("rs_rating 90th percentile >= 90", False, "exception: %s" % exc)
-
-    # 10. The universe IS the universe.json file: same names, same order,
-    #     de-duplicated, no ".NS" suffix leakage, and >= 200 entries.
-    try:
-        approx = {"UNIVERSE_SOURCE": "json", "UNIVERSE_JSON": "universe.json",
-                  "VERBOSE": False}
-        uni = quiet_call(get_universe, approx)
-        raw, json_path = _load_universe_json(approx)
-        ok = (uni == raw and len(uni) >= NIFTY_50_MIN_EXPECTED and
-              len(set(uni)) == len(uni) and
-              all(not s.endswith(".NS") for s in uni))
-        check("universe == universe.json contents", ok,
-              "count=%d file=%s" % (len(uni), os.path.basename(json_path or "-")))
-    except SystemExit as exc:
-        check("universe == universe.json contents", False,
-              "universe file missing/unusable (exit %s)" % exc.code)
-    except Exception as exc:
-        check("universe == universe.json contents", False,
-              "exception: %s" % exc)
-
-    # 10b. Subset modes may only REMOVE symbols from the file -- never add any.
-    try:
-        approx = {"UNIVERSE_JSON": "universe.json", "VERBOSE": False}
-        raw, _ = _load_universe_json(approx)
-        raw_set = set(raw)
-        subsets = {}
-        for mode in ("nifty50", "nifty200", "nifty500"):
-            cfg_mode = dict(approx)
-            cfg_mode["UNIVERSE_SOURCE"] = mode
-            subsets[mode] = quiet_call(get_universe, cfg_mode)
-        ok = (all(s in raw_set for sub in subsets.values() for s in sub) and
-              subsets["nifty500"] == raw and
-              len(subsets["nifty200"]) <= 200 and
-              len(subsets["nifty50"]) <= len(NIFTY_50))
-        check("subset modes only filter universe.json", ok,
-              "nifty50=%d nifty200=%d nifty500=%d file=%d"
-              % (len(subsets["nifty50"]), len(subsets["nifty200"]),
-                 len(subsets["nifty500"]), len(raw)))
-    except SystemExit as exc:
-        check("subset modes only filter universe.json", False,
-              "universe file missing/unusable (exit %s)" % exc.code)
-    except Exception as exc:
-        check("subset modes only filter universe.json", False,
-              "exception: %s" % exc)
-
-    # 10c. The universe file is found even when the process runs from another
-    #      working directory (the "script invoked from a different folder" case).
-    try:
-        orig_cwd = os.getcwd()
-        tmp_dir = orig_cwd
-        for candidate in (os.path.abspath(os.sep), "/tmp", os.path.expanduser("~")):
-            if os.path.isdir(candidate):
-                tmp_dir = candidate
-                break
-        os.chdir(tmp_dir)
-        try:
-            found, _searched = _universe_file_path(approx)
-            uni = quiet_call(get_universe, approx)
-        finally:
-            os.chdir(orig_cwd)
-        ok = (found is not None and len(uni) == len(raw) and
-              os.path.normcase(os.path.dirname(found)) ==
-              os.path.normcase(os.path.dirname(json_path or "")))
-        check("universe file resolves from any cwd", ok,
-              "from %s -> %s" % (tmp_dir, found or "NOT FOUND"))
-    except Exception as exc:
-        check("universe file resolves from any cwd", False,
-              "exception: %s" % exc)
-
-    # 11. NIFTY_50 is exactly 50 unique names.
-    try:
-        ok = len(NIFTY_50) == 50 and len(set(NIFTY_50)) == 50
-        check("NIFTY_50 == 50 unique names", ok, "count=%d unique=%d"
-              % (len(NIFTY_50), len(set(NIFTY_50))))
-    except Exception as exc:
-        check("NIFTY_50 == 50 unique names", False, "exception: %s" % exc)
-
-    # 12. CSV column order matches the required spec exactly.
-    try:
-        expected = ["rank", "symbol", "close", "ret_12_1_pct", "vol_pct",
-                    "rs_rating", "am_ok", "adv_cr", "regime_ok", "run_date"]
-        check("CSV column order", CSV_COLUMNS == expected,
-              "|".join(CSV_COLUMNS))
-    except Exception as exc:
-        check("CSV column order", False, "exception: %s" % exc)
-
-    # 13. CONFIG parameter usage audit (no orphan parameters).
-    try:
-        with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
-            source = fh.read()
-        orphans = []
-        for key in CONFIG.keys():
-            if source.count('"%s"' % key) <= 1:      # only the CONFIG definition
-                orphans.append(key)
-        check("every CONFIG key is referenced in code", not orphans,
-              "orphans=%s" % (orphans if orphans else "none"))
-    except Exception as exc:
-        check("every CONFIG key is referenced in code", False,
-              "exception: %s" % exc)
-
-    failed = results.count(False)
-    print("")
-    print("Self-test result: %d/%d checks passed."
-          % (len(results) - failed, len(results)))
-    return 0 if failed == 0 else 1
-
-
-# =============================================================================
-# PART 9 -- CLI
-# =============================================================================
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description=("Dual momentum screener for NSE cash equities. "
-                     "Screener only -- no orders, no broker, no backtest."),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--universe-file", dest="universe_file", default=None,
-                        help=("explicit path to the universe JSON, e.g. "
-                              "C:\\...\\algo-trading\\stock-data\\universe.json "
-                              "(default: auto-detect next to this script)"))
-    parser.add_argument("--universe", choices=["json", "nifty50", "nifty200",
-                                               "nifty500"],
-                        default=None,
-                        help=("subset of the universe.json file to screen "
-                              "(default: json = the whole file)"))
-    parser.add_argument("--top", type=int, default=None,
-                        help="number of rows to print/export")
-    parser.add_argument("--rs-floor", dest="rs_floor", type=int, default=None,
-                        help="minimum RS rating (0-100)")
-    parser.add_argument("--no-vol-adjust", dest="no_vol_adjust",
-                        action="store_true",
-                        help="rank on raw momentum instead of momentum/vol")
-    parser.add_argument("--csv", dest="csv", default=None,
-                        help="output CSV path")
-    parser.add_argument("--refresh", action="store_true",
-                        help="ignore the local cache and refetch")
-    parser.add_argument("--quiet", action="store_true",
-                        help="suppress step-by-step progress output")
-    parser.add_argument("--selftest", action="store_true",
-                        help="run offline unit checks and exit (no network)")
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
-
-    cfg = dict(CONFIG)                 # run-time copy; CONFIG stays pristine
-
-    # CLI overrides (explicitly required by the spec)
-    if args.universe:
-        cfg["UNIVERSE_SOURCE"] = args.universe
-    if args.universe_file:
-        cfg["UNIVERSE_FILE"] = args.universe_file
-    if args.top is not None:
-        cfg["OUTPUT_TOP_N"] = int(args.top)
-    if args.rs_floor is not None:
-        cfg["RS_MIN_RATING"] = int(args.rs_floor)
-    if args.no_vol_adjust:
-        cfg["USE_VOL_ADJUSTED_RS"] = False
-    if args.csv:
-        cfg["OUTPUT_CSV"] = args.csv
-    if args.quiet:
-        cfg["VERBOSE"] = False
-
-    # env.txt is loaded so the rest of the repo shares one environment file.
-    # The screener itself never uses broker credentials.
-    load_env_file(cfg)
-
-    if args.selftest:
-        return run_selftest()
-
-    if cfg["VERBOSE"]:
-        print("NOTE: RISK_FREE_RATE_ANNUAL=%.3f -- %s"
-              % (float(cfg["RISK_FREE_RATE_ANNUAL"]),
-                 cfg.get("RISK_FREE_RATE_UPDATE_HINT", "")))
-
-    run_screener(cfg, refresh=args.refresh)
-    return 0
-
+        if args.diagnose:
+            return diagnose_api(root, data_dir)
+        with process_lock(data_dir / "screener.lock"):
+            if args.check_universe:
+                cfg = config_from_args(args)
+                symbols = load_universe(data_dir / "universe.json")
+                client = Upstox(read_token(root), cfg, data_dir)
+                try:
+                    resolved, issues, ratio = universe_preflight(client, symbols, cfg)
+                    atomic_json(data_dir / "reports" / "universe_check.json",
+                                {"checked_at": now_ist(), "resolved": resolved, "issues": issues, "coverage": ratio})
+                    enforce_universe_policy(resolved, issues, ratio, cfg)
+                    return 0
+                finally:
+                    client.close()
+            store = Store(data_dir / "momentum.sqlite3")
+            store.recover_interrupted(now_ist())
+            code = 0
+            if not (args.show or args.history):
+                cfg = config_from_args(args)
+                print(f"Universe file: {data_dir / 'universe.json'}")
+                symbols = load_universe(data_dir / "universe.json")
+                cutoff = completed_cutoff(datetime.now(IST), cfg)
+                if args.as_of:
+                    if args.as_of > cutoff:
+                        raise ValueError("--as-of exceeds safe completed-candle cutoff; wait until eod_ready_ist")
+                    cutoff = args.as_of
+                code = scan(root, data_dir, store, cfg, symbols, cutoff, bool(args.as_of), logger)
+            data, dashboard = write_reports(store, data_dir)
+            print_report(data, full_history=True)
+            print(f"\nDashboard: {dashboard}\nDatabase: {data_dir / 'momentum.sqlite3'}")
+            if args.open_report:
+                webbrowser.open(dashboard.as_uri())
+            return code
+    except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if store:
+            store.close()
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-        sys.exit(130)
-    except Exception as exc:                 # last-resort guard: never traceback
-        print("FATAL: unexpected error: %s" % exc)
-        sys.exit(2)
+    raise SystemExit(main())
