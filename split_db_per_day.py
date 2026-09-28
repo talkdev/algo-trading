@@ -14,7 +14,12 @@
 #    * option_chain_snapshot for the session (all expiries, market hours)
 #    * intraday_candles for the session (1-minute bars)
 #    * the previous session's LAST 1-minute close (gap detection)
+#    * session_state.prev_day_vix_close (Gate 1 + momentum_vix_gap)
 #    * session_state and the other date-scoped tables for forensics / parity
+#
+#  After every split each day is printed FIDELITY PASS / WARN / FAIL.
+#  Missing yesterday's VIX is FAIL and the process exits 2 by default.
+#  python split_db_per_day.py --allow-unfaithful   # only to ignore that
 #
 #  IDEMPOTENCE
 #  -----------
@@ -32,6 +37,12 @@
 #     python split_db_per_day.py --verify-only    # fingerprint compare, no write
 #
 #     python backtest_engine.py --db data/per_day --from 2026-09-08 --to 2026-09-22
+#
+#  LIVE-PRIMARY SAFETY
+#  -------------------
+#  The live file is never written. A read-only SQLite backup() snapshot is
+#  taken first; every ATTACH / fingerprint / copy runs against that snapshot.
+#  journal_mode=OFF applies only to the per-day temp shard, never to source.
 #
 # ============================================================================
 
@@ -105,15 +116,56 @@ CRITICAL_FINGERPRINT = (
 )
 
 
+def _as_ro_uri(path: str | Path) -> str:
+    """SQLite URI for a read-only attach/open. Forward slashes on Windows."""
+    return f"file:{Path(path).resolve().as_posix()}?mode=ro"
+
+
 def open_db(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     path = str(path)
     if readonly:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con = sqlite3.connect(_as_ro_uri(path), uri=True)
     else:
         con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=60000")
     return con
+
+
+def remove_db_trio(path: Path) -> None:
+    """Delete path and its -wal/-shm companions if present."""
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(path) + suffix) if suffix else path
+        try:
+            if p.exists():
+                p.unlink()
+        except OSError:
+            pass
+
+
+def snapshot_readonly(src_path: Path) -> Path:
+    """Consistent copy of a (possibly live WAL) DB. Never writes the source."""
+    src_path = Path(src_path).resolve()
+    snap = src_path.with_name(f"{src_path.name}.split_snap.{os.getpid()}")
+    remove_db_trio(snap)
+    src = sqlite3.connect(_as_ro_uri(src_path), uri=True, timeout=60)
+    try:
+        src.execute("PRAGMA busy_timeout=60000")
+        dst = sqlite3.connect(str(snap), timeout=60)
+        try:
+            src.backup(dst)
+        except BaseException:
+            dst.close()
+            remove_db_trio(snap)
+            raise
+        finally:
+            try:
+                dst.close()
+            except Exception:
+                pass
+    finally:
+        src.close()
+    return snap
 
 
 def table_exists(con: sqlite3.Connection, table: str) -> bool:
@@ -267,6 +319,97 @@ def _prev_context(con: sqlite3.Connection, date: str) -> Dict[str, Any]:
         "ctx_time": str(row["candle_time"] or ""),
         "ctx_close": close_f,
     }
+
+
+def shard_fidelity(
+    path: Path,
+    date: str,
+    *,
+    expect_prev_close: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Live-faithful replay needs yesterday's VIX. Previous close is a warning.
+
+    Missing prev_day_vix_close is a FAIL (Gate 1 + momentum_vix_gap go blind).
+    Missing previous-session candle is a WARN unless the source DB actually
+    had one (then it is a split defect and FAIL).
+    """
+    out: Dict[str, Any] = {
+        "date": date,
+        "ok": False,
+        "prev_day_vix": None,
+        "prev_close": None,
+        "prev_close_date": None,
+        "why": [],
+        "warnings": [],
+    }
+    if not path.exists():
+        out["why"] = ["missing shard"]
+        return out
+    try:
+        con = open_db(path, readonly=True)
+    except sqlite3.Error as exc:
+        out["why"] = [f"unreadable: {exc}"]
+        return out
+    try:
+        ctx = _prev_context(con, date)
+        out["prev_close"] = ctx.get("ctx_close")
+        out["prev_close_date"] = ctx.get("ctx_date")
+        if out["prev_close"] is None:
+            if expect_prev_close is True:
+                out["why"].append("no previous-session candle")
+            else:
+                out["warnings"].append("no previous-session candle")
+        prev_vix = None
+        if table_exists(con, "session_state"):
+            cols = set(table_columns(con, "session_state"))
+            if "prev_day_vix_close" in cols:
+                sql = (
+                    "SELECT prev_day_vix_close FROM session_state "
+                    "WHERE substr(trading_date,1,10)=? "
+                    "AND prev_day_vix_close IS NOT NULL "
+                    "AND prev_day_vix_close > 0"
+                )
+                if "updated_at" in cols:
+                    sql += " ORDER BY updated_at DESC LIMIT 1"
+                else:
+                    sql += " LIMIT 1"
+                row = con.execute(sql, (date,)).fetchone()
+                if row is not None:
+                    try:
+                        prev_vix = float(row["prev_day_vix_close"])
+                    except (TypeError, ValueError, KeyError):
+                        prev_vix = None
+        out["prev_day_vix"] = prev_vix
+        if prev_vix is None:
+            out["why"].append("no prev_day_vix_close")
+        out["ok"] = not out["why"]
+        return out
+    except sqlite3.Error as exc:
+        out["why"] = [f"query failed: {exc}"]
+        return out
+    finally:
+        con.close()
+
+
+def format_fidelity(fid: Dict[str, Any]) -> str:
+    pv = fid.get("prev_day_vix")
+    pc = fid.get("prev_close")
+    pvs = str(pv) if pv is not None else "MISSING"
+    pcs = str(pc) if pc is not None else "MISSING"
+    extra = f" ({fid.get('prev_close_date')})" if fid.get("prev_close_date") else ""
+    if fid.get("ok") and not fid.get("warnings"):
+        return f"FIDELITY PASS  prev_vix={pvs}  prev_close={pcs}{extra}"
+    if fid.get("ok"):
+        warn = "; ".join(fid.get("warnings") or [])
+        return (
+            f"FIDELITY WARN  prev_vix={pvs}  prev_close={pcs}{extra}  "
+            f"({warn})"
+        )
+    why = "; ".join(fid.get("why") or ["unknown"])
+    return (
+        f"FIDELITY FAIL  prev_vix={pvs}  prev_close={pcs}  "
+        f"({why}) — do not use this P&L as go-live"
+    )
 
 
 def fingerprint_source(src: sqlite3.Connection, date: str) -> Dict[str, Any]:
@@ -471,7 +614,15 @@ def build_day(
                         if "already exists" not in str(exc).lower():
                             raise
 
-                dst.execute("ATTACH DATABASE ? AS src", (str(Path(src_path).resolve()),))
+                # ATTACH the snapshot by filesystem path. A file: URI here
+                # is treated as a literal filename because this connection
+                # is not opened with uri=True (Windows: "unable to open
+                # database: file:C:/...?mode=ro"). The snapshot is a
+                # private copy — not the live primary.
+                dst.execute(
+                    "ATTACH DATABASE ? AS src",
+                    (str(Path(src_path).resolve()),),
+                )
                 try:
                     for table, col in BY_DATE:
                         if not table_exists(src_ro, table):
@@ -676,6 +827,11 @@ def main() -> int:
         action="store_true",
         help="also copy calibration_state / expiry_results (not needed for BT)",
     )
+    ap.add_argument(
+        "--allow-unfaithful",
+        action="store_true",
+        help="exit 0 even if a shard is missing yesterday's VIX (do not use for go-live)",
+    )
     args = ap.parse_args()
 
     src_path = Path(args.src)
@@ -701,8 +857,18 @@ def main() -> int:
             f"weekends only filtered.\n"
         )
 
-    src = open_db(src_path, readonly=True)
+    live_src = src_path
+    snap_path: Optional[Path] = None
+    src: Optional[sqlite3.Connection] = None
     try:
+        print(
+            "\n  Snapshotting source with a read-only backup "
+            "(live file is not written) ..."
+        )
+        snap_path = snapshot_readonly(live_src)
+        work_src = snap_path
+        print(f"  Snapshot : {work_src.name}")
+        src = open_db(work_src, readonly=True)
         dates = discover_dates(src)
         if args.dates:
             wanted = {d[:10] for d in args.dates}
@@ -717,7 +883,7 @@ def main() -> int:
             print("\n  No valid trading dates found to process.\n")
             return 1
 
-        print(f"\n  Source : {src_path}")
+        print(f"\n  Source : {live_src}  (work copy {work_src.name})")
         print(f"  Output : {out_dir}/")
         print(f"  Dates  : {len(dates)}  ({dates[0]} .. {dates[-1]})")
         print(
@@ -727,6 +893,7 @@ def main() -> int:
         )
 
         skipped = rebuilt = failed = verified_ok = verified_bad = 0
+        fidelity_bad = 0
         total_bytes = 0
         t0 = time.time()
 
@@ -745,28 +912,47 @@ def main() -> int:
             same = fingerprints_equal(src_fp, existing_fp or {})
 
             if args.verify_only:
+                src_has_close = (
+                    (src_fp.get("context") or {}).get("ctx_close") is not None
+                )
+                fid = shard_fidelity(
+                    out_path, d, expect_prev_close=src_has_close
+                )
+                if not fid.get("ok"):
+                    fidelity_bad += 1
                 if same:
-                    print(f"  {d}: MATCH  ({out_path.name})")
+                    print(
+                        f"  {d}: MATCH  ({out_path.name})  "
+                        f"{format_fidelity(fid)}"
+                    )
                     verified_ok += 1
                 else:
                     why = _diff_hint(src_fp, existing_fp)
-                    print(f"  {d}: DRIFT  {why}")
+                    print(f"  {d}: DRIFT  {why}  {format_fidelity(fid)}")
                     verified_bad += 1
                 continue
 
             if same and not args.force:
                 size_kb = out_path.stat().st_size / 1024
                 total_bytes += out_path.stat().st_size
+                fid = shard_fidelity(
+                    out_path, d,
+                    expect_prev_close=(
+                        (src_fp.get("context") or {}).get("ctx_close") is not None
+                    ),
+                )
+                if not fid.get("ok"):
+                    fidelity_bad += 1
                 print(
                     f"  {d}: UNCHANGED  {size_kb:>10,.1f} KB  "
-                    f"(fingerprint match — kept)"
+                    f"(fingerprint match — kept)  {format_fidelity(fid)}"
                 )
                 skipped += 1
                 continue
 
             try:
                 result = build_day(
-                    src_path,
+                    work_src,
                     out_path,
                     d,
                     include_global=bool(args.include_global),
@@ -783,15 +969,17 @@ def main() -> int:
                 for k, v in (result.get("counts") or {}).items()
             )
             action = "REPLACED" if existing_fp is not None else "CREATED"
-            ctx = (result.get("fingerprint") or {}).get("context") or {}
-            ctx_note = (
-                f"ctx={ctx.get('ctx_date')}@{ctx.get('ctx_close')}"
-                if ctx.get("ctx_close") is not None
-                else "ctx=NONE"
+            fid = shard_fidelity(
+                out_path, d,
+                expect_prev_close=(
+                    (src_fp.get("context") or {}).get("ctx_close") is not None
+                ),
             )
+            if not fid.get("ok"):
+                fidelity_bad += 1
             print(
                 f"  {d}: {action:8s}  {rows:>10,} rows  "
-                f"{size_kb:>10,.1f} KB  {ctx_note}"
+                f"{size_kb:>10,.1f} KB  {format_fidelity(fid)}"
             )
             rebuilt += 1
 
@@ -800,17 +988,38 @@ def main() -> int:
         if args.verify_only:
             print(
                 f"  Verify: {verified_ok} match, {verified_bad} drift, "
-                f"{skipped} empty-source  ({elapsed:.1f}s)\n"
+                f"{skipped} empty-source, fidelity_fail={fidelity_bad}  "
+                f"({elapsed:.1f}s)\n"
             )
-            return 0 if verified_bad == 0 else 2
+            if verified_bad:
+                return 2
+            if fidelity_bad and not args.allow_unfaithful:
+                return 2
+            return 0
 
         print(
             f"  Done. rebuilt={rebuilt} unchanged={skipped} failed={failed}  "
+            f"fidelity_fail={fidelity_bad}  "
             f"{total_bytes / (1024 * 1024):,.1f} MB on disk  ({elapsed:.1f}s)\n"
         )
-        return 0 if failed == 0 else 1
+        if failed:
+            return 1
+        if fidelity_bad and not args.allow_unfaithful:
+            print(
+                "  One or more shards missing prev_day_vix_close. "
+                "Do not treat those P&L numbers as live-faithful. "
+                "(pass --allow-unfaithful only to ignore this.)"
+            )
+            return 2
+        return 0
     finally:
-        src.close()
+        if src is not None:
+            try:
+                src.close()
+            except Exception:
+                pass
+        if snap_path is not None:
+            remove_db_trio(snap_path)
 
 
 def _diff_hint(
