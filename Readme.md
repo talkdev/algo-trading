@@ -88,6 +88,8 @@ Hard Invariant = no credit into labelled threatened trend
 | Sticky trend refuse | After a labelled UPTREND BCS refuse (or DOWNTREND BPS refuse), a one-cycle RANGE flicker does not re-open that credit. |
 | Unfinished extremes | BCS at loc ≥ 0.90 / BPS at loc ≤ 0.10 refused unless day-structure / extreme-fade waiver applies. |
 | Mid-range fade | Mid-location fade into a with-grind EMA/VWAP is refused (Sep18-class). |
+| Live WAL | `wal_autocheckpoint=0`; close does **not** TRUNCATE. Recover with `restore_primary_db.py`. |
+| Replay fidelity | Live-parity preflight (yesterday VIX / prior close / chain / session_state). FAIL exits 2 unless `--allow-unfaithful`. |
 
 #### Still true from v65–v65h (do not regress)
 
@@ -116,63 +118,49 @@ Replay P&L tables printed in older README revisions are **not** a live guarantee
 3. **Hunt first divergence of decision**, not EOD P&L. Replay blotter wins are not proof live will refuse the next bad entry.
 4. **Deploy proof.** Restart the live process; banner must show `v65m7q-cycle-alive-watchdog`. Confirm PID start time ≥ fix time.
 5. **Inherited bad opens.** Entry invariants do not close positions opened under old code; manage/flatten under the exit ladder.
-6. **Sanity before live:** `python verify_all.py` (module self-tests + static pre-flight). There is no `preflight_live.py` or `tests/test_live_invariants.py` in this tree.
+6. **Sanity before live:** `python verify_all.py` (module self-tests + static pre-flight). There is no `preflight_live.py` or `tests/test_live_invariants.py` in this tree. Corrupt primary: `python restore_primary_db.py` (never while `main.py` has the file open).
 
 ---
 
 ### 2. Module Architecture & Import Dependency Graph
 
 ```
+   bot_controller.py (/run)          backtest_engine.py
+   Telegram remote; writes           SimClock + ReplayClient
+   algo.stop on /stop                FillModel + scratch DB
+              │                                  │
+              └──────────────┬───────────────────┘
+                             ▼
                   ┌───────────────────────────────┐
                   │           main.py             │
                   │   Live / replay orchestrator  │
                   │     MainEngine.run_one_cycle  │
+                  │   telegram_reporter (live)    │
                   └──────────────┬────────────────┘
                                  │
-              ┌──────────────────┼──────────────────┐
-              ▼                  ▼                  ▼
-   ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-   │ bot_controller  │ │ backtest_engine │ │ telegram_reporter│
-   │ Telegram /start │ │ SimClock +      │ │ daemon sender   │
-   │ /stop → algo.stop│ │ ReplayClient    │ │ (live only)     │
-   └─────────────────┘ └────────┬────────┘ └─────────────────┘
-                                │
-                                ▼
-        ┌───────────────────────────────────────────────┐
-        │              strategy_engine.py               │
-        │   Hard gates, Intent, map, EV, momentum       │
-        └───────┬───────────────────────────────┬───────┘
-                │                               │
-                ▼                               ▼
-    ┌───────────────────────┐       ┌───────────────────────┐
-    │   regime_engine.py    │       │  calibration_engine.py│
-    │  4-tier classifier    │       │  rolling 20-session   │
-    │  size_multiplier      │       │  Bayesian shrinkage   │
-    └───────────┬───────────┘       └───────────┬───────────┘
-                │                               │
-                ▼                               ▼
-    ┌───────────────────────┐       ┌───────────────────────┐
-    │  execution_engine.py  │       │    data_engine.py     │
-    │  PENDING→OPEN, 7-pri  │       │  1m/5m/15m bars,      │
-    │  exit, profit lock,   │       │  chain, Greeks, OR    │
-    │  flatten / orphans    │       │                       │
-    └───────────┬───────────┘       └───────────┬───────────┘
-                │                               │
-                └───────────────┬───────────────┘
-                                ▼
-                    ┌───────────────────────┐
-                    │        core.py        │
-                    │ Config, Database,     │
-                    │ ExpiryCalendar,       │
-                    │ UpstoxClient, by_dte  │
-                    └───────────────────────┘
+        ┌────────────────────────┼────────────────────────┐
+        ▼                        ▼                        ▼
+ strategy_engine.py      execution_engine.py        data_engine.py
+ hard gates / Intent     PENDING→OPEN / 7-pri       1m/5m/15m bars
+ map / EV / momentum     lock / HWM / flatten       chain / OR / VIX
+        │                        │                        │
+        └────────────┬───────────┴────────────┬───────────┘
+                     ▼                        ▼
+             regime_engine.py         calibration_engine.py
+             4-tier classifier        rolling 20-session
+                     │                (main.py instance is live)
+                     └────────────┬───────────┘
+                                  ▼
+                               core.py
+                    Config, Database (WAL, no TRUNCATE),
+                    ExpiryCalendar, UpstoxClient, by_dte
 ```
 
 #### Key module roles
 
 1. **`main.py` — production driver.** Instantiates every engine, runs the cycle (`regime_calc_interval_sec` default **15**), watchdog, `/stop` flatten, daily halt, Telegram lifecycle, trade console report. `MainEngine.for_replay()` is the backtest entry. Paper is the default (`PAPER_TRADE_MODE`); live requires `LIVE_RATES_VERIFIED`.
-2. **`bot_controller.py` — operator remote.** Telegram `/start` `/stop` (writes `logs/algo.stop`). It is **not** the trading loop.
-3. **`core.py`.** `Config` (env.txt + defaults), SQLite `Database` (WAL + `synchronous=FULL` + `quick_check` on open), `ExpiryCalendar` (NIFTY **weekly Tuesday** expiry; Monday if Tuesday is a holiday), `UpstoxClient`, `now_ist` / `today_ist` / `by_dte` / `dte_blend`.
+2. **`bot_controller.py` — operator remote.** Telegram `/start`/`help` print commands; **`/run` launches `main.py`**; `/stop` writes `{LOG_DIR}/algo.stop` then the engine flattens. Startup kills duplicate `bot_controller.py` processes (Task Scheduler relaunch guard). It is **not** the trading loop. `/stock` runs `stock-screener.py`.
+3. **`core.py`.** `Config` (env.txt + defaults), SQLite `Database` (WAL + `synchronous=FULL` + `wal_autocheckpoint=0` + **no TRUNCATE on close**, `quick_check` on open), `ExpiryCalendar` (NIFTY **weekly Tuesday** expiry; Monday if Tuesday is a holiday), `UpstoxClient`, `now_ist` / `today_ist` / `by_dte` / `dte_blend`.
 4. **`data_engine.py`.** Spot / VIX / chain ingest, 1-minute bars, 5-minute fast ADX (`adx_fast_resample=300s`), 15-minute MTF (EMA 9/21, ADX 14, VWAP, Parkinson RV). **No Supertrend; no synthetic Black-76/BS Greeks** — deltas/IV come from the broker chain. Drops the **forming 1-minute bar** before MTF. Session windows from **DTE**, not weekday.
 5. **`calibration_engine.py`.** Live `CalibrationEngine` used by `MainEngine` and injected into `StrategyEngine` / `ExecutionEngine`. Rolling ~20-session shrinkage on VIX / VRP / OI / PCR / skew / day-range. `regime_engine.py` still contains a second `CalibrationEngine` class that `RegimeEngine` constructs internally — live threshold updates are pushed from the `main.py` instance.
 6. **`regime_engine.py`.** Four-tier classification → `final_regime` + `size_multiplier`. Does **not** emit `MOMENTUM_BUY_*` — those are strategy-layer substitutes.
@@ -180,11 +168,10 @@ Replay P&L tables printed in older README revisions are **not** a live guarantee
 8. **`execution_engine.py`.** Place / reconcile / monitor / flatten. 7-priority exit ladder, debit HWM, PENDING_ENTRY, orphan Exit-All.
 9. **`backtest_engine.py`.** Historical pump + `FillModel` + blotter / audit / `--test`.
 10. **`telegram_reporter.py`.** Start / heartbeat / order / close / stop. Own daemon thread — never sync-send on the trading thread.
-11. **`split_db_per_day.py`.** Live primary → `data/per_day/*.db` shards for replay.
-12. **`verify_all.py`.** Module self-tests + static pre-flight (does not start the live loop).
-13. **`upstox_token.py`.** OAuth token refresh.
-
-`restore_primary_db.py` is **not** in this tree. A corrupt/empty primary is handled by `Database` refusing a failed `quick_check`, and by `backtest_engine.py` falling back to `data/per_day/` when `--db` is omitted.
+11. **`split_db_per_day.py`.** Snapshot the live primary read-only, then write `data/per_day/*.db` shards. Each day prints FIDELITY PASS/WARN/FAIL (missing yesterday VIX is FAIL, exit 2). `--allow-unfaithful` only to ignore that.
+12. **`restore_primary_db.py`.** Recover `data/nifty_algo_v3.db`: refuse if `main.py` still has it open → integrity of live+WAL → table salvage → newest `.corrupt.*` quarantine → merge `data/per_day/` last (overlay today’s salvaged rows). `--dry-run` / `--force-shards`.
+13. **`verify_all.py`.** Module self-tests + static pre-flight (does not start the live loop). Still lists `clean-db.py` in compile checks; that file is **not** in the tree.
+14. **`upstox_token.py`.** OAuth token refresh.
 
 ---
 
@@ -225,10 +212,12 @@ class StrategyEngine:
 
 #### Database
 
-- WAL + `PRAGMA synchronous=FULL`, 60s busy timeout, WAL checkpoint on close and after chain-snapshot bursts.
-- Startup `PRAGMA quick_check`; a failed primary is refused (do not trade on a corrupt file).
+- WAL + `PRAGMA synchronous=FULL`, `wal_autocheckpoint=0`, 60s busy timeout, 64MB cache.
+- **Do not checkpoint-truncate the live primary.** A kill during `wal_checkpoint(TRUNCATE)` rewrote the btree and emptied the WAL. Close leaves the WAL on disk; next open replays it. Chain-snapshot bursts do **not** checkpoint. `checkpoint()` is optional PASSIVE and is not on the live write path.
+- Startup: `PRAGMA quick_check` + `COUNT(*)` on `option_chain_snapshot`. Fail loudly and point at `python restore_primary_db.py`.
 - `strategy_decisions` stores every cycle (`action`, `strategy_name`, `reason`, `params_json`, `signals_json`).
 - After regime merge, `MainEngine` patches the latest `cycle_log` **and** `market_snapshots` row (snapshots are written *before* enrichment).
+- Previous-day VIX for Gate 1 / `momentum_vix_gap` prefers `session_state.prev_day_vix_close`, then `daily_summary.vix_close`, then `vix_history`. Shards that omit yesterday’s VIX are **not live-faithful**.
 
 ---
 
@@ -614,19 +603,22 @@ SizedLots = RawLots × size_mult
 
 ```bash
 python main.py                 # live or paper (PAPER_TRADE_MODE in env.txt)
-python bot_controller.py       # Telegram remote
+python bot_controller.py       # Telegram remote (/run, /stop, /status)
 python verify_all.py           # module tests + static pre-flight
 python upstox_token.py         # refresh access token
+python restore_primary_db.py   # recover corrupt/unreadable primary
+python split_db_per_day.py     # shards for replay (after a healthy session)
 ```
 
-- `PAPER_TRADE_MODE=true` uses `PaperOrderExecutor` + optional `FillModel`.  
+- `PAPER_TRADE_MODE=true` uses `PaperOrderExecutor` + optional `FillModel`. Live also requires `LIVE_RATES_VERIFIED=true` or the loader forces paper.
 - Live orders: place **once** (`order_max_retries=0`), reconcile by tag (`order_tag_prefix=nav6`). Exits escalate as LIMIT + market-protection (2%); no MARKET/SL-M for options.  
-- `/stop` writes `{LOG_DIR}/algo.stop`. Main flattens (tag Exit-All, including PENDING_ENTRY) then exits.  
+- `/stop` writes `{LOG_DIR}/algo.stop`. Main flattens (tag Exit-All, including PENDING_ENTRY) then exits **without** WAL TRUNCATE.  
 - Watchdog: poll 5s; feed degrade 45s / force-exit 120s; square-off deadline **15:18**. A cycle in progress is **alive**.  
 - Soft halt at 50% of daily loss (alert); hard halt **flattens**.  
 - Startup: PENDING_ENTRY reconcile (probe all dispatch states; flatten via tag — never `execute_close` with empty legs); orphan PLACED without `position_id` flattened (`orphan_flatten_at_broker=true`); OPEN with 0 legs → `_finalize_empty_open_position`; broker flat + local OPEN → `_heal_local_open_broker_flat`.  
 - `ALLOW_SAME_CYCLE_REENTRY` default **true** (live = BT).  
 - Lot size default **65** — verify against the current NSE series.
+- `bot_controller` kills other copies of itself on launch so Telegram `getUpdates` is not locked.
 
 #### Telegram (`telegram_reporter.py`)
 
@@ -644,9 +636,10 @@ Same 84-column block in live and replay, from the persisted book + current chain
 
 #### Primary DB
 
-- Path default `data/nifty_algo_v3.db`.  
-- After healthy sessions: `python split_db_per_day.py` (optional `--force`, `--verify-only`, `--dates`, `--include-global`).  
-- **No** Google Drive upload in the current `split_db_per_day.py`.  
+- Path default `data/nifty_algo_v3.db`. WAL is the crash log (`wal_autocheckpoint=0`).
+- After healthy sessions: `python split_db_per_day.py` (optional `--force`, `--verify-only`, `--dates`, `--include-global`, `--allow-unfaithful`). Split snapshots the live file **read-only** and never writes it. Missing yesterday VIX → FIDELITY FAIL, exit 2.
+- Corrupt / unreadable primary: `python restore_primary_db.py` (`--dry-run`, `--force-shards`). Refuses if `main.py` still holds the file.
+- **No** Google Drive upload in `split_db_per_day.py`.
 - Replay without `--db`: use primary if it has `option_chain_snapshot` rows; else every usable `data/per_day/*.db` shard.
 
 ---
@@ -655,9 +648,12 @@ Same 84-column block in live and replay, from the persisted book + current chain
 
 Harness edges only: `SimClock`, `ReplayClient`, `FillModel`, scratch `Database`, Telegram stub. No parallel `decide()` / `monitor_position()` / `_open` / `_close`.
 
+Every run first executes a **live-parity preflight** (env/holidays/events, construct `MainEngine`, yesterday VIX + prior close + chain + `session_state` on each session). FAIL exits **2** unless `--allow-unfaithful`. A green blotter on an unfaithful shard is not go-live evidence.
+
 ```bash
 python backtest_engine.py [OPTIONS]
-python split_db_per_day.py [--force] [--verify-only] [--dates YYYY-MM-DD ...]
+python split_db_per_day.py [--force] [--verify-only] [--dates YYYY-MM-DD ...] [--allow-unfaithful]
+python restore_primary_db.py [--dry-run] [--force-shards]
 python verify_all.py
 ```
 
@@ -673,6 +669,7 @@ python verify_all.py
 | `--audit` | Coverage only |
 | `--test` | Harness self-test |
 | `--verbose` | Cycle log |
+| `--allow-unfaithful` | Ignore live-parity FAIL (do not treat that P&L as go-live) |
 | `--trade-report {each_cycle,on_change,off}` | Overrides `TRADE_REPORT_MODE` |
 
 Hunt correlated-debit overlap only when the **live** book itself stacked; do not force the env in replay.
@@ -749,7 +746,8 @@ Hunt correlated-debit overlap only when the **live** book itself stacked; do not
 
 | Knob | Default | Env |
 |---|---|---|
-| Paper mode | from env | `PAPER_TRADE_MODE` |
+| Paper mode | true unless live verified | `PAPER_TRADE_MODE` |
+| Live rates verified | **false** (forces paper) | `LIVE_RATES_VERIFIED` |
 | Capital | ₹10,00,000 | `STARTING_CAPITAL` |
 | Daily loss / per-trade | 8% / 2% | `MAX_DAILY_LOSS_PCT` / `MAX_RISK_PER_TRADE_PCT` |
 | Concurrent / entries | 2 / 3 | `MAX_CONCURRENT_POSITIONS` / `MAX_ENTRIES_PER_DAY` |
