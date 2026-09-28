@@ -1017,9 +1017,10 @@ class RegimeClassifier:
 
         Gate order (hard blocks checked first):
         1. ABORT: real VIX spike, extreme VIX, VIX data failure
-        2. VRP data error: VRP > max(8pp, 0.70 x ATM IV) → NEUTRAL
+        2. VRP data error: dead RV or VRP above the IV-relative bound → NEUTRAL
         3. IV behavior: EXPANDING/SPIKING → NEUTRAL (hard block)
-        4. Day move used: > 55% of straddle → NEUTRAL
+        4. Day-move stamps NEUTRAL except on WIDE/VERY_WIDE labelled trends
+           (strategy layer still owns the threat-side block)
         5. VRP classification: proportional to ATM IV, DTE-adjusted, OR-adjusted
         6. Borderline sell check
 
@@ -1047,16 +1048,30 @@ class RegimeClassifier:
 
         # ── Gate 1: ABORT checks ──────────────────────────────────────────
 
-        # Real VIX spike: VIX up ≥15% from previous day close AND VIX ≥ 14
+        # Real VIX spike: VIX up ≥15% from previous close AND VIX ≥ 14
+        # AND the session itself is expanding. An overnight gap to ~14
+        # with STABLE/DECLINING IV is a level, not an emergency — the
+        # later VRP gates classify it as sell-premium (live Sep28:
+        # 9 ABORT enter/exit flips at VIX 13.96–14.12, VRP 6–10pp,
+        # afternoon windows all STABLE). Same contract as straddle
+        # explosion: that path also does not ABORT. Absolute VIX still
+        # aborts below.
         if prev_day_vix_close and prev_day_vix_close > 0 and vix >= 14.0:
             spike_pct = (vix - prev_day_vix_close) / prev_day_vix_close * 100.0
             if spike_pct >= self.config.abort_vix_spike_pct:
-                details["trigger"] = f"REAL_VIX_SPIKE_{spike_pct:.1f}pct"
-                self.logger.warning(
-                    f"ABORT: Real VIX spike {spike_pct:.1f}% "
-                    f"({prev_day_vix_close:.1f} → {vix:.1f})"
+                _ivb = str(iv_behavior or "").upper()
+                if _ivb in ("EXPANDING", "SPIKING"):
+                    details["trigger"] = f"REAL_VIX_SPIKE_{spike_pct:.1f}pct"
+                    self.logger.warning(
+                        f"ABORT: Real VIX spike {spike_pct:.1f}% "
+                        f"({prev_day_vix_close:.1f} → {vix:.1f}) "
+                        f"iv={_ivb}"
+                    )
+                    return VolatilityRegime.ABORT, details
+                details["overnight_vix_gap_pct"] = round(spike_pct, 2)
+                details["trigger"] = (
+                    f"OVERNIGHT_VIX_GAP_{spike_pct:.1f}pct_iv_{_ivb or 'UNKNOWN'}"
                 )
-                return VolatilityRegime.ABORT, details
 
         # Extreme absolute VIX
         if vix >= self.config.abort_vix_absolute:
@@ -1160,10 +1175,32 @@ class RegimeClassifier:
             details["trigger"] = f"IV_{iv_behavior}_HARD_BLOCK"
             return VolatilityRegime.NEUTRAL, details
 
-        # ── Gate 4: Day move used ─────────────────────────────────────────
+        # ── Gate 4: Day-move stamps NEUTRAL unless the tape is a measured
+        # wide-range trend. Exhausted session range is a strategy question
+        # (threat-side + with-trend exemption in _check_hard_gates). Using
+        # it as a vol fact zeroed VRP on the engine's best harvest days
+        # (live: VRP ~8.7pp, day_move 141%, OR VERY_WIDE, vol=NEUTRAL, then
+        # EV killed the with-trend BCS). A NARROW/MODERATE morning that
+        # merely outran the straddle still stamps NEUTRAL — that wait is
+        # what kept Sep17 from booking a 10:06 flicker BPS.
         if day_move_used >= self.config.day_move_used_block_pct:
-            details["trigger"] = f"DAY_MOVE_USED_{day_move_used:.0f}PCT"
-            return VolatilityRegime.NEUTRAL, details
+            _px_dm = str(signals.get("price_regime") or "")
+            _or_dm = str(or_condition or "")
+            _wide_trend = (
+                _or_dm in ("WIDE", "VERY_WIDE")
+                and _px_dm in (
+                    "DOWNTREND", "STRONG_DOWNTREND",
+                    "UPTREND", "STRONG_UPTREND",
+                )
+            )
+            details["day_move_used_pct"] = day_move_used
+            if _wide_trend:
+                details["day_move_note"] = (
+                    f"DAY_MOVE_{day_move_used:.0f}PCT_WIDE_TREND_NOT_A_VOL_STAMP"
+                )
+            else:
+                details["trigger"] = f"DAY_MOVE_USED_{day_move_used:.0f}PCT"
+                return VolatilityRegime.NEUTRAL, details
 
         # ── Gate 5: Chain stale ───────────────────────────────────────────
         if chain_stale:
@@ -2812,13 +2849,21 @@ class RegimeClassifier:
         if borderline_sell:
             conflict_reduction *= 0.50
 
-        # OR condition modifier
-        if or_condition == "MODERATE":
-            conflict_reduction *= 0.75
-        elif or_condition == "WIDE":
-            conflict_reduction *= 0.50
-        elif or_condition == "VERY_WIDE":
-            conflict_reduction *= 0.25
+        # OR width is a condor/range risk. A confirmed trend already
+        # printed that range — crushing the with-trend vertical for the
+        # same wide OR (strategy already waives wide_or on this path)
+        # left directional tickets at ~0.07 size while EV still ran.
+        _dir_price = price in (
+            PriceRegime.UPTREND, PriceRegime.STRONG_UPTREND,
+            PriceRegime.DOWNTREND, PriceRegime.STRONG_DOWNTREND,
+        )
+        if not _dir_price:
+            if or_condition == "MODERATE":
+                conflict_reduction *= 0.75
+            elif or_condition == "WIDE":
+                conflict_reduction *= 0.50
+            elif or_condition == "VERY_WIDE":
+                conflict_reduction *= 0.25
 
         # Strong trend → reduce size (more risk)
         if price in (PriceRegime.STRONG_UPTREND, PriceRegime.STRONG_DOWNTREND):
@@ -3715,27 +3760,52 @@ def _self_test() -> None:
     print(f"  VRP=3.2pp, EXPANDING → {vol2.value} (expect NEUTRAL)")
     assert vol2 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL, got {vol2}"
 
-    # NEUTRAL (day move used)
-    # v3.2: day_move_used_pct is no longer "percentage of the whole-day
-    # straddle consumed" - it is the realised range as a percentage of
-    # the range the market PRICED for the elapsed part of the session,
-    # so 100 means "running exactly as priced" and the block threshold
-    # moved from 60 to 125. The fixture is derived from the configured
-    # threshold so it tests the behaviour rather than pinning a number.
+    # Day-move still stamps NEUTRAL on a quiet/narrow tape (the wait
+    # that blocked the Sep17 10:06 flicker). Wide-OR + labelled trend
+    # is the harvest tape and must keep the VRP classification.
     _dm_block = float(classifier.config.day_move_used_block_pct)
-    s3 = make_signals(vrp_smoothed=3.2, day_move_used_pct=_dm_block + 15.0)
+    s3 = make_signals(
+        vrp_smoothed=3.2, iv_behavior="STABLE",
+        day_move_used_pct=_dm_block + 15.0,
+    )
     vol3, d3 = classifier.classify_volatility(s3, 0, 11.0)
     print(
         f"  VRP=3.2pp, day_move={_dm_block + 15.0:.0f}% "
-        f"(block={_dm_block:.0f}%) → {vol3.value} (expect NEUTRAL)"
+        f"(block={_dm_block:.0f}%) → {vol3.value} (expect NEUTRAL on narrow tape)"
     )
     assert vol3 == VolatilityRegime.NEUTRAL, f"Expected NEUTRAL, got {vol3}"
 
-    # ABORT (real VIX spike)
-    s4 = make_signals(vix=16.0)
+    s3w = make_signals(
+        vrp_smoothed=8.7, iv_behavior="STABLE",
+        day_move_used_pct=_dm_block + 15.0,
+        or_condition="VERY_WIDE",
+        price_regime="DOWNTREND",
+    )
+    vol3w, d3w = classifier.classify_volatility(s3w, 0, 11.0)
+    print(
+        f"  VRP=8.7pp, VERY_WIDE+DOWNTREND, day_move={_dm_block + 15.0:.0f}% "
+        f"→ {vol3w.value} (expect SELL, not a vol stamp)"
+    )
+    assert vol3w in (
+        VolatilityRegime.SELL_PREMIUM, VolatilityRegime.STRONG_SELL_PREMIUM,
+    ), f"Wide-trend day-move must not stamp NEUTRAL, got {vol3w}"
+
+    # ABORT (real VIX spike) — in-session expansion, not overnight print
+    s4 = make_signals(vix=16.0, iv_behavior="SPIKING")
     vol4, d4 = classifier.classify_volatility(s4, 0, 11.0)  # 11→16 = 45% spike
-    print(f"  VIX=16, prev=11 (45% spike) → {vol4.value} (expect ABORT)")
+    print(f"  VIX=16 SPIKING, prev=11 (45% spike) → {vol4.value} (expect ABORT)")
     assert vol4 == VolatilityRegime.ABORT, f"Expected ABORT, got {vol4}"
+
+    # Overnight gap to 16 with STABLE IV is a level, not an emergency
+    s4s = make_signals(vix=16.0, iv_behavior="STABLE", vrp_smoothed=8.0, vrp_raw=8.0)
+    vol4s, d4s = classifier.classify_volatility(s4s, 0, 11.0)
+    print(
+        f"  VIX=16 STABLE, prev=11 → {vol4s.value} "
+        f"(expect not ABORT, trigger={d4s.get('trigger')})"
+    )
+    assert vol4s != VolatilityRegime.ABORT, (
+        f"STABLE overnight VIX gap must not ABORT, got {vol4s} {d4s}"
+    )
 
     # ABORT (extreme VIX)
     s5 = make_signals(vix=25.0)

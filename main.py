@@ -172,6 +172,7 @@ class MainEngine:
         self._watchdog_last_alert   = 0.0
         self._watchdog_failures     = 0
         self._signal_received       = None
+        self._shutdown_done         = False
 
         # Replay must not steal SIGINT from the parent CLI / harness.
         if not self.replay_mode:
@@ -209,11 +210,15 @@ class MainEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     def _handle_signal(self, signum, frame) -> None:
-        """Handle OS signals (Ctrl+C, SIGTERM) for graceful shutdown."""
+        """Request stop. Do not raise and do not touch SQLite here.
+
+        Raising KeyboardInterrupt from this handler interrupted sqlite3
+        mid-write, then close() ran wal_checkpoint(TRUNCATE) and left a
+        malformed primary with an empty WAL. Set the flag; the loop
+        finishes the current statement, then shuts down.
+        """
         self._signal_received = signum
-        self.logger.info(f"Received signal {signum} — initiating graceful shutdown.")
         self.running = False
-        raise KeyboardInterrupt()
 
     # ─────────────────────────────────────────────────────────────────────
     # STARTUP
@@ -247,8 +252,14 @@ class MainEngine:
             "ADX Trend Threshold":   self.config.adx_trend_threshold,
             "ADX Strong Threshold":  self.config.adx_strong_threshold,
             "VRP Sell Threshold":    f"{self.config.vrp_sell_threshold_default:.2f}pp (default)",
-            "ABORT VIX Spike":       f"{self.config.abort_vix_spike_pct:.0f}% from prev close",
+            "ABORT VIX Spike":       f"{self.config.abort_vix_spike_pct:.0f}% from prev close "
+                                     f"(ABORT only if IV EXPANDING/SPIKING)",
             "ABORT VIX Absolute":    f"{self.config.abort_vix_absolute:.0f}",
+            "Yesterday VIX close":   (
+                f"{float(self.market_engine.state.get('prev_day_vix_close')):.2f}"
+                if self.market_engine.state.get("prev_day_vix_close")
+                else "MISSING — Gate 1 / VIX-gap blind"
+            ),
             "Day Move Block":        f"{self.config.day_move_used_block_pct:.0f}%",
             "Delta Close Threshold": self.config.delta_close_threshold,
             "Spot Proximity":        f"{self.config.spot_proximity_pts}pts",
@@ -270,6 +281,47 @@ class MainEngine:
         # v8: say on the console whether the phone will ring, and why not.
         print(f"  {self.telegram.describe()}")
         print()
+
+    def _print_default_live_guards(self) -> None:
+        """Always-on startup checks. No extra flags."""
+        pv = self.market_engine.state.get("prev_day_vix_close")
+        try:
+            pv_f = float(pv) if pv else None
+        except (TypeError, ValueError):
+            pv_f = None
+        if not pv_f:
+            print("\n  " + "!" * 70)
+            print("  !!! YESTERDAY VIX MISSING — Gate 1 and VIX-gap will not see it.")
+            print("  " + "!" * 70 + "\n")
+            self.logger.critical("prev_day_vix_close is missing at startup")
+        else:
+            self.logger.info(f"Yesterday VIX close = {pv_f:.2f}")
+
+        try:
+            open_pos = self.execution_engine._get_open_positions() or []
+        except Exception:
+            open_pos = []
+        today = today_ist().isoformat()
+        live_open = [
+            p for p in open_pos
+            if str(p.get("trading_date") or "")[:10] == today
+        ]
+        if not live_open:
+            self.logger.info("No OPEN tickets. This start is a clean process.")
+            return
+        print("\n  " + "!" * 70)
+        print("  !!! OPEN TICKET(S) — this process loaded CURRENT code onto a live book.")
+        print("  Planned gate-change restart: flatten first, then start again.")
+        print("  Crash recovery: leave this running; do not kill it to pick up new gates.")
+        for p in live_open:
+            print(
+                f"     {p.get('strategy_name')}  entry={p.get('entry_time')}  "
+                f"lots={p.get('final_lots')}"
+            )
+        print("  " + "!" * 70 + "\n")
+        self.logger.critical(
+            f"Resuming {len(live_open)} OPEN position(s) under this process's code"
+        )
 
     def _verify_lot_size(self) -> None:
         """Log lot size verification reminder."""
@@ -1861,6 +1913,13 @@ class MainEngine:
         Otherwise saves session state and leaves same-day positions for resume
         (unless past square-off deadline).
         """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        try:
+            self._stop_watchdog()
+        except Exception:
+            pass
         self.logger.info("Graceful shutdown initiated.")
 
         open_positions = self.execution_engine._get_open_positions()
@@ -1948,8 +2007,10 @@ class MainEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     def _sleep(self, seconds: float) -> None:
-        """Sleep for the given number of seconds."""
-        time_module.sleep(max(0.0, seconds))
+        """Sleep in short slices so Ctrl+C can end the wait without raising."""
+        end = time_module.monotonic() + max(0.0, seconds)
+        while self.running and time_module.monotonic() < end:
+            time_module.sleep(min(0.25, end - time_module.monotonic()))
 
     @contextlib.contextmanager
     def _flatten_gate(self):
@@ -2239,6 +2300,8 @@ class MainEngine:
         self._validate_session_state_integrity()
         self._carry_forward_capital()
         self._reconcile_unresolved_dispatches()
+        if not self.replay_mode:
+            self._print_default_live_guards()
 
         # Startup calibration
         self._run_calibration_cycle(force=True, schedule="startup")
@@ -2274,7 +2337,10 @@ class MainEngine:
                 except Exception as _pme:
                     self.logger.warning(f"Pre-market validation error: {_pme}")
                 _retries += 1
-                time_module.sleep(30)
+                self._sleep(30)
+                if not self.running:
+                    self.perform_graceful_shutdown()
+                    return
         elif now_t < dtime(9, 15):
             self.logger.info(
                 "Pre-market: Engine ready. Market opens at 09:15. Waiting."
@@ -2384,17 +2450,23 @@ class MainEngine:
 
                 self._sleep(max(0.2, 1.0 - loop_duration))
 
-            # v58: stop-file break exits the while without KeyboardInterrupt —
-            # still must flatten + save before finally.
-            if self._stop_request_flatten:
+            # Clean loop exit (Ctrl+C flag, stop-file, EOD). Close is in
+            # finally and never checkpoint-truncates the primary.
+            if self._signal_received is not None:
+                self.logger.info(
+                    f"Received signal {self._signal_received} — "
+                    "SQLite idle, shutting down without checkpoint-truncate."
+                )
+            if not self._eod_done:
                 self.perform_graceful_shutdown()
-                self.running = False
-                return
+            return
 
         except KeyboardInterrupt:
+            # Default SIGINT is replaced; this is a fallback if something
+            # else raises. Do not interrupt an in-flight sqlite write again.
             self.logger.info("Shutdown signal received.")
-            self.perform_graceful_shutdown()
             self.running = False
+            self.perform_graceful_shutdown()
             return
 
         except Exception as e:
@@ -2404,6 +2476,11 @@ class MainEngine:
             return
 
         finally:
+            if not self._shutdown_done and not self._eod_done:
+                try:
+                    self.perform_graceful_shutdown()
+                except Exception:
+                    pass
             self._stop_watchdog()
             # ── v8 requirement 5: the engine has stopped ──────────────────
             # Every exit path lands here - the end-of-day break, Ctrl+C,
@@ -2419,8 +2496,10 @@ class MainEngine:
                 self.telegram.close(timeout=8.0)
             except Exception as e:
                 self.logger.debug(f"telegram shutdown error: {e}")
-
-        self.db.close()
+            try:
+                self.db.close()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
