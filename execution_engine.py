@@ -749,11 +749,19 @@ class LiveOrderExecutor:
                 fallback=float(leg.get("exec_price", 0) or 0),
                 expected_qty=qty,
             )
+        tag = placed.get("tag")
+        if tag and fill_price > 0:
+            # Confirmed fill booked into the entry path — leave the ledger
+            # terminal so startup reconcile does not treat this as an orphan.
+            self._dispatch_write(
+                tag, leg, transaction_type, qty, fill_price, "ENTRY",
+                order_id=order_id, state="BOOKED",
+            )
         return {
             "order_id":   order_id,
             "fill_price": fill_price,
             "status":     "FILLED",
-            "tag":        placed.get("tag"),
+            "tag":        tag,
             "qty":        qty,
         }
 
@@ -851,10 +859,17 @@ class LiveOrderExecutor:
                     fill_price = float(outcome.get("price") or 0.0)
 
             if fill_price > 0:
+                tag = placed.get("tag")
+                if tag:
+                    self._dispatch_write(
+                        tag, leg, transaction_type, qty, fill_price, "EXIT",
+                        order_id=order_id, state="BOOKED",
+                    )
                 return {
                     "order_id":   order_id,
                     "fill_price": fill_price,
                     "status":     "FILLED",
+                    "tag":        tag,
                 }
 
             # Nothing may be left resting at the broker: an order that fills
@@ -873,10 +888,17 @@ class LiveOrderExecutor:
                         f"exit order {order_id} filled while being cancelled at "
                         f"{price:.2f} — booking that fill rather than re-quoting"
                     )
+                    tag = placed.get("tag")
+                    if tag:
+                        self._dispatch_write(
+                            tag, leg, transaction_type, qty, price, "EXIT",
+                            order_id=order_id, state="BOOKED",
+                        )
                     return {
                         "order_id":   order_id,
                         "fill_price": price,
                         "status":     "FILLED",
+                        "tag":        tag,
                     }
             if confirmed.get("state") != "CANCELLED":
                 raise RuntimeError(

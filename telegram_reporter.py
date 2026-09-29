@@ -71,7 +71,7 @@ from core import (
     # sign or label the same number.
     TRADE_REPORT_RULE, TRADE_REPORT_SUB,
     _tr_num, _tr_money, _tr_signed, _tr_price, _tr_strike,
-    _tr_side, _tr_closing_side, _tr_symbol, _tr_hhmm,
+    _tr_side, _tr_closing_side, _tr_symbol, _tr_hhmm, _tr_lane,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1101,8 +1101,8 @@ class TelegramReporter:
             rows = self._positions(trading_date)
             out: List[str] = []
             for index, position in enumerate(rows, start=1):
-                closed = str(position.get("status") or "OPEN").upper().startswith("CLOSE")
-                if kind == KIND_HEARTBEAT and closed:
+                lane = _tr_lane(position.get("status"))
+                if kind == KIND_HEARTBEAT and lane != "OPEN":
                     continue
                 legs = self._legs(position)
                 lines = self.block_lines(index, position, legs, chain, as_of)
@@ -1120,7 +1120,8 @@ class TelegramReporter:
         chain = snap.get("chain") or {}
         lines = self.block_lines(index, position, legs, chain, as_of)
         name = position.get("strategy_name") or "UNKNOWN"
-        closed = str(position.get("status") or "OPEN").upper().startswith("CLOSE")
+        lane = _tr_lane(position.get("status"))
+        closed = lane == "CLOSED"
         when = _tr_hhmm(position.get("exit_time") if closed
                         else position.get("entry_time"))
 
@@ -1212,7 +1213,9 @@ class TelegramReporter:
         """
         chain = chain or {}
         status = str(position.get("status") or "OPEN").upper()
-        closed = status.startswith("CLOSE")
+        lane = _tr_lane(status)
+        closed = lane == "CLOSED"
+        aborted = lane == "ABORTED"
         lots = 0
         try:
             lots = int(position.get("final_lots") or 0)
@@ -1225,9 +1228,17 @@ class TelegramReporter:
             except Exception:
                 lots = 1
 
+        if closed:
+            status_label = "Closed"
+        elif aborted:
+            status_label = "Aborted"
+        elif lane == "PENDING":
+            status_label = "Pending"
+        else:
+            status_label = "Open"
         out = [
             f"Trade-{index} | {position.get('strategy_name') or 'UNKNOWN'}"
-            f" | {'Closed' if closed else 'Open'}",
+            f" | {status_label}",
             f"  Start {_tr_hhmm(position.get('entry_time'))}",
         ]
         for leg in legs:
@@ -1237,9 +1248,9 @@ class TelegramReporter:
                 f"{_tr_price(leg.get('entry_price'))} "
                 f"(strike {_tr_strike(leg.get('strike'))})"
             )
-        reason = position.get("exit_reason") if closed else None
+        reason = position.get("exit_reason") if (closed or aborted) else None
         out.append(
-            f"  End {_tr_hhmm(position.get('exit_time') if closed else as_of)}"
+            f"  End {_tr_hhmm(position.get('exit_time') if (closed or aborted) else as_of)}"
             + (f" ({reason})" if reason else "")
         )
         for leg in legs:
@@ -1267,7 +1278,7 @@ class TelegramReporter:
                     position, legs, chain)
             except Exception as exc:
                 self._log("debug", f"compact money failed: {exc}")
-        out.append(f"  Position Status: {'Close' if closed else 'Open'}")
+        out.append(f"  Position Status: {status_label}")
         out.append(f"  Total Investment: {_tr_money(committed)}")
         out.append(f"  Total Profit: {_tr_signed(net)} "
                    f"{'realised' if realised else 'unrealised'}")
@@ -1425,9 +1436,12 @@ class TelegramReporter:
             events: List[Tuple[int, dict, List[dict], str]] = []
             for index, position in enumerate(rows, start=1):
                 position_id = str(position.get("position_id") or f"#{index}")
-                status = "CLOSED" if str(
-                    position.get("status") or "OPEN").upper().startswith("CLOSE") \
-                    else "OPEN"
+                lane = _tr_lane(position.get("status"))
+                # Only OPEN / CLOSED fire trade events; ABORTED drafts never
+                # became a booked trade.
+                if lane not in ("OPEN", "CLOSED"):
+                    continue
+                status = lane
                 previous = self._seen.get(position_id)
                 if previous == status:
                     continue

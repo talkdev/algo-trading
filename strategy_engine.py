@@ -935,6 +935,80 @@ class StrategyEngine:
                     f"{signals.get('spot_velocity_pts', 0):.0f}pts_in_3min"
                 )
 
+        # Against-thesis credit impulse: absolute velocity alone missed the
+        # 2026-09-29 11:10 BEAR entry (spot +28pts in 15s into the short-call
+        # side while abs 3-bar noise stayed under the flat limit). Signed
+        # impulse blocks selling the side the tape is attacking.
+        try:
+            _imp_up = float(signals.get("spot_impulse_up_pts") or 0.0)
+            _imp_dn = float(signals.get("spot_impulse_down_pts") or 0.0)
+            _imp_spot = float(signals.get("spot") or 0.0)
+            _imp_vix = float(signals.get("vix") or 12.0)
+            _imp_lim = max(
+                (_imp_spot * float(getattr(self.config, "spot_velocity_pct", 0.0014) or 0.0014)
+                 * (1.0 + max(0.0, (_imp_vix - 12.0)) / 24.0))
+                if _imp_spot > 0 else 35.0,
+                25.0,
+            )
+        except (TypeError, ValueError):
+            _imp_up = _imp_dn = 0.0
+            _imp_lim = 25.0
+        _imp_tw = (
+            bool(signals.get("two_way_auction"))
+            and (signals.get("afternoon_high_fade")
+                 or signals.get("afternoon_low_fade"))
+        )
+        if not _imp_tw:
+            if final_regime == "PREMIUM_SELL_BEAR" and _imp_up > _imp_lim:
+                return "NO_TRADE", (
+                    f"credit_impulse_against_bear_"
+                    f"{_imp_up:.0f}pts_up_gt_{_imp_lim:.0f}"
+                )
+            if final_regime == "PREMIUM_SELL_BULL" and _imp_dn > _imp_lim:
+                return "NO_TRADE", (
+                    f"credit_impulse_against_bull_"
+                    f"{_imp_dn:.0f}pts_down_gt_{_imp_lim:.0f}"
+                )
+
+        # Entry-abort storm: ABORTED attempts do not burn max_entries, so a
+        # rejected multi-leg can re-fire every cycle (live 2026-09-29: 28
+        # BULL_PUT_SPREAD aborts in ~20 min). Cool the same family down.
+        try:
+            _abort_rows = self.db.query(
+                "SELECT strategy_name, entry_time, exit_time FROM positions "
+                "WHERE trading_date=? AND status='ABORTED' "
+                "ORDER BY entry_time DESC LIMIT 8",
+                (today_ist().isoformat(),),
+            ) or []
+        except Exception:
+            _abort_rows = []
+        if len(_abort_rows) >= 2:
+            try:
+                _a0 = datetime.fromisoformat(str(
+                    _abort_rows[0].get("exit_time")
+                    or _abort_rows[0].get("entry_time")
+                ))
+                _a1 = datetime.fromisoformat(str(
+                    _abort_rows[1].get("exit_time")
+                    or _abort_rows[1].get("entry_time")
+                ))
+                _now_ab = now_ist()
+                _gap01 = abs((_a0 - _a1).total_seconds()) / 60.0
+                _since = (_now_ab - _a0).total_seconds() / 60.0
+                _fam0 = str(_abort_rows[0].get("strategy_name") or "")
+                _fam1 = str(_abort_rows[1].get("strategy_name") or "")
+                if (
+                    _fam0
+                    and _fam0 == _fam1
+                    and _gap01 <= 15.0
+                    and _since < 15.0
+                ):
+                    return "NO_TRADE", (
+                        f"entry_abort_storm_{_fam0}_"
+                        f"{_since:.0f}min_of_15_cooldown"
+                    )
+            except Exception:
+                pass
 
         if signals.get("straddle_expanding"):
             # Hard sell stand-aside while ATM straddle is up >6% vs the
@@ -1155,6 +1229,24 @@ class StrategyEngine:
             (final_regime == "PREMIUM_SELL_BEAR" and _dm_px in ("DOWNTREND", "STRONG_DOWNTREND"))
             or (final_regime == "PREMIUM_SELL_BULL" and _dm_px in ("UPTREND", "STRONG_UPTREND"))
         )
+        # Expiry (DTE0): an already-spent day range + plain DOWNTREND/UPTREND
+        # is a late-chop trap (live 2026-09-29: BEAR credit @124% day-move /
+        # MEDIUM / DOWNTREND entered into a bounce and CLOSE_STOP'd in 4 min).
+        # Keep the with-trend exemption only when the tape is STRONG or
+        # confidence is HIGH — otherwise the 125% block stands on expiry.
+        try:
+            _dm_dte0 = int(actual_dte if actual_dte is not None else -1)
+        except (TypeError, ValueError):
+            _dm_dte0 = -1
+        if (
+            _dm_dte0 == 0
+            and _dm_trend_confirmed
+            and _dm_threat >= 100.0
+        ):
+            _dm_conf = str(signals.get("confidence_level") or "").upper()
+            _dm_strong = _dm_px in ("STRONG_DOWNTREND", "STRONG_UPTREND")
+            if not (_dm_strong or _dm_conf == "HIGH"):
+                _dm_trend_confirmed = False
         # ── PATCH_V15: the range verdict is judged on RANGE, not speed ───
         # The time-scaled gauge above says how fast the session has moved
         # for the clock; that is the right question for a directional
@@ -5950,6 +6042,29 @@ class StrategyEngine:
             return False, "momentum_straddle_expanding", 0
         if signals.get("spot_velocity_block"):
             return False, "momentum_spot_velocity_too_fast", 0
+        # Signed impulse: do not buy puts into a rally / calls into a dump.
+        try:
+            _m_up = float(signals.get("spot_impulse_up_pts") or 0.0)
+            _m_dn = float(signals.get("spot_impulse_down_pts") or 0.0)
+            _m_spot = float(signals.get("spot") or 0.0)
+            _m_vix = float(signals.get("vix") or 12.0)
+            _m_lim = max(
+                (_m_spot * float(getattr(cfg, "spot_velocity_pct", 0.0014) or 0.0014)
+                 * (1.0 + max(0.0, (_m_vix - 12.0)) / 24.0))
+                if _m_spot > 0 else 35.0,
+                25.0,
+            )
+        except (TypeError, ValueError):
+            _m_up = _m_dn = 0.0
+            _m_lim = 25.0
+        if direction < 0 and _m_up > _m_lim:
+            return False, (
+                f"momentum_impulse_against_put_{_m_up:.0f}pts_up"
+            ), 0
+        if direction > 0 and _m_dn > _m_lim:
+            return False, (
+                f"momentum_impulse_against_call_{_m_dn:.0f}pts_down"
+            ), 0
         try:
             _vx  = float(signals.get("vix") or 0.0)
             _pvx = float(signals.get("prev_day_vix_close") or 0.0)
@@ -6009,6 +6124,23 @@ class StrategyEngine:
         # OR is already proven above: extreme ADX (>=50) without EMA is
         # enough for the day_move chase exemption on crash tapes where
         # ema_structure is still INSUFFICIENT_DATA (Sep15 10:06).
+        # Expiry-day chase: once ≥100% of the opening straddle is spent,
+        # only a crash-grade ADX (≥50) may keep buying the move. This is a
+        # HARD refuse (not an exemption toggle): env momentum_day_move_max
+        # is 200%, so the soft chase-cap below would still let ADX≈42
+        # LONG_PUTs through (replay 2026-09-29 −₹5.8k). Sep15 crash ADX≈87
+        # and Sep22 ADX≈50.5 continuation still clear; plain mid-40s do not.
+        try:
+            _mom_dte = signals.get("actual_dte")
+            if _mom_dte is None:
+                _mom_dte = signals.get("expiry_dte")
+            _mom_dte = int(_mom_dte if _mom_dte is not None else -1)
+        except (TypeError, ValueError):
+            _mom_dte = -1
+        if _mom_dte == 0 and used >= 100.0 and adx < 50.0:
+            return False, (
+                f"momentum_dte0_exhausted_adx_{adx:.0f}_lt_50"
+            ), 0
         _mom_strong = (
             adx >= _adx_strong
             and price in (
