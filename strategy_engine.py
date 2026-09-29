@@ -415,6 +415,13 @@ class StrategyEngine:
                         (signals or {}).get("event_day")
                         or (signals or {}).get("event_announced")
                     )
+                    # Measured trend uses the same ADX evidence the
+                    # momentum path already trusts: mature at the floor,
+                    # or an extreme print (ADX>=50) even if the 15-min
+                    # flag is still preview. Requiring the flag alone
+                    # blocked stacking while preview ADX printed 75
+                    # (live Sep28 10:55–11:22 BCS on, LONG_PUT never
+                    # reached the slot). Event days stay at 45.
                     _need = max(
                         45.0 if _event_stack else 36.0,
                         float(
@@ -422,7 +429,14 @@ class StrategyEngine:
                             or 28.0
                         ),
                     )
-                    if not (_mature and _adx >= _need):
+                    _measured = (
+                        _adx >= _need
+                        and (
+                            _mature
+                            or _adx >= 50.0
+                        )
+                    )
+                    if not _measured:
                         return (
                             f"slot_conflict_correlated_debit_beside_credit:{o}"
                         )
@@ -2386,19 +2400,32 @@ class StrategyEngine:
         # 4. true pin only — never a catch-all. Condor/fly need a NARROW
         # opening range, mid location, and a real flat ADX read. MODERATE
         # OR is not a pin.
+        #
+        # Stream hunt 2026-09-25 10:28–10:30: PREMIUM_SELL_RANGE +
+        # STRONG_SELL + NARROW OR + loc 0.55–0.61 + ADX 15.75 FLAT +
+        # rng 92, then range_wait_no_pin_no_lean. Two graph holes:
+        # (a) pin required adx_15_mature while the 5-min print was
+        #     already in the flat band — same tape as condor_requires_
+        #     mature_flat_adx, zero-ADX 16/17-Sep ICs stay refused
+        #     (adx < 12).
+        # (b) _grind_away fired on EMA/VWAP at loc>=0.58 without the
+        #     positioning the lean itself requires, so UNCLEAR vetoed
+        #     the pin and did not deliver the vertical.
         _pin_or = or_condition in ("VERY_NARROW", "NARROW")
-        _pin_adx = (
-            adx_15_mature
-            and 12.0 <= adx_15 < self.CONDOR_PIN_ADX_MAX
-        )
-        _pin_loc = self.PIN_LOC_LO < _loc < self.PIN_LOC_HI
+        _pin_adx = 12.0 <= adx_15 < self.CONDOR_PIN_ADX_MAX
+        _pin_loc = self.PIN_LOC_LO <= _loc <= self.PIN_LOC_HI
         _pin_rng = _rng < self.CONDOR_MAX_SESSION_RANGE_PTS
         _pin_vol = vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+        _pos_g = str(signals.get("positioning_regime") or "")
+        _pos_ok_bull_g = _pos_g in ("BULLISH", "RANGE", "STRONG_RANGE")
+        _pos_ok_bear_g = _pos_g in ("BEARISH", "RANGE", "STRONG_RANGE")
         _grind_away = (
             (_loc >= self.RANGE_SOFT_LEAN_HI
+             and _pos_ok_bull_g
              and self._soft_location_evidence(signals, "BULL"))
             or (_loc <= self.RANGE_SOFT_LEAN_LO
-                and self._soft_location_evidence(signals, "BEAR"))
+             and _pos_ok_bear_g
+             and self._soft_location_evidence(signals, "BEAR"))
         )
         if (_pin_or and _pin_adx and _pin_loc and _pin_rng and _pin_vol
                 and current_time < dtime(12, 0) and not _event
@@ -2979,15 +3006,12 @@ class StrategyEngine:
                 )
             if adx_15 >= self.config.adx_strong_threshold:
                 return False, f"condor_blocked_strong_adx_{adx_15:.0f}"
-            # Pin/condor needs a real ADX read. Immature/zero ADX with a
-            # RANGE label was how live sold a weekly IC into a two-way tape
-            # (no trend proof, no pin proof — just OR narrow).
-            # v53: also refuse the noise band ADX in (0, 12) — live 17-Sep
-            # selected IC at adx=0 / 16-Sep at adx=10; a pin needs a
-            # settled flat print, not a warm-up coincident with maturity.
-            if (not bool(signals.get("adx_15_mature", False))
-                    or adx_15 < 12.0):
-                return False, "condor_requires_mature_flat_adx"
+            # Pin/condor needs a printed flat ADX, not the 15-min mature
+            # flag. Zero / (0,12) still refused (16-Sep adx=10, 17-Sep
+            # adx=0 ICs). The mature flag alone sat above a 15.75 FLAT
+            # print and held the Sep25 NARROW-OR pin in range_wait.
+            if adx_15 < 12.0:
+                return False, "condor_requires_flat_adx_ge_12"
             if bool(signals.get("two_way_auction")):
                 return False, "condor_banned_on_two_way_auction"
             # v52: pin needs a NARROW OR. MODERATE was the live IC catch-all.
@@ -3034,7 +3058,7 @@ class StrategyEngine:
                 return False, (
                     f"condor_location_drift_{_ic_loc:.2f}_prefer_vertical"
                 )
-            if not (self.PIN_LOC_LO < _ic_loc < self.PIN_LOC_HI):
+            if not (self.PIN_LOC_LO <= _ic_loc <= self.PIN_LOC_HI):
                 return False, (
                     f"condor_location_not_mid_{_ic_loc:.2f}_prefer_wait_or_vertical"
                 )
@@ -4270,6 +4294,32 @@ class StrategyEngine:
             val = max(float(wing_pts) * 0.55, prox)
         return round(max(val, 10.0), 1)
 
+    def _with_trend_credit_aligned(
+        self,
+        signals: dict,
+        legs: Optional[List[dict]],
+    ) -> bool:
+        """True when a directional credit sits on the unfavoured side of a labelled trend.
+
+        Hard gates already waive wide-OR / day-move for this path. EV must
+        price the same thesis — not a symmetric condor tail on a one-way tape.
+        Vol label is not required: classify_final emits PREMIUM_SELL_BEAR/BULL
+        on NEUTRAL vol for measured trends.
+        """
+        if not legs:
+            return False
+        sell_sides = {
+            str(l.get("option_type") or "").lower()
+            for l in legs if str(l.get("action")) == "SELL"
+        }
+        fr = str(signals.get("final_regime") or "")
+        px = str(signals.get("price_regime") or "")
+        if sell_sides == {"call"} and fr == "PREMIUM_SELL_BEAR":
+            return px in ("DOWNTREND", "STRONG_DOWNTREND")
+        if sell_sides == {"put"} and fr == "PREMIUM_SELL_BULL":
+            return px in ("UPTREND", "STRONG_UPTREND")
+        return False
+
     def _compute_ev_gate(
         self,
         net_credit:      float,
@@ -4676,39 +4726,30 @@ class StrategyEngine:
             # diffusive than their terminal volatility implies, or any
             # of the positioning the prior is built from.
             p_win = _wm * p_win_model + (1.0 - _wm) * p_win_prior
-        # v3.9: regime-structure alignment. The touch model assumes
-        # symmetric threat: a rally toward a sold call spread and a
-        # selloff toward a sold put spread are priced alike. But the
-        # structure placed by a directional regime sell has its threat
-        # side on the UNFAVOURED move of a confirmed trend - on
-        # 2026-09-08 (downtrend, STRONG_SELL_PREMIUM, VRP 3.17pp) the
-        # post-midday tape never retraced more than 21 points against
-        # the call credit. Desks recognise this skew explicitly; a
-        # small bounded bonus is how it shows up here without letting
-        # the label override the arithmetic.
+        # Regime-structure alignment. Hard gates already treat with-trend
+        # BCS/BPS as the thesis of a labelled trend (wide-OR / day-move
+        # waivers). EV required vol=SELL_PREMIUM AND market delta, then
+        # fattened p_tail on the same wide OR — so the path classify_final
+        # opened died at the economics node. Align when the vol stamp is
+        # a real sell (Gate 4 no longer forges NEUTRAL on wide-trend days)
+        # even if delta is missing. Do not skip ADX tail fattening: that
+        # wait is what kept a NARROW-OR flicker BPS off the Sep17 book.
+        _aligned = self._with_trend_credit_aligned(signals, legs)
         _align = float(getattr(self.config, "ev_regime_align_bonus", 0.05))
-        if _align > 0 and legs and _p_mkt is not None:
-            _sell_sides = {
-                str(l.get("option_type"))
-                for l in legs if str(l.get("action")) == "SELL"
-            }
-            _fr_ev = str(signals.get("final_regime") or "")
-            _vr_ok = str(signals.get("vol_regime") or "") in (
-                "SELL_PREMIUM", "STRONG_SELL_PREMIUM"
-            )
-            _aligned = _vr_ok and (
-                (_sell_sides == {"call"} and _fr_ev == "PREMIUM_SELL_BEAR") or
-                (_sell_sides == {"put"} and _fr_ev == "PREMIUM_SELL_BULL")
-            )
-            if _aligned:
-                p_win += _align
+        _vol_sell = str(signals.get("vol_regime") or "") in (
+            "SELL_PREMIUM", "STRONG_SELL_PREMIUM"
+        )
+        if _align > 0 and _aligned and _vol_sell:
+            p_win += _align
         p_win = max(0.28, min(0.92, p_win))
 
         # ── [E2] Three-outcome expectancy ─────────────────────────────────
         # v44: gamma-gap probability blended on sqrt-life, not a DTE0/1+ step
         p_tail = self.config.gamma_tail_prob_for_dte(dte)
-        # A wide opening range and a trending tape both fatten the tail.
-        if or_condition in ("WIDE", "VERY_WIDE"):
+        # Wide OR fattening is a pin/condor tax. A with-trend vertical is
+        # harvesting that range; do not charge it twice. Strong ADX still
+        # fattens the tail (continuation can overshoot the short).
+        if or_condition in ("WIDE", "VERY_WIDE") and not _aligned:
             p_tail *= 1.8
         _adx_ev = float(signals.get("adx_15") or 0.0)
         if _adx_ev >= float(self.config.adx_strong_threshold):
@@ -6073,18 +6114,38 @@ class StrategyEngine:
         if _vx > 0 and _pvx > 0:
             _gap = (_vx / _pvx - 1.0) * 100.0
             if _gap > float(getattr(cfg, "momentum_vix_gap_max_pct", 12.0)):
-                # Overnight VIX gap is not "buying a top" when the session
-                # itself just exploded the straddle on a measured trend
-                # (Sep24: prev 10.36 → 12.32 = 19% fail while ADX≈40 dump).
+                # Companion debit only. First-ticket LONG_* into an overnight
+                # VIX gap displaces the credit the regime already selected
+                # (replay Sep28 10:56 LONG_PUT vs live 11:05 BCS).
+                _open_credit_same = False
+                try:
+                    _on = self._open_strategy_names()
+                    if direction < 0:
+                        _open_credit_same = BEAR_CALL_SPREAD in _on
+                    elif direction > 0:
+                        _open_credit_same = BULL_PUT_SPREAD in _on
+                except Exception:
+                    _open_credit_same = False
                 _iv_cont_gap = (
-                    bool(signals.get("straddle_exploded"))
-                    or str(signals.get("iv_behavior") or "")
-                    in ("EXPANDING", "SPIKING")
-                ) and adx >= 40.0 and (
-                    (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
-                    or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+                    _open_credit_same
+                    and (
+                        bool(signals.get("straddle_exploded"))
+                        or str(signals.get("iv_behavior") or "")
+                        in ("EXPANDING", "SPIKING")
+                    )
+                    and adx >= 40.0 and _trend_aligned
                 )
-                if not _iv_cont_gap:
+                _quiet_cont = (
+                    _open_credit_same
+                    and _trend_aligned
+                    and _ivb in ("STABLE", "DECLINING", "CRUSHING")
+                    and adx >= float(getattr(cfg, "adx_strong_threshold", 28.0))
+                    and (
+                        bool(signals.get("adx_15_mature", False))
+                        or adx >= 40.0
+                    )
+                )
+                if not (_iv_cont_gap or _quiet_cont):
                     return False, f"momentum_vix_gap_{_gap:.0f}pct", 0
 
         # ── freshness: a day that has already spent its priced range is
@@ -7082,6 +7143,7 @@ class StrategyEngine:
             for tok in (
                 "condor_requires_mature_adx",
                 "condor_requires_mature_flat_adx",
+                "condor_requires_flat_adx_ge_12",
                 "condor_requires_narrow_or",
                 "condor_location_not_mid",
                 "condor_location_drift",

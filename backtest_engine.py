@@ -35,6 +35,15 @@
 #  2. Snapshot data only exists for sessions the engine was actually running.
 #     Run --audit first.
 #  3. The rejection census is as important as P&L.
+#  4. Replay first runs a live-parity preflight that must PASS or the
+#     process exits 2 (the 28-Sep miss: BT green, live Gate 1 ABORT
+#     because yesterday's VIX was missing on the shard). Checks:
+#       a) env.txt, nse_holidays.json, high_impact_events.json
+#       b) import + construct MainEngine (same path as main.py)
+#       c) live primary at DB_PATH: readable, yesterday VIX, prior close
+#       d) each replay session: prev_vix, prior close, chain, session_state
+#     Token / Upstox login is the only live check this file skips.
+#     --allow-unfaithful to ignore.
 #
 #  USAGE
 #  -----
@@ -83,7 +92,11 @@ import core  # noqa: E402
 from core import (  # noqa: E402
     Config,
     Database,
+    DEFAULT_EVENTS_FILE,
+    DEFAULT_HOLIDAYS_FILE,
+    ENV_FILE,
     RateLimiter,
+    get_high_impact_events,
     get_nse_holidays,
     load_config,
     today_ist,
@@ -373,7 +386,138 @@ class HistoricalStore:
                 f"gap leans cannot fire. Re-split with a patched "
                 f"split_db_per_day.py for live-faithful replays."
             )
-        return DaySlice(trading_date, rows, candles, prev_close)
+        # Yesterday's VIX lives on this session's session_state row.
+        # Prior daily_summary / vix_history rows are not in a per-day shard.
+        prev_day_vix = None
+        ss = self._q(
+            "SELECT prev_day_vix_close FROM session_state "
+            "WHERE trading_date=? AND prev_day_vix_close IS NOT NULL "
+            "AND prev_day_vix_close > 0 "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (trading_date,),
+        )
+        if not ss:
+            ss = self._q(
+                "SELECT prev_day_vix_close FROM session_state "
+                "WHERE trading_date=? AND prev_day_vix_close IS NOT NULL "
+                "AND prev_day_vix_close > 0 LIMIT 1",
+                (trading_date,),
+            )
+        if ss:
+            try:
+                prev_day_vix = float(ss[0]["prev_day_vix_close"])
+            except (TypeError, ValueError, KeyError):
+                prev_day_vix = None
+        if prev_day_vix is None:
+            print(
+                f"[backtest] WARNING: {trading_date}: no prev_day_vix_close "
+                f"on session_state — Gate 1 spike-ABORT and momentum_vix_gap "
+                f"will not see yesterday's close."
+            )
+        return DaySlice(trading_date, rows, candles, prev_close, prev_day_vix)
+
+    def probe_live_parity(
+        self,
+        trading_date: str,
+        *,
+        first_book_date: Optional[str] = None,
+    ) -> dict:
+        """Same inputs live main.py needs, minus the Upstox token.
+
+        FAIL (why): missing prev_day_vix, missing prior close (except the
+        first day in the book), no session_state, fewer than 5 chain
+        snapshots. WARN: partial capture ending before 15:00.
+        """
+        out: dict = {
+            "date": trading_date,
+            "ok": False,
+            "why": [],
+            "warnings": [],
+            "prev_day_vix": None,
+            "prev_close": None,
+            "n_chain": 0,
+            "last_hhmm": "",
+            "n_session": 0,
+        }
+        rows = self._q(
+            "SELECT COUNT(DISTINCT capture_time) AS n, "
+            "MAX(capture_time) AS last_ct "
+            "FROM option_chain_snapshot WHERE trading_date=? "
+            "AND substr(capture_time, 12, 5) >= '09:15' "
+            "AND substr(capture_time, 12, 5) <= '15:30'",
+            (trading_date,),
+        )
+        n_chain = int((rows[0] or {}).get("n") or 0) if rows else 0
+        last_ct = str((rows[0] or {}).get("last_ct") or "") if rows else ""
+        last_hhmm = last_ct[11:16] if len(last_ct) >= 16 else ""
+        out["n_chain"] = n_chain
+        out["last_hhmm"] = last_hhmm
+        if n_chain < 5:
+            out["why"].append(f"only {n_chain} chain snapshots")
+        if last_hhmm and last_hhmm < "15:00":
+            out["warnings"].append(f"partial capture ends {last_hhmm}")
+
+        ss = self._q(
+            "SELECT COUNT(*) AS n FROM session_state "
+            "WHERE substr(trading_date,1,10)=?",
+            (trading_date,),
+        )
+        n_ss = int((ss[0] or {}).get("n") or 0) if ss else 0
+        out["n_session"] = n_ss
+        if n_ss == 0:
+            out["why"].append("no session_state row")
+
+        vix_rows = self._q(
+            "SELECT prev_day_vix_close FROM session_state "
+            "WHERE substr(trading_date,1,10)=? "
+            "AND prev_day_vix_close IS NOT NULL AND prev_day_vix_close > 0 "
+            "LIMIT 1",
+            (trading_date,),
+        )
+        if vix_rows:
+            try:
+                out["prev_day_vix"] = float(vix_rows[0]["prev_day_vix_close"])
+            except (TypeError, ValueError, KeyError):
+                out["prev_day_vix"] = None
+        if out["prev_day_vix"] is None:
+            out["why"].append("no prev_day_vix_close")
+
+        prev = self._q(
+            "SELECT close FROM intraday_candles "
+            "WHERE trading_date < ? AND interval_min=1 "
+            "ORDER BY trading_date DESC, candle_time DESC LIMIT 1",
+            (trading_date,),
+        )
+        if prev:
+            try:
+                out["prev_close"] = float(prev[0]["close"])
+            except (TypeError, ValueError, KeyError):
+                out["prev_close"] = None
+        if out["prev_close"] is None:
+            if first_book_date and trading_date == first_book_date:
+                out["warnings"].append(
+                    "no previous-session candle (first day in book)"
+                )
+            else:
+                out["why"].append("no previous-session candle")
+
+        cols = self._q("PRAGMA table_info(session_state)")
+        col_names = {str(r.get("name") or "") for r in cols}
+        if cols and "prev_day_vix_close" not in col_names:
+            out["why"].append("session_state.prev_day_vix_close column missing")
+
+        bars = self._q(
+            "SELECT COUNT(*) AS n FROM intraday_candles "
+            "WHERE trading_date=? AND interval_min=1",
+            (trading_date,),
+        )
+        n_bars = int((bars[0] or {}).get("n") or 0) if bars else 0
+        out["n_candles"] = n_bars
+        if n_bars == 0:
+            out["warnings"].append("no 1-minute candles for the session")
+
+        out["ok"] = not out["why"]
+        return out
 
 
 # PATCH_V14: the session parameters compared against the recorded row, in the
@@ -468,6 +612,16 @@ class MultiStore:
                 out.setdefault(k, v)
         return out
 
+    def probe_live_parity(
+        self,
+        trading_date: str,
+        *,
+        first_book_date: Optional[str] = None,
+    ) -> dict:
+        return self._for(trading_date).probe_live_parity(
+            trading_date, first_book_date=first_book_date
+        )
+
 
 class DaySlice:
     """One session's recorded chain snapshots and 1-minute bars."""
@@ -478,9 +632,11 @@ class DaySlice:
         chain_rows: List[dict],
         candles: List[dict],
         prev_close: Optional[float],
+        prev_day_vix: Optional[float] = None,
     ):
         self.trading_date = trading_date
         self.prev_close = prev_close
+        self.prev_day_vix = prev_day_vix
         self.candles = candles
 
         self.cycles: List[str] = []
@@ -729,6 +885,8 @@ class Results:
         # result, while the full-day replay is +1,952 (the late BCS ran
         # into its trailing stop). (date, last_cycle_hhmm) pairs.
         self.truncated_days: List[Tuple[str, str]] = []
+        # Days whose shard has no yesterday VIX — Gate 1 / vix-gap were blind.
+        self.unfaithful_days: List[Tuple[str, str]] = []
         self.rejections: Counter = Counter()
         self.rejection_detail: Dict[str, List[str]] = defaultdict(list)
         self.cycles = 0
@@ -1304,9 +1462,43 @@ class BacktestRunner:
                 f"Re-split from the full database (split_db_per_day.py "
                 f"--dates {trading_date})."
             )
+        if day.prev_day_vix is None:
+            self.results.unfaithful_days.append(
+                (trading_date, "no prev_day_vix_close")
+            )
+            print(
+                f"[backtest] FIDELITY FAIL {trading_date}: no prev_day_vix_close "
+                f"— Gate 1 spike-ABORT and momentum_vix_gap are blind. "
+                f"Do not use this P&L as a go-live check."
+            )
+        elif day.prev_close is None:
+            first = None
+            try:
+                book = self.store.tradable_dates(None, None)
+                first = book[0] if book else None
+            except Exception:
+                first = None
+            if first and trading_date != first:
+                self.results.unfaithful_days.append(
+                    (trading_date, "no previous-session candle")
+                )
+            print(
+                f"[backtest] FIDELITY WARN {trading_date}: no previous-session "
+                f"candle — gap detection disabled (prev_vix="
+                f"{day.prev_day_vix})."
+            )
 
         engine = self.engine
         st = engine.market_engine.state
+        # Shard session_state holds yesterday's VIX. Scratch book does not.
+        # Inject before the first cycle so reset_if_new_day / fresh session
+        # init see it (Gate 1 + momentum_vix_gap).
+        _pvx = day.prev_day_vix
+        engine.market_engine._replay_prev_day_vix = (
+            float(_pvx) if _pvx else None
+        )
+        if _pvx:
+            st["prev_day_vix_close"] = float(_pvx)
         st["current_capital"] = (
             self.results.starting_capital
             + sum(self.results.daily_pnl.values())
@@ -2236,6 +2428,17 @@ def print_report(res: Results, config: Config, args, store=None) -> None:
         if len(res.truncated_days) > 8:
             print("     ...")
 
+    if getattr(res, "unfaithful_days", None):
+        print()
+        print(
+            f"  !! NOT LIVE-FAITHFUL on {len(res.unfaithful_days)} session(s) - "
+            f"yesterday's VIX was missing:"
+        )
+        for _d, _why in res.unfaithful_days[:8]:
+            print(f"     {_d}  {_why}   (do not use this P&L as go-live)")
+        if len(res.unfaithful_days) > 8:
+            print("     ...")
+
     # -- funnel -----------------------------------------------------------
     print_funnel(res)
     print_ev_decomposition(res)
@@ -2801,6 +3004,412 @@ def _open_store(db_paths: List[str]):
     return HistoricalStore(db_paths[0])
 
 
+def format_live_parity(probe: dict) -> str:
+    pv = probe.get("prev_day_vix")
+    pc = probe.get("prev_close")
+    pvs = f"{pv:.2f}" if isinstance(pv, (int, float)) else "MISSING"
+    pcs = str(pc) if pc is not None else "MISSING"
+    n = int(probe.get("n_chain") or 0)
+    extra = f"  chain={n}"
+    last = probe.get("last_hhmm") or ""
+    if last:
+        extra += f"  last={last}"
+    n_bars = probe.get("n_candles")
+    if n_bars is not None:
+        extra += f"  candles={int(n_bars)}"
+    if probe.get("ok") and not probe.get("warnings"):
+        return f"LIVE-PARITY PASS  prev_vix={pvs}  prev_close={pcs}{extra}"
+    if probe.get("ok"):
+        warn = "; ".join(probe.get("warnings") or [])
+        return (
+            f"LIVE-PARITY WARN  prev_vix={pvs}  prev_close={pcs}{extra}  "
+            f"({warn})"
+        )
+    why = "; ".join(probe.get("why") or ["unknown"])
+    return (
+        f"LIVE-PARITY FAIL  prev_vix={pvs}  prev_close={pcs}{extra}  "
+        f"({why}) — replay P&L is not a go-live check for this day"
+    )
+
+
+_ENGINE_IMPORTS = (
+    "main",
+    "data_engine",
+    "regime_engine",
+    "strategy_engine",
+    "execution_engine",
+    "calibration_engine",
+)
+
+
+def _ro_sqlite(path: Path) -> sqlite3.Connection:
+    uri = f"{Path(path).resolve().as_uri()}?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=15)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _unlink_sqlite(path: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(path) + suffix) if suffix else path
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def probe_live_primary(db_path: Path) -> dict:
+    """Read-only: would main.py see yesterday's VIX and prior close?
+
+    Uses the same three sources as Database.get_prev_day_vix_close:
+    today's session_state, then daily_summary, then vix_history.
+    Does not write and does not validate the Upstox token.
+    """
+    out: dict = {
+        "ok": False,
+        "why": [],
+        "warnings": [],
+        "path": str(db_path),
+        "prev_day_vix": None,
+        "prev_vix_source": "",
+        "prev_close": None,
+        "prev_close_date": "",
+    }
+    path = Path(db_path)
+    if not path.is_file():
+        out["why"].append("live DB file missing")
+        return out
+    try:
+        if path.stat().st_size < 4096:
+            out["why"].append("live DB is empty / not initialised")
+            return out
+    except OSError as exc:
+        out["why"].append(f"cannot stat live DB: {exc}")
+        return out
+
+    con = None
+    try:
+        con = _ro_sqlite(path)
+    except sqlite3.Error as exc:
+        out["why"].append(f"unreadable: {exc}")
+        return out
+
+    try:
+        q = con.execute("PRAGMA quick_check").fetchone()
+        if q and str(q[0]) != "ok":
+            out["why"].append(f"quick_check failed: {q[0]}")
+            return out
+
+        tables = {
+            str(r[0])
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        required = (
+            "session_state",
+            "option_chain_snapshot",
+            "intraday_candles",
+            "positions",
+            "trade_entries",
+        )
+        missing = [t for t in required if t not in tables]
+        if missing:
+            out["why"].append("missing tables: " + ", ".join(missing))
+
+        today_str = today_ist().isoformat()
+        if isinstance(today_str, datetime):
+            today_str = today_str.date().isoformat()
+
+        if "session_state" in tables:
+            cols = {
+                str(r[1])
+                for r in con.execute("PRAGMA table_info(session_state)")
+            }
+            if "prev_day_vix_close" not in cols:
+                out["warnings"].append(
+                    "prev_day_vix_close column missing "
+                    "(main.py migration would add it empty)"
+                )
+            else:
+                sql = (
+                    "SELECT prev_day_vix_close FROM session_state "
+                    "WHERE substr(trading_date,1,10)=? "
+                    "AND prev_day_vix_close IS NOT NULL "
+                    "AND prev_day_vix_close > 0"
+                )
+                if "updated_at" in cols:
+                    sql += " ORDER BY updated_at DESC LIMIT 1"
+                else:
+                    sql += " LIMIT 1"
+                row = con.execute(sql, (today_str,)).fetchone()
+                if row is not None:
+                    try:
+                        out["prev_day_vix"] = float(row["prev_day_vix_close"])
+                        out["prev_vix_source"] = "session_state"
+                    except (TypeError, ValueError, KeyError):
+                        pass
+
+        if out["prev_day_vix"] is None and "daily_summary" in tables:
+            row = con.execute(
+                "SELECT vix_close FROM daily_summary "
+                "WHERE trading_date < ? AND vix_close IS NOT NULL "
+                "AND vix_close > 0 ORDER BY trading_date DESC LIMIT 1",
+                (today_str,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    out["prev_day_vix"] = float(row["vix_close"])
+                    out["prev_vix_source"] = "daily_summary"
+                except (TypeError, ValueError, KeyError):
+                    pass
+
+        if out["prev_day_vix"] is None and "vix_history" in tables:
+            row = con.execute(
+                "SELECT vix_value FROM vix_history "
+                "WHERE date < ? AND vix_value > 0 "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (today_str,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    out["prev_day_vix"] = float(row["vix_value"])
+                    out["prev_vix_source"] = "vix_history"
+                except (TypeError, ValueError, KeyError):
+                    pass
+
+        if out["prev_day_vix"] is None:
+            out["why"].append(
+                "no prev_day_vix_close "
+                "(session_state / daily_summary / vix_history)"
+            )
+
+        if "intraday_candles" in tables:
+            row = con.execute(
+                "SELECT trading_date, close FROM intraday_candles "
+                "WHERE trading_date < ? AND interval_min=1 "
+                "ORDER BY trading_date DESC, candle_time DESC LIMIT 1",
+                (today_str,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    out["prev_close"] = float(row["close"])
+                    out["prev_close_date"] = str(row["trading_date"] or "")[:10]
+                except (TypeError, ValueError, KeyError):
+                    pass
+        if out["prev_close"] is None:
+            out["why"].append("no previous-session candle")
+
+        out["ok"] = not out["why"]
+        return out
+    except sqlite3.Error as exc:
+        out["why"].append(f"query failed: {exc}")
+        out["ok"] = False
+        return out
+    finally:
+        if con is not None:
+            con.close()
+
+
+def format_live_primary(probe: dict) -> str:
+    pv = probe.get("prev_day_vix")
+    pc = probe.get("prev_close")
+    pvs = f"{pv:.2f}" if isinstance(pv, (int, float)) else "MISSING"
+    src = probe.get("prev_vix_source") or ""
+    if src and pvs != "MISSING":
+        pvs = f"{pvs} ({src})"
+    pcs = str(pc) if pc is not None else "MISSING"
+    pcd = probe.get("prev_close_date") or ""
+    if pcd and pcs != "MISSING":
+        pcs = f"{pcs} ({pcd})"
+    extra = f"  {probe.get('path') or ''}"
+    if probe.get("ok") and not probe.get("warnings"):
+        return f"PASS  prev_vix={pvs}  prev_close={pcs}{extra}"
+    if probe.get("ok"):
+        warn = "; ".join(probe.get("warnings") or [])
+        return f"WARN  prev_vix={pvs}  prev_close={pcs}  ({warn}){extra}"
+    why = "; ".join(probe.get("why") or ["unknown"])
+    return f"FAIL  prev_vix={pvs}  prev_close={pcs}  ({why}){extra}"
+
+
+def preflight_engine_boot(config: Config) -> List[Tuple[str, bool, str]]:
+    """Everything main.py needs at startup except the Upstox token."""
+    rows: List[Tuple[str, bool, str]] = []
+
+    env_path = Path(ENV_FILE)
+    if env_path.is_file():
+        rows.append(("env.txt", True, str(env_path)))
+    else:
+        rows.append(("env.txt", False, f"missing at {env_path}"))
+
+    hol_path = Path(DEFAULT_HOLIDAYS_FILE)
+    try:
+        holidays = get_nse_holidays() or set()
+    except Exception as exc:
+        holidays = set()
+        rows.append(
+            ("nse_holidays.json", False, f"{type(exc).__name__}: {exc}")
+        )
+    else:
+        if not hol_path.is_file():
+            rows.append(("nse_holidays.json", False, "file missing"))
+        elif not holidays:
+            rows.append(
+                ("nse_holidays.json", False, "empty — holiday sessions would trade")
+            )
+        else:
+            rows.append(
+                ("nse_holidays.json", True, f"{len(holidays)} dates")
+            )
+
+    ev_path = Path(DEFAULT_EVENTS_FILE)
+    try:
+        events = get_high_impact_events() or {}
+    except Exception as exc:
+        rows.append(
+            ("high_impact_events.json", False, f"{type(exc).__name__}: {exc}")
+        )
+    else:
+        if not ev_path.is_file():
+            rows.append(
+                ("high_impact_events.json", False, "file missing — EVENT days look NORMAL")
+            )
+        elif not events:
+            rows.append(
+                ("high_impact_events.json", True, "empty (no EVENT days labelled)")
+            )
+        else:
+            rows.append(
+                ("high_impact_events.json", True, f"{len(events)} event date(s)")
+            )
+
+    imported: List[str] = []
+    import_err = ""
+    for name in _ENGINE_IMPORTS:
+        try:
+            __import__(name)
+            imported.append(name)
+        except Exception as exc:
+            import_err = f"{name}: {type(exc).__name__}: {exc}"
+            break
+    if import_err:
+        rows.append(("engine imports", False, import_err))
+    else:
+        rows.append(("engine imports", True, "/".join(imported)))
+
+    if import_err:
+        rows.append(("MainEngine construct", False, "skipped — import failed"))
+        return rows
+
+    fd, scratch = tempfile.mkstemp(prefix="bt_preflight_", suffix=".db")
+    os.close(fd)
+    scratch_path = Path(scratch)
+    sink = io.StringIO()
+    try:
+        from dataclasses import replace as _dc_replace
+        import main as main_mod
+
+        cfg = _dc_replace(config, paper_trade_mode=True)
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            db = Database(scratch_path)
+            logger = logging.getLogger("bt_preflight")
+            logger.handlers = [logging.NullHandler()]
+            logger.setLevel(logging.ERROR)
+            logger.propagate = False
+            engine = main_mod.MainEngine.for_replay(
+                config=cfg,
+                db=db,
+                client=object(),
+                logger=logger,
+            )
+            _ = (
+                engine.market_engine,
+                engine.regime_engine,
+                engine.strategy_engine,
+                engine.execution_engine,
+                engine.cal_engine,
+            )
+            db.close()
+        rows.append(("MainEngine construct", True, "for_replay ok"))
+    except Exception as exc:
+        rows.append(
+            ("MainEngine construct", False, f"{type(exc).__name__}: {exc}")
+        )
+    finally:
+        _unlink_sqlite(scratch_path)
+
+    return rows
+
+
+def preflight_live_parity(
+    store,
+    dates: List[str],
+    allow_unfaithful: bool,
+    config: Optional[Config] = None,
+) -> int:
+    """Refuse to replay unless live would also start (minus the token).
+
+    Token / Upstox login is the only live startup check not repeated here.
+    """
+    if not dates:
+        return 0
+    print()
+    print(hr("═"))
+    print("LIVE-PARITY PREFLIGHT  (same inputs as main.py, minus token)")
+    print("  env / holidays / events / engine construct")
+    print("  live DB_PATH → Gate 1 VIX + gap (session_state / daily_summary / vix_history)")
+    print("  each replay session → prev_vix, prior close, chain, session_state")
+    print(hr("═"))
+    bad = 0
+
+    if config is not None:
+        for label, ok, detail in preflight_engine_boot(config):
+            tag = "PASS" if ok else "FAIL"
+            print(f"  {label:<24s}  {tag}  {detail}")
+            if not ok:
+                bad += 1
+        live_probe = probe_live_primary(Path(config.db_path))
+        print(f"  {'live DB_PATH':<24s}  {format_live_primary(live_probe)}")
+        if not live_probe.get("ok"):
+            bad += 1
+        print()
+
+    book = store.tradable_dates(None, None) or dates
+    first_book = book[0] if book else dates[0]
+    day_bad = 0
+    for d in dates:
+        probe = store.probe_live_parity(d, first_book_date=first_book)
+        print(f"  {d}:  {format_live_parity(probe)}")
+        if not probe.get("ok"):
+            day_bad += 1
+            bad += 1
+    print()
+    if bad and not allow_unfaithful:
+        print(
+            f"  REFUSING TO REPLAY: {bad} check(s) failed "
+            f"({day_bad}/{len(dates)} session(s) unfaithful). "
+            f"A green backtest with a missing yesterday-VIX is how live "
+            f"ABORTed on 28-Sep while replay printed P&L. Fix the live DB "
+            f"(or re-split) or pass --allow-unfaithful only if you accept "
+            f"a blind Gate 1."
+        )
+        print()
+        return 2
+    if bad:
+        print(
+            f"  {bad} FAIL ignored via --allow-unfaithful. "
+            f"Do not treat those P&L numbers as go-live."
+        )
+        print()
+    else:
+        print(
+            f"  {len(dates)}/{len(dates)} sessions PASS and live boot checks "
+            f"PASS — token is the remaining live-only check."
+        )
+        print()
+    return 0
+
+
 def _parallel_day_worker(job: dict) -> dict:
     """Replay a single session in a child process.
 
@@ -2844,10 +3453,15 @@ def _parallel_day_worker(job: dict) -> dict:
             truncated = [
                 hhmm for (d, hhmm) in res.truncated_days if d == day
             ]
+            unfaithful = [
+                why for (d, why) in getattr(res, "unfaithful_days", [])
+                if d == day
+            ]
         return {
             "date": day, "pnl": pnl, "report": report, "ok": True,
             "trades": trades, "rejections": rejections,
             "truncated": truncated[0] if truncated else "",
+            "unfaithful": unfaithful[0] if unfaithful else "",
         }
     except Exception as exc:
         return {
@@ -2876,6 +3490,7 @@ def run_parallel_quiet(
             "fill_edge": float(args.fill_edge),
             "stress_exit": float(args.stress_exit),
             "capital": args.capital,
+            "allow_unfaithful": bool(getattr(args, "allow_unfaithful", False)),
             "trade_report": (
                 args.trade_report
                 or getattr(config, "trade_report_mode", "each_cycle")
@@ -2970,6 +3585,8 @@ def run_parallel_quiet(
     for row in ordered:
         rej = row.get("rejections") or []
         tail = f"  [PARTIAL: chain ends {row['truncated']}]" if row.get("truncated") else ""
+        if row.get("unfaithful"):
+            tail += f"  [NOT LIVE-FAITHFUL: {row['unfaithful']}]"
         print(f"  {row['date']}{tail}")
         for k, v in rej[:4]:
             print(f"      {v:>5d}  {str(k)[:70]}")
@@ -2988,6 +3605,17 @@ def run_parallel_quiet(
 
     summary_rows = [(row["date"], float(row.get("pnl") or 0.0)) for row in ordered]
     print_daily_profit_summary(summary_rows)
+    unfaithful = [row for row in ordered if row.get("unfaithful")]
+    if unfaithful:
+        print()
+        print(
+            f"  !! {len(unfaithful)} session(s) missing yesterday's VIX — "
+            f"do not use those P&L numbers as go-live."
+        )
+        for row in unfaithful:
+            print(f"     {row['date']}  {row['unfaithful']}")
+        if not getattr(args, "allow_unfaithful", False):
+            return 2
     return 0 if any(r.get("ok") for r in ordered) else 1
 
 
@@ -3048,6 +3676,13 @@ def main() -> int:
     ap.add_argument("--audit", action="store_true", help="report data coverage only")
     ap.add_argument("--test", action="store_true", help="run the harness self-test")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--allow-unfaithful",
+        action="store_true",
+        help="exit 0 even if live-parity preflight FAILs "
+             "(missing yesterday VIX / prior close / chain / session_state / "
+             "live DB / engine construct). Do not use that P&L as go-live.",
+    )
     ap.add_argument(
         "--trade-report", dest="trade_report", default=None,
         choices=("each_cycle", "on_change", "off"),
@@ -3124,6 +3759,12 @@ def main() -> int:
         if not dates:
             print_audit(store)
             return 1
+        pre = preflight_live_parity(
+            store, dates, bool(getattr(args, "allow_unfaithful", False)),
+            config,
+        )
+        if pre:
+            return pre
         return run_parallel_quiet(dates, db_paths, config, args)
 
     if len(db_paths) > 1:
@@ -3133,6 +3774,13 @@ def main() -> int:
     if not dates:
         print_audit(store)
         return 1
+
+    pre = preflight_live_parity(
+        store, dates, bool(getattr(args, "allow_unfaithful", False)),
+        config,
+    )
+    if pre:
+        return pre
 
     print()
     print(hr("═"))
@@ -3178,6 +3826,8 @@ def main() -> int:
         print(hr("═"))
         for block in runner.final_report_lines:
             print(block)
+    if res.unfaithful_days and not args.allow_unfaithful:
+        return 2
     return 0
 
 
