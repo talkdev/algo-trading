@@ -223,7 +223,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m7q-cycle-alive-watchdog"
+        _engine_build = "v65m7s-credit-impulse-dte0"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,
@@ -414,6 +414,16 @@ class MainEngine:
         except Exception as e:
             self.logger.warning(f"risk_halt write failed (halt still in memory): {e}")
 
+    @staticmethod
+    def _broker_already_flat_error(exc: Exception) -> bool:
+        """Upstox UDAPI1111 / empty book — Exit-All had nothing to flatten."""
+        text = str(exc or "").lower()
+        return (
+            "udapi1111" in text
+            or "no open position" in text
+            or "no open positions" in text
+        )
+
     def _reconcile_unresolved_dispatches(self) -> None:
         """Resolve orders the ledger never saw answered.
 
@@ -425,6 +435,12 @@ class MainEngine:
 
         v58: also scan PLACED rows with no position_id (fills recorded before
         the book insert crashed) — previously only DISPATCHED|UNRESOLVED.
+
+        v65m7r: a broker FILLED tag is NOT an orphan merely because the local
+        book is no longer OPEN. CLOSED positions already booked the fill;
+        ABORTED/unwind EXIT fills leave the broker flat (UDAPI1111). Only
+        residual broker exposure warrants Exit-All — and UDAPI1111 must
+        terminalize the ledger as RECONCILED_FLAT (not infinite CRITICAL).
         """
         if self.config.paper_trade_mode:
             return
@@ -453,6 +469,7 @@ class MainEngine:
                 self.logger.warning(f"cannot reconcile tag {tag}: {e}")
                 continue
             status = ""
+            latest = {}
             if found:
                 latest = max(
                     found, key=lambda r: str(r.get("order_timestamp") or "")
@@ -463,8 +480,8 @@ class MainEngine:
                 qty    = int(latest.get("filled_quantity") or latest.get("quantity") or 0)
                 action = str(latest.get("transaction_type") or row.get("transaction_type") or "")
                 pid = str(row.get("position_id") or "")
-                # P59-04: orphan = filled at broker with no OPEN book row
-                # (v59 always sets position_id, so null-id gate is dead).
+                phase = str(row.get("phase") or "")
+                pos_status = ""
                 book_open = False
                 if pid:
                     try:
@@ -472,37 +489,57 @@ class MainEngine:
                             "SELECT status FROM positions WHERE position_id=?",
                             (pid,),
                         )
-                        book_open = bool(
-                            prow and str(prow.get("status") or "").upper()
-                            in ("OPEN", "PENDING_ENTRY")
-                        )
+                        pos_status = str(
+                            (prow or {}).get("status") or ""
+                        ).upper()
+                        book_open = pos_status in ("OPEN", "PENDING_ENTRY")
                     except Exception:
                         book_open = False
-                msg = (
-                    f"unresolved order (tag {tag}) is FILLED at the broker: "
-                    f"{action} {qty} for position "
-                    f"{pid or 'none'} at {price:.2f} "
-                    f"({row.get('phase')}) — book_open={book_open}"
-                )
-                self.logger.critical(msg)
-                self._alert("CRITICAL", msg)
-                if (
-                    bool(getattr(self.config, "orphan_flatten_at_broker", True))
-                    and not book_open
-                ):
-                    try:
-                        self.client.exit_all_positions(segment="NSE_FO", tag=tag)
-                        self._alert(
-                            "CRITICAL",
-                            f"broker Exit-All-Positions dispatched for orphan "
-                            f"tag {tag} (position_id={pid or 'none'})",
-                        )
-                    except Exception as e:
-                        self.logger.critical(
-                            f"orphan flatten for tag {tag} failed: {e} — flatten "
-                            f"by hand"
-                        )
-                new_state = "BROKER_FILLED_UNBOOKED"
+                        pos_status = ""
+
+                # Already booked in the local book — no orphan, no Exit-All.
+                if book_open or pos_status.startswith("CLOSE"):
+                    new_state = "BOOKED"
+                    self.logger.info(
+                        f"dispatch tag {tag} FILLED and book "
+                        f"{'OPEN' if book_open else pos_status or 'CLOSED'} "
+                        f"({action} {qty} @ {price:.2f}, {phase}) — marking BOOKED"
+                    )
+                else:
+                    # Residual exposure candidate (ABORTED / missing / unbooked).
+                    msg = (
+                        f"unresolved order (tag {tag}) is FILLED at the broker: "
+                        f"{action} {qty} for position "
+                        f"{pid or 'none'} at {price:.2f} "
+                        f"({phase}) — book={pos_status or 'none'}"
+                    )
+                    self.logger.critical(msg)
+                    self._alert("CRITICAL", msg)
+                    new_state = "BROKER_FILLED_UNBOOKED"
+                    if bool(getattr(self.config, "orphan_flatten_at_broker", True)):
+                        try:
+                            self.client.exit_all_positions(
+                                segment="NSE_FO", tag=tag
+                            )
+                            new_state = "FLATTENED_ORPHAN"
+                            self._alert(
+                                "CRITICAL",
+                                f"broker Exit-All-Positions dispatched for orphan "
+                                f"tag {tag} (position_id={pid or 'none'})",
+                            )
+                        except Exception as e:
+                            if self._broker_already_flat_error(e):
+                                # Exit fill / unwind already left the book flat.
+                                new_state = "RECONCILED_FLAT"
+                                self.logger.warning(
+                                    f"orphan flatten for tag {tag}: broker already "
+                                    f"flat ({e}) — marking RECONCILED_FLAT"
+                                )
+                            else:
+                                self.logger.critical(
+                                    f"orphan flatten for tag {tag} failed: {e} — "
+                                    f"flatten by hand"
+                                )
             elif not found:
                 new_state = "NOT_PLACED"
                 self.logger.warning(

@@ -3668,10 +3668,17 @@ class MarketDataEngine:
         # is correspondingly larger too).
         _spot_velocity_block = False
         _sv = 0.0
+        _sv_up = 0.0
+        _sv_down = 0.0
         if not bars.empty and len(bars) >= 3:
             _recent3 = bars.tail(3)
             if len(_recent3) >= 2:
-                _sv = abs(float(_recent3["close"].iloc[-1]) - float(_recent3["close"].iloc[0]))
+                _c0 = float(_recent3["close"].iloc[0])
+                _c1 = float(_recent3["close"].iloc[-1])
+                _sv = abs(_c1 - _c0)
+                _signed = _c1 - _c0
+                _sv_up = max(0.0, _signed)
+                _sv_down = max(0.0, -_signed)
                 try:
                     _sv_ref = float(spot or self.state.get("prev_spot") or 0.0)
                 except Exception:
@@ -3965,6 +3972,10 @@ class MarketDataEngine:
             "borderline_sell":          False,
             "spot_velocity_block":       _spot_velocity_block,
             "spot_velocity_pts":         _sv,
+            # Signed 3-bar impulse: credit must not sell into a spike
+            # AGAINST the short side (rally vs short calls / dump vs short puts).
+            "spot_impulse_up_pts":       _sv_up,
+            "spot_impulse_down_pts":     _sv_down,
         }
 
         # ── 28. Save session state and persist data ───────────────────────

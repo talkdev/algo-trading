@@ -1198,6 +1198,19 @@ class Config:
     reentry_opposite_cooldown_min:       float = 3.0
     reentry_opposite_reconfirm_min:      float = 12.0
     reentry_opposite_material_frac:      float = 0.25
+    # Surprise trend-switch defenses (all DTE):
+    # - dwell: directional credit/debit needs a stable price_regime first
+    # - exhausted-move floors: weak ADX may not chase a spent day range
+    # - stop-opposite: after CLOSE_STOP, opposite credit waits longer
+    # - impulse exit: open verticals/debits flatten on adverse spike
+    regime_entry_dwell_min:              float = 5.0
+    exhausted_move_pct:                  float = 100.0
+    exhausted_move_adx_floor_dte0:       float = 50.0
+    exhausted_move_pct_dte1plus:         float = 125.0
+    exhausted_move_adx_floor_dte1plus:   float = 45.0
+    stop_opposite_reconfirm_min:         float = 20.0
+    surprise_impulse_exit_min_hold_min:   float = 1.0
+    trend_flip_min_hold_min:             float = 5.0
     # Hard-exit buffer. Morning/range still needs ~90 minutes of room.
     # From afternoon_credit_after_hhmm a measured fade/trend ticket is a
     # short-hold (professional NIFTY desks flat well before the 15:20
@@ -4406,6 +4419,18 @@ def _tr_symbol(option_type) -> str:
     return t or "OPT"
 
 
+def _tr_lane(status) -> str:
+    """Map positions.status to a display lane: OPEN / CLOSED / ABORTED / PENDING."""
+    s = str(status or "OPEN").upper()
+    if s.startswith("CLOSE"):
+        return "CLOSED"
+    if s.startswith("ABORT") or s in ("FAILED", "CANCELLED", "CANCELED"):
+        return "ABORTED"
+    if "PENDING" in s:
+        return "PENDING"
+    return "OPEN"
+
+
 def _tr_hhmm(value) -> str:
     """Anything the book stores as a time -> 'HH:MM'."""
     if value is None or value == "":
@@ -4567,7 +4592,12 @@ class TradeConsoleReporter:
         except Exception as exc:
             self._debug(f"positions query failed: {exc}")
             return []
-        return list(rows)
+        # ABORTED drafts never became trades — keep them out of the
+        # operator trade tape (they still live in positions for forensics).
+        return [
+            r for r in rows
+            if _tr_lane(r.get("status")) != "ABORTED"
+        ]
 
     def legs_for(self, position_id: str) -> List[dict]:
         try:
@@ -4757,8 +4787,10 @@ class TradeConsoleReporter:
     def render(self, index: int, position: dict, legs: List[dict],
                chain: dict, as_of) -> List[str]:
         lots   = self._lots(position, legs)
-        status = str(position.get("status") or "OPEN").upper()
-        closed = status.startswith("CLOSE")
+        lane   = _tr_lane(position.get("status"))
+        closed = lane == "CLOSED"
+        aborted = lane == "ABORTED"
+        terminal = closed or aborted
 
         out = [TRADE_REPORT_RULE]
         out.append(f"Trade-{index}")
@@ -4776,7 +4808,7 @@ class TradeConsoleReporter:
             out.append("no leg rows persisted for this position")
 
         out.append(TRADE_REPORT_SUB)
-        end_time = position.get("exit_time") if closed else as_of
+        end_time = position.get("exit_time") if terminal else as_of
         out.append(f"Trade End Data: time: {_tr_hhmm(end_time)}")
         for leg in legs:
             leg_closed = str(leg.get("leg_status") or "").upper() == "CLOSED"
@@ -4802,11 +4834,21 @@ class TradeConsoleReporter:
             out.append("no leg rows persisted for this position")
         if closed:
             out.append(f"Closed - {position.get('exit_reason') or 'unknown'}")
+        elif aborted:
+            out.append(f"Aborted - {position.get('exit_reason') or 'unknown'}")
         else:
             out.append("Open")
 
         out.append(TRADE_REPORT_SUB)
-        out.append(f"Position Status: {'Close' if closed else 'Open'}")
+        if closed:
+            status_label = "Close"
+        elif aborted:
+            status_label = "Aborted"
+        elif lane == "PENDING":
+            status_label = "Pending"
+        else:
+            status_label = "Open"
+        out.append(f"Position Status: {status_label}")
         committed, committed_basis = self.investment(position, legs)
         net, realised, profit_basis = self.profit(position, legs, chain)
         out.append(f"Total Investment: {_tr_money(committed)}")
@@ -4825,7 +4867,7 @@ class TradeConsoleReporter:
                 title: Optional[str]) -> str:
         n_open = sum(
             1 for r in rows
-            if str(r.get("status") or "").upper().startswith("OPEN")
+            if _tr_lane(r.get("status")) == "OPEN"
         )
         stamp = as_of.strftime("%H:%M:%S") if isinstance(as_of, datetime) \
             else _tr_hhmm(as_of)
