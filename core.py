@@ -1211,6 +1211,13 @@ class Config:
     stop_opposite_reconfirm_min:         float = 20.0
     surprise_impulse_exit_min_hold_min:   float = 1.0
     trend_flip_min_hold_min:             float = 5.0
+    # TapeState WHEN-layer (additive). Publisher on by default; entry/exit/
+    # size gates default on after regression — set false in env to disable.
+    tape_state_enabled:                  bool  = True
+    tape_state_entry_gate:               bool  = True
+    tape_state_exit_gate:                bool  = True
+    tape_state_size_nudge:               bool  = True
+    tape_state_size_boost:               float = 1.10
     # Hard-exit buffer. Morning/range still needs ~90 minutes of room.
     # From afternoon_credit_after_hhmm a measured fade/trend ticket is a
     # short-hold (professional NIFTY desks flat well before the 15:20
@@ -2006,6 +2013,38 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         telegram_include_open_blocks=_get_bool(
             env, "TELEGRAM_INCLUDE_OPEN_BLOCKS", True
         ),
+        # ── TapeState WHEN-layer (additive; env overrides) ───────────────
+        regime_entry_dwell_min=min(
+            max(_get_float(env, "REGIME_ENTRY_DWELL_MIN", 5.0), 0.0), 30.0
+        ),
+        exhausted_move_pct=min(
+            max(_get_float(env, "EXHAUSTED_MOVE_PCT", 100.0), 50.0), 400.0
+        ),
+        exhausted_move_adx_floor_dte0=min(
+            max(_get_float(env, "EXHAUSTED_MOVE_ADX_FLOOR_DTE0", 50.0), 20.0), 80.0
+        ),
+        exhausted_move_pct_dte1plus=min(
+            max(_get_float(env, "EXHAUSTED_MOVE_PCT_DTE1PLUS", 125.0), 50.0), 400.0
+        ),
+        exhausted_move_adx_floor_dte1plus=min(
+            max(_get_float(env, "EXHAUSTED_MOVE_ADX_FLOOR_DTE1PLUS", 45.0), 20.0), 80.0
+        ),
+        stop_opposite_reconfirm_min=min(
+            max(_get_float(env, "STOP_OPPOSITE_RECONFIRM_MIN", 20.0), 0.0), 90.0
+        ),
+        surprise_impulse_exit_min_hold_min=min(
+            max(_get_float(env, "SURPRISE_IMPULSE_EXIT_MIN_HOLD_MIN", 1.0), 0.0), 30.0
+        ),
+        trend_flip_min_hold_min=min(
+            max(_get_float(env, "TREND_FLIP_MIN_HOLD_MIN", 5.0), 0.0), 60.0
+        ),
+        tape_state_enabled=_get_bool(env, "TAPE_STATE_ENABLED", True),
+        tape_state_entry_gate=_get_bool(env, "TAPE_STATE_ENTRY_GATE", True),
+        tape_state_exit_gate=_get_bool(env, "TAPE_STATE_EXIT_GATE", True),
+        tape_state_size_nudge=_get_bool(env, "TAPE_STATE_SIZE_NUDGE", True),
+        tape_state_size_boost=min(
+            max(_get_float(env, "TAPE_STATE_SIZE_BOOST", 1.10), 1.0), 1.15
+        ),
     )
 
 
@@ -2373,6 +2412,12 @@ CREATE TABLE IF NOT EXISTS cycle_log (
     oi_change_pct       REAL,
     resistance_strength REAL,
     support_strength    REAL,
+    tape_state          TEXT,
+    tape_state_reason   TEXT,
+    tape_side           INTEGER,
+    tape_dwell_min      REAL,
+    tape_allow_entry    INTEGER,
+    tape_force_flat     INTEGER,
     raw_json            TEXT
 );
 
@@ -2952,6 +2997,12 @@ MIGRATION_SQL: List[str] = [
     "ALTER TABLE market_snapshots ADD COLUMN iv_behavior TEXT",
     "ALTER TABLE market_snapshots ADD COLUMN day_move_used_pct REAL",
     "ALTER TABLE market_snapshots ADD COLUMN skew_otm REAL",
+    "ALTER TABLE cycle_log ADD COLUMN tape_state TEXT",
+    "ALTER TABLE cycle_log ADD COLUMN tape_state_reason TEXT",
+    "ALTER TABLE cycle_log ADD COLUMN tape_side INTEGER",
+    "ALTER TABLE cycle_log ADD COLUMN tape_dwell_min REAL",
+    "ALTER TABLE cycle_log ADD COLUMN tape_allow_entry INTEGER",
+    "ALTER TABLE cycle_log ADD COLUMN tape_force_flat INTEGER",
 ]
 
 

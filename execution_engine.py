@@ -2583,6 +2583,118 @@ class ExecutionEngine:
                         "spot": spot,
                     }
 
+        # ── TapeState WHEN flatten: adverse impulse / force_flat (additive)
+        # Fires before trend-flip so a surprise bounce cuts wrong-side
+        # credit/debit without rewriting Priority 1–7 or profit-lock math.
+        try:
+            if bool(getattr(self.config, "tape_state_exit_gate", False)):
+                _ti_name = str(position.get("strategy_name") or "")
+                _ti_hold = 9999.0
+                try:
+                    _ti_et = position.get("entry_time")
+                    if _ti_et:
+                        _ti_hold = (
+                            now_ist() - datetime.fromisoformat(str(_ti_et))
+                        ).total_seconds() / 60.0
+                except Exception:
+                    _ti_hold = 9999.0
+                _ti_min = float(getattr(
+                    self.config, "surprise_impulse_exit_min_hold_min", 1.0) or 1.0)
+                _ti_raw = {}
+                try:
+                    _ti_raw = json.loads(position.get("raw_params_json") or "{}")
+                except Exception:
+                    _ti_raw = {}
+                _ti_fade = bool(
+                    _ti_raw.get("afternoon_high_fade")
+                    or _ti_raw.get("afternoon_low_fade")
+                )
+                # Never flatten a winner (same discipline as trend-flip).
+                if entry_credit > 0:
+                    _ti_under = liq_premium > entry_credit * 1.05
+                elif entry_credit < 0:
+                    _ti_under = (
+                        abs(float(liq_premium or 0.0))
+                        < abs(entry_credit) * 0.95
+                    )
+                else:
+                    _ti_under = False
+                if (not _ti_fade) and _ti_hold >= _ti_min and _ti_under:
+                    _ti_up = float(signals.get("spot_impulse_up_pts") or 0.0)
+                    _ti_dn = float(signals.get("spot_impulse_down_pts") or 0.0)
+                    try:
+                        _ti_spot = float(signals.get("spot") or 0.0)
+                        _ti_vix = float(signals.get("vix") or 12.0)
+                        _ti_pct = float(getattr(
+                            self.config, "spot_velocity_pct", 0.0014) or 0.0014)
+                        _ti_lim = max(
+                            (_ti_spot * _ti_pct * (
+                                1.0 + max(0.0, (_ti_vix - 12.0)) / 24.0
+                            )) if _ti_spot > 0 else 35.0,
+                            25.0,
+                        )
+                    except (TypeError, ValueError):
+                        _ti_lim = 25.0
+                    _ti_force = bool(signals.get("tape_force_flat"))
+                    _ti_state = str(signals.get("tape_state") or "")
+                    try:
+                        _ti_tside = int(signals.get("tape_side") or 0)
+                    except (TypeError, ValueError):
+                        _ti_tside = 0
+                    # force_flat only when TURN is against THIS position
+                    # (tape_side = stale regime being attacked).
+                    _ti_against = False
+                    _ti_detail = ""
+                    if _ti_name == "BEAR_CALL_SPREAD" and (
+                        _ti_up > _ti_lim
+                        or (
+                            _ti_force and _ti_state == "TURN_STARTING"
+                            and _ti_tside <= 0 and _ti_up >= _ti_dn
+                        )
+                    ):
+                        _ti_against = True
+                        _ti_detail = f"impulse_up_{_ti_up:.0f}_gt_{_ti_lim:.0f}"
+                    elif _ti_name == "BULL_PUT_SPREAD" and (
+                        _ti_dn > _ti_lim
+                        or (
+                            _ti_force and _ti_state == "TURN_STARTING"
+                            and _ti_tside >= 0 and _ti_dn >= _ti_up
+                        )
+                    ):
+                        _ti_against = True
+                        _ti_detail = f"impulse_dn_{_ti_dn:.0f}_gt_{_ti_lim:.0f}"
+                    elif _ti_name == "LONG_PUT" and (
+                        _ti_up > _ti_lim
+                        or (
+                            _ti_force and _ti_state == "TURN_STARTING"
+                            and _ti_tside <= 0 and _ti_up >= _ti_dn
+                        )
+                    ):
+                        _ti_against = True
+                        _ti_detail = f"impulse_up_{_ti_up:.0f}_gt_{_ti_lim:.0f}"
+                    elif _ti_name == "LONG_CALL" and (
+                        _ti_dn > _ti_lim
+                        or (
+                            _ti_force and _ti_state == "TURN_STARTING"
+                            and _ti_tside >= 0 and _ti_dn >= _ti_up
+                        )
+                    ):
+                        _ti_against = True
+                        _ti_detail = f"impulse_dn_{_ti_dn:.0f}_gt_{_ti_lim:.0f}"
+                    if _ti_against:
+                        self.logger.warning(
+                            f"TAPE ADVERSE IMPULSE: {_ti_name} {_ti_detail} "
+                            f"hold={_ti_hold:.1f}m state={_ti_state}"
+                        )
+                        return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                            "reason_detail": (
+                                f"tape_adverse_impulse_{_ti_detail}"
+                                f"_state_{_ti_state or 'na'}"
+                            ),
+                        }
+        except Exception as _ti_exc:
+            self.logger.debug(f"tape impulse exit skipped: {_ti_exc}")
+
         # ── PATCH_V12 Priority 2.5: trend-flip exit for verticals ─────────
         # A BEAR_CALL held into a MEASURED uptrend (or BULL_PUT into a
         # measured downtrend) is no longer the trade that was approved
