@@ -137,9 +137,9 @@ LEGACY_ENV_FILE = PROJECT_DIR / "env.txt"
 # Weekly Supertrend settings (the requested 10 & 3).
 DEFAULT_SUPERTREND_PERIOD = 10
 DEFAULT_SUPERTREND_MULTIPLIER = 3.0
-# Table order for the selected names: "asc"  = oldest Supertrend change date first,
-# "desc" = most recent flip first, "score"  = keep the residual-momentum order.
-DEFAULT_SUPERTREND_SORT = "asc"
+# Table order for the selected names: "desc" = most recent Supertrend flip first,
+# "asc"  = oldest trend first, "score"       = keep the residual-momentum order.
+DEFAULT_SUPERTREND_SORT = "desc"
 SUPERTREND_SORT_OPTIONS = ("asc", "desc", "score")
 WEEKLY_RESAMPLE_RULE = "W-FRI"  # NSE trading week, week ending Friday.
 SUPERTREND_SORT_LABELS = {
@@ -1484,18 +1484,22 @@ def summarize_portfolio_beta(members: Sequence[PortfolioMember]) -> tuple[float,
     return beta, 1.0, f"within the [{BETA_LOWER_BOUND:.1f}, {BETA_UPPER_BOUND:.1f}] monitor band"
 
 
+def _has_supertrend_reading(state: Optional[SupertrendState]) -> bool:
+    return state is not None and state.direction != 0
+
+
 def _supertrend_sort_key(state: Optional[SupertrendState]) -> tuple[date, int]:
-    """Sort key for the ST-since column.
+    """Sort key for the ST-since column, for names that do have a reading.
 
     A stock whose trend never flipped inside the loaded history is the *oldest*
-    trend in the table, so it sorts before every dated flip (secondary key -1).
-    Rows with no Supertrend at all go last (secondary key 1) in both directions.
+    trend in the table, so it sorts before every dated flip (secondary key -1)
+    and therefore after every dated flip when the order is reversed.
     """
-    if state is None or (state.change_date is None and state.first_resolved_date is None):
-        return (date.max, 1)
     if state.change_date is not None:
         return (state.change_date, 0)
-    return (state.first_resolved_date, -1)
+    if state.first_resolved_date is not None:
+        return (state.first_resolved_date, -1)
+    return (date.min, -1)
 
 
 def sort_members_by_supertrend(
@@ -1507,16 +1511,19 @@ def sort_members_by_supertrend(
 
     Sorting is stable, so two stocks that flipped in the same week stay in
     residual-momentum rank order. The momentum rank itself is untouched and is
-    still printed in the Rank/%ile column.
+    still printed in the Rank/%ile column. Names with no Supertrend reading are
+    held to the end in both directions, so they never displace a readable row.
     """
     ordered = list(members)
     if order not in ("asc", "desc"):
         return ordered
-    ordered.sort(
-        key=lambda member: _supertrend_sort_key(supertrend_states.get(member.stock.symbol)),
+    readable = [m for m in ordered if _has_supertrend_reading(supertrend_states.get(m.stock.symbol))]
+    unreadable = [m for m in ordered if not _has_supertrend_reading(supertrend_states.get(m.stock.symbol))]
+    readable.sort(
+        key=lambda member: _supertrend_sort_key(supertrend_states[member.stock.symbol]),
         reverse=(order == "desc"),
     )
-    return ordered
+    return readable + unreadable
 
 
 def summarize_supertrend_counts(
