@@ -10,8 +10,16 @@ Method implemented:
     signal residuals are computed, matching the supplied specification.
   * Score = sum(formation residuals) / sample standard deviation of those
     residuals. Stocks above the residual-volatility cap are excluded.
-  * Select up to 15 long-side names, use inverse residual-volatility weights,
+  * Select up to 50 long-side names, use inverse residual-volatility weights,
     and optionally apply entry/exit rank buffers from a user-supplied holdings CSV.
+  * Weekly Supertrend (ATR period 10, multiplier 3) is computed for every stock
+    with price history, and the top-50 table reports whether it is currently
+    POSITIVE or NEGATIVE plus the week it last flipped. Weekly bars are
+    resampled from the daily OHLCV already downloaded (no extra API calls),
+    using Wilder ATR and the standard +/-1 flip rule.
+  * The selected names are displayed sorted by that "ST since" date, oldest
+    trend first (--supertrend-sort asc, the default); desc shows the most recent
+    flips first and score restores the raw momentum ranking.
   * Report portfolio beta and an informational gross-exposure scale; never place
     orders or persist/change a real portfolio.
 
@@ -109,21 +117,36 @@ MIN_PRICE_INR = 20.0
 LIQUIDITY_LOOKBACK_SESSIONS = 63  # approximately three months of NSE sessions.
 DEFAULT_MIN_MEDIAN_DAILY_TURNOVER_INR = 500_000_000.0  # ₹50 crore/day.
 DEFAULT_MAX_MONTHLY_RESIDUAL_VOLATILITY = 0.15
-DEFAULT_PORTFOLIO_SIZE = 15
+DEFAULT_PORTFOLIO_SIZE = 50
 ENTRY_BUFFER_FRACTION = 0.08
 EXIT_BUFFER_FRACTION = 0.15
 BETA_LOWER_BOUND = 0.7
 BETA_UPPER_BOUND = 1.3
 DEFAULT_MAX_FACTOR_STALENESS_MONTHS = 2
-DEFAULT_MIN_ELIGIBLE_UNIVERSE = 15
+DEFAULT_MIN_ELIGIBLE_UNIVERSE = 30
 MAX_LAST_DAILY_BAR_AGE_DAYS = 10
 DEFAULT_REQUESTS_PER_SECOND = 5.0  # Below the published API limit, with headroom.
+DEFAULT_PRICE_HISTORY_EXTRA_MONTHS = 0
 DEFAULT_MAX_WORKERS = 6
 DEFAULT_CACHE_TTL_HOURS = 8.0
 DEFAULT_CACHE_DIR = STOCK_DATA_DIR / "cache"
 DEFAULT_FACTOR_CACHE_DIR = STOCK_DATA_DIR / "factors"
 DEFAULT_ENV_FILE = STOCK_DATA_DIR / "env.txt"
 LEGACY_ENV_FILE = PROJECT_DIR / "env.txt"
+
+# Weekly Supertrend settings (the requested 10 & 3).
+DEFAULT_SUPERTREND_PERIOD = 10
+DEFAULT_SUPERTREND_MULTIPLIER = 3.0
+# Table order for the selected names: "asc"  = oldest Supertrend change date first,
+# "desc" = most recent flip first, "score"  = keep the residual-momentum order.
+DEFAULT_SUPERTREND_SORT = "asc"
+SUPERTREND_SORT_OPTIONS = ("asc", "desc", "score")
+WEEKLY_RESAMPLE_RULE = "W-FRI"  # NSE trading week, week ending Friday.
+SUPERTREND_SORT_LABELS = {
+    "asc": "by weekly Supertrend change date, ascending (oldest trend first, most recent flip last)",
+    "desc": "by weekly Supertrend change date, descending (most recent flip first)",
+    "score": "by residual-momentum score (Supertrend shown for reference only)",
+}
 
 
 class ScreenerError(RuntimeError):
@@ -264,6 +287,45 @@ class PortfolioMember:
     percentile_rank: float
     inverse_vol_weight: float
     gross_adjusted_weight: float
+
+
+@dataclass(frozen=True)
+class SupertrendState:
+    """Weekly Supertrend reading for one stock.
+
+    ``direction`` is +1 when the Supertrend line sits under price (positive /
+    bullish / green) and -1 when it sits above price (negative / bearish / red).
+    ``change_date`` is the week of the most recent flip; when the trend is older
+    than the loaded history it is None and ``first_resolved_date`` carries the
+    earliest week the indicator could be resolved.
+    """
+
+    direction: int
+    value: float
+    change_date: Optional[date]
+    weeks_since_change: Optional[int]
+    flip_in_window: bool
+    first_resolved_date: Optional[date]
+    weekly_bars: int
+
+    @property
+    def direction_label(self) -> str:
+        if self.direction > 0:
+            return "POS"
+        if self.direction < 0:
+            return "NEG"
+        return "n/a"
+
+    def since_label(self) -> str:
+        if self.direction == 0:
+            return "n/a"
+        if self.change_date is None:
+            if self.first_resolved_date is None:
+                return "n/a"
+            # No flip inside the loaded window: the trend is at least this old.
+            return f"≤ {self.first_resolved_date.isoformat()}"
+        weeks = "" if self.weeks_since_change is None else f" ({self.weeks_since_change}w)"
+        return f"{self.change_date.isoformat()}{weeks}"
 
 
 @dataclass(frozen=True)
@@ -1048,6 +1110,226 @@ def monthly_closes_from_daily(daily: pd.DataFrame) -> pd.Series:
     return monthly[~monthly.index.duplicated(keep="last")].sort_index()
 
 
+def resample_daily_to_weekly(
+    daily: pd.DataFrame,
+    rule: str = WEEKLY_RESAMPLE_RULE,
+) -> pd.DataFrame:
+    """Aggregate daily OHLCV into NSE trading weeks (week ending Friday).
+
+    Each weekly bar is indexed by the last session that actually traded in that
+    week, so an in-progress current week is dated by its latest session rather
+    than by a future calendar Friday. Weeks with no session are dropped, so a
+    holiday week never creates a synthetic bar.
+    """
+    columns = ["open", "high", "low", "close", "volume"]
+    empty = pd.DataFrame(columns=columns)
+    if daily is None or daily.empty or not {"open", "high", "low", "close"}.issubset(daily.columns):
+        return empty
+    frame = daily.copy().sort_index()
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame = frame[columns].apply(pd.to_numeric, errors="coerce")
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    frame = frame[(frame[["open", "high", "low", "close"]] > 0).all(axis=1)]
+    if frame.empty:
+        return empty
+    grouper = pd.Grouper(freq=rule, label="right", closed="right")
+    weekly = frame.groupby(grouper).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    weekly = weekly.dropna(subset=["open", "high", "low", "close"])
+    if weekly.empty:
+        return empty
+    last_session = frame.index.to_series().groupby(grouper).max()
+    weekly.index = pd.DatetimeIndex(last_session.reindex(weekly.index).to_numpy())
+    weekly = weekly[~weekly.index.duplicated(keep="last")].sort_index()
+    return weekly
+
+
+def wilder_atr(frame: pd.DataFrame, period: int) -> pd.Series:
+    """Wilder-smoothed ATR (RMA), seeded with the mean of the first `period` true ranges."""
+    high = frame["high"].astype(float).to_numpy()
+    low = frame["low"].astype(float).to_numpy()
+    close = frame["close"].astype(float).to_numpy()
+    n = len(frame)
+    out = np.full(n, np.nan)
+    if n < period or period < 1:
+        return pd.Series(out, index=frame.index, name="atr")
+    previous_close = np.empty(n)
+    previous_close[0] = np.nan
+    previous_close[1:] = close[:-1]
+    true_range = np.maximum(
+        high - low,
+        np.maximum(np.abs(high - previous_close), np.abs(low - previous_close)),
+    )
+    # First bar has no previous close; true range collapses to high - low.
+    true_range[0] = high[0] - low[0]
+    out[period - 1] = float(np.mean(true_range[:period]))
+    for i in range(period, n):
+        out[i] = (out[i - 1] * (period - 1) + true_range[i]) / period
+    return pd.Series(out, index=frame.index, name="atr")
+
+
+def calculate_supertrend(
+    frame: pd.DataFrame,
+    period: int = DEFAULT_SUPERTREND_PERIOD,
+    multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+) -> pd.DataFrame:
+    """Classic Supertrend on the supplied OHLC bars (weekly bars for this screen).
+
+    Convention: bands are hl2 ± multiplier × Wilder ATR(period). The support band
+    (hl2 − k·ATR) can only ratchet up while the prior close holds above it, and
+    the resistance band (hl2 + k·ATR) can only ratchet down while the prior close
+    holds below it. Trend flips to +1 when close exceeds the prior resistance
+    band and to −1 when close breaks the prior support band; the plotted line is
+    the support band in an uptrend and the resistance band in a downtrend.
+    The first `period` bars are needed to seed the ATR and are left unresolved.
+    """
+    if period < 1:
+        raise ValueError("supertrend period must be at least 1")
+    if not np.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError("supertrend multiplier must be a positive finite number")
+
+    result = frame.copy()
+    high = result["high"].astype(float).to_numpy()
+    low = result["low"].astype(float).to_numpy()
+    close = result["close"].astype(float).to_numpy()
+    n = len(result)
+    lower_band = np.full(n, np.nan)   # support line, active while trend is +1
+    upper_band = np.full(n, np.nan)   # resistance line, active while trend is -1
+    trend = np.zeros(n, dtype=int)
+    resolved = np.zeros(n, dtype=bool)
+    atr = wilder_atr(result, period).to_numpy(dtype=float)
+    start = next((i for i in range(n) if np.isfinite(atr[i])), None)
+    if start is None:
+        result["lower_band"] = lower_band
+        result["upper_band"] = upper_band
+        result["supertrend"] = np.nan
+        result["trend"] = 0
+        return result
+
+    hl2 = (high + low) / 2.0
+    basic_lower = hl2 - multiplier * atr
+    basic_upper = hl2 + multiplier * atr
+
+    for i in range(start, n):
+        if i == start:
+            # Seed the recursion with this bar's own bands (no prior state).
+            previous_lower = basic_lower[i]
+            previous_upper = basic_upper[i]
+            previous_close = close[i - 1] if i > 0 else close[i]
+            previous_trend = 1
+        else:
+            previous_lower = lower_band[i - 1]
+            previous_upper = upper_band[i - 1]
+            previous_close = close[i - 1]
+            previous_trend = trend[i - 1]
+
+        current_lower = max(basic_lower[i], previous_lower) if previous_close > previous_lower else basic_lower[i]
+        current_upper = min(basic_upper[i], previous_upper) if previous_close < previous_upper else basic_upper[i]
+
+        if previous_trend == -1 and close[i] > previous_upper:
+            current_trend = 1
+        elif previous_trend == 1 and close[i] < previous_lower:
+            current_trend = -1
+        else:
+            current_trend = previous_trend
+
+        lower_band[i] = current_lower
+        upper_band[i] = current_upper
+        trend[i] = current_trend
+        resolved[i] = True
+
+    result["lower_band"] = lower_band
+    result["upper_band"] = upper_band
+    result["supertrend"] = np.where(trend > 0, lower_band, np.where(trend < 0, upper_band, np.nan))
+    result["trend"] = np.where(resolved, trend, 0)
+    return result
+
+
+def supertrend_state(
+    daily: pd.DataFrame,
+    period: int = DEFAULT_SUPERTREND_PERIOD,
+    multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+) -> tuple[Optional[SupertrendState], Optional[str]]:
+    """Return (state, failure reason) for the weekly Supertrend of one stock.
+
+    Weekly bars are resampled from the daily history already downloaded, so this
+    costs no additional market-data requests. ``failure reason`` is None on
+    success; otherwise it explains why no reading could be produced.
+    """
+    weekly = resample_daily_to_weekly(daily)
+    minimum_bars = period + 2  # ATR seed plus one bar to establish direction.
+    if len(weekly) < minimum_bars:
+        return None, f"fewer than {minimum_bars} weekly bars"
+    try:
+        result = calculate_supertrend(weekly, period=period, multiplier=multiplier)
+    except (ValueError, KeyError, TypeError) as exc:
+        return None, f"supertrend calculation failed ({type(exc).__name__})"
+    resolved = result.loc[result["trend"] != 0]
+    if resolved.empty:
+        return None, "weekly ATR never seeded"
+
+    trends = resolved["trend"].to_numpy(dtype=int)
+    bar_dates = [timestamp.date() for timestamp in resolved.index]
+    last_index = len(trends) - 1
+    direction = int(trends[last_index])
+    value = float(resolved["supertrend"].iloc[last_index])
+
+    flip_index: Optional[int] = None
+    for i in range(last_index, 0, -1):
+        if trends[i] != trends[i - 1]:
+            flip_index = i
+            break
+
+    if flip_index is not None:
+        change_date: Optional[date] = bar_dates[flip_index]
+        weeks_since: Optional[int] = last_index - flip_index
+        flip_in_window = True
+    else:
+        change_date = None
+        weeks_since = None
+        flip_in_window = False
+
+    return (
+        SupertrendState(
+            direction=direction,
+            value=value,
+            change_date=change_date,
+            weeks_since_change=weeks_since,
+            flip_in_window=flip_in_window,
+            first_resolved_date=bar_dates[0],
+            weekly_bars=int(len(weekly)),
+        ),
+        None,
+    )
+
+
+def compute_weekly_supertrend(
+    prices: Mapping[str, pd.DataFrame],
+    period: int = DEFAULT_SUPERTREND_PERIOD,
+    multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+) -> tuple[dict[str, SupertrendState], dict[str, str]]:
+    """Compute weekly Supertrend for every symbol with price history, in memory."""
+    states: dict[str, SupertrendState] = {}
+    failures: dict[str, str] = {}
+    for symbol in sorted(prices):
+        daily = prices.get(symbol)
+        if daily is None or daily.empty:
+            failures[symbol] = "no price history"
+            continue
+        state, reason = supertrend_state(daily, period=period, multiplier=multiplier)
+        if state is None:
+            failures[symbol] = reason or "unavailable"
+        else:
+            states[symbol] = state
+    return states, failures
+
+
 def residual_volatility_passes(
     residual_volatility: float,
     maximum: float = DEFAULT_MAX_MONTHLY_RESIDUAL_VOLATILITY,
@@ -1200,6 +1482,58 @@ def summarize_portfolio_beta(members: Sequence[PortfolioMember]) -> tuple[float,
             "no leverage/scale-up is applied"
         )
     return beta, 1.0, f"within the [{BETA_LOWER_BOUND:.1f}, {BETA_UPPER_BOUND:.1f}] monitor band"
+
+
+def _supertrend_sort_key(state: Optional[SupertrendState]) -> tuple[date, int]:
+    """Sort key for the ST-since column.
+
+    A stock whose trend never flipped inside the loaded history is the *oldest*
+    trend in the table, so it sorts before every dated flip (secondary key -1).
+    Rows with no Supertrend at all go last (secondary key 1) in both directions.
+    """
+    if state is None or (state.change_date is None and state.first_resolved_date is None):
+        return (date.max, 1)
+    if state.change_date is not None:
+        return (state.change_date, 0)
+    return (state.first_resolved_date, -1)
+
+
+def sort_members_by_supertrend(
+    members: Sequence[PortfolioMember],
+    supertrend_states: Mapping[str, SupertrendState],
+    order: str = DEFAULT_SUPERTREND_SORT,
+) -> list[PortfolioMember]:
+    """Return the selected names ordered for display; ties keep the score order.
+
+    Sorting is stable, so two stocks that flipped in the same week stay in
+    residual-momentum rank order. The momentum rank itself is untouched and is
+    still printed in the Rank/%ile column.
+    """
+    ordered = list(members)
+    if order not in ("asc", "desc"):
+        return ordered
+    ordered.sort(
+        key=lambda member: _supertrend_sort_key(supertrend_states.get(member.stock.symbol)),
+        reverse=(order == "desc"),
+    )
+    return ordered
+
+
+def summarize_supertrend_counts(
+    members: Sequence[PortfolioMember],
+    supertrend_states: Mapping[str, SupertrendState],
+) -> tuple[int, int, int]:
+    """Count positive / negative / unavailable Supertrend readings in the table."""
+    positive = negative = unavailable = 0
+    for member in members:
+        state = supertrend_states.get(member.stock.symbol)
+        if state is None or state.direction == 0:
+            unavailable += 1
+        elif state.direction > 0:
+            positive += 1
+        else:
+            negative += 1
+    return positive, negative, unavailable
 
 
 def _latest_close_before_today(daily: pd.DataFrame) -> float:
@@ -1399,7 +1733,15 @@ def print_screen(
     price_failures: Mapping[str, str],
     filter_reasons: Mapping[str, int],
     cache_hits: int,
+    supertrend_states: Optional[Mapping[str, SupertrendState]] = None,
+    supertrend_failures: Optional[Mapping[str, str]] = None,
+    supertrend_period: int = DEFAULT_SUPERTREND_PERIOD,
+    supertrend_multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+    supertrend_sort: str = DEFAULT_SUPERTREND_SORT,
 ) -> None:
+    supertrend_states = supertrend_states or {}
+    supertrend_failures = supertrend_failures or {}
+    ordered_members = sort_members_by_supertrend(members, supertrend_states, supertrend_sort)
     print("\nRESIDUAL MOMENTUM — NSE STOCK SCREEN (INFORMATIONAL ONLY; NO ORDERS)\n")
     print(f"Signal / return data through : {as_of_month}")
     print(f"Indian factor data through   : {factor_month} (lag to latest full month: {factor_lag_months})")
@@ -1422,6 +1764,20 @@ def print_screen(
     print(f"Universe                      : {requested_count} requested; {mapped_count} exact NSE EQ mappings")
     print(f"Eligible after filters        : {eligible_count}; cached price histories: {cache_hits}")
     print(f"Long basket                   : up to {portfolio_size}; selected {len(members)}")
+    print(f"Table order                   : {SUPERTREND_SORT_LABELS.get(supertrend_sort, supertrend_sort)}")
+    print(
+        f"Weekly Supertrend             : ATR({supertrend_period}) × {supertrend_multiplier:g} on weekly bars "
+        f"(W-FRI) resampled from the daily history already downloaded"
+    )
+    print(
+        "Supertrend legend             : POS = line below price (bullish); NEG = line above price (bearish); "
+        "'ST since' = week the trend last flipped"
+    )
+    print(
+        "Supertrend caveats            : '≤ date' = trend older than the loaded history (use "
+        "--history-extra-months to load more); the newest weekly bar may be the in-progress week, "
+        "dated by its last session"
+    )
 
     if buffer_summary.applied:
         print(
@@ -1469,10 +1825,14 @@ def print_screen(
             "Gross weight",
             "Last close",
             "Median turnover/day",
+            f"ST ({supertrend_period},{supertrend_multiplier:g})",
+            "ST since",
+            "ST level",
         )
         rows: list[tuple[str, ...]] = []
-        for position, member in enumerate(members, start=1):
+        for position, member in enumerate(ordered_members, start=1):
             stock = member.stock
+            state = supertrend_states.get(stock.symbol)
             rows.append(
                 (
                     str(position),
@@ -1486,6 +1846,9 @@ def print_screen(
                     f"{member.gross_adjusted_weight * 100:.2f}%",
                     _format_money_inr(stock.latest_price),
                     f"₹{stock.median_daily_turnover_inr / 10_000_000:,.2f} Cr",
+                    state.direction_label if state is not None else "n/a",
+                    state.since_label() if state is not None else "n/a",
+                    _format_money_inr(state.value) if state is not None else "n/a",
                 )
             )
         widths = [
@@ -1495,6 +1858,16 @@ def print_screen(
         print("  ".join("-" * widths[i] for i in range(len(headers))))
         for row in rows:
             print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+        if supertrend_states:
+            positive, negative, unavailable = summarize_supertrend_counts(members, supertrend_states)
+            print(
+                f"\nWeekly Supertrend in this basket: {positive} POS / {negative} NEG"
+                + (f" / {unavailable} unavailable" if unavailable else "")
+                + f"  (computed for {len(supertrend_states)} symbol(s) with price history"
+                + (f"; {len(supertrend_failures)} unavailable" if supertrend_failures else "")
+                + ")"
+            )
 
     if filter_reasons:
         summary = ", ".join(f"{count} {reason}" for reason, count in sorted(filter_reasons.items()))
@@ -1549,13 +1922,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-residual-vol-pct", type=float, default=None,
                         help="exclude monthly residual volatility above this percent (default 15)")
     parser.add_argument("--portfolio-size", type=int, default=None,
-                        help="maximum long-side names (default 15)")
+                        help="maximum long-side names shown in the table (default 50)")
     parser.add_argument("--holdings-file", type=Path, default=None,
                         help="optional current-holdings CSV with a symbol/ticker column; applies 8%% entry / 15%% exit buffers")
     parser.add_argument("--min-eligible", type=int, default=None,
-                        help="minimum screened cross-section required before printing (default 15)")
+                        help="minimum screened cross-section required before printing (default 30)")
     parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS,
                         help="parallel candle workers, capped at 8 (default 6)")
+    parser.add_argument("--supertrend-period", type=int, default=None,
+                        help="weekly Supertrend ATR period (default 10)")
+    parser.add_argument("--supertrend-multiplier", type=float, default=None,
+                        help="weekly Supertrend ATR multiplier (default 3)")
+    parser.add_argument("--supertrend-sort", choices=SUPERTREND_SORT_OPTIONS, default=None,
+                        help="order of the displayed rows: asc = oldest 'ST since' first (default), "
+                             "desc = most recent flip first, score = residual-momentum rank")
+    parser.add_argument("--history-extra-months", type=int, default=None,
+                        help="extra months of daily history to load before the regression window "
+                             "(default 0; only needed to date older weekly Supertrend flips)")
     parser.add_argument("--refresh", action="store_true", help="ignore cached candles and fetch fresh history")
     return parser
 
@@ -1645,6 +2028,20 @@ def run_screen(args: argparse.Namespace) -> int:
         DEFAULT_CACHE_TTL_HOURS,
         "PRICE_CACHE_TTL_HOURS",
     )
+    supertrend_period = args.supertrend_period
+    if supertrend_period is None:
+        supertrend_period = _optional_int(
+            env_value(env_values, "SUPERTREND_PERIOD"),
+            DEFAULT_SUPERTREND_PERIOD,
+            "SUPERTREND_PERIOD",
+        )
+    supertrend_multiplier = args.supertrend_multiplier
+    if supertrend_multiplier is None:
+        supertrend_multiplier = _optional_float(
+            env_value(env_values, "SUPERTREND_MULTIPLIER"),
+            DEFAULT_SUPERTREND_MULTIPLIER,
+            "SUPERTREND_MULTIPLIER",
+        )
     if (
         max_staleness < 0 or min_turnover < 0 or min_eligible < 1 or cache_hours < 0
         or portfolio_size < 1 or not 0 < max_residual_vol_pct <= 100
@@ -1652,6 +2049,30 @@ def run_screen(args: argparse.Namespace) -> int:
         raise ScreenerError(
             "Staleness, turnover, cache, and eligible-count settings must be non-negative; "
             "portfolio size must be positive and residual-volatility cap must be in (0, 100] percent."
+        )
+    supertrend_sort = (
+        args.supertrend_sort
+        or env_value(env_values, "SUPERTREND_SORT", DEFAULT_SUPERTREND_SORT)
+        or DEFAULT_SUPERTREND_SORT
+    ).strip().lower()
+    if supertrend_sort not in SUPERTREND_SORT_OPTIONS:
+        raise ScreenerError(
+            "SUPERTREND_SORT/--supertrend-sort must be 'asc', 'desc', or 'score'."
+        )
+    history_extra_months = args.history_extra_months
+    if history_extra_months is None:
+        history_extra_months = _optional_int(
+            env_value(env_values, "PRICE_HISTORY_EXTRA_MONTHS"),
+            DEFAULT_PRICE_HISTORY_EXTRA_MONTHS,
+            "PRICE_HISTORY_EXTRA_MONTHS",
+        )
+    if supertrend_period < 2 or not np.isfinite(supertrend_multiplier) or supertrend_multiplier <= 0:
+        raise ScreenerError(
+            "Weekly Supertrend needs an ATR period of at least 2 and a positive multiplier."
+        )
+    if history_extra_months < 0 or history_extra_months > 120:
+        raise ScreenerError(
+            "PRICE_HISTORY_EXTRA_MONTHS/--history-extra-months must be between 0 and 120."
         )
     current_holdings = read_current_holdings(args.holdings_file)
     if args.holdings_file is not None:
@@ -1715,10 +2136,18 @@ def run_screen(args: argparse.Namespace) -> int:
     # Keep one extra price month before the 36 regression returns. The range is
     # anchored to the usable signal month (not today's month) so an explicitly
     # stale/historical screen still has enough price history.
+    # NOTE: this same daily history is resampled to weekly bars for Supertrend,
+    # so no separate weekly request is made. --history-extra-months extends the
+    # range further back purely to date older weekly Supertrend flips.
     first_needed_month = as_of_month - (REGRESSION_MONTHS + 1)
-    start_date = (first_needed_month.start_time - pd.DateOffset(months=2)).date()
+    start_date = (
+        first_needed_month.start_time - pd.DateOffset(months=2 + history_extra_months)
+    ).date()
     end_date = today
-    console_status(f"[3/4] Fetching daily OHLCV from {start_date} through {end_date}; progress updates follow.")
+    console_status(
+        f"[3/4] Fetching daily OHLCV from {start_date} through {end_date}; progress updates follow "
+        f"(this also feeds the weekly Supertrend)."
+    )
     prices, price_failures, cache_hits = _fetch_prices(
         instruments=instruments,
         client=client,
@@ -1765,6 +2194,32 @@ def run_screen(args: argparse.Namespace) -> int:
         portfolio_size=portfolio_size,
         current_holdings=current_holdings,
     )
+
+    # Supertrend is derived from the daily bars already in memory, so it costs
+    # no extra API calls even though it is computed for every priced symbol.
+    console_status(
+        f"[4/4] Computing weekly Supertrend (ATR {supertrend_period} × {supertrend_multiplier:g}) "
+        f"for {len(prices)} histories..."
+    )
+    supertrend_states, supertrend_failures = compute_weekly_supertrend(
+        prices,
+        period=supertrend_period,
+        multiplier=supertrend_multiplier,
+    )
+    missing_in_table = [
+        member.stock.symbol for member in portfolio_members if member.stock.symbol not in supertrend_states
+    ]
+    console_status(
+        f"[4/4] Supertrend ready for {len(supertrend_states)} symbol(s)"
+        + (f"; {len(supertrend_failures)} unavailable" if supertrend_failures else "")
+        + "."
+    )
+    if missing_in_table:
+        print(
+            "WARNING: no weekly Supertrend for table entries: " + ", ".join(missing_in_table[:20]),
+            file=sys.stderr,
+        )
+
     portfolio_beta, gross_scale, beta_message = summarize_portfolio_beta(portfolio_members)
     console_status(
         f"[4/4] Portfolio screen ready: {len(portfolio_members)} name(s); "
@@ -1792,6 +2247,11 @@ def run_screen(args: argparse.Namespace) -> int:
         price_failures=price_failures,
         filter_reasons=filter_reasons,
         cache_hits=cache_hits,
+        supertrend_states=supertrend_states,
+        supertrend_failures=supertrend_failures,
+        supertrend_period=supertrend_period,
+        supertrend_multiplier=supertrend_multiplier,
+        supertrend_sort=supertrend_sort,
     )
     return 0
 

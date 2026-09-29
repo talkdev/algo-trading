@@ -28,6 +28,7 @@ from regime_engine import RegimeEngine, merge_regime_into_signals
 from calibration_engine import CalibrationEngine
 from strategy_engine import StrategyEngine
 from execution_engine import ExecutionEngine
+from tape_state_engine import TapeStateEngine
 # v8: the five Telegram lifecycle updates - engine started, a heartbeat every
 # TELEGRAM_HEARTBEAT_MIN minutes while it runs, a trade order placed, a trade
 # order closed, and the engine stopped with the reason. Its own module and its
@@ -117,6 +118,7 @@ class MainEngine:
         self.regime_engine = RegimeEngine(
             self.config, self.db, self.market_engine, self.logger
         )
+        self.tape_state_engine = TapeStateEngine(self.config, self.logger)
         self.strategy_engine = StrategyEngine(
             self.config, self.db, self.market_engine, self.cal_engine, self.logger
         )
@@ -1224,6 +1226,15 @@ class MainEngine:
             except Exception as e:
                 self.logger.error(f"Regime engine error: {e}", exc_info=True)
                 # Continue without regime — signals will have None for regime fields
+
+            # ── Step 3b: TapeState WHEN-layer (additive; fail-open NEUTRAL)
+            _cyc_phase = "tape_state"
+            try:
+                signals = self.tape_state_engine.update(
+                    signals, self.market_engine.state
+                )
+            except Exception as e:
+                self.logger.debug(f"TapeState engine error: {e}")
         except Exception:
             _elapsed = time_module.monotonic() - _cyc_t0
             if _elapsed >= 60.0:
@@ -1256,6 +1267,18 @@ class MainEngine:
                         signals.get("final_regime_notes")
                         if signals.get("final_regime") in ("NO_TRADE", "ABORT")
                         else None
+                    ),
+                    "tape_state":        signals.get("tape_state"),
+                    "tape_state_reason": signals.get("tape_state_reason"),
+                    "tape_side":         signals.get("tape_side"),
+                    "tape_dwell_min":    signals.get("tape_dwell_min"),
+                    "tape_allow_entry":  (
+                        int(bool(signals.get("tape_allow_entry")))
+                        if signals.get("tape_allow_entry") is not None else None
+                    ),
+                    "tape_force_flat":   (
+                        int(bool(signals.get("tape_force_flat")))
+                        if signals.get("tape_force_flat") is not None else None
                     ),
                 }
                 self.db.update(

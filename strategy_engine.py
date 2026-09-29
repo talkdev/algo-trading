@@ -22,6 +22,7 @@ from core import (
 )
 from data_engine import MarketDataEngine
 from calibration_engine import CalibrationEngine, CalibrationState
+from tape_state_engine import entry_when_block_reason, size_nudge_multiplier
 
 IRON_CONDOR      = "IRON_CONDOR"
 IRON_BUTTERFLY   = "IRON_BUTTERFLY"
@@ -710,7 +711,8 @@ class StrategyEngine:
                             or (_stale_done and _fade_next)
                             or _two_way_fade
                             or _range_to_tw_fade
-                            or _opp_rotation):
+                            or _opp_rotation
+                            or _pin_failed_to_dir):
                         return "NO_TRADE", (
                             f"entry_cooldown_{_cd_need - mins:.0f}min_remaining"
                         )
@@ -738,6 +740,32 @@ class StrategyEngine:
             if _opp_rotation:
                 _reconfirm = float(getattr(
                     self.config, "reentry_opposite_reconfirm_min", 12) or 12)
+            # Phase 4: after a protective CLOSE_STOP, opposite credit must
+            # not take the short 12m regime-rotation path. Keep the normal
+            # reconfirm clock (or stop_opposite floor if it is higher) and
+            # require TapeState TREND_* when the entry gate is on.
+            _last_exit_reason = str(state.get("last_exit_reason") or "")
+            _after_protective_stop = (
+                (not _opp_rotation)
+                and _last_exit_reason.startswith("CLOSE_STOP")
+                and _next_side in ("BULL", "BEAR")
+                and _last_side in ("BULL", "BEAR")
+                and _next_side != _last_side
+            )
+            if _after_protective_stop:
+                _stop_opp = float(getattr(
+                    self.config, "stop_opposite_reconfirm_min", 20.0) or 20.0)
+                # Floor only — never shorten below protective-stop policy.
+                _reconfirm = max(_reconfirm, _stop_opp)
+                if bool(getattr(self.config, "tape_state_entry_gate", False)):
+                    _ts = str(signals.get("tape_state") or "NEUTRAL")
+                    if _ts not in ("TREND_ON", "TREND_STRENGTHENING", "BREAK_FROM_COIL"):
+                        # Fail-open NEUTRAL still waits the clock; non-trend
+                        # labels (COIL/TURN/EXHAUSTED) refuse opposite credit.
+                        if _ts not in ("NEUTRAL", ""):
+                            return "NO_TRADE", (
+                                f"tape_when_stop_opposite_{_ts}_need_trend"
+                            )
             if _since is not None and _since < _reconfirm:
                 try:
                     _sp = float(signals.get("spot") or 0.0)
@@ -1373,6 +1401,11 @@ class StrategyEngine:
             )
             if not signals.get("gap_fade_opportunity") and not _trend_side_ok:
                 return "NO_TRADE", f"wide_or_{or_condition}_dangerous_to_sell_premium"
+
+        # ── TapeState WHEN entry gate (additive, fail-open) ──────────────
+        _tape_block = entry_when_block_reason(signals, final_regime, self.config)
+        if _tape_block:
+            return "NO_TRADE", _tape_block
 
         return None
 
@@ -6171,6 +6204,21 @@ class StrategyEngine:
             used = float(signals.get("day_move_used_pct") or 0.0)
         except (TypeError, ValueError):
             used = 0.0
+        # Directional spend: total range from a morning dump must not ban a
+        # fresh opposite-side debit (Sep29 bull after down open).
+        try:
+            if direction > 0:
+                used = float(
+                    signals.get("day_up_used_pct", used)
+                    if signals.get("day_up_used_pct") is not None else used
+                )
+            elif direction < 0:
+                used = float(
+                    signals.get("day_down_used_pct", used)
+                    if signals.get("day_down_used_pct") is not None else used
+                )
+        except (TypeError, ValueError):
+            pass
         _adx_strong = float(getattr(cfg, "adx_strong_threshold", 28.0))
         _ema = str(signals.get("ema_structure") or "")
         _ema_align = (
@@ -6909,6 +6957,8 @@ class StrategyEngine:
         _late = "late_window" in str(why)
 
         size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
+        # TapeState STRENGTHENING size nudge (additive; capped 1.15).
+        size_mult *= float(size_nudge_multiplier(signals, self.config))
         # v48: aligned long beside an open credit vertical is the second
         # concurrent slot — size it down and hard-cap lots so a grind-day
         # debit cannot print an 8-lot ticket next to a 3-lot put (21-Sep).
@@ -7337,6 +7387,8 @@ class StrategyEngine:
             return {"action": "NO_TRADE", "reason": _sticky}
 
         size_mult = max(float(signals.get("size_multiplier") or 0.50), 0.10)
+        # TapeState STRENGTHENING size nudge (additive; capped 1.15).
+        size_mult *= float(size_nudge_multiplier(signals, self.config))
         # Second concurrent ticket (opposite extreme fade, or aligned
         # long premium) is sized at 0.70x so peak book risk stays inside
         # ~1.7x a single ticket, not 2x. Same at every DTE.

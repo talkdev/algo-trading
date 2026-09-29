@@ -2,7 +2,7 @@
 
 ## Architecture Overview & Technical Reference Manual
 
-**Current build:** `v65m7q-cycle-alive-watchdog`  
+**Current build:** `v65m7s-credit-impulse-dte0`  
 **Hard invariant:** never open credit into a labelled threatened trend  
 **Live entry point:** `python main.py`  
 **Replay:** `python backtest_engine.py` (same `MainEngine.run_one_cycle()`)
@@ -12,7 +12,7 @@
 ### Table of Contents
 
 1. [Executive Summary & Core Design Philosophy](#1-executive-summary--core-design-philosophy)
-   - [1.1 Current build (v65m7q)](#11-current-build-v65m7q--backtest-is-a-data-pump-into-mainengine)
+   - [1.1 Current build (v65m7s)](#11-current-build-v65m7s--backtest-is-a-data-pump-into-mainengine)
    - [1.2 Live-hardening SOP](#12-live-hardening-sop)
 2. [Module Architecture & Import Dependency Graph](#2-module-architecture--import-dependency-graph)
 3. [Engine Initialization, Data Structures & State Mechanics](#3-engine-initialization-data-structures--state-mechanics)
@@ -41,14 +41,15 @@ The system is a cost-aware, intraday NIFTY 50 options engine for NSE weekly / ne
 #### Core Tenets
 
 - **Cost-aware structural edge.** Every candidate structure must clear realistic round-trip friction (STT, exchange, SEBI, stamp, GST, brokerage, bid-ask slippage). Edge is never assumed.
-- **Strict intraday demarcation.** Positions open after the session window (DTE-dependent) and flatten before the hard exit (15:15 IST weekly, 15:00 on 0DTE) — five minutes before the broker 15:20 F&O RMS sweep.
+- **Strict intraday demarcation.** Positions open after the session window (DTE-dependent) and flatten at the hard exit (**15:15** IST weekly / **15:00** on 0DTE). Watchdog square-off deadline is **15:18**; broker F&O RMS sweep is ~15:20.
 - **Asymmetric book.** The primary book is a premium seller (Iron Condor, Iron Butterfly, Bull Put Spread, Bear Call Spread). Long Call / Long Put exist only as a **substitute** when the sell-side is refused (or as an aligned second-slot debit when that env is enabled).
 - **Two-way auction preservation.** Expanding sessions reject mid-range pins and fade confirmed extremes instead.
 - **Hard credit-into-trend invariant.** `_hard_credit_into_trend_refusal()` is the single source of truth: no BCS into labelled UPTREND / no BPS into labelled DOWNTREND once ADX is at the trend threshold. Waivers are day-structure bearish or a pinned high-extreme fade — never a self-set circular exemption.
+- **Additive TapeState WHEN-layer.** `RegimeEngine` still owns WHICH side; `TapeStateEngine` classifies WHEN (`TREND_ON` / `TREND_STRENGTHENING` / `BREAK_FROM_COIL` / `COIL` / `TURN_STARTING` / `TREND_EXHAUSTED` / `NEUTRAL`). Fail-open to `NEUTRAL` when disabled or unclassified.
 
 ---
 
-### 1.1 Current build (v65m7q) — backtest is a data pump into MainEngine
+### 1.1 Current build (v65m7s) — backtest is a data pump into MainEngine
 
 **Architecture rule:** do **not** maintain a second trading loop. Replay feeds historical DB cycles into the **same** live path:
 
@@ -59,7 +60,7 @@ HistoricalStore → SimClock.set → ReplayClient.point → MainEngine.run_one_c
 | Layer | Live | Replay |
 |---|---|---|
 | Orchestration | `MainEngine.run_one_cycle()` | **identical** (`MainEngine.for_replay`) |
-| Indicators / regime / decide / monitor / entry / exit / state / P&L | live engines | **identical** |
+| Indicators / regime / TapeState / decide / monitor / entry / exit / state / P&L | live engines | **identical** |
 | Broker I/O | `UpstoxClient` | `ReplayClient` (DB snapshots) |
 | Fills | `PaperOrderExecutor` or live | `PaperOrderExecutor` + `FillModel` |
 | Clock | wall `now_ist` | `SimClock` (patches `core` / `main` / engines) |
@@ -68,46 +69,49 @@ HistoricalStore → SimClock.set → ReplayClient.point → MainEngine.run_one_c
 Startup banner must show:
 
 ```text
-Engine Build = v65m7q-cycle-alive-watchdog
+Engine Build = v65m7s-credit-impulse-dte0
 Hard Invariant = no credit into labelled threatened trend
 ```
 
-#### What this build owns (v65h → v65m7q)
+#### What this build owns (v65m7q → v65m7s)
 
 | Area | Behaviour |
 |---|---|
-| Cycle-alive watchdog | A slow but **running** cycle must not look like a dead feed. `MainEngine` marks `_cycle_in_progress` and phase-times `run_one_cycle()` (Sep25 live printed 80–170s iterations). |
-| Construct-fail latch | Latch after **2** identical economics rejects (`construct_fail_latch_after=2`). Single-reject sticky over-suppressed re-probes. Deep-EV latch only when EV ≤ `construct_fail_deep_ev_pts` (−10 pts). |
+| TapeState WHEN-layer | New `tape_state_engine.py`. Runs after regime merge inside `run_one_cycle()` (live = replay). Publisher + entry/exit/size gates default **on**; env can disable per flag. Fail-open → `NEUTRAL`. |
+| Credit impulse (hard gate) | Signed `spot_impulse_up/down_pts` refuse `PREMIUM_SELL_BEAR` into a rally / `PREMIUM_SELL_BULL` into a dump when impulse > VIX-scaled limit (floor 25 pts). Two-way extreme fade exempt. Catches Sep29-class +28pt pops that absolute 3-bar velocity missed. |
+| Directional day-move | Threat / exhaustion / momentum chase use `day_up_used_pct` / `day_down_used_pct`, not total range. A morning dump must not ban a fresh opposite-side ticket (Sep29). |
+| DTE0 day-move exemption | With-trend day-move waiver on expiry needs **STRONG_*** price **or** HIGH confidence once threat ≥ 100%; plain DOWNTREND/MEDIUM no longer clears a spent expiry chase. |
+| Momentum DTE0 exhaust | On expiry, side-spend ≥ 100% + ADX < 50 → hard refuse (`momentum_dte0_exhausted_adx_*`). Crash-grade ADX still clears. |
+| Momentum signed impulse | Do not buy puts into a rally / calls into a dump (`momentum_impulse_against_*`). |
+| Entry-abort storm | ≥2 same-family `ABORTED` within 15 min → 15 min cooldown (`entry_abort_storm_*`) so rejected multi-legs cannot re-fire every cycle. |
+| Tape exit (additive) | Before trend-flip: underwater non-fade verticals/debits flatten on adverse impulse or position-matched `TURN_STARTING` (`tape_adverse_impulse_*`). Never flattens winners; never kills two-way fade tickets. |
+| Post-protective-stop | After `CLOSE_STOP`, opposite credit keeps the longer reconfirm floor (`stop_opposite_reconfirm_min` default 20) and, when the entry gate is on, needs `TREND_ON` / `TREND_STRENGTHENING` / `BREAK_FROM_COIL`. |
+| Pin→dir cooldown | Pin-failed demotion to an evidenced vertical is cooldown-exempt (same family as opposite fade / rotation). |
+| STRENGTHENING size nudge | `size_nudge_multiplier` ×1.10 (cap 1.15) on `TREND_STRENGTHENING` only. |
+| Orphan reconcile (v65m7r) | Broker FILLED is **not** an orphan when the local book is already OPEN/CLOSED. UDAPI1111 (already flat) → `RECONCILED_FLAT`, not infinite CRITICAL Exit-All. |
+| Cycle-alive watchdog | Inherited from v65m7q: slow but **running** cycle is alive; phase-times `run_one_cycle()`. |
+| Construct-fail latch | Latch after **2** identical economics rejects. Deep-EV latch only when EV ≤ `construct_fail_deep_ev_pts` (−10 pts). |
 | Broker history truth | History API failure must **not** look like “no order” (v65m7p). |
-| Hard invariant → debit | `hard_invariant` / `no_calls_into` / `no_puts_into` / unfinished-extreme / sticky tokens are momentum-block markers so a refused credit can still consult LONG_CALL / LONG_PUT. |
-| Extreme fade pin | Only the **matching** extreme is pinned (a low-location BCS must not inherit a high-fade flag). |
-| Fade flags on FLAT | Location-derived fade flags must not permanently latch when the tape is FLAT. |
-| Sticky max-pain | When IV expand clears, drop the sticky max-pain latch so Intent can re-evaluate. Soft/warmup BCS still needs a prior refuse + ≥10 pt spot move before max-pain is waived. |
-| Open-spike wait | “Unresolved” is not wall-clock alone — a lower-high / pullback can resolve the wick before 12:15. |
-| Range-origin map | `PREMIUM_SELL_BULL` / `PREMIUM_SELL_BEAR` with `price=RANGE` defer to `_resolve_range_strategy` so location+tape evidence applies (and cannot flip to the opposite vertical). |
-| Sticky trend refuse | After a labelled UPTREND BCS refuse (or DOWNTREND BPS refuse), a one-cycle RANGE flicker does not re-open that credit. |
-| Unfinished extremes | BCS at loc ≥ 0.90 / BPS at loc ≤ 0.10 refused unless day-structure / extreme-fade waiver applies. |
-| Mid-range fade | Mid-location fade into a with-grind EMA/VWAP is refused (Sep18-class). |
 | Live WAL | `wal_autocheckpoint=0`; close does **not** TRUNCATE. Recover with `restore_primary_db.py`. |
-| Replay fidelity | Live-parity preflight (yesterday VIX / prior close / chain / session_state). FAIL exits 2 unless `--allow-unfaithful`. |
+| Replay fidelity | Live-parity preflight. FAIL exits 2 unless `--allow-unfaithful`. |
 
-#### Still true from v65–v65h (do not regress)
+#### Still true from v65–v65m7q (do not regress)
 
-- Replay is a MainEngine pump (not a second `decide()` / `_open` / `_close`).
-- Debit HWM: Phase A after `momentum_lock_trigger` is free-trade only; Phase B trail only once HWM open gain ≥ `momentum_hwm_large_frac` (default **1.0** = 2× entry), giving back `momentum_hwm_giveback_frac` (0.20).
+- Replay is a MainEngine pump (not a second `decide()` / `_open` / `_close`). TapeState is **not** forked in `backtest_engine.py` — it rides the same `run_one_cycle()`.
+- Hard invariant → debit: refused-credit markers still reach LONG_CALL / LONG_PUT.
+- Extreme fade pin is matching-extreme only; fade flags must not latch on FLAT.
+- Sticky max-pain drops when IV expand clears; soft/warmup BCS needs prior refuse + ≥10 pt spot move.
+- Open-spike wait can resolve via lower-high / pullback before 12:15.
+- Range-origin map defers `PREMIUM_SELL_BULL/BEAR` + `price=RANGE` to `_resolve_range_strategy`.
+- Sticky trend refuse after labelled UPTREND BCS / DOWNTREND BPS refuse.
+- Debit HWM: Phase A free-trade after lock trigger; Phase B trail once HWM ≥ 2× entry.
 - Replay does **not** force `allow_correlated_debit_beside_credit` (default **false**).
-- Immature ORB breakout needs same-side VWAP (not NEUTRAL/UNKNOWN).
-- Immature directional credit may underwrite on strong ADX preview (≥ `adx_strong_threshold`).
-- Profit-lock **arming** on DTE1+ uses the weekly 22% bar (not a ~29% blend). Armed lock-hit = `CLOSE_TARGET`.
-- DTE1 lock-anchored P6 ladder; near-expiry give-back capped at `profit_lock_max_giveback_pts_dte0/dte1` (2.0 pts). IC/fly arm at `profit_lock_pct_symmetric` (0.10).
-- Location-edge credits: `credit_risk_ratio_away_side` (0.04); EV may clear down to −friction; DTE0 wing `credit_ratio` eased to 0.09 on that path only.
-- Soft directional always requires `_soft_tape_agrees`. Soft lean at loc ≥ 0.70 / ≤ 0.30 can book without VWAP lag veto.
+- Profit-lock arming on DTE1+ uses the weekly 22% bar; IC/fly arm at 10%.
+- Soft directional always requires `_soft_tape_agrees`.
 
-#### Prior (v50–v64) — superseded, do not treat as current
+#### Prior (v50–v64 / old v65m7q stamp) — superseded
 
-Those passes closed live book-truth (PENDING_ENTRY, orphan flatten, Intent, fill qty), tape/lean visibility, and the first MainEngine pump. The long per-version hunt tables (v50–v64) live in git history. **Do not** follow “restart on v61/v62/v65h” banners or the old `v65h-invariant` stamp.
-
-Replay P&L tables printed in older README revisions are **not** a live guarantee. Hunt the first decision divergence, not end-of-day ₹.
+Do **not** follow `v65m7q-cycle-alive-watchdog` or older banners. Hunt the first decision divergence, not EOD ₹. Older README P&L tables are not a live guarantee.
 
 ---
 
@@ -116,9 +120,9 @@ Replay P&L tables printed in older README revisions are **not** a live guarantee
 1. **Hard invariants first.** `_hard_credit_into_trend_refusal()` is the single source of truth (map + counter-trend). No fade/two-way carve-out may reopen a labelled UPTREND BCS / DOWNTREND BPS except the documented waivers inside that function.
 2. **No circular waiver.** Do not set an exemption in the same function that checks it.
 3. **Hunt first divergence of decision**, not EOD P&L. Replay blotter wins are not proof live will refuse the next bad entry.
-4. **Deploy proof.** Restart the live process; banner must show `v65m7q-cycle-alive-watchdog`. Confirm PID start time ≥ fix time.
-5. **Inherited bad opens.** Entry invariants do not close positions opened under old code; manage/flatten under the exit ladder.
-6. **Sanity before live:** `python verify_all.py` (module self-tests + static pre-flight). There is no `preflight_live.py` or `tests/test_live_invariants.py` in this tree. Corrupt primary: `python restore_primary_db.py` (never while `main.py` has the file open).
+4. **Deploy proof.** Restart the live process; banner must show `v65m7s-credit-impulse-dte0`. Confirm PID start time ≥ fix time.
+5. **Inherited bad opens.** Entry invariants do not close positions opened under old code; manage/flatten under the exit ladder (TapeState exit can cut underwater wrong-side holds).
+6. **Sanity before live:** `python verify_all.py` (module self-tests + static pre-flight) and `python tape_state_engine.py` (WHEN-layer self-test). Corrupt primary: `python restore_primary_db.py` (never while `main.py` has the file open).
 
 ---
 
@@ -141,15 +145,21 @@ Replay P&L tables printed in older README revisions are **not** a live guarantee
         ┌────────────────────────┼────────────────────────┐
         ▼                        ▼                        ▼
  strategy_engine.py      execution_engine.py        data_engine.py
- hard gates / Intent     PENDING→OPEN / 7-pri       1m/5m/15m bars
+ hard gates / Intent     PENDING→OPEN / ladder      1m/5m/15m bars
  map / EV / momentum     lock / HWM / flatten       chain / OR / VIX
+ tape WHEN entry/size    tape adverse-impulse exit  impulse / day_up/dn
         │                        │                        │
         └────────────┬───────────┴────────────┬───────────┘
                      ▼                        ▼
-             regime_engine.py         calibration_engine.py
-             4-tier classifier        rolling 20-session
-                     │                (main.py instance is live)
+             regime_engine.py         tape_state_engine.py
+             4-tier WHICH-side        additive WHEN classifier
+                     │                (fail-open NEUTRAL)
+                     │                        │
                      └────────────┬───────────┘
+                                  ▼
+                      calibration_engine.py
+                      rolling 20-session (main.py instance)
+                                  │
                                   ▼
                                core.py
                     Config, Database (WAL, no TRUNCATE),
@@ -158,20 +168,22 @@ Replay P&L tables printed in older README revisions are **not** a live guarantee
 
 #### Key module roles
 
-1. **`main.py` — production driver.** Instantiates every engine, runs the cycle (`regime_calc_interval_sec` default **15**), watchdog, `/stop` flatten, daily halt, Telegram lifecycle, trade console report. `MainEngine.for_replay()` is the backtest entry. Paper is the default (`PAPER_TRADE_MODE`); live requires `LIVE_RATES_VERIFIED`.
-2. **`bot_controller.py` — operator remote.** Telegram `/start`/`help` print commands; **`/run` launches `main.py`**; `/stop` writes `{LOG_DIR}/algo.stop` then the engine flattens. Startup kills duplicate `bot_controller.py` processes (Task Scheduler relaunch guard). It is **not** the trading loop. `/stock` runs `stock-screener.py`.
-3. **`core.py`.** `Config` (env.txt + defaults), SQLite `Database` (WAL + `synchronous=FULL` + `wal_autocheckpoint=0` + **no TRUNCATE on close**, `quick_check` on open), `ExpiryCalendar` (NIFTY **weekly Tuesday** expiry; Monday if Tuesday is a holiday), `UpstoxClient`, `now_ist` / `today_ist` / `by_dte` / `dte_blend`.
-4. **`data_engine.py`.** Spot / VIX / chain ingest, 1-minute bars, 5-minute fast ADX (`adx_fast_resample=300s`), 15-minute MTF (EMA 9/21, ADX 14, VWAP, Parkinson RV). **No Supertrend; no synthetic Black-76/BS Greeks** — deltas/IV come from the broker chain. Drops the **forming 1-minute bar** before MTF. Session windows from **DTE**, not weekday.
+1. **`main.py` — production driver.** Instantiates every engine (including `TapeStateEngine`), runs the cycle (`regime_calc_interval_sec` default **15**), watchdog, `/stop` flatten, daily halt, Telegram lifecycle, trade console report. `MainEngine.for_replay()` is the backtest entry. Paper is the default (`PAPER_TRADE_MODE`); live requires `LIVE_RATES_VERIFIED=true` in env or the loader forces paper.
+2. **`bot_controller.py` — operator remote.** Telegram `/start`/`help` print commands; **`/run` launches `main.py`**; `/stop` writes `{LOG_DIR}/algo.stop` then the engine flattens. Startup kills duplicate `bot_controller.py` processes (Task Scheduler relaunch guard). It is **not** the trading loop. `/stock` still points at missing `stock-screener.py` (removed); the tree has `stock-tsmom.py` instead (not wired to Telegram).
+3. **`core.py`.** `Config` (env.txt + defaults), SQLite `Database` (WAL + `synchronous=FULL` + `wal_autocheckpoint=0` + **no TRUNCATE on close**, `quick_check` on open), `ExpiryCalendar` (NIFTY **weekly Tuesday** expiry; Monday if Tuesday is a holiday), `UpstoxClient`, `now_ist` / `today_ist` / `by_dte` / `dte_blend`. TapeState knobs live here (`TAPE_STATE_*`, exhausted-move floors, `stop_opposite_reconfirm_min`). `LIVE_RATES_VERIFIED` is a **loader-only** safety check (not a `Config` field) — if paper is off and rates are unverified, `load_config` forces paper.
+4. **`data_engine.py`.** Spot / VIX / chain ingest, 1-minute bars, 5-minute fast ADX (`adx_fast_resample=300s`), 15-minute MTF (EMA 9/21, ADX 14, VWAP, Parkinson RV). Publishes signed 3-bar `spot_impulse_up/down_pts`, absolute `spot_velocity_*`, and `day_up_used_pct` / `day_down_used_pct`. **No Supertrend; no synthetic Black-76/BS Greeks** — deltas/IV come from the broker chain. Drops the **forming 1-minute bar** before MTF. Session windows from **DTE**, not weekday: 0DTE forced to **10:30–13:00 / hard exit 15:00** in `run_cycle` (overrides `Config.tuesday_last_entry`, which can still print **12:30** on the startup banner).
 5. **`calibration_engine.py`.** Live `CalibrationEngine` used by `MainEngine` and injected into `StrategyEngine` / `ExecutionEngine`. Rolling ~20-session shrinkage on VIX / VRP / OI / PCR / skew / day-range. `regime_engine.py` still contains a second `CalibrationEngine` class that `RegimeEngine` constructs internally — live threshold updates are pushed from the `main.py` instance.
-6. **`regime_engine.py`.** Four-tier classification → `final_regime` + `size_multiplier`. Does **not** emit `MOMENTUM_BUY_*` — those are strategy-layer substitutes.
-7. **`strategy_engine.py`.** Hard gates, Intent, map, range resolver, hard invariant, entry rules, strike/EV/sizing, momentum substitute.
-8. **`execution_engine.py`.** Place / reconcile / monitor / flatten. 7-priority exit ladder, debit HWM, PENDING_ENTRY, orphan Exit-All.
-9. **`backtest_engine.py`.** Historical pump + `FillModel` + blotter / audit / `--test`.
-10. **`telegram_reporter.py`.** Start / heartbeat / order / close / stop. Own daemon thread — never sync-send on the trading thread.
-11. **`split_db_per_day.py`.** Snapshot the live primary read-only, then write `data/per_day/*.db` shards. Each day prints FIDELITY PASS/WARN/FAIL (missing yesterday VIX is FAIL, exit 2). `--allow-unfaithful` only to ignore that.
-12. **`restore_primary_db.py`.** Recover `data/nifty_algo_v3.db`: refuse if `main.py` still has it open → integrity of live+WAL → table salvage → newest `.corrupt.*` quarantine → merge `data/per_day/` last (overlay today’s salvaged rows). `--dry-run` / `--force-shards`.
-13. **`verify_all.py`.** Module self-tests + static pre-flight (does not start the live loop). Still lists `clean-db.py` in compile checks; that file is **not** in the tree.
-14. **`upstox_token.py`.** OAuth token refresh.
+6. **`regime_engine.py`.** Four-tier classification → `final_regime` + `size_multiplier` (WHICH side). Does **not** emit `MOMENTUM_BUY_*` — those are strategy-layer substitutes. Does **not** own WHEN timing — that is TapeState.
+7. **`tape_state_engine.py`.** Additive WHEN classifier. Labels (first match): `TURN_STARTING` → `TREND_EXHAUSTED` → `BREAK_FROM_COIL` → `COIL` → `TREND_STRENGTHENING` → `TREND_ON` → `NEUTRAL`. Writes `tape_state`, `tape_state_reason`, `tape_side`, `tape_dwell_min`, `tape_allow_entry`, `tape_force_flat` onto signals and into `cycle_log`. Helpers: `entry_when_block_reason`, `size_nudge_multiplier`.
+8. **`strategy_engine.py`.** Hard gates (incl. credit impulse / abort storm / TapeState WHEN), Intent, map, range resolver, hard invariant, entry rules, strike/EV/sizing, momentum substitute.
+9. **`execution_engine.py`.** Place / reconcile / monitor / flatten. Exit ladder + TapeState adverse-impulse flatten (before trend-flip), debit HWM, PENDING_ENTRY, orphan Exit-All.
+10. **`backtest_engine.py`.** Historical pump + `FillModel` + blotter / audit / `--test`. No parallel TapeState fork — uses `MainEngine.run_one_cycle()`.
+11. **`telegram_reporter.py`.** Start / heartbeat / order / close / stop. Own daemon thread — never sync-send on the trading thread.
+12. **`split_db_per_day.py`.** Snapshot the live primary read-only, then write `data/per_day/*.db` shards. Each day prints FIDELITY PASS/WARN/FAIL (missing yesterday VIX is FAIL, exit 2). `--allow-unfaithful` only to ignore that.
+13. **`restore_primary_db.py`.** Recover `data/nifty_algo_v3.db`: refuse if `main.py` still has it open → integrity of live+WAL → table salvage → newest `.corrupt.*` quarantine → merge `data/per_day/` last (overlay today’s salvaged rows). `--dry-run` / `--force-shards`.
+14. **`verify_all.py`.** Module self-tests + static pre-flight (does not start the live loop). Compile list still includes missing `clean-db.py`; does **not** yet include `tape_state_engine.py` or `restore_primary_db.py` (run `python tape_state_engine.py` separately).
+15. **`upstox_token.py`.** OAuth token refresh.
+16. **`stock-tsmom.py`.** Standalone stock TSMOM utility (not part of the NIFTY options cycle).
 
 ---
 
@@ -205,10 +217,12 @@ class StrategyEngine:
 - `construct_fail` sticky key + `_max_pain_block_spot`
 - `displaced_tape` latch
 - `daily_halted`
+- `last_exit_reason` (used for post-`CLOSE_STOP` opposite-credit policy)
+- TapeState dwell/coil memory: `tape_coil_latched`, `tape_track_side`, `tape_track_since`, `tape_adx_hist`, `tape_px_hist`
 
 #### Open-slot accounting
 
-`PENDING_ENTRY` **counts** toward `max_concurrent_positions`. Successful `OPEN`+`CLOSED` count toward `max_entries_per_day`. Aborted/pending drafts do not burn the daily entry cap.
+`PENDING_ENTRY` **counts** toward `max_concurrent_positions`. Successful `OPEN`+`CLOSED` count toward `max_entries_per_day`. Aborted/pending drafts do not burn the daily entry cap (but an **abort storm** of the same family still cools new attempts — see hard gates).
 
 #### Database
 
@@ -216,14 +230,14 @@ class StrategyEngine:
 - **Do not checkpoint-truncate the live primary.** A kill during `wal_checkpoint(TRUNCATE)` rewrote the btree and emptied the WAL. Close leaves the WAL on disk; next open replays it. Chain-snapshot bursts do **not** checkpoint. `checkpoint()` is optional PASSIVE and is not on the live write path.
 - Startup: `PRAGMA quick_check` + `COUNT(*)` on `option_chain_snapshot`. Fail loudly and point at `python restore_primary_db.py`.
 - `strategy_decisions` stores every cycle (`action`, `strategy_name`, `reason`, `params_json`, `signals_json`).
-- After regime merge, `MainEngine` patches the latest `cycle_log` **and** `market_snapshots` row (snapshots are written *before* enrichment).
+- After regime merge (+ TapeState), `MainEngine` patches the latest `cycle_log` with regime **and** tape columns (`tape_state`, `tape_state_reason`, `tape_side`, `tape_dwell_min`, `tape_allow_entry`, `tape_force_flat`). `market_snapshots` is written *before* enrichment and is patched with **regime fields only** (vol/price/positioning/final/confidence) — tape columns are cycle_log-only.
 - Previous-day VIX for Gate 1 / `momentum_vix_gap` prefers `session_state.prev_day_vix_close`, then `daily_summary.vix_close`, then `vix_history`. Shards that omit yesterday’s VIX are **not live-faithful**.
 
 ---
 
 ### 4. Master Pipeline Lifecycle: `decide()`
 
-Called from `MainEngine.run_one_cycle()` whenever the clock is inside the entry cut (09:30 … late-momentum end 14:57) and the flatten lock is held. ABORT / feed_stale / None regime are **hard-gate** refusals inside `decide()`, so momentum markers still fire.
+Called from `MainEngine.run_one_cycle()` whenever the outer entry gate passes: clock in **09:30 … late-momentum end 14:57**, flatten lock held, `or_computed`, not daily-halted, and same-cycle reentry policy. ABORT / feed_stale / None regime are **hard-gate** refusals inside `decide()`, so momentum markers still fire.
 
 ```
                          [ signals ]
@@ -270,14 +284,15 @@ Every NO_TRADE path consults `_momentum_decision` before returning. Intent is re
 1. Day reset  
 2. `MarketDataEngine.run_cycle()`  
 3. `RegimeEngine.process_signals` + `merge_regime_into_signals`  
-4. Patch `cycle_log` / `market_snapshots`  
-5. `monitor_all_positions` (always — ABORT never skips exits)  
+3b. `TapeStateEngine.update` (WHEN-layer; fail-open `NEUTRAL`)  
+4. Patch `cycle_log` (regime + tape) / `market_snapshots` (regime only)  
+5. `monitor_all_positions` (always — ABORT never skips exits; TapeState impulse exit runs here)  
 6. `perform_hard_exit_sweep`  
 7. `check_daily_loss_halt`  
 8. `decide()` → `process_entry_decision`  
-9. Daily P&L + console trade report  
+9. Daily P&L + console trade report (+ Telegram trade updates on live)  
 
-Cycle interval default: `regime_calc_interval_sec = 15` (`REGIME_CALC_INTERVAL_SEC`). The outer loop also allows decide() from **09:30** through the late-momentum end (**14:57**); sell-side clocks inside `decide()` still use the DTE window.
+Cycle interval default: `regime_calc_interval_sec = 15` (`REGIME_CALC_INTERVAL_SEC`; some `main.py` comments still say 45 — trust Config). Sell-side clocks inside `decide()` still use the DTE window (`entry_start`/`entry_end`).
 
 ---
 
@@ -297,24 +312,39 @@ Evaluated in order. Session clocks come from `state` (DTE-set), not the static R
 | 8 | `max_concurrent_positions_reached` | OPEN+PENDING ≥ `max_concurrent_positions` (**2**) | Second ticket must be a different trade |
 | 9 | `max_entries_per_day_N_reached` | OPEN+CLOSED ≥ **3** | +1 extra (cap 4) on live two-way fade |
 | 10 | `second_slot_cooldown_*` | open book + < 10 min since last **entry** | Opposite extreme fade exempt |
-| 11 | `entry_cooldown_*` | < 10 min since last **act** (entry or exit) | Opposite rotation: `reentry_opposite_cooldown_min` (3) |
-| 12 | `no_material_change_since_exit_*` | spot move < max(0.12% , 15 pts) | Opposite rotation uses 0.25× |
+| 11 | `entry_cooldown_*` | < 10 min since last **act** (entry or exit) | Opposite rotation / extreme fade / pin→dir demotion exempt; opposite rotation reconfirm uses `reentry_opposite_cooldown_min` (3) |
+| 12 | `no_material_change_since_exit_*` | spot move < max(0.12% , 15 pts) | Opposite rotation uses 0.25×. After protective `CLOSE_STOP`, opposite credit floors at `stop_opposite_reconfirm_min` (20) and may emit `tape_when_stop_opposite_*` |
 | 13 | `2_consecutive_stops_halt` | blotter streak ≥ 2 | Banked `CLOSE_TARGET` is **not** a stop |
 | 14 | `same_signal_combo_caused_last_stop` | same regime/signal fingerprint | |
 | 15 | `stop_cooldown_*` | `STOP_COOLDOWN_MAP` | CLOSE_STOP 30m, CLOSE_ADX 45m, CLOSE_VWAP 20m, CLOSE_DELTA 30m |
-| 16 | `spot_velocity_too_fast` | 5-min displacement vs `spot_velocity_pct` (0.14%) | Two-way + matching fade exempt |
-| 17 | `straddle_expanding_no_sell_into_rising_iv` | ATM straddle up >6% vs ~5-min lookback (`[-1]`) | **No IV confirm** — do not qualify on EXPANDING/SPIKING (live morning blocks fired with DECLINING IV on ATM roll) |
+| 16 | `spot_velocity_too_fast_*pts_in_3min` | Abs move over last **~3 one-minute bars** vs VIX-scaled `spot_velocity_pct` (0.14%, floor 25 pts) | Two-way + matching fade exempt |
+| 16b | `credit_impulse_against_bear_*` / `credit_impulse_against_bull_*` | Signed 3-bar impulse > same VIX-scaled limit against the credit thesis | Two-way extreme fade exempt; catches pops absolute velocity missed |
+| 16c | `entry_abort_storm_*` | ≥2 same-family ABORTED within 15 min, still inside 15 min cooldown | ABORTED does not burn max_entries — this cools the re-fire loop |
+| 17 | `straddle_expanding_no_sell_into_rising_iv` | ATM straddle up >6% vs ~5-min lookback (most recent sample ≥270s old) | **No IV confirm** — do not qualify on EXPANDING/SPIKING (live morning blocks fired with DECLINING IV on ATM roll) |
 | 18 | `opening_range_not_yet_computed` / `opening_range_pending` | `or_computed` false / `price_regime==OBSERVING` | Separate tokens |
 | 19 | `open_spike_wait_unresolved_lower_high` | open-HIGH wick, before resolve / 12:15 | Pullback 30 pts or LH loc ≥ 0.70 after 10:45 |
 | 20 | `chain_stale_cannot_validate_strikes` | chain age > 120s | |
-| 21 | `expiry_day_waiting_for_0dte` | Tuesday morning, 0DTE chain not loaded | |
+| 21 | `expiry_day_waiting_for_0dte_series_listed` | Tuesday morning, 0DTE chain not loaded | |
 | 22 | `confidence_*_insufficient_*` | LOW/NONE | Extreme fade / away-side intent can waive |
 | 23 | `dte_X_above_max_4_*` / `dte_requires_confidence` | DTE > 4, or DTE ≥ 4 needs HIGH | |
-| 24 | `day_move_used_*_no_edge` | range / straddle ≥ `day_move_used_block_pct` | `day_move_range_factor` converts range→displacement |
+| 24 | `day_move_used_*_no_edge` | **threat-side** range (`day_up` for BEAR / `day_down` for BULL) ≥ block pct | Condors keep total-range. Confirmed with-trend verticals exempt except DTE0 spent + plain trend/MEDIUM |
 | 25 | `only_Xmin_before_hard_exit_need_Y` | < 90 min (morning) / < 50 min after 13:00 | `afternoon_credit_after_hhmm=13:00` |
 | 26 | `wide_or_*_dangerous_to_sell_premium` | WIDE / VERY_WIDE without confirmed trend | |
+| 27 | `tape_when_*` | TapeState WHEN entry gate | Blocks stale-side `TURN_STARTING`, this-side `TREND_EXHAUSTED`, directional into `COIL`. Fail-open on `NEUTRAL` / disabled. Two-way extreme fades exempt. |
 
 Intent exemptions are **post-selection** (v60). Hard gates must not call `_intent_exempt`.
+
+#### TapeState WHEN labels (first match)
+
+| Label | Meaning | Entry | Exit / size |
+|---|---|---|---|
+| `TURN_STARTING` | Adverse impulse vs regime (+ optional price flip) | Block **old** side only | `tape_force_flat` → position-matched impulse flatten |
+| `TREND_EXHAUSTED` | This side’s directional spend spent without crash-grade ADX | Block this-side chase | — |
+| `BREAK_FROM_COIL` | Coil latch + with-side impulse | Allow | — |
+| `COIL` | Narrow/choppy + weak ADX + tight VWAP | Block directional; RANGE/fades OK | Latch for later break |
+| `TREND_STRENGTHENING` | Dwell + rising ADX + with-side EMA | Allow | Size × `tape_state_size_boost` (1.10, cap 1.15) |
+| `TREND_ON` | Dwell + with-regime, not exhausted | Allow | — |
+| `NEUTRAL` | Fail-open / unclassified / disabled | Allow (no WHEN refuse) | — |
 
 ---
 
@@ -533,7 +563,10 @@ Momentum **never** runs unprompted. It answers sell-side refusals whose reason m
 - Location lean on RANGE/CHOPPY: debit follows the lean (puts at the low, calls at the high).
 - After a losing credit stop: one-way continuation allowed when ADX is strong and the tape is not two-way/chop; side aligns to what beat the vertical (BCS→calls, BPS→puts; IC/RANGE free).
 - Late window **14:30–14:57**, ADX ≥ 28, VWAP displacement, fresh extreme, half-risk, max 4 lots, ≥ 25 min to hard exit.
-- VIX gap ≤ 12%; do not chase SPIKING IV. Day-move cap 200% of priced range.
+- VIX gap ≤ 12%; do not chase SPIKING IV unless trend-aligned. Day-move chase uses **side** spend (`day_up` / `day_down`), not total range.
+- Signed impulse: refuse puts into a rally / calls into a dump.
+- DTE0: side-spend ≥ 100% and ADX < 50 → hard refuse (`momentum_dte0_exhausted_adx_*`); crash-grade ADX still clears.
+- Soft chase cap (`momentum_day_move_max_pct`) still applies unless measured-strong exemption fires.
 - Aligned debit beside an open credit is **off** (`allow_correlated_debit_beside_credit=false`) unless env-enabled; second-slot debit cap 3 lots.
 
 #### Economics
@@ -554,7 +587,8 @@ Momentum **never** runs unprompted. It answers sell-side refusals whose reason m
 |---|---|---|---|
 | 1 | Delta breach | `CLOSE_STOP` | Short Δ vs `delta_close_for_dte` |
 | 2 | Spot proximity | `CLOSE_STOP` | Gap-fraction on 0DTE (`prox_gap_frac_dte0=0.70`) |
-| 2.5 | Trend-flip (verticals) | `CLOSE_STOP` | Measured trend against the short |
+| 2.4 | Tape adverse impulse | `CLOSE_STOP` | Additive WHEN exit **before** trend-flip in evaluation order. Uses `EXIT_PRIORITY_PRICE_STOP` (enum 3) — not a separate priority constant. Underwater non-fade vertical/debit vs signed impulse or position-matched `TURN_STARTING`. Never flattens winners |
+| 2.5 | Trend-flip (verticals) | `CLOSE_STOP` | Measured trend against the short; also `EXIT_PRIORITY_PRICE_STOP` |
 | 3 | Price / premium stop | `CLOSE_STOP` | **If profit-lock armed → `CLOSE_TARGET`** |
 | 4 | Profit lock | arm / ratchet | DTE0 40%; DTE1+ 22% (clock steps 15%/10%); IC/fly 10% |
 | 5 | Cheap buyback | `CLOSE_TARGET` | Short ≤ `cheap_buyback_pts` (**5.0**) after 13:00 |
@@ -565,7 +599,7 @@ Momentum **never** runs unprompted. It answers sell-side refusals whose reason m
 **Debit HWM:** Phase A free-trade after +25%; Phase B trail from peak once 2× entry, keep ~80% of peak open gain. Hitting the armed debit trail is `CLOSE_TARGET`.  
 **Banked exits are not stops** (`banked_exit_is_not_a_stop`) — they do not spend the two-stop halt budget.
 
-Regime rotation can free a slot on a mature opposite trend after `regime_rotation_min_hold_min` (25).
+Regime rotation can free a slot on a mature opposite trend after `regime_rotation_min_hold_min` (25). After a protective `CLOSE_STOP`, opposite credit uses `stop_opposite_reconfirm_min` (20) floor and may require TapeState `TREND_*` / `BREAK_FROM_COIL`.
 
 ---
 
@@ -588,7 +622,7 @@ RawLots = MaxRisk / StructuralLoss
 SizedLots = RawLots × size_mult
 ```
 
-- `size_mult` from regime; second concurrent ticket × 0.70; extreme fade × 1.05–1.15; soft directional 0.75; weekly unclear range 0.75.  
+- `size_mult` from regime; second concurrent ticket × 0.70; extreme fade × 1.05–1.15; soft directional 0.75; weekly unclear range 0.75; TapeState `TREND_STRENGTHENING` × `tape_state_size_boost` (1.10, cap 1.15).  
 - Floor `min_lots_fraction=0.60`. HIGH-confidence amortization may size up to amortize ₹20×legs brokerage.  
 - `LOT_CAPS_BY_DAY`: Mon 8 / Tue 10 / Wed 6 / Thu 6 / Fri 5, scaled by √(capital / starting).  
 - Margin: wing × 65 × 1.10 × (1+addon) × lots ≤ 80% capital. 0DTE addon +18%.  
@@ -605,17 +639,18 @@ SizedLots = RawLots × size_mult
 python main.py                 # live or paper (PAPER_TRADE_MODE in env.txt)
 python bot_controller.py       # Telegram remote (/run, /stop, /status)
 python verify_all.py           # module tests + static pre-flight
+python tape_state_engine.py    # TapeState WHEN self-test
 python upstox_token.py         # refresh access token
 python restore_primary_db.py   # recover corrupt/unreadable primary
 python split_db_per_day.py     # shards for replay (after a healthy session)
 ```
 
-- `PAPER_TRADE_MODE=true` uses `PaperOrderExecutor` + optional `FillModel`. Live also requires `LIVE_RATES_VERIFIED=true` or the loader forces paper.
+- `PAPER_TRADE_MODE=true` uses `PaperOrderExecutor` + optional `FillModel`. Live also requires `LIVE_RATES_VERIFIED=true` in env (loader-only flag) or `load_config` forces paper.
 - Live orders: place **once** (`order_max_retries=0`), reconcile by tag (`order_tag_prefix=nav6`). Exits escalate as LIMIT + market-protection (2%); no MARKET/SL-M for options.  
 - `/stop` writes `{LOG_DIR}/algo.stop`. Main flattens (tag Exit-All, including PENDING_ENTRY) then exits **without** WAL TRUNCATE.  
 - Watchdog: poll 5s; feed degrade 45s / force-exit 120s; square-off deadline **15:18**. A cycle in progress is **alive**.  
 - Soft halt at 50% of daily loss (alert); hard halt **flattens**.  
-- Startup: PENDING_ENTRY reconcile (probe all dispatch states; flatten via tag — never `execute_close` with empty legs); orphan PLACED without `position_id` flattened (`orphan_flatten_at_broker=true`); OPEN with 0 legs → `_finalize_empty_open_position`; broker flat + local OPEN → `_heal_local_open_broker_flat`.  
+- Startup: PENDING_ENTRY reconcile (probe all dispatch states; flatten via tag — never `execute_close` with empty legs); orphan PLACED without `position_id` flattened (`orphan_flatten_at_broker=true`) **only when residual broker exposure exists** — FILLED + local CLOSED → `BOOKED`; already-flat Exit-All → `RECONCILED_FLAT`; OPEN with 0 legs → `_finalize_empty_open_position`; broker flat + local OPEN → `_heal_local_open_broker_flat`.  
 - `ALLOW_SAME_CYCLE_REENTRY` default **true** (live = BT).  
 - Lot size default **65** — verify against the current NSE series.
 - `bot_controller` kills other copies of itself on launch so Telegram `getUpdates` is not locked.
@@ -632,7 +667,7 @@ Same 84-column block in live and replay, from the persisted book + current chain
 
 - `env.txt` overrides OS env; unknowns ignored. Token-only file uses code defaults.  
 - Holidays: `nse_holidays.json`. Events: `high_impact_events.json` (mtime reload).  
-- Dependencies: `requirements.txt` (numpy, pandas, requests, python-telegram-bot, psutil, Google API clients).
+- Dependencies: `requirements.txt` (numpy, pandas, requests, python-telegram-bot, psutil; Google API clients remain listed but `split_db_per_day.py` has **no** Drive upload path).
 
 #### Primary DB
 
@@ -655,6 +690,7 @@ python backtest_engine.py [OPTIONS]
 python split_db_per_day.py [--force] [--verify-only] [--dates YYYY-MM-DD ...] [--allow-unfaithful]
 python restore_primary_db.py [--dry-run] [--force-shards]
 python verify_all.py
+python tape_state_engine.py
 ```
 
 | Flag | Meaning |
@@ -690,12 +726,16 @@ Hunt correlated-debit overlap only when the **live** book itself stacked; do not
 - `second_slot_cooldown_Xmin_remaining`, `entry_cooldown_Xmin_remaining`
 - `no_material_change_since_exit_*`, `2_consecutive_stops_halt`
 - `same_signal_combo_caused_last_stop`, `stop_cooldown_Xmin_remaining`
-- `spot_velocity_too_fast`, `straddle_expanding_no_sell_into_rising_iv`
+- `spot_velocity_too_fast_*pts_in_3min`, `credit_impulse_against_bear_*`, `credit_impulse_against_bull_*`
+- `entry_abort_storm_*`
+- `straddle_expanding_no_sell_into_rising_iv`
 - `opening_range_not_yet_computed`, `opening_range_pending`, `open_spike_wait_unresolved_lower_high`
-- `chain_stale_cannot_validate_strikes`, `expiry_day_waiting_for_0dte`
+- `chain_stale_cannot_validate_strikes`, `expiry_day_waiting_for_0dte_series_listed`
 - `confidence_*_insufficient_*`, `dte_X_above_max_4_*`
 - `day_move_used_*_no_edge`, `only_Xmin_before_hard_exit_need_Y`
 - `wide_or_*_dangerous_to_sell_premium`
+- `tape_when_TURN_STARTING_*`, `tape_when_TREND_EXHAUSTED_*`, `tape_when_COIL_*`
+- `tape_when_stop_opposite_*_need_trend`
 
 #### Map / invariant / range
 
@@ -737,8 +777,14 @@ Hunt correlated-debit overlap only when the **live** book itself stacked; do not
 - `momentum_needs_trend_got_*`, `momentum_adx_*_below_min`
 - `momentum_call_at_or_below_vwap`, `momentum_put_at_or_above_vwap`
 - `momentum_iv_expanding_no_chase`, `momentum_day_move_used_*`
+- `momentum_dte0_exhausted_adx_*_lt_50`
+- `momentum_impulse_against_put_*`, `momentum_impulse_against_call_*`
 - `momentum_expected_capture_*_below_*x_friction`
 - `momentum_before_entry_window_*`, `momentum_late_*`
+
+#### Exit (TapeState)
+
+- `tape_adverse_impulse_*` (reason_detail on `CLOSE_STOP`)
 
 ---
 
@@ -747,7 +793,7 @@ Hunt correlated-debit overlap only when the **live** book itself stacked; do not
 | Knob | Default | Env |
 |---|---|---|
 | Paper mode | true unless live verified | `PAPER_TRADE_MODE` |
-| Live rates verified | **false** (forces paper) | `LIVE_RATES_VERIFIED` |
+| Live rates verified | **false** (loader forces paper; not a Config attr) | `LIVE_RATES_VERIFIED` |
 | Capital | ₹10,00,000 | `STARTING_CAPITAL` |
 | Daily loss / per-trade | 8% / 2% | `MAX_DAILY_LOSS_PCT` / `MAX_RISK_PER_TRADE_PCT` |
 | Concurrent / entries | 2 / 3 | `MAX_CONCURRENT_POSITIONS` / `MAX_ENTRIES_PER_DAY` |
@@ -756,6 +802,14 @@ Hunt correlated-debit overlap only when the **live** book itself stacked; do not
 | Force lots | off | `FORCE_LOTS` |
 | ADX trend / strong | 20 / 28 | `ADX_TREND_THRESHOLD` / `ADX_STRONG_THRESHOLD` |
 | Weekly window | 09:45–14:15 / 15:15 | `TRADING_WINDOW_*` / `HARD_EXIT_TIME` |
-| 0DTE window | 10:30–13:00 / 15:00 | set by DTE in `data_engine` |
+| 0DTE window | 10:30–13:00 / 15:00 | set by DTE in `data_engine` (not `tuesday_last_entry`) |
 | Late momentum | 14:30–14:57 | `MOMENTUM_LATE_WINDOW_*` |
 | Lot size / strike step | 65 / 50 | `NIFTY_LOT_SIZE` / `NIFTY_STRIKE_STEP` |
+| TapeState enabled | **true** | `TAPE_STATE_ENABLED` |
+| TapeState entry / exit / size | **true** / **true** / **true** | `TAPE_STATE_ENTRY_GATE` / `TAPE_STATE_EXIT_GATE` / `TAPE_STATE_SIZE_NUDGE` |
+| TapeState size boost | 1.10 (cap 1.15) | `TAPE_STATE_SIZE_BOOST` |
+| Regime entry dwell | 5 min | `REGIME_ENTRY_DWELL_MIN` |
+| Exhausted move (DTE0 / DTE1+) | 100% / 125% | `EXHAUSTED_MOVE_PCT` / `EXHAUSTED_MOVE_PCT_DTE1PLUS` |
+| Exhausted ADX floor (DTE0 / DTE1+) | 50 / 45 | `EXHAUSTED_MOVE_ADX_FLOOR_DTE0` / `EXHAUSTED_MOVE_ADX_FLOOR_DTE1PLUS` |
+| Stop-opposite reconfirm | 20 min | `STOP_OPPOSITE_RECONFIRM_MIN` |
+| Surprise impulse min hold | 1 min | `SURPRISE_IMPULSE_EXIT_MIN_HOLD_MIN` |

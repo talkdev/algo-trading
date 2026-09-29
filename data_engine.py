@@ -677,6 +677,11 @@ class MarketDataEngine:
                 "last_exit_is_afternoon_low_fade",
                 "last_exit_is_afternoon_high_fade",
                 "tape_displacement",
+                "tape_coil_latched",
+                "tape_track_side",
+                "tape_track_since",
+                "tape_adx_hist",
+                "tape_px_hist",
                 "session_mean_reversion_book",
                 "session_no_calls_after_uptrend_refuse",
                 "session_no_puts_after_downtrend_refuse",
@@ -692,6 +697,16 @@ class MarketDataEngine:
                     if _k == "_straddle_hist" and isinstance(_v, (list, tuple)):
                         _aux_out[_k] = [
                             [float(_p[0]), float(_p[1])]
+                            for _p in list(_v)[-40:]
+                            if isinstance(_p, (list, tuple)) and len(_p) == 2
+                        ]
+                    elif _k == "tape_adx_hist" and isinstance(_v, (list, tuple)):
+                        _aux_out[_k] = [
+                            float(x) for x in list(_v)[-12:]
+                        ]
+                    elif _k == "tape_px_hist" and isinstance(_v, (list, tuple)):
+                        _aux_out[_k] = [
+                            [str(_p[0]), str(_p[1])]
                             for _p in list(_v)[-40:]
                             if isinstance(_p, (list, tuple)) and len(_p) == 2
                         ]
