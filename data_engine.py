@@ -356,6 +356,11 @@ class MarketDataEngine:
         # Ensure all required columns exist
         self._ensure_extra_columns()
 
+        # Replay injects yesterday's VIX from the shard's session_state.
+        # Must exist before _load_or_init_session_state (called here and
+        # again on day-roll).
+        self._replay_prev_day_vix: Optional[float] = None
+
         # Load or initialise session state
         self.state: dict = self._load_or_init_session_state()
 
@@ -501,10 +506,18 @@ class MarketDataEngine:
             # Re-resolve day_mode from the current events file so a restart
             # after a calendar edit does not keep a stale NORMAL flag.
             out["day_mode"] = self._compute_day_mode(today_ist())
+            if not out.get("prev_day_vix_close"):
+                _seed = getattr(self, "_replay_prev_day_vix", None)
+                if _seed:
+                    out["prev_day_vix_close"] = float(_seed)
             return out
 
         # Fresh session
         prev_day_vix = self.db.get_prev_day_vix_close()
+        if not prev_day_vix:
+            _seed = getattr(self, "_replay_prev_day_vix", None)
+            if _seed:
+                prev_day_vix = float(_seed)
         day_label    = ExpiryCalendar.get_day_label(today_ist())
         dte          = ExpiryCalendar.get_dte(today_ist())
 
@@ -2809,13 +2822,9 @@ class MarketDataEngine:
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     rows,
                 )
-                # Push WAL pages after each chain burst so a hard kill cannot
-                # leave the primary btree half-written (root cause of the
-                # 2026-09 corrupt nifty_algo_v3.db).
-                try:
-                    self.db.checkpoint()
-                except Exception:
-                    pass
+                # Do not checkpoint here. Copying WAL into the main file
+                # every cycle is the window a manual cancel tears. The WAL
+                # is the crash log; next open replays it.
             except Exception as e:
                 self.logger.debug(f"Chain snapshot persist error: {e}")
 

@@ -2965,9 +2965,10 @@ class Database:
     Uses WAL mode for concurrent read/write.
     Auto-initialises schema and runs migrations on startup.
 
-    Durability: synchronous=FULL + WAL checkpoint on close. NORMAL was
-    enough to lose pages on hard kill / power loss and left
-    nifty_algo_v3.db with a malformed btree (see restore_primary_db.py).
+    Durability: synchronous=FULL. The WAL file is the crash-recovery log.
+    Never checkpoint-truncate the live primary: a kill during TRUNCATE
+    left nifty_algo_v3.db with a malformed btree and no WAL to replay
+    (see restore_primary_db.py). Next open applies leftover WAL.
     """
 
     def __init__(self, db_path: Path, *, skip_integrity_check: bool = False):
@@ -2983,9 +2984,13 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
-        # FULL: every commit reaches the disk before returning. Slightly
-        # slower writes; prevents the half-corrupt primary we hit in prod.
+        # FULL: every commit reaches the disk before returning.
         self._conn.execute("PRAGMA synchronous=FULL;")
+        # Keep the session in the WAL. Default autocheckpoint=1000 copies
+        # into the main btree during live writes — the same window a
+        # manual cancel used to tear. Next open (or a clean last-close)
+        # applies the WAL.
+        self._conn.execute("PRAGMA wal_autocheckpoint=0;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.execute("PRAGMA busy_timeout=60000;")
         self._conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache
@@ -3483,6 +3488,18 @@ class Database:
     def get_prev_day_vix_close(self) -> Optional[float]:
         """Return yesterday's closing VIX value."""
         today_str = today_ist().isoformat()
+        # Session_state is the live process's own record of yesterday's
+        # close. Per-day shards keep this and drop prior daily_summary /
+        # vix_history rows, so looking only at those tables made replay
+        # skip Gate 1 and momentum_vix_gap (Sep28 LONG_PUT at 10:56).
+        row_ss = self.query_one(
+            "SELECT prev_day_vix_close FROM session_state "
+            "WHERE trading_date=? AND prev_day_vix_close IS NOT NULL "
+            "AND prev_day_vix_close > 0",
+            (today_str,),
+        )
+        if row_ss and row_ss.get("prev_day_vix_close"):
+            return float(row_ss["prev_day_vix_close"])
         row = self.query_one(
             "SELECT vix_close FROM daily_summary "
             "WHERE trading_date < ? AND vix_close IS NOT NULL AND vix_close > 0 "
@@ -3503,24 +3520,36 @@ class Database:
         return None
 
     def close(self) -> None:
-        """Flush WAL and close the database connection."""
+        """Close the connection. Do not checkpoint the main file.
+
+        A Ctrl+C / console kill during wal_checkpoint(TRUNCATE) rewrote
+        the btree and then emptied the WAL — that is how the live primary
+        went malformed. Leaving the WAL on disk is the recovery path.
+        Idempotent: a second close is a no-op.
+        """
         with self._lock:
+            conn = getattr(self, "_conn", None)
+            if conn is None:
+                return
+            self._conn = None
             try:
-                # Truncate checkpoint so a crash after close cannot leave
-                # an orphan -wal that disagrees with a restored primary.
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
-            try:
-                self._conn.close()
+                conn.close()
             except Exception:
                 pass
 
     def checkpoint(self) -> None:
-        """Push WAL pages into the main file (call after heavy write bursts)."""
+        """Optional PASSIVE checkpoint. Not used on the live write path.
+
+        PASSIVE copies WAL frames into the main file but does not truncate
+        the WAL. A kill during PASSIVE can still tear the btree; live
+        persist must not call this every cycle.
+        """
         with self._lock:
+            conn = getattr(self, "_conn", None)
+            if conn is None:
+                return
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception:
                 pass
 
