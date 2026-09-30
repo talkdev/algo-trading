@@ -1340,7 +1340,10 @@ class StrategyEngine:
             _dm_range_confirmed = True
         # v57: away-side lean IS the day-move thesis (flush to the extreme);
         # do not ban the credit ticket the resolver is about to book.
-        if self._away_side_intent(signals):
+        # v65m7v: waiver uses lean PRESENCE (ignore spend). Booking still
+        # refuses spent sides via `_away_side_allowed`. Coupling waiver to
+        # spend-nulled intent was the Sep22 −₹14k regression.
+        if self._away_side_lean_present(signals):
             _dm_range_confirmed = True
         if _dm_threat >= self.config.day_move_used_block_pct and not (
             _dm_trend_confirmed or _dm_range_confirmed
@@ -2213,6 +2216,80 @@ class StrategyEngine:
         intent = signals.get("_intent") or {}
         return key in (intent.get("exemptions") or [])
 
+    def _side_day_spend_pct(self, signals: dict, side: str) -> float:
+        """Signed day-move spend for an away-side lean (up for BULL / down for BEAR).
+
+        Uses the live time-scaled gauge. Peak-latch was tried and rejected:
+        after a real flush, away-side credit at the extreme IS the edge
+        (Sep22 BCS); latching ≥100% blocked those days entirely.
+        """
+        try:
+            if side == "BULL":
+                return float(signals.get("day_up_used_pct") or 0.0)
+            if side == "BEAR":
+                return float(signals.get("day_down_used_pct") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return 0.0
+
+    def _side_spend_exhausted(self, signals: dict, side: str) -> bool:
+        """True when that side of the straddle day-move is already spent (≥100%)."""
+        return self._side_day_spend_pct(signals, side) >= 100.0
+
+    def _away_side_allowed(self, signals: dict, side: str) -> bool:
+        """P0: spent-side away leans are refused unless a tagged extreme fade owns them.
+
+        Selling puts at the high after day_up ≥ 100% (live 2026-09-30 BPS
+        −₹914) is exhaustion, not a fresh away-side thesis. Symmetric for
+        calls at the low after day_down ≥ 100%. Tagged afternoon high/low
+        fades keep the spent side — the flush IS their edge.
+
+        Sep22-class warmup lean at loc 0.08 with day_down ~86% stays allowed
+        (under 100%). Blanket warmup bans were wrong; spend is the fence.
+        """
+        if side not in ("BULL", "BEAR"):
+            return False
+        if not self._side_spend_exhausted(signals, side):
+            return True
+        if side == "BULL" and bool(signals.get("afternoon_low_fade")):
+            return True
+        if side == "BEAR" and bool(signals.get("afternoon_high_fade")):
+            return True
+        return False
+
+    def _away_side_lean_present(self, signals: dict) -> Optional[str]:
+        """Location/soft lean thesis ignoring spend — day-move waiver only.
+
+        v65m7v: P0 must not null the day-move waiver when spend refuses
+        booking. Waiver asks "is this an away-side thesis?"; booking asks
+        "is that side still fresh?" Separating them restores Sep22-class
+        tickets that were blocked only because intent was spend-nulled.
+        """
+        try:
+            rng, loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            rng, loc = 0.0, 0.5
+        if rng >= self.RANGE_LEAN_MIN_PTS:
+            if loc >= self.RANGE_LEAN_HI:
+                return "BULL"
+            if loc <= self.RANGE_LEAN_LO:
+                return "BEAR"
+            if loc >= self.RANGE_SOFT_LEAN_HI and (
+                loc >= 0.70 or self._soft_location_evidence(signals, "BULL")
+            ):
+                return "BULL"
+            if loc <= self.RANGE_SOFT_LEAN_LO and (
+                loc <= 0.30 or self._soft_location_evidence(signals, "BEAR")
+            ):
+                return "BEAR"
+        try:
+            _ds_ok, _ = self._range_day_bearish_lean(signals)
+            if _ds_ok:
+                return "BEAR"
+        except Exception:
+            pass
+        return None
+
     def _away_side_location_lean(self, signals: dict) -> Optional[str]:
         """Return 'BULL'/'BEAR' when session location alone books away-side credit.
 
@@ -2228,9 +2305,9 @@ class StrategyEngine:
         if rng < self.RANGE_LEAN_MIN_PTS:
             return None
         if loc >= self.RANGE_LEAN_HI:
-            return "BULL"
+            return "BULL" if self._away_side_allowed(signals, "BULL") else None
         if loc <= self.RANGE_LEAN_LO:
-            return "BEAR"
+            return "BEAR" if self._away_side_allowed(signals, "BEAR") else None
         return None
 
     def _away_side_intent(self, signals: dict) -> Optional[str]:
@@ -2246,6 +2323,7 @@ class StrategyEngine:
         try:
             _ds_ok, _ = self._range_day_bearish_lean(signals)
             if _ds_ok:
+                # Day-structure BCS is a bear thesis; not an away-side put lean.
                 return "BEAR"
         except Exception:
             pass
@@ -2263,7 +2341,7 @@ class StrategyEngine:
                 or self._soft_location_evidence(signals, "BULL")
             )
         ):
-            return "BULL"
+            return "BULL" if self._away_side_allowed(signals, "BULL") else None
         if (
             loc <= self.RANGE_SOFT_LEAN_LO
             and loc > self.RANGE_LEAN_LO
@@ -2272,7 +2350,7 @@ class StrategyEngine:
                 or self._soft_location_evidence(signals, "BEAR")
             )
         ):
-            return "BEAR"
+            return "BEAR" if self._away_side_allowed(signals, "BEAR") else None
         return None
 
     def _soft_location_evidence(self, signals: dict, side: str) -> bool:
@@ -2285,15 +2363,15 @@ class StrategyEngine:
         v64: INSUFFICIENT_DATA / empty EMA is not evidence — RANGE+vwap
         alone previously returned True during warmup and soft-leaned into
         adx=0 entries that live cycle_log never took.
+
+        v65m7v: warmup + UPTREND/DOWNTREND flicker alone is also not
+        evidence. Extreme loc during warmup is handled by `_ext_hi/_ext_lo`
+        + spent-side (Sep22 warmup low lean with day_down~86% still books;
+        Sep30 warmup high with day_up≥100% is refused).
         """
         price = str(signals.get("price_regime") or "")
         ema = str(signals.get("ema_structure") or "")
         if ema in ("", "INSUFFICIENT_DATA"):
-            # No MTF structure yet: only a clear price-regime trend counts.
-            if side == "BULL":
-                return price in ("UPTREND", "STRONG_UPTREND")
-            if side == "BEAR":
-                return price in ("DOWNTREND", "STRONG_DOWNTREND")
             return False
         try:
             vd = float(signals.get("vwap_dist_pct") or 0.0)
@@ -2364,6 +2442,11 @@ class StrategyEngine:
         # Mature mild band (0.62/0.38) needs trend-level ADX + non-UNCLEAR
         # positioning. Soft/extreme path is separate (not an else-dump): EMA
         # evidence also requires non-UNCLEAR.
+        #
+        # v65m7v: warmup extremes are ALLOWED again (Sep22 BCS
+        # range_soft_location_lean_0.08:warmup with day_down~86% was the
+        # session's edge). Spent-side (≥100% peak) is the fence that stops
+        # Sep30-class puts at the high after day_up already printed 115%.
         if (not _event) and _rng >= self.RANGE_LEAN_MIN_PTS:
             _adx_trend = float(
                 getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
@@ -2375,14 +2458,12 @@ class StrategyEngine:
                 str(signals.get("ema_structure") or "")
                 == "INSUFFICIENT_DATA"
             )
-            if _warmup:
-                _ext_hi = _loc >= 0.70 and _pos in ("RANGE", "STRONG_RANGE")
-                _ext_lo = _loc <= 0.30 and _pos in ("RANGE", "STRONG_RANGE")
-            else:
-                _ext_hi = _loc >= 0.70 and _pos_ok_bull
-                _ext_lo = _loc <= 0.30 and _pos_ok_bear
+            _ext_hi = _loc >= 0.70 and _pos_ok_bull
+            _ext_lo = _loc <= 0.30 and _pos_ok_bear
 
             if (adx_15_mature and adx_15 >= _adx_trend):
+                # Mature measured lean: do NOT apply spent fence — with-trend
+                # premium after a large excursion is the thesis (Sep21/28).
                 if _loc >= self.RANGE_LEAN_HI and _pos_ok_bull:
                     self.logger.info(
                         f"Range resolution: loc={_loc:.2f} >= {self.RANGE_LEAN_HI}"
@@ -2397,6 +2478,7 @@ class StrategyEngine:
                     return BEAR_CALL_SPREAD, f"range_location_lean_{_loc:.2f}"
 
             # Soft / extreme lean — evidence never unlocks UNCLEAR OI.
+            # Spent fence applies HERE only (immature/warmup chase at extremes).
             _ev_bull = (
                 _pos_ok_bull
                 and self._soft_location_evidence(signals, "BULL")
@@ -2406,6 +2488,12 @@ class StrategyEngine:
                 and self._soft_location_evidence(signals, "BEAR")
             )
             if _loc >= self.RANGE_SOFT_LEAN_HI and (_ext_hi or _ev_bull):
+                if not self._away_side_allowed(signals, "BULL"):
+                    return (
+                        "NO_TRADE",
+                        f"range_soft_lean_bull_day_up_spent_"
+                        f"{self._side_day_spend_pct(signals, 'BULL'):.0f}",
+                    )
                 self.logger.info(
                     f"Range resolution: soft lean loc={_loc:.2f} "
                     f"-> BULL_PUT_SPREAD"
@@ -2418,6 +2506,12 @@ class StrategyEngine:
                     f"{':warmup' if _warmup else ''}"
                 )
             if _loc <= self.RANGE_SOFT_LEAN_LO and (_ext_lo or _ev_bear):
+                if not self._away_side_allowed(signals, "BEAR"):
+                    return (
+                        "NO_TRADE",
+                        f"range_soft_lean_bear_day_down_spent_"
+                        f"{self._side_day_spend_pct(signals, 'BEAR'):.0f}",
+                    )
                 self.logger.info(
                     f"Range resolution: soft lean loc={_loc:.2f} "
                     f"-> BEAR_CALL_SPREAD"
@@ -7774,14 +7868,26 @@ def _self_test() -> None:
     assert strat2 == IRON_BUTTERFLY, f"Expected IRON_BUTTERFLY, got {strat2}"
     print("  [OK] VERY_NARROW butterfly confirmed")
 
+    # price must leave RANGE — RANGE-origin PREMIUM_SELL_BULL/BEAR defer to
+    # _resolve_range_strategy (pin / location lean), not the directional map.
     strat3, _ = engine._map_regime_to_strategy(
-        make_signals(final_regime="PREMIUM_SELL_BULL")
+        make_signals(
+            final_regime="PREMIUM_SELL_BULL",
+            price_regime="UPTREND",
+            adx_15=28.0,
+            adx_15_mature=True,
+        )
     )
     print(f"  PREMIUM_SELL_BULL -> {strat3} (expect BULL_PUT_SPREAD)")
     assert strat3 == BULL_PUT_SPREAD, f"Expected BULL_PUT_SPREAD, got {strat3}"
 
     strat4, _ = engine._map_regime_to_strategy(
-        make_signals(final_regime="PREMIUM_SELL_BEAR")
+        make_signals(
+            final_regime="PREMIUM_SELL_BEAR",
+            price_regime="DOWNTREND",
+            adx_15=28.0,
+            adx_15_mature=True,
+        )
     )
     print(f"  PREMIUM_SELL_BEAR -> {strat4} (expect BEAR_CALL_SPREAD)")
     assert strat4 == BEAR_CALL_SPREAD, f"Expected BEAR_CALL_SPREAD, got {strat4}"
@@ -8118,6 +8224,99 @@ def _self_test() -> None:
         f"  Phantom trades logged: "
         f"{phantom_count['cnt'] if phantom_count else 0} [OK]"
     )
+
+    # ── P0/P1 refined (v65m7v): spend fence, keep Sep22 warmup lean ──────
+    print_section("Spent-Side Lean / Warmup (v65m7v)")
+    _sep30 = make_signals(
+        spot=22746.0,
+        day_high_so_far=22750.0,
+        day_low_so_far=22660.0,
+        or_high=22734.0,
+        or_low=22660.0,
+        day_up_used_pct=115.0,
+        day_up_used_peak_pct=115.0,
+        day_down_used_pct=11.0,
+        day_move_used_pct=115.0,
+        ema_structure="INSUFFICIENT_DATA",
+        adx_15=20.6,
+        adx_15_mature=False,
+        price_regime="RANGE",
+        positioning_regime="RANGE",
+        final_regime="PREMIUM_SELL_RANGE",
+        vol_regime="SELL_PREMIUM",
+        opening_straddle_pts=310.0,
+        actual_dte=3,
+    )
+    _s30, _w30 = engine._resolve_range_strategy(
+        3, "NARROW", 20.6, False, dtime(10, 14), "SELL_PREMIUM", _sep30,
+    )
+    assert _s30 == "NO_TRADE" and "day_up_spent" in _w30, (
+        f"spent day_up + warmup extreme must refuse BPS, got {_s30}/{_w30}"
+    )
+    # Sep22-class: warmup lean at low with day_down < 100% must still book
+    _sep22 = make_signals(
+        spot=23417.0,
+        day_high_so_far=23489.0,
+        day_low_so_far=23414.0,
+        or_high=23480.0,
+        or_low=23420.0,
+        day_up_used_pct=85.0,
+        day_down_used_pct=86.0,
+        day_down_used_peak_pct=86.0,
+        ema_structure="INSUFFICIENT_DATA",
+        adx_15=0.0,
+        adx_15_mature=False,
+        price_regime="RANGE",
+        positioning_regime="RANGE",
+        final_regime="PREMIUM_SELL_RANGE",
+        vol_regime="SELL_PREMIUM",
+        opening_straddle_pts=200.0,
+        actual_dte=0,
+    )
+    _s22, _w22 = engine._resolve_range_strategy(
+        0, "MODERATE", 0.0, False, dtime(10, 37), "SELL_PREMIUM", _sep22,
+    )
+    assert _s22 == BEAR_CALL_SPREAD and ":warmup" in _w22, (
+        f"Sep22-class warmup low lean must book BCS, got {_s22}/{_w22}"
+    )
+    assert engine._away_side_intent(_sep30) is None, (
+        "P0: away-side intent must be None when day_up spent at high loc"
+    )
+    assert engine._away_side_lean_present(_sep30) == "BULL", (
+        "day-move waiver must still see lean presence when spend blocks booking"
+    )
+    # Confirmed UPTREND directional BPS must NOT use the range spent fence
+    # (with-trend premium after a spent rally is the thesis — Sep21/28).
+    _dir, _dw = engine._map_regime_to_strategy(
+        make_signals(
+            final_regime="PREMIUM_SELL_BULL",
+            price_regime="UPTREND",
+            adx_15=28.0,
+            adx_15_mature=True,
+            spot=22746.0,
+            atm_strike=22750,
+            day_high_so_far=22750.0,
+            day_low_so_far=22660.0,
+            or_high=22734.0,
+            or_low=22660.0,
+            day_up_used_pct=115.0,
+            day_down_used_pct=11.0,
+            ema_structure="BULLISH",
+            gap_direction="FLAT",
+        ),
+        _test_time=dtime(10, 15),
+    )
+    assert _dir == BULL_PUT_SPREAD, (
+        f"with-trend directional BPS must book, got {_dir}/{_dw}"
+    )
+    # Tagged high-fade still allowed as BEAR intent when day_up spent
+    _fade = dict(_sep30)
+    _fade["afternoon_high_fade"] = True
+    assert engine._away_side_allowed(_fade, "BEAR") is True
+    print(f"  spent-up warmup:  {_s30} ({_w30})")
+    print(f"  sep22 warmup low: {_s22} ({_w22})")
+    print(f"  directional trend: {_dir}")
+    print("  [OK] Spent-side / Sep22-warmup / waiver-decouple tests passed")
 
     db.close()
     print_section("STRATEGY ENGINE SELF-TEST COMPLETE", char="#")

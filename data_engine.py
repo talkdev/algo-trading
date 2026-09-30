@@ -577,6 +577,8 @@ class MarketDataEngine:
             "gap_size_pts":                0.0,
             "gap_fade_opportunity":        False,
             "first_bar_close":             None,
+            "day_up_used_peak_pct":        0.0,
+            "day_down_used_peak_pct":      0.0,
             "_straddle_open_for_regime":   0.0,
             "_straddle_open_for_summary":  0.0,
             "_last_valid_atm_iv":           None,
@@ -1427,7 +1429,10 @@ class MarketDataEngine:
                                 f"— using cached {cached_rv*100:.2f}%"
                             )
                             return cached_rv, "cached"
-                        # Use VIX-implied
+                        # Keep None here: a sub-floor print is treated as
+                        # "RV unavailable" by VRP (fail-closed to NEUTRAL).
+                        # Do not silently reinflate to VIX-implied — that
+                        # reopened losing early credit on replay Sep9/Sep17.
                         vix_now = self.state.get("prev_vix") or vix or 15.0
                         return None, "vix_implied_disabled"
 
@@ -1466,6 +1471,18 @@ class MarketDataEngine:
                     # was half the priced straddle. Cap the spike against
                     # the session anchor and shrink the estimate toward
                     # that anchor while the window is incomplete.
+                    #
+                    # v65m7t: live 2026-09-30 OR-complete (~20 HL bars)
+                    # lifted RV +1.2pp vs the VIX-implied anchor under the
+                    # n/60 + 1.35× blend, crushed VRP from ~2.9
+                    # (STRONG_SELL) through the floor-2.0 sell bar into
+                    # NEUTRAL, and hard-darked RANGE_RANGE condors. Keep
+                    # the PATCH_V15 blend graph, but while the HL sample
+                    # is still immature (<45 bars) clamp absolute RV to
+                    # anchor+0.50pp so the open auction cannot flip the
+                    # sell book off. Mature windows keep the 1.35× path.
+                    # (A heavier all-morning anchor ramp / floor→VIX
+                    # reinflation regressed Sep9/Sep17 into early losers.)
                     _anchor_v15 = float(self.state.get("rv_anchor_pct") or 0.0)
                     if _anchor_v15 < rv_floor:
                         _anchor_v15 = float(cached_rv or 0.0) \
@@ -1476,6 +1493,10 @@ class MarketDataEngine:
                             rv = _anchor_v15 * 1.35
                         _w_v15 = min(len(log_hl_sq) / 60.0, 1.0)
                         rv = _w_v15 * rv + (1.0 - _w_v15) * _anchor_v15
+                        if len(log_hl_sq) < 45:
+                            _early_max = _anchor_v15 + 0.005  # +0.50pp
+                            if rv > _early_max:
+                                rv = _early_max
 
                     # Valid RV
                     self.state["parkinson_rv_pct"]            = rv
@@ -1912,6 +1933,15 @@ class MarketDataEngine:
                     day_low = float(market_bars["low"].min())
                     up = max(day_high - ref, 0.0) / _straddle_ref * 100.0
                     down = max(ref - day_low, 0.0) / _straddle_ref * 100.0
+                    # v65m7v: latch peaks so √elapsed decay cannot re-arm a
+                    # spent-side lean after the morning printed ≥100%.
+                    try:
+                        _pu = float(self.state.get("day_up_used_peak_pct") or 0.0)
+                        _pd = float(self.state.get("day_down_used_peak_pct") or 0.0)
+                        self.state["day_up_used_peak_pct"] = max(_pu, round(up, 2))
+                        self.state["day_down_used_peak_pct"] = max(_pd, round(down, 2))
+                    except (TypeError, ValueError):
+                        pass
                     return round(up, 2), round(down, 2)
         except Exception:
             pass
@@ -3879,6 +3909,13 @@ class MarketDataEngine:
             # PATCH_V12: one-sided excursion vs priced displacement.
             "day_up_used_pct":          day_up_used_pct,
             "day_down_used_pct":        day_down_used_pct,
+            # v65m7v: peak of time-scaled gauge (spent fence does not decay).
+            "day_up_used_peak_pct":     float(
+                self.state.get("day_up_used_peak_pct") or day_up_used_pct or 0.0
+            ),
+            "day_down_used_peak_pct":   float(
+                self.state.get("day_down_used_peak_pct") or day_down_used_pct or 0.0
+            ),
             "opening_straddle_pts":     self.state.get("opening_straddle_pts", 0.0),
             "expected_move_remaining_pts": _expected_move_remaining,
             "expected_range_so_far_pts":   _expected_range_so_far,
@@ -4228,6 +4265,56 @@ def _self_test() -> None:
     print(f"  Parkinson RV: {rv*100:.2f}% (source={source})" if rv else
           f"  Parkinson RV: unavailable (source={source})")
     print("  [OK] Parkinson RV test passed")
+
+    # Early-window anchor hand-off (v65m7t / live 2026-09-30):
+    # At OR-complete (~20 HL bars) absolute RV is clamped to anchor+0.50pp
+    # so a violent open cannot push a ~2.9pp VRP below the floor-2.0 sell
+    # bar. Anchor = VIX*0.75.
+    print_section("Parkinson Early-Window Anchor Test")
+    eng_v15 = MarketDataEngine.__new__(MarketDataEngine)
+    eng_v15.config = engine.config
+    eng_v15.logger = engine.logger
+    eng_v15.state = {
+        "actual_dte": 3,
+        "parkinson_rv_pct": None,
+        "parkinson_rv_computed_date": None,
+        "rv_anchor_pct": 0.1005,   # VIX 13.4 * 0.75
+        "rv_anchor_date": today_ist().isoformat(),
+        "prev_vix": 13.4,
+    }
+    # 20 one-minute bars with a wide open auction HL (matches the OR print).
+    _rows_v15 = []
+    _base = 22700.0
+    for _i in range(20):
+        _t = f"09:{15 + _i // 60:02d}:{_i % 60:02d}"
+        # First 5 bars: ~25pt HL (violent open); rest: ~4pt HL (coil).
+        _hl = 25.0 if _i < 5 else 4.0
+        _rows_v15.append({
+            "time": _t,
+            "open": _base,
+            "high": _base + _hl / 2.0,
+            "low": _base - _hl / 2.0,
+            "close": _base,
+            "volume": 1000,
+        })
+    _bars_v15 = pd.DataFrame(_rows_v15)
+    _rv_v15, _src_v15 = eng_v15.compute_parkinson_rv(13.4, _bars_v15)
+    assert _rv_v15 is not None, "early-window RV must resolve"
+    _atm_iv_v15 = 0.1288  # ~12.88% as on the live OR print
+    _vrp_v15 = _atm_iv_v15 * 100.0 - _rv_v15 * 100.0
+    print(
+        f"  early RV={_rv_v15*100:.2f}% source={_src_v15} "
+        f"VRP≈{_vrp_v15:.2f}pp (need > 2.0 for SELL_PREMIUM)"
+    )
+    assert _rv_v15 <= 0.1005 + 0.005 + 1e-9, (
+        f"early-window RV {_rv_v15*100:.2f}% exceeded anchor+0.50pp "
+        f"(10.55%) — sell book would dark"
+    )
+    assert _vrp_v15 > 2.0, (
+        f"early-window VRP {_vrp_v15:.2f}pp <= 2.0 — "
+        f"RANGE condor would hard-refuse as NEUTRAL"
+    )
+    print("  [OK] Parkinson early-window anchor test passed")
 
     # ── VRP smoothing test ────────────────────────────────────────────────
     print_section("VRP Smoothing Test")
