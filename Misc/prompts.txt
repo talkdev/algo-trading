@@ -1,24 +1,21 @@
 Do not Hallucinate.
-You are an AI auditor for a live NIFTY options intraday algo trade engine.
-Audit the market and engine state from Market OPEN to ensure correct trades gets executed during the day and the trade engine is not hitting any bug.
-Look for any Regime mismatch, False/weak signals, Excessive signal flipping, Unstable thresholds, Bad liquidity, Data anomalies, Strategy/gate mismatch.
-You need to start from a scratch and check from a completely different and fresh perspective.
-Do not use any previous dignosis method and regression at all start from scratch and fresh.
+You are an AI analyzer for a live NIFTY options intraday algo trade engine.
+analyze the market and engine state from Market today's OPEN to ensure profitable trades gets executed during the day and any gate is not blocking the trade engine.
+Perform analysis for today's session only. Figure out and fix why no profitable trades are taken in today's session.
 Also run whatever you plan to run must be in parallel as independent OS process for all days. Because your all script runs are taking infinite number of time because you do not run each day in parallel as a separate OS process in in new console.
-MANDATORY: Tune the engine and gate graphs and paths instead of adding date-tied patches.
-Final report format: Failure → Root Cause → Fix Applied → Regression Result → Trading/P&L Impact for each days & delta.
+Do not stop running main.py at any cost, for loading any change in the code I will restart main.py manually.
+MANDATORY: Fix the engine and gate graphs and paths instead of adding date-tied patches.
+Final report format in very easy language: Failure → Root Cause → Fix Applied → Regression Result → Trading/P&L Impact for each days & delta.
 
 
 Do not hallucinate.
-Continue the live-trading bug hunt using the replay pump considering 27th as sample day. Perform engine audit by verifying signal stream of the day.
-Read the weak-day signal streams and look for a fix that can actually move P&L.
-Look for any Regime mismatch, False/weak signals, Excessive signal flipping, Unstable thresholds, Bad liquidity, Data anomalies, Strategy/gate mismatch.
+Continue the live-trading bug hunt using the replay pump considering 30th as sample day. Perform engine analysis by verifying signal stream of the day. 
 You need to start from a scratch and check from a completely different and fresh perspective.
 Do not use any previous dignosis method and regression at all start from scratch and fresh.
 Also run whatever you plan to run must be in parallel as independent OS process for all days. Because your all script runs are taking infinite number of time because you do not run each day in parallel as a separate OS process in in new console.
 don’t run parallel full-book hunts against the live primaryinstead use already-split per_day shards only.
-MANDATORY: Tune the engine and gate graphs and paths instead of adding date-tied patches.
-Final report format: Failure → Root Cause → Fix Applied → Regression Result → Trading/P&L Impact for each days & delta.
+MANDATORY: Tune the engine as a whole instead of adding date-tied patches.
+Final report format in very easy language: Failure → Root Cause → Fix Applied → Regression Result → Trading/P&L Impact for each days & delta.
 
 
 You need to start from a scratch and check from a completely different and fresh perspective.
@@ -28,22 +25,35 @@ Continue the live-trading bug hunt,Regime mismatch, False/weak signals, Excessiv
 Perform engine audit by verifying signal stream.
 Read the weak-day signal streams and look for a fix that can actually move P&L.
 Also run whatever you plan to run must be in parallel as independent OS process for all days. Because your all script runs are taking infinite number of time because you do not run each day in parallel as a separate OS process in in new console.
-Final report format: Failure → Root Cause → Fix Applied → Regression Result → Trading/P&L Impact for each days & delta.
+Final report format in very easy language: Failure → Root Cause → Fix Applied → Regression Result → Trading/P&L Impact for each days & delta.
 
 Baeline:
 | Date           | Daily Profit (₹) |
 | -------------- | ---------------: |
-| 2026-09-08     |         ₹2,861 |
+| 2026-09-08     |         ₹2,706 |
 | 2026-09-09     |         ₹5,975 |
 | 2026-09-10     |         ₹4,062 |
 | 2026-09-11     |         ₹9,897 |
-| 2026-09-15     |        ₹14,817 |
+| 2026-09-15     |        ₹14,257 |
 | 2026-09-16     |         ₹4,274 |
 | 2026-09-17     |         ₹5,905 |
 | 2026-09-18     |         ₹2,354 |
-| 2026-09-21     |         ₹6,905 |
+| 2026-09-21     |         ₹7,073 |
 | 2026-09-22     |        ₹13,712 |
-| 2026-09-23     |         ₹5,386 |
-| 2026-09-24     |        ₹19,367 |
-| 2026-09-25     |         ₹1,394 |
-| Total          |        ₹96,909 |
+| 2026-09-23     |         ₹5,218 |
+| 2026-09-24     |        ₹17,331 |
+| 2026-09-25     |         ₹1,811 |
+| 2026-09-28     |         ₹6,977 |
+| 2026-09-29     |         ₹2,677 |
+| 2026-09-30     |        ₹-1,100 |
+| Total          |       ₹103,129 |
+
+Already discovered issues which needs to be confirmed and fixed- 
+1. Noon re-arm of spent chase  
+   Morning `day_up≈115%` blocked soft lean, but √elapsed makes the same high look ~86% by lunch → soft BPS reloaded at 12:06 (live). Peak latch was removed to save Sep22, so this hole is still open.
+2. Mature RANGE lean skips the spent fence  
+   Soft/warmup spent refuse works; once ADX matures at the highs under `PREMIUM_SELL_RANGE`, spent chase can still book.
+3. Restart reconcile can abort a closed winner / zero day P&L  
+   Today 14:24: already-closed +₹642 trade treated as `PENDING_ENTRY` → Exit-All noise → `ABORTED`, session P&L forced toward 0. Avoid mid-session restarts if possible.
+4. `same_side_chase` after `CLOSE_STOP` is weak  
+   After the −₹914 stop, puts were sold again at loc ~0.65 (not blocked as chase). Stop → reload into the same grind is still allowed.

@@ -243,6 +243,11 @@ class StrategyEngine:
         chase even below loc 0.80 (sample 17-Sep second BPS @13:04
         PREMIUM_SELL_BULL+UPTREND adx≈39 → HARD_EXIT wipe). First ticket
         already monetised the lean; the reload holds into the bell.
+
+        After CLOSE_STOP the bar is tighter: soft-lean location
+        (loc ≥ 0.58 puts / ≤ 0.42 calls) is already a reload into the
+        same grind (live 2026-09-30: −₹914 stop → BPS again at loc~0.65).
+        Tagged opposite-extreme fades still clear.
         """
         state = self.market_engine.state
         last_side = str(state.get("last_exit_strategy_side") or "")
@@ -257,6 +262,7 @@ class StrategyEngine:
         _harvested = last_xr.startswith("CLOSE_TARGET") or last_xr.startswith(
             "CLOSE_PROFIT"
         )
+        _stopped = last_xr.startswith("CLOSE_STOP")
         try:
             _adx = float(signals.get("adx_15") or 0.0)
         except (TypeError, ValueError):
@@ -284,6 +290,8 @@ class StrategyEngine:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
+            if _stopped and _loc >= self.RANGE_SOFT_LEAN_HI:
+                return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             if _loc >= 0.80:
                 return f"same_side_chase_puts_at_high_loc_{_loc:.2f}"
             return None
@@ -302,6 +310,8 @@ class StrategyEngine:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
+            if _stopped and _loc <= self.RANGE_SOFT_LEAN_LO:
+                return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             if _loc <= 0.20:
                 return f"same_side_chase_calls_at_low_loc_{_loc:.2f}"
             return None
@@ -1015,39 +1025,86 @@ class StrategyEngine:
         # Entry-abort storm: ABORTED attempts do not burn max_entries, so a
         # rejected multi-leg can re-fire every cycle (live 2026-09-29: 28
         # BULL_PUT_SPREAD aborts in ~20 min). Cool the same family down.
+        # State latch survives DB timing races between abort write and the
+        # next decide() cycle; window/count tightened after Sep29 storm.
+        _abort_cd_min = float(
+            getattr(self.config, "entry_abort_storm_cooldown_min", 20.0) or 20.0
+        )
+        _st_ab = self.market_engine.state
+        _latched_fam = str(_st_ab.get("entry_abort_storm_family") or "")
+        _latched_until = _st_ab.get("entry_abort_storm_until")
+        if _latched_fam and _latched_until:
+            try:
+                _until_dt = datetime.fromisoformat(str(_latched_until))
+                _left = (_until_dt - now_ist()).total_seconds() / 60.0
+                if _left > 0:
+                    return "NO_TRADE", (
+                        f"entry_abort_storm_{_latched_fam}_"
+                        f"{_left:.0f}min_of_{_abort_cd_min:.0f}_cooldown"
+                    )
+                _st_ab.pop("entry_abort_storm_family", None)
+                _st_ab.pop("entry_abort_storm_until", None)
+            except Exception:
+                pass
         try:
             _abort_rows = self.db.query(
                 "SELECT strategy_name, entry_time, exit_time FROM positions "
                 "WHERE trading_date=? AND status='ABORTED' "
-                "ORDER BY entry_time DESC LIMIT 8",
+                "ORDER BY entry_time DESC LIMIT 12",
                 (today_ist().isoformat(),),
             ) or []
         except Exception:
             _abort_rows = []
         if len(_abort_rows) >= 2:
             try:
+                _now_ab = now_ist()
+                _fam0 = str(_abort_rows[0].get("strategy_name") or "")
                 _a0 = datetime.fromisoformat(str(
                     _abort_rows[0].get("exit_time")
                     or _abort_rows[0].get("entry_time")
                 ))
+                _since = (_now_ab - _a0).total_seconds() / 60.0
+                _same_fam_recent = 0
+                for _ar in _abort_rows:
+                    if str(_ar.get("strategy_name") or "") != _fam0:
+                        continue
+                    try:
+                        _at = datetime.fromisoformat(str(
+                            _ar.get("exit_time") or _ar.get("entry_time")
+                        ))
+                    except Exception:
+                        continue
+                    if (_now_ab - _at).total_seconds() / 60.0 <= 20.0:
+                        _same_fam_recent += 1
                 _a1 = datetime.fromisoformat(str(
                     _abort_rows[1].get("exit_time")
                     or _abort_rows[1].get("entry_time")
                 ))
-                _now_ab = now_ist()
                 _gap01 = abs((_a0 - _a1).total_seconds()) / 60.0
-                _since = (_now_ab - _a0).total_seconds() / 60.0
-                _fam0 = str(_abort_rows[0].get("strategy_name") or "")
                 _fam1 = str(_abort_rows[1].get("strategy_name") or "")
-                if (
+                _pair_storm = (
                     _fam0
                     and _fam0 == _fam1
-                    and _gap01 <= 15.0
-                    and _since < 15.0
-                ):
+                    and _gap01 <= 10.0
+                    and _since < _abort_cd_min
+                )
+                _count_storm = (
+                    _fam0
+                    and _same_fam_recent >= 3
+                    and _since < _abort_cd_min
+                )
+                if _pair_storm or _count_storm:
+                    try:
+                        from datetime import timedelta as _td_ab
+                        _st_ab["entry_abort_storm_family"] = _fam0
+                        _st_ab["entry_abort_storm_until"] = (
+                            _now_ab + _td_ab(minutes=_abort_cd_min)
+                        ).isoformat()
+                    except Exception:
+                        pass
                     return "NO_TRADE", (
                         f"entry_abort_storm_{_fam0}_"
-                        f"{_since:.0f}min_of_15_cooldown"
+                        f"{_since:.0f}min_of_{_abort_cd_min:.0f}_cooldown"
                     )
             except Exception:
                 pass
@@ -1835,6 +1892,11 @@ class StrategyEngine:
             )
             if _hard_u:
                 return "NO_TRADE", _hard_u
+            _pda_u = self._post_debit_abort_credit_refusal(
+                BULL_PUT_SPREAD, signals
+            )
+            if _pda_u:
+                return "NO_TRADE", _pda_u
             # RANGE-origin OR-mid short-circuit with price still RANGE:
             # defer to range resolution (symmetric with BEAR path).
             _px_u = str(signals.get("price_regime") or "")
@@ -1929,6 +1991,16 @@ class StrategyEngine:
             )
             if _hard_b:
                 return "NO_TRADE", _hard_b
+            _bounce_b = self._spent_downside_bounce_refusal(
+                BEAR_CALL_SPREAD, signals
+            )
+            if _bounce_b:
+                return "NO_TRADE", _bounce_b
+            _pda_b = self._post_debit_abort_credit_refusal(
+                BEAR_CALL_SPREAD, signals
+            )
+            if _pda_b:
+                return "NO_TRADE", _pda_b
             _mid_b = self._mid_range_fade_into_grind_refusal(
                 BEAR_CALL_SPREAD, signals
             )
@@ -2219,15 +2291,27 @@ class StrategyEngine:
     def _side_day_spend_pct(self, signals: dict, side: str) -> float:
         """Signed day-move spend for an away-side lean (up for BULL / down for BEAR).
 
-        Uses the live time-scaled gauge. Peak-latch was tried and rejected:
-        after a real flush, away-side credit at the extreme IS the edge
-        (Sep22 BCS); latching ≥100% blocked those days entirely.
+        Fence uses max(current, peak) of the time-scaled gauge. √elapsed
+        grows the denominator through the day, so a morning print of
+        day_up≈115% decays to ~86% by lunch and would otherwise re-arm a
+        spent soft lean (live 2026-09-30 12:06 BPS). Peak (latched only
+        after 10:15 so open √elapsed spikes cannot poison it) keeps the
+        side spent once it has printed ≥100% in the mature window.
+
+        Sep22-class warmup BCS still books: early open day_down>100% is
+        not latched; at entry current≈86–100% with peak still fresh.
+        Tagged afternoon fades bypass via `_away_side_allowed`.
+        With-trend PREMIUM_SELL_BULL/BEAR maps do not use this fence.
         """
         try:
             if side == "BULL":
-                return float(signals.get("day_up_used_pct") or 0.0)
+                cur = float(signals.get("day_up_used_pct") or 0.0)
+                peak = float(signals.get("day_up_used_peak_pct") or 0.0)
+                return max(cur, peak)
             if side == "BEAR":
-                return float(signals.get("day_down_used_pct") or 0.0)
+                cur = float(signals.get("day_down_used_pct") or 0.0)
+                peak = float(signals.get("day_down_used_peak_pct") or 0.0)
+                return max(cur, peak)
         except (TypeError, ValueError):
             return 0.0
         return 0.0
@@ -2462,15 +2546,30 @@ class StrategyEngine:
             _ext_lo = _loc <= 0.30 and _pos_ok_bear
 
             if (adx_15_mature and adx_15 >= _adx_trend):
-                # Mature measured lean: do NOT apply spent fence — with-trend
-                # premium after a large excursion is the thesis (Sep21/28).
+                # Mature RANGE lean still respects the spent fence. Soft/
+                # warmup already did; skipping it here let ADX maturity
+                # alone re-book a spent chase under PREMIUM_SELL_RANGE.
+                # With-trend PREMIUM_SELL_BULL/BEAR maps stay outside this
+                # resolver (Sep21/28 directional thesis unchanged).
                 if _loc >= self.RANGE_LEAN_HI and _pos_ok_bull:
+                    if not self._away_side_allowed(signals, "BULL"):
+                        return (
+                            "NO_TRADE",
+                            f"range_location_lean_bull_day_up_spent_"
+                            f"{self._side_day_spend_pct(signals, 'BULL'):.0f}",
+                        )
                     self.logger.info(
                         f"Range resolution: loc={_loc:.2f} >= {self.RANGE_LEAN_HI}"
                         f" -> BULL_PUT_SPREAD (puts sit away from price)"
                     )
                     return BULL_PUT_SPREAD, f"range_location_lean_{_loc:.2f}"
                 if _loc <= self.RANGE_LEAN_LO and _pos_ok_bear:
+                    if not self._away_side_allowed(signals, "BEAR"):
+                        return (
+                            "NO_TRADE",
+                            f"range_location_lean_bear_day_down_spent_"
+                            f"{self._side_day_spend_pct(signals, 'BEAR'):.0f}",
+                        )
                     self.logger.info(
                         f"Range resolution: loc={_loc:.2f} <= {self.RANGE_LEAN_LO}"
                         f" -> BEAR_CALL_SPREAD (calls sit away from price)"
@@ -2719,6 +2818,101 @@ class StrategyEngine:
             return False
         return True
 
+    def _post_debit_abort_credit_refusal(
+        self,
+        strategy_name: str,
+        signals: dict,
+    ) -> Optional[str]:
+        """Refuse opposite credit after a long-premium entry abort.
+
+        Live 2026-09-29: LONG_PUT selected into the dump but ENTRY_FAILED;
+        eight minutes later BEAR_CALL booked into the V-bounce and stopped
+        (−₹1.7k). The debit abort is the tell — do not sell the other side
+        of the same move for a short cooldown.
+        """
+        if strategy_name not in (BEAR_CALL_SPREAD, BULL_PUT_SPREAD):
+            return None
+        latch = self.market_engine.state.get("last_debit_abort") or {}
+        if not isinstance(latch, dict):
+            return None
+        _ab = str(latch.get("strategy") or "")
+        _against = (
+            (strategy_name == BEAR_CALL_SPREAD and _ab == "LONG_PUT")
+            or (strategy_name == BULL_PUT_SPREAD and _ab == "LONG_CALL")
+        )
+        if not _against:
+            return None
+        try:
+            _age = (
+                now_ist() - datetime.fromisoformat(str(latch.get("t")))
+            ).total_seconds() / 60.0
+        except Exception:
+            return None
+        _cd = float(
+            getattr(self.config, "post_debit_abort_credit_cooldown_min", 20.0)
+            or 20.0
+        )
+        if _age < 0 or _age >= _cd:
+            if _age >= _cd:
+                self.market_engine.state.pop("last_debit_abort", None)
+            return None
+        return (
+            f"post_debit_abort_no_{'calls' if strategy_name == BEAR_CALL_SPREAD else 'puts'}"
+            f"_after_{_ab}_{_age:.0f}min_of_{_cd:.0f}"
+        )
+
+    def _spent_downside_bounce_refusal(
+        self,
+        strategy_name: str,
+        signals: dict,
+    ) -> Optional[str]:
+        """Refuse BEAR_CALL into a mid-recovery bounce after spent downside.
+
+        Live 2026-09-29: day_down≈200%, BCS booked mid-V (loc≈0.48) into
+        the bounce and CLOSE_STOP'd in 4 minutes. Spot-path hunt showed the
+        later 12:15–12:45 dump (−74pts) as FLAT_MISS because a blanket
+        bounce refuse also blocked high-zone fades. Only the mid band
+        (0.35–0.75) is refused; lows stay with-trend, highs stay fadeable.
+        """
+        if strategy_name != BEAR_CALL_SPREAD:
+            return None
+        if bool(signals.get("afternoon_high_fade")):
+            return None
+        try:
+            _dn = float(
+                signals.get("day_down_used_peak_pct")
+                or signals.get("day_down_used_pct")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _dn = 0.0
+        if _dn < 100.0:
+            return None
+        try:
+            _rng, _loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return None
+        # Mid-recovery only — not lows (with-trend) and not highs (fade).
+        if _rng < 85.0 or _loc < 0.35 or _loc >= 0.75:
+            return None
+        try:
+            _imp_up = float(signals.get("spot_impulse_up_pts") or 0.0)
+        except (TypeError, ValueError):
+            _imp_up = 0.0
+        _px = str(signals.get("price_regime") or "")
+        _ema = str(signals.get("ema_structure") or "")
+        _bouncing = (
+            _imp_up >= 20.0
+            or _px in ("UPTREND", "STRONG_UPTREND", "RANGE", "CHOPPY")
+            or _ema in ("BULLISH", "TRANSITIONAL")
+        )
+        if not _bouncing:
+            return None
+        return (
+            f"spent_downside_bounce_no_calls_dn_{_dn:.0f}"
+            f"_loc_{_loc:.2f}_ema_{_ema or 'na'}"
+        )
+
     def _mid_range_fade_into_grind_refusal(
         self,
         strategy_name: str,
@@ -2804,7 +2998,14 @@ class StrategyEngine:
                 _struct_bear = bool(self._day_structure_bearish(signals)[0])
             except Exception:
                 _struct_bear = False
-            if _struct_bear:
+            _ema_hi = str(signals.get("ema_structure") or "")
+            # Day-structure lag must not waive a live grind-up
+            # (Sep23: PREMIUM_SELL_BEAR + UPTREND + EMA BULLISH booked BCS
+            # that rode to HARD_EXIT while LONG_CALL was the chart trade).
+            _struct_waive = _struct_bear and _ema_hi not in (
+                "BULLISH", "TRANSITIONAL",
+            )
+            if _struct_waive:
                 self.market_engine.state.pop(
                     "session_no_calls_after_uptrend_refuse", None
                 )
@@ -2837,9 +3038,13 @@ class StrategyEngine:
                 _struct_bear = bool(self._day_structure_bearish(signals)[0])
             except Exception:
                 _struct_bear = False
+            _ema_st = str(signals.get("ema_structure") or "")
+            _struct_waive_st = _struct_bear and _ema_st not in (
+                "BULLISH", "TRANSITIONAL",
+            )
             _fade_hi = self._extreme_high_call_fade_ok(signals, _adx, _loc)
             if (
-                _struct_bear
+                _struct_waive_st
                 or _fade_hi
                 or _adx < _thr
                 or _loc < 0.70
@@ -2847,7 +3052,7 @@ class StrategyEngine:
                 self.market_engine.state.pop(
                     "session_no_calls_after_uptrend_refuse", None
                 )
-                if _fade_hi or _struct_bear:
+                if _fade_hi or _struct_waive_st:
                     return None
             else:
                 return (
@@ -2918,6 +3123,14 @@ class StrategyEngine:
         )
         if _mid_fade:
             return f"counter_trend_entry_blocked:{strategy_name}:{_mid_fade}"
+
+        _bounce = self._spent_downside_bounce_refusal(strategy_name, signals)
+        if _bounce:
+            return f"counter_trend_entry_blocked:{strategy_name}:{_bounce}"
+
+        _pda = self._post_debit_abort_credit_refusal(strategy_name, signals)
+        if _pda:
+            return f"counter_trend_entry_blocked:{strategy_name}:{_pda}"
 
         # Hard invariant first — extreme high-fade waiver lives inside it.
         _hard = self._hard_credit_into_trend_refusal(strategy_name, signals)
@@ -6034,6 +6247,9 @@ class StrategyEngine:
         # Exception: post-harvest with-trend continuation may use the same
         # ADX floor as the hard credit invariant (trend threshold) without
         # waiting for the mature flag (Sep23 UPTREND after BPS).
+        # NOTE: a "strong preview + spent day_move" carve-out was tried
+        # (v65m7y) to unlock Sep29 LONG_PUT earlier; it destroyed Sep15
+        # (−₹15k vs baseline) and did not lift Sep29 replay — reverted.
         if not bool(signals.get("adx_15_mature", False)):
             if not self._post_harvest_trend_continuation(signals):
                 return False, "momentum_adx_immature", 0
@@ -8225,8 +8441,8 @@ def _self_test() -> None:
         f"{phantom_count['cnt'] if phantom_count else 0} [OK]"
     )
 
-    # ── P0/P1 refined (v65m7v): spend fence, keep Sep22 warmup lean ──────
-    print_section("Spent-Side Lean / Warmup (v65m7v)")
+    # ── P0/P1 refined: peak spend fence, mature RANGE fence, keep Sep22 ──
+    print_section("Spent-Side Lean / Warmup / Noon Re-arm")
     _sep30 = make_signals(
         spot=22746.0,
         day_high_so_far=22750.0,
@@ -8252,6 +8468,44 @@ def _self_test() -> None:
     )
     assert _s30 == "NO_TRADE" and "day_up_spent" in _w30, (
         f"spent day_up + warmup extreme must refuse BPS, got {_s30}/{_w30}"
+    )
+    # Noon re-arm: current gauge decayed under 100%, post-10:15 peak spent.
+    _noon = make_signals(
+        spot=22735.0,
+        day_high_so_far=22750.0,
+        day_low_so_far=22660.0,
+        or_high=22734.0,
+        or_low=22660.0,
+        day_up_used_pct=86.0,
+        day_up_used_peak_pct=115.0,  # latched after 10:15, not open spike
+        day_down_used_pct=7.0,
+        ema_structure="BULLISH",
+        adx_15=16.7,
+        adx_15_mature=True,
+        price_regime="RANGE",
+        positioning_regime="RANGE",
+        final_regime="PREMIUM_SELL_RANGE",
+        vol_regime="STRONG_SELL_PREMIUM",
+        opening_straddle_pts=310.0,
+        actual_dte=3,
+    )
+    _sn, _wn = engine._resolve_range_strategy(
+        3, "NARROW", 16.7, True, dtime(12, 6), "STRONG_SELL_PREMIUM", _noon,
+    )
+    assert _sn == "NO_TRADE" and "day_up_spent" in _wn, (
+        f"noon soft lean must refuse on peak spend, got {_sn}/{_wn}"
+    )
+    assert engine._side_day_spend_pct(_noon, "BULL") >= 100.0, (
+        "spend pct must use peak when current decayed"
+    )
+    # Mature RANGE lean at highs with peak spent must also refuse.
+    _mature = dict(_noon)
+    _mature["adx_15"] = 22.0
+    _smat, _wmat = engine._resolve_range_strategy(
+        3, "NARROW", 22.0, True, dtime(12, 30), "SELL_PREMIUM", _mature,
+    )
+    assert _smat == "NO_TRADE" and "day_up_spent" in _wmat, (
+        f"mature RANGE lean must respect spent fence, got {_smat}/{_wmat}"
     )
     # Sep22-class: warmup lean at low with day_down < 100% must still book
     _sep22 = make_signals(
@@ -8313,10 +8567,130 @@ def _self_test() -> None:
     _fade = dict(_sep30)
     _fade["afternoon_high_fade"] = True
     assert engine._away_side_allowed(_fade, "BEAR") is True
+    # After CLOSE_STOP, same-side BPS at loc~0.65 must refuse.
+    market_engine.state["last_exit_strategy_side"] = "BULL"
+    market_engine.state["last_exit_time"] = "2026-09-30T11:18:30"
+    market_engine.state["last_exit_reason"] = "CLOSE_STOP"
+    _chase = engine._same_side_chase_refusal(
+        BULL_PUT_SPREAD,
+        make_signals(
+            spot=22735.0,
+            day_high_so_far=22750.0,
+            day_low_so_far=22660.0,
+            or_high=22734.0,
+            or_low=22660.0,
+            price_regime="RANGE",
+            adx_15=17.0,
+        ),
+    )
+    assert _chase and "after_stop" in _chase, (
+        f"post-stop same-side at soft loc must refuse, got {_chase}"
+    )
+    market_engine.state["last_exit_strategy_side"] = ""
+    market_engine.state["last_exit_time"] = None
+    market_engine.state["last_exit_reason"] = ""
     print(f"  spent-up warmup:  {_s30} ({_w30})")
+    print(f"  noon peak fence:  {_sn} ({_wn})")
+    print(f"  mature spent:     {_smat} ({_wmat})")
     print(f"  sep22 warmup low: {_s22} ({_w22})")
     print(f"  directional trend: {_dir}")
-    print("  [OK] Spent-side / Sep22-warmup / waiver-decouple tests passed")
+    print(f"  post-stop chase:  {_chase}")
+    print("  [OK] Spent-side / noon / mature / Sep22 / stop-chase tests passed")
+
+    # ── v65m7x: BEAR+UPTREND EMA waiver tight + spent-down bounce ──
+    print_section("Bear-into-uptrend / spent-downside bounce")
+    _sep23 = make_signals(
+        final_regime="PREMIUM_SELL_BEAR",
+        price_regime="UPTREND",
+        adx_15=21.2,
+        adx_15_mature=True,
+        ema_structure="BULLISH",
+        spot=23436.8,
+        atm_strike=23450,
+        day_high_so_far=23450.0,
+        day_low_so_far=23350.0,
+        or_high=23420.0,
+        or_low=23360.0,
+        day_up_used_pct=117.0,
+        day_down_used_pct=8.0,
+        gap_direction="DOWN",
+        prev_close=23480.0,
+        day_high=23450.0,
+        resistance_strike=23500.0,
+        resistance_strength=3.0,
+        vol_regime="SELL_PREMIUM",
+        opening_straddle_pts=220.0,
+        actual_dte=4,
+        confidence_level="HIGH",
+    )
+    _h23 = engine._hard_credit_into_trend_refusal(BEAR_CALL_SPREAD, _sep23)
+    assert _h23 and "no_calls_into_UPTREND" in _h23, (
+        f"Sep23-class BCS into UPTREND/EMA BULLISH must refuse, got {_h23}"
+    )
+    _m23, _mw23 = engine._map_regime_to_strategy(_sep23, _test_time=dtime(11, 13))
+    assert _m23 == "NO_TRADE" and "no_calls_into" in str(_mw23), (
+        f"map must refuse Sep23 BCS, got {_m23}/{_mw23}"
+    )
+    _sep29b = make_signals(
+        final_regime="PREMIUM_SELL_BEAR",
+        price_regime="DOWNTREND",
+        adx_15=41.0,
+        adx_15_mature=True,
+        ema_structure="TRANSITIONAL",
+        spot=22657.7,
+        atm_strike=22650,
+        day_high_so_far=22750.0,
+        day_low_so_far=22570.0,
+        or_high=22740.0,
+        or_low=22580.0,
+        day_up_used_pct=40.0,
+        day_down_used_pct=199.0,
+        day_down_used_peak_pct=207.0,
+        spot_impulse_up_pts=35.0,
+        gap_direction="FLAT",
+        vol_regime="SELL_PREMIUM",
+        opening_straddle_pts=280.0,
+        actual_dte=0,
+        confidence_level="MEDIUM",
+    )
+    _b29 = engine._spent_downside_bounce_refusal(BEAR_CALL_SPREAD, _sep29b)
+    assert _b29 and "spent_downside_bounce" in _b29, (
+        f"Sep29 bounce BCS must refuse, got {_b29}"
+    )
+    # Still-at-lows with-trend BEAR after spent down must stay open.
+    _crash = dict(_sep29b)
+    _crash["spot"] = 22590.0
+    _crash["ema_structure"] = "BEARISH"
+    _crash["spot_impulse_up_pts"] = 5.0
+    _crash["price_regime"] = "DOWNTREND"
+    assert engine._spent_downside_bounce_refusal(BEAR_CALL_SPREAD, _crash) is None, (
+        "with-trend BCS at lows after spent down must remain allowed"
+    )
+    # High-zone after V (Sep29 12:15 dump) must allow fade / BEAR credit.
+    _hi_fade = dict(_sep29b)
+    _hi_fade["spot"] = 22740.0
+    _hi_fade["day_high_so_far"] = 22752.0
+    _hi_fade["day_low_so_far"] = 22570.0
+    _hi_fade["ema_structure"] = "TRANSITIONAL"
+    _hi_fade["spot_impulse_up_pts"] = 5.0
+    _hi_fade["price_regime"] = "RANGE"
+    assert engine._spent_downside_bounce_refusal(BEAR_CALL_SPREAD, _hi_fade) is None, (
+        "high-zone after spent downside must allow BCS/fade"
+    )
+    print(f"  hard UPTREND refuse: {_h23}")
+    print(f"  bounce refuse:       {_b29}")
+    # After LONG_PUT abort, BCS must cool.
+    market_engine.state["last_debit_abort"] = {
+        "strategy": "LONG_PUT",
+        "t": now_ist().isoformat(),
+    }
+    _pda = engine._post_debit_abort_credit_refusal(BEAR_CALL_SPREAD, _sep29b)
+    assert _pda and "post_debit_abort_no_calls" in _pda, (
+        f"BCS after LONG_PUT abort must refuse, got {_pda}"
+    )
+    market_engine.state.pop("last_debit_abort", None)
+    print(f"  post-debit-abort:    {_pda}")
+    print("  [OK] Bear-into-uptrend / bounce / post-debit-abort tests passed")
 
     db.close()
     print_section("STRATEGY ENGINE SELF-TEST COMPLETE", char="#")

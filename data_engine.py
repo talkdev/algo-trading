@@ -691,6 +691,10 @@ class MarketDataEngine:
                 "events_calendar_snapshot",
                 "day_mode_latched",
                 "event_day_latched",
+                # Spent-side peak must survive mid-session restart; otherwise
+                # √elapsed re-arms soft leans after a crash/restart (Sep30).
+                "day_up_used_peak_pct",
+                "day_down_used_peak_pct",
             ):
                 if _k not in data:
                     continue
@@ -1933,13 +1937,33 @@ class MarketDataEngine:
                     day_low = float(market_bars["low"].min())
                     up = max(day_high - ref, 0.0) / _straddle_ref * 100.0
                     down = max(ref - day_low, 0.0) / _straddle_ref * 100.0
-                    # v65m7v: latch peaks so √elapsed decay cannot re-arm a
-                    # spent-side lean after the morning printed ≥100%.
+                    # Latch time-scaled peaks so √elapsed decay cannot re-arm
+                    # a spent lean (Sep30 noon: 115% → 86%). Two guards stop
+                    # false peaks from poisoning the fence:
+                    #   1) ignore first 60 minutes (open √elapsed spike)
+                    #   2) require absolute excursion ≥ 50% of opening
+                    #      straddle (time_scaled% × √frac) — Sep21-class
+                    #      modest opens print ≥100% time-scaled after 10:15
+                    #      without a real half-straddle move; latching those
+                    #      blocked the afternoon winners.
                     try:
-                        _pu = float(self.state.get("day_up_used_peak_pct") or 0.0)
-                        _pd = float(self.state.get("day_down_used_peak_pct") or 0.0)
-                        self.state["day_up_used_peak_pct"] = max(_pu, round(up, 2))
-                        self.state["day_down_used_peak_pct"] = max(_pd, round(down, 2))
+                        _abs_up = (up / 100.0) * _math_dm.sqrt(_frac_dm)
+                        _abs_dn = (down / 100.0) * _math_dm.sqrt(_frac_dm)
+                        if _elapsed_dm >= 60.0:
+                            _pu = float(
+                                self.state.get("day_up_used_peak_pct") or 0.0
+                            )
+                            _pd = float(
+                                self.state.get("day_down_used_peak_pct") or 0.0
+                            )
+                            if _abs_up >= 0.50:
+                                self.state["day_up_used_peak_pct"] = max(
+                                    _pu, round(up, 2)
+                                )
+                            if _abs_dn >= 0.50:
+                                self.state["day_down_used_peak_pct"] = max(
+                                    _pd, round(down, 2)
+                                )
                     except (TypeError, ValueError):
                         pass
                     return round(up, 2), round(down, 2)

@@ -230,7 +230,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m7v-soft-spend-only"
+        _engine_build = "v65m7z-occupancy-midbounce"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,
@@ -658,11 +658,104 @@ class MainEngine:
                     f"Prior session P&L: Rs{prior_pnl:,.2f}"
                 )
 
+    def _ledger_exit_for_position(self, position_id: str) -> Optional[dict]:
+        """Return the durable exit ledger row for a position, if any.
+
+        Prefer trade_exits; fall back to exit_quality_log. Used so a mid-
+        session restart cannot ABORT a ticket that already realized P&L
+        (live 2026-09-30 14:24: +₹642 winner flattened to ABORTED).
+        """
+        pid = str(position_id or "")
+        if not pid:
+            return None
+        try:
+            row = self.db.query_one(
+                "SELECT net_pnl_rupees AS pnl, exit_time, exit_reason "
+                "FROM trade_exits WHERE position_id=? "
+                "ORDER BY exit_time DESC LIMIT 1",
+                (pid,),
+            )
+            if row and row.get("exit_time"):
+                return {
+                    "pnl": float(row.get("pnl") or 0.0),
+                    "exit_time": row.get("exit_time"),
+                    "exit_reason": str(row.get("exit_reason") or "LEDGER_CLOSE"),
+                    "source": "trade_exits",
+                }
+        except Exception:
+            pass
+        try:
+            row = self.db.query_one(
+                "SELECT exit_pnl_rupees AS pnl, exit_time, "
+                "exit_priority_fired "
+                "FROM exit_quality_log WHERE position_id=? "
+                "ORDER BY exit_time DESC LIMIT 1",
+                (pid,),
+            )
+            if row and row.get("exit_time"):
+                return {
+                    "pnl": float(row.get("pnl") or 0.0),
+                    "exit_time": row.get("exit_time"),
+                    "exit_reason": "STARTUP_LEDGER_CLOSE",
+                    "source": "exit_quality_log",
+                }
+        except Exception:
+            pass
+        return None
+
+    def _mark_position_closed_from_ledger(
+        self, position_id: str, ledger: dict
+    ) -> None:
+        """Promote a stuck OPEN/PENDING row to CLOSED using ledger P&L."""
+        pid = str(position_id or "")
+        pnl = float(ledger.get("pnl") or 0.0)
+        try:
+            self.db.update(
+                "positions",
+                {
+                    "status": "CLOSED",
+                    "exit_reason": str(
+                        ledger.get("exit_reason") or "STARTUP_LEDGER_CLOSE"
+                    )[:200],
+                    "exit_time": ledger.get("exit_time") or now_ist().isoformat(),
+                    "net_pnl_rupees": pnl,
+                    "updated_at": now_ist().isoformat(),
+                },
+                {"position_id": pid},
+            )
+        except Exception as e:
+            self.logger.critical(
+                f"ledger CLOSE mark failed for {pid[:16]}: {e}"
+            )
+            return
+        try:
+            state = self.market_engine.state
+            # Recompute realized from CLOSED blotter — never zero a winner.
+            row = self.db.query_one(
+                "SELECT COALESCE(SUM(net_pnl_rupees),0) AS total "
+                "FROM positions WHERE trading_date=? AND status='CLOSED'",
+                (today_ist().isoformat(),),
+            )
+            actual = float((row or {}).get("total") or 0.0)
+            state["daily_pnl"] = actual
+            self.market_engine._save_session_state()
+        except Exception as e:
+            self.logger.warning(f"daily_pnl restore after ledger CLOSE: {e}")
+        self.logger.critical(
+            f"Startup: {pid[:16]} already closed on ledger "
+            f"({ledger.get('source')}) pnl=Rs{pnl:,.0f} — marked CLOSED "
+            f"(no Exit-All / no ABORT)"
+        )
+
     def _reconcile_pending_entries_on_startup(self) -> None:
         """v61: PENDING_ENTRY reconcile is its own phase (never gated on OPEN).
 
         Crash mid-entry often leaves PENDING with zero OPEN — the old path
         early-returned and never probed the broker (P59-01).
+
+        If the ledger already shows a close (trade_exits / exit_quality),
+        mark CLOSED and keep the P&L — never Exit-All / ABORT a finished
+        ticket (live 2026-09-30 14:24).
         """
         try:
             pending = self.db.query(
@@ -678,6 +771,10 @@ class MainEngine:
         )
         for pos in pending:
             pid = str(pos.get("position_id") or "")
+            ledger = self._ledger_exit_for_position(pid)
+            if ledger is not None:
+                self._mark_position_closed_from_ledger(pid, ledger)
+                continue
             broker_filled = False
             fill_tags: list = []
             if not self.config.paper_trade_mode and pid:
@@ -795,7 +892,9 @@ class MainEngine:
                     pos, "STALE_PRIOR_DAY_CLOSE", 0, {}
                 )
             else:
-                # OPEN with zero legs = promote crash mid-write (P59-06)
+                # OPEN with zero open legs: either a finished close whose
+                # status write failed, or a promote crash mid-write (P59-06).
+                # Ledger-first: never demote a realized winner to PENDING.
                 try:
                     legs = self.execution_engine._get_position_legs(
                         pos["position_id"]
@@ -806,9 +905,32 @@ class MainEngine:
                     ]
                 except Exception:
                     open_legs = []
+                    legs = []
                 if not open_legs and not self.config.paper_trade_mode:
+                    pid = str(pos.get("position_id") or "")
+                    ledger = self._ledger_exit_for_position(pid)
+                    legs_all_closed = bool(legs) and all(
+                        str(l.get("leg_status") or "").upper() == "CLOSED"
+                        for l in legs
+                    )
+                    if ledger is not None or legs_all_closed:
+                        if ledger is None:
+                            ledger = {
+                                "pnl": float(pos.get("net_pnl_rupees") or 0.0),
+                                "exit_time": (
+                                    pos.get("exit_time")
+                                    or now_ist().isoformat()
+                                ),
+                                "exit_reason": str(
+                                    pos.get("exit_reason")
+                                    or "STARTUP_LEGS_CLOSED"
+                                ),
+                                "source": "position_legs",
+                            }
+                        self._mark_position_closed_from_ledger(pid, ledger)
+                        continue
                     self.logger.critical(
-                        f"OPEN {pos['position_id'][:16]} has no legs — "
+                        f"OPEN {pid[:16]} has no legs — "
                         f"treating as PENDING broker reconcile"
                     )
                     try:
@@ -818,7 +940,7 @@ class MainEngine:
                                 "status": "PENDING_ENTRY",
                                 "updated_at": now_ist().isoformat(),
                             },
-                            {"position_id": pos["position_id"]},
+                            {"position_id": pid},
                         )
                     except Exception:
                         pass
