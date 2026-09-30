@@ -2754,6 +2754,81 @@ class ExecutionEngine:
         except Exception as _flip_exc:
             self.logger.debug(f"trend-flip check skipped: {_flip_exc}")
 
+        # ── v65m7v: grind-over exit (credit vertical, no full DOWNTREND) ──
+        # Trend-flip waits for a labelled DOWNTREND/UPTREND. A slow rollover
+        # often stays RANGE until the price stop. If the vertical is clearly
+        # underwater, hold≥15m, ADX is alive, and session location has
+        # flipped against the credit side, scratch via CLOSE_STOP before the
+        # wing stop — frees the slot without needing the full trend label.
+        try:
+            _gr_name = str(position.get("strategy_name") or "")
+            _gr_px = str(signals.get("price_regime") or "")
+            _gr_adx = float(signals.get("adx_15") or 0.0)
+            _gr_hold = 9999.0
+            try:
+                _gr_et = position.get("entry_time")
+                if _gr_et:
+                    _gr_hold = (
+                        now_ist() - datetime.fromisoformat(str(_gr_et))
+                    ).total_seconds() / 60.0
+            except Exception:
+                _gr_hold = 9999.0
+            _gr_raw = {}
+            try:
+                _gr_raw = json.loads(position.get("raw_params_json") or "{}")
+            except Exception:
+                _gr_raw = {}
+            _gr_fade = bool(
+                _gr_raw.get("afternoon_high_fade")
+                or _gr_raw.get("afternoon_low_fade")
+            )
+            try:
+                _sp_g = float(signals.get("spot") or 0.0)
+                _dh_g = float(
+                    signals.get("day_high_so_far")
+                    or signals.get("day_high") or 0.0
+                )
+                _dl_g = float(
+                    signals.get("day_low_so_far")
+                    or signals.get("day_low") or 0.0
+                )
+                _rr_g = (_dh_g - _dl_g) if (_dh_g > _dl_g > 0) else 0.0
+                _loc_g = (
+                    (_sp_g - _dl_g) / _rr_g
+                    if _rr_g > 1.0 and _sp_g > 0 else 0.5
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                _rr_g, _loc_g = 0.0, 0.5
+            _gr_against = (
+                (_gr_name == "BULL_PUT_SPREAD"
+                 and _rr_g >= 85.0 and _loc_g <= 0.40
+                 and _gr_px in ("RANGE", "CHOPPY", "DOWNTREND", "STRONG_DOWNTREND"))
+                or (_gr_name == "BEAR_CALL_SPREAD"
+                    and _rr_g >= 85.0 and _loc_g >= 0.60
+                    and _gr_px in ("RANGE", "CHOPPY", "UPTREND", "STRONG_UPTREND"))
+            )
+            if (
+                _gr_against
+                and (not _gr_fade)
+                and _gr_adx >= 18.0
+                and entry_credit > 0
+                and liq_premium > entry_credit * 1.15
+                and _gr_hold >= 15.0
+            ):
+                self.logger.warning(
+                    f"GRIND-OVER EXIT: {_gr_name} loc={_loc_g:.2f} "
+                    f"px={_gr_px} adx={_gr_adx:.0f} hold={_gr_hold:.0f}m "
+                    f"liq={liq_premium:.2f} vs credit={entry_credit:.2f}"
+                )
+                return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                    "reason_detail": (
+                        f"grind_over_exit_{_gr_name}_loc_{_loc_g:.2f}_"
+                        f"px_{_gr_px}_adx_{_gr_adx:.0f}"
+                    ),
+                }
+        except Exception as _gr_exc:
+            self.logger.debug(f"grind-over exit skipped: {_gr_exc}")
+
         # ── PATCH_V45: regime-rotation exit (free the single slot) ────────
         # Trend-flip above only fires when the vertical is already
         # underwater. A morning bull put that is still green while the
