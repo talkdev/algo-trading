@@ -1080,6 +1080,8 @@ class ExecutionEngine:
             ("positions", "profit_lock_stop_level",  "REAL"),
             # Debit HWM: best mid value seen while long; drives fat-winner trail.
             ("positions", "peak_debit_value",        "REAL"),
+            # Best (lowest) credit liquidation mark — winner give-back trail.
+            ("positions", "peak_credit_liq",         "REAL"),
             ("positions", "exit_priority",           "INTEGER"),
             ("positions", "price_stop_level_call",   "REAL"),
             ("positions", "price_stop_level_put",    "REAL"),
@@ -1829,6 +1831,18 @@ class ExecutionEngine:
                 )
             except Exception as ue:
                 self.logger.critical(f"PENDING_ENTRY abort mark failed: {ue}")
+            # Live Sep29: LONG_PUT aborted unfilled @11:02, then BCS booked
+            # into the bounce 8m later (−₹1.7k). Latch debit aborts so the
+            # opposite credit cannot fill the hole the debit was meant for.
+            try:
+                _ab_name = str(params.get("strategy_name") or "")
+                if _ab_name in ("LONG_PUT", "LONG_CALL"):
+                    self.market_engine.state["last_debit_abort"] = {
+                        "strategy": _ab_name,
+                        "t": now_ist().isoformat(),
+                    }
+            except Exception:
+                pass
             return None
 
         # Build actual fill legs
@@ -2412,13 +2426,27 @@ class ExecutionEngine:
         if not chain:
             liq_premium = current_premium
 
+        # Credit peak: lowest liquidation mark seen (most profitable).
+        _peak_credit_liq = None
+        try:
+            _prev_peak = position.get("peak_credit_liq")
+            if _prev_peak is not None:
+                _peak_credit_liq = min(float(_prev_peak), float(liq_premium))
+            else:
+                _peak_credit_liq = float(liq_premium)
+        except (TypeError, ValueError):
+            _peak_credit_liq = None
+        _upd_mark = {
+            "last_known_premium":       current_premium,
+            "last_liquidation_premium": liq_premium,
+            "updated_at":               now_ist().isoformat(),
+        }
+        if _peak_credit_liq is not None:
+            _upd_mark["peak_credit_liq"] = _peak_credit_liq
+            position["peak_credit_liq"] = _peak_credit_liq
         self.db.update(
             "positions",
-            {
-                "last_known_premium":       current_premium,
-                "last_liquidation_premium": liq_premium,
-                "updated_at":               now_ist().isoformat(),
-            },
+            _upd_mark,
             {"position_id": position["position_id"]},
         )
 
@@ -2707,6 +2735,10 @@ class ExecutionEngine:
         # flicker), and the trade is older than 10 minutes.
         # Condors/flys are exempt: a trend does not invalidate both
         # sides at once.
+        #
+        # Sticky latch: Sep18 BCS saw UPTREND↔RANGE flicker while slowly
+        # bleeding — flip never armed on RANGE bars. Latch the adverse
+        # label for 25m so underwater exits still fire through flicker.
         try:
             _flip_name = str(position.get("strategy_name") or "")
             _flip_px   = str(signals.get("price_regime") or "")
@@ -2727,6 +2759,60 @@ class ExecutionEngine:
                 or (_flip_name == "BULL_PUT_SPREAD" and
                     _flip_px in ("DOWNTREND", "STRONG_DOWNTREND"))
             )
+            _flip_pid = str(position.get("position_id") or "")
+            _flip_latch_key = f"adverse_flip_latch_{_flip_pid}"
+            if (
+                _flip_against and _flip_mat and _flip_adx >= 20.0
+                and _flip_pid
+            ):
+                self.market_engine.state[_flip_latch_key] = {
+                    "px": _flip_px,
+                    "adx": _flip_adx,
+                    "t": now_ist().isoformat(),
+                }
+            # Sticky adverse latch: Sep18 BCS flickered UPTREND↔RANGE while
+            # bleeding — labelled flip never armed on RANGE bars. Only extend
+            # the underwater stop through flicker when location is also
+            # against the credit side (avoids Sep16 mild-bleed false stops).
+            _flip_sticky = False
+            _flip_sticky_px = _flip_px
+            _latch = self.market_engine.state.get(_flip_latch_key) or {}
+            if (not _flip_against) and isinstance(_latch, dict) and _latch.get("t"):
+                try:
+                    _latch_age = (
+                        now_ist() - datetime.fromisoformat(str(_latch["t"]))
+                    ).total_seconds() / 60.0
+                    _sp_s = float(signals.get("spot") or 0.0)
+                    _dh_s = float(
+                        signals.get("day_high_so_far")
+                        or signals.get("day_high") or 0.0
+                    )
+                    _dl_s = float(
+                        signals.get("day_low_so_far")
+                        or signals.get("day_low") or 0.0
+                    )
+                    _rr_s = (_dh_s - _dl_s) if (_dh_s > _dl_s > 0) else 0.0
+                    _loc_s = (
+                        (_sp_s - _dl_s) / _rr_s
+                        if _rr_s > 1.0 and _sp_s > 0 else 0.5
+                    )
+                    _loc_against = (
+                        (_flip_name == "BEAR_CALL_SPREAD"
+                         and _rr_s >= 85.0 and _loc_s >= 0.60)
+                        or (_flip_name == "BULL_PUT_SPREAD"
+                            and _rr_s >= 85.0 and _loc_s <= 0.40)
+                    )
+                    if (
+                        _latch_age <= 20.0
+                        and _flip_mat
+                        and _flip_adx >= 22.0
+                        and _flip_px in ("RANGE", "CHOPPY")
+                        and _loc_against
+                    ):
+                        _flip_sticky = True
+                        _flip_sticky_px = str(_latch.get("px") or _flip_px)
+                except Exception:
+                    _flip_sticky = False
             _flip_raw = {}
             try:
                 _flip_raw = json.loads(position.get("raw_params_json") or "{}")
@@ -2736,23 +2822,177 @@ class ExecutionEngine:
                 _flip_raw.get("afternoon_high_fade")
                 or _flip_raw.get("afternoon_low_fade")
             )
-            if (_flip_against and (not _flip_is_fade) and _flip_mat and _flip_adx >= 20.0
-                    and entry_credit > 0
-                    and liq_premium > entry_credit * 1.05
-                    and _flip_hold_min >= 10.0):
+            _flip_under_need = (
+                entry_credit * 1.12 if _flip_sticky else entry_credit * 1.05
+            )
+            if (
+                (_flip_against or _flip_sticky)
+                and (not _flip_is_fade)
+                and _flip_mat
+                and _flip_adx >= 20.0
+                and entry_credit > 0
+                and liq_premium > _flip_under_need
+                and _flip_hold_min >= 10.0
+            ):
+                _flip_tag = _flip_sticky_px if _flip_sticky else _flip_px
                 self.logger.warning(
                     f"PATCH_V12 TREND FLIP: {_flip_name} held into "
-                    f"{_flip_px} (adx={_flip_adx:.0f} mature), "
+                    f"{_flip_tag} (adx={_flip_adx:.0f} mature"
+                    f"{', sticky' if _flip_sticky else ''}), "
                     f"liq={liq_premium:.2f} vs credit={entry_credit:.2f} — closing early"
                 )
                 return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
                     "reason_detail": (
-                        f"trend_flip_exit_{_flip_px}_adx_{_flip_adx:.0f}_"
+                        f"trend_flip_exit_{_flip_tag}_adx_{_flip_adx:.0f}_"
                         f"liq_{liq_premium:.2f}_vs_credit_{entry_credit:.2f}"
+                        f"{'_sticky' if _flip_sticky else ''}"
                     ),
                 }
+            # v65m7x: winner harvest ONLY on peak give-back while still green
+            # against a labelled trend. A pure hold-time cut (v1) harvested
+            # Sep16 BCS early (−₹2.7k vs HARD_EXIT). Require a real peak
+            # (≥10% of credit) then ≥45% give-back of that peak.
+            if (
+                _flip_against
+                and (not _flip_is_fade)
+                and _flip_mat
+                and _flip_adx >= 24.0
+                and entry_credit > 0
+                and liq_premium < entry_credit
+                and _flip_hold_min >= 25.0
+            ):
+                _peak_l = float(
+                    position.get("peak_credit_liq")
+                    if position.get("peak_credit_liq") is not None
+                    else liq_premium
+                )
+                _peak_gain = max(entry_credit - _peak_l, 0.0)
+                _cur_gain = max(entry_credit - liq_premium, 0.0)
+                _gave_back = (
+                    _peak_gain >= 0.10 * entry_credit
+                    and _cur_gain <= 0.55 * _peak_gain
+                )
+                if _gave_back:
+                    self.logger.info(
+                        f"ADVERSE-FLIP WINNER HARVEST: {_flip_name} into "
+                        f"{_flip_px} adx={_flip_adx:.0f} hold={_flip_hold_min:.0f}m "
+                        f"gain={_cur_gain:.2f} peak={_peak_gain:.2f}"
+                    )
+                    return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+                        "reason_detail": (
+                            f"adverse_flip_winner_harvest_{_flip_px}"
+                            f"_adx_{_flip_adx:.0f}_hold_{_flip_hold_min:.0f}m"
+                            f"_gain_{_cur_gain:.2f}_peak_{_peak_gain:.2f}"
+                        ),
+                    }
         except Exception as _flip_exc:
             self.logger.debug(f"trend-flip check skipped: {_flip_exc}")
+
+        # ── v65m7z: adverse occupancy scratch (spot-path wrong-side hold) ─
+        # Spot-leg hunt: Sep18/23 held BEAR credit through +20–40pt BULL
+        # legs; trend-flip needs underwater and never frees a green wrong-
+        # side ticket. Scratch/rotate when impulse+location run against the
+        # credit side long enough that the slot is the P&L problem.
+        try:
+            _ao_name = str(position.get("strategy_name") or "")
+            _ao_px = str(signals.get("price_regime") or "")
+            _ao_adx = float(signals.get("adx_15") or 0.0)
+            _ao_mat = bool(signals.get("adx_15_mature", False))
+            _ao_hold = 9999.0
+            try:
+                _ao_et = position.get("entry_time")
+                if _ao_et:
+                    _ao_hold = (
+                        now_ist() - datetime.fromisoformat(str(_ao_et))
+                    ).total_seconds() / 60.0
+            except Exception:
+                _ao_hold = 9999.0
+            _ao_raw = {}
+            try:
+                _ao_raw = json.loads(position.get("raw_params_json") or "{}")
+            except Exception:
+                _ao_raw = {}
+            _ao_fade = bool(
+                _ao_raw.get("afternoon_high_fade")
+                or _ao_raw.get("afternoon_low_fade")
+            )
+            try:
+                _ao_up = float(signals.get("spot_impulse_up_pts") or 0.0)
+                _ao_dn = float(signals.get("spot_impulse_down_pts") or 0.0)
+            except (TypeError, ValueError):
+                _ao_up = _ao_dn = 0.0
+            try:
+                _sp_a = float(signals.get("spot") or 0.0)
+                _dh_a = float(
+                    signals.get("day_high_so_far")
+                    or signals.get("day_high") or 0.0
+                )
+                _dl_a = float(
+                    signals.get("day_low_so_far")
+                    or signals.get("day_low") or 0.0
+                )
+                _rr_a = (_dh_a - _dl_a) if (_dh_a > _dl_a > 0) else 0.0
+                _loc_a = (
+                    (_sp_a - _dl_a) / _rr_a
+                    if _rr_a > 1.0 and _sp_a > 0 else 0.5
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                _rr_a, _loc_a = 0.0, 0.5
+            try:
+                _ao_lim = max(
+                    25.0,
+                    float(signals.get("spot") or 0.0) * 0.0012,
+                )
+            except (TypeError, ValueError):
+                _ao_lim = 25.0
+            _ao_against = (
+                (
+                    _ao_name == "BEAR_CALL_SPREAD"
+                    and _ao_up >= _ao_lim
+                    and _rr_a >= 85.0
+                    and _loc_a >= 0.60
+                    and _ao_px in (
+                        "UPTREND", "STRONG_UPTREND", "RANGE", "CHOPPY"
+                    )
+                )
+                or (
+                    _ao_name == "BULL_PUT_SPREAD"
+                    and _ao_dn >= _ao_lim
+                    and _rr_a >= 85.0
+                    and _loc_a <= 0.40
+                    and _ao_px in (
+                        "DOWNTREND", "STRONG_DOWNTREND", "RANGE", "CHOPPY"
+                    )
+                )
+            )
+            _ao_under = entry_credit > 0 and liq_premium > entry_credit * 1.05
+            _ao_banked = (
+                entry_credit > 0
+                and (entry_credit - liq_premium) >= 0.10 * entry_credit
+            )
+            _ao_long = _ao_hold >= 55.0
+            if (
+                _ao_against
+                and (not _ao_fade)
+                and _ao_mat
+                and _ao_adx >= 22.0
+                and entry_credit > 0
+                and _ao_hold >= 30.0
+                and (_ao_under or _ao_banked or _ao_long)
+            ):
+                self.logger.info(
+                    f"ADVERSE OCCUPANCY: {_ao_name} loc={_loc_a:.2f} "
+                    f"px={_ao_px} adx={_ao_adx:.0f} hold={_ao_hold:.0f}m "
+                    f"imp_up={_ao_up:.0f}/dn={_ao_dn:.0f} — freeing slot"
+                )
+                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                    "reason_detail": (
+                        f"adverse_occupancy_{_ao_name}_loc_{_loc_a:.2f}"
+                        f"_px_{_ao_px}_hold_{_ao_hold:.0f}m"
+                    ),
+                }
+        except Exception as _ao_exc:
+            self.logger.debug(f"adverse occupancy skipped: {_ao_exc}")
 
         # ── v65m7v: grind-over exit (credit vertical, no full DOWNTREND) ──
         # Trend-flip waits for a labelled DOWNTREND/UPTREND. A slow rollover

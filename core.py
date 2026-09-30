@@ -1193,6 +1193,12 @@ class Config:
     regime_rotation_enabled:             bool  = True
     regime_rotation_min_hold_min:        float = 25.0
     regime_rotation_adx_min:             float = 22.0
+    # After 2 same-family ABORTs within 10m (or 3 within 20m), cool that
+    # family before re-firing (live Sep29 reject storm).
+    entry_abort_storm_cooldown_min:      float = 20.0
+    # After LONG_PUT/LONG_CALL ENTRY_FAILED, block opposite credit briefly
+    # (live Sep29: put abort → BCS into bounce).
+    post_debit_abort_credit_cooldown_min: float = 20.0
     # After an opposite-side exit the anti-churn clocks shrink: same-side
     # re-entries still pay the full 10/45/15pt discipline.
     reentry_opposite_cooldown_min:       float = 3.0
@@ -2237,6 +2243,8 @@ CREATE TABLE IF NOT EXISTS positions (
     -- which engine happened to be constructed first decided whether the
     -- column existed at all.
     last_liquidation_premium REAL,
+    -- Best (lowest) credit liquidation mark for adverse-flip winner harvest.
+    peak_credit_liq         REAL,
     profit_lock_activated   INTEGER DEFAULT 0,
     profit_lock_stop_level  REAL,
     paper_trade             INTEGER DEFAULT 1,
@@ -2936,6 +2944,7 @@ MIGRATION_SQL: List[str] = [
     # (and, for the liquidation mark, before it) that no schema declared.
     "ALTER TABLE positions ADD COLUMN entry_credit_realised REAL",
     "ALTER TABLE positions ADD COLUMN last_liquidation_premium REAL",
+    "ALTER TABLE positions ADD COLUMN peak_credit_liq REAL",
     "ALTER TABLE trade_entries ADD COLUMN vol_regime_at_entry TEXT",
     "ALTER TABLE trade_entries ADD COLUMN price_regime_at_entry TEXT",
     "ALTER TABLE trade_entries ADD COLUMN positioning_at_entry TEXT",
