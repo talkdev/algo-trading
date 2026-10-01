@@ -18,14 +18,21 @@
 #       ExecutionEngine.monitor / entry / exit / state / P&L
 #
 #  SIMULATED — only the unavoidable edges:
-#     * Broker fills → PaperOrderExecutor + FillModel (bid/ask edge)
+#     * Broker fills → PaperOrderExecutor + FillModel(mode="live") which
+#       mirrors LiveOrderExecutor aggressive limit ticks (not optimistic edge).
 #     * Wall-clock   → SimClock (now_ist / today_ist) + sleep no-op
+#
+#  Live ABORT mirroring is OPT-IN (--mirror-live-aborts). Default OFF:
+#  backtest verifies LATEST engine code on the recorded tape — it must not
+#  copy live rejects from an older build (sell-first / storm-IC would have
+#  filled where live ABORTed). Use --mirror-live-aborts only when comparing
+#  paper fills to a same-build live session.
 #
 #  Do NOT add a second decide/monitor/entry_possible loop here. If replay
 #  diverges from live, fix the live path or the I/O adapters above.
 #
 #  Caveats that remain (honest about optimism):
-#     * No partial fills / rejects / latency — every paper order fills.
+#     * Rejects with no live-ledger twin are still always-filled.
 #     * Snapshot cadence bounds the monitoring loop (intra-snapshot invisible).
 #
 #  READ THIS BEFORE BELIEVING ANY NUMBER IT PRINTS
@@ -829,18 +836,79 @@ class FillModel:
     """
     Turns an intention into a price, from the recorded two-sided quote.
 
-    edge = 0.0  -> you pay the full spread (sell at bid, buy at ask)
-    edge = 0.5  -> you get mid, i.e. the spread costs you nothing
-    Default 0.25 assumes a resting limit that usually gets a quarter of the
-    spread back. Raise it to flatter yourself; lower it to be honest about
-    size.
+    mode="live" (default): mirror LiveOrderExecutor._aggressive_limit_price
+      — entry SELL at bid−5 ticks, BUY at ask+2 ticks; urgent exits cross
+      through LTP by market_protection_pct. This is the live-parity path.
+
+    mode="edge" (legacy optimistic):
+      edge = 0.0  -> pay the full spread (sell at bid, buy at ask)
+      edge = 0.5  -> mid (spread costs nothing)
+      Default edge 0.25 assumed a resting limit that captures 1/4 spread —
+      that systematically beat live fills and inflated BT P&L.
     """
 
-    def __init__(self, edge: float = 0.25, stress_mult: float = 0.5):
-        self.edge = min(max(edge, 0.0), 0.5)
-        self.stress_mult = min(max(stress_mult, 0.0), 1.0)
+    def __init__(
+        self,
+        edge: float = 0.0,
+        stress_mult: float = 0.5,
+        *,
+        mode: str = "live",
+        entry_sell_ticks: int = 5,
+        entry_buy_ticks: int = 2,
+        tick: float = 0.10,
+        market_protection_pct: float = 2.0,
+    ):
+        self.mode = str(mode or "live").strip().lower()
+        if self.mode not in ("live", "edge"):
+            self.mode = "live"
+        self.edge = min(max(float(edge), 0.0), 0.5)
+        self.stress_mult = min(max(float(stress_mult), 0.0), 1.0)
+        self.entry_sell_ticks = max(1, int(entry_sell_ticks))
+        self.entry_buy_ticks = max(1, int(entry_buy_ticks))
+        self.tick = float(tick) if float(tick) > 0 else 0.10
+        self.market_protection_pct = min(
+            max(float(market_protection_pct or 2.0), 1.0), 25.0
+        )
+
+    def _round_tick(self, price: float) -> float:
+        t = self.tick
+        return round(round(max(price, t) / t) * t, 2)
+
+    def _live_aggressive(
+        self, quote: dict, action: str, urgent: bool = False
+    ) -> Optional[float]:
+        bid = float(quote.get("bid") or 0)
+        ask = float(quote.get("ask") or 0)
+        ltp = float(quote.get("ltp") or 0)
+        tick = self.tick
+        if urgent:
+            ref = ltp or ((bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0)
+            if ref <= 0:
+                return None
+            pct = self.market_protection_pct / 100.0
+            raw = ref * (1.0 + pct) if action == "BUY" else ref * (1.0 - pct)
+            return self._round_tick(raw)
+        if action == "SELL":
+            n = self.entry_sell_ticks
+            if bid > 0:
+                return self._round_tick(bid - n * tick)
+            if ask > 0:
+                return self._round_tick(ask - (n + 2) * tick)
+            if ltp > 0:
+                return self._round_tick(ltp - n * tick)
+            return None
+        n = self.entry_buy_ticks
+        if ask > 0:
+            return self._round_tick(ask + n * tick)
+        if bid > 0:
+            return self._round_tick(bid + (n + 2) * tick)
+        if ltp > 0:
+            return self._round_tick(ltp + n * tick)
+        return None
 
     def price(self, quote: dict, action: str, urgent: bool = False) -> Optional[float]:
+        if self.mode == "live":
+            return self._live_aggressive(quote, action, urgent=urgent)
         bid = float(quote.get("bid") or 0)
         ask = float(quote.get("ask") or 0)
         ltp = float(quote.get("ltp") or 0)
@@ -851,6 +919,94 @@ class FillModel:
         if action == "SELL":
             return round(bid + (mid - bid) * (edge / 0.5), 2)
         return round(ask - (ask - mid) * (edge / 0.5), 2)
+
+
+class LiveAbortMirror:
+    """Mirror live ABORTED entries so paper cannot invent fills live never got.
+
+    Live 2026-10-01: six BULL_PUT_SPREAD attempts rejected → abort storm;
+    paper always-filled the same selects and booked a different day P&L.
+    When the primary live DB has ABORTED rows for the replayed date, paper
+    entry for that strategy near those timestamps fails the same way.
+    """
+
+    def __init__(self, events: Optional[List[Tuple[str, datetime]]] = None,
+                 window_sec: float = 180.0):
+        self.events = list(events or [])
+        self.window_sec = float(window_sec)
+        self._fired: set = set()
+
+    @classmethod
+    def from_live_db(
+        cls, db_path: str, trading_date: str, window_sec: float = 180.0
+    ) -> "LiveAbortMirror":
+        events: List[Tuple[str, datetime]] = []
+        p = Path(str(db_path))
+        if not p.exists():
+            return cls(events, window_sec=window_sec)
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT strategy_name, entry_time FROM positions "
+                "WHERE trading_date=? AND status='ABORTED' "
+                "ORDER BY entry_time",
+                (str(trading_date)[:10],),
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                name = str(r["strategy_name"] or "")
+                raw = str(r["entry_time"] or "")
+                if not name or not raw:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    if ts.tzinfo is not None:
+                        ts = ts.replace(tzinfo=None)
+                except Exception:
+                    continue
+                events.append((name, ts))
+        except Exception:
+            events = []
+        return cls(events, window_sec=window_sec)
+
+    def should_reject(self, strategy_name: str, now: datetime) -> Optional[str]:
+        """Refuse the next paper entry for a strategy that live aborted.
+
+        Prefer a timestamp match within `window_sec`. If the replay clock
+        drifts (common when snapshot cadence ≠ live), fall back to
+        consuming the next unused live ABORT for that strategy so BT
+        cannot invent fills after live already failed N times (Oct1:
+        6 BPS aborts; time-window-only still let BT fill a 7th BPS).
+        """
+        if not self.events or not strategy_name:
+            return None
+        n = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
+        # 1) nearest unused abort within the window
+        best_i = None
+        best_dt = None
+        for i, (name, ts) in enumerate(self.events):
+            if name != strategy_name or i in self._fired:
+                continue
+            dt = abs((n - ts).total_seconds())
+            if dt <= self.window_sec and (best_dt is None or dt < best_dt):
+                best_i, best_dt = i, dt
+        if best_i is not None:
+            self._fired.add(best_i)
+            return (
+                f"order mirrored_live_abort_{strategy_name} "
+                f"terminated as 'rejected' — not filled"
+            )
+        # 2) count-based fallback: still unused aborts for this family today
+        for i, (name, _ts) in enumerate(self.events):
+            if name != strategy_name or i in self._fired:
+                continue
+            self._fired.add(i)
+            return (
+                f"order mirrored_live_abort_{strategy_name} "
+                f"terminated as 'rejected' — not filled"
+            )
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1156,6 +1312,9 @@ class BacktestRunner:
         verbose: bool = False,
         trade_report: Optional[str] = None,
         cycle_reports: bool = True,
+        abort_mirror: Optional[LiveAbortMirror] = None,
+        live_db_path: Optional[str] = None,
+        mirror_live_aborts: bool = False,
     ):
         self.store = store
         self.config = config
@@ -1165,6 +1324,10 @@ class BacktestRunner:
         self.results = Results(float(config.starting_capital))
         self._scratch: Optional[str] = None
         self._sink = io.StringIO()
+        self.abort_mirror = abort_mirror
+        self.live_db_path = live_db_path
+        # Default OFF: verify latest code on tape, do not copy live ABORTs.
+        self.mirror_live_aborts = bool(mirror_live_aborts)
         # ── v7: per-trade console report ──────────────────────────────────
         # trade_report overrides TRADE_REPORT_MODE from the config
         # (each_cycle | on_change | off); None keeps the configured mode.
@@ -1281,6 +1444,7 @@ class BacktestRunner:
             fill_model=self.fills,
             logger=logger,
             trade_report_source="BACKTEST",
+            abort_mirror=self.abort_mirror,
         )
         if self.trade_report_mode is not None:
             engine.trade_reporter.set_mode(self.trade_report_mode)
@@ -1447,6 +1611,33 @@ class BacktestRunner:
         self.results.days.append(trading_date)
         self.results._cur_day = trading_date
         self._harvested_pids = set()
+
+        # Optional live-abort mirror (OFF by default). When enabled, paper
+        # refuses fills at timestamps live ABORTed — useful for same-build
+        # parity. Default path runs latest code freely on the recorded tape.
+        if self.mirror_live_aborts:
+            _live_path = (
+                self.live_db_path
+                or str(getattr(self.config, "db_path", "") or "")
+            )
+            if _live_path:
+                self.abort_mirror = LiveAbortMirror.from_live_db(
+                    _live_path, trading_date
+                )
+            else:
+                self.abort_mirror = LiveAbortMirror()
+            if getattr(self, "engine", None) is not None:
+                self.engine.execution_engine.abort_mirror = self.abort_mirror
+            if self.abort_mirror.events:
+                print(
+                    f"[backtest] {trading_date}: mirroring "
+                    f"{len(self.abort_mirror.events)} live ABORT(s) into "
+                    f"paper fills (--mirror-live-aborts)"
+                )
+        else:
+            self.abort_mirror = LiveAbortMirror()
+            if getattr(self, "engine", None) is not None:
+                self.engine.execution_engine.abort_mirror = None
 
         try:
             _last_hhmm = str(day.cycles[-1])[11:16]
@@ -2162,8 +2353,16 @@ def print_report(res: Results, config: Config, args, store=None) -> None:
     print(f"  sessions replayed : {len(res.days)}")
     print(f"  engine cycles     : {res.cycles:,}")
     print(f"  entry decisions   : {res.entries_considered + s.get('trades', 0):,}")
-    print(f"  fill model        : edge={args.fill_edge:.2f} "
-          f"stress={args.stress_exit:.2f}")
+    print(f"  fill model        : mode={getattr(args, 'fill_mode', 'live')} "
+          f"edge={getattr(args, 'fill_edge', 0.0):.2f} "
+          f"stress_exit={getattr(args, 'stress_exit', 0.5):.2f}"
+          + ("  [live-aggressive ticks]"
+             if str(getattr(args, "fill_mode", "live")) == "live"
+             else "  [legacy edge blend]"))
+    print(f"  live abort mirror : "
+          + ("ON (--mirror-live-aborts) — paper copies live rejects"
+             if bool(getattr(args, "mirror_live_aborts", False))
+             else "OFF (default) — latest code free on tape"))
     print(f"  capital           : Rs {config.starting_capital:,.0f}")
 
     if not s.get("trades"):
@@ -2609,7 +2808,7 @@ def _forced_round_trip(store: "HistoricalStore", cfg: Config,
     day = store.load_day(dates[0])
     # trade_report is forced on so this coverage does not depend on what
     # TRADE_REPORT_MODE / TRADE_REPORT_ENABLED say in env.txt.
-    runner = BacktestRunner(store, cfg, FillModel(0.25, 0.5), verbose=False,
+    runner = BacktestRunner(store, cfg, FillModel(mode="live"), verbose=False,
                             trade_report="each_cycle")
     runner._build()
     try:
@@ -2801,7 +3000,7 @@ def self_test() -> int:
           f"{sum(d['cycles'] for d in audit['days'])} snapshots  [OK]")
 
     cfg = load_config()
-    runner = BacktestRunner(store, cfg, FillModel(0.25, 0.5), verbose=False)
+    runner = BacktestRunner(store, cfg, FillModel(mode="live"), verbose=False)
     res = runner.run(dates)
 
     print(f"  replayed {res.cycles} cycles across {len(res.days)} sessions  [OK]")
@@ -3434,10 +3633,16 @@ def _parallel_day_worker(job: dict) -> dict:
             runner = BacktestRunner(
                 store,
                 config,
-                FillModel(float(job["fill_edge"]), float(job["stress_exit"])),
+                FillModel(
+                    float(job.get("fill_edge") or 0.0),
+                    float(job.get("stress_exit") or 0.5),
+                    mode=str(job.get("fill_mode") or "live"),
+                ),
                 verbose=False,
                 trade_report=job.get("trade_report") or "each_cycle",
                 cycle_reports=False,
+                live_db_path=job.get("live_db_path"),
+                mirror_live_aborts=bool(job.get("mirror_live_aborts")),
             )
             res = runner.run([day])
             report = "\n\n".join(
@@ -3489,6 +3694,11 @@ def run_parallel_quiet(
             "db_paths": db_paths,
             "fill_edge": float(args.fill_edge),
             "stress_exit": float(args.stress_exit),
+            "fill_mode": str(getattr(args, "fill_mode", "live") or "live"),
+            "live_db_path": str(getattr(config, "db_path", "") or ""),
+            "mirror_live_aborts": bool(
+                getattr(args, "mirror_live_aborts", False)
+            ),
             "capital": args.capital,
             "allow_unfaithful": bool(getattr(args, "allow_unfaithful", False)),
             "trade_report": (
@@ -3667,11 +3877,27 @@ def main() -> int:
     ap.add_argument("--from", dest="d_from", default=None, help="first date YYYY-MM-DD")
     ap.add_argument("--to", dest="d_to", default=None, help="last date YYYY-MM-DD")
     ap.add_argument("--capital", type=float, default=None, help="override capital")
-    ap.add_argument("--fill-edge", type=float, default=0.25,
-                    help="0=pay the full spread, 0.5=get mid (default 0.25)")
+    ap.add_argument(
+        "--fill-mode",
+        choices=("live", "edge"),
+        default="live",
+        help="live (default): aggressive ticks matching LiveOrderExecutor; "
+             "edge: legacy optimistic bid/ask blend via --fill-edge",
+    )
+    ap.add_argument("--fill-edge", type=float, default=0.0,
+                    help="only for --fill-mode edge: 0=full spread, 0.5=mid "
+                         "(ignored in live mode)")
     ap.add_argument("--stress-exit", type=float, default=0.5,
-                    help="fraction of the edge retained on urgent exits "
-                         "(default 0.5)")
+                    help="edge-mode only: fraction of edge kept on urgent exits "
+                         "(default 0.5); live mode uses market-protection pct")
+    ap.add_argument(
+        "--mirror-live-aborts",
+        action="store_true",
+        help="OPT-IN: refuse paper fills where the live DB recorded ABORTED "
+             "for the same strategy/day. Default OFF — backtest verifies "
+             "latest engine code on the tape and must not copy live rejects "
+             "from an older build.",
+    )
     ap.add_argument("--csv", default=None, help="write the trade blotter here")
     ap.add_argument("--audit", action="store_true", help="report data coverage only")
     ap.add_argument("--test", action="store_true", help="run the harness self-test")
@@ -3802,8 +4028,15 @@ def main() -> int:
         print()
 
     runner = BacktestRunner(
-        store, config, FillModel(args.fill_edge, args.stress_exit), args.verbose,
+        store, config,
+        FillModel(
+            args.fill_edge, args.stress_exit,
+            mode=str(getattr(args, "fill_mode", "live") or "live"),
+        ),
+        args.verbose,
         trade_report=args.trade_report,
+        live_db_path=str(getattr(config, "db_path", "") or ""),
+        mirror_live_aborts=bool(getattr(args, "mirror_live_aborts", False)),
     )
     res = runner.run(dates)
     print_report(res, config, args, store=store)

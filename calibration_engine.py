@@ -1476,11 +1476,11 @@ class CalibrationEngine:
 
             self.logger.info(
                 f"  Regime accuracy (n={accuracy.get('total', 0)}): "
-                f"vol={accuracy.get('vol_accuracy', 0):.1%} "
-                f"price={accuracy.get('price_accuracy', 0):.1%} "
-                f"pos={accuracy.get('pos_accuracy', 0):.1%} "
-                f"final={accuracy.get('final_accuracy', 0):.1%} "
-                f"avg_score={avg_score:.3f}"
+                f"vol={float(accuracy.get('vol_accuracy') or 0):.1%} "
+                f"price={float(accuracy.get('price_accuracy') or 0):.1%} "
+                f"pos={float(accuracy.get('pos_accuracy') or 0):.1%} "
+                f"final={float(accuracy.get('final_accuracy') or 0):.1%} "
+                f"avg_score={float(avg_score or 0):.3f}"
             )
 
         except Exception as e:

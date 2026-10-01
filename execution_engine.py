@@ -211,31 +211,55 @@ class LiveOrderExecutor:
         opt_type:         str,
         transaction_type: str,
         fallback:         float,
+        *,
+        aggressiveness:   int = 2,
     ) -> float:
         """
         Compute aggressive limit price to ensure fill.
-        BUY: ask + 2 ticks (willing to pay slightly more)
-        SELL: bid - 2 ticks (willing to accept slightly less)
+        BUY: ask + N ticks (willing to pay slightly more)
+        SELL: bid - N ticks (willing to accept slightly less)
+
+        Entry short legs use higher aggressiveness so a stale bid does not
+        bounce as `rejected` before the fill poll can escalate.
         """
         opt = chain.get(strike, {}).get(opt_type, {}) if chain else {}
         bid = float(opt.get("bid", 0) or 0)
         ask = float(opt.get("ask", 0) or 0)
         tick = 0.10
+        n = max(1, int(aggressiveness or 2))
 
         if transaction_type == "BUY":
             price = (
-                ask + 2 * tick if ask > 0
-                else bid + 4 * tick if bid > 0
-                else fallback + 2 * tick
+                ask + n * tick if ask > 0
+                else bid + (n + 2) * tick if bid > 0
+                else fallback + n * tick
             )
         else:
             price = (
-                max(bid - 2 * tick, tick) if bid > 0
-                else max(ask - 4 * tick, tick) if ask > 0
-                else max(fallback - 2 * tick, tick)
+                max(bid - n * tick, tick) if bid > 0
+                else max(ask - (n + 2) * tick, tick) if ask > 0
+                else max(fallback - n * tick, tick)
             )
 
         return round(round(price / tick) * tick, 2)
+
+    @staticmethod
+    def _order_reject_detail(details: Optional[dict]) -> str:
+        """Extract broker reject/status text from an order-details payload."""
+        if not isinstance(details, dict):
+            return ""
+        for key in (
+            "status_message", "rejection_reason", "reject_reason",
+            "message", "status_message_raw", "exchange_message",
+            "remarks", "error",
+        ):
+            val = details.get(key)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                return text[:240]
+        return ""
 
     # Broker statuses meaning "this order is done and fully executed".
     _TERMINAL_OK = {"complete", "completed", "filled", "traded", "executed"}
@@ -270,8 +294,17 @@ class LiveOrderExecutor:
                 price   = details.get("average_price") or details.get("price")
 
                 if status in self._TERMINAL_BAD:
+                    _why = self._order_reject_detail(details)
+                    self.logger.error(
+                        f"[LIVE] ORDER REJECT order_id={order_id} "
+                        f"status={status} reason={_why or 'n/a'} "
+                        f"price={details.get('price')!r} "
+                        f"avg={details.get('average_price')!r} "
+                        f"filled={filled!r} pending={pending!r}"
+                    )
                     raise RuntimeError(
-                        f"order {order_id} terminated as '{status}' — not filled"
+                        f"order {order_id} terminated as '{status}'"
+                        f"{(' — ' + _why) if _why else ' — not filled'}"
                     )
 
                 if status in self._TERMINAL_OK:
@@ -326,6 +359,20 @@ class LiveOrderExecutor:
             except RuntimeError:
                 raise
             except Exception as e:
+                _msg = str(e)
+                _not_ready = (
+                    "UDAPI100010" in _msg
+                    or "Order not found" in _msg
+                    or "404" in _msg
+                )
+                # First two 404s are broker index lag, not a real failure.
+                if _not_ready and attempt < 2:
+                    self.logger.debug(
+                        f"order_details not ready for {order_id} "
+                        f"(attempt {attempt + 1}/{retries}): {_msg[:120]}"
+                    )
+                    time_module.sleep(0.6)
+                    continue
                 self.logger.warning(
                     f"Could not fetch order details for {order_id} "
                     f"(attempt {attempt + 1}/{retries}): {e}"
@@ -494,9 +541,11 @@ class LiveOrderExecutor:
                 "filled_qty": filled,
             }
         if status in self._TERMINAL_BAD:
+            _why = self._order_reject_detail(row if isinstance(row, dict) else {})
             raise RuntimeError(
                 f"order {order_id} (tag {tag}) terminated as '{status}' after an "
                 f"unconfirmed request"
+                f"{(' — ' + _why) if _why else ''}"
             )
         return {"state": "OPEN", "order_id": order_id, "tag": tag, "status": status}
 
@@ -723,9 +772,13 @@ class LiveOrderExecutor:
 
         qty              = lots * self.config.lot_size
         transaction_type = "SELL" if leg["action"] == "SELL" else "BUY"
-        limit_price      = self._aggressive_limit_price(
+        # Short credit legs: cross deeper (5 ticks) so a one-tick stale
+        # bid does not bounce as immediate `rejected` (live 2026-10-01).
+        _agg = 5 if transaction_type == "SELL" else 2
+        fallback_px = float(leg.get("exec_price", 0) or 0)
+        limit_price = self._aggressive_limit_price(
             chain, leg["strike"], leg["option_type"],
-            transaction_type, float(leg.get("exec_price", 0) or 0)
+            transaction_type, fallback_px, aggressiveness=_agg,
         )
 
         placed = self._place_order_reconciled(
@@ -742,13 +795,77 @@ class LiveOrderExecutor:
             + (" (reconciled after lost response)" if placed.get("reconciled") else "")
         )
 
+        # Broker order-index lag: order_details can 404 (UDAPI100010) for
+        # a few hundred ms after place (live 2026-10-01). Brief settle
+        # before the fill poll avoids a false "not found" on attempt 1.
+        if order_id and not self.config.paper_trade_mode:
+            time_module.sleep(0.45)
+
         fill_price = float(placed.get("fill_price") or 0.0)
         if fill_price <= 0:
-            fill_price = self._get_fill_price(
-                order_id,
-                fallback=float(leg.get("exec_price", 0) or 0),
-                expected_qty=qty,
-            )
+            try:
+                fill_price = self._get_fill_price(
+                    order_id,
+                    fallback=fallback_px,
+                    expected_qty=qty,
+                )
+            except RuntimeError as _rej:
+                # One wider re-quote for SELL rejects only — never double
+                # a BUY that already risked capital, and never escalate a
+                # non-reject failure (e.g. phantom / partial).
+                _msg = str(_rej).lower()
+                _is_reject = (
+                    "terminated as 'rejected'" in _msg
+                    or "terminated as \"rejected\"" in _msg
+                    or " — rejected" in _msg
+                )
+                if transaction_type != "SELL" or not _is_reject:
+                    raise
+                self.logger.warning(
+                    f"[LIVE] ENTRY SELL rejected — re-quoting through "
+                    f"market-protection: {_rej}"
+                )
+                try:
+                    self.client.cancel_order(order_id)
+                except Exception:
+                    pass
+                opt = (chain or {}).get(float(leg["strike"]), {}).get(
+                    str(leg["option_type"]), {}
+                ) if chain else {}
+                ltp = (
+                    float(opt.get("ltp", 0) or 0)
+                    or float(opt.get("bid", 0) or 0)
+                    or float(opt.get("ask", 0) or 0)
+                    or fallback_px
+                )
+                pct = float(getattr(self.config, "market_protection_pct", 2.0))
+                wide = self.client.synthetic_market_price(ltp, "SELL", pct)
+                if wide <= 0:
+                    wide = self._aggressive_limit_price(
+                        chain, leg["strike"], leg["option_type"],
+                        "SELL", fallback_px, aggressiveness=8,
+                    )
+                placed = self._place_order_reconciled(
+                    instrument_key=instrument_key, leg=leg,
+                    transaction_type="SELL", qty=qty,
+                    limit_price=wide, phase="ENTRY",
+                )
+                order_id = placed.get("order_id", "")
+                self.logger.info(
+                    f"[LIVE] ENTRY SELL RETRY {leg['option_type'].upper()} "
+                    f"{leg['strike']:.0f} @ limit={wide:.2f} "
+                    f"order_id={order_id} tag={placed.get('tag')}"
+                )
+                if order_id and not self.config.paper_trade_mode:
+                    time_module.sleep(0.45)
+                fill_price = float(placed.get("fill_price") or 0.0)
+                if fill_price <= 0:
+                    fill_price = self._get_fill_price(
+                        order_id,
+                        fallback=fallback_px,
+                        expected_qty=qty,
+                    )
+
         tag = placed.get("tag")
         if tag and fill_price > 0:
             # Confirmed fill booked into the entry path — leave the ledger
@@ -980,6 +1097,7 @@ class ExecutionEngine:
         client:         UpstoxClient,
         logger,
         fill_model=None,
+        abort_mirror=None,
     ):
         self.config        = config
         self.db            = db
@@ -995,6 +1113,7 @@ class ExecutionEngine:
         )
         self._chain_by_expiry: dict = {}
         self.fill_model = fill_model
+        self.abort_mirror = abort_mirror
 
         self._ensure_extra_columns()
 
@@ -1732,7 +1851,12 @@ class ExecutionEngine:
 
         v61 Flow:
         1. Insert PENDING_ENTRY + attach position_id BEFORE any place
-        2. Execute BUY legs first, then SELL legs
+        2. Credit structures: SELL (short) legs first, then BUY hedges.
+           Debit structures: BUY legs first, then SELL.
+           Live 2026-10-01 BULL_PUT: BUY long filled then SELL short was
+           RMS-rejected (naked-margin check before netting) → partial
+           unwind → abort storm. Short-first lets the broker see defined
+           risk when the long arrives.
         3. On failure: emergency unwind; ABORT only if broker flat
         4. Persist legs WHILE PENDING, then promote to OPEN
         """
@@ -1741,6 +1865,39 @@ class ExecutionEngine:
         chain       = self.market_engine.last_chain
         filled_legs: List[dict] = []
         now = now_ist()
+
+        # Replay live-parity: refuse paper fills at timestamps where the
+        # live book recorded ABORTED for this strategy (e.g. Oct1 BPS RMS).
+        _mirror = getattr(self, "abort_mirror", None)
+        if _mirror is not None:
+            _rej = _mirror.should_reject(
+                str(params.get("strategy_name") or ""), now
+            )
+            if _rej:
+                self.logger.error(f"Entry execution failed: {_rej}")
+                try:
+                    self.db.insert("positions", {
+                        "position_id":      position_id,
+                        "trading_date":     today_ist().isoformat(),
+                        "strategy_name":    params["strategy_name"],
+                        "strategy_type":    params.get("strategy_type"),
+                        "selection_reason": params.get("selection_reason"),
+                        "target_expiry":    params.get("target_expiry"),
+                        "actual_dte":       params.get("actual_dte"),
+                        "entry_time":       now.isoformat(),
+                        "entry_spot":       params.get("entry_spot"),
+                        "final_lots":       lots,
+                        "status":           "ABORTED",
+                        "exit_time":        now.isoformat(),
+                        "exit_reason":      f"ENTRY_FAILED:{_rej}"[:240],
+                        "paper_trade":      1,
+                        "raw_params_json":  json.dumps(params, default=str),
+                        "created_at":       now.isoformat(),
+                        "updated_at":       now.isoformat(),
+                    })
+                except Exception:
+                    pass
+                return None
 
         # Intent-first durable draft so a crash mid-fill is recoverable.
         try:
@@ -1770,8 +1927,26 @@ class ExecutionEngine:
         try:
             buy_legs  = [l for l in params["legs"] if l["action"] == "BUY"]
             sell_legs = [l for l in params["legs"] if l["action"] == "SELL"]
+            _stype = str(params.get("strategy_type") or "").upper()
+            try:
+                _net_credit = float(
+                    params.get("net_credit")
+                    or params.get("entry_credit")
+                    or params.get("total_credit")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                _net_credit = 0.0
+            _credit_first = (
+                _stype in ("SELL", "CREDIT")
+                or _net_credit > 0.0
+            )
+            _ordered = (
+                sell_legs + buy_legs if _credit_first
+                else buy_legs + sell_legs
+            )
 
-            for leg in buy_legs + sell_legs:
+            for leg in _ordered:
                 leg_with_id = {**leg, "position_id": position_id}
                 fill = self.executor.execute_leg_entry(leg_with_id, lots, chain)
                 filled_legs.append({**leg_with_id, "fill": fill})
@@ -2171,9 +2346,13 @@ class ExecutionEngine:
         #   Phase A (runner): after +lock_trigger, stop = free-trade only.
         #     Do NOT trail mid-move — that is how +₹1.3k / +₹8.7k scalp-outs
         #     miss the real peak.
-        #   Phase B (fat winner): only once HWM open gain ≥ large_frac of
-        #     entry (default 1.0 → HWM ≥ 2× entry). Then trail from the
-        #     stored peak, giving back only giveback_frac of peak open gain
+        #   Phase B (fat winner): once HWM reaches the earlier of
+        #     (a) entry×(1+large_frac) or (b) the planned target_premium.
+        #     Live 2026-10-01 LONG_PUT: peak 233.8 (= target, 1.6× entry)
+        #     but large_frac=1.0 required 2× (~292) before trailing, so the
+        #     stop stayed at free-trade ~147, then 14:30 flatten banked only
+        #     +₹6.5k after a ~₹28k open peak. Arming at target fixes that.
+        #     Trail gives back only giveback_frac of peak open gain
         #     (default 0.20 → keep ~80% of the peak).
         _persist = False
         try:
@@ -2217,11 +2396,15 @@ class ExecutionEngine:
             prev_hwm = 0.0
         hwm = max(prev_hwm, float(value_mid or 0.0))
         be_level = entry_value + rt_cost
-        large_frac = float(getattr(cfg, "momentum_hwm_large_frac", 1.00))
+        large_frac = float(getattr(cfg, "momentum_hwm_large_frac", 0.60))
         giveback = float(getattr(cfg, "momentum_hwm_giveback_frac", 0.20))
         large_frac = min(max(large_frac, 0.30), 2.0)
         giveback = min(max(giveback, 0.05), 0.50)
         fat_hwm = entry_value * (1.0 + large_frac)
+        # Never require a fatter HWM than the ticket's own target — otherwise
+        # persist-suppressed D3 + free-trade-only D2 give the peak back.
+        if target > entry_value > 0:
+            fat_hwm = min(fat_hwm, float(target))
 
         new_level = None
         ratchet_reason = None
@@ -2252,6 +2435,21 @@ class ExecutionEngine:
                     },
                     {"position_id": position["position_id"]},
                 )
+                # If liquidation already sits under the new HWM trail
+                # (gap / wide bid), bank now — do not wait a cycle.
+                if (
+                    ratchet_reason == "momentum_hwm_trail"
+                    and value <= float(_lock_out) + 1e-9
+                ):
+                    return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+                        "reason_detail": (
+                            f"momentum_hwm_trail_hit_{value:.2f}"
+                            f"<={float(_lock_out):.2f}"
+                        ),
+                        "locked_level": float(_lock_out),
+                        "peak_debit_value": hwm,
+                        "fat_winner": True,
+                    }
                 return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, {
                     "reason_detail": ratchet_reason or "momentum_profit_lock",
                     "new_level": _lock_out,
@@ -2276,16 +2474,20 @@ class ExecutionEngine:
             )
 
         # ── D3: planned target ───────────────────────────────────────────
-        # PATCH_V12: no fixed targets into a living trend (see D2).
-        if target > 0 and value >= target and not _persist:
-            self.logger.info(
-                f"DEBIT TARGET: {position['strategy_name']} value={value:.2f} "
-                f">= target={target:.2f}"
-            )
-            return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
-                "reason_detail": "momentum_target_reached",
-                "value": value,
-            }
+        # Persist still suppresses an immediate target flatten so a living
+        # trend can run — but only AFTER Phase B has armed (fat_hwm ≤
+        # target). If somehow HWM never armed, take the target anyway so
+        # Oct1-style givebacks cannot recur.
+        if target > 0 and value >= target:
+            if not _persist or hwm < fat_hwm - 1e-9:
+                self.logger.info(
+                    f"DEBIT TARGET: {position['strategy_name']} value={value:.2f} "
+                    f">= target={target:.2f} persist={_persist}"
+                )
+                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
+                    "reason_detail": "momentum_target_reached",
+                    "value": value,
+                }
 
         # ── D4: never carry a long option into the closing bell ──────────
         try:
@@ -2868,6 +3070,8 @@ class ExecutionEngine:
                 )
                 _peak_gain = max(entry_credit - _peak_l, 0.0)
                 _cur_gain = max(entry_credit - liq_premium, 0.0)
+                # Require a real peak (≥10% of credit) then ≥45% give-back
+                # of that peak before harvesting a still-green credit.
                 _gave_back = (
                     _peak_gain >= 0.10 * entry_credit
                     and _cur_gain <= 0.55 * _peak_gain
