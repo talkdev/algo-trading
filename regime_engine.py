@@ -1517,18 +1517,6 @@ class RegimeClassifier:
         skew_bear  = self._t("skew_bearish_threshold","skew_bearish_threshold",3.0)
         skew_bull  = self._t("skew_bullish_threshold","skew_bullish_threshold",0.95)
 
-        # Derived conditions
-        wall_strong_range = (
-            r_str >= oi_strong and
-            s_str >= oi_strong and
-            0.8 <= pcr <= 1.3 and
-            oi_change > oi_build
-        )
-        wall_range = (
-            r_str >= oi_mod and
-            s_str >= oi_mod and
-            0.7 <= pcr <= 1.4
-        )
         oi_building  = oi_change > oi_build
         oi_unwinding = oi_change < oi_unwind
 
@@ -1546,6 +1534,28 @@ class RegimeClassifier:
         pcr_extreme_bear = pcr < max(pcr_bull * 0.80, _pcr_abs_bear)
         pcr_bullish      = pcr > pcr_bear
         pcr_bearish      = pcr < pcr_bull
+
+        # Derived wall structure. The old wall_range PCR band (0.7–1.4)
+        # left a deadzone between the absolute extreme floor (0.58) and
+        # 0.70: NIFTY weeklies often print PCR 0.58–0.69 with BOTH walls
+        # strong, fell through to UNCLEAR, and hard-blocked the range
+        # book (live 2026-10-01: PCR ~0.58–0.65, walls ~4.5/4.5, dozens
+        # of RANGE_UNCLEAR_POSITIONING_NO_TRADE cycles). Align the band
+        # with the absolute extreme bounds; extremes still divert below.
+        # Live PCR <0.58 + BPS abort-storm is handled by storm→IC
+        # fallback in strategy_engine (muting extremes under strong walls
+        # cost Sep28's LONG_PUT continuation).
+        wall_strong_range = (
+            r_str >= oi_strong and
+            s_str >= oi_strong and
+            _pcr_abs_bear <= pcr <= _pcr_abs_bull and
+            oi_change > oi_build
+        )
+        wall_range = (
+            r_str >= oi_mod and
+            s_str >= oi_mod and
+            _pcr_abs_bear <= pcr <= _pcr_abs_bull
+        )
 
         skew_bearish = skew_ratio is not None and skew_ratio > skew_bear
         skew_bullish = skew_ratio is not None and skew_ratio < skew_bull
@@ -2481,13 +2491,38 @@ class RegimeClassifier:
             # Do NOT fall through to PREMIUM_SELL_RANGE on NEUTRAL: soft lean
             # under lean-only minted Sep25 10:13 BPS −₹2.1k (NEUTRAL vol,
             # no VRP edge). Pin stays blocked; wait for fade/positioning.
+            #
+            # Exhausted-move harvest (v65m8/m10): when most of the priced day
+            # move is already used and VRP is still positive (just thin),
+            # a NARROW/MODERATE range book has a different edge — the move
+            # is done, not "lean with no premium". Tightened after Sep25
+            # regression at dmu>=65/vrp>0 (early thin-VRP condor clipped
+            # the day's expectancy). Require clearer exhaustion + VRP.
+            _dmu = float(signals.get("day_move_used_pct") or 0.0)
+            try:
+                _vrp_s = float(signals.get("vrp_smoothed"))
+            except (TypeError, ValueError):
+                _vrp_s = None
+            _exhausted_harvest = (
+                vol == VolatilityRegime.NEUTRAL
+                and _vrp_s is not None
+                and _vrp_s >= 1.0
+                and _dmu >= 80.0
+                and or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
+                and not bool(signals.get("event_day"))
+            )
             if vol not in (VolatilityRegime.SELL_PREMIUM,
                            VolatilityRegime.STRONG_SELL_PREMIUM):
-                return (
-                    FinalRegime.NO_TRADE,
-                    f"RANGE_{pos.value}_CONDOR_REQUIRES_SELL_PREMIUM_"
-                    f"GOT_{vol.value}",
+                if not _exhausted_harvest:
+                    return (
+                        FinalRegime.NO_TRADE,
+                        f"RANGE_{pos.value}_CONDOR_REQUIRES_SELL_PREMIUM_"
+                        f"GOT_{vol.value}",
+                    )
+                signals["weekly_range_size_discount"] = float(
+                    getattr(self.config, "exhausted_move_condor_size", 0.60)
                 )
+                signals["exhausted_move_condor"] = True
             # Elevated-but-not-strong ADX: still a range tape, sell a
             # wider condor at a size discount. Tape rule, every DTE.
             _adx_wide = (
@@ -2496,8 +2531,9 @@ class RegimeClassifier:
             )
             if _adx_wide:
                 signals["weekly_wide_condor"] = True
-                signals["weekly_range_size_discount"] = float(
-                    getattr(self.config, "range_adx_wide_size", 0.80)
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    float(getattr(self.config, "range_adx_wide_size", 0.80)),
                 )
             # Expiry-day pin: remaining life IS the rest of the session.
             if (dte_blend(dte) >= 0.9 and
@@ -2509,6 +2545,11 @@ class RegimeClassifier:
                     FinalRegime.PREMIUM_SELL_RANGE,
                     "RANGE_EXPIRY_AFTERNOON_PIN",
                 )
+            if _exhausted_harvest and vol == VolatilityRegime.NEUTRAL:
+                return (
+                    FinalRegime.PREMIUM_SELL_RANGE,
+                    f"RANGE_{pos.value}_{or_condition}_EXHAUSTED_MOVE_HARVEST",
+                )
             return (
                 FinalRegime.PREMIUM_SELL_RANGE,
                 f"RANGE_{pos.value}_{or_condition}",
@@ -2518,9 +2559,17 @@ class RegimeClassifier:
         if pos == PositioningRegime.BULLISH:
             # PATCH_V23 / v51: RANGE-origin directional credit, every DTE.
             # Soft location+tape path after 10:15 replaces a hard ADX wait.
+            # Soft side must match the OR-mid override that follows: a
+            # BULLISH read with spot below mid sells calls (BEAR), so
+            # requiring SOFT BULL (high loc) permanently blocked the
+            # override before ADX maturity.
+            or_high = float(signals.get("or_high") or spot)
+            or_low  = float(signals.get("or_low")  or spot)
+            or_mid  = (or_high + or_low) / 2.0
+            _soft_side = "BULL" if spot >= or_mid else "BEAR"
             if (not bool(signals.get("adx_15_mature", False))
                     or float(signals.get("adx_15") or 0.0) <= 0.0):
-                if not self._soft_directional_ok(signals, "BULL", current_time):
+                if not self._soft_directional_ok(signals, _soft_side, current_time):
                     return (
                         FinalRegime.NO_TRADE,
                         "RANGE_VERTICAL_ADX_IMMATURE",
@@ -2533,9 +2582,6 @@ class RegimeClassifier:
             # measured trend behind it is not a directional edge.
             if signals.get("event_day") and not signals.get("adx_15_mature"):
                 return FinalRegime.NO_TRADE, "EVENT_RANGE_VERTICAL_NEEDS_MEASURED_ADX"
-            or_high = float(signals.get("or_high") or spot)
-            or_low  = float(signals.get("or_low")  or spot)
-            or_mid  = (or_high + or_low) / 2.0
             if spot >= or_mid:
                 return (
                     FinalRegime.PREMIUM_SELL_BULL,
@@ -2551,9 +2597,16 @@ class RegimeClassifier:
         # ── BEARISH positioning → bear call (unless spot above OR midpoint) ─
         if pos == PositioningRegime.BEARISH:
             # PATCH_V23 / v51: RANGE-origin directional credit, every DTE.
+            # Soft side follows the OR-mid override (live 2026-10-01 10:00:
+            # BEARISH PCR at day high asked soft BEAR/low-loc and refused
+            # forever, while the override would have sold puts).
+            or_high = float(signals.get("or_high") or spot)
+            or_low  = float(signals.get("or_low")  or spot)
+            or_mid  = (or_high + or_low) / 2.0
+            _soft_side = "BEAR" if spot <= or_mid else "BULL"
             if (not bool(signals.get("adx_15_mature", False))
                     or float(signals.get("adx_15") or 0.0) <= 0.0):
-                if not self._soft_directional_ok(signals, "BEAR", current_time):
+                if not self._soft_directional_ok(signals, _soft_side, current_time):
                     return (
                         FinalRegime.NO_TRADE,
                         "RANGE_VERTICAL_ADX_IMMATURE",
@@ -2566,9 +2619,6 @@ class RegimeClassifier:
             # measured trend behind it is not a directional edge.
             if signals.get("event_day") and not signals.get("adx_15_mature"):
                 return FinalRegime.NO_TRADE, "EVENT_RANGE_VERTICAL_NEEDS_MEASURED_ADX"
-            or_high = float(signals.get("or_high") or spot)
-            or_low  = float(signals.get("or_low")  or spot)
-            or_mid  = (or_high + or_low) / 2.0
             if spot <= or_mid:
                 return (
                     FinalRegime.PREMIUM_SELL_BEAR,
@@ -3921,14 +3971,31 @@ def _self_test() -> None:
     print(f"  Strong walls, neutral PCR, OI building → {pos1.value} (expect STRONG_RANGE)")
     assert pos1 == PositioningRegime.STRONG_RANGE, f"Expected STRONG_RANGE, got {pos1}"
 
-    # BULLISH
-    pos2 = classifier.classify_positioning(make_signals(pcr=0.48))
-    print(f"  PCR=0.48 (extreme greed/low PCR) → {pos2.value} (contrarian: expect BEARISH)")
+    # Extreme low PCR with NO walls → contrarian BEARISH
+    pos2 = classifier.classify_positioning(make_signals(
+        pcr=0.48, resistance_strength=1.0, support_strength=1.0,
+        oi_change_pct=0.02,
+    ))
+    print(f"  PCR=0.48 weak walls → {pos2.value} (contrarian: expect BEARISH)")
     assert pos2 == PositioningRegime.BEARISH, f"Expected BEARISH (contrarian low-PCR), got {pos2}"
 
-    # BEARISH
-    pos3 = classifier.classify_positioning(make_signals(pcr=1.50))
-    print(f"  PCR=1.50 (extreme fear/high PCR) → {pos3.value} (contrarian: expect BULLISH)")
+    # Strong walls + mild-low PCR still BEARISH (extreme <0.58); live
+    # noon BPS-storm is recovered via storm→IC, not by muting PCR.
+    pos2b = classifier.classify_positioning(make_signals(
+        resistance_strength=4.5, support_strength=4.5,
+        pcr=0.525, oi_change_pct=0.08,
+    ))
+    print(f"  Strong walls + PCR=0.525 → {pos2b.value} (expect BEARISH extreme)")
+    assert pos2b == PositioningRegime.BEARISH, (
+        f"Expected BEARISH at PCR 0.525, got {pos2b}"
+    )
+
+    # Extreme high PCR with NO walls → contrarian BULLISH
+    pos3 = classifier.classify_positioning(make_signals(
+        pcr=1.50, resistance_strength=1.0, support_strength=1.0,
+        oi_change_pct=0.02,
+    ))
+    print(f"  PCR=1.50 weak walls → {pos3.value} (contrarian: expect BULLISH)")
     assert pos3 == PositioningRegime.BULLISH, f"Expected BULLISH (contrarian high-PCR), got {pos3}"
 
     # BEARISH (fear skew)

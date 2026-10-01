@@ -83,6 +83,7 @@ class MainEngine:
         replay_mode: bool = False,
         logger: Any = None,
         trade_report_source: str = "TRADE ENGINE",
+        abort_mirror: Any = None,
     ):
         # ── Load configuration ────────────────────────────────────────────
         self.config = config if config is not None else load_config()
@@ -124,7 +125,8 @@ class MainEngine:
         )
         self.execution_engine = ExecutionEngine(
             self.config, self.db, self.market_engine, self.cal_engine,
-            self.client, self.logger, fill_model=fill_model
+            self.client, self.logger, fill_model=fill_model,
+            abort_mirror=abort_mirror,
         )
 
         # ── v7: per-trade console report ─────────────────────────────────
@@ -190,12 +192,15 @@ class MainEngine:
         fill_model: Any = None,
         logger: Any = None,
         trade_report_source: str = "BACKTEST",
+        abort_mirror: Any = None,
     ) -> "MainEngine":
         """Build the live engine wired for DB replay.
 
         Same `run_one_cycle()` path as production. Only the I/O edges differ:
         `client` is a ReplayClient, `db` is a scratch book, fills go through
-        PaperOrderExecutor + FillModel. No second decide/monitor loop.
+        PaperOrderExecutor + FillModel (live-aggressive by default). Optional
+        `abort_mirror` (opt-in) can refuse paper fills where live recorded
+        ABORTED — default replay leaves it unset so latest code is verified.
         """
         return cls(
             config=config,
@@ -205,6 +210,7 @@ class MainEngine:
             replay_mode=True,
             logger=logger,
             trade_report_source=trade_report_source,
+            abort_mirror=abort_mirror,
         )
 
     # ─────────────────────────────────────────────────────────────────────
@@ -230,7 +236,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m7z-occupancy-midbounce"
+        _engine_build = "v65m14-feedstale-green-skip"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,
@@ -380,11 +386,17 @@ class MainEngine:
             except (TypeError, ValueError):
                 start_cap = cur_cap = float(self.config.starting_capital)
             if npos == 0 and abs(float(state.get("daily_pnl") or 0.0)) < 1e-9:
-                # Capital moved with no blotter — restore day-start capital.
-                if abs(cur_cap - start_cap) >= 1.0:
+                # Phantom dent cleanup only. Prior-day carry-forward sits
+                # ABOVE starting_capital with zero same-day trades (live
+                # 2026-10-01: Rs1,003,245 correctly carried, then this
+                # path wiped it to Rs1,000,000 before _carry_forward
+                # put it back). Only restore when capital is BELOW the
+                # day-start (the old self-test / phantom-stop dent).
+                if cur_cap < start_cap - 0.5:
                     self.logger.warning(
                         f"Session state integrity: current_capital={cur_cap:.0f} "
-                        f"with zero positions/pnl — restoring {start_cap:.0f}"
+                        f"below start {start_cap:.0f} with zero positions/pnl "
+                        f"— restoring {start_cap:.0f}"
                     )
                     state["current_capital"] = start_cap
         real_stops = real_streak  # halt logic below still uses streak
@@ -2178,11 +2190,10 @@ class MainEngine:
             f"Restart engine to resume."
         )
         self.logger.info("Shutdown complete.")
-
-        try:
-            self.db.close()
-        except Exception:
-            pass
+        # Do NOT close the DB here. run()'s finally block still needs it
+        # for the Telegram stop snapshot / trade report (live 2026-10-01:
+        # close-then-snapshot → 'NoneType' object has no attribute
+        # 'execute'). finally closes after notify_stopped.
 
     # ─────────────────────────────────────────────────────────────────────
     # SLEEP HELPER
@@ -2192,7 +2203,14 @@ class MainEngine:
         """Sleep in short slices so Ctrl+C can end the wait without raising."""
         end = time_module.monotonic() + max(0.0, seconds)
         while self.running and time_module.monotonic() < end:
-            time_module.sleep(min(0.25, end - time_module.monotonic()))
+            # Clamp to >=0: between the while-check and sleep(), monotonic can
+            # cross `end` and produce a tiny negative → ValueError that killed
+            # the live loop (2026-10-01 10:21 FATAL sleep length must be
+            # non-negative).
+            remaining = end - time_module.monotonic()
+            if remaining <= 0.0:
+                break
+            time_module.sleep(min(0.25, remaining))
 
     @contextlib.contextmanager
     def _flatten_gate(self):
@@ -2379,10 +2397,52 @@ class MainEngine:
                         )
                         _open = True
                     if _open:
-                        self._watchdog_flatten(
-                            f"FEED_STALE_{idle:.0f}s: no completed cycle for "
-                            f"{force:.0f}s while positions were open"
-                        )
+                        # Soft-day hole (live Sep25): FEED_STALE flattened a
+                        # still-green BCS (−₹336) because a slow cycle tripped
+                        # the watchdog. Force-exit only when any open ticket
+                        # is underwater; green books keep risk on and wait
+                        # for the next completed cycle.
+                        _underwater = False
+                        try:
+                            for _p in (
+                                self.execution_engine._get_open_positions()
+                                or []
+                            ):
+                                try:
+                                    _ec = float(_p.get("entry_credit") or 0.0)
+                                    _liq = _p.get("current_liq_premium")
+                                    if _liq is None:
+                                        _liq = _p.get("exit_premium")
+                                    if _liq is None:
+                                        _liq = _p.get("current_premium")
+                                    if _ec > 0 and _liq is not None:
+                                        if float(_liq) > _ec:
+                                            _underwater = True
+                                            break
+                                    _mtm = _p.get("unrealized_pnl_rupees")
+                                    if _mtm is None:
+                                        _mtm = _p.get("gross_pnl_rupees")
+                                    if _mtm is not None and float(_mtm) < 0:
+                                        _underwater = True
+                                        break
+                                except (TypeError, ValueError):
+                                    continue
+                        except Exception as _e:
+                            self.logger.warning(
+                                f"watchdog MTM check failed ({_e}); "
+                                f"assuming underwater and flattening"
+                            )
+                            _underwater = True
+                        if _underwater:
+                            self._watchdog_flatten(
+                                f"FEED_STALE_{idle:.0f}s: no completed cycle "
+                                f"for {force:.0f}s with underwater risk"
+                            )
+                        elif self._watchdog_failures == 0:
+                            self.logger.critical(
+                                f"WATCHDOG: stale {idle:.0f}s past force-exit "
+                                f"but open book is green — skip flatten"
+                            )
                     elif self._watchdog_failures == 0:
                         self.logger.critical(
                             f"WATCHDOG: stale {idle:.0f}s past force-exit "

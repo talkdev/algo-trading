@@ -831,6 +831,27 @@ class MarketDataEngine:
             )
             vix = self.state.get("prev_vix")
 
+        # Reject impossible one-cycle VIX jumps as feed garbage.
+        # Live 2026-10-01 09:44: a single bad frame printed VIX 11→16 then
+        # 25 and tripped ABORT while true India VIX sat ~13.6. India VIX
+        # does not move 20%+ in one ~15s poll under any real tape.
+        _prev_v = self.state.get("prev_vix")
+        if (
+            vix is not None
+            and _prev_v is not None
+            and float(_prev_v) > 0
+        ):
+            try:
+                _chg = abs(float(vix) - float(_prev_v)) / float(_prev_v)
+            except (TypeError, ValueError, ZeroDivisionError):
+                _chg = 0.0
+            if _chg >= 0.20:
+                self.logger.warning(
+                    f"VIX bad tick {_prev_v:.1f} → {vix:.1f} "
+                    f"({_chg * 100:.0f}% in one cycle) — keeping last known"
+                )
+                vix = float(_prev_v)
+
         if vix is not None:
             self._vix_fail_count = 0
         else:
@@ -1482,11 +1503,21 @@ class MarketDataEngine:
                     # (STRONG_SELL) through the floor-2.0 sell bar into
                     # NEUTRAL, and hard-darked RANGE_RANGE condors. Keep
                     # the PATCH_V15 blend graph, but while the HL sample
-                    # is still immature (<45 bars) clamp absolute RV to
-                    # anchor+0.50pp so the open auction cannot flip the
-                    # sell book off. Mature windows keep the 1.35× path.
+                    # is still immature clamp absolute RV so the open
+                    # auction cannot flip the sell book off. Mature
+                    # windows keep the 1.35× path.
                     # (A heavier all-morning anchor ramp / floor→VIX
                     # reinflation regressed Sep9/Sep17 into early losers.)
+                    #
+                    # v65m8: live 2026-10-01 showed the prior <45-bar /
+                    # +0.50pp clamp lifting too early (~10:00, ~50 HL
+                    # bars). RV jumped 10.3%→12.6% vs ATM IV ~12.1%,
+                    # VRP flipped negative, and VOL_BUY_OPTIONS hard-
+                    # blocked the day-high / failed-break window for
+                    # ~20 minutes. Extend the immature window to 90 HL
+                    # bars (the dte>=2 lookback itself) and allow
+                    # +1.00pp vs anchor — enough for a real open print,
+                    # not enough to invent a BUY_OPTIONS regime.
                     _anchor_v15 = float(self.state.get("rv_anchor_pct") or 0.0)
                     if _anchor_v15 < rv_floor:
                         _anchor_v15 = float(cached_rv or 0.0) \
@@ -1497,8 +1528,8 @@ class MarketDataEngine:
                             rv = _anchor_v15 * 1.35
                         _w_v15 = min(len(log_hl_sq) / 60.0, 1.0)
                         rv = _w_v15 * rv + (1.0 - _w_v15) * _anchor_v15
-                        if len(log_hl_sq) < 45:
-                            _early_max = _anchor_v15 + 0.005  # +0.50pp
+                        if len(log_hl_sq) < 90:
+                            _early_max = _anchor_v15 + 0.010  # +1.00pp
                             if rv > _early_max:
                                 rv = _early_max
 

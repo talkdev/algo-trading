@@ -365,6 +365,123 @@ class StrategyEngine:
             return "BEAR" in open_sides and "BULL" not in open_sides
         return False
 
+    def _entry_abort_storm_blocks(
+        self, strategy_name: str, signals: dict
+    ) -> Optional[str]:
+        """Refuse only the cooled family after an entry-abort storm.
+
+        Latched in `_check_hard_gates` via signals. Other families (e.g.
+        IRON_CONDOR while BULL_PUT is cooling) stay tradeable — live
+        2026-10-01 lost a STRONG_SELL RANGE condor to a blanket latch.
+        """
+        _fam = str(signals.get("_entry_abort_storm_family") or "")
+        if not _fam or not strategy_name or strategy_name == "NO_TRADE":
+            return None
+        if str(strategy_name) != _fam:
+            return None
+        try:
+            _left = float(signals.get("_entry_abort_storm_left_min") or 0.0)
+        except (TypeError, ValueError):
+            _left = 0.0
+        try:
+            _cd = float(signals.get("_entry_abort_storm_cd_min") or 20.0)
+        except (TypeError, ValueError):
+            _cd = 20.0
+        return (
+            f"entry_abort_storm_{_fam}_"
+            f"{_left:.0f}min_of_{_cd:.0f}_cooldown"
+        )
+
+    def _storm_fallback_iron_condor(
+        self,
+        blocked_strategy: str,
+        signals: dict,
+        selection_reason: str,
+        storm_reason: str,
+    ) -> Optional[dict]:
+        """When BPS/BCS is storm-cooled but vol is rich, take the condor.
+
+        Live 2026-10-01: STRONG_SELL + RANGE price kept mapping to BPS via
+        BEARISH PCR / low fade; storm cooled BPS and the book went dark
+        with VRP ~3.3pp. IC is the delta-neutral harvest of the same
+        rich-vol RANGE tape and is a different family.
+        """
+        if blocked_strategy not in (BULL_PUT_SPREAD, BEAR_CALL_SPREAD):
+            return None
+        _vol = str(
+            getattr(signals.get("vol_regime"), "value", None)
+            or signals.get("vol_regime")
+            or ""
+        ).upper()
+        _price = str(
+            getattr(signals.get("price_regime"), "value", None)
+            or signals.get("price_regime")
+            or ""
+        ).upper()
+        if _vol not in (
+            "SELL_PREMIUM", "STRONG_SELL_PREMIUM", "BORDERLINE_SELL"
+        ):
+            return None
+        if _price and _price not in ("RANGE",):
+            return None
+        _or = str(signals.get("or_condition") or "")
+        if _or in ("WIDE", "VERY_WIDE"):
+            return None
+        if bool(signals.get("event_day") or signals.get("event_announced")):
+            return None
+        if self._slot_conflict(IRON_CONDOR, signals):
+            return None
+        if self._entry_abort_storm_blocks(IRON_CONDOR, signals):
+            return None
+        if self._counter_trend_entry_refusal(IRON_CONDOR, signals):
+            return None
+        _ok, _why = self._validate_entry_rules(IRON_CONDOR, signals)
+        if not _ok:
+            return None
+        try:
+            _size = float(signals.get("size_multiplier") or 1.0)
+        except (TypeError, ValueError):
+            _size = 1.0
+        # Slightly smaller — substituting under a storm, not a clean IC.
+        _size = max(0.40, min(_size, 0.85) * 0.75)
+        _alt_reason = (
+            f"{selection_reason}:storm_fallback_ic_from_{blocked_strategy}"
+            f"|{_why or 'ok'}|{storm_reason}"
+        )
+        _params = self.compute_params(
+            IRON_CONDOR, _alt_reason, signals, _size
+        )
+        if not _params.get("valid"):
+            return None
+        signals["_intent"] = self._build_decision_intent(
+            IRON_CONDOR, signals, _alt_reason
+        )
+        if isinstance(_params, dict):
+            _params["_intent"] = signals.get("_intent")
+        self.logger.info(
+            f"Abort-storm fallback: {blocked_strategy} cooled → "
+            f"IRON_CONDOR (vol={_vol} price={_price})"
+        )
+        self._clear_construct_fail()
+        self._log_decision(
+            signals, "STRATEGY_SELECTED", _alt_reason,
+            IRON_CONDOR, _params,
+        )
+        self._persist_decision(
+            signals, IRON_CONDOR, _alt_reason, _params, "STRATEGY_SELECTED",
+        )
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{IRON_CONDOR}",
+            None, self._count_open_positions(),
+        )
+        return {
+            "action":        "ENTER",
+            "strategy_name": IRON_CONDOR,
+            "reason":        _alt_reason,
+            "params":        _params,
+            "intent":        signals.get("_intent"),
+        }
+
     def _slot_conflict(self, strategy_name: str, signals: Optional[dict] = None) -> Optional[str]:
         """Refuse a second structure that stacks or duplicates the book.
 
@@ -1024,9 +1141,12 @@ class StrategyEngine:
 
         # Entry-abort storm: ABORTED attempts do not burn max_entries, so a
         # rejected multi-leg can re-fire every cycle (live 2026-09-29: 28
-        # BULL_PUT_SPREAD aborts in ~20 min). Cool the same family down.
-        # State latch survives DB timing races between abort write and the
-        # next decide() cycle; window/count tightened after Sep29 storm.
+        # BULL_PUT_SPREAD aborts in ~20 min). Cool the SAME family only.
+        # Live 2026-10-01: two BULL_PUT partials latched a 20m storm that
+        # blanketed decide() and blocked PREMIUM_SELL_RANGE / IRON_CONDOR
+        # while VRP was 3pp STRONG_SELL — the comment said "same family"
+        # but the early return cooled the entire book. Latch into signals;
+        # decide() enforces after strategy selection.
         _abort_cd_min = float(
             getattr(self.config, "entry_abort_storm_cooldown_min", 20.0) or 20.0
         )
@@ -1038,12 +1158,12 @@ class StrategyEngine:
                 _until_dt = datetime.fromisoformat(str(_latched_until))
                 _left = (_until_dt - now_ist()).total_seconds() / 60.0
                 if _left > 0:
-                    return "NO_TRADE", (
-                        f"entry_abort_storm_{_latched_fam}_"
-                        f"{_left:.0f}min_of_{_abort_cd_min:.0f}_cooldown"
-                    )
-                _st_ab.pop("entry_abort_storm_family", None)
-                _st_ab.pop("entry_abort_storm_until", None)
+                    signals["_entry_abort_storm_family"] = _latched_fam
+                    signals["_entry_abort_storm_left_min"] = float(_left)
+                    signals["_entry_abort_storm_cd_min"] = float(_abort_cd_min)
+                else:
+                    _st_ab.pop("entry_abort_storm_family", None)
+                    _st_ab.pop("entry_abort_storm_until", None)
             except Exception:
                 pass
         try:
@@ -1102,10 +1222,12 @@ class StrategyEngine:
                         ).isoformat()
                     except Exception:
                         pass
-                    return "NO_TRADE", (
-                        f"entry_abort_storm_{_fam0}_"
-                        f"{_since:.0f}min_of_{_abort_cd_min:.0f}_cooldown"
-                    )
+                    _left_now = max(0.0, _abort_cd_min - _since)
+                    signals["_entry_abort_storm_family"] = _fam0
+                    signals["_entry_abort_storm_left_min"] = float(_left_now)
+                    signals["_entry_abort_storm_cd_min"] = float(_abort_cd_min)
+                    # Do NOT return NO_TRADE here — other families
+                    # (IRON_CONDOR on PREMIUM_SELL_RANGE) must still trade.
             except Exception:
                 pass
 
@@ -7577,6 +7699,30 @@ class StrategyEngine:
             )
             return {"action": "NO_TRADE", "reason": selection_reason}
 
+        # Family-scoped abort storm (set in _check_hard_gates). Only the
+        # cooled family is refused — other structures stay tradeable.
+        # When the cooled family is the ONLY mapped credit (BPS/BCS) but
+        # vol is still rich RANGE, fall through to IRON_CONDOR.
+        _storm_block = self._entry_abort_storm_blocks(strategy_name, signals)
+        if _storm_block:
+            _ic_fb = self._storm_fallback_iron_condor(
+                strategy_name, signals, selection_reason, _storm_block
+            )
+            if _ic_fb is not None:
+                return _ic_fb
+            alt = self._momentum_decision(signals, _storm_block)
+            if alt is not None:
+                return alt
+            _storm_block = self._with_momentum_refuse(signals, _storm_block)
+            self._log_decision(signals, "NO_TRADE", _storm_block)
+            self._persist_decision(
+                signals, strategy_name, _storm_block, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _storm_block, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _storm_block}
+
         # v59: Intent contract — selection commits exemptions for secondary gates.
         signals["_intent"] = self._build_decision_intent(
             strategy_name, signals, selection_reason
@@ -7650,16 +7796,25 @@ class StrategyEngine:
                         self._validate_entry_rules(_alt_name, signals)
                     )
                     if _alt_ok:
-                        strategy_name = _alt_name
-                        selection_reason = (
-                            f"{selection_reason}:demoted_from_ic_on_{rules_reason}"
+                        _storm_rules = self._entry_abort_storm_blocks(
+                            _alt_name, signals
                         )
-                        # v60: rebuild Intent for the demoted structure
-                        signals["_intent"] = self._build_decision_intent(
-                            strategy_name, signals, selection_reason
-                        )
-                        rules_ok = True
-                        rules_reason = _alt_why
+                        if _storm_rules:
+                            full_reason = (
+                                f"strategy_rules_failed:{rules_reason}"
+                                f"|demote_{_alt_name}_storm:{_storm_rules}"
+                            )
+                        else:
+                            strategy_name = _alt_name
+                            selection_reason = (
+                                f"{selection_reason}:demoted_from_ic_on_{rules_reason}"
+                            )
+                            # v60: rebuild Intent for the demoted structure
+                            signals["_intent"] = self._build_decision_intent(
+                                strategy_name, signals, selection_reason
+                            )
+                            rules_ok = True
+                            rules_reason = _alt_why
             if not rules_ok:
                 # PATCH_V12 (round 3): the substitute is consulted on
                 # structure-rule refusals exactly as on hard-gate and
@@ -7762,40 +7917,50 @@ class StrategyEngine:
                         _alt_name, _alt_reason, signals, size_mult
                     )
                     if _alt_params.get("valid"):
-                        self._clear_construct_fail()
-                        signals["_intent"] = self._build_decision_intent(
-                            _alt_name, signals, _alt_reason
+                        _storm_alt = self._entry_abort_storm_blocks(
+                            _alt_name, signals
                         )
-                        if isinstance(_alt_params, dict):
-                            _alt_params["_intent"] = signals["_intent"]
-                        self.logger.info(
-                            f"IC construct demoted → {_alt_name} "
-                            f"(was {fail_reason[:100]})"
+                        if _storm_alt:
+                            full_reason = (
+                                f"params_invalid:{fail_reason}"
+                                f"|demote_{_alt_name}_storm:{_storm_alt}"
+                            )
+                        else:
+                            self._clear_construct_fail()
+                            signals["_intent"] = self._build_decision_intent(
+                                _alt_name, signals, _alt_reason
+                            )
+                            if isinstance(_alt_params, dict):
+                                _alt_params["_intent"] = signals["_intent"]
+                            self.logger.info(
+                                f"IC construct demoted → {_alt_name} "
+                                f"(was {fail_reason[:100]})"
+                            )
+                            self._log_decision(
+                                signals, "STRATEGY_SELECTED", _alt_reason,
+                                _alt_name, _alt_params,
+                            )
+                            self._persist_decision(
+                                signals, _alt_name, _alt_reason,
+                                _alt_params, "STRATEGY_SELECTED",
+                            )
+                            self.market_engine.finalize_cycle_log(
+                                f"STRATEGY_SELECTED:{_alt_name}",
+                                None, self._count_open_positions(),
+                            )
+                            return {
+                                "action":        "ENTER",
+                                "strategy_name": _alt_name,
+                                "reason":        _alt_reason,
+                                "params":        _alt_params,
+                                "intent":        signals.get("_intent"),
+                            }
+                    else:
+                        full_reason = (
+                            f"params_invalid:{fail_reason}"
+                            f"|demote_{_alt_name}_also:"
+                            f"{_alt_params.get('reason', 'unknown')}"
                         )
-                        self._log_decision(
-                            signals, "STRATEGY_SELECTED", _alt_reason,
-                            _alt_name, _alt_params,
-                        )
-                        self._persist_decision(
-                            signals, _alt_name, _alt_reason,
-                            _alt_params, "STRATEGY_SELECTED",
-                        )
-                        self.market_engine.finalize_cycle_log(
-                            f"STRATEGY_SELECTED:{_alt_name}",
-                            None, self._count_open_positions(),
-                        )
-                        return {
-                            "action":        "ENTER",
-                            "strategy_name": _alt_name,
-                            "reason":        _alt_reason,
-                            "params":        _alt_params,
-                            "intent":        signals.get("_intent"),
-                        }
-                    full_reason = (
-                        f"params_invalid:{fail_reason}"
-                        f"|demote_{_alt_name}_also:"
-                        f"{_alt_params.get('reason', 'unknown')}"
-                    )
 
             sticky = self._note_construct_fail(
                 signals, strategy_name, fail_reason

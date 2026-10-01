@@ -1032,7 +1032,7 @@ class Config:
     # Phase-B unlock: HWM must be this fraction above entry (1.0 = 2× entry)
     # before the tight trail engages. Too low (e.g. 0.80) arms mid-trend and
     # scalp-exits before the real peak (Sep22 LP: +₹8.7k at 13:55, missed 14:01).
-    momentum_hwm_large_frac:       float = 1.00
+    momentum_hwm_large_frac:       float = 0.60
     momentum_hwm_giveback_frac:    float = 0.20
     momentum_target_frac:          float = 0.60
     momentum_final_window_min:     int   = 45
@@ -1886,7 +1886,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_stop_frac=min(max(_get_float(env, "MOMENTUM_STOP_FRAC", 0.35), 0.10), 0.70),
         momentum_lock_trigger=min(max(_get_float(env, "MOMENTUM_LOCK_TRIGGER", 0.25), 0.05), 1.00),
         momentum_lock_keep_frac=min(max(_get_float(env, "MOMENTUM_LOCK_KEEP_FRAC", 0.50), 0.10), 0.95),
-        momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 1.00), 0.30), 2.00),
+        momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 0.60), 0.30), 2.00),
         momentum_hwm_giveback_frac=min(max(_get_float(env, "MOMENTUM_HWM_GIVEBACK_FRAC", 0.20), 0.05), 0.50),
         momentum_target_frac=min(max(_get_float(env, "MOMENTUM_TARGET_FRAC", 0.60), 0.10), 3.00),
         momentum_final_window_min=_get_int(env, "MOMENTUM_FINAL_WINDOW_MIN", 45),
@@ -4673,6 +4673,9 @@ class TradeConsoleReporter:
 
     def positions_for(self, trading_date: str) -> List[dict]:
         try:
+            if self.db is None or not hasattr(self.db, "query"):
+                self._debug("positions query skipped: db closed")
+                return []
             rows = self.db.query(
                 "SELECT * FROM positions WHERE trading_date=? "
                 "ORDER BY entry_time ASC, created_at ASC, rowid ASC",
