@@ -22,8 +22,9 @@ Setup
 3. python upstox_token.py
 4. Schedule daily a few minutes after 03:30 IST (token expiry)
 
-Writes the fresh token to token.json AND updates UPSTOX_ACCESS_TOKEN in
-env.txt so main.py / core.load_config pick it up without a manual paste.
+Writes the fresh token to Misc/token.json and logs to Misc/upstox_token.log,
+AND updates UPSTOX_ACCESS_TOKEN in env.txt so main.py / core.load_config
+pick it up without a manual paste.
 """
 
 from __future__ import annotations
@@ -39,9 +40,10 @@ from pathlib import Path
 from upstox_totp import ConfigurationError, UpstoxTOTP
 
 BASE_DIR = Path(__file__).resolve().parent
+MISC_DIR = BASE_DIR / "Misc"
 ENV_FILE = BASE_DIR / "env.txt"
-TOKEN_FILE = BASE_DIR / "token.json"
-LOG_FILE = BASE_DIR / "upstox_token.log"
+TOKEN_FILE = MISC_DIR / "token.json"
+LOG_FILE = MISC_DIR / "upstox_token.log"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 REQUIRED = (
@@ -53,6 +55,8 @@ REQUIRED = (
     "UPSTOX_CLIENT_SECRET",
     "UPSTOX_REDIRECT_URI",
 )
+
+MISC_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -241,8 +245,11 @@ def load_cached_token() -> str | None:
 if __name__ == "__main__":
     try:
         token = generate_and_save_token()
-        # Print only a short prefix — full token lands in env.txt / token.json
-        print(f"Access token OK ({len(token)} chars) → {ENV_FILE.name} + {TOKEN_FILE.name}")
+        # Print only a short prefix — full token lands in env.txt / Misc/token.json
+        print(
+            f"Access token OK ({len(token)} chars) → "
+            f"{ENV_FILE.name} + {TOKEN_FILE.relative_to(BASE_DIR)}"
+        )
     except Exception:
         log.exception("Failed to refresh Upstox access token")
         sys.exit(1)
