@@ -86,8 +86,11 @@ class PaperOrderExecutor:
     v64: optional FillModel (same as backtest_engine) so paper and replay
     share one fill policy. Without it, entry uses strategy exec_price and
     exit uses full bid/ask (legacy paper behaviour).
-    """
 
+    v65m34: with FillModel(mode=live), fills are expected average_price
+    (touch). Missing / unmarketable quotes raise like a live reject so
+    execute_entry can ABORT / unwind — never book a phantom fill.
+    """
     def __init__(self, config: Config, logger, fill_model=None):
         self.config  = config
         self.logger  = logger
@@ -104,7 +107,11 @@ class PaperOrderExecutor:
         """Simulate entry fill."""
         order_id   = self._next_order_id()
         fill_price = float(leg.get("exec_price", 0) or 0)
-        if self.fill_model is not None and chain:
+        if self.fill_model is not None:
+            if not chain:
+                raise RuntimeError(
+                    "terminated as 'rejected' — no chain for paper fill"
+                )
             strike   = float(leg.get("strike", 0) or 0)
             opt_type = str(leg.get("option_type", ""))
             opt = (chain.get(strike) or {}).get(opt_type) or {}
@@ -114,8 +121,18 @@ class PaperOrderExecutor:
                 "ltp": float(opt.get("ltp") or 0),
             }
             px = self.fill_model.price(quoted, str(leg.get("action") or "SELL"))
-            if px is not None and px > 0:
-                fill_price = float(px)
+            if px is None or float(px) <= 0:
+                raise RuntimeError(
+                    f"terminated as 'rejected' — unmarketable "
+                    f"{leg.get('action')} {opt_type} {strike:.0f} "
+                    f"bid={quoted['bid']} ask={quoted['ask']} ltp={quoted['ltp']}"
+                )
+            fill_price = float(px)
+
+        if fill_price <= 0:
+            raise RuntimeError(
+                "terminated as 'rejected' — no executable entry price"
+            )
 
         self.logger.info(
             f"[PAPER] ENTRY: {leg['action']} {leg['option_type'].upper()} "
@@ -153,12 +170,23 @@ class PaperOrderExecutor:
             )
             if px is not None and px > 0:
                 fill_price = float(px)
+            else:
+                raise RuntimeError(
+                    f"exit {opt_type} {strike:.0f} rejected — "
+                    f"unmarketable close {close_action} "
+                    f"bid={bid} ask={ask} ltp={ltp}"
+                )
 
         if fill_price <= 0:
             if action == "SELL":
                 fill_price = ask if ask > 0 else (ltp if ltp > 0 else entry_price)
             else:
                 fill_price = bid if bid > 0 else (ltp if ltp > 0 else entry_price)
+
+        if fill_price <= 0:
+            raise RuntimeError(
+                f"exit {opt_type} {strike:.0f} rejected — no executable price"
+            )
 
         self.logger.info(
             f"[PAPER] EXIT: close {action} {opt_type.upper()} "
@@ -1199,6 +1227,8 @@ class ExecutionEngine:
             ("positions", "profit_lock_stop_level",  "REAL"),
             # Debit HWM: best mid value seen while long; drives fat-winner trail.
             ("positions", "peak_debit_value",        "REAL"),
+            # Timestamp of last HWM print — fade harvest waits until peak ages.
+            ("positions", "peak_debit_at",           "TEXT"),
             # Best (lowest) credit liquidation mark — winner give-back trail.
             ("positions", "peak_credit_liq",         "REAL"),
             ("positions", "exit_priority",           "INTEGER"),
@@ -2340,21 +2370,24 @@ class ExecutionEngine:
         # Wrong approaches (both failed Sep22 LONG_PUT):
         #   * Clamp trail to breakeven while "trend persist" → held through
         #     ₹13k peak at 14:01, gave it all back, CLOSE_STOP −₹912.
-        #   * Loose mid-trail from first modest green → exited +₹1.3k at
-        #     12:05 and never saw the afternoon peak.
-        # Correct shape:
-        #   Phase A (runner): after +lock_trigger, stop = free-trade only.
-        #     Do NOT trail mid-move — that is how +₹1.3k / +₹8.7k scalp-outs
-        #     miss the real peak.
-        #   Phase B (fat winner): once HWM reaches the earlier of
-        #     (a) entry×(1+large_frac) or (b) the planned target_premium.
-        #     Live 2026-10-01 LONG_PUT: peak 233.8 (= target, 1.6× entry)
-        #     but large_frac=1.0 required 2× (~292) before trailing, so the
-        #     stop stayed at free-trade ~147, then 14:30 flatten banked only
-        #     +₹6.5k after a ~₹28k open peak. Arming at target fixes that.
-        #     Trail gives back only giveback_frac of peak open gain
-        #     (default 0.20 → keep ~80% of the peak).
+        #   * Soft mid-trail while trend still alive → scalp-exit mid-climb
+        #     (v65m35: Sep22 LP +₹2.4k at 11:57 / Oct1 +₹9.7k at 13:46,
+        #     both missed the real peak).
+        # Correct shape (v65m36):
+        #   Phase A: while trend persists, free-trade floor only after lock
+        #     so the runner can develop.
+        #   Phase A fade: once soft HWM is in hand AND persist is OFF, trail
+        #     loosely — bank mid-peaks that would otherwise wait for a
+        #     labelled flip (Sep21 LONG_CALL 54% give-back to 14:30 flat).
+        #   Phase B: fat HWM / target → tight trail.
+        #   D3: at planned target, bank on HWM pullback (don't wait for flip).
+        #
+        # Persist = labelled trend STILL WITH US. RANGE is weaken, not
+        # alive — counting RANGE as persist (pre-v65m56) free-traded through
+        # mid-day soften and blocked soft trail until a flip that never
+        # came. Adverse labels clear persist immediately.
         _persist = False
+        _trend_against = False
         try:
             _sig = signals or {}
             _sname = str(position.get("strategy_name") or "")
@@ -2375,8 +2408,12 @@ class ExecutionEngine:
             _orl = float(_sig.get("or_low") or 0.0)
             _ormid = (_orh + _orl) / 2.0 if (_orh > 0 and _orl > 0) else 0.0
             _trend_side_ok = (
-                (_dir > 0 and _px in ("UPTREND", "STRONG_UPTREND", "RANGE"))
-                or (_dir < 0 and _px in ("DOWNTREND", "STRONG_DOWNTREND", "RANGE"))
+                (_dir > 0 and _px in ("UPTREND", "STRONG_UPTREND"))
+                or (_dir < 0 and _px in ("DOWNTREND", "STRONG_DOWNTREND"))
+            )
+            _trend_against = (
+                (_dir > 0 and _px in ("DOWNTREND", "STRONG_DOWNTREND"))
+                or (_dir < 0 and _px in ("UPTREND", "STRONG_UPTREND"))
             )
             _brk_ok = (
                 _ormid <= 0
@@ -2389,66 +2426,188 @@ class ExecutionEngine:
             )
         except Exception:
             _persist = False
+            _trend_against = False
 
         try:
             prev_hwm = float(position.get("peak_debit_value") or 0.0)
         except (TypeError, ValueError):
             prev_hwm = 0.0
         hwm = max(prev_hwm, float(value_mid or 0.0))
+        hwm_up = hwm > prev_hwm + 1e-9
         be_level = entry_value + rt_cost
         large_frac = float(getattr(cfg, "momentum_hwm_large_frac", 0.60))
-        giveback = float(getattr(cfg, "momentum_hwm_giveback_frac", 0.20))
-        large_frac = min(max(large_frac, 0.30), 2.0)
+        giveback = float(getattr(cfg, "momentum_hwm_giveback_frac", 0.15))
+        soft_frac = float(getattr(cfg, "momentum_hwm_soft_frac", 0.30))
+        soft_gb = float(getattr(cfg, "momentum_hwm_soft_giveback_frac", 0.40))
+        pull_frac = float(getattr(cfg, "momentum_hwm_pullback_frac", 0.03))
+        fade_pull_frac = float(
+            getattr(cfg, "momentum_hwm_fade_pullback_frac", 0.08)
+        )
+        peak_age_min = float(getattr(cfg, "momentum_hwm_peak_age_min", 10.0))
+        large_frac = min(max(large_frac, 0.25), 2.0)
         giveback = min(max(giveback, 0.05), 0.50)
+        soft_frac = min(max(soft_frac, 0.10), 1.0)
+        soft_gb = min(max(soft_gb, 0.10), 0.60)
+        pull_frac = min(max(pull_frac, 0.01), 0.15)
+        fade_pull_frac = min(max(fade_pull_frac, 0.03), 0.25)
+        peak_age_min = min(max(peak_age_min, 3.0), 45.0)
         fat_hwm = entry_value * (1.0 + large_frac)
+        soft_hwm = entry_value * (1.0 + soft_frac)
         # Never require a fatter HWM than the ticket's own target — otherwise
         # persist-suppressed D3 + free-trade-only D2 give the peak back.
         if target > entry_value > 0:
             fat_hwm = min(fat_hwm, float(target))
+        # Late-afternoon progressive fat: optional via env (default OFF).
+        _aft_partial = float(
+            getattr(cfg, "momentum_hwm_afternoon_partial_frac", 0.0) or 0.0
+        )
+        _aft_partial = min(max(_aft_partial, 0.0), 1.0)
+        if (
+            current_time >= dtime(13, 45)
+            and _aft_partial > 0.0
+            and target > entry_value > 0
+        ):
+            _partial_hwm = entry_value + _aft_partial * (
+                float(target) - entry_value
+            )
+            fat_hwm = min(fat_hwm, _partial_hwm)
+        stale_gb = float(
+            getattr(cfg, "momentum_hwm_stale_giveback_frac", 0.25) or 0.25
+        )
+        stale_gb = min(max(stale_gb, 0.10), 0.50)
+        # After 14:00, lower the soft-HWM bar so modest peaks that never
+        # reached +30% still get stale/soft trail (Sep21 engine HWM sat
+        # ~1.22–1.28× while soft_frac=0.30 required 1.30× — trail never
+        # armed, free-trade gave the spike back). Morning keeps the
+        # higher bar so Sep22 mid-day local peaks stay free-trade.
+        if current_time >= dtime(14, 0) and entry_value > 0:
+            soft_hwm = min(soft_hwm, entry_value * 1.20)
+
+        _now = now_ist()
+        _peak_at_raw = position.get("peak_debit_at")
+        if hwm_up or not _peak_at_raw:
+            _peak_at = _now
+        else:
+            try:
+                _peak_at = datetime.fromisoformat(str(_peak_at_raw))
+                if getattr(_peak_at, "tzinfo", None) is not None:
+                    _peak_at = _peak_at.replace(tzinfo=None)
+            except Exception:
+                _peak_at = _now
+        try:
+            _peak_age = max((_now - _peak_at).total_seconds() / 60.0, 0.0)
+        except Exception:
+            _peak_age = 0.0
+        # After 14:00 / adverse flip, age the peak faster so a just-printed
+        # soft HWM is not free-traded for another full 10 minutes.
+        _age_need = peak_age_min
+        if current_time >= dtime(14, 0) or _trend_against:
+            _age_need = min(peak_age_min, 6.0)
+        _peak_aged = _peak_age >= _age_need - 1e-9
+
+        # Soft trail / fade after fat HWM, final stretch, OR thesis dead
+        # (trend weakened to RANGE / flipped / ADX died). Requiring 14:00
+        # or fat alone held soft peaks through mid-day weaken until a
+        # labelled flip that often never printed.
+        _thesis_dead = (not _persist) or _trend_against
+        _mature = (
+            hwm >= fat_hwm - 1e-9
+            or current_time >= dtime(14, 0)
+            or (
+                _thesis_dead
+                and hwm >= soft_hwm - 1e-9
+                and _peak_aged
+            )
+        )
 
         new_level = None
         ratchet_reason = None
+        peak_gain = max(hwm - entry_value, 0.0)
         if hwm >= fat_hwm - 1e-9:
-            peak_gain = max(hwm - entry_value, 0.0)
             new_level = hwm - peak_gain * giveback
             new_level = max(new_level, be_level)
             ratchet_reason = "momentum_hwm_trail"
-        elif value_mid >= lock or activated:
-            # Runner: free-trade floor only — do not scalp modest greens.
-            new_level = be_level
-            ratchet_reason = "momentum_free_trade"
+        elif (
+            activated
+            or value_mid >= lock
+            or hwm >= soft_hwm - 1e-9
+        ):
+            # Arm from HWM once a soft peak has printed — not only when
+            # *current* mid is still above the lock trigger. Sep21 LONG_CALL
+            # printed ~1.22–1.28× HWM then pulled below the 1.25× trigger;
+            # the old `value_mid >= lock or activated` gate skipped the
+            # entire ratchet and free-traded the giveback.
+            if (
+                hwm >= soft_hwm - 1e-9
+                and _peak_aged
+                and _mature
+                and _persist
+                and (not _trend_against)
+            ):
+                # Stale-peak harvest under persist after 14:00 / fat:
+                # medium giveback banks an aged soft HWM without waiting
+                # for trend death (Sep21 LONG_CALL free-traded 104→92
+                # while soft trail required persist OFF).
+                new_level = hwm - peak_gain * stale_gb
+                new_level = max(new_level, be_level)
+                ratchet_reason = "momentum_stale_peak_trail"
+            elif (
+                _thesis_dead
+                and hwm >= soft_hwm - 1e-9
+                and _peak_aged
+                and _mature
+            ):
+                new_level = hwm - peak_gain * soft_gb
+                new_level = max(new_level, be_level)
+                ratchet_reason = (
+                    "momentum_adverse_flip_trail"
+                    if _trend_against
+                    else "momentum_soft_hwm_trail"
+                )
+            elif value_mid >= lock or activated:
+                new_level = be_level
+                ratchet_reason = "momentum_free_trade"
+            else:
+                # Soft HWM seen but not yet mature/aged — hold without
+                # clamping to BE so a brief pullback under the lock
+                # trigger cannot disable management on the next print.
+                new_level = None
+                ratchet_reason = None
 
         if new_level is not None:
             cur_level = float(locked or 0.0)
             raised = (not activated) or (new_level > cur_level + 1e-9)
-            hwm_up = hwm > prev_hwm + 1e-9
             if raised or hwm_up or not activated:
                 _lock_out = max(new_level, cur_level) if activated else new_level
                 self.db.update(
                     "positions",
                     {
                         "peak_debit_value":       hwm,
+                        "peak_debit_at":          _peak_at.isoformat(),
                         "profit_lock_activated":  1,
                         "profit_lock_stop_level": _lock_out,
                         "stop_premium":           max(stop, _lock_out),
-                        "updated_at":             now_ist().isoformat(),
+                        "updated_at":             _now.isoformat(),
                     },
                     {"position_id": position["position_id"]},
                 )
-                # If liquidation already sits under the new HWM trail
-                # (gap / wide bid), bank now — do not wait a cycle.
                 if (
-                    ratchet_reason == "momentum_hwm_trail"
+                    ratchet_reason in (
+                        "momentum_hwm_trail",
+                        "momentum_soft_hwm_trail",
+                        "momentum_stale_peak_trail",
+                        "momentum_adverse_flip_trail",
+                    )
                     and value <= float(_lock_out) + 1e-9
                 ):
                     return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
                         "reason_detail": (
-                            f"momentum_hwm_trail_hit_{value:.2f}"
+                            f"{ratchet_reason}_hit_{value:.2f}"
                             f"<={float(_lock_out):.2f}"
                         ),
                         "locked_level": float(_lock_out),
                         "peak_debit_value": hwm,
-                        "fat_winner": True,
+                        "fat_winner": hwm >= fat_hwm - 1e-9,
                     }
                 return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, {
                     "reason_detail": ratchet_reason or "momentum_profit_lock",
@@ -2462,30 +2621,65 @@ class ExecutionEngine:
                     "locked_level": float(locked or new_level),
                     "peak_debit_value": hwm,
                 }
-        elif hwm > prev_hwm + 1e-9:
-            # Still underwater / not armed — just remember the peak.
+        elif hwm_up:
             self.db.update(
                 "positions",
                 {
                     "peak_debit_value": hwm,
-                    "updated_at": now_ist().isoformat(),
+                    "peak_debit_at":    _peak_at.isoformat(),
+                    "updated_at":       _now.isoformat(),
                 },
                 {"position_id": position["position_id"]},
             )
 
+        # ── D2b: aged-peak fade harvest ──────────────────────────────────
+        # HWM must sit ≥ peak_age_min without a new high, then pull ≥
+        # fade_pull_frac — blocks mid-climb scalp (Sep22/Oct1).
+        _fade_pts = max(fade_pull_frac * hwm, 1.0) if hwm > 0 else 1.0
+        _pull_pts = max(pull_frac * hwm, 0.50) if hwm > 0 else 0.50
+        _faded = hwm > entry_value and float(value_mid or 0.0) <= (hwm - _fade_pts)
+        _pulled = hwm > entry_value and float(value_mid or 0.0) <= (hwm - _pull_pts)
+        if (
+            activated
+            and hwm >= soft_hwm - 1e-9
+            and value >= be_level - 1e-9
+            and _peak_aged
+            and _faded
+            and _mature
+        ):
+            self.logger.info(
+                f"DEBIT PEAK-FADE HARVEST: {position['strategy_name']} "
+                f"value={value:.2f} hwm={hwm:.2f} age={_peak_age:.0f}m "
+                f"persist={int(_persist)} fade>={_fade_pts:.2f}"
+            )
+            return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+                "reason_detail": (
+                    f"momentum_peak_fade_hwm_{hwm:.2f}"
+                    f"_value_{value:.2f}"
+                    f"_age_{_peak_age:.0f}m"
+                    f"_persist_{int(_persist)}"
+                ),
+                "peak_debit_value": hwm,
+                "persist": _persist,
+            }
+
         # ── D3: planned target ───────────────────────────────────────────
-        # Persist still suppresses an immediate target flatten so a living
-        # trend can run — but only AFTER Phase B has armed (fat_hwm ≤
-        # target). If somehow HWM never armed, take the target anyway so
-        # Oct1-style givebacks cannot recur.
+        # Persist may still ride fresh highs at/above target under Phase B
+        # trail — but on any measurable pullback from HWM, bank the target
+        # now. Waiting for trend flip is how Oct1/Sep11 gave 21–30% back.
         if target > 0 and value >= target:
-            if not _persist or hwm < fat_hwm - 1e-9:
+            _bank_now = (not _persist) or _pulled or (hwm < fat_hwm - 1e-9)
+            if _bank_now:
                 self.logger.info(
                     f"DEBIT TARGET: {position['strategy_name']} value={value:.2f} "
-                    f">= target={target:.2f} persist={_persist}"
+                    f">= target={target:.2f} persist={_persist} pulled={_pulled}"
                 )
                 return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
-                    "reason_detail": "momentum_target_reached",
+                    "reason_detail": (
+                        "momentum_target_reached"
+                        + ("_pullback" if _pulled else "")
+                        + ("_persist_off" if not _persist else "")
+                    ),
                     "value": value,
                 }
 
@@ -2932,11 +3126,11 @@ class ExecutionEngine:
         # price. Measured 2026-09-11: a bear call held 85 minutes
         # into a CPI rally to a -Rs 3,924 premium stop; the flip was
         # measurable ~25 minutes earlier at roughly half the loss.
-        # Fires only when the flip is measured (mature ADX >= 20),
-        # the position is underwater (never cut a winner on a regime
-        # flicker), and the trade is older than 10 minutes.
-        # Condors/flys are exempt: a trend does not invalidate both
-        # sides at once.
+            # Fires only when the flip is measured (mature ADX >= 20),
+            # the position is underwater (never cut a winner on a regime
+            # flicker), and the trade has cleared trend_flip_min_hold_min.
+            # Condors/flys are exempt: a trend does not invalidate both
+            # sides at once.
         #
         # Sticky latch: Sep18 BCS saw UPTREND↔RANGE flicker while slowly
         # bleeding — flip never armed on RANGE bars. Latch the adverse
@@ -3027,6 +3221,10 @@ class ExecutionEngine:
             _flip_under_need = (
                 entry_credit * 1.12 if _flip_sticky else entry_credit * 1.05
             )
+            _flip_hold_floor = float(
+                getattr(self.config, "trend_flip_min_hold_min", 5.0) or 5.0
+            )
+            _flip_hold_floor = min(max(_flip_hold_floor, 3.0), 15.0)
             if (
                 (_flip_against or _flip_sticky)
                 and (not _flip_is_fade)
@@ -3034,7 +3232,7 @@ class ExecutionEngine:
                 and _flip_adx >= 20.0
                 and entry_credit > 0
                 and liq_premium > _flip_under_need
-                and _flip_hold_min >= 10.0
+                and _flip_hold_min >= _flip_hold_floor
             ):
                 _flip_tag = _flip_sticky_px if _flip_sticky else _flip_px
                 self.logger.warning(
@@ -3050,18 +3248,20 @@ class ExecutionEngine:
                         f"{'_sticky' if _flip_sticky else ''}"
                     ),
                 }
-            # v65m7x: winner harvest ONLY on peak give-back while still green
-            # against a labelled trend. A pure hold-time cut (v1) harvested
-            # Sep16 BCS early (−₹2.7k vs HARD_EXIT). Require a real peak
-            # (≥10% of credit) then ≥45% give-back of that peak.
+            # v65m35/56: winner harvest on adverse labelled trend — require a
+            # real peak (≥10% of credit) then ≥25% give-back of that peak
+            # (was 45%: waited too long for the flip and lost the max).
+            # Sticky latch included: Sep17 BCS peaked in RANGE after the
+            # adverse UPTREND latch — labelled `_flip_against` alone missed
+            # the harvest and free-traded the give-back.
             if (
-                _flip_against
+                (_flip_against or _flip_sticky)
                 and (not _flip_is_fade)
                 and _flip_mat
-                and _flip_adx >= 24.0
+                and _flip_adx >= 22.0
                 and entry_credit > 0
                 and liq_premium < entry_credit
-                and _flip_hold_min >= 25.0
+                and _flip_hold_min >= max(15.0, _flip_hold_floor)
             ):
                 _peak_l = float(
                     position.get("peak_credit_liq")
@@ -3070,27 +3270,118 @@ class ExecutionEngine:
                 )
                 _peak_gain = max(entry_credit - _peak_l, 0.0)
                 _cur_gain = max(entry_credit - liq_premium, 0.0)
-                # Require a real peak (≥10% of credit) then ≥45% give-back
-                # of that peak before harvesting a still-green credit.
                 _gave_back = (
                     _peak_gain >= 0.10 * entry_credit
-                    and _cur_gain <= 0.55 * _peak_gain
+                    and _cur_gain <= 0.75 * _peak_gain
                 )
                 if _gave_back:
+                    _harv_tag = _flip_sticky_px if _flip_sticky else _flip_px
                     self.logger.info(
                         f"ADVERSE-FLIP WINNER HARVEST: {_flip_name} into "
-                        f"{_flip_px} adx={_flip_adx:.0f} hold={_flip_hold_min:.0f}m "
+                        f"{_harv_tag} adx={_flip_adx:.0f} hold={_flip_hold_min:.0f}m "
                         f"gain={_cur_gain:.2f} peak={_peak_gain:.2f}"
+                        f"{' sticky' if _flip_sticky else ''}"
                     )
                     return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
                         "reason_detail": (
-                            f"adverse_flip_winner_harvest_{_flip_px}"
+                            f"adverse_flip_winner_harvest_{_harv_tag}"
                             f"_adx_{_flip_adx:.0f}_hold_{_flip_hold_min:.0f}m"
                             f"_gain_{_cur_gain:.2f}_peak_{_peak_gain:.2f}"
+                            f"{'_sticky' if _flip_sticky else ''}"
                         ),
                     }
         except Exception as _flip_exc:
             self.logger.debug(f"trend-flip check skipped: {_flip_exc}")
+
+        # ── Put-fade thesis break (Oct1 chart: −122pt day) ────────────────
+        # Low-fade BPS that prints a NEW session low while already red has
+        # failed the bounce thesis (BT Oct1 11:03→12:26 −₹6.3k). Require
+        # underwater credit too — Sep17 green fades that tick a new low
+        # then reverse must not be scratched (v65m18 −₹8.5k regression).
+        try:
+            _pf_name = str(position.get("strategy_name") or "")
+            if (
+                _pf_name == "BULL_PUT_SPREAD"
+                and entry_credit > 0
+                and liq_premium > entry_credit * 1.05
+            ):
+                _pf_raw = {}
+                try:
+                    _pf_raw = json.loads(
+                        position.get("raw_params_json") or "{}"
+                    )
+                except Exception:
+                    _pf_raw = {}
+                _pf_fade = bool(
+                    _pf_raw.get("afternoon_low_fade")
+                    or position.get("afternoon_low_fade")
+                )
+                if _pf_fade:
+                    _pf_hold = 9999.0
+                    try:
+                        _pf_et = position.get("entry_time")
+                        if _pf_et:
+                            _pf_hold = (
+                                now_ist()
+                                - datetime.fromisoformat(str(_pf_et))
+                            ).total_seconds() / 60.0
+                    except Exception:
+                        _pf_hold = 9999.0
+                    try:
+                        _pf_entry = float(position.get("entry_spot") or 0.0)
+                        _pf_dl = float(
+                            signals.get("day_low_so_far")
+                            or signals.get("day_low")
+                            or 0.0
+                        )
+                        _pf_spot = float(signals.get("spot") or 0.0)
+                        _pf_open = float(
+                            signals.get("day_open_spot")
+                            or signals.get("day_open")
+                            or signals.get("spot_open")
+                            or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        _pf_entry = _pf_dl = _pf_spot = _pf_open = 0.0
+                    _pf_buf = float(
+                        getattr(
+                            self.config, "put_fade_new_low_break_pts", 40.0
+                        ) or 40.0
+                    )
+                    _pf_down = float(
+                        getattr(
+                            self.config, "put_fade_session_down_pts", 50.0
+                        ) or 50.0
+                    )
+                    # Sep17 UP-day fades retest lows without the session
+                    # being red vs open — do not scratch those (v65m18b).
+                    _session_red = (
+                        _pf_open > 0
+                        and _pf_spot > 0
+                        and _pf_spot <= (_pf_open - _pf_down)
+                    )
+                    if (
+                        _pf_hold >= 12.0
+                        and _session_red
+                        and _pf_entry > 0
+                        and _pf_dl > 0
+                        and _pf_dl <= (_pf_entry - _pf_buf)
+                    ):
+                        self.logger.warning(
+                            f"PUT-FADE THESIS BREAK (down day): spot "
+                            f"{_pf_spot:.0f}<=open {_pf_open:.0f}-"
+                            f"{_pf_down:.0f}; day_low {_pf_dl:.0f}<="
+                            f"entry {_pf_entry:.0f}-{_pf_buf:.0f}"
+                        )
+                        return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                            "reason_detail": (
+                                f"put_fade_down_day_new_low_dl_{_pf_dl:.0f}"
+                                f"_open_{_pf_open:.0f}_spot_{_pf_spot:.0f}"
+                                f"_hold_{_pf_hold:.0f}m"
+                            ),
+                        }
+        except Exception as _pf_exc:
+            self.logger.debug(f"put-fade thesis check skipped: {_pf_exc}")
 
         # ── v65m7z: adverse occupancy scratch (spot-path wrong-side hold) ─
         # Spot-leg hunt: Sep18/23 held BEAR credit through +20–40pt BULL

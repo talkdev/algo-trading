@@ -18,8 +18,10 @@
 #       ExecutionEngine.monitor / entry / exit / state / P&L
 #
 #  SIMULATED — only the unavoidable edges:
-#     * Broker fills → PaperOrderExecutor + FillModel(mode="live") which
-#       mirrors LiveOrderExecutor aggressive limit ticks (not optimistic edge).
+#     * Broker fills → PaperOrderExecutor + FillModel(mode="live"):
+#       live places an aggressive *limit* to ensure a fill, then books the
+#       broker average_price (≈ touch). BT models that expected fill, not
+#       the limit itself. Unmarketable quotes raise like a live reject.
 #     * Wall-clock   → SimClock (now_ist / today_ist) + sleep no-op
 #
 #  Live ABORT mirroring is OPT-IN (--mirror-live-aborts). Default OFF:
@@ -32,7 +34,7 @@
 #  diverges from live, fix the live path or the I/O adapters above.
 #
 #  Caveats that remain (honest about optimism):
-#     * Rejects with no live-ledger twin are still always-filled.
+#     * Liquidity / RMS rejects with no quote-side signal still always-fill.
 #     * Snapshot cadence bounds the monitoring loop (intra-snapshot invisible).
 #
 #  READ THIS BEFORE BELIEVING ANY NUMBER IT PRINTS
@@ -139,7 +141,7 @@ class SimClock:
 
     MODULES = (
         "core", "main", "data_engine", "regime_engine", "strategy_engine",
-        "execution_engine", "calibration_engine",
+        "execution_engine", "calibration_engine", "tape_state_engine",
     )
 
     def __init__(self) -> None:
@@ -834,11 +836,16 @@ class ReplayClient:
 
 class FillModel:
     """
-    Turns an intention into a price, from the recorded two-sided quote.
+    Turns an intention into an expected *fill* price from the recorded quote.
 
-    mode="live" (default): mirror LiveOrderExecutor._aggressive_limit_price
-      — entry SELL at bid−5 ticks, BUY at ask+2 ticks; urgent exits cross
-      through LTP by market_protection_pct. This is the live-parity path.
+    mode="live" (default): match LiveOrderExecutor economics, not its limit.
+      Live places an aggressive limit (SELL bid−N ticks / BUY ask+N) so the
+      order crosses, then books broker average_price ≈ touch. BT therefore
+      fills at touch (SELL→bid, BUY→ask). One-sided / empty quotes return
+      None so PaperOrderExecutor can reject like live.
+      Urgent exits: live still *starts* at touch (agg=2); protection is only
+      the escalate path. On a snapshot grid we book touch when two-sided,
+      else market_protection_pct through LTP (escalate fallback).
 
     mode="edge" (legacy optimistic):
       edge = 0.0  -> pay the full spread (sell at bid, buy at ask)
@@ -855,7 +862,7 @@ class FillModel:
         mode: str = "live",
         entry_sell_ticks: int = 5,
         entry_buy_ticks: int = 2,
-        tick: float = 0.10,
+        tick: float = 0.05,
         market_protection_pct: float = 2.0,
     ):
         self.mode = str(mode or "live").strip().lower()
@@ -863,9 +870,10 @@ class FillModel:
             self.mode = "live"
         self.edge = min(max(float(edge), 0.0), 0.5)
         self.stress_mult = min(max(float(stress_mult), 0.0), 1.0)
+        # Kept for docs / marketability checks; fill uses touch, not limit.
         self.entry_sell_ticks = max(1, int(entry_sell_ticks))
         self.entry_buy_ticks = max(1, int(entry_buy_ticks))
-        self.tick = float(tick) if float(tick) > 0 else 0.10
+        self.tick = float(tick) if float(tick) > 0 else 0.05
         self.market_protection_pct = min(
             max(float(market_protection_pct or 2.0), 1.0), 25.0
         )
@@ -874,41 +882,52 @@ class FillModel:
         t = self.tick
         return round(round(max(price, t) / t) * t, 2)
 
-    def _live_aggressive(
+    def _touch(self, quote: dict, action: str) -> Optional[float]:
+        """Expected average_price after an aggressive limit crosses the book."""
+        bid = float(quote.get("bid") or 0)
+        ask = float(quote.get("ask") or 0)
+        ltp = float(quote.get("ltp") or 0)
+        if action == "SELL":
+            if bid > 0:
+                return self._round_tick(bid)
+            if ltp > 0:
+                return self._round_tick(ltp)
+            return None
+        if ask > 0:
+            return self._round_tick(ask)
+        if ltp > 0:
+            return self._round_tick(ltp)
+        return None
+
+    def _protection(self, quote: dict, action: str) -> Optional[float]:
+        bid = float(quote.get("bid") or 0)
+        ask = float(quote.get("ask") or 0)
+        ltp = float(quote.get("ltp") or 0)
+        ref = ltp or ((bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0)
+        if ref <= 0:
+            return None
+        pct = self.market_protection_pct / 100.0
+        raw = ref * (1.0 + pct) if action == "BUY" else ref * (1.0 - pct)
+        return self._round_tick(raw)
+
+    def _live_expected_fill(
         self, quote: dict, action: str, urgent: bool = False
     ) -> Optional[float]:
         bid = float(quote.get("bid") or 0)
         ask = float(quote.get("ask") or 0)
-        ltp = float(quote.get("ltp") or 0)
-        tick = self.tick
+        touch = self._touch(quote, action)
+        two_sided = bid > 0 and ask > 0 and ask >= bid
+        if touch is not None and (two_sided or not urgent):
+            return touch
+        # Escalate path: one-sided quote on an urgent exit (live would
+        # eventually synthetic_market_price after the ladder).
         if urgent:
-            ref = ltp or ((bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0)
-            if ref <= 0:
-                return None
-            pct = self.market_protection_pct / 100.0
-            raw = ref * (1.0 + pct) if action == "BUY" else ref * (1.0 - pct)
-            return self._round_tick(raw)
-        if action == "SELL":
-            n = self.entry_sell_ticks
-            if bid > 0:
-                return self._round_tick(bid - n * tick)
-            if ask > 0:
-                return self._round_tick(ask - (n + 2) * tick)
-            if ltp > 0:
-                return self._round_tick(ltp - n * tick)
-            return None
-        n = self.entry_buy_ticks
-        if ask > 0:
-            return self._round_tick(ask + n * tick)
-        if bid > 0:
-            return self._round_tick(bid + (n + 2) * tick)
-        if ltp > 0:
-            return self._round_tick(ltp + n * tick)
-        return None
+            return self._protection(quote, action)
+        return touch
 
     def price(self, quote: dict, action: str, urgent: bool = False) -> Optional[float]:
         if self.mode == "live":
-            return self._live_aggressive(quote, action, urgent=urgent)
+            return self._live_expected_fill(quote, action, urgent=urgent)
         bid = float(quote.get("bid") or 0)
         ask = float(quote.get("ask") or 0)
         ltp = float(quote.get("ltp") or 0)
@@ -919,6 +938,34 @@ class FillModel:
         if action == "SELL":
             return round(bid + (mid - bid) * (edge / 0.5), 2)
         return round(ask - (ask - mid) * (edge / 0.5), 2)
+
+
+def make_fill_model(
+    config: Optional["Config"] = None,
+    *,
+    edge: float = 0.0,
+    stress_exit: float = 0.5,
+    mode: str = "live",
+) -> FillModel:
+    """Build FillModel using live Config tick / market-protection defaults."""
+    tick = 0.05
+    prot = 2.0
+    if config is not None:
+        try:
+            tick = float(getattr(config, "tick_size", 0.05) or 0.05)
+        except (TypeError, ValueError):
+            tick = 0.05
+        try:
+            prot = float(getattr(config, "market_protection_pct", 2.0) or 2.0)
+        except (TypeError, ValueError):
+            prot = 2.0
+    return FillModel(
+        float(edge),
+        float(stress_exit),
+        mode=str(mode or "live"),
+        tick=tick,
+        market_protection_pct=prot,
+    )
 
 
 class LiveAbortMirror:
@@ -2356,7 +2403,7 @@ def print_report(res: Results, config: Config, args, store=None) -> None:
     print(f"  fill model        : mode={getattr(args, 'fill_mode', 'live')} "
           f"edge={getattr(args, 'fill_edge', 0.0):.2f} "
           f"stress_exit={getattr(args, 'stress_exit', 0.5):.2f}"
-          + ("  [live-aggressive ticks]"
+          + ("  [live expected fill = touch]"
              if str(getattr(args, "fill_mode", "live")) == "live"
              else "  [legacy edge blend]"))
     print(f"  live abort mirror : "
@@ -3633,9 +3680,10 @@ def _parallel_day_worker(job: dict) -> dict:
             runner = BacktestRunner(
                 store,
                 config,
-                FillModel(
-                    float(job.get("fill_edge") or 0.0),
-                    float(job.get("stress_exit") or 0.5),
+                make_fill_model(
+                    config,
+                    edge=float(job.get("fill_edge") or 0.0),
+                    stress_exit=float(job.get("stress_exit") or 0.5),
                     mode=str(job.get("fill_mode") or "live"),
                 ),
                 verbose=False,
@@ -3881,8 +3929,8 @@ def main() -> int:
         "--fill-mode",
         choices=("live", "edge"),
         default="live",
-        help="live (default): aggressive ticks matching LiveOrderExecutor; "
-             "edge: legacy optimistic bid/ask blend via --fill-edge",
+        help="live (default): expected broker average_price (touch) after "
+             "LiveOrderExecutor aggressive limit; edge: legacy bid/ask blend",
     )
     ap.add_argument("--fill-edge", type=float, default=0.0,
                     help="only for --fill-mode edge: 0=full spread, 0.5=mid "
@@ -4029,8 +4077,10 @@ def main() -> int:
 
     runner = BacktestRunner(
         store, config,
-        FillModel(
-            args.fill_edge, args.stress_exit,
+        make_fill_model(
+            config,
+            edge=args.fill_edge,
+            stress_exit=args.stress_exit,
             mode=str(getattr(args, "fill_mode", "live") or "live"),
         ),
         args.verbose,

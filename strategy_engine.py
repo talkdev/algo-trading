@@ -77,7 +77,7 @@ LOT_CAPS_BY_DAY: Dict[str, int] = {
     "FRIDAY":    5,
 }
 
-ENTRY_COOLDOWN_MIN = 10
+ENTRY_COOLDOWN_MIN = 15
 
 STOP_COOLDOWN_MAP: Dict[str, int] = {
     "CLOSE_STOP":  30,
@@ -212,6 +212,37 @@ class StrategyEngine:
         except Exception:
             rows = []
         return [str(r["strategy_name"] or "") for r in (rows or [])]
+
+    def _open_momentum_age_min(self) -> float:
+        """Minutes since the oldest open momentum debit was entered.
+
+        Used to keep same-side credit from stacking onto a brand-new long
+        (whip-scratch pattern). Returns a large number when no momentum
+        is open so the credit-beside gate stays open.
+        """
+        names = tuple(MOMENTUM_STRATEGIES)
+        if not names:
+            return 9999.0
+        marks = ",".join("?" * len(names))
+        try:
+            rows = self.db.query(
+                f"SELECT entry_time FROM positions "
+                f"WHERE trading_date=? AND status IN ('OPEN','PENDING_ENTRY') "
+                f"AND strategy_name IN ({marks}) "
+                f"ORDER BY entry_time ASC",
+                (today_ist().isoformat(),) + names,
+            )
+        except Exception:
+            rows = []
+        if not rows:
+            return 9999.0
+        try:
+            et = datetime.fromisoformat(str(rows[0].get("entry_time") or ""))
+            if getattr(et, "tzinfo", None) is not None:
+                et = et.replace(tzinfo=None)
+            return max((now_ist() - et).total_seconds() / 60.0, 0.0)
+        except Exception:
+            return 9999.0
 
     @staticmethod
     def _sides_of(strategy_name: str) -> set:
@@ -573,6 +604,38 @@ class StrategyEngine:
                 # a credit vertical beside an open long option: same side only
                 if not (new_sides & o_sides):
                     return f"slot_conflict_credit_against_open_long:{o}"
+                # Same-side credit on a young debit is a whip-scratch
+                # (debit opens, credit fires, stops in minutes). Do NOT
+                # waive the hold for "measured ADX" — a crash-tape ADX
+                # print is exactly when stacking credit is most toxic
+                # (day_move already 200%+). After the hold, still refuse
+                # when the session range is spent vs the straddle.
+                _mom_age = self._open_momentum_age_min()
+                _need_hold = float(
+                    getattr(
+                        self.config,
+                        "credit_beside_momentum_min_hold_min",
+                        25.0,
+                    ) or 25.0
+                )
+                if _mom_age < _need_hold:
+                    return (
+                        f"slot_conflict_credit_beside_young_momentum_"
+                        f"{_mom_age:.0f}m_lt_{_need_hold:.0f}m"
+                    )
+                try:
+                    _dm = float((signals or {}).get("day_move_used_pct") or 0.0)
+                except (TypeError, ValueError):
+                    _dm = 0.0
+                _dm_cap = float(
+                    getattr(self.config, "day_move_used_block_pct", 125.0)
+                    or 125.0
+                )
+                if _dm >= _dm_cap:
+                    return (
+                        f"slot_conflict_credit_beside_momentum_"
+                        f"day_move_spent_{_dm:.0f}pct"
+                    )
                 continue
             if new_sides & o_sides:
                 return f"slot_conflict_same_side_already_sold:{o}"
@@ -1959,6 +2022,54 @@ class StrategyEngine:
                         f"low_fade_vetoed_one_way_downtrend_adx_{_tr_adx:.0f}"
                     )
                     return
+                # Oct1 11:03: spike-low + spot still at open → fake low fade.
+                # Sep17-class spike-low already below open stays allowed.
+                if bool(signals.get("day_low_is_open_spike")):
+                    try:
+                        _do = float(signals.get("day_open_spot") or 0.0)
+                        _sp = float(signals.get("spot") or 0.0)
+                        _need = float(
+                            getattr(
+                                self.config, "low_fade_below_open_pts", 20.0
+                            )
+                            or 20.0
+                        )
+                    except (TypeError, ValueError):
+                        _do = _sp = 0.0
+                        _need = 20.0
+                    if _do > 0 and _sp > 0 and _sp > (_do - _need):
+                        signals["fade_vetoed_spike_low_at_open"] = (
+                            f"spike_low_spot_{_sp:.0f}_open_{_do:.0f}"
+                        )
+                        return
+                # Oct1 knife window 12:00–13:15 only.
+                try:
+                    _sp_b = float(signals.get("spot") or 0.0)
+                    _dl_b = float(
+                        signals.get("day_low_so_far")
+                        or signals.get("day_low")
+                        or 0.0
+                    )
+                    _ab = (_sp_b - _dl_b) if (_sp_b > 0 and _dl_b > 0) else 9999.0
+                    if (
+                        dtime(12, 0) <= current_time < dtime(13, 15)
+                        and (
+                            _ab < 5.0
+                            or (
+                                bool(
+                                    signals.get("day_low_is_open_spike")
+                                    or signals.get("day_low_was_open_spike")
+                                )
+                                and _ab < 25.0
+                            )
+                        )
+                    ):
+                        signals["fade_vetoed_knife_day_low"] = (
+                            f"above_low_{_ab:.0f}"
+                        )
+                        return
+                except (TypeError, ValueError):
+                    pass
                 signals["afternoon_low_fade"] = True
                 signals["final_regime"] = "PREMIUM_SELL_BULL"
                 signals["weekly_range_size_discount"] = 1.0
@@ -1990,9 +2101,64 @@ class StrategyEngine:
                     signals["final_regime"] = "PREMIUM_SELL_BEAR"
                     final_regime = "PREMIUM_SELL_BEAR"
                 elif _tw_loc <= 0.20:
-                    signals["afternoon_low_fade"] = True
-                    signals["final_regime"] = "PREMIUM_SELL_BULL"
-                    final_regime = "PREMIUM_SELL_BULL"
+                    _spike_at_open = False
+                    if bool(signals.get("day_low_is_open_spike")):
+                        try:
+                            _do2 = float(signals.get("day_open_spot") or 0.0)
+                            _sp2 = float(signals.get("spot") or 0.0)
+                            _need2 = float(
+                                getattr(
+                                    self.config,
+                                    "low_fade_below_open_pts",
+                                    20.0,
+                                )
+                                or 20.0
+                            )
+                            _spike_at_open = (
+                                _do2 > 0
+                                and _sp2 > 0
+                                and _sp2 > (_do2 - _need2)
+                            )
+                        except (TypeError, ValueError):
+                            _spike_at_open = False
+                    _knife = False
+                    try:
+                        _sp3 = float(signals.get("spot") or 0.0)
+                        _dl3 = float(
+                            signals.get("day_low_so_far")
+                            or signals.get("day_low")
+                            or 0.0
+                        )
+                        _knife = False
+                        _ab3 = (
+                            (_sp3 - _dl3) if (_sp3 > 0 and _dl3 > 0) else 9999.0
+                        )
+                        if (
+                            dtime(12, 0) <= current_time < dtime(13, 15)
+                            and (
+                                _ab3 < 5.0
+                                or (
+                                    bool(
+                                        signals.get("day_low_is_open_spike")
+                                        or signals.get(
+                                            "day_low_was_open_spike"
+                                        )
+                                    )
+                                    and _ab3 < 25.0
+                                )
+                            )
+                        ):
+                            _knife = True
+                    except (TypeError, ValueError):
+                        _knife = False
+                    if _spike_at_open:
+                        signals["fade_vetoed_spike_low_at_open"] = True
+                    elif _knife:
+                        signals["fade_vetoed_knife_day_low"] = True
+                    else:
+                        signals["afternoon_low_fade"] = True
+                        signals["final_regime"] = "PREMIUM_SELL_BULL"
+                        final_regime = "PREMIUM_SELL_BULL"
 
         if final_regime == "PREMIUM_SELL_RANGE":
             strategy, why = self._resolve_range_strategy(
@@ -2637,6 +2803,41 @@ class StrategyEngine:
                 signals["afternoon_high_fade"] = True
                 return BEAR_CALL_SPREAD, f"two_way_high_fade_loc_{_loc:.2f}"
             if _rng >= self.TWO_WAY_MIN_RANGE and _loc <= self.TWO_WAY_FADE_LO:
+                # Oct1 12:10: spike-low + hugging printed low is a knife
+                # catch. Sep18 non-spike fades stay allowed.
+                try:
+                    _sp_tw = float(signals.get("spot") or 0.0)
+                    _dl_tw = float(
+                        signals.get("day_low_so_far")
+                        or signals.get("day_low")
+                        or 0.0
+                    )
+                    _ab_tw = (
+                        (_sp_tw - _dl_tw)
+                        if (_sp_tw > 0 and _dl_tw > 0)
+                        else 9999.0
+                    )
+                    if (
+                        dtime(12, 0) <= current_time < dtime(13, 15)
+                        and (
+                            _ab_tw < 5.0
+                            or (
+                                bool(
+                                    signals.get("day_low_is_open_spike")
+                                    or signals.get("day_low_was_open_spike")
+                                )
+                                and _ab_tw < 25.0
+                            )
+                        )
+                    ):
+                        signals["fade_vetoed_knife_day_low"] = True
+                        return (
+                            "NO_TRADE",
+                            f"two_way_low_fade_knife_day_low_"
+                            f"{_ab_tw:.0f}pt",
+                        )
+                except (TypeError, ValueError):
+                    pass
                 self.logger.info("Range resolution: two_way_low_prefer_bull_put")
                 signals["afternoon_low_fade"] = True
                 return BULL_PUT_SPREAD, f"two_way_low_fade_loc_{_loc:.2f}"
@@ -2715,17 +2916,30 @@ class StrategyEngine:
                         f"range_soft_lean_bull_day_up_spent_"
                         f"{self._side_day_spend_pct(signals, 'BULL'):.0f}",
                     )
-                self.logger.info(
-                    f"Range resolution: soft lean loc={_loc:.2f} "
-                    f"-> BULL_PUT_SPREAD"
-                    f"{':extreme' if _ext_hi else ''}"
-                    f"{':warmup' if _warmup else ''}"
+                # Pin band owns mid-range (BT Sep25 10:28:14 BPS −₹1.4k).
+                # Soft lean 0.58 overlaps pin 0.40–0.60; any soft lean here
+                # steals the pin ticket. Defer to the pin step below —
+                # positioned leans OUTSIDE the pin band (loc>0.60) stay.
+                _pin_eligible = (
+                    or_condition in ("VERY_NARROW", "NARROW")
+                    and 12.0 <= adx_15 < self.CONDOR_PIN_ADX_MAX
+                    and self.PIN_LOC_LO <= _loc <= self.PIN_LOC_HI
+                    and _rng < self.CONDOR_MAX_SESSION_RANGE_PTS
+                    and vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+                    and current_time < dtime(12, 0)
                 )
-                return BULL_PUT_SPREAD, (
-                    f"range_soft_location_lean_{_loc:.2f}"
-                    f"{':extreme' if _ext_hi else ''}"
-                    f"{':warmup' if _warmup else ''}"
-                )
+                if not _pin_eligible:
+                    self.logger.info(
+                        f"Range resolution: soft lean loc={_loc:.2f} "
+                        f"-> BULL_PUT_SPREAD"
+                        f"{':extreme' if _ext_hi else ''}"
+                        f"{':warmup' if _warmup else ''}"
+                    )
+                    return BULL_PUT_SPREAD, (
+                        f"range_soft_location_lean_{_loc:.2f}"
+                        f"{':extreme' if _ext_hi else ''}"
+                        f"{':warmup' if _warmup else ''}"
+                    )
             if _loc <= self.RANGE_SOFT_LEAN_LO and (_ext_lo or _ev_bear):
                 if not self._away_side_allowed(signals, "BEAR"):
                     return (
@@ -2733,17 +2947,26 @@ class StrategyEngine:
                         f"range_soft_lean_bear_day_down_spent_"
                         f"{self._side_day_spend_pct(signals, 'BEAR'):.0f}",
                     )
-                self.logger.info(
-                    f"Range resolution: soft lean loc={_loc:.2f} "
-                    f"-> BEAR_CALL_SPREAD"
-                    f"{':extreme' if _ext_lo else ''}"
-                    f"{':warmup' if _warmup else ''}"
+                _pin_eligible = (
+                    or_condition in ("VERY_NARROW", "NARROW")
+                    and 12.0 <= adx_15 < self.CONDOR_PIN_ADX_MAX
+                    and self.PIN_LOC_LO <= _loc <= self.PIN_LOC_HI
+                    and _rng < self.CONDOR_MAX_SESSION_RANGE_PTS
+                    and vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+                    and current_time < dtime(12, 0)
                 )
-                return BEAR_CALL_SPREAD, (
-                    f"range_soft_location_lean_{_loc:.2f}"
-                    f"{':extreme' if _ext_lo else ''}"
-                    f"{':warmup' if _warmup else ''}"
-                )
+                if not _pin_eligible:
+                    self.logger.info(
+                        f"Range resolution: soft lean loc={_loc:.2f} "
+                        f"-> BEAR_CALL_SPREAD"
+                        f"{':extreme' if _ext_lo else ''}"
+                        f"{':warmup' if _warmup else ''}"
+                    )
+                    return BEAR_CALL_SPREAD, (
+                        f"range_soft_location_lean_{_loc:.2f}"
+                        f"{':extreme' if _ext_lo else ''}"
+                        f"{':warmup' if _warmup else ''}"
+                    )
 
         # 4. true pin only — never a catch-all. Condor/fly need a NARROW
         # opening range, mid location, and a real flat ADX read. MODERATE
@@ -3514,12 +3737,16 @@ class StrategyEngine:
                     f"{_ic_rng:.0f}pts_prefer_extreme_fade"
                 )
             # Soft lean thresholds: any grind evidence → vertical, not IC.
+            # EXCEPT inside the pin band: soft 0.58 overlaps pin 0.40–0.60.
+            # Refusing IC here demotes to a losing BPS (Sep25 10:28 −₹1.4k).
             if _ic_rng >= self.RANGE_LEAN_MIN_PTS and (
                     _ic_loc >= self.RANGE_SOFT_LEAN_HI
                     or _ic_loc <= self.RANGE_SOFT_LEAN_LO):
-                return False, (
-                    f"condor_location_drift_{_ic_loc:.2f}_prefer_vertical"
-                )
+                _in_pin_band = self.PIN_LOC_LO <= _ic_loc <= self.PIN_LOC_HI
+                if not _in_pin_band:
+                    return False, (
+                        f"condor_location_drift_{_ic_loc:.2f}_prefer_vertical"
+                    )
             if not (self.PIN_LOC_LO <= _ic_loc <= self.PIN_LOC_HI):
                 return False, (
                     f"condor_location_not_mid_{_ic_loc:.2f}_prefer_wait_or_vertical"
@@ -6734,6 +6961,16 @@ class StrategyEngine:
                     f"momentum_only_{mins_left:.0f}min_before_hard_exit"
                 ), 0
 
+        # Oct1 BT 12:56 LONG_PUT −₹409; live winner was 13:03 adx45.
+        # On a latched open-low-spike crash, hold the debit until 13:00
+        # (Sep22/29 morning LONGs are before noon — unaffected).
+        if direction < 0 and bool(
+            signals.get("day_low_is_open_spike")
+            or signals.get("day_low_was_open_spike")
+        ):
+            if dtime(12, 0) <= cur < dtime(13, 0):
+                return False, "momentum_wait_spike_low_crash_to_13:00", 0
+
         # ── one clip a day, and never beside an open position ───────────
         if self._count_momentum_entries() >= int(
                 getattr(cfg, "momentum_max_trades_per_day", 1)):
@@ -7655,9 +7892,16 @@ class StrategyEngine:
         if _rng < self.RANGE_LEAN_MIN_PTS:
             return None
         # Clear location only — soft mid-range stays flat (Sep11 protection).
+        # Inside the pin band never demote to a vertical (Sep25 10:28
+        # IC→BPS −₹1.4k). Stand aside / rebuild the pin.
+        _in_pin_band = self.PIN_LOC_LO <= _loc <= self.PIN_LOC_HI
         if _loc >= self.RANGE_SOFT_LEAN_HI:
+            if _in_pin_band:
+                return None
             return BULL_PUT_SPREAD
         if _loc <= self.RANGE_SOFT_LEAN_LO:
+            if _in_pin_band:
+                return None
             return BEAR_CALL_SPREAD
         return None
 

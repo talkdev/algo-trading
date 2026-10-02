@@ -198,7 +198,7 @@ class MainEngine:
 
         Same `run_one_cycle()` path as production. Only the I/O edges differ:
         `client` is a ReplayClient, `db` is a scratch book, fills go through
-        PaperOrderExecutor + FillModel (live-aggressive by default). Optional
+        PaperOrderExecutor + FillModel (expected touch fill by default). Optional
         `abort_mirror` (opt-in) can refuse paper fills where live recorded
         ABORTED — default replay leaves it unset so latest code is verified.
         """
@@ -236,7 +236,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m14-feedstale-green-skip"
+        _engine_build = "v65m56-thesis-dead-trail"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,
