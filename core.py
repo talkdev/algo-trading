@@ -1021,19 +1021,33 @@ class Config:
     momentum_stop_frac:            float = 0.35
     momentum_lock_trigger:         float = 0.25
     momentum_lock_keep_frac:       float = 0.50
-    # Debit high-water-mark protection (replaces persist→breakeven clamp):
-    #   Phase A: once +lock_trigger, stop → free-trade (BE+costs) so runners
-    #            can develop (do NOT scalp early).
-    #   Phase B: once HWM open gain ≥ hwm_large_frac of entry, trail from
-    #            peak and only give back hwm_giveback_frac of peak open gain
-    #            (default keep 80% of the peak). Sep22 LONG_PUT peaked ~₹13k
-    #            at 14:01; BE-clamp → −₹912; early loose trail → +₹1.3k at
-    #            12:05 and missed the peak. HWM trail exits near the peak.
-    # Phase-B unlock: HWM must be this fraction above entry (1.0 = 2× entry)
-    # before the tight trail engages. Too low (e.g. 0.80) arms mid-trend and
-    # scalp-exits before the real peak (Sep22 LP: +₹8.7k at 13:55, missed 14:01).
+    # Debit high-water-mark protection:
+    #   Phase A soft: once HWM open ≥ soft_frac above entry, trail with
+    #                 soft_giveback so mid-runners are not free-trade-only
+    #                 until trend death (Sep21 LONG_CALL gave 54% of peak).
+    #   Phase B fat:  once HWM ≥ min(large_frac, target), tight giveback.
+    #   Late-aft partial: after 13:45, also arm Phase B once HWM has
+    #                 taken afternoon_partial_frac of planned target gain
+    #                 (Sep21 halfway spike). Default 0.50; set 0 to disable.
+    #                 13:00+0.45 was rejected (Oct1/Sep22 mid-climb scalp).
+    #   Stale peak:   soft HWM + peak_age + mature clock, even under
+    #                 persist → medium giveback.
     momentum_hwm_large_frac:       float = 0.60
-    momentum_hwm_giveback_frac:    float = 0.20
+    momentum_hwm_giveback_frac:    float = 0.15
+    momentum_hwm_soft_frac:        float = 0.30
+    momentum_hwm_soft_giveback_frac: float = 0.32
+    # Late-aft partial fat arm disabled by default (0). softfix_v65m50/52
+    # showed Oct1/Sep22 mid-climb scalp when armed after 13:00–13:45.
+    momentum_hwm_afternoon_partial_frac: float = 0.0
+    momentum_hwm_stale_giveback_frac: float = 0.25
+    momentum_hwm_pullback_frac:    float = 0.03
+    # Persist-death / fade harvest needs a *real* peak pullback so an ADX
+    # flicker mid-climb cannot scalp a runner (Sep22 LP softfix_v65m36).
+    momentum_hwm_fade_pullback_frac: float = 0.08
+    # Minutes a debit HWM must sit without a new high before fade-harvest /
+    # soft-trail-on-persist-off may fire. Blocks mid-climb scalp on noise
+    # (Sep22/Oct1 softfix_v65m35–37).
+    momentum_hwm_peak_age_min:     float = 10.0
     momentum_target_frac:          float = 0.60
     momentum_final_window_min:     int   = 45
     # Sizing: the debit route risks the stop, not the notional, and the
@@ -1357,6 +1371,10 @@ class Config:
     # Default refuse; set ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT=true to restore
     # the old second-slot aligned-debit behaviour.
     allow_correlated_debit_beside_credit: bool = False
+    # Minutes an open long-premium ticket must live before a same-side
+    # credit vertical may stack beside it (unless ADX is already measured
+    # strong). Blocks whip-scratch second slots without naming a day.
+    credit_beside_momentum_min_hold_min: float = 25.0
     alert_telegram_bot_token:      str   = ""
     alert_telegram_chat_id:        str   = ""
     alert_webhook_url:             str   = ""
@@ -1886,8 +1904,29 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_stop_frac=min(max(_get_float(env, "MOMENTUM_STOP_FRAC", 0.35), 0.10), 0.70),
         momentum_lock_trigger=min(max(_get_float(env, "MOMENTUM_LOCK_TRIGGER", 0.25), 0.05), 1.00),
         momentum_lock_keep_frac=min(max(_get_float(env, "MOMENTUM_LOCK_KEEP_FRAC", 0.50), 0.10), 0.95),
-        momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 0.60), 0.30), 2.00),
-        momentum_hwm_giveback_frac=min(max(_get_float(env, "MOMENTUM_HWM_GIVEBACK_FRAC", 0.20), 0.05), 0.50),
+        momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 0.60), 0.25), 2.00),
+        momentum_hwm_giveback_frac=min(max(_get_float(env, "MOMENTUM_HWM_GIVEBACK_FRAC", 0.15), 0.05), 0.50),
+        momentum_hwm_soft_frac=min(max(_get_float(env, "MOMENTUM_HWM_SOFT_FRAC", 0.30), 0.10), 1.00),
+        momentum_hwm_soft_giveback_frac=min(
+            max(_get_float(env, "MOMENTUM_HWM_SOFT_GIVEBACK_FRAC", 0.32), 0.10), 0.60
+        ),
+        momentum_hwm_afternoon_partial_frac=min(
+            max(_get_float(env, "MOMENTUM_HWM_AFTERNOON_PARTIAL_FRAC", 0.0), 0.0),
+            1.00,
+        ),
+        momentum_hwm_stale_giveback_frac=min(
+            max(_get_float(env, "MOMENTUM_HWM_STALE_GIVEBACK_FRAC", 0.25), 0.10),
+            0.50,
+        ),
+        momentum_hwm_pullback_frac=min(
+            max(_get_float(env, "MOMENTUM_HWM_PULLBACK_FRAC", 0.03), 0.01), 0.15
+        ),
+        momentum_hwm_fade_pullback_frac=min(
+            max(_get_float(env, "MOMENTUM_HWM_FADE_PULLBACK_FRAC", 0.08), 0.03), 0.25
+        ),
+        momentum_hwm_peak_age_min=min(
+            max(_get_float(env, "MOMENTUM_HWM_PEAK_AGE_MIN", 10.0), 3.0), 45.0
+        ),
         momentum_target_frac=min(max(_get_float(env, "MOMENTUM_TARGET_FRAC", 0.60), 0.10), 3.00),
         momentum_final_window_min=_get_int(env, "MOMENTUM_FINAL_WINDOW_MIN", 45),
         momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
@@ -1934,6 +1973,13 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         allow_same_cycle_reentry=_get_bool(env, "ALLOW_SAME_CYCLE_REENTRY", True),
         allow_correlated_debit_beside_credit=_get_bool(
             env, "ALLOW_CORRELATED_DEBIT_BESIDE_CREDIT", False
+        ),
+        credit_beside_momentum_min_hold_min=min(
+            max(
+                _get_float(env, "CREDIT_BESIDE_MOMENTUM_MIN_HOLD_MIN", 25.0),
+                5.0,
+            ),
+            60.0,
         ),
         # ── v6 live execution hardening ───────────────────────────────────
         order_max_retries=min(max(_get_int(env, "ORDER_MAX_RETRIES", 0), 0), 2),

@@ -1892,6 +1892,12 @@ class MarketDataEngine:
                             and abs(day_low - float(_pre["low"].min())) < 0.51
                             and (_pol - day_low) >= _gap
                         )
+                        # Latch: once an open-drive low spike is detected,
+                        # keep it for the session so fades after a new-low
+                        # print (flag clears) still know the structure
+                        # (BT Oct1 12:11 knife after spikeL→False).
+                        if self.state["day_low_is_open_spike"]:
+                            self.state["day_low_was_open_spike"] = True
                     except Exception:
                         self.state.setdefault("post_open_high_so_far", day_high)
                         self.state.setdefault("post_open_low_so_far", day_low)
@@ -3174,6 +3180,8 @@ class MarketDataEngine:
                             and abs(_day_low - float(_pre["low"].min())) < 0.51
                             and (_pol - _day_low) >= _gap
                         )
+                        if self.state["day_low_is_open_spike"]:
+                            self.state["day_low_was_open_spike"] = True
                     except Exception:
                         self.state.setdefault("post_open_high_so_far", _day_high)
                         self.state.setdefault("post_open_low_so_far", _day_low)
@@ -3960,6 +3968,7 @@ class MarketDataEngine:
             "post_open_low_so_far":     self.state.get("post_open_low_so_far"),
             "day_high_is_open_spike":   bool(self.state.get("day_high_is_open_spike")),
             "day_low_is_open_spike":    bool(self.state.get("day_low_is_open_spike")),
+            "day_low_was_open_spike":   bool(self.state.get("day_low_was_open_spike")),
             "day_open_spot":            float(self.state.get("day_open_spot") or 0.0),
             # PATCH_V12: one-sided excursion vs priced displacement.
             "day_up_used_pct":          day_up_used_pct,

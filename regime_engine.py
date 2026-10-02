@@ -2087,7 +2087,54 @@ class RegimeClassifier:
                     # Low fades are a morning product (≤12:15). After lunch
                     # the bearish lean / high-fade book owns the tape;
                     # strategy_engine unlocks a post-scalp low fade only.
-                    if _fade_t >= time(12, 15) and not _two_way:
+                    _spike_at_open = False
+                    if bool(signals.get("day_low_is_open_spike")):
+                        try:
+                            _do = float(signals.get("day_open_spot") or 0.0)
+                            _need = float(
+                                getattr(
+                                    self.config,
+                                    "low_fade_below_open_pts",
+                                    20.0,
+                                )
+                                or 20.0
+                            )
+                            _spike_at_open = (
+                                _do > 0
+                                and _fspot > 0
+                                and _fspot > (_do - _need)
+                            )
+                        except (TypeError, ValueError):
+                            _spike_at_open = False
+                    # Knife-catch 12:00–13:15 only (BT Oct1 12:10/12:14).
+                    # End at 13:15 so Sep25 13:41 bounce credit stays
+                    # (v65m31 PM latch through 15:00 left 14:06 BPS −₹790).
+                    _knife = False
+                    try:
+                        _above = (
+                            (_fspot - _raw_l)
+                            if (_fspot > 0 and _raw_l > 0)
+                            else 9999.0
+                        )
+                        _had_spike = bool(
+                            signals.get("day_low_is_open_spike")
+                            or signals.get("day_low_was_open_spike")
+                        )
+                        if (
+                            time(12, 0) <= _fade_t < time(13, 15)
+                            and (
+                                _above < 5.0
+                                or (_had_spike and _above < 25.0)
+                            )
+                        ):
+                            _knife = True
+                    except (TypeError, ValueError):
+                        _knife = False
+                    if _spike_at_open:
+                        signals["fade_vetoed_spike_low_at_open"] = True
+                    elif _knife:
+                        signals["fade_vetoed_knife_day_low"] = True
+                    elif _fade_t >= time(12, 15) and not _two_way:
                         pass
                     elif _struct_bear:
                         pass
@@ -2130,13 +2177,47 @@ class RegimeClassifier:
                     if _gap_dir == "DOWN" and _pc > 0 and _dh > 0 and _dh < _pc:
                         pass
                     else:
-                        signals["afternoon_low_fade"] = True
-                        signals["weekly_range_size_discount"] = 1.0
-                        return (
-                            FinalRegime.PREMIUM_SELL_BULL,
-                            "TWO_WAY_CHOPPY_LOW_FADE",
-                            False,
-                        )
+                        try:
+                            _ab = (
+                                (_fspot - _raw_l)
+                                if (_fspot > 0 and _raw_l > 0)
+                                else 9999.0
+                            )
+                            _knife = False
+                            if (
+                                time(12, 0) <= _fade_t < time(13, 15)
+                                and (
+                                    _ab < 5.0
+                                    or (
+                                        bool(
+                                            signals.get("day_low_is_open_spike")
+                                            or signals.get(
+                                                "day_low_was_open_spike"
+                                            )
+                                        )
+                                        and _ab < 25.0
+                                    )
+                                )
+                            ):
+                                _knife = True
+                            if _knife:
+                                signals["fade_vetoed_knife_day_low"] = True
+                            else:
+                                signals["afternoon_low_fade"] = True
+                                signals["weekly_range_size_discount"] = 1.0
+                                return (
+                                    FinalRegime.PREMIUM_SELL_BULL,
+                                    "TWO_WAY_CHOPPY_LOW_FADE",
+                                    False,
+                                )
+                        except (TypeError, ValueError):
+                            signals["afternoon_low_fade"] = True
+                            signals["weekly_range_size_discount"] = 1.0
+                            return (
+                                FinalRegime.PREMIUM_SELL_BULL,
+                                "TWO_WAY_CHOPPY_LOW_FADE",
+                                False,
+                            )
             return FinalRegime.NO_TRADE, "NO_TRADE:CHOPPY_MARKET", False
 
         # ── Hard Block 3: Volatility blocks ───────────────────────────────
