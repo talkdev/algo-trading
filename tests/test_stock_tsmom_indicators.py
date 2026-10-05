@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import math
 import sys
 import unittest
+from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -234,6 +237,151 @@ class DailyIndicatorTests(unittest.TestCase):
         daily = self._prices(np.array([100.0, 102.0, 104.0]))
         daily["Adj Close"] = [50.0, 51.0, 52.0]
         self.assertEqual(stock_tsmom.daily_close_series(daily).tolist(), [50.0, 51.0, 52.0])
+
+    @staticmethod
+    def _candidate_stock(symbol: str, score: float) -> stock_tsmom.RankedStock:
+        return stock_tsmom.RankedStock(
+            symbol=symbol,
+            score=score,
+            residual_sum=0.1,
+            residual_volatility=0.05,
+            beta_market=1.0,
+            beta_smb=0.0,
+            beta_hml=0.0,
+            r_squared=0.5,
+            latest_price=110.0,
+            median_daily_turnover_inr=1_000_000.0,
+        )
+
+    def _entry_inputs(
+        self,
+        weekly_direction: int = 1,
+        daily_direction: int = 1,
+        cross_age: int = 0,
+    ) -> tuple[pd.DataFrame, stock_tsmom.SupertrendReading, stock_tsmom.CrossoverState]:
+        index = pd.bdate_range("2025-01-01", periods=80)
+        close = np.linspace(100.0, 110.0, len(index))
+        daily = self._prices(close, index=index)
+        daily["volume"] = 1_000.0
+        daily.iloc[-1, daily.columns.get_loc("volume")] = 1_300.0
+        weekly = stock_tsmom.SupertrendState(
+            timeframe="weekly",
+            direction=weekly_direction,
+            value=108.0,
+            change_date=None,
+            bars_since_change=None,
+            flip_in_window=False,
+            first_resolved_date=index[0].date(),
+            bars=16,
+        )
+        daily_st = stock_tsmom.SupertrendState(
+            timeframe="daily",
+            direction=daily_direction,
+            value=108.0,
+            change_date=None,
+            bars_since_change=None,
+            flip_in_window=False,
+            first_resolved_date=index[0].date(),
+            bars=len(index),
+        )
+        cross_date = index[-1 - cross_age].date()
+        crossover = stock_tsmom.CrossoverState(
+            direction=1,
+            jma_value=109.0,
+            dwma_value=108.0,
+            difference=1.0,
+            change_date=cross_date,
+            days_since_change=cross_age,
+            crossover_in_window=True,
+            first_scanned_date=index[0].date(),
+            scanned_bars=len(index) - 10,
+            daily_bars=len(index),
+            crossover_count=1,
+            last_crossover_type=1,
+            last_crossover_jma_value=109.0,
+            last_crossover_dwma_value=108.0,
+        )
+        return daily, stock_tsmom.SupertrendReading(weekly=weekly, daily=daily_st), crossover
+
+    def test_entry_screen_buy_requires_all_five_technical_rules(self) -> None:
+        daily, supertrend, crossover = self._entry_inputs()
+        candidate = stock_tsmom.classify_entry_candidate(
+            self._candidate_stock("BUYME", 7.2), daily, supertrend, crossover
+        )
+        self.assertEqual(candidate.classification, "BUY")
+        self.assertTrue(candidate.fresh_positive_cross)
+        self.assertEqual(candidate.weekly_supertrend, "POS")
+        self.assertEqual(candidate.crossover_type, "Positive")
+        self.assertGreater(candidate.close, candidate.ema20)
+        self.assertGreaterEqual(candidate.volume_multiple, 1.2)
+        self.assertLessEqual(candidate.close, 1.08 * candidate.ema20)
+
+    def test_entry_screen_watch_and_avoid_wait_rules(self) -> None:
+        daily, supertrend, old_cross = self._entry_inputs(cross_age=1)
+        watch = stock_tsmom.classify_entry_candidate(
+            self._candidate_stock("WATCHME", 6.5), daily, supertrend, old_cross
+        )
+        self.assertEqual(watch.classification, "WATCH")
+        self.assertIn("No Positive JMA/DWMA cross on the latest session", watch.reasons)
+
+        negative_weekly = stock_tsmom.SupertrendState(
+            timeframe="weekly",
+            direction=-1,
+            value=112.0,
+            change_date=pd.Timestamp("2025-07-01").date(),
+            bars_since_change=1,
+            flip_in_window=True,
+            first_resolved_date=pd.Timestamp("2024-01-01").date(),
+            bars=80,
+        )
+        avoid = stock_tsmom.classify_entry_candidate(
+            self._candidate_stock("AVOIDME", 8.0),
+            daily,
+            stock_tsmom.SupertrendReading(weekly=negative_weekly, daily=supertrend.daily),
+            old_cross,
+        )
+        self.assertEqual(avoid.classification, "AVOID/WAIT")
+        self.assertIn("Weekly Supertrend is NEG", avoid.reasons)
+
+        positive_weekly_negative_daily = replace(
+            supertrend,
+            daily=replace(supertrend.daily, direction=-1),
+        )
+        deteriorating = stock_tsmom.classify_entry_candidate(
+            self._candidate_stock("DAILYNEG", 6.8), daily, positive_weekly_negative_daily, old_cross
+        )
+        self.assertEqual(deteriorating.classification, "AVOID/WAIT")
+        self.assertIn("Daily Supertrend is NEG", deteriorating.reasons)
+
+        overextended_daily = daily.copy()
+        overextended_daily.iloc[-1, overextended_daily.columns.get_loc("close")] = 120.0
+        overextended = stock_tsmom.classify_entry_candidate(
+            self._candidate_stock("EXTENDED", 6.2), overextended_daily, supertrend, old_cross
+        )
+        self.assertEqual(overextended.classification, "WATCH")
+        self.assertTrue(any("more than 8% above EMA20" in reason for reason in overextended.reasons))
+
+    def test_entry_screen_uses_all_score_qualified_stocks_and_prints_after_review(self) -> None:
+        daily, supertrend, crossover = self._entry_inputs()
+        stocks = [self._candidate_stock("QUALIFIED", 7.0), self._candidate_stock("LOW", 5.9)]
+        candidates, below = stock_tsmom.screen_entry_candidates(
+            stocks,
+            prices={"QUALIFIED": daily},
+            supertrend_states={"QUALIFIED": supertrend},
+            crossover_states={"QUALIFIED": crossover},
+        )
+        self.assertEqual(below, 1)
+        self.assertEqual([candidate.symbol for candidate in candidates], ["QUALIFIED"])
+        self.assertEqual(candidates[0].classification, "BUY")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            stock_tsmom.print_entry_candidate_screen(candidates, screened_count=2, below_score_threshold=1)
+        rendered = output.getvalue()
+        self.assertIn("ENTRY CANDIDATE REVIEW", rendered)
+        self.assertIn("BUY rules", rendered)
+        self.assertIn("QUALIFIED", rendered)
+        self.assertIn("BUY 1 / WATCH 0 / AVOID/WAIT 0", rendered)
 
 
 if __name__ == "__main__":
