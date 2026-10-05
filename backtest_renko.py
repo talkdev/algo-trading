@@ -28,7 +28,7 @@ import math
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
@@ -674,6 +674,22 @@ class SessionBaseline:
     allow_short: bool = True
 
 
+@dataclass
+class DayDiagnostics:
+    trade_date: date
+    bricks_total: int = 0
+    signal_flips: int = 0
+    filtered_out_of_window: int = 0
+    filtered_regime: int = 0
+    filtered_cooldown: int = 0
+    filtered_same_pos: int = 0
+    entries_taken: int = 0
+    stop_hits: int = 0
+    square_offs: int = 0
+    signal_reversals: int = 0
+    signal_exits: int = 0
+
+
 class FractionalRenkoEngine:
     """Pre-market ATR → locked fractional brick → synthetic Renko Supertrend.
 
@@ -1197,14 +1213,15 @@ class Backtester:
         trade_date: date,
         minute_bars: pd.DataFrame,
         baseline: SessionBaseline,
-    ) -> list[Trade]:
+    ) -> tuple[list[Trade], DayDiagnostics]:
+        diag = DayDiagnostics(trade_date=trade_date)
         if minute_bars.empty:
-            return []
+            return [], diag
         day_bars = minute_bars.sort_index().copy()
         bricks = self.engine.run_session(day_bars, baseline)
         if bricks.empty:
             LOG.debug("%s: no Renko bricks formed", trade_date)
-            return []
+            return [], diag
         confirm = max(int(self.settings.confirm_bricks or 1), 1)
         if confirm > 1 and "trend" in bricks.columns:
             bricks = bricks.copy()
@@ -1212,6 +1229,9 @@ class Backtester:
                 bricks["trend"].to_numpy(dtype=int), confirm
             )
         signals = self._collapse_signals(bricks)
+        diag.bricks_total = int(len(bricks))
+        if not signals.empty and "signal" in signals.columns:
+            diag.signal_flips = int((signals["signal"].astype(int) != 0).sum())
         so_ts, so_px = self._square_off_price(day_bars)
         so_minutes = so_ts.hour * 60 + so_ts.minute
 
@@ -1245,9 +1265,16 @@ class Backtester:
                 )
             )
             if reason == "STOP":
+                diag.stop_hits += 1
                 cooldown_until = ts + timedelta(
                     minutes=max(int(self.settings.stop_cooldown_minutes or 0), 0)
                 )
+            elif reason == "SQUARE_OFF_1520":
+                diag.square_offs += 1
+            elif reason == "SIGNAL_REVERSE":
+                diag.signal_reversals += 1
+            elif reason == "SIGNAL_EXIT":
+                diag.signal_exits += 1
             position = 0
             entry_time = None
 
@@ -1276,10 +1303,14 @@ class Backtester:
                     # Stopped on this bar — do not reverse on the same print.
                     continue
             signal = int(row.signal)
-            if signal == 0 or signal == position:
+            if signal == 0:
+                continue
+            if signal == position:
+                diag.filtered_same_pos += 1
                 continue
             # Outside the entry window: hold; stop + 15:20 square-off own the exit.
             if not self._in_entry_window(ts):
+                diag.filtered_out_of_window += 1
                 continue
             raw_px = float(row.close)
             with_trend = (
@@ -1294,21 +1325,34 @@ class Backtester:
                     "SIGNAL_EXIT" if not with_trend else "SIGNAL_REVERSE",
                 )
                 if not with_trend:
+                    diag.filtered_regime += 1
                     continue
             if signal not in (1, -1):
                 continue
             if not with_trend:
+                diag.filtered_regime += 1
                 continue
             if cooldown_until is not None and ts < cooldown_until:
+                diag.filtered_cooldown += 1
                 continue
             position = signal
             entry_time = ts
             entry_raw = raw_px
+            diag.entries_taken += 1
 
         if position != 0 and entry_time is not None:
             if not try_stop(so_ts):
                 close_now(so_ts, so_px, "SQUARE_OFF_1520")
-        return trades
+        # Flips at/after square-off were never offered to the entry filters.
+        if not signals.empty:
+            for row in signals.itertuples(index=False):
+                if int(row.signal) == 0:
+                    continue
+                ts = self._to_datetime(row.timestamp)
+                t_min = ts.hour * 60 + ts.minute
+                if t_min >= so_minutes:
+                    diag.filtered_out_of_window += 1
+        return trades, diag
 
     def run(
         self,
@@ -1317,7 +1361,7 @@ class Backtester:
         start: date,
         end: date,
         holidays: Optional[set[date]] = None,
-    ) -> tuple[list[Trade], list[SessionBaseline]]:
+    ) -> tuple[list[Trade], list[SessionBaseline], list[DayDiagnostics]]:
         if minutes.empty:
             raise StrategyError("No 1-minute history to backtest")
         sessions = daterange_trading_days(start, end, holidays)
@@ -1333,6 +1377,7 @@ class Backtester:
 
         trades: list[Trade] = []
         baselines: list[SessionBaseline] = []
+        diagnostics: list[DayDiagnostics] = []
         for d in sessions:
             day_mask = session_dates == d
             day_bars = minutes.loc[day_mask]
@@ -1347,7 +1392,8 @@ class Backtester:
                 LOG.warning("Skipping %s: %s", d, exc)
                 continue
             baselines.append(baseline)
-            day_trades = self.run_day(d, day_bars, baseline)
+            day_trades, day_diag = self.run_day(d, day_bars, baseline)
+            diagnostics.append(day_diag)
             bias = (
                 "LONG"
                 if baseline.allow_long and not baseline.allow_short
@@ -1366,7 +1412,7 @@ class Backtester:
                 len(day_trades),
             )
             trades.extend(day_trades)
-        return trades, baselines
+        return trades, baselines, diagnostics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1558,6 +1604,7 @@ class PerformanceReporter:
         baselines: Sequence[SessionBaseline] | None = None,
         settings: Optional[BacktestSettings] = None,
         source: str = "",
+        diagnostics: Sequence[DayDiagnostics] | None = None,
     ) -> None:
         width = 78
         bar = "═" * width
@@ -1596,6 +1643,8 @@ class PerformanceReporter:
                 f"Brick μ={np.mean(bricks):.3f}  "
                 f"[{min(bricks):.3f} – {max(bricks):.3f}]"
             )
+        if diagnostics:
+            print_attrition_summary(diagnostics)
         print(thin)
         metrics = report.to_dict()
         keys = list(metrics.keys())
@@ -1874,7 +1923,10 @@ def run_self_tests() -> int:
     unique_days = sorted(set(pd.DatetimeIndex(minute_s.index).tz_convert(IST_ZONE).date))
     trade_start = unique_days[22]
     bt = Backtester(engine, settings)
-    trades, bases = bt.run(daily_s, minute_s, trade_start, end, holidays)
+    trades, bases, diags = bt.run(daily_s, minute_s, trade_start, end, holidays)
+    _assert(len(diags) == len(bases), "diagnostics/session mismatch")
+    _assert(sum(d.entries_taken for d in diags) == len(trades), "entries_taken != trades")
+    _assert(all(d.signal_flips >= 0 for d in diags), "negative flips")
     reporter = PerformanceReporter(capital=settings.capital)
     report = reporter.build(trades)
     _assert(report.total_trades == len(trades), "trade count mismatch")
@@ -1934,6 +1986,327 @@ def run_self_tests() -> int:
     return 0
 
 
+def print_attrition_summary(diagnostics: Sequence[DayDiagnostics]) -> None:
+    flips = sum(d.signal_flips for d in diagnostics)
+    out_w = sum(d.filtered_out_of_window for d in diagnostics)
+    regime = sum(d.filtered_regime for d in diagnostics)
+    cool = sum(d.filtered_cooldown for d in diagnostics)
+    same = sum(d.filtered_same_pos for d in diagnostics)
+    taken = sum(d.entries_taken for d in diagnostics)
+
+    def pct(n: int) -> str:
+        return f"{(n / flips * 100.0):.0f}%" if flips else "n/a"
+
+    print("  Signal attrition (all sessions)")
+    print(f"    Flips seen            : {flips}")
+    print(f"    └ outside entry window: {out_w}  ({pct(out_w)})")
+    print(f"    └ against SMA regime  : {regime}  ({pct(regime)})")
+    print(f"    └ inside stop cooldown: {cool}  ({pct(cool)})")
+    print(f"    └ same as open pos    : {same}  ({pct(same)})")
+    print(f"    Entries taken         : {taken}")
+
+
+def _exit_counts(report: PerformanceReport) -> dict[str, int]:
+    if report.trade_log is None or report.trade_log.empty or "Reason" not in report.trade_log.columns:
+        return {
+            "STOP": 0,
+            "SIGNAL_REVERSE": 0,
+            "SIGNAL_EXIT": 0,
+            "SQUARE_OFF_1520": 0,
+        }
+    vc = report.trade_log["Reason"].astype(str).value_counts().to_dict()
+    return {
+        "STOP": int(vc.get("STOP", 0)),
+        "SIGNAL_REVERSE": int(vc.get("SIGNAL_REVERSE", 0)),
+        "SIGNAL_EXIT": int(vc.get("SIGNAL_EXIT", 0)),
+        "SQUARE_OFF_1520": int(vc.get("SQUARE_OFF_1520", 0)),
+    }
+
+
+IN_SAMPLE_GATES = "IN_SAMPLE"
+OOS_GATES = "OOS"
+
+
+def evaluate_gates(
+    report: PerformanceReport,
+    diagnostics: Sequence[DayDiagnostics],
+    gates: str = IN_SAMPLE_GATES,
+) -> dict[str, tuple[bool, Any, str]]:
+    """Return {gate_name: (passed, observed, threshold)}."""
+    exits = _exit_counts(report)
+    n = int(report.total_trades)
+    non_so = n - int(exits["SQUARE_OFF_1520"])
+    pf = report.profit_factor
+    if gates == OOS_GATES:
+        specs: list[tuple[str, bool, Any, str]] = [
+            ("Total Trades (OOS)", n >= 10, n, ">=10"),
+            ("Net P&L (OOS)", report.net_pnl > 0, round(report.net_pnl, 2), ">0"),
+            (
+                "Profit Factor (OOS)",
+                math.isfinite(pf) and pf >= 1.10 or (not math.isfinite(pf) and pf > 0),
+                (round(pf, 3) if math.isfinite(pf) else "inf"),
+                ">=1.10",
+            ),
+            (
+                "Max Drawdown % (OOS)",
+                report.max_drawdown_pct <= 20.0,
+                round(report.max_drawdown_pct, 2),
+                "<=20",
+            ),
+        ]
+    else:
+        hold_ok = 30.0 <= float(report.avg_hold_min) <= 240.0
+        pf_ok = (math.isfinite(pf) and pf >= 1.30) or (
+            not math.isfinite(pf) and pf > 0
+        )
+        specs = [
+            ("Total Trades", n >= 30, n, ">=30"),
+            (
+                "Profit Factor",
+                pf_ok,
+                (round(pf, 3) if math.isfinite(pf) else "inf"),
+                ">=1.30",
+            ),
+            ("Net P&L (₹)", report.net_pnl > 0, round(report.net_pnl, 2), ">0"),
+            (
+                "Max Drawdown %",
+                report.max_drawdown_pct <= 15.0,
+                round(report.max_drawdown_pct, 2),
+                "<=15.0",
+            ),
+            (
+                "Avg Hold (min)",
+                hold_ok,
+                round(float(report.avg_hold_min), 1),
+                ">=30 and <=240",
+            ),
+            (
+                "Non-square-off exits",
+                non_so >= 0.25 * n if n else False,
+                non_so,
+                ">=0.25 * total_trades",
+            ),
+        ]
+    return {name: (passed, observed, thresh) for name, passed, observed, thresh in specs}
+
+
+def gates_pass(result: dict[str, tuple[bool, Any, str]]) -> bool:
+    return all(v[0] for v in result.values())
+
+
+def print_gate_table(result: dict[str, tuple[bool, Any, str]], title: str = "In-sample gates") -> None:
+    print(f"  {title}")
+    for name, (passed, observed, thresh) in result.items():
+        mark = "PASS" if passed else "FAIL"
+        print(f"    {name:<24} {str(observed):>12}  need {thresh:<22} {mark}")
+    print(f"  GATE: {'PASS' if gates_pass(result) else 'FAIL'}")
+
+
+GRID_SPECS: list[tuple[str, str, dict[str, Any]]] = [
+    ("G0", "(baseline)", {}),
+    ("G1", "--sma-period 0", {"sma_period": 0}),
+    (
+        "G2",
+        "--sma-period 0 --target-minutes 30",
+        {"sma_period": 0, "target_minutes": 30},
+    ),
+    (
+        "G3",
+        "--sma-period 0 --target-minutes 20",
+        {"sma_period": 0, "target_minutes": 20},
+    ),
+    (
+        "G4",
+        "--sma-period 0 --target-minutes 30 --stop-atr-mult 1.0",
+        {"sma_period": 0, "target_minutes": 30, "stop_atr_mult": 1.0},
+    ),
+    (
+        "G5",
+        "--sma-period 0 --target-minutes 30 --stop-atr-mult 1.5",
+        {"sma_period": 0, "target_minutes": 30, "stop_atr_mult": 1.5},
+    ),
+    (
+        "G6",
+        "--sma-period 10 --target-minutes 30",
+        {"sma_period": 10, "target_minutes": 30},
+    ),
+    (
+        "G7",
+        "--sma-period 0 --target-minutes 30 --confirm-bricks 2",
+        {"sma_period": 0, "target_minutes": 30, "confirm_bricks": 2},
+    ),
+    (
+        "G8",
+        "--sma-period 0 --target-minutes 30 --entry-start 10:00 --entry-end 14:00",
+        {
+            "sma_period": 0,
+            "target_minutes": 30,
+            "entry_start": dtime(10, 0),
+            "entry_end": dtime(14, 0),
+        },
+    ),
+]
+
+
+def apply_grid_overrides(base: BacktestSettings, overrides: dict[str, Any]) -> BacktestSettings:
+    kw: dict[str, Any] = {}
+    if "sma_period" in overrides:
+        kw["sma_filter_period"] = int(overrides["sma_period"])
+    if "target_minutes" in overrides:
+        kw["fractional_divisor"] = SESSION_MINUTES / max(int(overrides["target_minutes"]), 1)
+    if "stop_atr_mult" in overrides:
+        kw["stop_atr_mult"] = float(overrides["stop_atr_mult"])
+    if "confirm_bricks" in overrides:
+        kw["confirm_bricks"] = int(overrides["confirm_bricks"])
+    if "entry_start" in overrides:
+        kw["entry_start"] = overrides["entry_start"]
+    if "entry_end" in overrides:
+        kw["entry_end"] = overrides["entry_end"]
+    return replace(base, **kw) if kw else base
+
+
+def _run_config(
+    settings: BacktestSettings,
+    daily: pd.DataFrame,
+    minutes: pd.DataFrame,
+    from_date: date,
+    to_date: date,
+    holidays: set[date],
+) -> tuple[list[Trade], list[SessionBaseline], list[DayDiagnostics], PerformanceReport, float]:
+    t0 = time.monotonic()
+    engine = FractionalRenkoEngine(settings)
+    bt = Backtester(engine, settings)
+    trades, baselines, diags = bt.run(daily, minutes, from_date, to_date, holidays)
+    reporter = PerformanceReporter(capital=settings.capital)
+    report = reporter.build(trades)
+    elapsed = time.monotonic() - t0
+    return trades, baselines, diags, report, elapsed
+
+
+def grid_row_dict(
+    gid: str,
+    flags: str,
+    report: PerformanceReport,
+    diags: Sequence[DayDiagnostics],
+    elapsed: float,
+    gate_label: str,
+) -> dict[str, Any]:
+    exits = _exit_counts(report)
+    pf = report.profit_factor
+    return {
+        "id": gid,
+        "flags": flags,
+        "total_trades": report.total_trades,
+        "win_rate_pct": round(report.win_rate_pct, 4),
+        "gross_pnl": round(report.gross_pnl, 2),
+        "net_pnl": round(report.net_pnl, 2),
+        "profit_factor": (round(pf, 4) if math.isfinite(pf) else "inf"),
+        "max_dd_pct": round(report.max_drawdown_pct, 4),
+        "max_dd_rupees": round(report.max_drawdown_rupees, 2),
+        "sharpe": (round(report.sharpe_ratio, 4) if math.isfinite(report.sharpe_ratio) else "inf"),
+        "avg_hold_min": round(float(report.avg_hold_min), 2),
+        "avg_qty": round(float(report.avg_qty), 4),
+        "exits_stop": exits["STOP"],
+        "exits_signal_reverse": exits["SIGNAL_REVERSE"],
+        "exits_signal_exit": exits["SIGNAL_EXIT"],
+        "exits_square_off": exits["SQUARE_OFF_1520"],
+        "flips_seen": sum(d.signal_flips for d in diags),
+        "filtered_out_of_window": sum(d.filtered_out_of_window for d in diags),
+        "filtered_regime": sum(d.filtered_regime for d in diags),
+        "filtered_cooldown": sum(d.filtered_cooldown for d in diags),
+        "run_seconds": round(elapsed, 3),
+        "in_sample_gate": gate_label,
+    }
+
+
+def run_grid(
+    base_settings: BacktestSettings,
+    daily: pd.DataFrame,
+    minutes: pd.DataFrame,
+    from_date: date,
+    to_date: date,
+    holidays: set[date],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    print()
+    print(f"GRID  {from_date} → {to_date}  ({len(GRID_SPECS)} configs, one fetch)")
+    for gid, flags, overrides in GRID_SPECS:
+        settings = apply_grid_overrides(base_settings, overrides)
+        _trades, _base, diags, report, elapsed = _run_config(
+            settings, daily, minutes, from_date, to_date, holidays
+        )
+        gate = evaluate_gates(report, diags, IN_SAMPLE_GATES)
+        label = "PASS" if gates_pass(gate) else "FAIL"
+        row = grid_row_dict(gid, flags, report, diags, elapsed, label)
+        rows.append(row)
+        print()
+        print(f"  {gid}  {flags}  [{label}]  {elapsed:.1f}s")
+        print(
+            f"    trades={report.total_trades}  win={report.win_rate_pct:.2f}%  "
+            f"net=₹{report.net_pnl:.2f}  PF={row['profit_factor']}  "
+            f"DD={report.max_drawdown_pct:.2f}%  hold={report.avg_hold_min:.1f}m"
+        )
+        print_gate_table(gate)
+    df = pd.DataFrame(rows)
+    stamp = now_ist().strftime("%Y%m%d_%H%M%S")
+    path = RESULTS_DIR / f"renko_grid_{stamp}.csv"
+    df.to_csv(path, index=False)
+    print()
+    print(f"Grid CSV → {path}")
+    print(df.to_string(index=False))
+    return df
+
+
+def run_walk_forward(
+    gid: str,
+    base_settings: BacktestSettings,
+    daily: pd.DataFrame,
+    minutes: pd.DataFrame,
+    holidays: set[date],
+) -> str:
+    spec = next((s for s in GRID_SPECS if s[0] == gid), None)
+    if spec is None:
+        raise StrategyError(f"Unknown grid id {gid}")
+    _gid, flags, overrides = spec
+    settings = apply_grid_overrides(base_settings, overrides)
+    is_from, is_to = date(2026, 4, 1), date(2026, 6, 30)
+    oos_from, oos_to = date(2026, 7, 1), date(2026, 9, 30)
+    _t, _b, is_diag, is_report, _ = _run_config(
+        settings, daily, minutes, is_from, is_to, holidays
+    )
+    _t, _b, oos_diag, oos_report, _ = _run_config(
+        settings, daily, minutes, oos_from, oos_to, holidays
+    )
+    oos_gate = evaluate_gates(oos_report, oos_diag, OOS_GATES)
+    verdict = "PASS" if gates_pass(oos_gate) else "FAIL"
+    is_pf = is_report.profit_factor
+    oos_pf = oos_report.profit_factor
+
+    def fmt_pf(x: float) -> str:
+        return f"{x:.2f}" if math.isfinite(x) else "inf"
+
+    lines = [
+        f"  Walk-forward: {gid}",
+        f"  flags: {flags}",
+        "  ────────────────────────────────────────────────────────",
+        f"  {'Metric':<20} {'In-sample':>12} {'Out-of-sample':>16}   Gate",
+        f"  {'Total Trades':<20} {is_report.total_trades:>12} {oos_report.total_trades:>16}   >=10",
+        f"  {'Net P&L (₹)':<20} {is_report.net_pnl:>12.2f} {oos_report.net_pnl:>16.2f}   >0",
+        f"  {'Profit Factor':<20} {fmt_pf(is_pf):>12} {fmt_pf(oos_pf):>16}   >=1.10",
+        f"  {'Max DD %':<20} {is_report.max_drawdown_pct:>12.1f} {oos_report.max_drawdown_pct:>16.1f}   <=20",
+        "  ────────────────────────────────────────────────────────",
+        f"  VERDICT: {verdict}",
+    ]
+    if verdict == "FAIL":
+        lines.append("  Do not re-tune on the out-of-sample window.")
+    text = "\n".join(lines)
+    print()
+    print(text)
+    print()
+    return text
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI / MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1988,6 +2361,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--seed", type=int, default=42, help="Synthetic RNG seed")
+    p.add_argument("--grid", action="store_true", help="Run the fixed 9-row diagnostic grid")
+    p.add_argument(
+        "--walk-forward",
+        default=None,
+        metavar="ID",
+        help="Walk-forward a grid id (G0–G8) on frozen IS/OOS windows",
+    )
     return p.parse_args(argv)
 
 
@@ -2083,7 +2463,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
 
     holidays = load_nse_holidays()
-    if args.from_date and args.to_date:
+    if args.walk_forward:
+        from_date, to_date = date(2026, 4, 1), date(2026, 9, 30)
+    elif args.from_date and args.to_date:
         from_date, to_date = args.from_date, args.to_date
     elif args.from_date:
         from_date, to_date = args.from_date, today_ist()
@@ -2138,17 +2520,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     LOG.info("Daily bars=%d  1-minute bars=%d  source=%s", len(daily), len(minutes), source)
+
+    if args.grid:
+        try:
+            run_grid(settings, daily, minutes, from_date, to_date, holidays)
+        except StrategyError as exc:
+            LOG.error("%s", exc)
+            return 3
+        return 0
+
+    if args.walk_forward:
+        try:
+            run_walk_forward(
+                str(args.walk_forward).upper(),
+                settings,
+                daily,
+                minutes,
+                holidays,
+            )
+        except StrategyError as exc:
+            LOG.error("%s", exc)
+            return 3
+        return 0
+
     engine = FractionalRenkoEngine(settings)
     bt = Backtester(engine, settings)
     try:
-        trades, baselines = bt.run(daily, minutes, from_date, to_date, holidays)
+        trades, baselines, diagnostics = bt.run(
+            daily, minutes, from_date, to_date, holidays
+        )
     except StrategyError as exc:
         LOG.error("%s", exc)
         return 3
 
     reporter = PerformanceReporter(capital=settings.capital)
     report = reporter.build(trades)
-    reporter.print_tearsheet(report, baselines, settings, source=source)
+    reporter.print_tearsheet(
+        report, baselines, settings, source=source, diagnostics=diagnostics
+    )
     try:
         reporter.save(report)
     except OSError as exc:
