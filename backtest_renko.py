@@ -10,6 +10,7 @@ Run:
     python backtest_renko.py
     python backtest_renko.py --from-date 2026-08-01 --to-date 2026-09-30
     python backtest_renko.py --synthetic --days 20 --cash-to-lose 2000
+    python backtest_renko.py --from-date 2026-08-01 --to-date 2026-09-30 --realistic
     python backtest_renko.py --self-test
 
 Credentials are read from a local ``env.txt`` (never from OS environment)::
@@ -115,12 +116,16 @@ class BacktestSettings:
     cash_to_lose: float = DEFAULT_CASH_TO_LOSE
     capital: float = DEFAULT_CAPITAL
     slippage_pct: float = SLIPPAGE_PCT
+    slippage_points: float = 0.0  # if >0, absolute pts replace the % penalty
     supertrend_multiplier: float = SUPERTREND_MULTIPLIER
     atr_lookback: int = ATR_LOOKBACK
     fractional_divisor: float = FRACTIONAL_DIVISOR
     session_start: dtime = SESSION_START
     session_end: dtime = SESSION_END
     square_off: dtime = SQUARE_OFF
+    open_buffer_minutes: int = 0
+    entry_cutoff: Optional[dtime] = None
+    confirm_bricks: int = 1
     lot_size: int = 1
     request_timeout: float = 30.0
     max_retries: int = 4
@@ -934,9 +939,13 @@ class Trade:
             "Qty": self.quantity,
             "Gross_PnL": round(self.pnl_gross, 2),
             "Slippage": round(self.slippage_impact, 2),
+            "Gross_Pts": round(self.direction * (self.exit_price_raw - self.entry_price_raw), 2),
             "Reason": self.reason,
             "Brick_Size": round(self.brick_size, 4),
             "Date": self.trade_date.isoformat(),
+            "Hold_Min": round(
+                (self.exit_time - self.entry_time).total_seconds() / 60.0, 1
+            ),
         }
 
 
@@ -952,11 +961,16 @@ class Backtester:
         self.engine = engine or FractionalRenkoEngine(self.settings)
 
     def _slip(self, price: float, direction: int, is_entry: bool) -> float:
-        """0.05% penalty against the trader on every fill."""
-        pct = self.settings.slippage_pct
+        """Penalty against the trader on every fill.
+
+        ``slippage_points > 0`` wins (Nifty-realistic ticks). Otherwise the
+        fractional ``slippage_pct`` (default 0.05%) is applied.
+        """
+        pts = float(self.settings.slippage_points or 0.0)
+        delta = pts if pts > 0 else abs(price) * float(self.settings.slippage_pct)
         if is_entry:
-            return price * (1.0 + pct) if direction == 1 else price * (1.0 - pct)
-        return price * (1.0 - pct) if direction == 1 else price * (1.0 + pct)
+            return price + delta if direction == 1 else price - delta
+        return price - delta if direction == 1 else price + delta
 
     @staticmethod
     def _bar_time(ts: Any) -> dtime:
@@ -1000,6 +1014,27 @@ class Backtester:
         changed = (last["trend"] != last["trend_prev"]) & (last["trend"] != 0)
         last.loc[changed, "signal"] = last.loc[changed, "trend"].astype(int)
         return last.reset_index(drop=True)
+
+    @staticmethod
+    def _confirm_trend(trend: np.ndarray, confirm: int) -> np.ndarray:
+        """Hold a new Supertrend state until ``confirm`` consecutive bricks agree."""
+        n = int(confirm)
+        if n <= 1 or len(trend) == 0:
+            return trend
+        out = np.zeros(len(trend), dtype=int)
+        run = 0
+        last = 0
+        held = 0
+        for i, t in enumerate(int(x) for x in trend):
+            if t != 0 and t == last:
+                run += 1
+            else:
+                run = 1 if t != 0 else 0
+                last = t
+            if t != 0 and run >= n:
+                held = t
+            out[i] = held
+        return out
 
     def _square_off_price(self, minute_bars: pd.DataFrame) -> tuple[datetime, float]:
         if minute_bars.empty:
@@ -1067,9 +1102,25 @@ class Backtester:
         if bricks.empty:
             LOG.debug("%s: no Renko bricks formed", trade_date)
             return []
+        confirm = max(int(self.settings.confirm_bricks or 1), 1)
+        if confirm > 1 and "trend" in bricks.columns:
+            bricks = bricks.copy()
+            bricks["trend"] = self._confirm_trend(
+                bricks["trend"].to_numpy(dtype=int), confirm
+            )
         signals = self._collapse_signals(bricks)
         so_ts, so_px = self._square_off_price(day_bars)
         so_minutes = so_ts.hour * 60 + so_ts.minute
+        sess_start = self.settings.session_start
+        open_floor = (
+            sess_start.hour * 60
+            + sess_start.minute
+            + max(int(self.settings.open_buffer_minutes or 0), 0)
+        )
+        cutoff = self.settings.entry_cutoff
+        entry_limit = (
+            cutoff.hour * 60 + cutoff.minute if cutoff is not None else so_minutes
+        )
 
         trades: list[Trade] = []
         position = 0
@@ -1083,6 +1134,8 @@ class Backtester:
             t_min = ts.hour * 60 + ts.minute
             if t_min >= so_minutes:
                 break
+            if t_min < open_floor:
+                continue
             signal = int(row.signal)
             if signal == 0 or signal == position:
                 continue
@@ -1104,7 +1157,7 @@ class Backtester:
                 )
                 position = 0
                 entry_time = None
-            if signal in (1, -1):
+            if signal in (1, -1) and t_min < entry_limit:
                 position = signal
                 entry_time = ts
                 entry_raw = raw_px
@@ -1201,6 +1254,11 @@ class PerformanceReport:
     trade_log: pd.DataFrame
     equity_curve: pd.Series
     daily_pnl: pd.Series
+    gross_points: float = 0.0
+    avg_slippage: float = 0.0
+    scratch_trades: int = 0
+    avg_hold_min: float = 0.0
+    avg_qty: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1211,6 +1269,7 @@ class PerformanceReport:
             "Gross P&L (₹)": round(self.gross_pnl, 2),
             "Slippage Impact (₹)": round(self.slippage_impact, 2),
             "Net P&L (₹)": round(self.net_pnl, 2),
+            "Gross P&L (pts)": round(self.gross_points, 2),
             "Profit Factor": round(self.profit_factor, 3)
             if math.isfinite(self.profit_factor)
             else "n/a",
@@ -1313,6 +1372,17 @@ class PerformanceReporter:
             index=pd.to_datetime([t.exit_time for t in trades]),
             name="equity",
         )
+        holds = np.array(
+            [
+                (t.exit_time - t.entry_time).total_seconds() / 60.0
+                for t in trades
+            ],
+            dtype=float,
+        )
+        rets = np.array([t.return_pct for t in trades], dtype=float)
+        # Scratches: losers whose whole return is inside a 0.12% cost band
+        # (round-trip 0.05%+0.05% prints at -0.10%).
+        scratch = int(np.sum((rets < 0) & (np.abs(rets) <= 0.12)))
         return PerformanceReport(
             total_trades=n,
             winning_trades=win_n,
@@ -1334,6 +1404,11 @@ class PerformanceReporter:
             trade_log=log_df,
             equity_curve=equity_s,
             daily_pnl=daily,
+            gross_points=float(pts.sum()),
+            avg_slippage=float(slip.mean()) if n else 0.0,
+            scratch_trades=scratch,
+            avg_hold_min=float(holds.mean()) if n else 0.0,
+            avg_qty=float(np.mean([t.quantity for t in trades])) if n else 0.0,
         )
 
     def print_tearsheet(
@@ -1351,14 +1426,26 @@ class PerformanceReporter:
         print("  FRACTIONAL ATR RENKO SUPERTREND  —  STRATEGY TEAR-SHEET")
         print(bar)
         if settings:
+            if settings.slippage_points and settings.slippage_points > 0:
+                slip_txt = f"{settings.slippage_points:g} pts/fill"
+            else:
+                slip_txt = f"{settings.slippage_pct * 100:.3f}% per fill"
+            buf = settings.open_buffer_minutes
+            cutoff = (
+                settings.entry_cutoff.strftime("%H:%M")
+                if settings.entry_cutoff
+                else "square-off"
+            )
             print(
                 f"  Instrument     : {settings.instrument_key}\n"
                 f"  Cash to lose   : ₹{settings.cash_to_lose:,.2f}    "
                 f"Capital: ₹{settings.capital:,.2f}\n"
-                f"  Slippage       : {settings.slippage_pct * 100:.3f}% per fill    "
+                f"  Slippage       : {slip_txt}    "
                 f"ST multiplier: {settings.supertrend_multiplier:g}\n"
                 f"  Brick formula  : Daily_ATR_5 / {settings.fractional_divisor:g}    "
-                f"Square-off: {settings.square_off.strftime('%H:%M')} IST"
+                f"Square-off: {settings.square_off.strftime('%H:%M')} IST\n"
+                f"  Open buffer    : {buf} min    Entry cutoff: {cutoff}    "
+                f"Confirm bricks: {settings.confirm_bricks}"
             )
         if source:
             print(f"  Data source    : {source}")
@@ -1415,8 +1502,63 @@ class PerformanceReporter:
                     f"  … {len(show) - preview_n} more rows omitted from console "
                     "(full blotter written to CSV)."
                 )
+        self._print_cost_diagnosis(report, baselines, settings)
         print(bar)
         print()
+
+    def _print_cost_diagnosis(
+        self,
+        report: PerformanceReport,
+        baselines: Sequence[SessionBaseline] | None,
+        settings: Optional[BacktestSettings],
+    ) -> None:
+        if report.total_trades == 0:
+            return
+        thin = "─" * 78
+        print(thin)
+        print("  COST DIAGNOSIS")
+        mean_px = 0.0
+        if not report.trade_log.empty and "Entry_Price" in report.trade_log.columns:
+            mean_px = float(report.trade_log["Entry_Price"].mean())
+        brick_mu = (
+            float(np.mean([b.static_brick_size for b in baselines]))
+            if baselines
+            else 0.0
+        )
+        risk_mu = 2.0 * brick_mu if brick_mu else 0.0
+        if settings and settings.slippage_points and settings.slippage_points > 0:
+            fill_pts = float(settings.slippage_points)
+            model = f"{fill_pts:g} points/fill"
+        else:
+            pct = settings.slippage_pct if settings else SLIPPAGE_PCT
+            fill_pts = mean_px * pct
+            model = f"{pct * 100:.3f}% of spot ({fill_pts:.2f} pts/fill @ {mean_px:,.0f})"
+        rt_pts = 2.0 * fill_pts
+        friction_vs_risk = (rt_pts / risk_mu * 100.0) if risk_mu else 0.0
+        print(
+            f"  Cost model     : {model}\n"
+            f"  Round-trip     : {rt_pts:.2f} Nifty pts   "
+            f"Mean brick: {brick_mu:.2f}   PCR R: {risk_mu:.2f} pts\n"
+            f"  Friction / R   : {friction_vs_risk:.0f}% of intended per-trade risk\n"
+            f"  Avg slippage   : ₹{report.avg_slippage:,.0f}/trade   "
+            f"Avg hold: {report.avg_hold_min:.0f} min   "
+            f"Avg qty: {report.avg_qty:.0f}\n"
+            f"  Gross (pre-cost): ₹{report.gross_pnl:,.0f}  ({report.gross_points:+.1f} pts)    "
+            f"Friction: ₹{report.slippage_impact:,.0f}"
+        )
+        if (
+            settings
+            and (not settings.slippage_points)
+            and settings.slippage_pct >= 0.0004
+            and report.slippage_impact > abs(report.gross_pnl)
+        ):
+            print(
+                "  NOTE           : 0.05% of Nifty is ~12 pts/fill (~25 pts round-trip).\n"
+                "                   That is a stock-like penalty, not an index/fut tick.\n"
+                "                   Re-run with realistic Nifty friction:\n"
+                "                     python backtest_renko.py --from-date … --to-date … "
+                "--realistic"
+            )
 
     def save(self, report: PerformanceReport, prefix: str = "renko") -> Path:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1568,6 +1710,10 @@ def run_self_tests() -> int:
     slipped_sell = bt._slip(10_000.0, 1, False)
     _assert(abs(slipped_buy - 10_005.0) < 1e-9, slipped_buy)
     _assert(abs(slipped_sell - 9_995.0) < 1e-9, slipped_sell)
+    pts_settings = BacktestSettings(slippage_pct=0.0, slippage_points=1.5)
+    bt_pts = Backtester(engine, pts_settings)
+    _assert(abs(bt_pts._slip(24_500.0, 1, True) - 24_501.5) < 1e-9, "points slip long entry")
+    _assert(abs(bt_pts._slip(24_500.0, -1, True) - 24_498.5) < 1e-9, "points slip short entry")
     n_ok += 1
 
     # 9. End-to-end synthetic day produces a well-formed report
@@ -1635,6 +1781,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--capital", type=float, default=DEFAULT_CAPITAL)
     p.add_argument("--lot-size", type=int, default=1)
     p.add_argument("--slippage", type=float, default=SLIPPAGE_PCT, help="Fractional penalty (0.0005=0.05%)")
+    p.add_argument(
+        "--slippage-points",
+        type=float,
+        default=0.0,
+        help="If >0, use absolute Nifty points per fill instead of --slippage %%",
+    )
+    p.add_argument("--open-buffer", type=int, default=0, help="Skip signals in the first N minutes after 09:15")
+    p.add_argument("--entry-cutoff", default=None, help="HH:MM IST — no new entries after this (exits still fire)")
+    p.add_argument("--confirm-bricks", type=int, default=1, help="Bricks that must agree before a Supertrend flip trades")
+    p.add_argument(
+        "--realistic",
+        action="store_true",
+        help="Nifty-realistic costs: 1 pt/fill, 15-min open buffer, no entries after 15:00",
+    )
     p.add_argument("--multiplier", type=float, default=SUPERTREND_MULTIPLIER)
     p.add_argument("--env-file", type=Path, default=ENV_FILE)
     p.add_argument("--synthetic", action="store_true", help="Skip Upstox; use generated Nifty-like data")
@@ -1750,13 +1910,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("from-date must be on or before to-date", file=sys.stderr)
         return 2
 
+    entry_cutoff: Optional[dtime] = None
+    if args.entry_cutoff:
+        hh, mm = str(args.entry_cutoff).split(":")
+        entry_cutoff = dtime(int(hh), int(mm))
+    slippage_pct = float(args.slippage)
+    slippage_points = float(args.slippage_points or 0.0)
+    open_buffer = int(args.open_buffer or 0)
+    confirm_bricks = max(int(args.confirm_bricks or 1), 1)
+    if args.realistic:
+        slippage_pct = 0.0
+        if slippage_points <= 0:
+            slippage_points = 1.0
+        if open_buffer <= 0:
+            open_buffer = 15
+        if entry_cutoff is None:
+            entry_cutoff = dtime(15, 0)
     settings = BacktestSettings(
         instrument_key=args.instrument,
         cash_to_lose=float(args.cash_to_lose),
         capital=float(args.capital),
-        slippage_pct=float(args.slippage),
+        slippage_pct=slippage_pct,
+        slippage_points=slippage_points,
         supertrend_multiplier=float(args.multiplier),
         lot_size=max(int(args.lot_size), 1),
+        open_buffer_minutes=open_buffer,
+        entry_cutoff=entry_cutoff,
+        confirm_bricks=confirm_bricks,
     )
 
     print()
