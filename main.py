@@ -236,7 +236,7 @@ class MainEngine:
         """Print startup configuration banner."""
         # Build stamp: operator must see this matches tests/test_live_invariants.py
         # after every restart. Bump when hard-invariant policy changes.
-        _engine_build = "v65m56-thesis-dead-trail"
+        _engine_build = "v65m57-ctrlc-no-trade"
         print_section("NIFTY INTRADAY OPTIONS ALGO TRADING ENGINE v3.0", char="#")
         print_kv_table({
             "Engine Build":          _engine_build,
@@ -1335,6 +1335,11 @@ class MainEngine:
         Execute one complete trading cycle.
         Called every regime_calc_interval_sec (default 45s).
         """
+        # Ctrl+C / SIGTERM only flips running=False; bail before open/close
+        # so a manual stop cannot still trade while shutdown saves state.
+        if not self.running:
+            return
+
         # v65m7q / #6: mark alive for watchdog; phase-time slow cycles.
         _cyc_t0 = time_module.monotonic()
         self._cycle_in_progress = True
@@ -1377,6 +1382,16 @@ class MainEngine:
                 )
             self._cycle_in_progress = False
             raise
+
+        # Stop requested while data/regime ran — do not monitor or enter.
+        if not self.running:
+            self.logger.info(
+                "Stop requested mid-cycle — skipping monitor/entry/exit; "
+                "shutdown will save state and leave the book as-is "
+                "(unless stop-file flatten or past square-off deadline)."
+            )
+            self._cycle_in_progress = False
+            return
 
         # ── Step 4: Update cycle log + market snapshot with regime outputs ─
         _cyc_phase = "cycle_log"
@@ -1451,74 +1466,91 @@ class MainEngine:
             # the same moment: two live orders on one leg is the failure mode
             # every other part of this path exists to prevent.
             _cyc_phase = "monitor_entry"
-            with self._flatten_gate() as acting:
-                # ── Step 5: Monitor open positions ──────────────────────────
-                # IMPORTANT: positions are ALWAYS monitored regardless of regime
-                # ABORT only blocks new entries - never closes existing positions
-                if acting:
-                    self.execution_engine.monitor_all_positions(signals)
-
-                    # ── Step 6: Hard exit sweep ─────────────────────────────
-                    self.execution_engine.perform_hard_exit_sweep()
-
-                # ── Step 7: Daily loss halt check ───────────────────────────
-                # The halt action takes the flatten lock re-entrantly, so a
-                # flatten started here is serialised with the cycle exactly
-                # like the sweep.
-                self.check_daily_loss_halt()
-
-                # ── Step 8: Strategy decision and entry ─────────────────────
-                try:
-                    _late_cut = datetime.strptime(
-                        str(getattr(self.config, "momentum_late_window_end", "14:57")),
-                        "%H:%M",
-                    ).time()
-                except Exception:
-                    _late_cut = dtime(14, 57)
-                _entry_cut = dtime(14, 30)
-                if bool(getattr(self.config, "momentum_late_enabled", True)) and \
-                        bool(getattr(self.config, "momentum_enabled", True)):
-                    _entry_cut = max(_entry_cut, _late_cut)
-
-                # v58: always call decide() in the clock window under the flatten
-                # lock. ABORT / block_new_entries / None regime / feed_stale are
-                # hard-gate refusals inside decide() so momentum markers and
-                # refuse reasons match replay.
-                # v61 / P59-14: honor allow_same_cycle_reentry (BT already does).
-                _closed_cycle = bool(
-                    self.market_engine.state.pop("_closed_this_cycle", False)
+            # Re-check: Ctrl+C may arrive during cycle_log DB writes above.
+            if not self.running:
+                self.logger.info(
+                    "Stop requested before monitor/entry — no open/close this cycle."
                 )
-                _same_ok = bool(
-                    getattr(self.config, "allow_same_cycle_reentry", True)
-                )
-                entry_possible = (
-                    acting and
-                    current_time >= dtime(9, 30) and
-                    current_time <= _entry_cut and
-                    not self.market_engine.state.get("daily_halted") and
-                    bool(signals.get("or_computed", False)) and
-                    (_same_ok or not _closed_cycle)
-                )
+            else:
+                with self._flatten_gate() as acting:
+                    # ── Step 5: Monitor open positions ──────────────────────
+                    # IMPORTANT: positions are ALWAYS monitored regardless of
+                    # regime. ABORT only blocks new entries — never closes
+                    # existing positions (unless stop already requested).
+                    if acting and self.running:
+                        self.execution_engine.monitor_all_positions(signals)
 
-                if entry_possible:
+                        # ── Step 6: Hard exit sweep ─────────────────────────
+                        self.execution_engine.perform_hard_exit_sweep()
+
+                    # ── Step 7: Daily loss halt check ───────────────────────
+                    # The halt action takes the flatten lock re-entrantly, so a
+                    # flatten started here is serialised with the cycle exactly
+                    # like the sweep.
+                    if self.running:
+                        self.check_daily_loss_halt()
+
+                    # ── Step 8: Strategy decision and entry ─────────────────
                     try:
-                        if self._feed_stale:
-                            signals = dict(signals)
-                            signals["_feed_stale"] = True
-                        decision = self.strategy_engine.decide(signals)
-                        if decision.get("action") == "ENTER" and not self._feed_stale:
-                            self.execution_engine.process_entry_decision(
-                                decision, signals
+                        _late_cut = datetime.strptime(
+                            str(getattr(
+                                self.config, "momentum_late_window_end", "14:57"
+                            )),
+                            "%H:%M",
+                        ).time()
+                    except Exception:
+                        _late_cut = dtime(14, 57)
+                    _entry_cut = dtime(14, 30)
+                    if bool(getattr(self.config, "momentum_late_enabled", True)) and \
+                            bool(getattr(self.config, "momentum_enabled", True)):
+                        _entry_cut = max(_entry_cut, _late_cut)
+
+                    # v58: always call decide() in the clock window under the
+                    # flatten lock. ABORT / block_new_entries / None regime /
+                    # feed_stale are hard-gate refusals inside decide().
+                    # v61 / P59-14: honor allow_same_cycle_reentry.
+                    _closed_cycle = bool(
+                        self.market_engine.state.pop("_closed_this_cycle", False)
+                    )
+                    _same_ok = bool(
+                        getattr(self.config, "allow_same_cycle_reentry", True)
+                    )
+                    entry_possible = (
+                        self.running and
+                        acting and
+                        current_time >= dtime(9, 30) and
+                        current_time <= _entry_cut and
+                        not self.market_engine.state.get("daily_halted") and
+                        bool(signals.get("or_computed", False)) and
+                        (_same_ok or not _closed_cycle)
+                    )
+
+                    if entry_possible:
+                        try:
+                            if self._feed_stale:
+                                signals = dict(signals)
+                                signals["_feed_stale"] = True
+                            decision = self.strategy_engine.decide(signals)
+                            if (
+                                decision.get("action") == "ENTER"
+                                and not self._feed_stale
+                                and self.running
+                            ):
+                                self.execution_engine.process_entry_decision(
+                                    decision, signals
+                                )
+                            elif (
+                                decision.get("action") == "ENTER"
+                                and self._feed_stale
+                            ):
+                                self.logger.info(
+                                    "ENTER refused this cycle: trading feed is "
+                                    "stale (watchdog)"
+                                )
+                        except Exception as e:
+                            self.logger.error(
+                                f"Strategy/entry error: {e}", exc_info=True
                             )
-                        elif decision.get("action") == "ENTER" and self._feed_stale:
-                            self.logger.info(
-                                "ENTER refused this cycle: trading feed is "
-                                "stale (watchdog)"
-                            )
-                    except Exception as e:
-                        self.logger.error(
-                            f"Strategy/entry error: {e}", exc_info=True
-                        )
 
             # ── Step 9: Update cycle log with P&L ────────────────────────
             _cyc_phase = "footer"

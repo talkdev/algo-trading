@@ -170,24 +170,46 @@ def console_status(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def load_env_values(primary: Path, fallback: Path = LEGACY_ENV_FILE) -> dict[str, str]:
+    """Read screener env files without moving or writing project root env.txt.
+
+    Primary is normally stock-data/env.txt. If the access token is missing
+    there, values from the trading engine's root env.txt are filled in
+    read-only — never shutil.move / overwrite of either file.
+    """
+    values = read_env_file(primary) if primary.exists() else {}
+    need_token = not (values.get("UPSTOX_ACCESS_TOKEN") or "").strip()
+    if not need_token:
+        return values
+    try:
+        same = primary.resolve() == fallback.resolve()
+    except OSError:
+        same = False
+    if same or not fallback.exists():
+        return values
+    legacy = read_env_file(fallback)
+    for key, value in legacy.items():
+        if key not in values or not str(values.get(key) or "").strip():
+            values[key] = value
+    if (values.get("UPSTOX_ACCESS_TOKEN") or "").strip():
+        console_status(
+            f"[Setup] Using UPSTOX_ACCESS_TOKEN from {fallback.name} "
+            f"(read-only; {fallback.name} was not moved or modified)."
+        )
+    return values
+
+
 def migrate_legacy_env_file(
     legacy_path: Path = LEGACY_ENV_FILE,
     destination: Path = DEFAULT_ENV_FILE,
 ) -> Optional[Path]:
-    """Move the legacy root env.txt into stock-data without overwriting either copy."""
-    if not legacy_path.exists() or legacy_path.resolve() == destination.resolve():
-        return None
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    target = destination
-    if target.exists():
-        target = destination.with_name("env.txt.legacy")
-        index = 1
-        while target.exists():
-            target = destination.with_name(f"env.txt.legacy{index}")
-            index += 1
-    shutil.move(str(legacy_path), str(target))
-    console_status(f"[Setup] Moved legacy credentials file into {target}.")
-    return target
+    """Deprecated no-op.
+
+    Older builds moved project-root env.txt into stock-data/, which stole the
+    live trading engine's credentials file. Kept as a stub so any external
+    caller does not break; it never reads, writes, or moves env files.
+    """
+    return None
 
 
 def migrate_legacy_helper_data(
@@ -1899,7 +1921,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--env-file",
         type=Path,
         default=DEFAULT_ENV_FILE,
-        help="credential/config file (default: stock-data/env.txt; legacy root env.txt is moved there on first run)",
+        help="credential/config file (default: stock-data/env.txt; "
+             "falls back read-only to project env.txt for the access token — never moves/overwrites it)",
     )
     parser.add_argument(
         "--factor-file",
@@ -1975,13 +1998,12 @@ def run_screen(args: argparse.Namespace) -> int:
     if UNIVERSE_LOAD_ERROR is not None:
         raise ScreenerError(UNIVERSE_LOAD_ERROR)
     migrate_legacy_helper_data()
-    if Path(args.env_file).resolve() == DEFAULT_ENV_FILE.resolve():
-        migrate_legacy_env_file()
-    env_values = read_env_file(args.env_file)
+    env_values = load_env_values(Path(args.env_file))
     token = env_value(env_values, "UPSTOX_ACCESS_TOKEN", "") or ""
     if not token.strip():
         raise ScreenerError(
-            f"UPSTOX_ACCESS_TOKEN is missing. Add it to {args.env_file} or export it in the shell. "
+            f"UPSTOX_ACCESS_TOKEN is missing. Add it to {args.env_file} or "
+            f"{LEGACY_ENV_FILE} (read-only fallback) or export it in the shell. "
             "The API key/secret are not needed for these authenticated GET requests when a valid access token exists."
         )
 

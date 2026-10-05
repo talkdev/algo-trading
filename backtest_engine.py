@@ -58,9 +58,10 @@
 #  -----
 #     python backtest_engine.py
 #         Default: every NSE trading day from 2026-09-08 through today (IST),
-#         skipping weekends and nse_holidays.json. One child process per day,
-#         all days in parallel. Console output is ONLY the per-day trade
-#         report blocks plus the daily-profit summary table.
+#         skipping weekends and nse_holidays.json. Up to 5 days in parallel
+#         (queued); results print only after every day finishes.
+#         Console output is ONLY the per-day trade report blocks plus the
+#         daily-profit summary table.
 #         If config.db_path is empty/corrupt, auto-falls back to data/per_day/.
 #     python backtest_engine.py --db data/per_day
 #     python backtest_engine.py --audit
@@ -114,6 +115,9 @@ from core import (  # noqa: E402
 # Default quiet parallel range: every NSE trading day from this date through
 # the IST calendar day the script is launched on.
 DEFAULT_BACKTEST_START = date(2026, 9, 8)
+# Cap concurrent day processes so a long range does not spawn one worker per
+# session (memory / disk thrash). Remaining days queue until a slot frees.
+PARALLEL_DAY_WORKERS = 5
 
 # The engine modules are imported lazily inside build_engines() so that the
 # simulated clock is installed before any of them capture a timestamp.
@@ -3732,7 +3736,11 @@ def run_parallel_quiet(
     config: Config,
     args,
 ) -> int:
-    """Spawn one process per session; print trade reports then the P&L table."""
+    """Replay sessions with at most PARALLEL_DAY_WORKERS concurrent processes.
+
+    All jobs are submitted up front; the pool runs only N at a time. Reports
+    and the P&L table print only after every day has finished.
+    """
     if not dates:
         return 1
 
@@ -3759,9 +3767,7 @@ def run_parallel_quiet(
     ]
 
     by_date: Dict[str, dict] = {}
-    # One worker per day so every session truly runs concurrently. The
-    # machine may oversubscribe; that is what the operator asked for.
-    workers = max(1, len(jobs))
+    workers = max(1, min(int(PARALLEL_DAY_WORKERS), len(jobs)))
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
         futures = {pool.submit(_parallel_day_worker, job): job["day"]
@@ -3779,6 +3785,7 @@ def run_parallel_quiet(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
 
+    # All days finished — print reports + tables in date order.
     ordered = [by_date[d] for d in dates if d in by_date]
     first = True
     for row in ordered:
