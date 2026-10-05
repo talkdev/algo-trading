@@ -10,7 +10,7 @@ Run:
     python backtest_renko.py
     python backtest_renko.py --from-date 2026-08-01 --to-date 2026-09-30
     python backtest_renko.py --synthetic --days 20 --cash-to-lose 2000
-    python backtest_renko.py --from-date 2026-08-01 --to-date 2026-09-30 --realistic
+    python backtest_renko.py --from-date 2026-08-01 --to-date 2026-09-30
     python backtest_renko.py --self-test
 
 Credentials are read from a local ``env.txt`` (never from OS environment)::
@@ -66,15 +66,21 @@ HISTORICAL_CANDLE_PATH = (
 DEFAULT_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
 DEFAULT_CASH_TO_LOSE = 2_000.0
 DEFAULT_CAPITAL = 500_000.0
-SLIPPAGE_PCT = 0.0005  # 0.05%
-SUPERTREND_MULTIPLIER = 3.0
-ATR_LOOKBACK = 5
+SLIPPAGE_POINTS = 1.0  # per side, liquid Nifty futures
+SLIPPAGE_PCT = 0.0
+SUPERTREND_MULTIPLIER = 5.0
+ATR_LOOKBACK = 14
 SESSION_MINUTES = 375  # 09:15 → 15:30
-TARGET_TREND_MINUTES = 30
-FRACTIONAL_DIVISOR = SESSION_MINUTES / TARGET_TREND_MINUTES  # 12.5
+TARGET_TREND_MINUTES = 60
+FRACTIONAL_DIVISOR = SESSION_MINUTES / TARGET_TREND_MINUTES  # 6.25
 SESSION_START = dtime(9, 15)
 SESSION_END = dtime(15, 30)
+ENTRY_START = dtime(9, 45)
+ENTRY_END = dtime(14, 30)
 SQUARE_OFF = dtime(15, 20)
+STOP_ATR_MULT = 2.0
+SMA_FILTER_PERIOD = 20
+STOP_COOLDOWN_MINUTES = 15
 TRADING_DAYS_PER_YEAR = 252
 
 CANDLE_COLUMNS = ("timestamp", "open", "high", "low", "close", "volume", "oi")
@@ -116,16 +122,21 @@ class BacktestSettings:
     cash_to_lose: float = DEFAULT_CASH_TO_LOSE
     capital: float = DEFAULT_CAPITAL
     slippage_pct: float = SLIPPAGE_PCT
-    slippage_points: float = 0.0  # if >0, absolute pts replace the % penalty
+    slippage_points: float = SLIPPAGE_POINTS
     supertrend_multiplier: float = SUPERTREND_MULTIPLIER
     atr_lookback: int = ATR_LOOKBACK
     fractional_divisor: float = FRACTIONAL_DIVISOR
     session_start: dtime = SESSION_START
     session_end: dtime = SESSION_END
     square_off: dtime = SQUARE_OFF
+    entry_start: dtime = ENTRY_START
+    entry_end: dtime = ENTRY_END
     open_buffer_minutes: int = 0
     entry_cutoff: Optional[dtime] = None
     confirm_bricks: int = 1
+    stop_atr_mult: float = STOP_ATR_MULT
+    sma_filter_period: int = SMA_FILTER_PERIOD
+    stop_cooldown_minutes: int = STOP_COOLDOWN_MINUTES
     lot_size: int = 1
     request_timeout: float = 30.0
     max_retries: int = 4
@@ -656,6 +667,11 @@ class SessionBaseline:
     quantity: int
     risk_per_unit: float
     lookback_days: list[date]
+    stop_distance: float = 0.0
+    sma20: float = 0.0
+    prior_close: float = 0.0
+    allow_long: bool = True
+    allow_short: bool = True
 
 
 class FractionalRenkoEngine:
@@ -716,6 +732,35 @@ class FractionalRenkoEngine:
             raise StrategyError(f"Invalid static brick size {size}")
         return float(size)
 
+    def _session_dates(self, daily: pd.DataFrame) -> pd.DataFrame:
+        out = daily.copy()
+        idx = pd.DatetimeIndex(out.index)
+        if idx.tz is None:
+            idx = idx.tz_localize(IST_ZONE)
+        else:
+            idx = idx.tz_convert(IST_ZONE)
+        out["_session"] = idx.date
+        return out
+
+    def trend_filter(
+        self, daily: pd.DataFrame, asof: date
+    ) -> tuple[float, float, bool, bool]:
+        """Prior close vs SMA of the last ``sma_filter_period`` completed days."""
+        period = int(self.settings.sma_filter_period or 0)
+        tagged = self._session_dates(daily)
+        completed = tagged[tagged["_session"] < asof]
+        if period <= 0:
+            close = float(completed["close"].iloc[-1]) if len(completed) else 0.0
+            return close, close, True, True
+        if len(completed) < period:
+            raise StrategyError(
+                f"Need {period} completed daily closes before {asof} "
+                f"for SMA filter (have {len(completed)})"
+            )
+        sma = float(completed["close"].iloc[-period:].mean())
+        prior = float(completed["close"].iloc[-1])
+        return prior, sma, prior >= sma, prior <= sma
+
     def session_baseline(
         self,
         daily: pd.DataFrame,
@@ -724,7 +769,12 @@ class FractionalRenkoEngine:
     ) -> SessionBaseline:
         atr, used = self.daily_atr(daily, trade_date)
         brick = self.brick_size(atr)
-        risk = 2.0 * brick  # PCR formula: R = 2 × Static_Brick_Size
+        stop_mult = float(self.settings.stop_atr_mult)
+        if stop_mult <= 0 or not math.isfinite(stop_mult):
+            raise StrategyError(f"Invalid stop ATR multiplier {stop_mult}")
+        stop_distance = stop_mult * atr
+        # Size off the stop, not 2×brick — otherwise cash_to_lose is fiction.
+        risk = stop_distance
         budget = cash_to_lose if cash_to_lose is not None else self.settings.cash_to_lose
         raw_qty = math.floor(budget / risk) if risk > 0 else 0
         lot = max(int(self.settings.lot_size), 1)
@@ -733,6 +783,7 @@ class FractionalRenkoEngine:
             raise StrategyError(
                 f"{trade_date}: quantity=0 (cash_to_lose={budget:.2f}, R={risk:.4f})"
             )
+        prior, sma, allow_long, allow_short = self.trend_filter(daily, trade_date)
         return SessionBaseline(
             trade_date=trade_date,
             daily_atr_5=atr,
@@ -740,6 +791,11 @@ class FractionalRenkoEngine:
             quantity=qty,
             risk_per_unit=risk,
             lookback_days=used,
+            stop_distance=stop_distance,
+            sma20=sma,
+            prior_close=prior,
+            allow_long=allow_long,
+            allow_short=allow_short,
         )
 
     def build_renko(
@@ -963,14 +1019,18 @@ class Backtester:
     def _slip(self, price: float, direction: int, is_entry: bool) -> float:
         """Penalty against the trader on every fill.
 
-        ``slippage_points > 0`` wins (Nifty-realistic ticks). Otherwise the
-        fractional ``slippage_pct`` (default 0.05%) is applied.
+        Point slippage (default 1.0 Nifty pt/side) takes precedence. The
+        fractional model is retained only for explicit ``slippage_points=0``.
         """
-        pts = float(self.settings.slippage_points or 0.0)
-        delta = pts if pts > 0 else abs(price) * float(self.settings.slippage_pct)
+        if self.settings.slippage_points > 0:
+            pts = self.settings.slippage_points
+            if is_entry:
+                return price + pts if direction == 1 else price - pts
+            return price - pts if direction == 1 else price + pts
+        pct = self.settings.slippage_pct
         if is_entry:
-            return price + delta if direction == 1 else price - delta
-        return price - delta if direction == 1 else price + delta
+            return price * (1.0 + pct) if direction == 1 else price * (1.0 - pct)
+        return price * (1.0 - pct) if direction == 1 else price * (1.0 + pct)
 
     @staticmethod
     def _bar_time(ts: Any) -> dtime:
@@ -1036,6 +1096,34 @@ class Backtester:
             out[i] = held
         return out
 
+    def _find_stop_hit(
+        self,
+        day_bars: pd.DataFrame,
+        entry_time: datetime,
+        until: datetime,
+        direction: int,
+        stop_px: float,
+    ) -> Optional[tuple[datetime, float]]:
+        """First 1-minute bar after entry whose range pierces the stop."""
+        if day_bars.empty:
+            return None
+        entry_ts = pd.Timestamp(ensure_ist(entry_time))
+        until_ts = pd.Timestamp(ensure_ist(until))
+        idx = day_bars.index
+        if getattr(idx, "tz", None) is None:
+            idx = pd.DatetimeIndex(idx).tz_localize(IST_ZONE)
+        window = day_bars.loc[(idx > entry_ts) & (idx <= until_ts)]
+        if window.empty:
+            return None
+        if direction == 1:
+            hits = window["low"].astype(float) <= stop_px
+        else:
+            hits = window["high"].astype(float) >= stop_px
+        if not bool(hits.any()):
+            return None
+        hit_ts = hits.idxmax()
+        return self._to_datetime(hit_ts), float(stop_px)
+
     def _square_off_price(self, minute_bars: pd.DataFrame) -> tuple[datetime, float]:
         if minute_bars.empty:
             raise StrategyError("No 1-minute bars to square off")
@@ -1088,6 +1176,22 @@ class Backtester:
             trade_date=trade_date,
         )
 
+    def _in_entry_window(self, ts: datetime) -> bool:
+        t_min = ts.hour * 60 + ts.minute
+        start = self.settings.entry_start
+        end = self.settings.entry_end
+        floor = start.hour * 60 + start.minute + max(
+            int(self.settings.open_buffer_minutes or 0), 0
+        )
+        cap = end.hour * 60 + end.minute
+        if self.settings.entry_cutoff is not None:
+            cap = min(
+                cap,
+                self.settings.entry_cutoff.hour * 60
+                + self.settings.entry_cutoff.minute,
+            )
+        return floor <= t_min <= cap
+
     def run_day(
         self,
         trade_date: date,
@@ -1096,8 +1200,7 @@ class Backtester:
     ) -> list[Trade]:
         if minute_bars.empty:
             return []
-        day_bars = minute_bars.copy()
-        day_bars = day_bars.sort_index()
+        day_bars = minute_bars.sort_index().copy()
         bricks = self.engine.run_session(day_bars, baseline)
         if bricks.empty:
             LOG.debug("%s: no Renko bricks formed", trade_date)
@@ -1111,16 +1214,6 @@ class Backtester:
         signals = self._collapse_signals(bricks)
         so_ts, so_px = self._square_off_price(day_bars)
         so_minutes = so_ts.hour * 60 + so_ts.minute
-        sess_start = self.settings.session_start
-        open_floor = (
-            sess_start.hour * 60
-            + sess_start.minute
-            + max(int(self.settings.open_buffer_minutes or 0), 0)
-        )
-        cutoff = self.settings.entry_cutoff
-        entry_limit = (
-            cutoff.hour * 60 + cutoff.minute if cutoff is not None else so_minutes
-        )
 
         trades: list[Trade] = []
         position = 0
@@ -1128,54 +1221,93 @@ class Backtester:
         entry_raw = 0.0
         qty = baseline.quantity
         brick = baseline.static_brick_size
+        stop_dist = float(baseline.stop_distance)
+        cooldown_until: Optional[datetime] = None
+
+        def stop_px_for(direction: int, raw: float) -> float:
+            return raw - stop_dist if direction == 1 else raw + stop_dist
+
+        def close_now(ts: datetime, px: float, reason: str) -> None:
+            nonlocal position, entry_time, entry_raw, cooldown_until
+            if position == 0 or entry_time is None:
+                return
+            trades.append(
+                self._close_trade(
+                    direction=position,
+                    entry_time=entry_time,
+                    entry_raw=entry_raw,
+                    exit_time=ts,
+                    exit_raw=px,
+                    quantity=qty,
+                    brick_size=brick,
+                    trade_date=trade_date,
+                    reason=reason,
+                )
+            )
+            if reason == "STOP":
+                cooldown_until = ts + timedelta(
+                    minutes=max(int(self.settings.stop_cooldown_minutes or 0), 0)
+                )
+            position = 0
+            entry_time = None
+
+        def try_stop(until: datetime) -> bool:
+            if position == 0 or entry_time is None or stop_dist <= 0:
+                return False
+            hit = self._find_stop_hit(
+                day_bars,
+                entry_time,
+                until,
+                position,
+                stop_px_for(position, entry_raw),
+            )
+            if hit is None:
+                return False
+            close_now(hit[0], hit[1], "STOP")
+            return True
 
         for row in signals.itertuples(index=False):
             ts = self._to_datetime(row.timestamp)
             t_min = ts.hour * 60 + ts.minute
             if t_min >= so_minutes:
                 break
-            if t_min < open_floor:
-                continue
+            if position != 0:
+                if try_stop(ts):
+                    # Stopped on this bar — do not reverse on the same print.
+                    continue
             signal = int(row.signal)
             if signal == 0 or signal == position:
                 continue
+            # Outside the entry window: hold; stop + 15:20 square-off own the exit.
+            if not self._in_entry_window(ts):
+                continue
             raw_px = float(row.close)
-            # Close existing book, then reverse if the new signal is opposite.
-            if position != 0 and entry_time is not None:
-                trades.append(
-                    self._close_trade(
-                        direction=position,
-                        entry_time=entry_time,
-                        entry_raw=entry_raw,
-                        exit_time=ts,
-                        exit_raw=raw_px,
-                        quantity=qty,
-                        brick_size=brick,
-                        trade_date=trade_date,
-                        reason="SIGNAL_REVERSE" if signal == -position else "SIGNAL_EXIT",
-                    )
+            with_trend = (
+                (signal == 1 and baseline.allow_long)
+                or (signal == -1 and baseline.allow_short)
+            )
+            # Counter-trend Supertrend flip: flatten, never reverse.
+            if position != 0 and entry_time is not None and signal == -position:
+                close_now(
+                    ts,
+                    raw_px,
+                    "SIGNAL_EXIT" if not with_trend else "SIGNAL_REVERSE",
                 )
-                position = 0
-                entry_time = None
-            if signal in (1, -1) and t_min < entry_limit:
-                position = signal
-                entry_time = ts
-                entry_raw = raw_px
+                if not with_trend:
+                    continue
+            if signal not in (1, -1):
+                continue
+            if not with_trend:
+                continue
+            if cooldown_until is not None and ts < cooldown_until:
+                continue
+            position = signal
+            entry_time = ts
+            entry_raw = raw_px
 
         if position != 0 and entry_time is not None:
-            trades.append(
-                self._close_trade(
-                    direction=position,
-                    entry_time=entry_time,
-                    entry_raw=entry_raw,
-                    exit_time=so_ts,
-                    exit_raw=so_px,
-                    quantity=qty,
-                    brick_size=brick,
-                    trade_date=trade_date,
-                    reason="SQUARE_OFF_1520",
-                )
-            )
+            if not try_stop(so_ts):
+                close_now(so_ts, so_px, "SQUARE_OFF_1520")
         return trades
 
     def run(
@@ -1216,12 +1348,21 @@ class Backtester:
                 continue
             baselines.append(baseline)
             day_trades = self.run_day(d, day_bars, baseline)
+            bias = (
+                "LONG"
+                if baseline.allow_long and not baseline.allow_short
+                else "SHORT"
+                if baseline.allow_short and not baseline.allow_long
+                else "BOTH"
+            )
             LOG.info(
-                "%s  ATR5=%.2f  brick=%.3f  qty=%d  trades=%d",
+                "%s  ATR=%.2f  brick=%.3f  stop=%.1f  qty=%d  SMA%s  trades=%d",
                 d,
                 baseline.daily_atr_5,
                 baseline.static_brick_size,
+                baseline.stop_distance,
                 baseline.quantity,
+                bias,
                 len(day_trades),
             )
             trades.extend(day_trades)
@@ -1430,22 +1571,19 @@ class PerformanceReporter:
                 slip_txt = f"{settings.slippage_points:g} pts/fill"
             else:
                 slip_txt = f"{settings.slippage_pct * 100:.3f}% per fill"
-            buf = settings.open_buffer_minutes
-            cutoff = (
-                settings.entry_cutoff.strftime("%H:%M")
-                if settings.entry_cutoff
-                else "square-off"
-            )
             print(
                 f"  Instrument     : {settings.instrument_key}\n"
                 f"  Cash to lose   : ₹{settings.cash_to_lose:,.2f}    "
                 f"Capital: ₹{settings.capital:,.2f}\n"
                 f"  Slippage       : {slip_txt}    "
                 f"ST multiplier: {settings.supertrend_multiplier:g}\n"
-                f"  Brick formula  : Daily_ATR_5 / {settings.fractional_divisor:g}    "
-                f"Square-off: {settings.square_off.strftime('%H:%M')} IST\n"
-                f"  Open buffer    : {buf} min    Entry cutoff: {cutoff}    "
-                f"Confirm bricks: {settings.confirm_bricks}"
+                f"  Brick formula  : Daily_ATR / {settings.fractional_divisor:g}    "
+                f"ATR lookback: {settings.atr_lookback}\n"
+                f"  Stop           : {settings.stop_atr_mult:g} × ATR    "
+                f"SMA filter: {settings.sma_filter_period}d\n"
+                f"  Entry window   : {settings.entry_start.strftime('%H:%M')}"
+                f"–{settings.entry_end.strftime('%H:%M')} IST    "
+                f"Square-off: {settings.square_off.strftime('%H:%M')} IST"
             )
         if source:
             print(f"  Data source    : {source}")
@@ -1525,7 +1663,11 @@ class PerformanceReporter:
             if baselines
             else 0.0
         )
-        risk_mu = 2.0 * brick_mu if brick_mu else 0.0
+        risk_mu = (
+            float(np.mean([b.risk_per_unit for b in baselines]))
+            if baselines
+            else (2.0 * brick_mu if brick_mu else 0.0)
+        )
         if settings and settings.slippage_points and settings.slippage_points > 0:
             fill_pts = float(settings.slippage_points)
             model = f"{fill_pts:g} points/fill"
@@ -1546,6 +1688,11 @@ class PerformanceReporter:
             f"  Gross (pre-cost): ₹{report.gross_pnl:,.0f}  ({report.gross_points:+.1f} pts)    "
             f"Friction: ₹{report.slippage_impact:,.0f}"
         )
+        if report.trade_log is not None and not report.trade_log.empty:
+            if "Reason" in report.trade_log.columns:
+                counts = report.trade_log["Reason"].value_counts().to_dict()
+                pretty = ", ".join(f"{k}={v}" for k, v in counts.items())
+                print(f"  Exit mix       : {pretty}")
         if (
             settings
             and (not settings.slippage_points)
@@ -1553,11 +1700,8 @@ class PerformanceReporter:
             and report.slippage_impact > abs(report.gross_pnl)
         ):
             print(
-                "  NOTE           : 0.05% of Nifty is ~12 pts/fill (~25 pts round-trip).\n"
-                "                   That is a stock-like penalty, not an index/fut tick.\n"
-                "                   Re-run with realistic Nifty friction:\n"
-                "                     python backtest_renko.py --from-date … --to-date … "
-                "--realistic"
+                "  NOTE           : percent-of-spot slippage is ~12 pts/fill on Nifty.\n"
+                "                   Default is 1 pt/fill; pass --slippage-points 1."
             )
 
     def save(self, report: PerformanceReport, prefix: str = "renko") -> Path:
@@ -1630,8 +1774,10 @@ def run_self_tests() -> int:
             tmp.unlink()
 
     # 4. Brick size lock
+    engine_legacy = FractionalRenkoEngine(BacktestSettings(fractional_divisor=12.5))
+    _assert(abs(engine_legacy.brick_size(125.0) - 10.0) < 1e-12, "125/12.5 must be 10")
     engine = FractionalRenkoEngine()
-    _assert(abs(engine.brick_size(125.0) - 10.0) < 1e-12, "125/12.5 must be 10")
+    _assert(abs(engine.brick_size(125.0) - 20.0) < 1e-12, "125/6.25 must be 20")
     n_ok += 1
 
     # 5. PCR quantity
@@ -1705,9 +1851,12 @@ def run_self_tests() -> int:
     n_ok += 1
 
     # 8. Slippage + square-off + blotter identities
-    bt = Backtester(engine, settings)
-    slipped_buy = bt._slip(10_000.0, 1, True)
-    slipped_sell = bt._slip(10_000.0, 1, False)
+    pct_settings = BacktestSettings(
+        cash_to_lose=2_000.0, slippage_pct=0.0005, slippage_points=0.0
+    )
+    bt_pct = Backtester(engine, pct_settings)
+    slipped_buy = bt_pct._slip(10_000.0, 1, True)
+    slipped_sell = bt_pct._slip(10_000.0, 1, False)
     _assert(abs(slipped_buy - 10_005.0) < 1e-9, slipped_buy)
     _assert(abs(slipped_sell - 9_995.0) < 1e-9, slipped_sell)
     pts_settings = BacktestSettings(slippage_pct=0.0, slippage_points=1.5)
@@ -1719,14 +1868,12 @@ def run_self_tests() -> int:
     # 9. End-to-end synthetic day produces a well-formed report
     holidays: set[date] = set()
     daily_s, minute_s = generate_synthetic_market(
-        date(2026, 8, 3), n_days=12, seed=7, holidays=holidays
+        date(2026, 7, 1), n_days=36, seed=7, holidays=holidays
     )
-    start = minute_s.index.tz_convert(IST_ZONE).date.min()
     end = minute_s.index.tz_convert(IST_ZONE).date.max()
-    # ATR needs history before the first traded day — daily_s starts on start,
-    # so trade from the 7th session onward.
     unique_days = sorted(set(pd.DatetimeIndex(minute_s.index).tz_convert(IST_ZONE).date))
-    trade_start = unique_days[6]
+    trade_start = unique_days[22]
+    bt = Backtester(engine, settings)
     trades, bases = bt.run(daily_s, minute_s, trade_start, end, holidays)
     reporter = PerformanceReporter(capital=settings.capital)
     report = reporter.build(trades)
@@ -1756,7 +1903,34 @@ def run_self_tests() -> int:
             _assert(tm <= SQUARE_OFF, f"square-off after 15:20: {tm}")
     n_ok += 1
 
-    print(f"Self-tests passed: {n_ok}/9")
+    # 10. Hard stop fires on 1-minute range, not on the next Supertrend flip.
+    idx = pd.date_range("2026-09-11 09:45", periods=12, freq="min", tz=IST_ZONE)
+    lows = np.full(12, 99.0)
+    lows[4] = 90.0
+    stop_df = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": lows,
+            "close": 99.0,
+            "volume": 1.0,
+            "oi": 0.0,
+        },
+        index=idx,
+    )
+    hit = bt._find_stop_hit(
+        stop_df,
+        idx[0].to_pydatetime(),
+        idx[-1].to_pydatetime(),
+        1,
+        95.0,
+    )
+    _assert(hit is not None, "expected a long stop hit")
+    _assert(abs(hit[1] - 95.0) < 1e-9, f"stop fill {hit[1]}")
+    _assert(hit[0].minute == idx[4].minute, f"stop bar {hit[0]}")
+    n_ok += 1
+
+    print(f"Self-tests passed: {n_ok}/10")
     return 0
 
 
@@ -1766,6 +1940,11 @@ def run_self_tests() -> int:
 
 def _parse_date(text: str) -> date:
     return date.fromisoformat(text)
+
+
+def _parse_hhmm(text: str) -> dtime:
+    hh, mm = str(text).strip().split(":")
+    return dtime(int(hh), int(mm))
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1780,20 +1959,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--cash-to-lose", type=float, default=DEFAULT_CASH_TO_LOSE)
     p.add_argument("--capital", type=float, default=DEFAULT_CAPITAL)
     p.add_argument("--lot-size", type=int, default=1)
-    p.add_argument("--slippage", type=float, default=SLIPPAGE_PCT, help="Fractional penalty (0.0005=0.05%)")
+    p.add_argument("--slippage", type=float, default=SLIPPAGE_PCT, help="Fractional penalty (0 disables)")
     p.add_argument(
         "--slippage-points",
         type=float,
-        default=0.0,
-        help="If >0, use absolute Nifty points per fill instead of --slippage %%",
+        default=SLIPPAGE_POINTS,
+        help="Absolute Nifty points per fill; >0 overrides --slippage %%",
     )
-    p.add_argument("--open-buffer", type=int, default=0, help="Skip signals in the first N minutes after 09:15")
-    p.add_argument("--entry-cutoff", default=None, help="HH:MM IST — no new entries after this (exits still fire)")
+    p.add_argument("--open-buffer", type=int, default=0, help="Extra minutes after entry-start to skip")
+    p.add_argument("--entry-start", default="09:45", help="HH:MM IST — first allowed entry")
+    p.add_argument("--entry-end", default="14:30", help="HH:MM IST — last allowed entry (exits still fire)")
+    p.add_argument("--entry-cutoff", default=None, help="HH:MM IST — optional extra entry cap")
     p.add_argument("--confirm-bricks", type=int, default=1, help="Bricks that must agree before a Supertrend flip trades")
+    p.add_argument("--atr-lookback", type=int, default=ATR_LOOKBACK)
+    p.add_argument("--target-minutes", type=int, default=TARGET_TREND_MINUTES, help="Renko target TF; brick = ATR / (375/TF)")
+    p.add_argument("--stop-atr-mult", type=float, default=STOP_ATR_MULT)
+    p.add_argument("--sma-period", type=int, default=SMA_FILTER_PERIOD, help="0 disables the daily SMA filter")
     p.add_argument(
         "--realistic",
         action="store_true",
-        help="Nifty-realistic costs: 1 pt/fill, 15-min open buffer, no entries after 15:00",
+        help="Force 1 pt/fill (already the default cost model)",
     )
     p.add_argument("--multiplier", type=float, default=SUPERTREND_MULTIPLIER)
     p.add_argument("--env-file", type=Path, default=ENV_FILE)
@@ -1834,10 +2019,10 @@ def _load_data(
     if args.synthetic:
         LOG.info("Using synthetic market data (seed=%s)", args.seed)
         # Extra warm-up days so ATR lookback is defined on day 1 of the window.
-        warmup = from_date - timedelta(days=18)
+        warmup = from_date - timedelta(days=55)
         span = (to_date - warmup).days + 2
         daily, minutes = generate_synthetic_market(
-            warmup, n_days=max(span, args.days + 8), seed=args.seed, holidays=holidays
+            warmup, n_days=max(span, args.days + 30), seed=args.seed, holidays=holidays
         )
         return daily, minutes, "SYNTHETIC"
 
@@ -1848,15 +2033,15 @@ def _load_data(
         if args.no_synthetic_fallback:
             raise
         LOG.warning("%s — falling back to synthetic data", exc)
-        warmup = from_date - timedelta(days=18)
+        warmup = from_date - timedelta(days=55)
         span = (to_date - warmup).days + 2
         daily, minutes = generate_synthetic_market(
-            warmup, n_days=max(span, args.days + 8), seed=args.seed, holidays=holidays
+            warmup, n_days=max(span, args.days + 30), seed=args.seed, holidays=holidays
         )
         return daily, minutes, "SYNTHETIC (no env.txt token)"
 
     loader = UpstoxDataLoader(creds, settings)
-    daily_from = from_date - timedelta(days=40)
+    daily_from = from_date - timedelta(days=60)
     try:
         daily = loader.fetch_daily(daily_from, to_date, use_cache=not args.no_cache)
         minutes = loader.fetch_intraday_1m(
@@ -1866,10 +2051,10 @@ def _load_data(
         if args.no_synthetic_fallback:
             raise
         LOG.warning("Upstox download failed (%s) — synthetic fallback", exc)
-        warmup = from_date - timedelta(days=18)
+        warmup = from_date - timedelta(days=55)
         span = (to_date - warmup).days + 2
         daily, minutes = generate_synthetic_market(
-            warmup, n_days=max(span, args.days + 8), seed=args.seed, holidays=holidays
+            warmup, n_days=max(span, args.days + 30), seed=args.seed, holidays=holidays
         )
         return daily, minutes, "SYNTHETIC (Upstox error fallback)"
 
@@ -1877,10 +2062,10 @@ def _load_data(
         if args.no_synthetic_fallback:
             raise UpstoxDataError("Upstox returned no 1-minute candles")
         LOG.warning("Empty 1-minute payload — synthetic fallback")
-        warmup = from_date - timedelta(days=18)
+        warmup = from_date - timedelta(days=55)
         span = (to_date - warmup).days + 2
         daily, minutes = generate_synthetic_market(
-            warmup, n_days=max(span, args.days + 8), seed=args.seed, holidays=holidays
+            warmup, n_days=max(span, args.days + 30), seed=args.seed, holidays=holidays
         )
         return daily, minutes, "SYNTHETIC (empty Upstox 1-minute)"
     return daily, minutes, f"UPSTOX {settings.instrument_key}"
@@ -1912,20 +2097,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     entry_cutoff: Optional[dtime] = None
     if args.entry_cutoff:
-        hh, mm = str(args.entry_cutoff).split(":")
-        entry_cutoff = dtime(int(hh), int(mm))
+        entry_cutoff = _parse_hhmm(args.entry_cutoff)
     slippage_pct = float(args.slippage)
     slippage_points = float(args.slippage_points or 0.0)
     open_buffer = int(args.open_buffer or 0)
     confirm_bricks = max(int(args.confirm_bricks or 1), 1)
     if args.realistic:
         slippage_pct = 0.0
-        if slippage_points <= 0:
-            slippage_points = 1.0
-        if open_buffer <= 0:
-            open_buffer = 15
-        if entry_cutoff is None:
-            entry_cutoff = dtime(15, 0)
+        slippage_points = max(slippage_points, 1.0)
+    target_minutes = max(int(args.target_minutes), 1)
     settings = BacktestSettings(
         instrument_key=args.instrument,
         cash_to_lose=float(args.cash_to_lose),
@@ -1933,10 +2113,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         slippage_pct=slippage_pct,
         slippage_points=slippage_points,
         supertrend_multiplier=float(args.multiplier),
+        atr_lookback=max(int(args.atr_lookback), 2),
+        fractional_divisor=SESSION_MINUTES / target_minutes,
         lot_size=max(int(args.lot_size), 1),
+        entry_start=_parse_hhmm(args.entry_start),
+        entry_end=_parse_hhmm(args.entry_end),
         open_buffer_minutes=open_buffer,
         entry_cutoff=entry_cutoff,
         confirm_bricks=confirm_bricks,
+        stop_atr_mult=float(args.stop_atr_mult),
+        sma_filter_period=max(int(args.sma_period), 0),
     )
 
     print()
