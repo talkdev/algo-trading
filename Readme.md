@@ -183,7 +183,7 @@ Do **not** follow `v65m7q-cycle-alive-watchdog` or older banners. Hunt the first
 13. **`restore_primary_db.py`.** Recover `data/nifty_algo_v3.db`: refuse if `main.py` still has it open → integrity of live+WAL → table salvage → newest `.corrupt.*` quarantine → merge `data/per_day/` last (overlay today’s salvaged rows). `--dry-run` / `--force-shards`.
 14. **`verify_all.py`.** Module self-tests + static pre-flight (does not start the live loop). Compile list still includes missing `clean-db.py`; does **not** yet include `tape_state_engine.py` or `restore_primary_db.py` (run `python tape_state_engine.py` separately).
 15. **`upstox_token.py`.** OAuth token refresh.
-16. **`stock-tsmom.py`.** Standalone stock TSMOM utility (not part of the NIFTY options cycle).
+16. **`stock-tsmom.py`.** Standalone stock TSMOM utility (not part of the NIFTY options cycle). The screen now reports weekly and daily Supertrend readings, plus daily JMA(7, phase -40, power 0.35)/DWMA(20) crossover state and last-cross values; its table sorts by crossover date (`--crossover-sort desc|asc|score`, default `desc`). Use `--crossover-audit SYMBOL` to print all Positive/Negative crossover days for one loaded symbol. Daily indicators use Upstox close data (dividend/corporate-action adjustment is not assured).
 
 ---
 
