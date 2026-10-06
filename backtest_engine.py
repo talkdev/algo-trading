@@ -1213,14 +1213,18 @@ class Results:
             else:
                 break
         low = r.lower()
+        # Prefer specific WHEN/momentum tokens before the bare "dte" key —
+        # tape_when_TREND_EXHAUSTED_..._dte_0 was collapsing into "dte".
         for key in (
-            "ev_gate", "credit_risk_ratio", "net_credit", "credit_ratio",
+            "tape_when", "momentum_", "ev_gate", "credit_risk_ratio",
+            "net_credit", "credit_ratio",
             "brokerage", "friction",
             "target_", "risk_budget", "wing_cost", "condor_weak_side",
             "margin", "daily", "confidence", "expanding", "cooldown",
             "consecutive", "entry_window", "day_move", "chain_stale",
             "no_strategy", "strike", "hard_exit", "lots", "or_not_established",
-            "vix", "dte", "spread", "liquidity", "regime",
+            "vix", "dte_", "momentum_dte", "above_max_dte", "spread",
+            "liquidity", "regime",
         ):
             if key in low:
                 return key.rstrip("_")
@@ -2126,7 +2130,13 @@ STAGE_ORDER: List[Tuple[str, Tuple[str, ...]]] = [
         "cooldown", "consecutive")),
     # compute_params checks the contract before it builds anything, and
     # _check_hard_gates refuses a DTE above MAX_DTE_TRADEABLE before that.
-    ("contract / DTE", ("dte", "expiry", "no_expiry")),
+    # Use specific tokens — bare "dte" also matched tape_when_..._dte_0
+    # exhaustion reasons and parked 589 Oct-6 WHEN-blocks under this stage.
+    ("contract / DTE", (
+        "dte_", "dte2", "above_max_dte", "below_min_dte",
+        "no_expiry", "expiry_day_waiting", "waiting_for_0dte",
+        "0dte_series", "momentum_dte_",
+    )),
     # The regime combiner applies its own time gates (before 09:45, past
     # 14:30) and its confidence block in the same pass that produces the
     # verdict, so they belong here and not later. Leaving PAST_14:30 out
@@ -3973,6 +3983,12 @@ def main() -> int:
              "unrealised P&L moves by TRADE_REPORT_MARK_EPS; off suppresses "
              "it. Overrides TRADE_REPORT_MODE from the config.",
     )
+    ap.add_argument(
+        "--force-lots", type=int, default=None,
+        help="override FORCE_LOTS from env.txt for this replay only. "
+             "0 = natural engine sizing (recommended for P&L hunts); "
+             "N>=1 clamps every fill to N lots. Live env.txt is unchanged.",
+    )
     args = ap.parse_args()
 
     if args.test:
@@ -3982,6 +3998,12 @@ def main() -> int:
     if args.capital:
         import dataclasses
         config = dataclasses.replace(config, starting_capital=args.capital)
+    if args.force_lots is not None:
+        import dataclasses
+        _fl = int(args.force_lots)
+        config = dataclasses.replace(
+            config, force_lots=(_fl if _fl >= 1 else None)
+        )
 
     # PATCH_V14: --db takes one path, several, or a directory of per-day
     # splits. Multiple sources are served through MultiStore so the run has a

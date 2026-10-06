@@ -1435,22 +1435,63 @@ class RegimeClassifier:
 
         or_mid = (or_high + or_low) / 2.0 if (or_high > 0 and or_low > 0) else spot
 
+        # Session extreme distance — used to kill stale trend labels after
+        # a material bounce/pullback (Oct5 12:10 reclaim sat in DOWNTREND).
+        try:
+            _dl_pr = float(
+                signals.get("day_low_so_far")
+                or signals.get("day_low")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _dl_pr = 0.0
+        try:
+            _dh_pr = float(
+                signals.get("day_high_so_far")
+                or signals.get("day_high")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _dh_pr = 0.0
+        _above_low = (spot - _dl_pr) if _dl_pr > 0 else 0.0
+        _below_high = (_dh_pr - spot) if _dh_pr > 0 else 0.0
+        # Strong dumps/rallies with only a shallow <40pt pause still count.
+        _stale_dn = (
+            _above_low >= 35.0
+            and not (
+                adx_15 > adx_strong
+                and ema_structure == "BEARISH"
+                and _above_low < 40.0
+            )
+        )
+        _stale_up = (
+            _below_high >= 35.0
+            and not (
+                adx_15 > adx_strong
+                and ema_structure == "BULLISH"
+                and _below_high < 40.0
+            )
+        )
+
         # ── Step 4: STRONG_DOWNTREND ──────────────────────────────────────
         if (adx_15 > adx_strong and
                 ema_structure == "BEARISH" and
-                or_low > 0 and spot < or_low - 100):
+                or_low > 0 and spot < or_low - 100
+                and not _stale_dn):
             return PriceRegime.STRONG_DOWNTREND
 
         # ── Step 5: STRONG_UPTREND ────────────────────────────────────────
         if (adx_15 > adx_strong and
                 ema_structure == "BULLISH" and
-                or_high > 0 and spot > or_high + 100):
+                or_high > 0 and spot > or_high + 100
+                and not _stale_up):
             return PriceRegime.STRONG_UPTREND
 
         # ── Step 6: DOWNTREND ─────────────────────────────────────────────
         if (adx_15 >= adx_trend and
                 ema_structure in ("BEARISH", "TRANSITIONAL") and
-                or_low > 0 and spot < or_low - 20):
+                or_low > 0 and spot < or_low - 20
+                and not _stale_dn):
             # Confirm with HH/HL if available
             if hh_hl in ("DOWNTREND", "NEUTRAL", "INSUFFICIENT_DATA"):
                 return PriceRegime.DOWNTREND
@@ -1463,7 +1504,8 @@ class RegimeClassifier:
         # ── Step 7: UPTREND ───────────────────────────────────────────────
         if (adx_15 >= adx_trend and
                 ema_structure in ("BULLISH", "TRANSITIONAL") and
-                or_high > 0 and spot > or_high + 20):
+                or_high > 0 and spot > or_high + 20
+                and not _stale_up):
             if hh_hl in ("UPTREND", "NEUTRAL", "INSUFFICIENT_DATA"):
                 return PriceRegime.UPTREND
             if adx_15 >= adx_strong:
@@ -1472,9 +1514,15 @@ class RegimeClassifier:
 
         vwap_signal_pr = signals.get("vwap_signal", "UNKNOWN")
         vwap_dist_pr   = float(signals.get("vwap_dist_pct") or 0.0)
-        if adx_15 >= (adx_trend - 3) and vwap_signal_pr in ("BULLISH", "BULLISH_EXTENDED") and vwap_dist_pr > 0.20:
+        if (adx_15 >= (adx_trend - 3)
+                and vwap_signal_pr in ("BULLISH", "BULLISH_EXTENDED")
+                and vwap_dist_pr > 0.20
+                and not _stale_up):
             return PriceRegime.UPTREND
-        if adx_15 >= (adx_trend - 3) and vwap_signal_pr in ("BEARISH", "BEARISH_EXTENDED") and vwap_dist_pr < -0.20:
+        if (adx_15 >= (adx_trend - 3)
+                and vwap_signal_pr in ("BEARISH", "BEARISH_EXTENDED")
+                and vwap_dist_pr < -0.20
+                and not _stale_dn):
             return PriceRegime.DOWNTREND
         return PriceRegime.RANGE
 
@@ -2139,9 +2187,17 @@ class RegimeClassifier:
                     elif _struct_bear:
                         pass
                     else:
-                        if (not _two_way) and _measured_dn and not _struct_bull:
+                        # Always veto a live measured downtrend — including
+                        # two-way tapes. The prior `not _two_way` carve-out
+                        # forced AFTERNOON_DAY_LOW_FADE → PREMIUM_SELL_BULL
+                        # for 263 Oct5 cycles while price was DOWNTREND
+                        # (22612→22414 dump), blocking bear credit and
+                        # aligned debit. Two-way may still fade AFTER the
+                        # measured dump stalls (label leaves DOWNTREND).
+                        if _measured_dn and not _struct_bull:
                             signals["fade_vetoed_by_trend"] = (
-                                f"low_fade_vetoed_one_way_downtrend_adx_{_adx_f:.0f}"
+                                f"low_fade_vetoed_measured_downtrend_adx_{_adx_f:.0f}"
+                                + ("_two_way" if _two_way else "")
                             )
                         else:
                             signals["afternoon_low_fade"] = True
@@ -2176,6 +2232,12 @@ class RegimeClassifier:
                     _dh = float(signals.get("day_high_so_far") or 0.0)
                     if _gap_dir == "DOWN" and _pc > 0 and _dh > 0 and _dh < _pc:
                         pass
+                    elif _measured_dn and not _struct_bull:
+                        # Same live-dump veto as AFTERNOON_DAY_LOW_FADE.
+                        signals["fade_vetoed_by_trend"] = (
+                            f"choppy_low_fade_vetoed_measured_downtrend_"
+                            f"adx_{_adx_f:.0f}"
+                        )
                     else:
                         try:
                             _ab = (
@@ -4215,6 +4277,72 @@ def _self_test() -> None:
     )
     print(f"  DOWNTREND+BULLISH conflict+MEDIUM conf → {final7.value} (expect NO_TRADE)")
     assert final7 == FinalRegime.NO_TRADE, f"Got {final7}"
+
+    # Oct5-class: measured DOWNTREND + two_way at the low must NOT force
+    # AFTERNOON_DAY_LOW_FADE / PREMIUM_SELL_BULL (bear expression must win).
+    _oct5_fade = make_signals(
+        adx_15=32.0,
+        adx_15_mature=True,
+        spot=22450.0,
+        or_high=22564.0,
+        or_low=22506.0,
+        or_computed=True,
+        day_high_so_far=22622.0,
+        day_low_so_far=22440.0,
+        day_high=22622.0,
+        day_low=22440.0,
+        post_open_high_so_far=22622.0,
+        post_open_low_so_far=22440.0,
+        two_way_auction=True,
+        choppy_detected=False,
+        gap_direction="FLAT",
+        prev_close=22422.0,
+        opening_straddle_pts=200.0,
+        vrp_smoothed=3.0,
+        actual_dte=1,
+    )
+    # Seed through-OR two-way geometry (both edges poked).
+    _oct5_fade["day_high_so_far"] = 22622.0
+    _oct5_fade["day_low_so_far"] = 22440.0
+    final8, notes8, _ = classifier.classify_final(
+        VolatilityRegime.SELL_PREMIUM,
+        PriceRegime.DOWNTREND,
+        PositioningRegime.STRONG_RANGE,
+        ConfidenceLevel.HIGH,
+        _oct5_fade,
+        False, "",
+        _test_time=dtime(11, 0),
+    )
+    assert final8 == FinalRegime.PREMIUM_SELL_BEAR, (
+        f"Oct5-class measured dump must stay BEAR, got {final8}/{notes8}"
+    )
+    assert "AFTERNOON_DAY_LOW_FADE" not in str(notes8), (
+        f"low fade must not override measured downtrend, notes={notes8}"
+    )
+    print(f"  measured DN + two_way low → {final8.value} ({notes8})")
+
+    # Stale-dump reclaim: bounced ≥35pts off day low → not DOWNTREND.
+    _px_stale = classifier.classify_price(make_signals(
+        adx_15=32.0,
+        adx_15_mature=True,
+        ema_structure="BEARISH",
+        spot=22455.0,
+        or_high=22564.0,
+        or_low=22506.0,
+        or_computed=True,
+        day_high_so_far=22622.0,
+        day_low_so_far=22400.0,
+        day_high=22622.0,
+        day_low=22400.0,
+        hh_hl="NEUTRAL",
+        vwap_signal="BEARISH",
+        vwap_dist_pct=-0.25,
+        choppy_detected=False,
+    ))
+    assert _px_stale == PriceRegime.RANGE, (
+        f"stale dump bounce must be RANGE not DOWNTREND, got {_px_stale}"
+    )
+    print(f"  stale dump reclaim → {_px_stale.value}")
 
     print("  [OK] Final regime decision tree tests passed")
 

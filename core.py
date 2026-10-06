@@ -1151,6 +1151,18 @@ class Config:
         # dumps at the lows still need the aligned LONG_PUT (Sep24: 243
         # open_spike_wait cycles with structure lean while ADX matured).
         "open_spike_wait", "unresolved_lower_high",
+        # TapeState WHEN-layer refusals are sell-expression clocks, not
+        # "sell side still open". Without these markers, TREND_EXHAUSTED /
+        # TURN_STARTING / COIL blocks left the debit substitute dark while
+        # the reason string said momentum_sell_side_open(tape_when_...) —
+        # measured live 2026-10-06: PREMIUM_SELL_BULL all entry window,
+        # 589× tape_when_TREND_EXHAUSTED, zero momentum consults.
+        "tape_when", "trend_exhausted", "turn_starting",
+        # Spent-side chase / bounce credit refuses are sell-expression
+        # fences — the debit substitute must see them (Sep29: 86×
+        # spent_downside_bounce_no_puts left momentum_sell_side_open).
+        "spent_upside", "spent_downside", "day_up_spent", "day_down_spent",
+        "morning_pullback_no_calls", "post_condor_no_vertical",
     )
 
     # ══ PATCH_V13: closing-hour trend continuation ══════════════════════

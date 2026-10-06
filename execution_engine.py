@@ -2421,8 +2421,13 @@ class ExecutionEngine:
                 or (_dir < 0 and spot <= _ormid)
             )
             _death = float(getattr(cfg, "momentum_trend_death_adx", 15.0))
+            _adx_strong = float(getattr(cfg, "adx_strong_threshold", 28.0) or 28.0)
+            # Strong ADX without the mature flag is still a live trend —
+            # requiring mat alone scalp-exited Oct6 LONG_CALL at +1pt while
+            # ADX printed 41-44 UPTREND and spot ran another +100pt.
+            _mat_ok = _mat or _adx >= _adx_strong
             _persist = bool(
-                _dir != 0 and _trend_side_ok and _brk_ok and _mat and _adx >= _death
+                _dir != 0 and _trend_side_ok and _brk_ok and _mat_ok and _adx >= _death
             )
         except Exception:
             _persist = False
@@ -2565,8 +2570,22 @@ class ExecutionEngine:
                     else "momentum_soft_hwm_trail"
                 )
             elif value_mid >= lock or activated:
-                new_level = be_level
-                ratchet_reason = "momentum_free_trade"
+                # While trend still persists and we have not printed a soft
+                # HWM, ignore a one-tick lock touch — arming free-trade BE
+                # there scalp-exits runners (Oct6 LONG_CALL +1pt / 17m while
+                # spot continued +100pt). Once soft HWM exists or persist
+                # dies, free-trade BE is correct.
+                if (
+                    _persist
+                    and (not activated)
+                    and hwm < soft_hwm - 1e-9
+                    and (not _trend_against)
+                ):
+                    new_level = None
+                    ratchet_reason = None
+                else:
+                    new_level = be_level
+                    ratchet_reason = "momentum_free_trade"
             else:
                 # Soft HWM seen but not yet mature/aged — hold without
                 # clamping to BE so a brief pullback under the lock
@@ -3928,7 +3947,11 @@ class ExecutionEngine:
                 if bool(_fb_raw.get("afternoon_low_fade")):
                     self.market_engine.state["_closing_afternoon_low_fade"] = True
                 if bool(_fb_raw.get("afternoon_high_fade")):
-                    self.market_engine.state["_closing_afternoon_high_fade"] = True
+                    # Same rule as hard-exit close: OR-high reject ≠ MR fade.
+                    if not bool(_fb_raw.get("or_high_reject_fade")):
+                        self.market_engine.state["_closing_afternoon_high_fade"] = True
+                    else:
+                        self.market_engine.state["_closing_or_high_reject"] = True
                 self.logger.info(
                     f"PATCH_V25 FAILED_BREAK_SCALP: {position.get('strategy_name')} "
                     f"liq={liq_premium:.2f} tgt={_fb_tgt:.2f} held={_held_fb:.0f}m "
@@ -4867,10 +4890,27 @@ class ExecutionEngine:
             _rp = {}
         if bool(_rp.get("afternoon_low_fade")
                 or position.get("afternoon_low_fade")):
+            # OR-low reclaim is a structural bounce credit — latching it as
+            # a mean-reversion extreme still OK for opposite-fade discipline.
             self.market_engine.state["_closing_afternoon_low_fade"] = True
+        _is_or_high = bool(
+            _rp.get("or_high_reject_fade")
+            or position.get("or_high_reject_fade")
+        )
         if bool(_rp.get("afternoon_high_fade")
                 or position.get("afternoon_high_fade")):
-            self.market_engine.state["_closing_afternoon_high_fade"] = True
+            # OR-high reject is a morning dump continuation setup, NOT a
+            # two-way extreme scalp. Tagging it as afternoon_high_fade was
+            # latching session_mean_reversion_book and killing the dump
+            # LONG_PUT (Oct5 post_fix5: 976× momentum_skipped_after_extreme_fade).
+            if not _is_or_high:
+                self.market_engine.state["_closing_afternoon_high_fade"] = True
+            else:
+                self.market_engine.state["_closing_or_high_reject"] = True
+                self.logger.info(
+                    "OR-high reject close: skip mean-reversion fade latch "
+                    "(keep dump momentum open)"
+                )
         # v64: same tags monitor sets on harvest paths — hard-exit / EOD
         # closes of these tickets must still latch session_mean_reversion.
         if bool(_rp.get("neutral_range_vertical")
@@ -4981,10 +5021,35 @@ class ExecutionEngine:
             state["last_exit_strategy_side"] = "BULL"
         elif "BEAR_CALL" in _sname_x:
             state["last_exit_strategy_side"] = "BEAR"
+        elif "LONG_PUT" in _sname_x:
+            # Debit put is a BEAR book — opposite credit is put-spread bounce.
+            state["last_exit_strategy_side"] = "BEAR"
+        elif "LONG_CALL" in _sname_x:
+            state["last_exit_strategy_side"] = "BULL"
         elif "CONDOR" in _sname_x or "BUTTERFLY" in _sname_x:
             state["last_exit_strategy_side"] = "RANGE"
         elif _sname_x:
             state["last_exit_strategy_side"] = "OTHER"
+        # After a banked bear debit, clear a burned OR-low latch and arm one
+        # opposite put-credit (Oct5: LONG_PUT target at 12:21 then 13:40
+        # reclaim was dead because morning false reclaim set used, and LP
+        # side was OTHER so opposite OR cooldown never fired).
+        try:
+            _banked_debit = float(net_pnl_rs or 0.0) > 0.0
+        except (TypeError, ValueError):
+            _banked_debit = False
+        if _banked_debit and "LONG_PUT" in _sname_x:
+            state.pop("or_low_reclaim_used", None)
+            state["post_bear_debit_bounce_unlock"] = True
+            self.logger.info(
+                "post_bear_debit_bounce_unlock: armed after banked LONG_PUT"
+            )
+        if _banked_debit and "LONG_CALL" in _sname_x:
+            state.pop("or_high_reject_used", None)
+            state["post_bull_debit_bounce_unlock"] = True
+            self.logger.info(
+                "post_bull_debit_bounce_unlock: armed after banked LONG_CALL"
+            )
         # Sticky session latch: once any extreme fade / failed-break scalp
         # closes, the day is a mean-reversion book for momentum purposes.
         # last_exit_* flags are overwritten by the next close (18-Sep high
