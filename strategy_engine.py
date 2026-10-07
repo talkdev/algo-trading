@@ -7386,6 +7386,29 @@ class StrategyEngine:
         state = self.market_engine.state
         cur   = _test_time if _test_time is not None else now_ist().time()
 
+        # Hard stand-downs are not sell-expression refusals. Never open the
+        # long-premium substitute on a dead feed, missing spot, or ABORT book.
+        if signals.get("block_new_entries") or signals.get("api_auth_dead"):
+            return False, "momentum_hard_abort_stand_down", 0
+        if signals.get("spot") is None:
+            return False, "momentum_no_spot", 0
+        _br_u = str(block_reason or "").upper()
+        if (
+            "AUTH_FEED_DEAD" in _br_u
+            or "VIX_EMERGENCY" in _br_u
+            or _br_u.startswith("ABORT:")
+        ):
+            return False, "momentum_hard_abort_stand_down", 0
+
+        # Event days that require HIGH confidence for credit must not let
+        # the debit substitute bypass that bar via the "confidence"/"event"
+        # markers (live 2026-10-07 RBI MPC: EVENT:REQUIRES_HIGH_CONFIDENCE
+        # kept opening the momentum path every cycle).
+        if bool(signals.get("event_day")):
+            _conf = str(signals.get("confidence_level") or "").upper()
+            if _conf != "HIGH":
+                return False, "momentum_event_needs_high_confidence", 0
+
         # ── substitution only: the sell side must have been refused ──────
         reason = str(block_reason or "").lower()
         markers = tuple(getattr(cfg, "momentum_block_markers", ())) or ()
@@ -9071,10 +9094,21 @@ class StrategyEngine:
         if gate:
             action, reason = gate
             if action == "NO_TRADE":
-                alt = self._momentum_decision(signals, reason)
-                if alt is not None:
-                    return alt
-                reason = self._with_momentum_refuse(signals, reason)
+                # Do not consult momentum under hard ABORT / dead auth /
+                # missing spot — those are stand-downs, not sell-side
+                # expression gaps.
+                _stand = (
+                    bool(signals.get("block_new_entries"))
+                    or bool(signals.get("api_auth_dead"))
+                    or signals.get("spot") is None
+                    or "AUTH_FEED_DEAD" in str(reason or "").upper()
+                    or "VIX_EMERGENCY" in str(reason or "").upper()
+                )
+                if not _stand:
+                    alt = self._momentum_decision(signals, reason)
+                    if alt is not None:
+                        return alt
+                    reason = self._with_momentum_refuse(signals, reason)
             self._log_decision(signals, action, reason)
             self._persist_decision(signals, "NONE", reason, None, action)
             self.market_engine.finalize_cycle_log(
@@ -9084,12 +9118,19 @@ class StrategyEngine:
 
         strategy_name, selection_reason = self._map_regime_to_strategy(signals)
         if strategy_name == "NO_TRADE":
-            alt = self._momentum_decision(signals, selection_reason)
-            if alt is not None:
-                return alt
-            selection_reason = self._with_momentum_refuse(
-                signals, selection_reason
+            _stand = (
+                bool(signals.get("api_auth_dead"))
+                or signals.get("spot") is None
             )
+            if not _stand:
+                alt = self._momentum_decision(signals, selection_reason)
+                if alt is not None:
+                    return alt
+                selection_reason = self._with_momentum_refuse(
+                    signals, selection_reason
+                )
+            else:
+                selection_reason = str(selection_reason or "NO_TRADE")
             self._log_decision(signals, "NO_TRADE", selection_reason)
             self._persist_decision(
                 signals, "NO_TRADE", selection_reason, None, "NO_TRADE"

@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 
 from core import (
-    Config, Database, RateLimiter, UpstoxClient,
+    Config, Database, RateLimiter, UpstoxClient, UpstoxAPIError,
     ExpiryCalendar, now_ist, today_ist, parse_ist_timestamp, IST,
     INSTRUMENT_KEY_NIFTY_SPOT, INSTRUMENT_KEY_INDIA_VIX,
     print_section, print_kv_table,
@@ -381,6 +381,10 @@ class MarketDataEngine:
         self._first_bar_close_today: Optional[float] = None
         self._first_bar_date: Optional[str]          = None
         self._vix_fail_count: int                    = 0
+        # Auth/API death is not a VIX event. Track separately so the regime
+        # layer can ABORT as AUTH_FEED_DEAD instead of VIX_EMERGENCY.
+        self._api_auth_fail_count: int               = 0
+        self._api_auth_dead: bool                    = False
 
     # ─────────────────────────────────────────────────────────────────────
     # INITIALISATION HELPERS
@@ -768,6 +772,8 @@ class MarketDataEngine:
         self._first_bar_close_today  = None
         self._first_bar_date         = None
         self._vix_fail_count         = 0
+        self._api_auth_fail_count    = 0
+        self._api_auth_dead          = False
 
     def _close_stale_prior_day_positions(self, prior_date: Optional[str]) -> None:
         """v58: do NOT fabricate CLOSED rows.
@@ -807,6 +813,14 @@ class MarketDataEngine:
         except Exception as e:
             self.logger.error(f"Failed to fetch spot/VIX: {e}")
             self._vix_fail_count += 1
+            _code = getattr(e, "status_code", None)
+            if isinstance(e, UpstoxAPIError) and _code in (401, 403):
+                self._api_auth_fail_count += 1
+                self._api_auth_dead = True
+                self.logger.critical(
+                    f"API auth dead (HTTP {_code}) — feed unusable; "
+                    f"auth_fail_count={self._api_auth_fail_count}"
+                )
             return self.state.get("prev_spot"), self.state.get("prev_vix")
 
         spot = vix = None
@@ -854,6 +868,9 @@ class MarketDataEngine:
 
         if vix is not None:
             self._vix_fail_count = 0
+            # A live VIX tick means the token/API path is healthy again.
+            self._api_auth_fail_count = 0
+            self._api_auth_dead = False
         else:
             self._vix_fail_count += 1
 
@@ -3946,6 +3963,8 @@ class MarketDataEngine:
             "vix":                      vix,
             "prev_day_vix_close":       self.state.get("prev_day_vix_close"),
             "vix_fail_count":           self._vix_fail_count,
+            "api_auth_fail_count":      self._api_auth_fail_count,
+            "api_auth_dead":            bool(self._api_auth_dead),
             "circuit_breaker_suspected": circuit,
             "vix_spike_detected":       vix_spike,
 

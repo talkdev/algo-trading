@@ -12,14 +12,32 @@ Method implemented:
     residuals. Stocks above the residual-volatility cap are excluded.
   * Select up to 50 long-side names, use inverse residual-volatility weights,
     and optionally apply entry/exit rank buffers from a user-supplied holdings CSV.
-  * Weekly Supertrend (ATR period 10, multiplier 3) is computed for every stock
-    with price history, and the top-50 table reports whether it is currently
-    POSITIVE or NEGATIVE plus the week it last flipped. Weekly bars are
-    resampled from the daily OHLCV already downloaded (no extra API calls),
-    using Wilder ATR and the standard +/-1 flip rule.
-  * The selected names are displayed sorted by that "ST since" date, oldest
-    trend first (--supertrend-sort asc, the default); desc shows the most recent
-    flips first and score restores the raw momentum ranking.
+  * Supertrend (ATR period 10, multiplier 3) is computed for every stock with
+    price history on BOTH timeframes, and the top-50 table reports whether each
+    is currently POSITIVE or NEGATIVE plus the bar it last flipped: weekly bars
+    are resampled from the daily OHLCV already downloaded (no extra API calls)
+    and daily bars are the downloaded sessions themselves, both using Wilder ATR
+    and the standard +/-1 flip rule. The daily flip is the finer-grained trend
+    change; the weekly one is the slower confirmation.
+  * A daily JMA/DWMA crossover screen runs alongside them on the same daily
+    closes: a lag-reduced Jurik-style JMA (length 7, phase -40, power 0.35) is
+    the fast line and a double weighted moving average (length 20) is the slow
+    line. The first 100 bars are warm-up so the JMA can stabilise; from bar 101
+    a day is a POSITIVE (bullish) crossover when JMA[i-1] <= DWMA[i-1] and
+    JMA[i] > DWMA[i], and a NEGATIVE (bearish) crossover when JMA[i-1] >=
+    DWMA[i-1] and JMA[i] < DWMA[i]. Anything else is no crossover.
+  * The selected names are displayed sorted by that crossover day, not by the
+    Supertrend flip: --crossover-sort desc (the default) shows the most recent
+    JMA/DWMA cross first, asc shows the oldest (longest-running) cross first,
+    and score restores the raw momentum ranking.
+  * After the main screen, a separate BUY/WATCH/AVOID classification is printed
+    for every selected portfolio member without changing the residual-score
+    ranking. BUY requires score >= 6, weekly Supertrend POS, a Positive JMA/DWMA
+    crossover no more than five trading sessions old, a positive current spread,
+    close above EMA(20), and latest completed-session volume >= 1.2x the average
+    of the preceding 20 completed sessions. WATCH is score >= 6 with weekly
+    Supertrend POS but not BUY; AVOID is score < 6 or weekly Supertrend not POS.
+    The monthly factor and daily technical signal dates are reported separately.
   * Report portfolio beta and an informational gross-exposure scale; never place
     orders or persist/change a real portfolio.
 
@@ -45,7 +63,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import quote, urljoin
 from zoneinfo import ZoneInfo
 
@@ -134,19 +152,58 @@ DEFAULT_FACTOR_CACHE_DIR = STOCK_DATA_DIR / "factors"
 DEFAULT_ENV_FILE = STOCK_DATA_DIR / "env.txt"
 LEGACY_ENV_FILE = PROJECT_DIR / "env.txt"
 
-# Weekly Supertrend settings (the requested 10 & 3).
+# Supertrend settings (the requested 10 & 3). The same ATR period/multiplier is
+# applied to weekly bars and to daily bars; only the timeframe differs.
 DEFAULT_SUPERTREND_PERIOD = 10
 DEFAULT_SUPERTREND_MULTIPLIER = 3.0
-# Table order for the selected names: "desc" = most recent Supertrend flip first,
-# "asc"  = oldest trend first, "score"       = keep the residual-momentum order.
-DEFAULT_SUPERTREND_SORT = "desc"
-SUPERTREND_SORT_OPTIONS = ("asc", "desc", "score")
 WEEKLY_RESAMPLE_RULE = "W-FRI"  # NSE trading week, week ending Friday.
-SUPERTREND_SORT_LABELS = {
-    "asc": "by weekly Supertrend change date, ascending (oldest trend first, most recent flip last)",
-    "desc": "by weekly Supertrend change date, descending (most recent flip first)",
-    "score": "by residual-momentum score (Supertrend shown for reference only)",
+SUPERTREND_TIMEFRAMES = ("weekly", "daily")
+
+# Daily JMA/DWMA crossover settings (the requested 7 / -40 / 0.35 / 20).
+DEFAULT_JMA_LENGTH = 7
+DEFAULT_JMA_PHASE = -40.0
+DEFAULT_JMA_POWER = 0.35
+DEFAULT_DWMA_LENGTH = 20
+DEFAULT_CROSSOVER_WARMUP_BARS = 100  # JMA warm-up; detection starts on bar 101.
+CROSSOVER_FRESH_SESSIONS = 5         # basket summary tally: crosses in the last trading week.
+
+# Separate BUY/WATCH/AVOID entry classification for selected portfolio members.
+DEFAULT_BUY_SCORE = 6.0
+DEFAULT_BUY_CROSSOVER_MAX_AGE = 5
+DEFAULT_BUY_VOLUME_MULTIPLE = 1.2
+DEFAULT_BUY_EMA_LENGTH = 20
+DEFAULT_BUY_VOLUME_LOOKBACK = 20
+SIGNAL_CLASSIFICATIONS = ("BUY", "WATCH", "AVOID")
+JMA_PHASE_LIMIT = 100.0              # phase is only defined on [-100, 100].
+JMA_BETA_COEFFICIENT = 0.45          # beta = 0.45*(L-1) / (0.45*(L-1) + 2)
+JMA_VOLTY_LAG_BARS = 10              # vsum adds div * (volty - volty[10])
+JMA_VOLTY_DIVISOR = 0.1              # the "div" of the volty sum
+JMA_AVOLTY_MIN_LOOKBACK = 30         # avolty factor = 2 / (max(4*L, 30) + 1)
+JMA_POW1_FLOOR = 0.5                 # pow1 = max(len1 - 2, 0.5)
+JMA_LEN1_FLOOR = 0.0                 # len1 = max(log2(sqrt((L-1)/2)) + 2, 0)
+
+# Table order for the selected names, keyed on the daily JMA/DWMA crossover day:
+# "desc" = most recent cross first, "asc" = oldest cross first,
+# "score" = keep the residual-momentum order.
+DEFAULT_CROSSOVER_SORT = "desc"
+CROSSOVER_SORT_OPTIONS = ("asc", "desc", "score")
+CROSSOVER_SORT_LABELS = {
+    "asc": "by daily JMA/DWMA crossover date, ascending (oldest cross first, freshest cross last)",
+    "desc": "by daily JMA/DWMA crossover date, descending (most recent cross first)",
+    "score": "by residual-momentum score (crossover and Supertrend shown for reference only)",
 }
+# Legacy sort constants/functions remain available for callers of the old weekly
+# Supertrend API, but neither the screen nor the default row order uses them.
+DEFAULT_SUPERTREND_SORT = "desc"
+SUPERTREND_SORT_OPTIONS = CROSSOVER_SORT_OPTIONS
+SUPERTREND_SORT_LABELS = {
+    "asc": "by weekly Supertrend change date, ascending (oldest trend first)",
+    "desc": "by weekly Supertrend change date, descending (most recent flip first)",
+    "score": "by residual-momentum score",
+}
+# Supertrend no longer drives the table order; the legacy knob is still accepted
+# and maps onto CROSSOVER_SORT so old command lines keep working.
+LEGACY_SUPERTREND_SORT_ENV = "SUPERTREND_SORT"
 
 
 class ScreenerError(RuntimeError):
@@ -313,22 +370,40 @@ class PortfolioMember:
 
 @dataclass(frozen=True)
 class SupertrendState:
-    """Weekly Supertrend reading for one stock.
+    """Supertrend reading for one stock on one timeframe (weekly or daily).
 
     ``direction`` is +1 when the Supertrend line sits under price (positive /
     bullish / green) and -1 when it sits above price (negative / bearish / red).
-    ``change_date`` is the week of the most recent flip; when the trend is older
-    than the loaded history it is None and ``first_resolved_date`` carries the
-    earliest week the indicator could be resolved.
+    ``change_date`` is the bar of the most recent flip, dated by that bar's
+    session; when the trend is older than the loaded history it is None and
+    ``first_resolved_date`` carries the earliest bar the indicator could be
+    resolved. ``bars_since_change`` counts bars (weeks or sessions) in the same
+    timeframe, so the label suffix matches the timeframe.
     """
 
+    timeframe: str
     direction: int
     value: float
     change_date: Optional[date]
-    weeks_since_change: Optional[int]
+    bars_since_change: Optional[int]
     flip_in_window: bool
     first_resolved_date: Optional[date]
-    weekly_bars: int
+    bars: int
+
+    @property
+    def unit(self) -> str:
+        """Age suffix for ``since_label``: weeks for weekly bars, days for daily."""
+        return "w" if self.timeframe == "weekly" else "d"
+
+    @property
+    def weeks_since_change(self) -> Optional[int]:
+        """Legacy weekly field name retained as a read-only compatibility alias."""
+        return self.bars_since_change if self.timeframe == "weekly" else None
+
+    @property
+    def weekly_bars(self) -> int:
+        """Legacy weekly field name retained as a read-only compatibility alias."""
+        return self.bars if self.timeframe == "weekly" else 0
 
     @property
     def direction_label(self) -> str:
@@ -346,8 +421,119 @@ class SupertrendState:
                 return "n/a"
             # No flip inside the loaded window: the trend is at least this old.
             return f"≤ {self.first_resolved_date.isoformat()}"
-        weeks = "" if self.weeks_since_change is None else f" ({self.weeks_since_change}w)"
-        return f"{self.change_date.isoformat()}{weeks}"
+        bars = "" if self.bars_since_change is None else f" ({self.bars_since_change}{self.unit})"
+        return f"{self.change_date.isoformat()}{bars}"
+
+
+@dataclass(frozen=True)
+class SupertrendReading:
+    """Weekly + daily Supertrend for one symbol, with per-timeframe failure reasons."""
+
+    weekly: Optional[SupertrendState] = None
+    daily: Optional[SupertrendState] = None
+    weekly_reason: Optional[str] = None
+    daily_reason: Optional[str] = None
+
+    @property
+    def resolved(self) -> bool:
+        """True when at least one timeframe produced a reading."""
+        return self.weekly is not None or self.daily is not None
+
+    def state(self, timeframe: str) -> Optional[SupertrendState]:
+        if timeframe == "weekly":
+            return self.weekly
+        if timeframe == "daily":
+            return self.daily
+        raise ValueError(f"unknown Supertrend timeframe: {timeframe!r}")
+
+    def failure_reason(self) -> Optional[str]:
+        """Combined reason when neither timeframe could be resolved; else None."""
+        if self.resolved:
+            return None
+        reasons = [reason for reason in (self.weekly_reason, self.daily_reason) if reason]
+        return "; ".join(dict.fromkeys(reasons)) or "unavailable"
+
+
+@dataclass(frozen=True)
+class CrossoverState:
+    """Daily JMA/DWMA crossover reading for one stock.
+
+    ``direction`` mirrors the current line alignment on the latest scanned bar:
+    +1 means JMA is above DWMA, -1 means it is below, 0 means the lines are equal.
+    ``change_date`` is the session of the most recent crossover inside the
+    scanned window (warm-up bars are not scanned); ``last_crossover_type`` and
+    its two values capture the event itself. When there was no crossover,
+    ``first_scanned_date`` carries the first bar checked. ``days_since_change``
+    counts trading sessions, not calendar days.
+    """
+
+    direction: int
+    jma_value: float
+    dwma_value: float
+    difference: float
+    change_date: Optional[date]
+    days_since_change: Optional[int]
+    crossover_in_window: bool
+    first_scanned_date: Optional[date]
+    scanned_bars: int
+    daily_bars: int
+    crossover_count: int
+    last_crossover_type: Optional[int] = None
+    last_crossover_jma_value: Optional[float] = None
+    last_crossover_dwma_value: Optional[float] = None
+
+    @property
+    def direction_label(self) -> str:
+        if self.direction > 0:
+            return "POS"
+        if self.direction < 0:
+            return "NEG"
+        return "n/a"
+
+    @property
+    def last_crossover_label(self) -> str:
+        if self.last_crossover_type is None:
+            return "None"
+        return "Positive" if self.last_crossover_type > 0 else "Negative"
+
+    def since_label(self) -> str:
+        # Keep the event date visible even if today's lines happen to be exactly
+        # equal; equality on today's bar is not itself a crossover, but an earlier
+        # valid crossover still exists in the scanned window.
+        if self.change_date is not None:
+            days = "" if self.days_since_change is None else f" ({self.days_since_change}d)"
+            return f"{self.change_date.isoformat()}{days}"
+        if self.direction == 0 or self.first_scanned_date is None:
+            return "n/a"
+        # No crossover inside the scanned window: the current side is at least
+        # this old (or there was no valid cross after warm-up).
+        return f"≤ {self.first_scanned_date.isoformat()}"
+
+    def difference_label(self) -> str:
+        """Signed JMA − DWMA spread in ₹ (positive = fast line above slow line)."""
+        if not np.isfinite(self.difference):
+            return "n/a"
+        return f"{self.difference:+,.2f}"
+
+
+@dataclass(frozen=True)
+class SignalClassification:
+    """BUY/WATCH/AVOID result for one selected portfolio member."""
+
+    symbol: str
+    signal: str
+    score: float
+    weekly_supertrend: str
+    crossover_type: str
+    crossover_age: Optional[int]
+    jma_dwma_difference: float
+    close: float
+    ema20: float
+    volume: float
+    average_volume: float
+    volume_ratio: float
+    latest_date: Optional[date]
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1132,6 +1318,76 @@ def monthly_closes_from_daily(daily: pd.DataFrame) -> pd.Series:
     return monthly[~monthly.index.duplicated(keep="last")].sort_index()
 
 
+OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def clean_daily_bars(daily: pd.DataFrame) -> pd.DataFrame:
+    """Return sorted, de-duplicated daily OHLCV with finite, positive OHLC prices.
+
+    Weekly/daily Supertrend depends on a complete OHLC bar, so its input drops a
+    session with any missing, infinite, zero or negative OHLC value. Bars are
+    kept in session order; the index is the session date. JMA/DWMA uses the close
+    series separately so an otherwise-valid close is not lost because (for
+    example) the provider omitted that day's high or low.
+    """
+    columns = list(OHLCV_COLUMNS)
+    empty = pd.DataFrame(columns=columns)
+    if daily is None or daily.empty or not {"open", "high", "low", "close"}.issubset(daily.columns):
+        return empty
+    frame = daily.copy()
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame = frame.sort_index(kind="stable")
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = np.nan
+    frame = frame[columns].apply(pd.to_numeric, errors="coerce")
+    frame = frame[frame.index.notna()]
+    frame = frame[~frame.index.duplicated(keep="last")]
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    frame = frame[(frame[["open", "high", "low", "close"]] > 0).all(axis=1)]
+    if frame.empty:
+        return empty
+    return frame.sort_index(kind="stable")
+
+
+def daily_close_series(daily: pd.DataFrame) -> pd.Series:
+    """Return adjusted daily closes where supplied, else close, independent of OHLC.
+
+    The current Upstox candle endpoint exposes ``close`` but does not guarantee
+    dividend-adjusted values. Accept explicit ``adjusted_close``/``adj_close``
+    columns in cached or injected histories when available; otherwise use the
+    provider's close while the report states that corporate-action adjustment is
+    not assured.
+    """
+    if daily is None or daily.empty:
+        return pd.Series(dtype=float, name="close")
+    adjusted_column = next(
+        (
+            column
+            for column in daily.columns
+            if _normalized_column_name(column) in {"adjustedclose", "adjclose", "adjclosingprice"}
+        ),
+        None,
+    )
+    close_column = adjusted_column or ("close" if "close" in daily.columns else None)
+    if close_column is None:
+        return pd.Series(dtype=float, name="close")
+    frame = daily[[close_column]].copy()
+    frame.columns = ["close"]
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame = frame.sort_index(kind="stable")
+    frame = frame[frame.index.notna()]
+    frame = frame[~frame.index.duplicated(keep="last")]
+    close = pd.to_numeric(frame["close"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    close = close.dropna()
+    close = close[close > 0]
+    close.name = "close"
+    return close.astype(float)
+
+
 def resample_daily_to_weekly(
     daily: pd.DataFrame,
     rule: str = WEEKLY_RESAMPLE_RULE,
@@ -1143,16 +1399,9 @@ def resample_daily_to_weekly(
     than by a future calendar Friday. Weeks with no session are dropped, so a
     holiday week never creates a synthetic bar.
     """
-    columns = ["open", "high", "low", "close", "volume"]
+    columns = list(OHLCV_COLUMNS)
     empty = pd.DataFrame(columns=columns)
-    if daily is None or daily.empty or not {"open", "high", "low", "close"}.issubset(daily.columns):
-        return empty
-    frame = daily.copy().sort_index()
-    if not isinstance(frame.index, pd.DatetimeIndex):
-        frame.index = pd.to_datetime(frame.index, errors="coerce")
-    frame = frame[columns].apply(pd.to_numeric, errors="coerce")
-    frame = frame.dropna(subset=["open", "high", "low", "close"])
-    frame = frame[(frame[["open", "high", "low", "close"]] > 0).all(axis=1)]
+    frame = clean_daily_bars(daily)
     if frame.empty:
         return empty
     grouper = pd.Grouper(freq=rule, label="right", closed="right")
@@ -1201,7 +1450,7 @@ def calculate_supertrend(
     period: int = DEFAULT_SUPERTREND_PERIOD,
     multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
 ) -> pd.DataFrame:
-    """Classic Supertrend on the supplied OHLC bars (weekly bars for this screen).
+    """Classic Supertrend on the supplied OHLC bars (weekly or daily for this screen).
 
     Convention: bands are hl2 ± multiplier × Wilder ATR(period). The support band
     (hl2 − k·ATR) can only ratchet up while the prior close holds above it, and
@@ -1273,28 +1522,33 @@ def calculate_supertrend(
     return result
 
 
-def supertrend_state(
-    daily: pd.DataFrame,
+def _supertrend_state_from_bars(
+    bars: pd.DataFrame,
+    timeframe: str,
     period: int = DEFAULT_SUPERTREND_PERIOD,
     multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
 ) -> tuple[Optional[SupertrendState], Optional[str]]:
-    """Return (state, failure reason) for the weekly Supertrend of one stock.
+    """Return (state, failure reason) for one timeframe's already-aggregated bars.
 
-    Weekly bars are resampled from the daily history already downloaded, so this
-    costs no additional market-data requests. ``failure reason`` is None on
-    success; otherwise it explains why no reading could be produced.
+    ``bars`` must already be the timeframe's OHLC bars (weekly resample or clean
+    daily sessions) and ``timeframe`` labels the reading so the "since" suffix is
+    weeks or days. ``failure reason`` is None on success; otherwise it explains
+    why no reading could be produced.
     """
-    weekly = resample_daily_to_weekly(daily)
+    if timeframe not in SUPERTREND_TIMEFRAMES:
+        raise ValueError(f"unknown Supertrend timeframe: {timeframe!r}")
+    bar_word = "weekly" if timeframe == "weekly" else "daily"
     minimum_bars = period + 2  # ATR seed plus one bar to establish direction.
-    if len(weekly) < minimum_bars:
-        return None, f"fewer than {minimum_bars} weekly bars"
+    if bars is None or len(bars) < minimum_bars:
+        count = 0 if bars is None else len(bars)
+        return None, f"fewer than {minimum_bars} {bar_word} bars ({count} available)"
     try:
-        result = calculate_supertrend(weekly, period=period, multiplier=multiplier)
+        result = calculate_supertrend(bars, period=period, multiplier=multiplier)
     except (ValueError, KeyError, TypeError) as exc:
-        return None, f"supertrend calculation failed ({type(exc).__name__})"
+        return None, f"{bar_word} supertrend calculation failed ({type(exc).__name__})"
     resolved = result.loc[result["trend"] != 0]
     if resolved.empty:
-        return None, "weekly ATR never seeded"
+        return None, f"{bar_word} ATR never seeded"
 
     trends = resolved["trend"].to_numpy(dtype=int)
     bar_dates = [timestamp.date() for timestamp in resolved.index]
@@ -1310,25 +1564,111 @@ def supertrend_state(
 
     if flip_index is not None:
         change_date: Optional[date] = bar_dates[flip_index]
-        weeks_since: Optional[int] = last_index - flip_index
+        bars_since: Optional[int] = last_index - flip_index
         flip_in_window = True
     else:
         change_date = None
-        weeks_since = None
+        bars_since = None
         flip_in_window = False
 
     return (
         SupertrendState(
+            timeframe=timeframe,
             direction=direction,
             value=value,
             change_date=change_date,
-            weeks_since_change=weeks_since,
+            bars_since_change=bars_since,
             flip_in_window=flip_in_window,
             first_resolved_date=bar_dates[0],
-            weekly_bars=int(len(weekly)),
+            bars=int(len(bars)),
         ),
         None,
     )
+
+
+def supertrend_state(
+    daily: pd.DataFrame,
+    period: int = DEFAULT_SUPERTREND_PERIOD,
+    multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+) -> tuple[Optional[SupertrendState], Optional[str]]:
+    """Backward-compatible weekly Supertrend state from a stock's daily history.
+
+    The original screener exposed ``supertrend_state(daily, period, multiplier)``
+    as its weekly reading helper. Keep that behavior; use ``daily_supertrend_state``
+    for the new daily timeframe.
+    """
+    return _supertrend_state_from_bars(
+        resample_daily_to_weekly(daily),
+        timeframe="weekly",
+        period=period,
+        multiplier=multiplier,
+    )
+
+
+def weekly_supertrend_state(
+    daily: pd.DataFrame,
+    period: int = DEFAULT_SUPERTREND_PERIOD,
+    multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+) -> tuple[Optional[SupertrendState], Optional[str]]:
+    """Weekly Supertrend of one stock, resampled from the daily history in memory.
+
+    Weekly bars come from the daily history already downloaded, so this costs no
+    additional market-data requests.
+    """
+    return supertrend_state(daily, period=period, multiplier=multiplier)
+
+
+def daily_supertrend_state(
+    daily: pd.DataFrame,
+    period: int = DEFAULT_SUPERTREND_PERIOD,
+    multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+) -> tuple[Optional[SupertrendState], Optional[str]]:
+    """Daily Supertrend of one stock — the same ATR settings on daily sessions.
+
+    This is the finer-grained trend change asked for alongside the weekly one:
+    it flips on the session the daily close breaks the prior band, so its
+    "since" date is normally newer than the weekly flip.
+    """
+    return _supertrend_state_from_bars(
+        clean_daily_bars(daily),
+        timeframe="daily",
+        period=period,
+        multiplier=multiplier,
+    )
+
+
+def compute_supertrend_states(
+    prices: Mapping[str, pd.DataFrame],
+    period: int = DEFAULT_SUPERTREND_PERIOD,
+    multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
+) -> tuple[dict[str, SupertrendReading], dict[str, str]]:
+    """Compute weekly + daily Supertrend for every symbol with price history, in memory.
+
+    A symbol lands in ``failures`` only when neither timeframe could be resolved;
+    a partial result (for example too few sessions for the weekly ATR seed but
+    enough for the daily one) is kept with the missing timeframe set to None and
+    its reason recorded on the reading.
+    """
+    readings: dict[str, SupertrendReading] = {}
+    failures: dict[str, str] = {}
+    for symbol in sorted(prices):
+        daily = prices.get(symbol)
+        if daily is None or daily.empty:
+            failures[symbol] = "no price history"
+            continue
+        weekly_state, weekly_reason = weekly_supertrend_state(daily, period=period, multiplier=multiplier)
+        daily_state, daily_reason = daily_supertrend_state(daily, period=period, multiplier=multiplier)
+        reading = SupertrendReading(
+            weekly=weekly_state,
+            daily=daily_state,
+            weekly_reason=weekly_reason,
+            daily_reason=daily_reason,
+        )
+        if reading.resolved:
+            readings[symbol] = reading
+        else:
+            failures[symbol] = reading.failure_reason() or "unavailable"
+    return readings, failures
 
 
 def compute_weekly_supertrend(
@@ -1336,20 +1676,548 @@ def compute_weekly_supertrend(
     period: int = DEFAULT_SUPERTREND_PERIOD,
     multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
 ) -> tuple[dict[str, SupertrendState], dict[str, str]]:
-    """Compute weekly Supertrend for every symbol with price history, in memory."""
+    """Backward-compatible weekly-only Supertrend calculation helper.
+
+    The main screener uses ``compute_supertrend_states`` for both timeframes;
+    this wrapper preserves callers that only consume the older weekly result.
+    """
     states: dict[str, SupertrendState] = {}
+    failures: dict[str, str] = {}
+    for symbol in sorted(prices):
+        state, reason = weekly_supertrend_state(prices[symbol], period=period, multiplier=multiplier)
+        if state is None:
+            failures[symbol] = reason or "unavailable"
+        else:
+            states[symbol] = state
+    return states, failures
+
+
+@dataclass(frozen=True)
+class JmaParameters:
+    """Precomputed JMA constants for one (length, phase, power) triple.
+
+    With the screen defaults (length 7, phase -40, power 0.35) these are
+    beta 0.5744680851, len1 2.792481, pow1 0.792481, div 0.1, phase_ratio 1.1,
+    cap ≈ 3.6542 and an avolty smoothing factor of 2/31 = 0.064516129 — the
+    constant table of the supplied algorithm.
+    """
+
+    length: int
+    phase: float
+    power: float
+    beta: float
+    len1: float
+    pow1: float
+    div: float
+    phase_ratio: float
+    cap: float
+    avolty_factor: float
+
+
+def jma_parameters(
+    length: int = DEFAULT_JMA_LENGTH,
+    phase: float = DEFAULT_JMA_PHASE,
+    power: float = DEFAULT_JMA_POWER,
+) -> JmaParameters:
+    """Derive the JMA constants from length and phase.
+
+    ``power`` is part of the requested parameter triple and is validated, but in
+    this JMA variant the adaptive exponent comes from ``length`` alone
+    (pow1 = len1 − 2, floored at 0.5), so power does not alter the series — the
+    supplied algorithm's recurrence only uses beta, len1/pow1, div, phase_ratio,
+    the cap and the avolty factor. Phase outside [-100, 100] is clipped for
+    phase_ratio (0.5 below, 2.5 above), exactly as in the reference code.
+    """
+    if length < 2:
+        raise ValueError("JMA length must be at least 2")
+    if not np.isfinite(phase):
+        raise ValueError("JMA phase must be a finite number")
+    if not np.isfinite(power) or power <= 0:
+        raise ValueError("JMA power must be a positive finite number")
+
+    clipped_phase = float(min(JMA_PHASE_LIMIT, max(-JMA_PHASE_LIMIT, phase)))
+    if phase < -JMA_PHASE_LIMIT:
+        phase_ratio = 0.5
+    elif phase > JMA_PHASE_LIMIT:
+        phase_ratio = 2.5
+    else:
+        phase_ratio = 1.5 + phase * 0.01
+
+    half_length = 0.5 * (length - 1)
+    len1 = max(math.log(math.sqrt(half_length)) / math.log(2.0) + 2.0, JMA_LEN1_FLOOR)
+    pow1 = max(len1 - 2.0, JMA_POW1_FLOOR)
+    scaled = JMA_BETA_COEFFICIENT * (length - 1)
+    return JmaParameters(
+        length=int(length),
+        phase=clipped_phase,
+        power=float(power),
+        beta=scaled / (scaled + 2.0),
+        len1=len1,
+        pow1=pow1,
+        div=JMA_VOLTY_DIVISOR,
+        phase_ratio=phase_ratio,
+        cap=float(len1 ** (1.0 / pow1)),
+        avolty_factor=2.0 / (max(4 * length, JMA_AVOLTY_MIN_LOOKBACK) + 1),
+    )
+
+
+def calculate_jma(
+    close: pd.Series,
+    length: int = DEFAULT_JMA_LENGTH,
+    phase: float = DEFAULT_JMA_PHASE,
+    power: float = DEFAULT_JMA_POWER,
+) -> pd.Series:
+    """Lag-reduced Jurik-style JMA of the supplied closes, evaluated bar by bar.
+
+    The recurrence follows the supplied algorithm exactly. Volty is the larger of
+    |price − bsmax| and |price − bsmin| against the previous bar's Jurik bands;
+    an incremental 10-bar sum of volty is smoothed into avolty, and the ratio
+    volty/avolty clamped to [1, cap] is raised to pow1 to drive both the band
+    factor kv and the adaptive alpha. The three stages are an adaptive EMA
+    (ma1), a Kalman-style detrend (det0, phase-weighted into ma2) and the final
+    Jurik filter (det1, accumulated into jma). The first bar seeds jma/bsmax/
+    bsmin with its own close, so the early values need the warm-up period before
+    they are comparable to a slow reference line.
+
+    ``close`` must already be cleaned (finite, positive, oldest bar first) — see
+    ``daily_close_series`` — because the recursion carries every bar forward.
+    """
+    params = jma_parameters(length, phase, power)
+    prices = pd.to_numeric(close, errors="coerce").astype(float).to_numpy()
+    n = len(prices)
+    jma = np.full(n, np.nan)
+    if n == 0:
+        return pd.Series(jma, index=close.index, name="jma")
+
+    volty_history: list[float] = []
+    vsum = 0.0
+    avolty = 0.0
+    bsmax = float(prices[0])
+    bsmin = float(prices[0])
+    ma1 = 0.0
+    det0 = 0.0
+    e2 = 0.0
+    value = float(prices[0])
+    one_minus_beta = 1.0 - params.beta
+
+    for i in range(n):
+        price = float(prices[i])
+        del1 = price - bsmax
+        del2 = price - bsmin
+        volty = max(abs(del1), abs(del2))
+        volty_history.append(volty)
+        volty_lag = volty_history[i - JMA_VOLTY_LAG_BARS] if i >= JMA_VOLTY_LAG_BARS else 0.0
+        vsum += params.div * (volty - volty_lag)
+        avolty += params.avolty_factor * (vsum - avolty)
+
+        d_volty = (volty / avolty) if avolty > 0 else 0.0
+        d_volty = min(max(d_volty, 1.0), params.cap)
+        pow2 = d_volty ** params.pow1
+        kv = params.beta ** math.sqrt(pow2)
+        upper_band = price if del1 > 0 else price - kv * del1
+        lower_band = price if del2 < 0 else price - kv * del2
+
+        alpha = params.beta ** pow2
+        ma1 = (1.0 - alpha) * price + alpha * ma1
+        det0 = (price - ma1) * one_minus_beta + params.beta * det0
+        ma2 = ma1 + params.phase_ratio * det0
+        det1 = (ma2 - value) * (1.0 - alpha) ** 2 + (alpha ** 2) * e2
+        value += det1
+        e2 = det1
+        bsmax = upper_band
+        bsmin = lower_band
+        jma[i] = value
+
+    return pd.Series(jma, index=close.index, name="jma")
+
+
+def calculate_dwma(close: pd.Series, length: int = DEFAULT_DWMA_LENGTH) -> pd.Series:
+    """Double weighted MA: linear weights 1..length with the oldest bar weighted 1.
+
+    DWMA[i] = (1·C[i−N+1] + 2·C[i−N+2] + … + N·C[i]) / (N·(N+1)/2), so the newest
+    close carries the largest weight and the divisor for length 20 is 210. Bars
+    before the window is full are NaN, and a NaN inside the window propagates.
+    """
+    if length < 1:
+        raise ValueError("DWMA length must be at least 1")
+    prices = pd.to_numeric(close, errors="coerce").astype(float).to_numpy()
+    n = len(prices)
+    dwma = np.full(n, np.nan)
+    if n >= length:
+        weights = np.arange(1, length + 1, dtype=float)
+        weight_total = length * (length + 1) / 2.0
+        windows = np.lib.stride_tricks.sliding_window_view(prices, length)
+        dwma[length - 1:] = windows @ weights / weight_total
+    return pd.Series(dwma, index=close.index, name="dwma")
+
+
+CROSSOVER_LABELS = {1: "Positive", -1: "Negative", 0: "None"}
+
+
+def jma_dwma_crossover_frame(
+    close: pd.Series,
+    jma_length: int = DEFAULT_JMA_LENGTH,
+    jma_phase: float = DEFAULT_JMA_PHASE,
+    jma_power: float = DEFAULT_JMA_POWER,
+    dwma_length: int = DEFAULT_DWMA_LENGTH,
+    warmup_bars: int = DEFAULT_CROSSOVER_WARMUP_BARS,
+) -> pd.DataFrame:
+    """Per-day JMA vs DWMA comparison from bar warmup+1 onward (the spec output).
+
+    Columns are jma, dwma, jma_prev, dwma_prev, difference (JMA − DWMA) and
+    crossover (+1 Positive/bullish, −1 Negative/bearish, 0 None). A Positive day
+    needs jma_prev ≤ dwma_prev and jma > dwma; a Negative day is the mirror
+    image. Equality on the previous bar therefore resolves in the direction of
+    today's move, and equality on both bars is no crossover. Bars whose lines are
+    still NaN can never satisfy a comparison, so they are recorded as None.
+    """
+    if warmup_bars < 1:
+        raise ValueError("crossover warm-up must be at least 1 bar")
+    jma = calculate_jma(close, length=jma_length, phase=jma_phase, power=jma_power)
+    dwma = calculate_dwma(close, length=dwma_length)
+    frame = pd.DataFrame({"jma": jma, "dwma": dwma})
+    frame["jma_prev"] = frame["jma"].shift(1)
+    frame["dwma_prev"] = frame["dwma"].shift(1)
+    frame["difference"] = frame["jma"] - frame["dwma"]
+    scanned = frame.iloc[warmup_bars:].copy()
+    if scanned.empty:
+        scanned["crossover"] = pd.Series(dtype=int)
+        return scanned
+    previous_difference = scanned["jma_prev"] - scanned["dwma_prev"]
+    difference = scanned["difference"]
+    scanned["crossover"] = np.select(
+        [
+            (previous_difference <= 0) & (difference > 0),
+            (previous_difference >= 0) & (difference < 0),
+        ],
+        [1, -1],
+        default=0,
+    ).astype(int)
+    return scanned
+
+
+def crossover_state(
+    daily: pd.DataFrame,
+    jma_length: int = DEFAULT_JMA_LENGTH,
+    jma_phase: float = DEFAULT_JMA_PHASE,
+    jma_power: float = DEFAULT_JMA_POWER,
+    dwma_length: int = DEFAULT_DWMA_LENGTH,
+    warmup_bars: int = DEFAULT_CROSSOVER_WARMUP_BARS,
+) -> tuple[Optional[CrossoverState], Optional[str]]:
+    """Return (state, failure reason) for one stock's daily JMA/DWMA crossover.
+
+    The scan uses the daily closes already downloaded, so it costs no additional
+    market-data requests. ``failure reason`` is None on success; otherwise it
+    explains why no reading could be produced (normally too little history for
+    the warm-up).
+    """
+    close = daily_close_series(daily)
+    minimum_bars = max(warmup_bars + 1, dwma_length + 1)
+    if len(close) < minimum_bars:
+        return None, f"fewer than {minimum_bars} daily bars ({len(close)} available)"
+    try:
+        scanned = jma_dwma_crossover_frame(
+            close,
+            jma_length=jma_length,
+            jma_phase=jma_phase,
+            jma_power=jma_power,
+            dwma_length=dwma_length,
+            warmup_bars=warmup_bars,
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        return None, f"crossover calculation failed ({type(exc).__name__})"
+    resolved = scanned.dropna(subset=["jma", "dwma"])
+    if resolved.empty:
+        return None, f"no bar cleared the {warmup_bars}-bar JMA warm-up with resolved lines"
+
+    last_index = len(resolved) - 1
+    last = resolved.iloc[last_index]
+    difference = float(last["difference"])
+    crosses = resolved.index[resolved["crossover"] != 0]
+    crossover_count = int(len(crosses))
+
+    if difference > 0:
+        direction = 1
+    elif difference < 0:
+        direction = -1
+    else:
+        # Exactly equal on the last bar: keep the side the last crossover set,
+        # so the row still reports a date instead of an empty "n/a".
+        direction = int(resolved.loc[crosses[-1], "crossover"]) if crossover_count else 0
+
+    if crossover_count:
+        last_cross = crosses[-1]
+        cross_row = resolved.loc[last_cross]
+        change_date: Optional[date] = last_cross.date()
+        days_since: Optional[int] = last_index - int(resolved.index.get_loc(last_cross))
+        crossover_in_window = True
+        last_crossover_type: Optional[int] = int(cross_row["crossover"])
+        last_crossover_jma_value: Optional[float] = float(cross_row["jma"])
+        last_crossover_dwma_value: Optional[float] = float(cross_row["dwma"])
+    else:
+        change_date = None
+        days_since = None
+        crossover_in_window = False
+        last_crossover_type = None
+        last_crossover_jma_value = None
+        last_crossover_dwma_value = None
+
+    return (
+        CrossoverState(
+            direction=direction,
+            jma_value=float(last["jma"]),
+            dwma_value=float(last["dwma"]),
+            difference=difference,
+            change_date=change_date,
+            days_since_change=days_since,
+            crossover_in_window=crossover_in_window,
+            first_scanned_date=resolved.index[0].date(),
+            scanned_bars=int(len(resolved)),
+            daily_bars=int(len(close)),
+            crossover_count=crossover_count,
+            last_crossover_type=last_crossover_type,
+            last_crossover_jma_value=last_crossover_jma_value,
+            last_crossover_dwma_value=last_crossover_dwma_value,
+        ),
+        None,
+    )
+
+
+def compute_daily_crossovers(
+    prices: Mapping[str, pd.DataFrame],
+    jma_length: int = DEFAULT_JMA_LENGTH,
+    jma_phase: float = DEFAULT_JMA_PHASE,
+    jma_power: float = DEFAULT_JMA_POWER,
+    dwma_length: int = DEFAULT_DWMA_LENGTH,
+    warmup_bars: int = DEFAULT_CROSSOVER_WARMUP_BARS,
+) -> tuple[dict[str, CrossoverState], dict[str, str]]:
+    """Compute the daily JMA/DWMA crossover for every symbol with price history, in memory."""
+    states: dict[str, CrossoverState] = {}
     failures: dict[str, str] = {}
     for symbol in sorted(prices):
         daily = prices.get(symbol)
         if daily is None or daily.empty:
             failures[symbol] = "no price history"
             continue
-        state, reason = supertrend_state(daily, period=period, multiplier=multiplier)
+        state, reason = crossover_state(
+            daily,
+            jma_length=jma_length,
+            jma_phase=jma_phase,
+            jma_power=jma_power,
+            dwma_length=dwma_length,
+            warmup_bars=warmup_bars,
+        )
         if state is None:
             failures[symbol] = reason or "unavailable"
         else:
             states[symbol] = state
     return states, failures
+
+
+def daily_volume_series(daily: pd.DataFrame) -> pd.Series:
+    """Return sorted daily volume, preserving missing values for validation."""
+    if daily is None or daily.empty:
+        return pd.Series(dtype=float, name="volume")
+    volume_column = next(
+        (column for column in daily.columns if _normalized_column_name(column) == "volume"),
+        None,
+    )
+    if volume_column is None:
+        return pd.Series(dtype=float, name="volume")
+    frame = daily[[volume_column]].copy()
+    frame.columns = ["volume"]
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame = frame.sort_index(kind="stable")
+    frame = frame[frame.index.notna()]
+    frame = frame[~frame.index.duplicated(keep="last")]
+    volume = pd.to_numeric(frame["volume"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    volume = volume.where(volume >= 0)
+    volume.name = "volume"
+    return volume.astype(float)
+
+
+def classify_stock_signal(
+    stock: RankedStock,
+    daily: Optional[pd.DataFrame],
+    supertrend: Optional[SupertrendReading],
+    crossover: Optional[CrossoverState],
+    buy_score: float = DEFAULT_BUY_SCORE,
+    crossover_max_age: int = DEFAULT_BUY_CROSSOVER_MAX_AGE,
+    volume_multiple: float = DEFAULT_BUY_VOLUME_MULTIPLE,
+    ema_length: int = DEFAULT_BUY_EMA_LENGTH,
+    volume_lookback: int = DEFAULT_BUY_VOLUME_LOOKBACK,
+    supertrend_failure: Optional[str] = None,
+    crossover_failure: Optional[str] = None,
+) -> SignalClassification:
+    """Classify one stock using only its latest available completed daily bar.
+
+    The existing Upstox candle parser excludes a potentially incomplete current-
+    day bar. EMA is a standard recursive EMA (adjust=False) with a full-period
+    minimum history. Volume compares the latest completed session with the mean
+    of the preceding 20 completed sessions, excluding the tested session from its baseline.
+    """
+    if ema_length < 1 or volume_lookback < 1:
+        raise ValueError("EMA length and volume lookback must be positive")
+
+    score = float(stock.score) if np.isfinite(stock.score) else float("nan")
+    score_pass = np.isfinite(score) and score >= buy_score
+
+    weekly = supertrend.weekly if supertrend is not None else None
+    weekly_label = weekly.direction_label if weekly is not None else "n/a"
+    weekly_pass = weekly is not None and weekly.direction > 0
+
+    crossover_type: str
+    crossover_age: Optional[int] = None
+    if crossover is None:
+        crossover_type = "n/a"
+    elif crossover.last_crossover_type == 1:
+        crossover_type = "POS"
+        crossover_age = crossover.days_since_change
+    elif crossover.last_crossover_type == -1:
+        crossover_type = "NEG"
+        crossover_age = crossover.days_since_change
+    else:
+        crossover_type = "NONE"
+    positive_cross = crossover is not None and crossover.last_crossover_type == 1
+    recent_positive_cross = bool(
+        positive_cross
+        and crossover_age is not None
+        and 0 <= crossover_age <= crossover_max_age
+    )
+
+    difference = crossover.difference if crossover is not None else float("nan")
+    spread_pass = np.isfinite(difference) and difference > 0
+
+    close_series = daily_close_series(daily) if daily is not None else pd.Series(dtype=float, name="close")
+    latest_date = pd.Timestamp(close_series.index[-1]).date() if not close_series.empty else None
+    close = float(close_series.iloc[-1]) if not close_series.empty else float("nan")
+    ema20 = float("nan")
+    if len(close_series) >= ema_length:
+        ema_series = close_series.ewm(span=ema_length, adjust=False, min_periods=ema_length).mean()
+        if not ema_series.empty and np.isfinite(ema_series.iloc[-1]):
+            ema20 = float(ema_series.iloc[-1])
+    close_above_ema = np.isfinite(close) and np.isfinite(ema20) and close > ema20
+
+    volume = average_volume = volume_ratio = float("nan")
+    volume_valid_count = 0
+    if daily is not None and not close_series.empty:
+        aligned_volume = daily_volume_series(daily).reindex(close_series.index)
+        if not aligned_volume.empty and np.isfinite(aligned_volume.iloc[-1]):
+            volume = float(aligned_volume.iloc[-1])
+        volume_window = aligned_volume.tail(volume_lookback + 1)
+        baseline = volume_window.iloc[:-1]
+        volume_valid_count = int(np.isfinite(baseline.to_numpy(dtype=float)).sum())
+        if len(baseline) == volume_lookback and volume_valid_count == volume_lookback:
+            average_volume = float(baseline.mean())
+            if average_volume > 0 and np.isfinite(volume):
+                volume_ratio = volume / average_volume
+    volume_pass = np.isfinite(volume_ratio) and volume_ratio >= volume_multiple
+
+    buy = bool(
+        score_pass
+        and weekly_pass
+        and recent_positive_cross
+        and spread_pass
+        and close_above_ema
+        and volume_pass
+    )
+    if buy:
+        signal = "BUY"
+    elif score_pass and weekly_pass:
+        signal = "WATCH"
+    else:
+        signal = "AVOID"
+
+    if np.isfinite(score):
+        score_reason = f"Score {score:.2f} {'>=' if score_pass else '<'} {buy_score:g}"
+    else:
+        score_reason = "Score unavailable"
+    if weekly is None:
+        reason = supertrend.weekly_reason if supertrend is not None else supertrend_failure
+        weekly_reason = f"Weekly ST unavailable ({reason})" if reason else "Weekly ST unavailable"
+    elif weekly_pass:
+        weekly_reason = "Weekly ST POS"
+    elif weekly.direction < 0:
+        weekly_reason = "Weekly ST NEG"
+    else:
+        weekly_reason = "Weekly ST n/a"
+
+    if crossover is None:
+        cross_reason = f"Crossover unavailable ({crossover_failure})" if crossover_failure else "Crossover unavailable"
+    elif crossover_type == "NONE":
+        cross_reason = "No JMA/DWMA cross in loaded window"
+    elif crossover_age is None:
+        cross_reason = f"Cross {crossover_type}; age unavailable"
+    elif crossover_type == "NEG":
+        cross_reason = f"Cross NEG {crossover_age}d; waiting for POS"
+    elif 0 <= crossover_age <= crossover_max_age:
+        cross_reason = f"Cross POS {crossover_age}d"
+    elif crossover_age > crossover_max_age:
+        cross_reason = f"Cross POS {crossover_age}d (> {crossover_max_age}d)"
+    else:
+        cross_reason = "Cross POS age invalid"
+
+    spread_reason = f"JMA-DWMA {difference:+,.2f}" if np.isfinite(difference) else "JMA-DWMA unavailable"
+    if np.isfinite(ema20):
+        ema_reason = "Close>EMA20" if close_above_ema else "Close<=EMA20"
+    elif not np.isfinite(close):
+        ema_reason = "Close/EMA unavailable (no valid daily closes)"
+    else:
+        ema_reason = f"EMA{ema_length} unavailable ({len(close_series)}/{ema_length} closes)"
+    if np.isfinite(volume_ratio):
+        volume_reason = (
+            f"Volume {volume_ratio:.2f}x 20D"
+            if volume_pass
+            else f"Volume {volume_ratio:.2f}x < {volume_multiple:.2f}x"
+        )
+    elif not np.isfinite(volume):
+        volume_reason = "Latest completed-session volume unavailable"
+    elif np.isfinite(average_volume) and average_volume <= 0:
+        volume_reason = "Volume ratio unavailable (20D average is zero)"
+    else:
+        volume_reason = f"20D volume average unavailable ({volume_valid_count}/{volume_lookback} prior sessions)"
+
+    return SignalClassification(
+        symbol=stock.symbol,
+        signal=signal,
+        score=score,
+        weekly_supertrend=weekly_label,
+        crossover_type=crossover_type,
+        crossover_age=crossover_age,
+        jma_dwma_difference=float(difference),
+        close=close,
+        ema20=ema20,
+        volume=volume,
+        average_volume=average_volume,
+        volume_ratio=volume_ratio,
+        latest_date=latest_date,
+        reasons=(score_reason, weekly_reason, cross_reason, spread_reason, ema_reason, volume_reason),
+    )
+
+
+def classify_selected_portfolio_members(
+    members: Sequence[PortfolioMember],
+    prices: Mapping[str, pd.DataFrame],
+    supertrend_states: Mapping[str, SupertrendReading],
+    crossover_states: Mapping[str, CrossoverState],
+    supertrend_failures: Optional[Mapping[str, str]] = None,
+    crossover_failures: Optional[Mapping[str, str]] = None,
+) -> list[SignalClassification]:
+    """Classify every selected member in the existing residual-score rank order."""
+    supertrend_failures = supertrend_failures or {}
+    crossover_failures = crossover_failures or {}
+    return [
+        classify_stock_signal(
+            stock=member.stock,
+            daily=prices.get(member.stock.symbol),
+            supertrend=supertrend_states.get(member.stock.symbol),
+            crossover=crossover_states.get(member.stock.symbol),
+            supertrend_failure=supertrend_failures.get(member.stock.symbol),
+            crossover_failure=crossover_failures.get(member.stock.symbol),
+        )
+        for member in members
+    ]
 
 
 def residual_volatility_passes(
@@ -1506,17 +2374,61 @@ def summarize_portfolio_beta(members: Sequence[PortfolioMember]) -> tuple[float,
     return beta, 1.0, f"within the [{BETA_LOWER_BOUND:.1f}, {BETA_UPPER_BOUND:.1f}] monitor band"
 
 
+def _has_crossover_reading(state: Optional[CrossoverState]) -> bool:
+    # The state exists only after both lines resolved past warm-up. A zero spread
+    # is a valid (neutral) reading and must still sort by its last crossover date.
+    return state is not None
+
+
+def _crossover_sort_key(state: Optional[CrossoverState]) -> tuple[date, int]:
+    """Sort key for the crossover-since column, for names that do have a reading.
+
+    A stock whose JMA never crossed the DWMA inside the scanned window has the
+    *oldest* signal in the table, so it sorts before every dated crossover
+    (secondary key -1) and therefore after every dated crossover when the order
+    is reversed. Sorting on the date is the same as sorting on "days since the
+    crossover" in the opposite direction.
+    """
+    if state.change_date is not None:
+        return (state.change_date, 0)
+    if state.first_scanned_date is not None:
+        return (state.first_scanned_date, -1)
+    return (date.min, -1)
+
+
+def sort_members_by_crossover(
+    members: Sequence[PortfolioMember],
+    crossover_states: Mapping[str, CrossoverState],
+    order: str = DEFAULT_CROSSOVER_SORT,
+) -> list[PortfolioMember]:
+    """Return the selected names ordered for display; ties keep the score order.
+
+    The table order is driven by the daily JMA/DWMA crossover day, not by the
+    Supertrend flip. Sorting is stable, so two stocks that crossed on the same
+    session stay in residual-momentum rank order; the momentum rank itself is
+    untouched and is still printed in the Rank/%ile column. Names with no
+    crossover reading are held to the end in both directions, so they never
+    displace a readable row.
+    """
+    ordered = list(members)
+    if order not in ("asc", "desc"):
+        return ordered
+    readable = [m for m in ordered if _has_crossover_reading(crossover_states.get(m.stock.symbol))]
+    unreadable = [m for m in ordered if not _has_crossover_reading(crossover_states.get(m.stock.symbol))]
+    readable.sort(
+        key=lambda member: _crossover_sort_key(crossover_states[member.stock.symbol]),
+        reverse=(order == "desc"),
+    )
+    return readable + unreadable
+
+
 def _has_supertrend_reading(state: Optional[SupertrendState]) -> bool:
+    """Legacy weekly-reading predicate retained for downstream callers."""
     return state is not None and state.direction != 0
 
 
 def _supertrend_sort_key(state: Optional[SupertrendState]) -> tuple[date, int]:
-    """Sort key for the ST-since column, for names that do have a reading.
-
-    A stock whose trend never flipped inside the loaded history is the *oldest*
-    trend in the table, so it sorts before every dated flip (secondary key -1)
-    and therefore after every dated flip when the order is reversed.
-    """
+    """Legacy weekly Supertrend sort key; the main screen sorts on crossovers."""
     if state.change_date is not None:
         return (state.change_date, 0)
     if state.first_resolved_date is not None:
@@ -1529,13 +2441,7 @@ def sort_members_by_supertrend(
     supertrend_states: Mapping[str, SupertrendState],
     order: str = DEFAULT_SUPERTREND_SORT,
 ) -> list[PortfolioMember]:
-    """Return the selected names ordered for display; ties keep the score order.
-
-    Sorting is stable, so two stocks that flipped in the same week stay in
-    residual-momentum rank order. The momentum rank itself is untouched and is
-    still printed in the Rank/%ile column. Names with no Supertrend reading are
-    held to the end in both directions, so they never displace a readable row.
-    """
+    """Legacy weekly Supertrend sorting helper, no longer used by the screen."""
     ordered = list(members)
     if order not in ("asc", "desc"):
         return ordered
@@ -1548,14 +2454,41 @@ def sort_members_by_supertrend(
     return readable + unreadable
 
 
+def summarize_crossover_counts(
+    members: Sequence[PortfolioMember],
+    crossover_states: Mapping[str, CrossoverState],
+) -> tuple[int, int, int]:
+    """Count positive / negative / unavailable JMA-DWMA readings in the table."""
+    return _summarize_direction_counts(
+        members,
+        lambda symbol: crossover_states.get(symbol),
+    )
+
+
 def summarize_supertrend_counts(
     members: Sequence[PortfolioMember],
-    supertrend_states: Mapping[str, SupertrendState],
+    supertrend_states: Mapping[str, SupertrendReading],
+    timeframe: str = "weekly",
 ) -> tuple[int, int, int]:
-    """Count positive / negative / unavailable Supertrend readings in the table."""
+    """Count positive / negative / unavailable Supertrend readings on one timeframe."""
+    if timeframe not in SUPERTREND_TIMEFRAMES:
+        raise ValueError(f"unknown Supertrend timeframe: {timeframe!r}")
+
+    def lookup(symbol: str) -> Optional[SupertrendState]:
+        reading = supertrend_states.get(symbol)
+        return reading.state(timeframe) if reading is not None else None
+
+    return _summarize_direction_counts(members, lookup)
+
+
+def _summarize_direction_counts(
+    members: Sequence[PortfolioMember],
+    lookup: Callable[[str], Optional[Any]],
+) -> tuple[int, int, int]:
+    """Shared POS / NEG / unavailable tally for any per-symbol direction reading."""
     positive = negative = unavailable = 0
     for member in members:
-        state = supertrend_states.get(member.stock.symbol)
+        state = lookup(member.stock.symbol)
         if state is None or state.direction == 0:
             unavailable += 1
         elif state.direction > 0:
@@ -1762,15 +2695,24 @@ def print_screen(
     price_failures: Mapping[str, str],
     filter_reasons: Mapping[str, int],
     cache_hits: int,
-    supertrend_states: Optional[Mapping[str, SupertrendState]] = None,
+    crossover_states: Optional[Mapping[str, CrossoverState]] = None,
+    crossover_failures: Optional[Mapping[str, str]] = None,
+    jma_length: int = DEFAULT_JMA_LENGTH,
+    jma_phase: float = DEFAULT_JMA_PHASE,
+    jma_power: float = DEFAULT_JMA_POWER,
+    dwma_length: int = DEFAULT_DWMA_LENGTH,
+    crossover_warmup_bars: int = DEFAULT_CROSSOVER_WARMUP_BARS,
+    crossover_sort: str = DEFAULT_CROSSOVER_SORT,
+    supertrend_states: Optional[Mapping[str, SupertrendReading]] = None,
     supertrend_failures: Optional[Mapping[str, str]] = None,
     supertrend_period: int = DEFAULT_SUPERTREND_PERIOD,
     supertrend_multiplier: float = DEFAULT_SUPERTREND_MULTIPLIER,
-    supertrend_sort: str = DEFAULT_SUPERTREND_SORT,
 ) -> None:
+    crossover_states = crossover_states or {}
+    crossover_failures = crossover_failures or {}
     supertrend_states = supertrend_states or {}
     supertrend_failures = supertrend_failures or {}
-    ordered_members = sort_members_by_supertrend(members, supertrend_states, supertrend_sort)
+    ordered_members = sort_members_by_crossover(members, crossover_states, crossover_sort)
     print("\nRESIDUAL MOMENTUM — NSE STOCK SCREEN (INFORMATIONAL ONLY; NO ORDERS)\n")
     print(f"Signal / return data through : {as_of_month}")
     print(f"Indian factor data through   : {factor_month} (lag to latest full month: {factor_lag_months})")
@@ -1793,14 +2735,37 @@ def print_screen(
     print(f"Universe                      : {requested_count} requested; {mapped_count} exact NSE EQ mappings")
     print(f"Eligible after filters        : {eligible_count}; cached price histories: {cache_hits}")
     print(f"Long basket                   : up to {portfolio_size}; selected {len(members)}")
-    print(f"Table order                   : {SUPERTREND_SORT_LABELS.get(supertrend_sort, supertrend_sort)}")
+    print(f"Table order                   : {CROSSOVER_SORT_LABELS.get(crossover_sort, crossover_sort)}")
+    print(
+        f"Daily JMA/DWMA crossover      : JMA({jma_length}, phase {jma_phase:g}, power {jma_power:g}) as the fast "
+        f"line over DWMA({dwma_length}) as the slow line, on the daily closes already downloaded; the first "
+        f"{crossover_warmup_bars} bars are JMA warm-up and scanning starts on bar {crossover_warmup_bars + 1}"
+    )
+    print(
+        "Crossover rules               : POSITIVE when JMA[i-1] ≤ DWMA[i-1] and JMA[i] > DWMA[i]; NEGATIVE when "
+        "JMA[i-1] ≥ DWMA[i-1] and JMA[i] < DWMA[i]; otherwise no crossover that day"
+    )
+    print(
+        "Crossover legend              : 'Last cross' = Positive/Negative/None; 'X since' = last crossover session "
+        "(Nd = trading sessions since); 'JMA @ X'/'DWMA @ X' are values on that session; 'Δ now' is the current "
+        "JMA − DWMA spread"
+    )
+    print(
+        "Crossover caveats             : '≤ date' = no crossover since the first scanned bar (use "
+        "--history-extra-months to load more); the supplied recurrence derives pow1 from length, so "
+        f"power {jma_power:g} is reported but does not alter the line; Upstox close adjustment is not assured"
+    )
     print(
         f"Weekly Supertrend             : ATR({supertrend_period}) × {supertrend_multiplier:g} on weekly bars "
         f"(W-FRI) resampled from the daily history already downloaded"
     )
     print(
+        f"Daily Supertrend              : the same ATR({supertrend_period}) × {supertrend_multiplier:g} applied to "
+        "daily sessions, so its trend change is dated by the session that flipped it"
+    )
+    print(
         "Supertrend legend             : POS = line below price (bullish); NEG = line above price (bearish); "
-        "'ST since' = week the trend last flipped"
+        "'ST W since'/'ST D since' = week/session the trend last flipped, (Nw)/(Nd) = bars since"
     )
     print(
         "Supertrend caveats            : '≤ date' = trend older than the loaded history (use "
@@ -1854,14 +2819,24 @@ def print_screen(
             "Gross weight",
             "Last close",
             "Median turnover/day",
-            f"ST ({supertrend_period},{supertrend_multiplier:g})",
-            "ST since",
-            "ST level",
+            "Last cross",
+            "X since",
+            "JMA @ X",
+            "DWMA @ X",
+            "Δ now",
+            f"ST W ({supertrend_period},{supertrend_multiplier:g})",
+            "ST W since",
+            "ST W level",
+            f"ST D ({supertrend_period},{supertrend_multiplier:g})",
+            "ST D since",
         )
         rows: list[tuple[str, ...]] = []
         for position, member in enumerate(ordered_members, start=1):
             stock = member.stock
-            state = supertrend_states.get(stock.symbol)
+            cross = crossover_states.get(stock.symbol)
+            reading = supertrend_states.get(stock.symbol)
+            weekly = reading.weekly if reading is not None else None
+            daily_st = reading.daily if reading is not None else None
             rows.append(
                 (
                     str(position),
@@ -1875,9 +2850,20 @@ def print_screen(
                     f"{member.gross_adjusted_weight * 100:.2f}%",
                     _format_money_inr(stock.latest_price),
                     f"₹{stock.median_daily_turnover_inr / 10_000_000:,.2f} Cr",
-                    state.direction_label if state is not None else "n/a",
-                    state.since_label() if state is not None else "n/a",
-                    _format_money_inr(state.value) if state is not None else "n/a",
+                    cross.last_crossover_label if cross is not None else "n/a",
+                    cross.since_label() if cross is not None else "n/a",
+                    _format_money_inr(cross.last_crossover_jma_value)
+                    if cross is not None and cross.last_crossover_jma_value is not None
+                    else "n/a",
+                    _format_money_inr(cross.last_crossover_dwma_value)
+                    if cross is not None and cross.last_crossover_dwma_value is not None
+                    else "n/a",
+                    cross.difference_label() if cross is not None else "n/a",
+                    weekly.direction_label if weekly is not None else "n/a",
+                    weekly.since_label() if weekly is not None else "n/a",
+                    _format_money_inr(weekly.value) if weekly is not None else "n/a",
+                    daily_st.direction_label if daily_st is not None else "n/a",
+                    daily_st.since_label() if daily_st is not None else "n/a",
                 )
             )
         widths = [
@@ -1888,11 +2874,38 @@ def print_screen(
         for row in rows:
             print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
 
-        if supertrend_states:
-            positive, negative, unavailable = summarize_supertrend_counts(members, supertrend_states)
+        # Printed whenever there is anything to say, including the case where no
+        # symbol had enough history: a silent omission would hide the failure.
+        if crossover_states or crossover_failures:
+            positive, negative, unavailable = summarize_crossover_counts(members, crossover_states)
+            fresh = sum(
+                1
+                for member in members
+                if (state := crossover_states.get(member.stock.symbol)) is not None
+                and state.change_date is not None
+                and state.days_since_change is not None
+                and state.days_since_change <= CROSSOVER_FRESH_SESSIONS
+            )
             print(
-                f"\nWeekly Supertrend in this basket: {positive} POS / {negative} NEG"
+                f"\nDaily JMA/DWMA in this basket : {positive} POS / {negative} NEG"
                 + (f" / {unavailable} unavailable" if unavailable else "")
+                + f"; {fresh} crossed within the last {CROSSOVER_FRESH_SESSIONS} session(s)"
+                + f"  (computed for {len(crossover_states)} symbol(s) with price history"
+                + (f"; {len(crossover_failures)} unavailable" if crossover_failures else "")
+                + ")"
+            )
+        if supertrend_states or supertrend_failures:
+            weekly_positive, weekly_negative, weekly_na = summarize_supertrend_counts(
+                members, supertrend_states, "weekly"
+            )
+            daily_positive, daily_negative, daily_na = summarize_supertrend_counts(
+                members, supertrend_states, "daily"
+            )
+            print(
+                f"Supertrend in this basket     : weekly {weekly_positive} POS / {weekly_negative} NEG"
+                + (f" / {weekly_na} unavailable" if weekly_na else "")
+                + f"; daily {daily_positive} POS / {daily_negative} NEG"
+                + (f" / {daily_na} unavailable" if daily_na else "")
                 + f"  (computed for {len(supertrend_states)} symbol(s) with price history"
                 + (f"; {len(supertrend_failures)} unavailable" if supertrend_failures else "")
                 + ")"
@@ -1913,9 +2926,226 @@ def print_screen(
     )
 
 
+def print_signal_classifications(
+    signals: Sequence[SignalClassification],
+    selected_count: int,
+    as_of_month: pd.Period,
+    factor_month: pd.Period,
+) -> None:
+    """Print BUY/WATCH/AVOID as a separate derived signal, not a new ranking."""
+    counts = {
+        signal_name: sum(item.signal == signal_name for item in signals)
+        for signal_name in SIGNAL_CLASSIFICATIONS
+    }
+    classified_count = sum(counts.values())
+    count_ok = classified_count == selected_count and len(signals) == selected_count
+
+    print("\n" + "=" * 60)
+    print("BUY / WATCH / AVOID SIGNALS")
+    print("=" * 60)
+    print(f"BUY: {counts['BUY']}")
+    print(f"WATCH: {counts['WATCH']}")
+    print(f"AVOID: {counts['AVOID']}")
+    print(
+        f"Count check: {counts['BUY']} + {counts['WATCH']} + {counts['AVOID']} = "
+        f"{classified_count} ({selected_count} selected portfolio members) "
+        f"[{'PASS' if count_ok else 'FAIL'}]"
+    )
+    print(
+        f"BUY rules: score >= {DEFAULT_BUY_SCORE:g}; weekly ST POS; Positive JMA/DWMA cross age "
+        f"0-{DEFAULT_BUY_CROSSOVER_MAX_AGE} sessions; JMA-DWMA > 0; close > EMA{DEFAULT_BUY_EMA_LENGTH}; "
+        f"latest volume >= {DEFAULT_BUY_VOLUME_MULTIPLE:.1f}x the prior "
+        f"{DEFAULT_BUY_VOLUME_LOOKBACK}-session average"
+    )
+    print("WATCH: score >= threshold and weekly ST POS, but at least one BUY condition is missing")
+    print("AVOID: score < threshold or weekly ST != POS; not a fundamental-quality judgment")
+    print(
+        f"Factor signal: latest available monthly factor data "
+        f"(residual score through {as_of_month}; factor data through {factor_month})"
+    )
+    latest_session = max(
+        (item.latest_date for item in signals if item.latest_date is not None),
+        default=None,
+    )
+    technical_note = "latest completed daily session"
+    if latest_session is not None:
+        technical_note += f" (data through {latest_session.isoformat()})"
+    else:
+        technical_note += " (date unavailable)"
+    print(f"Technical entry signal: {technical_note}")
+
+    headers = (
+        "Symbol",
+        "Score",
+        "Cross",
+        "Cross Age",
+        "Weekly ST",
+        "JMA-DWMA",
+        "Close",
+        f"EMA{DEFAULT_BUY_EMA_LENGTH} / check",
+        "Volume (ratio)",
+        "Reason",
+    )
+    for signal_name in SIGNAL_CLASSIFICATIONS:
+        print(f"\n{signal_name}")
+        print("-" * len(signal_name))
+        rows: list[tuple[str, ...]] = []
+        for item in signals:
+            if item.signal != signal_name:
+                continue
+            if np.isfinite(item.ema20):
+                ema_check = "PASS" if np.isfinite(item.close) and item.close > item.ema20 else "FAIL"
+                ema_display = f"{ema_check} {_format_money_inr(item.ema20)}"
+            else:
+                ema_display = "n/a"
+            if np.isfinite(item.volume):
+                ratio_text = f"{item.volume:,.0f}"
+                ratio_text += f" ({item.volume_ratio:.2f}x)" if np.isfinite(item.volume_ratio) else " (ratio n/a)"
+            else:
+                ratio_text = "n/a"
+            rows.append(
+                (
+                    item.symbol,
+                    f"{item.score:.3f}" if np.isfinite(item.score) else "n/a",
+                    item.crossover_type,
+                    f"{item.crossover_age}d" if item.crossover_age is not None else "n/a",
+                    item.weekly_supertrend,
+                    f"{item.jma_dwma_difference:+,.2f}"
+                    if np.isfinite(item.jma_dwma_difference)
+                    else "n/a",
+                    _format_money_inr(item.close),
+                    ema_display,
+                    ratio_text,
+                    "; ".join(item.reasons),
+                )
+            )
+        if not rows:
+            print("(none)")
+            continue
+        widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
+        print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+        print("  ".join("-" * widths[i] for i in range(len(headers))))
+        for row in rows:
+            print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+    print(
+        "\nBUY means only that all defined quantitative conditions passed; it is not a guaranteed prediction. "
+        "AVOID is only a screen-status label, not a fundamental judgment. No orders are generated.\n"
+    )
+
+
+def print_crossover_audit(
+    symbol: str,
+    daily: pd.DataFrame,
+    jma_length: int = DEFAULT_JMA_LENGTH,
+    jma_phase: float = DEFAULT_JMA_PHASE,
+    jma_power: float = DEFAULT_JMA_POWER,
+    dwma_length: int = DEFAULT_DWMA_LENGTH,
+    warmup_bars: int = DEFAULT_CROSSOVER_WARMUP_BARS,
+) -> None:
+    """Print the supplied algorithm's crossover-day output for one symbol.
+
+    Every scanned session (bar warmup+1 onward) is evaluated; only the days that
+    actually crossed are printed, with the JMA, the DWMA, both previous-day
+    values, the JMA − DWMA difference and Positive/Negative. This is a debugging
+    aid for a single name — it changes nothing in the screen and places no orders.
+    """
+    close = daily_close_series(daily)
+    params = jma_parameters(jma_length, jma_phase, jma_power)
+    print(f"\nJMA/DWMA CROSSOVER AUDIT — {symbol} (INFORMATIONAL ONLY; NO ORDERS)\n")
+    print(f"Daily closes available        : {len(close)}")
+    print(
+        f"JMA constants                 : length={params.length} phase={params.phase:g} power={params.power:g} "
+        f"beta={params.beta:.10f} len1={params.len1:.6f} pow1={params.pow1:.6f} div={params.div:g}"
+    )
+    print(
+        f"                                phase_ratio={params.phase_ratio:g} cap={params.cap:.4f} "
+        f"avolty_factor={params.avolty_factor:.9f}"
+    )
+    print(
+        f"DWMA constants                : length={dwma_length}; weights 1..{dwma_length} (oldest bar = 1); "
+        f"divisor {dwma_length * (dwma_length + 1) // 2}"
+    )
+    print(f"Warm-up                       : first {warmup_bars} bar(s) skipped; scanning starts on bar {warmup_bars + 1}")
+    if len(close) <= warmup_bars:
+        print(
+            f"\nNothing to audit: {len(close)} daily close(s) does not exceed the {warmup_bars}-bar warm-up."
+        )
+        return
+    try:
+        scanned = jma_dwma_crossover_frame(
+            close,
+            jma_length=jma_length,
+            jma_phase=jma_phase,
+            jma_power=jma_power,
+            dwma_length=dwma_length,
+            warmup_bars=warmup_bars,
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        print(f"\nCrossover calculation failed: {type(exc).__name__}: {exc}")
+        return
+
+    crosses = scanned[scanned["crossover"] != 0]
+    print(f"Scanned bars                  : {len(scanned)}; crossover days found: {len(crosses)}")
+    state, reason = crossover_state(
+        daily,
+        jma_length=jma_length,
+        jma_phase=jma_phase,
+        jma_power=jma_power,
+        dwma_length=dwma_length,
+        warmup_bars=warmup_bars,
+    )
+    if state is not None:
+        print(
+            f"Latest reading                : JMA {state.jma_value:,.4f} vs DWMA {state.dwma_value:,.4f} "
+            f"({state.difference_label()}) → {state.direction_label}; last crossover {state.since_label()}"
+        )
+    else:
+        print(f"Latest reading                : unavailable ({reason})")
+    if crosses.empty:
+        print("\nNo crossover day inside the scanned window; the JMA stayed on one side of the DWMA.")
+        return
+
+    headers = ("Date", "JMA", "DWMA", "JMA prev", "DWMA prev", "JMA-DWMA", "Crossover")
+    rows = [
+        (
+            timestamp.date().isoformat(),
+            f"{row['jma']:,.4f}",
+            f"{row['dwma']:,.4f}",
+            f"{row['jma_prev']:,.4f}",
+            f"{row['dwma_prev']:,.4f}",
+            f"{row['difference']:+,.4f}",
+            CROSSOVER_LABELS.get(int(row["crossover"]), "None"),
+        )
+        for timestamp, row in crosses.iterrows()
+    ]
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
+    # Dates/labels read left-aligned; the numeric columns read right-aligned.
+    alignments = ("<", ">", ">", ">", ">", ">", "<")
+
+    def formatted(values: Sequence[str]) -> str:
+        return "  ".join(
+            value.ljust(widths[i]) if alignments[i] == "<" else value.rjust(widths[i])
+            for i, value in enumerate(values)
+        )
+
+    print()
+    print(formatted(headers))
+    print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        print(formatted(row))
+    print(
+        f"\nCrossover days are listed oldest first; {len(rows)} of {len(scanned)} scanned session(s) crossed. "
+        "Positive = JMA crossed above DWMA; Negative = JMA crossed below DWMA."
+    )
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rank the supplied NSE universe by India-factor residual momentum; no trading."
+        description=(
+            "Rank the supplied NSE universe by India-factor residual momentum and report daily JMA/DWMA "
+            "crossovers plus weekly/daily Supertrend; no trading."
+        )
     )
     parser.add_argument(
         "--env-file",
@@ -1960,15 +3190,34 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS,
                         help="parallel candle workers, capped at 8 (default 6)")
     parser.add_argument("--supertrend-period", type=int, default=None,
-                        help="weekly Supertrend ATR period (default 10)")
+                        help="Supertrend ATR period, applied to both the weekly and the daily bars (default 10)")
     parser.add_argument("--supertrend-multiplier", type=float, default=None,
-                        help="weekly Supertrend ATR multiplier (default 3)")
-    parser.add_argument("--supertrend-sort", choices=SUPERTREND_SORT_OPTIONS, default=None,
-                        help="order of the displayed rows: asc = oldest 'ST since' first (default), "
-                             "desc = most recent flip first, score = residual-momentum rank")
+                        help="Supertrend ATR multiplier, applied to both the weekly and the daily bars (default 3)")
+    parser.add_argument("--jma-length", type=int, default=None,
+                        help="daily JMA (fast line) length, at least 2 (default 7)")
+    parser.add_argument("--jma-phase", type=float, default=None,
+                        help="daily JMA phase, -100..100 (default -40)")
+    parser.add_argument("--jma-power", type=float, default=None,
+                        help="daily JMA power (default 0.35; kept for parity with the supplied parameters — the "
+                             "adaptive exponent is derived from the length, so power does not change the series)")
+    parser.add_argument("--dwma-length", type=int, default=None,
+                        help="daily DWMA (slow line) length, weights 1..length (default 20)")
+    parser.add_argument("--crossover-warmup-bars", type=int, default=None,
+                        help="daily bars skipped as JMA warm-up before crossover detection (default 100, so "
+                             "detection starts on bar 101)")
+    parser.add_argument("--crossover-sort", choices=CROSSOVER_SORT_OPTIONS, default=None,
+                        help="order of the displayed rows, keyed on the daily JMA/DWMA crossover day: "
+                             "desc = most recent cross first (default), asc = oldest cross first, "
+                             "score = residual-momentum rank")
+    parser.add_argument("--supertrend-sort", choices=CROSSOVER_SORT_OPTIONS, default=None,
+                        help="deprecated alias for --crossover-sort: the table order is the crossover day now, "
+                             "the Supertrend flip is reported but no longer sorts")
+    parser.add_argument("--crossover-audit", metavar="SYMBOL", default=None,
+                        help="also print the day-by-day JMA/DWMA crossover output (crossover days only) for one "
+                             "symbol from the history already loaded")
     parser.add_argument("--history-extra-months", type=int, default=None,
                         help="extra months of daily history to load before the regression window "
-                             "(default 0; only needed to date older weekly Supertrend flips)")
+                             "(default 0; only needed to date older weekly Supertrend flips or JMA/DWMA crosses)")
     parser.add_argument("--refresh", action="store_true", help="ignore cached candles and fetch fresh history")
     return parser
 
@@ -2071,6 +3320,25 @@ def run_screen(args: argparse.Namespace) -> int:
             DEFAULT_SUPERTREND_MULTIPLIER,
             "SUPERTREND_MULTIPLIER",
         )
+    jma_length = args.jma_length
+    if jma_length is None:
+        jma_length = _optional_int(env_value(env_values, "JMA_LENGTH"), DEFAULT_JMA_LENGTH, "JMA_LENGTH")
+    jma_phase = args.jma_phase
+    if jma_phase is None:
+        jma_phase = _optional_float(env_value(env_values, "JMA_PHASE"), DEFAULT_JMA_PHASE, "JMA_PHASE")
+    jma_power = args.jma_power
+    if jma_power is None:
+        jma_power = _optional_float(env_value(env_values, "JMA_POWER"), DEFAULT_JMA_POWER, "JMA_POWER")
+    dwma_length = args.dwma_length
+    if dwma_length is None:
+        dwma_length = _optional_int(env_value(env_values, "DWMA_LENGTH"), DEFAULT_DWMA_LENGTH, "DWMA_LENGTH")
+    crossover_warmup_bars = args.crossover_warmup_bars
+    if crossover_warmup_bars is None:
+        crossover_warmup_bars = _optional_int(
+            env_value(env_values, "CROSSOVER_WARMUP_BARS"),
+            DEFAULT_CROSSOVER_WARMUP_BARS,
+            "CROSSOVER_WARMUP_BARS",
+        )
     if (
         max_staleness < 0 or min_turnover < 0 or min_eligible < 1 or cache_hours < 0
         or portfolio_size < 1 or not 0 < max_residual_vol_pct <= 100
@@ -2079,14 +3347,33 @@ def run_screen(args: argparse.Namespace) -> int:
             "Staleness, turnover, cache, and eligible-count settings must be non-negative; "
             "portfolio size must be positive and residual-volatility cap must be in (0, 100] percent."
         )
-    supertrend_sort = (
-        args.supertrend_sort
-        or env_value(env_values, "SUPERTREND_SORT", DEFAULT_SUPERTREND_SORT)
-        or DEFAULT_SUPERTREND_SORT
-    ).strip().lower()
-    if supertrend_sort not in SUPERTREND_SORT_OPTIONS:
+    # Table order: the crossover day is authoritative; the Supertrend knob is a
+    # deprecated alias so older command lines and env files keep working.
+    crossover_sort = (args.crossover_sort or "").strip().lower()
+    legacy_sort_requested = False
+    if not crossover_sort and args.supertrend_sort:
+        crossover_sort = args.supertrend_sort.strip().lower()
+        legacy_sort_requested = True
+    if not crossover_sort:
+        configured_sort = env_value(env_values, "CROSSOVER_SORT", "") or ""
+        if configured_sort.strip():
+            crossover_sort = configured_sort.strip().lower()
+        else:
+            legacy_sort = env_value(env_values, LEGACY_SUPERTREND_SORT_ENV, "") or ""
+            if legacy_sort.strip():
+                crossover_sort = legacy_sort.strip().lower()
+                legacy_sort_requested = True
+    crossover_sort = crossover_sort or DEFAULT_CROSSOVER_SORT
+    if crossover_sort not in CROSSOVER_SORT_OPTIONS:
         raise ScreenerError(
-            "SUPERTREND_SORT/--supertrend-sort must be 'asc', 'desc', or 'score'."
+            "CROSSOVER_SORT/--crossover-sort (and its legacy SUPERTREND_SORT/--supertrend-sort alias) "
+            "must be 'asc', 'desc', or 'score'."
+        )
+    if legacy_sort_requested:
+        print(
+            "NOTICE: --supertrend-sort/SUPERTREND_SORT is a deprecated alias; the table order is now the daily "
+            "JMA/DWMA crossover day (use --crossover-sort/CROSSOVER_SORT). The Supertrend flip is still reported.",
+            file=sys.stderr,
         )
     history_extra_months = args.history_extra_months
     if history_extra_months is None:
@@ -2097,8 +3384,22 @@ def run_screen(args: argparse.Namespace) -> int:
         )
     if supertrend_period < 2 or not np.isfinite(supertrend_multiplier) or supertrend_multiplier <= 0:
         raise ScreenerError(
-            "Weekly Supertrend needs an ATR period of at least 2 and a positive multiplier."
+            "Supertrend needs an ATR period of at least 2 and a positive multiplier (both timeframes)."
         )
+    if not -JMA_PHASE_LIMIT <= jma_phase <= JMA_PHASE_LIMIT:
+        raise ScreenerError(
+            f"JMA_PHASE/--jma-phase must be between -{JMA_PHASE_LIMIT:g} and {JMA_PHASE_LIMIT:g}."
+        )
+    try:
+        jma_constants = jma_parameters(jma_length, jma_phase, jma_power)
+        if dwma_length < 2:
+            raise ValueError("DWMA length must be at least 2")
+        if crossover_warmup_bars < dwma_length:
+            raise ValueError(
+                f"the warm-up ({crossover_warmup_bars} bars) must cover the DWMA length ({dwma_length} bars)"
+            )
+    except ValueError as exc:
+        raise ScreenerError(f"Daily JMA/DWMA crossover settings are invalid: {exc}.") from None
     if history_extra_months < 0 or history_extra_months > 120:
         raise ScreenerError(
             "PRICE_HISTORY_EXTRA_MONTHS/--history-extra-months must be between 0 and 120."
@@ -2165,9 +3466,13 @@ def run_screen(args: argparse.Namespace) -> int:
     # Keep one extra price month before the 36 regression returns. The range is
     # anchored to the usable signal month (not today's month) so an explicitly
     # stale/historical screen still has enough price history.
-    # NOTE: this same daily history is resampled to weekly bars for Supertrend,
-    # so no separate weekly request is made. --history-extra-months extends the
-    # range further back purely to date older weekly Supertrend flips.
+    # NOTE: this same daily history feeds every indicator below — it is resampled
+    # to weekly bars for the weekly Supertrend, used as-is for the daily
+    # Supertrend, and used as-is for the JMA/DWMA crossover — so no separate
+    # weekly or indicator request is made. The default window is roughly 800
+    # sessions, well past the crossover's 100-bar JMA warm-up;
+    # --history-extra-months extends it further back purely to date older weekly
+    # Supertrend flips or older crossovers.
     first_needed_month = as_of_month - (REGRESSION_MONTHS + 1)
     start_date = (
         first_needed_month.start_time - pd.DateOffset(months=2 + history_extra_months)
@@ -2175,7 +3480,7 @@ def run_screen(args: argparse.Namespace) -> int:
     end_date = today
     console_status(
         f"[3/4] Fetching daily OHLCV from {start_date} through {end_date}; progress updates follow "
-        f"(this also feeds the weekly Supertrend)."
+        f"(this also feeds the weekly/daily Supertrend and the JMA/DWMA crossover)."
     )
     prices, price_failures, cache_hits = _fetch_prices(
         instruments=instruments,
@@ -2224,30 +3529,72 @@ def run_screen(args: argparse.Namespace) -> int:
         current_holdings=current_holdings,
     )
 
-    # Supertrend is derived from the daily bars already in memory, so it costs
-    # no extra API calls even though it is computed for every priced symbol.
+    # Supertrend (both timeframes) and the JMA/DWMA crossover are derived from
+    # the daily bars already in memory, so they cost no extra API calls even
+    # though they are computed for every priced symbol.
     console_status(
-        f"[4/4] Computing weekly Supertrend (ATR {supertrend_period} × {supertrend_multiplier:g}) "
-        f"for {len(prices)} histories..."
+        f"[4/4] Computing Supertrend (ATR {supertrend_period} × {supertrend_multiplier:g}) on weekly and daily "
+        f"bars for {len(prices)} histories..."
     )
-    supertrend_states, supertrend_failures = compute_weekly_supertrend(
+    supertrend_states, supertrend_failures = compute_supertrend_states(
         prices,
         period=supertrend_period,
         multiplier=supertrend_multiplier,
     )
-    missing_in_table = [
-        member.stock.symbol for member in portfolio_members if member.stock.symbol not in supertrend_states
-    ]
     console_status(
         f"[4/4] Supertrend ready for {len(supertrend_states)} symbol(s)"
         + (f"; {len(supertrend_failures)} unavailable" if supertrend_failures else "")
         + "."
     )
+    console_status(
+        f"[4/4] Computing daily JMA({jma_length}, phase {jma_phase:g}, power {jma_power:g}) × DWMA({dwma_length}) "
+        f"crossovers for {len(prices)} histories "
+        f"(beta={jma_constants.beta:.6f}, pow1={jma_constants.pow1:.6f}, cap={jma_constants.cap:.4f}, "
+        f"warm-up {crossover_warmup_bars} bars)..."
+    )
+    crossover_states, crossover_failures = compute_daily_crossovers(
+        prices,
+        jma_length=jma_length,
+        jma_phase=jma_phase,
+        jma_power=jma_power,
+        dwma_length=dwma_length,
+        warmup_bars=crossover_warmup_bars,
+    )
+    console_status(
+        f"[4/4] Crossovers ready for {len(crossover_states)} symbol(s)"
+        + (f"; {len(crossover_failures)} unavailable" if crossover_failures else "")
+        + "."
+    )
+    missing_in_table = [
+        member.stock.symbol
+        for member in portfolio_members
+        if member.stock.symbol not in crossover_states or member.stock.symbol not in supertrend_states
+    ]
     if missing_in_table:
         print(
-            "WARNING: no weekly Supertrend for table entries: " + ", ".join(missing_in_table[:20]),
+            "WARNING: no JMA/DWMA crossover or no Supertrend for table entries: "
+            + ", ".join(missing_in_table[:20]),
             file=sys.stderr,
         )
+
+    if args.crossover_audit:
+        audit_symbol = args.crossover_audit.strip().upper()
+        audit_daily = prices.get(audit_symbol)
+        if audit_daily is None or audit_daily.empty:
+            print(
+                f"WARNING: --crossover-audit {audit_symbol}: no daily price history was loaded for that symbol.",
+                file=sys.stderr,
+            )
+        else:
+            print_crossover_audit(
+                audit_symbol,
+                audit_daily,
+                jma_length=jma_length,
+                jma_phase=jma_phase,
+                jma_power=jma_power,
+                dwma_length=dwma_length,
+                warmup_bars=crossover_warmup_bars,
+            )
 
     portfolio_beta, gross_scale, beta_message = summarize_portfolio_beta(portfolio_members)
     console_status(
@@ -2276,11 +3623,35 @@ def run_screen(args: argparse.Namespace) -> int:
         price_failures=price_failures,
         filter_reasons=filter_reasons,
         cache_hits=cache_hits,
+        crossover_states=crossover_states,
+        crossover_failures=crossover_failures,
+        jma_length=jma_length,
+        jma_phase=jma_phase,
+        jma_power=jma_power,
+        dwma_length=dwma_length,
+        crossover_warmup_bars=crossover_warmup_bars,
+        crossover_sort=crossover_sort,
         supertrend_states=supertrend_states,
         supertrend_failures=supertrend_failures,
         supertrend_period=supertrend_period,
         supertrend_multiplier=supertrend_multiplier,
-        supertrend_sort=supertrend_sort,
+    )
+
+    # This derived technical signal applies only to the selected portfolio
+    # members; the main residual-momentum ranking and existing table stay intact.
+    signal_classifications = classify_selected_portfolio_members(
+        members=portfolio_members,
+        prices=prices,
+        supertrend_states=supertrend_states,
+        crossover_states=crossover_states,
+        supertrend_failures=supertrend_failures,
+        crossover_failures=crossover_failures,
+    )
+    print_signal_classifications(
+        signals=signal_classifications,
+        selected_count=len(portfolio_members),
+        as_of_month=as_of_month,
+        factor_month=factor_month,
     )
     return 0
 
