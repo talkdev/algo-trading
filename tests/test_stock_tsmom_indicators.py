@@ -7,7 +7,6 @@ import math
 import sys
 import unittest
 from contextlib import redirect_stdout
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -256,8 +255,9 @@ class DailyIndicatorTests(unittest.TestCase):
     def _entry_inputs(
         self,
         weekly_direction: int = 1,
-        daily_direction: int = 1,
         cross_age: int = 0,
+        cross_type: int | None = 1,
+        difference: float = 1.0,
     ) -> tuple[pd.DataFrame, stock_tsmom.SupertrendReading, stock_tsmom.CrossoverState]:
         index = pd.bdate_range("2025-01-01", periods=80)
         close = np.linspace(100.0, 110.0, len(index))
@@ -276,7 +276,7 @@ class DailyIndicatorTests(unittest.TestCase):
         )
         daily_st = stock_tsmom.SupertrendState(
             timeframe="daily",
-            direction=daily_direction,
+            direction=1,
             value=108.0,
             change_date=None,
             bars_since_change=None,
@@ -284,104 +284,201 @@ class DailyIndicatorTests(unittest.TestCase):
             first_resolved_date=index[0].date(),
             bars=len(index),
         )
-        cross_date = index[-1 - cross_age].date()
+        cross_date = index[-1 - cross_age].date() if cross_type is not None else None
         crossover = stock_tsmom.CrossoverState(
-            direction=1,
+            direction=1 if difference > 0 else (-1 if difference < 0 else 0),
             jma_value=109.0,
-            dwma_value=108.0,
-            difference=1.0,
+            dwma_value=109.0 - difference,
+            difference=difference,
             change_date=cross_date,
-            days_since_change=cross_age,
-            crossover_in_window=True,
+            days_since_change=cross_age if cross_type is not None else None,
+            crossover_in_window=cross_type is not None,
             first_scanned_date=index[0].date(),
             scanned_bars=len(index) - 10,
             daily_bars=len(index),
-            crossover_count=1,
-            last_crossover_type=1,
-            last_crossover_jma_value=109.0,
-            last_crossover_dwma_value=108.0,
+            crossover_count=1 if cross_type is not None else 0,
+            last_crossover_type=cross_type,
+            last_crossover_jma_value=109.0 if cross_type is not None else None,
+            last_crossover_dwma_value=109.0 - difference if cross_type is not None else None,
         )
         return daily, stock_tsmom.SupertrendReading(weekly=weekly, daily=daily_st), crossover
 
-    def test_entry_screen_buy_requires_all_five_technical_rules(self) -> None:
+    def test_buy_defaults_and_all_required_conditions(self) -> None:
+        self.assertEqual(stock_tsmom.DEFAULT_BUY_SCORE, 6.0)
+        self.assertEqual(stock_tsmom.DEFAULT_BUY_CROSSOVER_MAX_AGE, 5)
+        self.assertEqual(stock_tsmom.DEFAULT_BUY_VOLUME_MULTIPLE, 1.2)
+        self.assertEqual(stock_tsmom.DEFAULT_BUY_EMA_LENGTH, 20)
+        self.assertEqual(stock_tsmom.DEFAULT_BUY_VOLUME_LOOKBACK, 20)
+
         daily, supertrend, crossover = self._entry_inputs()
-        candidate = stock_tsmom.classify_entry_candidate(
+        signal = stock_tsmom.classify_stock_signal(
             self._candidate_stock("BUYME", 7.2), daily, supertrend, crossover
         )
-        self.assertEqual(candidate.classification, "BUY")
-        self.assertTrue(candidate.fresh_positive_cross)
-        self.assertEqual(candidate.weekly_supertrend, "POS")
-        self.assertEqual(candidate.crossover_type, "Positive")
-        self.assertGreater(candidate.close, candidate.ema20)
-        self.assertGreaterEqual(candidate.volume_multiple, 1.2)
-        self.assertLessEqual(candidate.close, 1.08 * candidate.ema20)
+        expected_average = float(daily["volume"].tail(21).iloc[:-1].mean())
+        expected_ema = float(
+            stock_tsmom.daily_close_series(daily)
+            .ewm(span=20, adjust=False, min_periods=20)
+            .mean()
+            .iloc[-1]
+        )
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual(signal.weekly_supertrend, "POS")
+        self.assertEqual(signal.crossover_type, "POS")
+        self.assertEqual(signal.crossover_age, 0)
+        self.assertAlmostEqual(signal.jma_dwma_difference, 1.0)
+        self.assertGreater(signal.close, signal.ema20)
+        self.assertAlmostEqual(signal.average_volume, expected_average)
+        self.assertAlmostEqual(signal.volume_ratio, 1_300.0 / expected_average)
+        self.assertAlmostEqual(signal.ema20, expected_ema)
+        self.assertTrue(any("Cross POS 0d" in reason for reason in signal.reasons))
+        self.assertTrue(any("Volume" in reason and "20D" in reason for reason in signal.reasons))
 
-    def test_entry_screen_watch_and_avoid_wait_rules(self) -> None:
-        daily, supertrend, old_cross = self._entry_inputs(cross_age=1)
-        watch = stock_tsmom.classify_entry_candidate(
-            self._candidate_stock("WATCHME", 6.5), daily, supertrend, old_cross
-        )
-        self.assertEqual(watch.classification, "WATCH")
-        self.assertIn("No Positive JMA/DWMA cross on the latest session", watch.reasons)
-
-        negative_weekly = stock_tsmom.SupertrendState(
-            timeframe="weekly",
-            direction=-1,
-            value=112.0,
-            change_date=pd.Timestamp("2025-07-01").date(),
-            bars_since_change=1,
-            flip_in_window=True,
-            first_resolved_date=pd.Timestamp("2024-01-01").date(),
-            bars=80,
-        )
-        avoid = stock_tsmom.classify_entry_candidate(
-            self._candidate_stock("AVOIDME", 8.0),
-            daily,
-            stock_tsmom.SupertrendReading(weekly=negative_weekly, daily=supertrend.daily),
-            old_cross,
-        )
-        self.assertEqual(avoid.classification, "AVOID/WAIT")
-        self.assertIn("Weekly Supertrend is NEG", avoid.reasons)
-
-        positive_weekly_negative_daily = replace(
-            supertrend,
-            daily=replace(supertrend.daily, direction=-1),
-        )
-        deteriorating = stock_tsmom.classify_entry_candidate(
-            self._candidate_stock("DAILYNEG", 6.8), daily, positive_weekly_negative_daily, old_cross
-        )
-        self.assertEqual(deteriorating.classification, "AVOID/WAIT")
-        self.assertIn("Daily Supertrend is NEG", deteriorating.reasons)
-
-        overextended_daily = daily.copy()
-        overextended_daily.iloc[-1, overextended_daily.columns.get_loc("close")] = 120.0
-        overextended = stock_tsmom.classify_entry_candidate(
-            self._candidate_stock("EXTENDED", 6.2), overextended_daily, supertrend, old_cross
-        )
-        self.assertEqual(overextended.classification, "WATCH")
-        self.assertTrue(any("more than 8% above EMA20" in reason for reason in overextended.reasons))
-
-    def test_entry_screen_uses_all_score_qualified_stocks_and_prints_after_review(self) -> None:
+    def test_exact_volume_threshold_passes_but_zero_spread_does_not(self) -> None:
         daily, supertrend, crossover = self._entry_inputs()
-        stocks = [self._candidate_stock("QUALIFIED", 7.0), self._candidate_stock("LOW", 5.9)]
-        candidates, below = stock_tsmom.screen_entry_candidates(
-            stocks,
-            prices={"QUALIFIED": daily},
-            supertrend_states={"QUALIFIED": supertrend},
-            crossover_states={"QUALIFIED": crossover},
+        daily.iloc[-1, daily.columns.get_loc("volume")] = 1_200.0
+        exact_volume = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("VOLBOUNDARY", 6.0), daily, supertrend, crossover
         )
-        self.assertEqual(below, 1)
-        self.assertEqual([candidate.symbol for candidate in candidates], ["QUALIFIED"])
-        self.assertEqual(candidates[0].classification, "BUY")
+        self.assertAlmostEqual(exact_volume.volume_ratio, 1.2)
+        self.assertEqual(exact_volume.signal, "BUY")
+
+        _, _, zero_spread_cross = self._entry_inputs(difference=0.0)
+        zero_spread = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("ZEROSPREAD", 6.0), daily, supertrend, zero_spread_cross
+        )
+        self.assertEqual(zero_spread.signal, "WATCH")
+        self.assertTrue(any("JMA-DWMA +0.00" in reason for reason in zero_spread.reasons))
+
+    def test_five_session_cross_age_passes_but_six_session_age_is_watch(self) -> None:
+        daily, supertrend, cross_at_five = self._entry_inputs(cross_age=5)
+        within_limit = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("FIVE", 6.0), daily, supertrend, cross_at_five
+        )
+        self.assertEqual(within_limit.signal, "BUY")
+
+        _, _, cross_at_six = self._entry_inputs(cross_age=6)
+        outside_limit = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("SIX", 6.0), daily, supertrend, cross_at_six
+        )
+        self.assertEqual(outside_limit.signal, "WATCH")
+        self.assertTrue(any("6d" in reason for reason in outside_limit.reasons))
+
+    def test_watch_is_strong_score_and_weekly_positive_without_buy(self) -> None:
+        daily, supertrend, negative_cross = self._entry_inputs(cross_age=1, cross_type=-1, difference=-0.5)
+        watch = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("WATCHME", 9.06), daily, supertrend, negative_cross
+        )
+        self.assertEqual(watch.signal, "WATCH")
+        self.assertIn("POS", watch.weekly_supertrend)
+        self.assertTrue(any("Cross NEG 1d" in reason for reason in watch.reasons))
+        self.assertTrue(any("Score 9.06 >= 6" in reason for reason in watch.reasons))
+
+        low_volume = daily.copy()
+        low_volume.iloc[-1, low_volume.columns.get_loc("volume")] = 1_000.0
+        low_vol_signal = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("LOWVOL", 6.2), low_volume, supertrend,
+            self._entry_inputs()[2],
+        )
+        self.assertEqual(low_vol_signal.signal, "WATCH")
+        self.assertLess(low_vol_signal.volume_ratio, stock_tsmom.DEFAULT_BUY_VOLUME_MULTIPLE)
+
+        close_below_ema = daily.copy()
+        close_below_ema.iloc[-1, close_below_ema.columns.get_loc("close")] = 100.0
+        close_signal = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("BELOWEMA", 6.2), close_below_ema, supertrend,
+            self._entry_inputs()[2],
+        )
+        self.assertEqual(close_signal.signal, "WATCH")
+        self.assertTrue(any("Close<=EMA20" in reason for reason in close_signal.reasons))
+
+    def test_avoid_means_score_below_threshold_or_weekly_not_positive(self) -> None:
+        daily, positive_weekly, crossover = self._entry_inputs()
+        low_score = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("LOW", 5.21), daily, positive_weekly, crossover
+        )
+        self.assertEqual(low_score.signal, "AVOID")
+        self.assertTrue(any("Score 5.21 < 6" in reason for reason in low_score.reasons))
+
+        daily, negative_weekly, crossover = self._entry_inputs(weekly_direction=-1)
+        negative_trend = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("NEG", 9.0), daily, negative_weekly, crossover
+        )
+        self.assertEqual(negative_trend.signal, "AVOID")
+        self.assertEqual(negative_trend.weekly_supertrend, "NEG")
+
+    def test_missing_technical_history_does_not_crash_and_cannot_be_buy(self) -> None:
+        daily = self._prices(np.linspace(100.0, 101.0, 10), index=pd.bdate_range("2025-01-01", periods=10))
+        _, positive_weekly, _ = self._entry_inputs()
+        missing_history = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("SHORT", 7.0),
+            daily,
+            positive_weekly,
+            None,
+            crossover_failure="fewer than 101 daily bars (10 available)",
+        )
+        self.assertEqual(missing_history.signal, "WATCH")
+        self.assertTrue(np.isnan(missing_history.ema20))
+        self.assertTrue(np.isnan(missing_history.volume_ratio))
+        self.assertTrue(any("unavailable" in reason.lower() for reason in missing_history.reasons))
+
+        missing_weekly = stock_tsmom.classify_stock_signal(
+            self._candidate_stock("NOWEEKLY", 7.0),
+            daily,
+            None,
+            None,
+            supertrend_failure="fewer than 12 weekly bars",
+        )
+        self.assertEqual(missing_weekly.signal, "AVOID")
+        self.assertTrue(any("fewer than 12 weekly bars" in reason for reason in missing_weekly.reasons))
+
+    def test_selected_members_get_one_signal_and_output_counts_sum_to_selection(self) -> None:
+        daily, positive_weekly, positive_cross = self._entry_inputs()
+        _, _, negative_cross = self._entry_inputs(cross_type=-1, cross_age=1, difference=-0.5)
+        _, negative_weekly, positive_cross_for_avoid = self._entry_inputs(weekly_direction=-1)
+        stocks = [
+            self._candidate_stock("BUY", 7.0),
+            self._candidate_stock("WATCH", 8.0),
+            self._candidate_stock("AVOID", 9.0),
+        ]
+        members = [
+            stock_tsmom.PortfolioMember(stock, rank, 1.0 / rank, 0.5, 0.5)
+            for rank, stock in enumerate(stocks, start=1)
+        ]
+        signals = stock_tsmom.classify_selected_portfolio_members(
+            members,
+            prices={stock.symbol: daily for stock in stocks},
+            supertrend_states={
+                "BUY": positive_weekly,
+                "WATCH": positive_weekly,
+                "AVOID": negative_weekly,
+            },
+            crossover_states={
+                "BUY": positive_cross,
+                "WATCH": negative_cross,
+                "AVOID": positive_cross_for_avoid,
+            },
+        )
+        self.assertEqual([item.symbol for item in signals], ["BUY", "WATCH", "AVOID"])
+        self.assertEqual([item.signal for item in signals], ["BUY", "WATCH", "AVOID"])
 
         output = io.StringIO()
         with redirect_stdout(output):
-            stock_tsmom.print_entry_candidate_screen(candidates, screened_count=2, below_score_threshold=1)
+            stock_tsmom.print_signal_classifications(
+                signals,
+                selected_count=len(members),
+                as_of_month=pd.Period("2025-06", freq="M"),
+                factor_month=pd.Period("2025-06", freq="M"),
+            )
         rendered = output.getvalue()
-        self.assertIn("ENTRY CANDIDATE REVIEW", rendered)
-        self.assertIn("BUY rules", rendered)
-        self.assertIn("QUALIFIED", rendered)
-        self.assertIn("BUY 1 / WATCH 0 / AVOID/WAIT 0", rendered)
+        self.assertIn("BUY / WATCH / AVOID SIGNALS", rendered)
+        self.assertIn("BUY: 1", rendered)
+        self.assertIn("WATCH: 1", rendered)
+        self.assertIn("AVOID: 1", rendered)
+        self.assertIn("1 + 1 + 1 = 3 (3 selected portfolio members) [PASS]", rendered)
+        self.assertIn("Factor signal: latest available monthly factor data", rendered)
+        self.assertIn("Technical entry signal: latest completed daily session", rendered)
+        self.assertIn("JMA-DWMA", rendered)
+        self.assertIn("Volume", rendered)
 
 
 if __name__ == "__main__":

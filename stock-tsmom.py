@@ -30,13 +30,14 @@ Method implemented:
     Supertrend flip: --crossover-sort desc (the default) shows the most recent
     JMA/DWMA cross first, asc shows the oldest (longest-running) cross first,
     and score restores the raw momentum ranking.
-  * After the main screen, a separate entry-candidate review checks every
-    eligible name with residual score >= 6 (not only the displayed basket):
-    weekly Supertrend POS, a Positive JMA/DWMA cross on the latest completed
-    daily bar, close above EMA(20), volume >= 1.2x the prior 20-session average,
-    and close no more than 8% above EMA(20) are required for BUY. A strong-score
-    name missing an entry trigger is WATCH; weekly/daily Supertrend NEG, JMA
-    below DWMA, or close below EMA(20) is classified AVOID/WAIT as deterioration.
+  * After the main screen, a separate BUY/WATCH/AVOID classification is printed
+    for every selected portfolio member without changing the residual-score
+    ranking. BUY requires score >= 6, weekly Supertrend POS, a Positive JMA/DWMA
+    crossover no more than five trading sessions old, a positive current spread,
+    close above EMA(20), and latest completed-session volume >= 1.2x the average
+    of the preceding 20 completed sessions. WATCH is score >= 6 with weekly
+    Supertrend POS but not BUY; AVOID is score < 6 or weekly Supertrend not POS.
+    The monthly factor and daily technical signal dates are reported separately.
   * Report portfolio beta and an informational gross-exposure scale; never place
     orders or persist/change a real portfolio.
 
@@ -166,13 +167,13 @@ DEFAULT_DWMA_LENGTH = 20
 DEFAULT_CROSSOVER_WARMUP_BARS = 100  # JMA warm-up; detection starts on bar 101.
 CROSSOVER_FRESH_SESSIONS = 5         # basket summary tally: crosses in the last trading week.
 
-# Separate residual-momentum + technical entry-candidate screen.
-ENTRY_MIN_RESIDUAL_SCORE = 6.0
-ENTRY_EMA_LENGTH = 20
-ENTRY_VOLUME_LOOKBACK = 20
-ENTRY_MIN_VOLUME_MULTIPLE = 1.2
-ENTRY_MAX_EMA_EXTENSION = 1.08
-ENTRY_STATUS_ORDER = ("BUY", "WATCH", "AVOID/WAIT")
+# Separate BUY/WATCH/AVOID entry classification for selected portfolio members.
+DEFAULT_BUY_SCORE = 6.0
+DEFAULT_BUY_CROSSOVER_MAX_AGE = 5
+DEFAULT_BUY_VOLUME_MULTIPLE = 1.2
+DEFAULT_BUY_EMA_LENGTH = 20
+DEFAULT_BUY_VOLUME_LOOKBACK = 20
+SIGNAL_CLASSIFICATIONS = ("BUY", "WATCH", "AVOID")
 JMA_PHASE_LIMIT = 100.0              # phase is only defined on [-100, 100].
 JMA_BETA_COEFFICIENT = 0.45          # beta = 0.45*(L-1) / (0.45*(L-1) + 2)
 JMA_VOLTY_LAG_BARS = 10              # vsum adds div * (volty - volty[10])
@@ -516,24 +517,22 @@ class CrossoverState:
 
 
 @dataclass(frozen=True)
-class EntryCandidate:
-    """One residual-score-qualified stock in the post-screen entry review."""
+class SignalClassification:
+    """BUY/WATCH/AVOID result for one selected portfolio member."""
 
     symbol: str
-    residual_score: float
-    classification: str
-    latest_date: Optional[date]
+    signal: str
+    score: float
+    weekly_supertrend: str
+    crossover_type: str
+    crossover_age: Optional[int]
+    jma_dwma_difference: float
     close: float
     ema20: float
     volume: float
     average_volume: float
-    volume_multiple: float
-    ema_extension_pct: float
-    weekly_supertrend: str
-    daily_supertrend: str
-    crossover_type: str
-    crossover_date: Optional[date]
-    fresh_positive_cross: bool
+    volume_ratio: float
+    latest_date: Optional[date]
     reasons: tuple[str, ...]
 
 
@@ -2038,139 +2037,187 @@ def daily_volume_series(daily: pd.DataFrame) -> pd.Series:
     return volume.astype(float)
 
 
-def classify_entry_candidate(
+def classify_stock_signal(
     stock: RankedStock,
     daily: Optional[pd.DataFrame],
     supertrend: Optional[SupertrendReading],
     crossover: Optional[CrossoverState],
-) -> EntryCandidate:
-    """Apply the separate BUY/WATCH/AVOID-WAIT rules to one score-qualified stock.
+    buy_score: float = DEFAULT_BUY_SCORE,
+    crossover_max_age: int = DEFAULT_BUY_CROSSOVER_MAX_AGE,
+    volume_multiple: float = DEFAULT_BUY_VOLUME_MULTIPLE,
+    ema_length: int = DEFAULT_BUY_EMA_LENGTH,
+    volume_lookback: int = DEFAULT_BUY_VOLUME_LOOKBACK,
+    supertrend_failure: Optional[str] = None,
+    crossover_failure: Optional[str] = None,
+) -> SignalClassification:
+    """Classify one stock using only its latest available completed daily bar.
 
-    A "fresh" Positive JMA/DWMA cross means the cross occurred on the latest
-    completed daily bar. The volume multiple is today's completed-session volume
-    divided by the mean of the *previous* 20 completed daily volumes (today is
-    excluded from its own baseline).
-
-    For an explicit deterioration rule, this screen treats weekly Supertrend
-    NEGATIVE, daily Supertrend NEGATIVE, current JMA below DWMA, or close below
-    EMA(20) as significant deterioration. Overextension or an unmet volume/cross
-    trigger alone is WATCH, not AVOID.
+    The existing Upstox candle parser excludes a potentially incomplete current-
+    day bar. EMA is a standard recursive EMA (adjust=False) with a full-period
+    minimum history. Volume compares the latest completed session with the mean
+    of the preceding 20 completed sessions, excluding the tested session from its baseline.
     """
+    if ema_length < 1 or volume_lookback < 1:
+        raise ValueError("EMA length and volume lookback must be positive")
+
+    score = float(stock.score) if np.isfinite(stock.score) else float("nan")
+    score_pass = np.isfinite(score) and score >= buy_score
+
+    weekly = supertrend.weekly if supertrend is not None else None
+    weekly_label = weekly.direction_label if weekly is not None else "n/a"
+    weekly_pass = weekly is not None and weekly.direction > 0
+
+    crossover_type: str
+    crossover_age: Optional[int] = None
+    if crossover is None:
+        crossover_type = "n/a"
+    elif crossover.last_crossover_type == 1:
+        crossover_type = "POS"
+        crossover_age = crossover.days_since_change
+    elif crossover.last_crossover_type == -1:
+        crossover_type = "NEG"
+        crossover_age = crossover.days_since_change
+    else:
+        crossover_type = "NONE"
+    positive_cross = crossover is not None and crossover.last_crossover_type == 1
+    recent_positive_cross = bool(
+        positive_cross
+        and crossover_age is not None
+        and 0 <= crossover_age <= crossover_max_age
+    )
+
+    difference = crossover.difference if crossover is not None else float("nan")
+    spread_pass = np.isfinite(difference) and difference > 0
+
     close_series = daily_close_series(daily) if daily is not None else pd.Series(dtype=float, name="close")
     latest_date = pd.Timestamp(close_series.index[-1]).date() if not close_series.empty else None
     close = float(close_series.iloc[-1]) if not close_series.empty else float("nan")
-    ema_series = close_series.ewm(span=ENTRY_EMA_LENGTH, adjust=False, min_periods=ENTRY_EMA_LENGTH).mean()
-    ema20 = float(ema_series.iloc[-1]) if not ema_series.empty and np.isfinite(ema_series.iloc[-1]) else float("nan")
+    ema20 = float("nan")
+    if len(close_series) >= ema_length:
+        ema_series = close_series.ewm(span=ema_length, adjust=False, min_periods=ema_length).mean()
+        if not ema_series.empty and np.isfinite(ema_series.iloc[-1]):
+            ema20 = float(ema_series.iloc[-1])
+    close_above_ema = np.isfinite(close) and np.isfinite(ema20) and close > ema20
 
-    volume = average_volume = volume_multiple = float("nan")
-    if daily is not None and latest_date is not None:
+    volume = average_volume = volume_ratio = float("nan")
+    volume_valid_count = 0
+    if daily is not None and not close_series.empty:
         aligned_volume = daily_volume_series(daily).reindex(close_series.index)
-        volume_window = aligned_volume.tail(ENTRY_VOLUME_LOOKBACK + 1)
-        if len(volume_window) == ENTRY_VOLUME_LOOKBACK + 1 and np.isfinite(volume_window.to_numpy(dtype=float)).all():
-            volume = float(volume_window.iloc[-1])
-            average_volume = float(volume_window.iloc[:-1].mean())
-            if average_volume > 0:
-                volume_multiple = volume / average_volume
+        if not aligned_volume.empty and np.isfinite(aligned_volume.iloc[-1]):
+            volume = float(aligned_volume.iloc[-1])
+        volume_window = aligned_volume.tail(volume_lookback + 1)
+        baseline = volume_window.iloc[:-1]
+        volume_valid_count = int(np.isfinite(baseline.to_numpy(dtype=float)).sum())
+        if len(baseline) == volume_lookback and volume_valid_count == volume_lookback:
+            average_volume = float(baseline.mean())
+            if average_volume > 0 and np.isfinite(volume):
+                volume_ratio = volume / average_volume
+    volume_pass = np.isfinite(volume_ratio) and volume_ratio >= volume_multiple
 
-    weekly = supertrend.weekly if supertrend is not None else None
-    daily_st = supertrend.daily if supertrend is not None else None
-    weekly_direction = weekly.direction if weekly is not None else 0
-    daily_direction = daily_st.direction if daily_st is not None else 0
-    weekly_label = weekly.direction_label if weekly is not None else "n/a"
-    daily_label = daily_st.direction_label if daily_st is not None else "n/a"
-
-    fresh_positive_cross = bool(
-        crossover is not None
-        and latest_date is not None
-        and crossover.last_crossover_type == 1
-        and crossover.change_date == latest_date
-        and crossover.days_since_change == 0
+    buy = bool(
+        score_pass
+        and weekly_pass
+        and recent_positive_cross
+        and spread_pass
+        and close_above_ema
+        and volume_pass
     )
-    crossover_type = crossover.last_crossover_label if crossover is not None else "n/a"
-    crossover_date = crossover.change_date if crossover is not None else None
-
-    has_ema = np.isfinite(ema20) and np.isfinite(close)
-    extension_pct = (close / ema20 - 1.0) * 100.0 if has_ema and ema20 > 0 else float("nan")
-    deteriorations: list[str] = []
-    if weekly_direction < 0:
-        deteriorations.append("Weekly Supertrend is NEG")
-    if daily_direction < 0:
-        deteriorations.append("Daily Supertrend is NEG")
-    if crossover is not None and crossover.direction < 0:
-        deteriorations.append("JMA is below DWMA")
-    if has_ema and close < ema20:
-        deteriorations.append("Close is below EMA20")
-
-    entry_gaps: list[str] = []
-    if weekly_direction != 1:
-        entry_gaps.append("Weekly Supertrend is not POS")
-    if not fresh_positive_cross:
-        entry_gaps.append("No Positive JMA/DWMA cross on the latest session")
-    if not has_ema:
-        entry_gaps.append("EMA20 unavailable")
-    elif close <= ema20:
-        entry_gaps.append("Close is not above EMA20")
-    if not np.isfinite(volume_multiple):
-        entry_gaps.append("20-day volume comparison unavailable")
-    elif volume_multiple < ENTRY_MIN_VOLUME_MULTIPLE:
-        entry_gaps.append(f"Volume is below {ENTRY_MIN_VOLUME_MULTIPLE:.1f}× prior 20-day average")
-    if has_ema and close > ENTRY_MAX_EMA_EXTENSION * ema20:
-        entry_gaps.append(f"Close is more than {(ENTRY_MAX_EMA_EXTENSION - 1) * 100:.0f}% above EMA20")
-
-    if deteriorations:
-        classification = "AVOID/WAIT"
-        reasons = tuple(dict.fromkeys(deteriorations + entry_gaps))
-    elif not entry_gaps:
-        classification = "BUY"
-        reasons = ("All entry rules passed",)
+    if buy:
+        signal = "BUY"
+    elif score_pass and weekly_pass:
+        signal = "WATCH"
     else:
-        classification = "WATCH"
-        reasons = tuple(dict.fromkeys(entry_gaps))
+        signal = "AVOID"
 
-    return EntryCandidate(
+    if np.isfinite(score):
+        score_reason = f"Score {score:.2f} {'>=' if score_pass else '<'} {buy_score:g}"
+    else:
+        score_reason = "Score unavailable"
+    if weekly is None:
+        reason = supertrend.weekly_reason if supertrend is not None else supertrend_failure
+        weekly_reason = f"Weekly ST unavailable ({reason})" if reason else "Weekly ST unavailable"
+    elif weekly_pass:
+        weekly_reason = "Weekly ST POS"
+    elif weekly.direction < 0:
+        weekly_reason = "Weekly ST NEG"
+    else:
+        weekly_reason = "Weekly ST n/a"
+
+    if crossover is None:
+        cross_reason = f"Crossover unavailable ({crossover_failure})" if crossover_failure else "Crossover unavailable"
+    elif crossover_type == "NONE":
+        cross_reason = "No JMA/DWMA cross in loaded window"
+    elif crossover_age is None:
+        cross_reason = f"Cross {crossover_type}; age unavailable"
+    elif crossover_type == "NEG":
+        cross_reason = f"Cross NEG {crossover_age}d; waiting for POS"
+    elif 0 <= crossover_age <= crossover_max_age:
+        cross_reason = f"Cross POS {crossover_age}d"
+    elif crossover_age > crossover_max_age:
+        cross_reason = f"Cross POS {crossover_age}d (> {crossover_max_age}d)"
+    else:
+        cross_reason = "Cross POS age invalid"
+
+    spread_reason = f"JMA-DWMA {difference:+,.2f}" if np.isfinite(difference) else "JMA-DWMA unavailable"
+    if np.isfinite(ema20):
+        ema_reason = "Close>EMA20" if close_above_ema else "Close<=EMA20"
+    elif not np.isfinite(close):
+        ema_reason = "Close/EMA unavailable (no valid daily closes)"
+    else:
+        ema_reason = f"EMA{ema_length} unavailable ({len(close_series)}/{ema_length} closes)"
+    if np.isfinite(volume_ratio):
+        volume_reason = (
+            f"Volume {volume_ratio:.2f}x 20D"
+            if volume_pass
+            else f"Volume {volume_ratio:.2f}x < {volume_multiple:.2f}x"
+        )
+    elif not np.isfinite(volume):
+        volume_reason = "Latest completed-session volume unavailable"
+    elif np.isfinite(average_volume) and average_volume <= 0:
+        volume_reason = "Volume ratio unavailable (20D average is zero)"
+    else:
+        volume_reason = f"20D volume average unavailable ({volume_valid_count}/{volume_lookback} prior sessions)"
+
+    return SignalClassification(
         symbol=stock.symbol,
-        residual_score=float(stock.score),
-        classification=classification,
-        latest_date=latest_date,
+        signal=signal,
+        score=score,
+        weekly_supertrend=weekly_label,
+        crossover_type=crossover_type,
+        crossover_age=crossover_age,
+        jma_dwma_difference=float(difference),
         close=close,
         ema20=ema20,
         volume=volume,
         average_volume=average_volume,
-        volume_multiple=volume_multiple,
-        ema_extension_pct=extension_pct,
-        weekly_supertrend=weekly_label,
-        daily_supertrend=daily_label,
-        crossover_type=crossover_type,
-        crossover_date=crossover_date,
-        fresh_positive_cross=fresh_positive_cross,
-        reasons=reasons,
+        volume_ratio=volume_ratio,
+        latest_date=latest_date,
+        reasons=(score_reason, weekly_reason, cross_reason, spread_reason, ema_reason, volume_reason),
     )
 
 
-def screen_entry_candidates(
-    stocks: Sequence[RankedStock],
+def classify_selected_portfolio_members(
+    members: Sequence[PortfolioMember],
     prices: Mapping[str, pd.DataFrame],
     supertrend_states: Mapping[str, SupertrendReading],
     crossover_states: Mapping[str, CrossoverState],
-) -> tuple[list[EntryCandidate], int]:
-    """Screen all main-screen eligible names at residual score >= 6, not only top basket."""
-    candidates: list[EntryCandidate] = []
-    below_threshold = 0
-    for stock in stocks:
-        if not np.isfinite(stock.score) or stock.score < ENTRY_MIN_RESIDUAL_SCORE:
-            below_threshold += 1
-            continue
-        candidates.append(
-            classify_entry_candidate(
-                stock=stock,
-                daily=prices.get(stock.symbol),
-                supertrend=supertrend_states.get(stock.symbol),
-                crossover=crossover_states.get(stock.symbol),
-            )
+    supertrend_failures: Optional[Mapping[str, str]] = None,
+    crossover_failures: Optional[Mapping[str, str]] = None,
+) -> list[SignalClassification]:
+    """Classify every selected member in the existing residual-score rank order."""
+    supertrend_failures = supertrend_failures or {}
+    crossover_failures = crossover_failures or {}
+    return [
+        classify_stock_signal(
+            stock=member.stock,
+            daily=prices.get(member.stock.symbol),
+            supertrend=supertrend_states.get(member.stock.symbol),
+            crossover=crossover_states.get(member.stock.symbol),
+            supertrend_failure=supertrend_failures.get(member.stock.symbol),
+            crossover_failure=crossover_failures.get(member.stock.symbol),
         )
-    order = {status: index for index, status in enumerate(ENTRY_STATUS_ORDER)}
-    candidates.sort(key=lambda item: (order[item.classification], -item.residual_score, item.symbol))
-    return candidates, below_threshold
+        for member in members
+    ]
 
 
 def residual_volatility_passes(
@@ -2879,92 +2926,111 @@ def print_screen(
     )
 
 
-def print_entry_candidate_screen(
-    candidates: Sequence[EntryCandidate],
-    screened_count: int,
-    below_score_threshold: int,
+def print_signal_classifications(
+    signals: Sequence[SignalClassification],
+    selected_count: int,
+    as_of_month: pd.Period,
+    factor_month: pd.Period,
 ) -> None:
-    """Print the post-screen buy-candidate review; this is informational only."""
-    counts = {status: 0 for status in ENTRY_STATUS_ORDER}
-    for candidate in candidates:
-        counts[candidate.classification] = counts.get(candidate.classification, 0) + 1
+    """Print BUY/WATCH/AVOID as a separate derived signal, not a new ranking."""
+    counts = {
+        signal_name: sum(item.signal == signal_name for item in signals)
+        for signal_name in SIGNAL_CLASSIFICATIONS
+    }
+    classified_count = sum(counts.values())
+    count_ok = classified_count == selected_count and len(signals) == selected_count
 
-    print("\nENTRY CANDIDATE REVIEW — INFORMATIONAL ONLY; NO ORDERS\n")
+    print("\n" + "=" * 60)
+    print("BUY / WATCH / AVOID SIGNALS")
+    print("=" * 60)
+    print(f"BUY: {counts['BUY']}")
+    print(f"WATCH: {counts['WATCH']}")
+    print(f"AVOID: {counts['AVOID']}")
     print(
-        f"Universe                       : {screened_count} main-screen eligible stocks with residual score ≥ "
-        f"{ENTRY_MIN_RESIDUAL_SCORE:g}; {below_score_threshold} eligible stock(s) below the score threshold excluded"
+        f"Count check: {counts['BUY']} + {counts['WATCH']} + {counts['AVOID']} = "
+        f"{classified_count} ({selected_count} selected portfolio members) "
+        f"[{'PASS' if count_ok else 'FAIL'}]"
     )
     print(
-        f"BUY rules                      : score ≥ {ENTRY_MIN_RESIDUAL_SCORE:g}; weekly Supertrend POS; Positive JMA/DWMA "
-        f"cross on latest completed daily bar; close > EMA({ENTRY_EMA_LENGTH}); volume ≥ "
-        f"{ENTRY_MIN_VOLUME_MULTIPLE:.1f}× prior {ENTRY_VOLUME_LOOKBACK}-day average; close ≤ "
-        f"{ENTRY_MAX_EMA_EXTENSION:.2f}× EMA({ENTRY_EMA_LENGTH})"
+        f"BUY rules: score >= {DEFAULT_BUY_SCORE:g}; weekly ST POS; Positive JMA/DWMA cross age "
+        f"0-{DEFAULT_BUY_CROSSOVER_MAX_AGE} sessions; JMA-DWMA > 0; close > EMA{DEFAULT_BUY_EMA_LENGTH}; "
+        f"latest volume >= {DEFAULT_BUY_VOLUME_MULTIPLE:.1f}x the prior "
+        f"{DEFAULT_BUY_VOLUME_LOOKBACK}-session average"
     )
+    print("WATCH: score >= threshold and weekly ST POS, but at least one BUY condition is missing")
+    print("AVOID: score < threshold or weekly ST != POS; not a fundamental-quality judgment")
     print(
-        "Fresh/volume convention        : crossover must be on the latest completed session; volume compares the "
-        "latest session with the preceding 20 sessions (latest session excluded from its average)"
+        f"Factor signal: latest available monthly factor data "
+        f"(residual score through {as_of_month}; factor data through {factor_month})"
     )
-    print(
-        "AVOID/WAIT deterioration rule  : weekly ST NEG, daily ST NEG, JMA below DWMA, or close below EMA20; "
-        "overextension or a missing entry trigger alone is WATCH"
+    latest_session = max(
+        (item.latest_date for item in signals if item.latest_date is not None),
+        default=None,
     )
-    print(
-        "Classification counts         : "
-        + " / ".join(f"{status} {counts.get(status, 0)}" for status in ENTRY_STATUS_ORDER)
-    )
-    if not candidates:
-        print("No main-screen eligible stocks met the residual-score threshold of 6.\n")
-        return
+    technical_note = "latest completed daily session"
+    if latest_session is not None:
+        technical_note += f" (data through {latest_session.isoformat()})"
+    else:
+        technical_note += " (date unavailable)"
+    print(f"Technical entry signal: {technical_note}")
 
     headers = (
-        "Status",
         "Symbol",
-        "Data as of",
-        "Residual",
-        "ST W",
-        "ST D",
-        "Last JMA/DWMA cross",
-        "Cross date",
+        "Score",
+        "Cross",
+        "Cross Age",
+        "Weekly ST",
+        "JMA-DWMA",
         "Close",
-        f"EMA{ENTRY_EMA_LENGTH}",
-        "Vol today",
-        f"Avg vol {ENTRY_VOLUME_LOOKBACK}d",
-        "Vol×",
-        "Ext%",
-        "Reason / unmet rule",
+        f"EMA{DEFAULT_BUY_EMA_LENGTH} / check",
+        "Volume (ratio)",
+        "Reason",
     )
-    rows: list[tuple[str, ...]] = []
-    for candidate in candidates:
-        cross_label = candidate.crossover_type
-        if candidate.fresh_positive_cross:
-            cross_label += " (fresh)"
-        rows.append(
-            (
-                candidate.classification,
-                candidate.symbol,
-                candidate.latest_date.isoformat() if candidate.latest_date is not None else "n/a",
-                f"{candidate.residual_score:.2f}",
-                candidate.weekly_supertrend,
-                candidate.daily_supertrend,
-                cross_label,
-                candidate.crossover_date.isoformat() if candidate.crossover_date is not None else "n/a",
-                _format_money_inr(candidate.close),
-                _format_money_inr(candidate.ema20),
-                f"{candidate.volume:,.0f}" if np.isfinite(candidate.volume) else "n/a",
-                f"{candidate.average_volume:,.0f}" if np.isfinite(candidate.average_volume) else "n/a",
-                f"{candidate.volume_multiple:.2f}×" if np.isfinite(candidate.volume_multiple) else "n/a",
-                f"{candidate.ema_extension_pct:+.2f}%" if np.isfinite(candidate.ema_extension_pct) else "n/a",
-                "; ".join(candidate.reasons),
+    for signal_name in SIGNAL_CLASSIFICATIONS:
+        print(f"\n{signal_name}")
+        print("-" * len(signal_name))
+        rows: list[tuple[str, ...]] = []
+        for item in signals:
+            if item.signal != signal_name:
+                continue
+            if np.isfinite(item.ema20):
+                ema_check = "PASS" if np.isfinite(item.close) and item.close > item.ema20 else "FAIL"
+                ema_display = f"{ema_check} {_format_money_inr(item.ema20)}"
+            else:
+                ema_display = "n/a"
+            if np.isfinite(item.volume):
+                ratio_text = f"{item.volume:,.0f}"
+                ratio_text += f" ({item.volume_ratio:.2f}x)" if np.isfinite(item.volume_ratio) else " (ratio n/a)"
+            else:
+                ratio_text = "n/a"
+            rows.append(
+                (
+                    item.symbol,
+                    f"{item.score:.3f}" if np.isfinite(item.score) else "n/a",
+                    item.crossover_type,
+                    f"{item.crossover_age}d" if item.crossover_age is not None else "n/a",
+                    item.weekly_supertrend,
+                    f"{item.jma_dwma_difference:+,.2f}"
+                    if np.isfinite(item.jma_dwma_difference)
+                    else "n/a",
+                    _format_money_inr(item.close),
+                    ema_display,
+                    ratio_text,
+                    "; ".join(item.reasons),
+                )
             )
-        )
-    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
-    print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
-    print("  ".join("-" * widths[i] for i in range(len(headers))))
-    for row in rows:
-        print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+        if not rows:
+            print("(none)")
+            continue
+        widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
+        print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+        print("  ".join("-" * widths[i] for i in range(len(headers))))
+        for row in rows:
+            print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
     print(
-        "\nBUY/WATCH/AVOID-WAIT are screening labels only, not personalized advice or orders. "
-        "The table uses the same daily candle history as the main screen.\n"
+        "\nBUY means only that all defined quantitative conditions passed; it is not a guaranteed prediction. "
+        "AVOID is only a screen-status label, not a fundamental judgment. No orders are generated.\n"
     )
 
 
@@ -3571,18 +3637,21 @@ def run_screen(args: argparse.Namespace) -> int:
         supertrend_multiplier=supertrend_multiplier,
     )
 
-    # The separate entry review is deliberately appended after the main screen
-    # and covers every eligible score-ranked name, not just the displayed basket.
-    entry_candidates, below_score_threshold = screen_entry_candidates(
-        stocks=ranked_candidates,
+    # This derived technical signal applies only to the selected portfolio
+    # members; the main residual-momentum ranking and existing table stay intact.
+    signal_classifications = classify_selected_portfolio_members(
+        members=portfolio_members,
         prices=prices,
         supertrend_states=supertrend_states,
         crossover_states=crossover_states,
+        supertrend_failures=supertrend_failures,
+        crossover_failures=crossover_failures,
     )
-    print_entry_candidate_screen(
-        candidates=entry_candidates,
-        screened_count=len(ranked_candidates),
-        below_score_threshold=below_score_threshold,
+    print_signal_classifications(
+        signals=signal_classifications,
+        selected_count=len(portfolio_members),
+        as_of_month=as_of_month,
+        factor_month=factor_month,
     )
     return 0
 
