@@ -1079,7 +1079,20 @@ class RegimeClassifier:
             self.logger.warning(f"ABORT: VIX={vix:.1f} >= {self.config.abort_vix_absolute}")
             return VolatilityRegime.ABORT, details
 
-        # VIX data failure
+        # Auth/API death (401/403) — not a VIX emergency. Same ABORT
+        # posture (block new entries) but a distinct trigger so operators
+        # refresh the token instead of hunting a phantom VIX outage.
+        if bool(signals.get("api_auth_dead")) or int(
+            signals.get("api_auth_fail_count") or 0
+        ) >= int(self.config.vix_fail_limit):
+            _af = int(signals.get("api_auth_fail_count") or 0)
+            details["trigger"] = f"AUTH_FEED_DEAD_{_af}_cycles"
+            self.logger.critical(
+                f"ABORT: broker API auth dead for {_af} consecutive cycles"
+            )
+            return VolatilityRegime.ABORT, details
+
+        # VIX data failure (feed up, VIX still missing)
         if vix_fail_count >= self.config.vix_fail_limit:
             details["trigger"] = f"VIX_DATA_FAILURE_{vix_fail_count}_cycles"
             self.logger.warning(
@@ -1937,9 +1950,21 @@ class RegimeClassifier:
 
         # ── Hard Block 1: ABORT ───────────────────────────────────────────
         if vol == VolatilityRegime.ABORT:
+            if bool(signals.get("api_auth_dead")) or "AUTH_FEED_DEAD" in str(
+                signals.get("vol_abort_trigger") or ""
+            ):
+                _abort_note = (
+                    "ABORT:AUTH_FEED_DEAD — new entries blocked, "
+                    "refresh broker token; positions managed by own rules"
+                )
+            else:
+                _abort_note = (
+                    "ABORT:VIX_EMERGENCY — new entries blocked, "
+                    "positions managed by own rules"
+                )
             return (
                 FinalRegime.ABORT,
-                "ABORT:VIX_EMERGENCY — new entries blocked, positions managed by own rules",
+                _abort_note,
                 True,  # block_new_entries = True
             )
 
@@ -3407,6 +3432,9 @@ class RegimeEngine:
 
         vol, vol_details = self.classifier.classify_volatility(
             signals, vix_fail_count, prev_day_vix_close
+        )
+        signals["vol_abort_trigger"] = str(
+            (vol_details or {}).get("trigger") or ""
         )
         price   = self.classifier.classify_price(signals)
         pos     = self.classifier.classify_positioning(signals)
