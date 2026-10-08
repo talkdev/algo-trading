@@ -2828,8 +2828,9 @@ class StrategyEngine:
         wing cost, credit ratio, EV, sizing, pre-trade) still applies.
 
         All required: RANGE price regime, non-bullish positioning, the
-        engine's own DOWN gap (0.4%+) still unfilled with spot heavy under
-        the previous close right now, and a real call-side OI wall above
+        engine's own DOWN gap (structure-sized open, not only the old
+        0.4% material floor) still unfilled with spot heavy under the
+        previous close right now, and a real call-side OI wall above
         spot to sell into.
 
         v1: no single-sided gap fade on Fridays (DTE 2). The lean was
