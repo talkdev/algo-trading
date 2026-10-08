@@ -579,6 +579,8 @@ class MarketDataEngine:
             "vix_regime_last_checked":     None,
             "gap_direction":               "FLAT",
             "gap_size_pts":                0.0,
+            "gap_open_pts":                0.0,   # signed open − prev close
+            "gap_is_material":             False, # ≥ material % (fade hunt)
             "gap_fade_opportunity":        False,
             "first_bar_close":             None,
             "day_up_used_peak_pct":        0.0,
@@ -1291,23 +1293,34 @@ class MarketDataEngine:
     # GAP DETECTION
     # ─────────────────────────────────────────────────────────────────────
 
+    # Structure gaps (lean / unreclaimed / two-way veto): small but real.
+    # Material gaps (fade-hunt): legacy ≥0.4% (~90pts on NIFTY 22.5k).
+    # Oct8 open was −47pts (0.21%) — old single 0.4% floor labelled FLAT,
+    # zeroed size, latched false two-way, and allowed a CHOPPY low-fade BPS.
+    GAP_STRUCTURE_MIN_PCT = 0.12
+    GAP_STRUCTURE_MIN_PTS = 25.0
+    GAP_MATERIAL_MIN_PCT = 0.40
+
     def _compute_gap_detection(self, bars: pd.DataFrame) -> None:
         """
         Detect opening gap vs previous day close.
         Sets in session_state:
           gap_direction: 'UP', 'DOWN', 'FLAT'
-          gap_size_pts: absolute gap in points
-          gap_fade_opportunity: True when gap is retracing ≥ 40%
+          gap_size_pts: absolute gap in points (always the true size)
+          gap_open_pts: signed open − prev close
+          gap_is_material: True when gap ≥ material % (fade monitoring)
+          gap_fade_opportunity: True when a material gap retraces ≥ 40%
 
-        Gap detection runs once per session (before 09:35).
-        Gap fade monitoring runs until 09:35.
+        Structure-sized gaps (≥25pts or ≥0.12%) get a directional label so
+        morning unreclaimed / lean / two-way gates see micro-gaps. Fade
+        hunting still requires a material (≥0.4%) gap.
         """
         if self.state.get("gap_direction") not in (None, "FLAT", ""):
-            # Already detected a gap today — only update fade status
-            self._update_gap_fade_status(bars)
+            # Already labelled UP/DOWN — only refresh fade status on material.
+            if bool(self.state.get("gap_is_material")):
+                self._update_gap_fade_status(bars)
             return
 
-        # Need first bar close
         if bars is None or bars.empty:
             return
 
@@ -1317,7 +1330,6 @@ class MarketDataEngine:
 
         first_bar_open = float(market_bars["open"].iloc[0])
 
-        # Get previous close
         prev_close = self.state.get("_prev_close_for_gap")
         if prev_close is None:
             prev_close = self._get_prev_close()
@@ -1329,20 +1341,30 @@ class MarketDataEngine:
 
         gap_pts = first_bar_open - prev_close
         gap_pct = abs(gap_pts) / prev_close * 100.0
+        # Always keep the signed facts — never wipe size on a "small" open.
+        self.state["gap_open_pts"] = float(gap_pts)
+        self.state["gap_size_pts"] = float(abs(gap_pts))
 
-        if gap_pct < 0.4:
-            self.state["gap_direction"]  = "FLAT"
-            self.state["gap_size_pts"]   = 0.0
+        _struct = (
+            abs(gap_pts) >= self.GAP_STRUCTURE_MIN_PTS
+            or gap_pct >= self.GAP_STRUCTURE_MIN_PCT
+        )
+        _material = gap_pct >= self.GAP_MATERIAL_MIN_PCT
+        self.state["gap_is_material"] = bool(_material)
+
+        if not _struct:
+            self.state["gap_direction"] = "FLAT"
             return
 
         direction = "UP" if gap_pts > 0 else "DOWN"
         self.state["gap_direction"] = direction
-        self.state["gap_size_pts"]  = abs(gap_pts)
         self.logger.info(
             f"Gap detected: {direction} {abs(gap_pts):.0f}pts "
             f"({gap_pct:.2f}%) from prev close {prev_close:.0f}"
+            f"{' [material]' if _material else ' [structure]'}"
         )
-        self._update_gap_fade_status(bars)
+        if _material:
+            self._update_gap_fade_status(bars)
 
     def _update_gap_fade_status(self, bars: pd.DataFrame) -> None:
         """
@@ -1355,7 +1377,11 @@ class MarketDataEngine:
         gap_dir  = self.state.get("gap_direction", "FLAT")
         gap_size = self.state.get("gap_size_pts", 0.0)
 
+        # Fade hunting is for material gaps only (structure micro-gaps keep
+        # direction for unreclaimed/lean/two-way, not for gap-fade tickets).
         if gap_dir == "FLAT" or gap_size <= 0:
+            return
+        if not bool(self.state.get("gap_is_material")):
             return
 
         now_t = now_ist().time()
@@ -3480,11 +3506,18 @@ class MarketDataEngine:
                 _gap_tw = str(self.state.get("gap_direction") or "")
                 try:
                     _pc_tw = float(self.state.get("_prev_close_for_gap") or 0.0)
+                    _gop_tw = float(self.state.get("gap_open_pts") or 0.0)
                 except (TypeError, ValueError):
                     _pc_tw = 0.0
+                    _gop_tw = 0.0
+                # Structure DOWN (incl. micro-gap) or signed open still heavy
+                # under prior close — do not latch false two-way for low fades.
                 _unfilled_down = (
-                    _gap_tw == "DOWN" and _pc_tw > 0 and _dh_tw > 0
-                    and _dh_tw < _pc_tw
+                    _pc_tw > 0 and _dh_tw > 0 and _dh_tw < _pc_tw
+                    and (
+                        _gap_tw == "DOWN"
+                        or _gop_tw <= -float(self.GAP_STRUCTURE_MIN_PTS)
+                    )
                 )
                 if not _unfilled_down:
                     self.state["two_way_auction_latched"] = True
@@ -4016,6 +4049,8 @@ class MarketDataEngine:
             # Gap
             "gap_direction":            self.state.get("gap_direction", "FLAT"),
             "gap_size_pts":             self.state.get("gap_size_pts", 0.0),
+            "gap_open_pts":             float(self.state.get("gap_open_pts") or 0.0),
+            "gap_is_material":          bool(self.state.get("gap_is_material", False)),
             "gap_fade_opportunity":     bool(self.state.get("gap_fade_opportunity", False)),
 
             # Day structure (gap-fill / heaviness reads for strategy selection)
