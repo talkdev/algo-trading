@@ -873,6 +873,9 @@ class Config:
     # delta-0.3 short 45 points away is defended at 70% of the gap -
     # not 5 points after entry by an absolute 40pt band.
     prox_gap_frac_dte0:        float = 0.70
+    # 0DTE with-trend HIGH credits: tip short sits inside the proximity
+    # band by design — skip Priority-2; premium/delta stops stay live.
+    prox_skip_dte0_with_trend: bool = True
     # Friction discipline.
     max_friction_frac_of_credit:  float = 0.28
     max_brokerage_frac_of_credit: float = 0.15
@@ -1156,13 +1159,11 @@ class Config:
         # dumps at the lows still need the aligned LONG_PUT (Sep24: 243
         # open_spike_wait cycles with structure lean while ADX matured).
         "open_spike_wait", "unresolved_lower_high",
-        # TapeState WHEN-layer refusals are sell-expression clocks, not
-        # "sell side still open". Without these markers, TREND_EXHAUSTED /
-        # TURN_STARTING / COIL blocks left the debit substitute dark while
-        # the reason string said momentum_sell_side_open(tape_when_...) —
-        # measured live 2026-10-06: PREMIUM_SELL_BULL all entry window,
-        # 589× tape_when_TREND_EXHAUSTED, zero momentum consults.
-        "tape_when", "trend_exhausted", "turn_starting",
+        # TapeState WHEN-layer refusals still reach the debit substitute so
+        # TURN_STARTING / COIL can express long. TREND_EXHAUSTED also matches
+        # via the "tape_when" prefix, but _momentum_gate hard-refuses that
+        # label — unlocking it minted the Oct6 LONG_CALL scratch (−₹4).
+        "tape_when", "turn_starting",
         # Spent-side chase / bounce credit refuses are sell-expression
         # fences — the debit substitute must see them (Sep29: 86×
         # spent_downside_bounce_no_puts left momentum_sell_side_open).
@@ -1862,6 +1863,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         em_band_lo=min(max(_get_float(env, "EM_BAND_LO", 0.80), 0.40), 1.20),
         em_band_hi=min(max(_get_float(env, "EM_BAND_HI", 1.35), 0.90), 2.50),
         prox_gap_frac_dte0=min(max(_get_float(env, "PROX_GAP_FRAC_DTE0", 0.70), 0.50), 0.95),
+        prox_skip_dte0_with_trend=_get_bool(env, "PROX_SKIP_DTE0_WITH_TREND", True),
         max_friction_frac_of_credit=min(max(_get_float(env, "MAX_FRICTION_FRAC_OF_CREDIT", 0.28), 0.05), 0.60),
         max_brokerage_frac_of_credit=min(max(_get_float(env, "MAX_BROKERAGE_FRAC_OF_CREDIT", 0.15), 0.02), 0.40),
         min_target_over_friction=min(max(_get_float(env, "MIN_TARGET_OVER_FRICTION", 1.25), 1.00), 3.00),

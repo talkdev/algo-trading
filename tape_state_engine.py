@@ -367,8 +367,15 @@ def entry_when_block_reason(signals: dict, final_regime: Optional[str], config: 
             return f"tape_when_{state}_{detail or 'old_side_bull'}"
         return None
 
-    # EXHAUSTED: block only when THIS side's directional spend is exhausted.
+    # EXHAUSTED: block spent-side CHASE, not with-trend credit HARVEST.
     # Total day_move from a morning dump must not ban a fresh bull (Sep29).
+    # When the opening straddle is already spent but conviction is still
+    # HIGH, ADX sits at/above the strong threshold, and IV is quiet/crushing,
+    # the away-side vertical (BPS in bull / BCS in bear) is the harvest —
+    # refusing it left 0DTE bull days dark while spot kept grinding
+    # (2026-10-06: TREND_EXHAUSTED blocked PREMIUM_SELL_BULL all entry
+    # window under CRUSHING IV / ADX~40+ / HIGH). Debit chase on the spent
+    # side stays refused in strategy_engine._momentum_gate.
     if state == TREND_EXHAUSTED:
         try:
             exh = float(getattr(config, "exhausted_move_pct", 100.0) or 100.0)
@@ -378,10 +385,40 @@ def entry_when_block_reason(signals: dict, final_regime: Optional[str], config: 
         day_up = _f(signals, "day_up_used_pct", day_move)
         day_dn = _f(signals, "day_down_used_pct", day_move)
         px_s = price_side(signals.get("price_regime"))
+        try:
+            _adx_h = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx_h = 0.0
+        try:
+            _adx_strong = float(
+                getattr(config, "adx_strong_threshold", 28.0) or 28.0
+            )
+        except (TypeError, ValueError):
+            _adx_strong = 28.0
+        _conf_h = str(signals.get("confidence_level") or "").upper()
+        _iv_h = str(signals.get("iv_behavior") or "")
+        try:
+            _dte_h = signals.get("actual_dte")
+            if _dte_h is None:
+                _dte_h = signals.get("expiry_dte")
+            _dte_h = int(_dte_h if _dte_h is not None else -1)
+        except (TypeError, ValueError):
+            _dte_h = -1
+        # 0DTE only — weekly at-highs chase (Sep30) must stay refused.
+        _harvest_ok = (
+            _dte_h == 0
+            and _conf_h == "HIGH"
+            and _adx_h >= _adx_strong
+            and _iv_h in ("STABLE", "DECLINING", "CRUSHING", "")
+        )
         if fr == "PREMIUM_SELL_BEAR" and px_s <= 0 and day_dn >= exh:
-            return f"tape_when_{state}_{detail or 'exhausted_bear_chase'}"
+            if not _harvest_ok:
+                return f"tape_when_{state}_{detail or 'exhausted_bear_chase'}"
+            return None
         if fr == "PREMIUM_SELL_BULL" and px_s >= 0 and day_up >= exh:
-            return f"tape_when_{state}_{detail or 'exhausted_bull_chase'}"
+            if not _harvest_ok:
+                return f"tape_when_{state}_{detail or 'exhausted_bull_chase'}"
+            return None
         return None
 
     if state == COIL and directional:
@@ -501,6 +538,34 @@ def _self_test() -> None:
     out4 = eng.update(dict(s4), st4)
     assert out4["tape_state"] in (TREND_ON, TREND_STRENGTHENING), out4
     assert entry_when_block_reason(out4, "PREMIUM_SELL_BULL", _Cfg()) is None
+
+    # Oct6-class: TREND_EXHAUSTED + HIGH + strong ADX + crushing IV → allow
+    # with-trend BPS harvest on 0DTE (spent upside is not a chase for put
+    # credit). Weeklies stay refused.
+    s5 = {
+        "tape_state": TREND_EXHAUSTED,
+        "tape_state_reason": "side_move_167_up=167_dn=17_adx_41_dte_0",
+        "tape_side": 1,
+        "tape_allow_entry": False,
+        "tape_force_flat": False,
+        "day_up_used_pct": 167.0,
+        "day_down_used_pct": 17.0,
+        "day_move_used_pct": 98.0,
+        "price_regime": "UPTREND",
+        "adx_15": 41.0,
+        "confidence_level": "HIGH",
+        "iv_behavior": "CRUSHING",
+        "actual_dte": 0,
+    }
+    assert entry_when_block_reason(s5, "PREMIUM_SELL_BULL", _Cfg()) is None
+    s5_weak = dict(s5)
+    s5_weak["confidence_level"] = "MEDIUM"
+    br5 = entry_when_block_reason(s5_weak, "PREMIUM_SELL_BULL", _Cfg())
+    assert br5 and "TREND_EXHAUSTED" in br5, br5
+    s5_weekly = dict(s5)
+    s5_weekly["actual_dte"] = 3
+    br5w = entry_when_block_reason(s5_weekly, "PREMIUM_SELL_BULL", _Cfg())
+    assert br5w and "TREND_EXHAUSTED" in br5w, br5w
 
     assert size_nudge_multiplier({"tape_state": TREND_STRENGTHENING}, _Cfg()) == 1.10
     assert size_nudge_multiplier({"tape_state": TREND_ON}, _Cfg()) == 1.0
