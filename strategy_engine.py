@@ -604,6 +604,20 @@ class StrategyEngine:
                 # a credit vertical beside an open long option: same side only
                 if not (new_sides & o_sides):
                     return f"slot_conflict_credit_against_open_long:{o}"
+                # 0DTE: never stack a tip credit on an open debit — the
+                # debit is already the expression; tip shorts stop out
+                # while theta never pays (Sep22 BCS −₹346 beside LONG_PUT).
+                try:
+                    _dte_sc = (signals or {}).get("actual_dte")
+                    if _dte_sc is None:
+                        _dte_sc = (signals or {}).get("expiry_dte")
+                    _dte_sc = int(_dte_sc if _dte_sc is not None else -1)
+                except (TypeError, ValueError):
+                    _dte_sc = -1
+                if _dte_sc == 0:
+                    return (
+                        f"slot_conflict_credit_beside_momentum_0dte:{o}"
+                    )
                 # Same-side credit on a young debit is a whip-scratch
                 # (debit opens, credit fires, stops in minutes). Do NOT
                 # waive the hold for "measured ADX" — a crash-tape ADX
@@ -2508,11 +2522,28 @@ class StrategyEngine:
                 return "NO_TRADE", _pda_u
             # RANGE-origin OR-mid short-circuit with price still RANGE:
             # defer to range resolution (symmetric with BEAR path).
+            # Exception (0DTE only): measured bull map (HIGH + ADX≥strong)
+            # — RANGE is classifier lag on a grind, and deferring into
+            # day_up_spent soft-lean refuse blanks BPS then opens LONG_CALL
+            # (Oct6 10:56). Weeklies keep the defer (Sep30 at-highs).
             _px_u = str(signals.get("price_regime") or "")
+            try:
+                _dte_bm = int(dte if dte is not None else -1)
+            except (TypeError, ValueError):
+                _dte_bm = -1
+            _bull_measured = (
+                _dte_bm == 0
+                and str(confidence or "").upper() == "HIGH"
+                and float(adx_15 or 0.0)
+                >= float(
+                    getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+                )
+            )
             if (
                 _px_u == "RANGE"
                 and not bool(signals.get("afternoon_low_fade"))
                 and not bool(signals.get("neutral_range_vertical"))
+                and not _bull_measured
             ):
                 strategy, why = self._resolve_range_strategy(
                     dte, or_condition, adx_15, adx_15_mature,
@@ -3860,6 +3891,37 @@ class StrategyEngine:
         # Location chase — do not require sided spend% (replay day_up often
         # sits 60-75% while the tape is still glued to the high; Sep30).
         if _off_high >= 40.0 or _loc < 0.80:
+            return None
+        # With-trend harvest (0DTE only): PREMIUM_SELL_BULL + HIGH + ADX
+        # at/above strong + quiet/crushing IV is selling puts into a
+        # continuing grind (Oct6), not the Sep30 weekly at-highs chase.
+        try:
+            _adx_h = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx_h = 0.0
+        try:
+            _strong_h = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+        except (TypeError, ValueError):
+            _strong_h = 28.0
+        try:
+            _dte_h = signals.get("actual_dte")
+            if _dte_h is None:
+                _dte_h = signals.get("expiry_dte")
+            _dte_h = int(_dte_h if _dte_h is not None else -1)
+        except (TypeError, ValueError):
+            _dte_h = -1
+        _conf_h = str(signals.get("confidence_level") or "").upper()
+        _iv_h = str(signals.get("iv_behavior") or "")
+        _fr_h = str(signals.get("final_regime") or "")
+        if (
+            _dte_h == 0
+            and _fr_h == "PREMIUM_SELL_BULL"
+            and _conf_h == "HIGH"
+            and _adx_h >= _strong_h
+            and _iv_h in ("STABLE", "DECLINING", "CRUSHING", "")
+        ):
             return None
         _spend = self._side_day_spend_pct(signals, "BULL")
         _why = (
@@ -5852,10 +5914,25 @@ class StrategyEngine:
         }
         fr = str(signals.get("final_regime") or "")
         px = str(signals.get("price_regime") or "")
+        try:
+            _w_adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _w_adx = 0.0
+        try:
+            _w_strong = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+        except (TypeError, ValueError):
+            _w_strong = 28.0
+        _w_hi = str(signals.get("confidence_level") or "").upper() == "HIGH"
         if sell_sides == {"call"} and fr == "PREMIUM_SELL_BEAR":
-            return px in ("DOWNTREND", "STRONG_DOWNTREND")
+            if px in ("DOWNTREND", "STRONG_DOWNTREND"):
+                return True
+            return _w_hi and _w_adx >= _w_strong and px == "RANGE"
         if sell_sides == {"put"} and fr == "PREMIUM_SELL_BULL":
-            return px in ("UPTREND", "STRONG_UPTREND")
+            if px in ("UPTREND", "STRONG_UPTREND"):
+                return True
+            return _w_hi and _w_adx >= _w_strong and px == "RANGE"
         return False
 
     def _compute_ev_gate(
@@ -6623,11 +6700,40 @@ class StrategyEngine:
         # @10:37 range_soft_location_lean_0.08) or with-trend verticals.
         # Same relief at every DTE.
         _cr_px = str(signals.get("price_regime") or "")
+        try:
+            _cr_adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _cr_adx = 0.0
+        try:
+            _cr_strong = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+        except (TypeError, ValueError):
+            _cr_strong = 28.0
+        _cr_conf = str(signals.get("confidence_level") or "").upper()
+        _cr_fr = str(signals.get("final_regime") or "")
+        # Measured bull/bear map (0DTE): RANGE flicker is classifier lag —
+        # still with-trend for the credit-risk floor (Oct6 BPS harvest).
+        # Weeklies keep the strict UPTREND/DOWNTREND with-trend test.
+        _measured_map = (
+            actual_dte == 0
+            and _cr_conf == "HIGH"
+            and _cr_adx >= _cr_strong
+            and (
+                (strategy_name == BULL_PUT_SPREAD
+                 and _cr_fr == "PREMIUM_SELL_BULL"
+                 and _cr_px in ("UPTREND", "STRONG_UPTREND", "RANGE"))
+                or (strategy_name == BEAR_CALL_SPREAD
+                    and _cr_fr == "PREMIUM_SELL_BEAR"
+                    and _cr_px in ("DOWNTREND", "STRONG_DOWNTREND", "RANGE"))
+            )
+        )
         _with_trend_credit = (
             (strategy_name == BEAR_CALL_SPREAD
              and _cr_px in ("DOWNTREND", "STRONG_DOWNTREND"))
             or (strategy_name == BULL_PUT_SPREAD
                 and _cr_px in ("UPTREND", "STRONG_UPTREND"))
+            or _measured_map
         )
         _away = None
         try:
@@ -7414,6 +7520,14 @@ class StrategyEngine:
         markers = tuple(getattr(cfg, "momentum_block_markers", ())) or ()
         if not any(str(m).lower() in reason for m in markers):
             return False, f"momentum_sell_side_open({reason[:34]})", 0
+        # Exhaustion-class sell refusals are not "express the same read long".
+        # The sell side already said the move is spent; buying that move is
+        # later still. "tape_when" still unlocks TURN_STARTING/COIL, but
+        # TREND_EXHAUSTED must stay dark (Oct6 LONG_CALL scratch −₹4 under
+        # STRONG_SELL_PREMIUM after costs). Do not also blanket-block other
+        # spent markers — Sep22 0DTE LONG_PUT winners (+₹2.1k) ride those.
+        if "trend_exhausted" in reason:
+            return False, "momentum_not_on_exhausted_tape", 0
 
         # ── calendar: never 0DTE (theta cliff), never a stale far week ───
         dte = signals.get("actual_dte")
@@ -7875,15 +7989,32 @@ class StrategyEngine:
             _mom_dte = int(_mom_dte if _mom_dte is not None else -1)
         except (TypeError, ValueError):
             _mom_dte = -1
+        # 0DTE LONG_CALL into rich, quiet premium after upside is spent:
+        # vol already says SELL and IV is crushing — buying the call is
+        # inverted (Oct6 scratch −₹4; post-BPS chase −₹196). Do not waive
+        # via post_harvest: that carve-out is for DTE≥1 continuation
+        # (Sep11/Sep23). LONG_PUT on a sell-vol dump day (Sep22) is
+        # unaffected (direction < 0).
+        _vol_r = str(signals.get("vol_regime") or "")
+        _iv_r = str(signals.get("iv_behavior") or "")
+        if (
+            _mom_dte == 0
+            and direction > 0
+            and _vol_r in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+            and used >= 90.0
+            and _iv_r in ("STABLE", "DECLINING", "CRUSHING")
+        ):
+            return False, (
+                f"momentum_no_call_under_{_vol_r}_spent_up_{used:.0f}"
+            ), 0
         if used >= 100.0 and adx < 50.0:
             if _mom_dte == 0:
-                # Crash-or-nothing floor (ADX≥50) blanked HIGH-conf grind
-                # days where ADX already sat at/above the strong threshold
-                # and price was still trending — live 2026-10-06 printed
-                # PREMIUM_SELL_BULL + day_up~170% + ADX 40-44 all entry
-                # window, then spot ran another +128pt with zero tickets.
-                # Keep the hard refuse for weak/RANGE/immature spent tapes;
-                # let a measured-strong HIGH-conf continuation through.
+                # Crash-or-nothing floor, with two narrow continues:
+                # (1) measured-strong HIGH-conf trend (Sep22 2nd LONG_PUT
+                #     reload after a banked TARGET on a still-running dump);
+                # (2) downside-spent mid-range bounce call.
+                # TREND_EXHAUSTED never reaches here — refused above — so the
+                # Oct6 LONG_CALL scratch cannot reopen via this carve-out.
                 _hi = str(signals.get("confidence_level") or "") == "HIGH"
                 _trend_px = price in (
                     "UPTREND", "STRONG_UPTREND",
@@ -10457,9 +10588,50 @@ def _self_test() -> None:
         f"Sep23-class HIGH/STABLE LONG_CALL must allow, got "
         f"ok={_ok23} why={_why23} dir={_dir23}"
     )
+    # Oct6-class: TREND_EXHAUSTED must not unlock 0DTE debit under
+    # STRONG_SELL with ~98% day_move already spent (cost-eaten scratch).
+    _oct6_mom = make_signals(
+        spot=22663.5,
+        day_high_so_far=22680.0,
+        day_low_so_far=22568.0,
+        or_high=22628.1,
+        or_low=22561.6,
+        or_computed=True,
+        or_width=66.5,
+        day_up_used_pct=98.0,
+        day_down_used_pct=18.0,
+        day_move_used_pct=98.0,
+        adx_15=40.86,
+        adx_15_mature=True,
+        price_regime="UPTREND",
+        ema_structure="INSUFFICIENT_DATA",
+        vwap=22634.0,
+        vwap_dist_pct=0.13,
+        iv_behavior="DECLINING",
+        confidence_level="HIGH",
+        final_regime="PREMIUM_SELL_BULL",
+        vol_regime="STRONG_SELL_PREMIUM",
+        opening_straddle_pts=121.9,
+        actual_dte=0,
+    )
+    _ok6, _why6, _dir6 = engine._momentum_gate(
+        _oct6_mom,
+        block_reason=(
+            "tape_when_TREND_EXHAUSTED_side_move_167_up=167_dn=17_adx_41_dte_0"
+        ),
+        _test_time=dtime(10, 56),
+    )
+    assert (not _ok6) and _dir6 == 0, (
+        f"Oct6-class exhausted 0DTE LONG_CALL must refuse, got "
+        f"ok={_ok6} why={_why6} dir={_dir6}"
+    )
+    assert "exhausted_tape" in _why6, (
+        f"Oct6 refuse reason unexpected: {_why6}"
+    )
     print(f"  oct5 mid-40s refuse: {_why5}")
     print(f"  crash ADX allow:     dir={_dirc} ({_whyc})")
     print(f"  sep23 continuation:  dir={_dir23} ({_why23})")
+    print(f"  oct6 exhausted refuse: {_why6}")
     print("  [OK] Spent-straddle momentum tests passed")
 
     # ── OR reject / low-fade invariant waive (Oct5 trend legs) ──
@@ -10472,6 +10644,9 @@ def _self_test() -> None:
         or_computed=True,
         day_high_so_far=22621.8,
         day_low_so_far=22506.35,
+        # Dump-day open near the poke high so mid_call's
+        # (hi-open)<35 carve-out treats this as Oct5-class, not Sep30 grind.
+        day_open=22600.0,
         day_up_used_pct=112.0,
         day_down_used_pct=54.0,
         ema_structure="INSUFFICIENT_DATA",

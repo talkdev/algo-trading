@@ -3002,29 +3002,64 @@ class ExecutionEngine:
             _prox_dte0 = ("BUTTERFLY" not in strategy_name_p2)
             _prox_gap_frac = float(getattr(self.config, "prox_gap_frac_dte0", 0.70))
             _entry_spot_p2 = float(position.get("entry_spot") or 0)
-            for leg in open_legs:
-                if leg["action"] != _prox_action:
-                    continue
-                strike = float(leg.get("strike", 0))
-                _band = proximity_pts
-                if _prox_dte0 and _entry_spot_p2 > 0:
-                    _gap = abs(strike - _entry_spot_p2)
-                    if _gap > 0:
-                        _band = min(
-                            proximity_pts,
-                            max((1.0 - _prox_gap_frac) * _gap, 10.0),
-                        )
-                if abs(spot - strike) <= _band:
-                    self.logger.warning(
-                        f"PRIORITY 2 SPOT PROXIMITY: spot={spot:.0f} "
-                        f"within {_band:.0f}pts of {_prox_action} "
-                        f"{leg['option_type']} {strike:.0f}"
+            # 0DTE with-trend HIGH credits park the short inside the
+            # proximity band by design (fat tip). Priority-2 then fires on
+            # noise and kills theta (Oct6 BPS → −₹190). Skip P2 for that
+            # entry structure; premium + delta stops remain. (Live px gate
+            # is wrong here: tip BPS often maps under RANGE while
+            # PREMIUM_SELL_BULL is the thesis — that re-armed P2 at +15s.)
+            _prox_skip = False
+            try:
+                _prox_conf = str(
+                    position.get("confidence_at_entry")
+                    or position.get("confidence_level_at_entry")
+                    or ""
+                ).upper()
+                _prox_fr = str(position.get("final_regime_at_entry") or "")
+                _prox_with_trend = (
+                    (
+                        strategy_name_p2 == "BULL_PUT_SPREAD"
+                        and _prox_fr == "PREMIUM_SELL_BULL"
                     )
-                    return "CLOSE_STOP", EXIT_PRIORITY_SPOT_PROXIMITY, {
-                        "reason_detail": f"spot_proximity_{abs(spot - strike):.0f}pts",
-                        "strike": strike,
-                        "spot": spot,
-                    }
+                    or (
+                        strategy_name_p2 == "BEAR_CALL_SPREAD"
+                        and _prox_fr == "PREMIUM_SELL_BEAR"
+                    )
+                )
+                _prox_skip = (
+                    actual_dte == 0
+                    and _prox_conf == "HIGH"
+                    and _prox_with_trend
+                    and bool(
+                        getattr(self.config, "prox_skip_dte0_with_trend", True)
+                    )
+                )
+            except Exception:
+                _prox_skip = False
+            if not _prox_skip:
+                for leg in open_legs:
+                    if leg["action"] != _prox_action:
+                        continue
+                    strike = float(leg.get("strike", 0))
+                    _band = proximity_pts
+                    if _prox_dte0 and _entry_spot_p2 > 0:
+                        _gap = abs(strike - _entry_spot_p2)
+                        if _gap > 0:
+                            _band = min(
+                                proximity_pts,
+                                max((1.0 - _prox_gap_frac) * _gap, 10.0),
+                            )
+                    if abs(spot - strike) <= _band:
+                        self.logger.warning(
+                            f"PRIORITY 2 SPOT PROXIMITY: spot={spot:.0f} "
+                            f"within {_band:.0f}pts of {_prox_action} "
+                            f"{leg['option_type']} {strike:.0f}"
+                        )
+                        return "CLOSE_STOP", EXIT_PRIORITY_SPOT_PROXIMITY, {
+                            "reason_detail": f"spot_proximity_{abs(spot - strike):.0f}pts",
+                            "strike": strike,
+                            "spot": spot,
+                        }
 
         # ── TapeState WHEN flatten: adverse impulse / force_flat (additive)
         # Fires before trend-flip so a surprise bounce cuts wrong-side
