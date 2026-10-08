@@ -4923,11 +4923,34 @@ class ExecutionEngine:
             _rp = json.loads(position.get("raw_params_json") or "{}")
         except Exception:
             _rp = {}
+        try:
+            _close_adx = float(
+                position.get("entry_adx_15")
+                or _rp.get("entry_adx_15")
+                or _rp.get("adx_15")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _close_adx = 0.0
+        _close_conf = str(
+            position.get("confidence_at_entry")
+            or _rp.get("confidence_level")
+            or _rp.get("confidence_level_at_entry")
+            or ""
+        ).upper()
+        _immature_fade_close = (_close_adx < 18.0) or (_close_conf == "LOW")
         if bool(_rp.get("afternoon_low_fade")
                 or position.get("afternoon_low_fade")):
-            # OR-low reclaim is a structural bounce credit — latching it as
-            # a mean-reversion extreme still OK for opposite-fade discipline.
-            self.market_engine.state["_closing_afternoon_low_fade"] = True
+            # Immature CHOPPY knife-fades must not own the session fade latch
+            # (Oct8 ADX0 LOW BPS → blocked dump LONG_PUT all day).
+            if _immature_fade_close:
+                self.logger.info(
+                    "immature low-fade close: skip afternoon_low_fade latch "
+                    f"(adx={_close_adx:.1f}, conf={_close_conf or '?'})"
+                )
+            else:
+                # OR-low reclaim / mature fade — opposite-fade discipline OK.
+                self.market_engine.state["_closing_afternoon_low_fade"] = True
         _is_or_high = bool(
             _rp.get("or_high_reject_fade")
             or position.get("or_high_reject_fade")
@@ -4938,14 +4961,19 @@ class ExecutionEngine:
             # two-way extreme scalp. Tagging it as afternoon_high_fade was
             # latching session_mean_reversion_book and killing the dump
             # LONG_PUT (Oct5 post_fix5: 976× momentum_skipped_after_extreme_fade).
-            if not _is_or_high:
-                self.market_engine.state["_closing_afternoon_high_fade"] = True
-            else:
+            if _is_or_high:
                 self.market_engine.state["_closing_or_high_reject"] = True
                 self.logger.info(
                     "OR-high reject close: skip mean-reversion fade latch "
                     "(keep dump momentum open)"
                 )
+            elif _immature_fade_close:
+                self.logger.info(
+                    "immature high-fade close: skip afternoon_high_fade latch "
+                    f"(adx={_close_adx:.1f}, conf={_close_conf or '?'})"
+                )
+            else:
+                self.market_engine.state["_closing_afternoon_high_fade"] = True
         # v64: same tags monitor sets on harvest paths — hard-exit / EOD
         # closes of these tickets must still latch session_mean_reversion.
         if bool(_rp.get("neutral_range_vertical")
@@ -4964,6 +4992,25 @@ class ExecutionEngine:
             )
         except Exception:
             pass
+        # Immature-fade MR latch skip reads these in _update_state_after_close.
+        try:
+            self.market_engine.state["_closing_entry_adx"] = float(
+                position.get("entry_adx_15")
+                or _rp.get("entry_adx_15")
+                or _rp.get("adx_15")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            self.market_engine.state["_closing_entry_adx"] = 0.0
+        try:
+            self.market_engine.state["_closing_entry_confidence"] = str(
+                position.get("confidence_at_entry")
+                or _rp.get("confidence_level")
+                or _rp.get("confidence_level_at_entry")
+                or ""
+            )
+        except Exception:
+            self.market_engine.state["_closing_entry_confidence"] = ""
 
         # ── Update session state ──────────────────────────────────────────
         self._update_state_after_close(reason, net_pnl_rs, priority)
@@ -5089,8 +5136,35 @@ class ExecutionEngine:
         # closes, the day is a mean-reversion book for momentum purposes.
         # last_exit_* flags are overwritten by the next close (18-Sep high
         # fade replaced the low-fade latch, then late LONG_CALL slipped in).
-        if _fb_closed or _low_fade_closed or _high_fade_closed:
+        # Immature / LOW-confidence fades must NOT latch the MR book —
+        # they are knife-catch noise, not a harvested two-way extreme
+        # (live 2026-10-08: ADX0 CHOPPY BPS → MR latch → dump LONG_PUT dark).
+        _immature_fade_latch = False
+        if _low_fade_closed or _high_fade_closed:
+            try:
+                _eadx = float(
+                    state.get("_closing_entry_adx")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                _eadx = 0.0
+            _econf = str(
+                state.get("_closing_entry_confidence") or ""
+            ).upper()
+            _immature_fade_latch = (_eadx < 18.0) or (_econf == "LOW")
+        if (
+            (_fb_closed or _low_fade_closed or _high_fade_closed)
+            and not _immature_fade_latch
+        ):
             state["session_mean_reversion_book"] = True
+        elif _immature_fade_latch:
+            self.logger.info(
+                "immature fade close: skip session_mean_reversion_book "
+                f"(adx={state.get('_closing_entry_adx')}, "
+                f"conf={state.get('_closing_entry_confidence')})"
+            )
+        state.pop("_closing_entry_adx", None)
+        state.pop("_closing_entry_confidence", None)
 
         # ── PATCH_V13: a protective exit that BANKS profit is not a stop ──
         # The ratcheted profit lock and an in-the-money price stop both come
