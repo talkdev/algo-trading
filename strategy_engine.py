@@ -766,6 +766,50 @@ class StrategyEngine:
         if bool(signals.get("failed_break_high")):
             signals["afternoon_high_fade"] = True
 
+    def _trend_continuation_clears_fade_latch(self, signals: dict) -> bool:
+        """True when a measured trend has invalidated the post-fade MR book.
+
+        Harvested extreme fades mark the session mean-reversion so we do
+        not buy mid-range premium after a scalp. Once ADX is strong and
+        price/regime agree on a one-way tape, that thesis is dead — the
+        aligned debit is the trade (live 2026-10-08 morning low-fade BPS
+        then ADX~54 DOWNTREND with LONG_PUT dark for 888 cycles).
+        """
+        try:
+            adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        _strong = float(
+            getattr(self.config, "adx_strong_threshold", 40.0) or 40.0
+        )
+        if adx < _strong:
+            return False
+        px = str(signals.get("price_regime") or "")
+        fr = str(signals.get("final_regime") or "")
+        st = self.market_engine.state
+        _low = bool(st.get("last_exit_is_afternoon_low_fade"))
+        _high = bool(st.get("last_exit_is_afternoon_high_fade"))
+        _mr = bool(st.get("session_mean_reversion_book"))
+        _side = str(st.get("last_exit_strategy_side") or "")
+
+        if (
+            (_low or (_mr and _side == "BULL"))
+            and px in ("DOWNTREND", "STRONG_DOWNTREND")
+            and fr == "PREMIUM_SELL_BEAR"
+        ):
+            return True
+        if (
+            (_high or (_mr and _side == "BEAR"))
+            and px in ("UPTREND", "STRONG_UPTREND")
+            and fr == "PREMIUM_SELL_BULL"
+        ):
+            return True
+        if px in ("STRONG_DOWNTREND", "STRONG_UPTREND") and adx >= max(
+            _strong, 50.0
+        ):
+            return True
+        return False
+
     def _low_fade_bounce_confirmed(self, signals: dict) -> bool:
         """True when a tagged low-fade has already lifted off the printed low.
 
@@ -2736,11 +2780,17 @@ class StrategyEngine:
         2026-09-09); these do not, which is exactly why they are allowed to
         arbitrate structure selection.
         """
-        if signals.get("gap_direction") != "DOWN":
-            return False, "structure_needs_down_gap"
+        # Prior-close unreclaimed is the structural fact. Do NOT require
+        # gap_direction==DOWN: the detector only labels gaps ≥0.4%, so a
+        # 0.2% heavy open stays FLAT and used to skip this veto (Oct-8
+        # 09:45 BPS). day_high < prev_close is enough.
         try:
             _pc = float(signals.get("prev_close") or 0.0)
-            _dh = float(signals.get("day_high") or 0.0)
+            _dh = float(
+                signals.get("day_high_so_far")
+                or signals.get("day_high")
+                or 0.0
+            )
             _sp = float(signals.get("spot") or 0.0)
         except (TypeError, ValueError):
             return False, "structure_day_unknown"
@@ -2760,7 +2810,7 @@ class StrategyEngine:
         if _rs < 2.0:
             return False, "structure_call_wall_too_weak"
         return True, (
-            f"gap_down_unfilled_dh={_dh:.0f}_pc={_pc:.0f}_"
+            f"prior_close_unreclaimed_dh={_dh:.0f}_pc={_pc:.0f}_"
             f"wall={_rw:.0f}x{_rs:.1f}"
         )
 
@@ -8616,10 +8666,21 @@ class StrategyEngine:
         except Exception:
             _late_now = False
         if _fade_latch and not _late_now:
-            signals["_momentum_refuse_reason"] = (
-                "momentum_skipped_after_extreme_fade"
-            )
-            return None
+            # Measured one-way trend falsifies the post-fade mean-reversion
+            # book. Without this waive, a morning CHOPPY low-fade scalp
+            # (even a lucky +₹300) latches MR and bans LONG_PUT for the
+            # rest of a crash day (live 2026-10-08: 888×
+            # momentum_skipped_after_extreme_fade while ADX~54 DOWNTREND
+            # dumped another 200pts; replay without the fade booked ~₹5k
+            # on puts). Engine-wide: strong ADX + aligned trend/regime.
+            if self._trend_continuation_clears_fade_latch(signals):
+                _st["session_mean_reversion_book"] = False
+                _fade_latch = False
+            else:
+                signals["_momentum_refuse_reason"] = (
+                    "momentum_skipped_after_extreme_fade"
+                )
+                return None
         if _st.get("last_exit_is_stale_weekly"):
             signals["_momentum_refuse_reason"] = "momentum_skipped_stale_weekly"
             return None
@@ -10632,6 +10693,44 @@ def _self_test() -> None:
     print(f"  crash ADX allow:     dir={_dirc} ({_whyc})")
     print(f"  sep23 continuation:  dir={_dir23} ({_why23})")
     print(f"  oct6 exhausted refuse: {_why6}")
+    # Oct8-class: post low-fade MR latch must clear on measured DOWNTREND
+    # so LONG_PUT can express the dump (was 888× extreme_fade skip live).
+    engine.market_engine.state["session_mean_reversion_book"] = True
+    engine.market_engine.state["last_exit_is_afternoon_low_fade"] = True
+    engine.market_engine.state["last_exit_strategy_side"] = "BULL"
+    _oct8_clr = make_signals(
+        spot=22440.0,
+        adx_15=54.0,
+        adx_15_mature=True,
+        price_regime="DOWNTREND",
+        final_regime="PREMIUM_SELL_BEAR",
+        vol_regime="NEUTRAL",
+        iv_behavior="STABLE",
+        actual_dte=3,
+        or_high=22599.0,
+        or_low=22487.0,
+        or_width=112.0,
+        day_high_so_far=22599.0,
+        day_low_so_far=22430.0,
+        vwap=22480.0,
+        vwap_dist_pct=-0.18,
+    )
+    assert engine._trend_continuation_clears_fade_latch(_oct8_clr), (
+        "Oct8-class measured DOWNTREND must clear post-fade MR latch"
+    )
+    _dec8 = engine._momentum_decision(
+        _oct8_clr, "iv_expanding_never_sell_into_rising_iv"
+    )
+    # May be None if OR/VWAP gate fails on sparse make_signals — at minimum
+    # the refuse reason must not be extreme_fade after the clear.
+    _ref8 = str(_oct8_clr.get("_momentum_refuse_reason") or "")
+    assert "after_extreme_fade" not in _ref8, (
+        f"measured dump must not refuse as extreme_fade, got {_ref8}"
+    )
+    print(f"  oct8 fade-latch clear: refuse={_ref8 or 'none'} dec={_dec8 is not None}")
+    engine.market_engine.state.pop("session_mean_reversion_book", None)
+    engine.market_engine.state.pop("last_exit_is_afternoon_low_fade", None)
+    engine.market_engine.state.pop("last_exit_strategy_side", None)
     print("  [OK] Spent-straddle momentum tests passed")
 
     # ── OR reject / low-fade invariant waive (Oct5 trend legs) ──
@@ -10779,6 +10878,23 @@ def _self_test() -> None:
     assert _s_gap == "NO_TRADE" and "day_structure_contradicts_bull" in _w_gap, (
         f"gap-down bare bounce without fade must veto BPS, got {_s_gap}/{_w_gap}"
     )
+    # Oct8-class: FLAT micro-gap + unreclaimed prior close also vetoes BPS.
+    _flat = dict(_gap)
+    _flat["gap_direction"] = "FLAT"
+    _flat["prev_close"] = 22603.0
+    _flat["day_high"] = 22599.0
+    _flat["day_high_so_far"] = 22599.0
+    _flat["spot"] = 22461.0
+    _flat["price_regime"] = "CHOPPY"
+    _flat["adx_15"] = 0.0
+    _flat["adx_15_mature"] = False
+    engine.market_engine.state.pop("session_no_puts_after_downtrend_refuse", None)
+    _s_flat, _w_flat = engine._map_regime_to_strategy(
+        _flat, _test_time=dtime(9, 45)
+    )
+    assert _s_flat == "NO_TRADE" and "day_structure_contradicts_bull" in _w_flat, (
+        f"FLAT unreclaimed prior close must veto BPS, got {_s_flat}/{_w_flat}"
+    )
     # Lift-confirmed fade waives the gap-down veto.
     _gap2 = dict(_gap)
     _gap2["spot"] = 23520.0
@@ -10794,6 +10910,7 @@ def _self_test() -> None:
     print(f"  low-fade waive: {_h_lf}")
     print(f"  adx-immature OR flip: {_nt.get('final_regime')}")
     print(f"  gap-down knife veto: {_w_gap}")
+    print(f"  flat unreclaimed veto: {_w_flat}")
     print(f"  gap-down lift allow: {_s_gap2}")
     print("  [OK] OR reject / low-fade waive tests passed")
 

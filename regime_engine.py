@@ -2111,10 +2111,15 @@ class RegimeClassifier:
             _adx_mat and _adx_f >= _adx_tr
             and price in (PriceRegime.DOWNTREND, PriceRegime.STRONG_DOWNTREND)
         )
-        # Session structure, independent of the 15-minute label. An
-        # unfilled gap-down is resistance: a bounce high is a fade even
-        # when ADX prints UPTREND. An unfilled gap-up is the symmetric
-        # support. A grind with no such structure is continuation.
+        # Session structure, independent of the 15-minute label. Bearish
+        # structure = prior close never tagged (day_high < prev_close).
+        # That does NOT require gap_direction==DOWN: the detector only
+        # labels gaps ≥0.4%, so a ~0.2% heavy open stays FLAT
+        # (live 2026-10-08: prev 22603, OR-high 22599 → choppy low-fade
+        # bull-put at 09:45 into a full-day dump). Bullish structure still
+        # needs a labelled UP gap — a day that merely holds above prior
+        # close is common on dumps that have not broken yesterday yet
+        # (Oct5-class) and must not disable the measured-downtrend veto.
         _gap_dir = str(signals.get("gap_direction") or "")
         try:
             _pc_s = float(signals.get("prev_close") or 0.0)
@@ -2126,9 +2131,7 @@ class RegimeClassifier:
             )
         except (TypeError, ValueError):
             _pc_s = _dh_s = _dl_s = 0.0
-        _struct_bear = (
-            _gap_dir == "DOWN" and _pc_s > 0 and _dh_s > 0 and _dh_s < _pc_s
-        )
+        _struct_bear = _pc_s > 0 and _dh_s > 0 and _dh_s < _pc_s
         _struct_bull = (
             _gap_dir == "UP" and _pc_s > 0 and _dl_s > 0 and _dl_s > _pc_s
         )
@@ -2251,12 +2254,12 @@ class RegimeClassifier:
                         False,
                     )
                 if _fpos <= 0.20:
-                    # PATCH_V31d: gap-down structure vetoes choppy low fades.
-                    _gap_dir = str(signals.get("gap_direction") or "")
-                    _pc = float(signals.get("prev_close") or 0.0)
-                    _dh = float(signals.get("day_high_so_far") or 0.0)
-                    if _gap_dir == "DOWN" and _pc > 0 and _dh > 0 and _dh < _pc:
-                        pass
+                    # Unreclaimed prior close vetoes choppy low fades —
+                    # including FLAT "micro-gaps" the 0.4% detector misses.
+                    if _struct_bear:
+                        signals["fade_vetoed_by_structure"] = (
+                            "choppy_low_fade_vetoed_prior_close_unreclaimed"
+                        )
                     elif _measured_dn and not _struct_bull:
                         # Same live-dump veto as AFTERNOON_DAY_LOW_FADE.
                         signals["fade_vetoed_by_trend"] = (
@@ -4348,6 +4351,48 @@ def _self_test() -> None:
         f"low fade must not override measured downtrend, notes={notes8}"
     )
     print(f"  measured DN + two_way low → {final8.value} ({notes8})")
+
+    # Oct8-class: FLAT micro-gap (open <0.4% under prior close) + CHOPPY
+    # at the lows must NOT mint TWO_WAY_CHOPPY_LOW_FADE / PREMIUM_SELL_BULL.
+    _oct8_fade = make_signals(
+        adx_15=0.0,
+        adx_15_mature=False,
+        spot=22461.0,
+        or_high=22599.0,
+        or_low=22487.0,
+        or_computed=True,
+        day_high_so_far=22599.0,
+        day_low_so_far=22460.0,
+        day_high=22599.0,
+        day_low=22460.0,
+        post_open_high_so_far=22599.0,
+        post_open_low_so_far=22460.0,
+        two_way_auction=True,
+        choppy_detected=True,
+        gap_direction="FLAT",
+        prev_close=22603.0,
+        opening_straddle_pts=272.0,
+        vrp_smoothed=1.4,
+        actual_dte=3,
+    )
+    final8b, notes8b, _ = classifier.classify_final(
+        VolatilityRegime.NEUTRAL,
+        PriceRegime.CHOPPY,
+        PositioningRegime.STRONG_RANGE,
+        ConfidenceLevel.LOW,
+        _oct8_fade,
+        False, "",
+        _test_time=dtime(9, 45),
+    )
+    assert final8b == FinalRegime.NO_TRADE, (
+        f"Oct8-class FLAT unreclaimed choppy low must stay NO_TRADE, "
+        f"got {final8b}/{notes8b}"
+    )
+    assert "TWO_WAY_CHOPPY_LOW_FADE" not in str(notes8b), (
+        f"choppy low fade must not fire under unreclaimed prior close, "
+        f"notes={notes8b}"
+    )
+    print(f"  FLAT micro-gap CHOPPY low → {final8b.value} ({notes8b})")
 
     # Stale-dump reclaim: bounced ≥35pts off day low → not DOWNTREND.
     _px_stale = classifier.classify_price(make_signals(
