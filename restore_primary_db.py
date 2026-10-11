@@ -342,6 +342,14 @@ def is_locked_by_writer(path: Path) -> bool:
     try:
         con = sqlite3.connect(str(path), timeout=0.25)
         try:
+            # Close must not checkpoint. The first restore probe did
+            # BEGIN IMMEDIATE and then closed, which merged the live WAL
+            # into the damaged main file and deleted the WAL.
+            try:
+                con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+            except (AttributeError, sqlite3.Error):
+                pass
+            con.execute("PRAGMA wal_autocheckpoint=0")
             con.execute("BEGIN IMMEDIATE")
             con.rollback()
         finally:
@@ -361,7 +369,12 @@ def verify_with_wal(path: Path) -> Tuple[bool, str]:
     try:
         con = sqlite3.connect(_ro_uri(path), uri=True, timeout=30)
         try:
+            con.execute("PRAGMA query_only=ON")
             con.execute("PRAGMA busy_timeout=60000")
+            try:
+                con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+            except (AttributeError, sqlite3.Error):
+                pass
             row = con.execute("PRAGMA integrity_check").fetchone()
             msg = str(row[0] if row else "unknown")
             if msg != "ok":
