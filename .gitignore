@@ -61,6 +61,13 @@ dist/
 *.bak
 *.orig
 
+# Engine runtime recovery (local position / halt / risk)
+gold-trade-engine/runtime_state.json
+gold-trade-engine/runtime_state.json.bak
+gold-trade-engine/runtime_state.json.tmp
+gold-trade-engine/risk_ledger.json
+gold-trade-engine/engine.lock
+
 
 # ============================================================
 # DATABASES
@@ -87,3 +94,5 @@ patch.py
 # Google / GCP client secrets (never commit)
 **/gen-lang-client-*.json
 
+/backtest_cache/*
+/backtest_output/*
