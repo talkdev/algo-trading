@@ -17,7 +17,6 @@ an unknown time is not evidence of a bad time.
 """
 
 import argparse
-import shutil
 import sqlite3
 import sys
 from datetime import datetime
@@ -113,10 +112,30 @@ def main() -> int:
         print("  dry run - nothing written. Re-run with --apply.\n")
         return 0
 
+    lock = Path(str(db) + ".writer.lock")
+    if lock.exists():
+        try:
+            fh = open(lock, "a+b")
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            fh.close()
+        except OSError:
+            print("  refused: the live engine holds this database. Stop main.py first.\n")
+            return 1
+
     if not args.no_backup:
         bak = db.with_name(
             f"{db.stem}.{datetime.now():%Y%m%d_%H%M%S}.bak{db.suffix}")
-        shutil.copy2(db, bak)
+        src = sqlite3.connect(f"file:{db.resolve().as_posix()}?mode=ro", uri=True)
+        dst = sqlite3.connect(str(bak))
+        try:
+            src.execute("PRAGMA query_only=ON")
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
         print(f"  backup: {bak.name}  ({bak.stat().st_size / 1e6:.1f} MB)")
 
     before = db.stat().st_size

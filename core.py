@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import math
@@ -3084,6 +3085,25 @@ MIGRATION_SQL: List[str] = [
 # DATABASE CLASS
 # ─────────────────────────────────────────────
 
+def stray_live_siblings(db_path: Path) -> List[Path]:
+    """Duplicate copies sitting beside the live database trio.
+
+    Windows and Drive name those ``nifty_algo_v3 (1).db-wal`` or
+    ``Copy of nifty_algo_v3.db``. Quarantine files and the writer lock
+    are not duplicates.
+    """
+    parent = db_path.parent
+    if not parent.is_dir():
+        return []
+    stem = re.escape(db_path.stem)
+    name = re.escape(db_path.name)
+    pattern = re.compile(
+        rf"^(?:{stem} \(\d+\)\.db(?:-wal|-shm)?|{name} \(\d+\)|Copy of {name})$",
+        re.IGNORECASE,
+    )
+    return sorted(p for p in parent.iterdir() if pattern.match(p.name))
+
+
 class Database:
     """
     Thread-safe SQLite database wrapper.
@@ -3093,35 +3113,59 @@ class Database:
     Durability: synchronous=FULL. The WAL file is the crash-recovery log.
     Never checkpoint-truncate the live primary: a kill during TRUNCATE
     left nifty_algo_v3.db with a malformed btree and no WAL to replay
-    (see restore_primary_db.py). Next open applies leftover WAL.
+    (see restore_primary_db.py). Close does not checkpoint
+    (SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE). Next open applies leftover WAL.
+    One process holds the writer lock for this path.
     """
 
     def __init__(self, db_path: Path, *, skip_integrity_check: bool = False):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._lock_fh = None
+        strays = stray_live_siblings(self.db_path)
+        if strays:
+            names = ", ".join(p.name for p in strays)
+            raise sqlite3.DatabaseError(
+                f"Duplicate database file(s) beside {self.db_path.name}: {names}. "
+                f"Move them out of {self.db_path.parent} before starting."
+            )
         if self.db_path.exists() and not skip_integrity_check:
             self._assert_file_healthy(self.db_path)
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            timeout=60,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        # FULL: every commit reaches the disk before returning.
-        self._conn.execute("PRAGMA synchronous=FULL;")
-        # Keep the session in the WAL. Default autocheckpoint=1000 copies
-        # into the main btree during live writes — the same window a
-        # manual cancel used to tear. Next open (or a clean last-close)
-        # applies the WAL.
-        self._conn.execute("PRAGMA wal_autocheckpoint=0;")
-        self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._conn.execute("PRAGMA busy_timeout=60000;")
-        self._conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache
-        self._conn.execute("PRAGMA temp_store=MEMORY;")
-        self._init_schema()
-        self._run_migrations()
+        self._acquire_writer_lock()
+        self._conn = None
+        try:
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=60,
+            )
+            self._disable_checkpoint_on_close()
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            # FULL: every commit reaches the disk before returning.
+            self._conn.execute("PRAGMA synchronous=FULL;")
+            # Keep the session in the WAL. Default autocheckpoint=1000 copies
+            # into the main btree during live writes — the same window a
+            # manual cancel used to tear. Next open applies the WAL.
+            # Close does not checkpoint (NO_CKPT_ON_CLOSE, set above).
+            self._conn.execute("PRAGMA wal_autocheckpoint=0;")
+            self._conn.execute("PRAGMA foreign_keys=ON;")
+            self._conn.execute("PRAGMA busy_timeout=60000;")
+            self._conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache
+            self._conn.execute("PRAGMA temp_store=MEMORY;")
+            self._init_schema()
+            self._run_migrations()
+        except Exception:
+            conn = self._conn
+            self._conn = None
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._release_writer_lock()
+            raise
 
     @staticmethod
     def _assert_file_healthy(path: Path) -> None:
@@ -3141,6 +3185,11 @@ class Database:
                 f"file:{path}?mode=ro", uri=True, timeout=30
             )
             try:
+                con.execute("PRAGMA query_only=ON")
+                try:
+                    con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+                except (AttributeError, sqlite3.Error):
+                    pass
                 has_chain = con.execute(
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type='table' AND name='option_chain_snapshot' "
@@ -3661,6 +3710,61 @@ class Database:
                 conn.close()
             except Exception:
                 pass
+            self._release_writer_lock()
+
+    def _disable_checkpoint_on_close(self) -> None:
+        """SQLite checkpoints when the last connection closes unless told not to."""
+        try:
+            self._conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        except (AttributeError, sqlite3.Error) as exc:
+            raise sqlite3.DatabaseError(
+                "Cannot disable SQLite checkpoint-on-close. Refusing to open "
+                f"{self.db_path} because a close would rewrite the main file."
+            ) from exc
+
+    def _acquire_writer_lock(self) -> None:
+        """One writer for this database path. Released on close or process exit."""
+        lock_path = Path(str(self.db_path) + ".writer.lock")
+        fh = open(lock_path, "a+b")
+        try:
+            fh.seek(0)
+            if fh.read(1) != b"\0":
+                fh.seek(0)
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            fh.close()
+            raise sqlite3.DatabaseError(
+                f"Another process already has {self.db_path} open for write."
+            ) from exc
+        self._lock_fh = fh
+
+    def _release_writer_lock(self) -> None:
+        fh = getattr(self, "_lock_fh", None)
+        self._lock_fh = None
+        if fh is None:
+            return
+        try:
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
 
     def checkpoint(self) -> None:
         """Optional PASSIVE checkpoint. Not used on the live write path.

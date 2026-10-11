@@ -241,6 +241,7 @@ class HistoricalStore:
         if not Path(db_path).exists():
             raise FileNotFoundError(db_path)
         self.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        self.conn.execute("PRAGMA query_only=ON")
         self.conn.row_factory = sqlite3.Row
 
     def _q(self, sql: str, params: tuple = ()) -> List[dict]:
@@ -997,6 +998,7 @@ class LiveAbortMirror:
             return cls(events, window_sec=window_sec)
         try:
             conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            conn.execute("PRAGMA query_only=ON")
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT strategy_name, entry_time FROM positions "
@@ -1333,6 +1335,7 @@ def load_calibration_as_of(
             continue
         try:
             con = sqlite3.connect(f"file:{pth}?mode=ro", uri=True)
+            con.execute("PRAGMA query_only=ON")
             con.row_factory = sqlite3.Row
             if cutoff:
                 row = con.execute(
@@ -3194,6 +3197,7 @@ def _db_has_chain_snapshots(path: str) -> bool:
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
+            con.execute("PRAGMA query_only=ON")
             # Full-table COUNT(*) is what fails on the half-corrupt primary
             # (LIMIT 1 / first-day GROUP BY can still succeed). Prefer that
             # probe so we fall back to per_day shards.
@@ -3306,6 +3310,11 @@ def _ro_sqlite(path: Path) -> sqlite3.Connection:
     uri = f"{Path(path).resolve().as_uri()}?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=15)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only=ON")
+    try:
+        con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+    except (AttributeError, sqlite3.Error):
+        pass
     return con
 
 

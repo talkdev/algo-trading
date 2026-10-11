@@ -123,12 +123,22 @@ def _as_ro_uri(path: str | Path) -> str:
 
 def open_db(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     path = str(path)
+    if not readonly and Path(path).name == "nifty_algo_v3.db":
+        raise RuntimeError(
+            "split_db_per_day refuses to write the live primary. "
+            "It snapshots with a read-only backup and writes shards only."
+        )
     if readonly:
-        con = sqlite3.connect(_as_ro_uri(path), uri=True)
+        con = sqlite3.connect(_as_ro_uri(path), uri=True, timeout=60)
+        con.execute("PRAGMA query_only=ON")
     else:
-        con = sqlite3.connect(path)
+        con = sqlite3.connect(path, timeout=60)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=60000")
+    try:
+        con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+    except (AttributeError, sqlite3.Error):
+        pass
     return con
 
 
@@ -150,7 +160,12 @@ def snapshot_readonly(src_path: Path) -> Path:
     remove_db_trio(snap)
     src = sqlite3.connect(_as_ro_uri(src_path), uri=True, timeout=60)
     try:
+        src.execute("PRAGMA query_only=ON")
         src.execute("PRAGMA busy_timeout=60000")
+        try:
+            src.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        except (AttributeError, sqlite3.Error):
+            pass
         dst = sqlite3.connect(str(snap), timeout=60)
         try:
             src.backup(dst)
