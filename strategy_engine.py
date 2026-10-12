@@ -269,11 +269,13 @@ class StrategyEngine:
         mid-range same-side vertical are different trades. Long premium
         is not a credit chase. Same tape rule at every DTE.
 
-        Also: after CLOSE_TARGET on a credit side, reloading that same
-        side into a mature labelled trend matching the lean is a late
-        chase even below loc 0.80 (sample 17-Sep second BPS @13:04
-        PREMIUM_SELL_BULL+UPTREND adx≈39 → HARD_EXIT wipe). First ticket
-        already monetised the lean; the reload holds into the bell.
+        After CLOSE_TARGET, a same-side reload *into a new extreme*
+        (loc ≥ 0.80 puts / ≤ 0.20 calls) is still a chase. A pullback
+        re-sell after a harvest — spot back through the exit — is the
+        continuation book (live 2026-10-12: BCS TARGET @13:15 at 22362,
+        then PREMIUM_SELL_BEAR HIGH @13:55 at ~22386 bounce was blocked
+        by a blanket mature-trend reload). The mature-trend ADX latch is
+        removed; location + pullback decide.
 
         After CLOSE_STOP the bar is tighter: soft-lean location
         (loc ≥ 0.58 puts / ≤ 0.42 calls) is already a reload into the
@@ -295,55 +297,40 @@ class StrategyEngine:
         )
         _stopped = last_xr.startswith("CLOSE_STOP")
         try:
-            _adx = float(signals.get("adx_15") or 0.0)
+            _spot = float(signals.get("spot") or 0.0)
+            _xspot = float(state.get("last_exit_spot") or 0.0)
         except (TypeError, ValueError):
-            _adx = 0.0
-        _px = str(signals.get("price_regime") or "")
-        # Strong-enough trend to treat a same-side reload as a chase.
-        # Use max(trend, 0.7*strong) so adx≈39 on a 40 strong-threshold
-        # book still trips without waiting for exact 40.0.
-        _strong = float(getattr(self.config, "adx_strong_threshold", 40.0) or 40.0)
-        _trend = float(getattr(self.config, "adx_trend_threshold", 20.0) or 20.0)
-        _reload_adx = max(_trend, 0.70 * _strong)
+            _spot = _xspot = 0.0
+        # Pullback through the harvest print = re-sell, not a chase.
+        _pullback_resell = False
+        if _harvested and _spot > 0 and _xspot > 0:
+            if last_side == "BEAR" and _spot > _xspot:
+                _pullback_resell = True
+            elif last_side == "BULL" and _spot < _xspot:
+                _pullback_resell = True
 
         if last_side == "BULL" and "BULL" in new_sides:
             if signals.get("afternoon_low_fade"):
                 return None
-            if (
-                _harvested
-                and _px in ("UPTREND", "STRONG_UPTREND")
-                and _adx >= _reload_adx
-            ):
-                return (
-                    f"same_side_reload_into_mature_uptrend_adx_{_adx:.0f}"
-                )
             try:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
             if _stopped and _loc >= self.RANGE_SOFT_LEAN_HI:
                 return f"same_side_reload_after_stop_loc_{_loc:.2f}"
-            if _loc >= 0.80:
+            if _loc >= 0.80 and not _pullback_resell:
                 return f"same_side_chase_puts_at_high_loc_{_loc:.2f}"
             return None
         if last_side == "BEAR" and "BEAR" in new_sides:
             if signals.get("afternoon_high_fade"):
                 return None
-            if (
-                _harvested
-                and _px in ("DOWNTREND", "STRONG_DOWNTREND")
-                and _adx >= _reload_adx
-            ):
-                return (
-                    f"same_side_reload_into_mature_downtrend_adx_{_adx:.0f}"
-                )
             try:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
             if _stopped and _loc <= self.RANGE_SOFT_LEAN_LO:
                 return f"same_side_reload_after_stop_loc_{_loc:.2f}"
-            if _loc <= 0.20:
+            if _loc <= 0.20 and not _pullback_resell:
                 return f"same_side_chase_calls_at_low_loc_{_loc:.2f}"
             return None
         return None
@@ -1404,10 +1391,15 @@ class StrategyEngine:
                             )
                         except Exception:
                             _same_side_extreme = False
-                        # After a profitable momentum TARGET, same-side trend
+                        # After a profitable TARGET/PROFIT, same-side trend
                         # continuation is the material change — do not demand
                         # another full reconfirm move (Oct6: LONG_CALL +₹8 at
-                        # 11:13 then no_material_change while spot +100pt).
+                        # 11:13 then no_material_change while spot +100pt;
+                        # Oct12: BCS TARGET +₹51 then PREMIUM_SELL_BEAR HIGH
+                        # sat behind 27pt reconfirm while ADX cooled 36→23).
+                        # Floor at trend ADX (not strong): the harvest already
+                        # proved the lean; a still-labelled same-side regime
+                        # or live PREMIUM_SELL_* HIGH is enough tape.
                         _after_mom_target_trend = False
                         try:
                             _xr_m = str(state.get("last_exit_reason") or "")
@@ -1415,23 +1407,43 @@ class StrategyEngine:
                             _pnl_m = float(state.get("last_exit_pnl_rs") or 0.0)
                             _pr_m = str(signals.get("price_regime") or "")
                             _adx_m = float(signals.get("adx_15") or 0.0)
-                            _adx_sm = float(
-                                getattr(self.config, "adx_strong_threshold", 28.0)
-                                or 28.0
+                            _adx_tm = float(
+                                getattr(self.config, "adx_trend_threshold", 20.0)
+                                or 20.0
                             )
+                            _reg_m = str(signals.get("final_regime") or "")
+                            _conf_m = str(
+                                signals.get("confidence_level") or ""
+                            ).upper()
                             _harv_m = (
                                 _xr_m.startswith("CLOSE_TARGET")
                                 or _xr_m.startswith("CLOSE_PROFIT")
                             )
+                            _side_tape_m = (
+                                (_side_m == "BULL"
+                                 and (
+                                     _pr_m in ("UPTREND", "STRONG_UPTREND")
+                                     or (
+                                         _reg_m == "PREMIUM_SELL_BULL"
+                                         and _conf_m in ("HIGH", "MEDIUM")
+                                     )
+                                 ))
+                                or (_side_m == "BEAR"
+                                    and (
+                                        _pr_m in ("DOWNTREND", "STRONG_DOWNTREND")
+                                        or (
+                                            _reg_m == "PREMIUM_SELL_BEAR"
+                                            and _conf_m in ("HIGH", "MEDIUM")
+                                        )
+                                    ))
+                            )
                             _after_mom_target_trend = (
                                 _harv_m
                                 and _pnl_m > 0.0
-                                and _adx_m >= _adx_sm
+                                and _side_tape_m
                                 and (
-                                    (_side_m == "BULL"
-                                     and _pr_m in ("UPTREND", "STRONG_UPTREND"))
-                                    or (_side_m == "BEAR"
-                                        and _pr_m in ("DOWNTREND", "STRONG_DOWNTREND"))
+                                    _adx_m >= _adx_tm
+                                    or _conf_m == "HIGH"
                                 )
                             )
                         except Exception:
@@ -1993,10 +2005,32 @@ class StrategyEngine:
             # above a confirmed breakdown (or puts below a breakout)
             # is how a wide-range trend day is harvested; the blanket
             # ban left 2026-09-15 untradeable by every route.
-            _px = signals.get("price_regime", "")
+            # Normalize Enum/str so PREMIUM_SELL_BEAR + DOWNTREND never
+            # miss the waiver (live 2026-10-12 still logged wide_or while
+            # cycle_log columns showed both labels).
+            _fr_w = str(getattr(final_regime, "value", final_regime) or "")
+            _px_w = signals.get("price_regime", "")
+            _px_w = str(getattr(_px_w, "value", _px_w) or "")
+            _adx_w = 0.0
+            try:
+                _adx_w = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_w = 0.0
+            _strong_w = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
             _trend_side_ok = (
-                (final_regime == "PREMIUM_SELL_BEAR" and _px in ("DOWNTREND", "STRONG_DOWNTREND"))
-                or (final_regime == "PREMIUM_SELL_BULL" and _px in ("UPTREND", "STRONG_UPTREND"))
+                (_fr_w == "PREMIUM_SELL_BEAR"
+                 and _px_w in ("DOWNTREND", "STRONG_DOWNTREND"))
+                or (_fr_w == "PREMIUM_SELL_BULL"
+                    and _px_w in ("UPTREND", "STRONG_UPTREND"))
+                # Strong ADX preview + directional price: same harvest,
+                # even if final_regime label flickers for a cycle.
+                or (_adx_w >= _strong_w
+                    and _px_w in (
+                        "DOWNTREND", "STRONG_DOWNTREND",
+                        "UPTREND", "STRONG_UPTREND",
+                    ))
             )
             if not signals.get("gap_fade_opportunity") and not _trend_side_ok:
                 return "NO_TRADE", f"wide_or_{or_condition}_dangerous_to_sell_premium"
@@ -6829,7 +6863,37 @@ class StrategyEngine:
                 ),
             }
 
-        _location_edge = bool(_away_side_credit and _range_loc_lean)
+        # Location-edge EV cushion: away-side range leans (existing) PLUS
+        # confirmed with-trend premium sells under strong ADX. Live
+        # 2026-10-12 sat in PREMIUM_SELL_BEAR HIGH with EV a few tenths
+        # under min for ~40 minutes while the dump was already done.
+        _trend_ev_edge = False
+        try:
+            _fr_e = signals.get("final_regime")
+            _fr_es = str(getattr(_fr_e, "value", _fr_e) or "")
+            _px_e = signals.get("price_regime")
+            _px_es = str(getattr(_px_e, "value", _px_e) or "")
+            _adx_e = float(signals.get("adx_15") or 0.0)
+            _strong_e = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+            _conf_e = str(signals.get("confidence_level") or "").upper()
+            _trend_ev_edge = (
+                _with_trend_credit
+                and _adx_e >= _strong_e
+                and _conf_e in ("HIGH", "MEDIUM")
+                and (
+                    (_fr_es == "PREMIUM_SELL_BEAR"
+                     and _px_es in ("DOWNTREND", "STRONG_DOWNTREND", "RANGE"))
+                    or (_fr_es == "PREMIUM_SELL_BULL"
+                        and _px_es in ("UPTREND", "STRONG_UPTREND", "RANGE"))
+                )
+            )
+        except (TypeError, ValueError):
+            _trend_ev_edge = False
+        _location_edge = bool(
+            (_away_side_credit and _range_loc_lean) or _trend_ev_edge
+        )
 
         if actual_wing_pts and actual_wing_pts > 0:
             ratio     = net_credit / actual_wing_pts
@@ -7686,30 +7750,58 @@ class StrategyEngine:
         # Exception: post-harvest with-trend continuation may use the same
         # ADX floor as the hard credit invariant (trend threshold) without
         # waiting for the mature flag (Sep23 UPTREND after BPS).
-        # NOTE: a "strong preview + spent day_move" carve-out was tried
-        # (v65m7y) to unlock Sep29 LONG_PUT earlier; it destroyed Sep15
-        # (−₹15k vs baseline) and did not lift Sep29 replay — reverted.
+        # Strong-preview escape (any DTE): the 5m Wilder maturity clock
+        # only flips ~10:55 (data_engine: 21×5m bars). Live 2026-10-12 had
+        # ADX preview 67-75 + PREMIUM_SELL_BEAR HIGH from ~10:07 but debit
+        # waited until mature@10:56 — missing the open dump. A prior looser
+        # carve-out (v65m7y) destroyed Sep15; this one requires strong-
+        # threshold ADX, spent side ≥100%, extreme loc, and a confirmed
+        # directional sell regime / price label.
         if not bool(signals.get("adx_15_mature", False)):
             _exp_imm_ok = False
             try:
+                _up_i = float(
+                    signals.get("day_up_used_peak_pct")
+                    or signals.get("day_up_used_pct")
+                    or 0.0
+                )
+                _dn_i = float(
+                    signals.get("day_down_used_peak_pct")
+                    or signals.get("day_down_used_pct")
+                    or 0.0
+                )
+                _, _loc_i, _, _ = self._session_range_pos(signals)
+                _fr_i = signals.get("final_regime")
+                _fr_s = str(getattr(_fr_i, "value", _fr_i) or "")
+                _px_i = signals.get("price_regime")
+                _px_s = str(getattr(_px_i, "value", _px_i) or "")
+                _conf_i = str(signals.get("confidence_level") or "").upper()
+                _strong_i = float(
+                    getattr(cfg, "adx_strong_threshold", 28.0) or 28.0
+                )
+                # 0DTE: existing softer escape — puts at the lows only.
+                # Call-side immature escape early-fired Oct6 LONG_CALL at
+                # 10:35 (ADX not mature) and wiped the later reload book.
+                # Mid-week bull immature escape (ADX≥strong + spent up +
+                # loc≥0.70) also early-fired Sep30 LONG_CALL and erased
+                # the +₹975 BPS book (−₹5k day). Bear-only.
                 if dte_i == 0 and adx >= 18.0:
-                    _up_i = float(
-                        signals.get("day_up_used_peak_pct")
-                        or signals.get("day_up_used_pct")
-                        or 0.0
-                    )
-                    _dn_i = float(
-                        signals.get("day_down_used_peak_pct")
-                        or signals.get("day_down_used_pct")
-                        or 0.0
-                    )
-                    _, _loc_i, _, _ = self._session_range_pos(signals)
-                    # Puts at the lows only. Call-side immature escape
-                    # early-fired Oct6 LONG_CALL at 10:35 (ADX not mature)
-                    # and wiped the later reload book.
                     _exp_imm_ok = (
                         direction < 0 and _dn_i >= 80.0 and _loc_i <= 0.30
                     )
+                if (
+                    not _exp_imm_ok
+                    and direction < 0
+                    and adx >= _strong_i
+                    and _conf_i in ("HIGH", "MEDIUM")
+                    and _dn_i >= 100.0
+                    and _loc_i <= 0.30
+                    and (
+                        _fr_s == "PREMIUM_SELL_BEAR"
+                        or _px_s in ("DOWNTREND", "STRONG_DOWNTREND")
+                    )
+                ):
+                    _exp_imm_ok = True
             except (TypeError, ValueError):
                 _exp_imm_ok = False
             if not _exp_imm_ok:

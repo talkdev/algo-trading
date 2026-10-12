@@ -1,0 +1,1416 @@
+{
+  "trading_day": "2026-10-12",
+  "generated_utc": "2026-10-12T14:49:20.172755+00:00",
+  "equity": 500000.0,
+  "realized_pnl": 0.0,
+  "trades_today": 0,
+  "fills": 0,
+  "blocked": false,
+  "decision_count": 421,
+  "decisions": [
+    {
+      "ts_utc": "2026-10-12T14:29:27.348926+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:20:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:29:32.773743+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:20:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:29:38.277726+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:20:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:29:43.731580+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:20:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:29:49.291616+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:20:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:29:54.753403+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:20:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:00.178891+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:05.724869+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:11.221150+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:16.645469+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:22.098042+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:27.607627+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:33.039456+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:38.494977+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:43.956679+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:49.436536+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:30:54.892106+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:00.399061+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:06.151236+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:11.666442+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:17.102246+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:22.523783+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:28.011665+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:33.448589+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:38.983519+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:44.494355+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:49.936078+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:31:55.345355+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:00.786088+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:06.289593+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:12.111826+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:17.487182+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:22.838057+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:28.228544+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:33.573753+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:39.062595+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:44.423484+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:49.830857+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:32:55.365486+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:00.733480+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:06.160239+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:11.550868+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:16.945779+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:22.364630+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:27.762521+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:33.209447+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:38.606204+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:44.009778+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:49.490899+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:33:54.912470+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:03.210360+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:08.772619+00:00",
+      "action": "WAIT",
+      "reason": "market_gate",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:21.663139+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:29.014129+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:34.868926+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:40.374840+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:45.828776+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:51.262466+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:34:56.730879+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:25:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:02.184948+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:07.653340+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:13.217477+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:31.321914+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:41.628904+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:47.158817+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:52.599732+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:35:58.044625+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:04.346192+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:09.800955+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:15.276849+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:20.718779+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:26.240635+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:31.724269+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:37.225161+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:42.761679+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:48.541407+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:54.040292+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:36:59.495134+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:04.936652+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:10.356513+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:15.837336+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:21.334014+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:26.788821+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:32.287638+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:37.753094+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:43.194297+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:48.666680+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:54.135581+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:37:59.622011+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:05.098569+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:10.631559+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:16.186965+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:21.730638+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:27.223452+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:32.721514+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:38.228746+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:43.776615+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:49.264017+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:38:54.745324+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:00.177179+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:05.675437+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:11.172654+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:16.590217+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:22.113695+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:27.606465+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:33.103434+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:38.609992+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:44.114764+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:49.662635+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:39:55.113156+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:30:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:00.565968+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:06.108662+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:11.626290+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:17.135417+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:22.722152+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:28.240552+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:33.752468+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:42.195832+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:47.610188+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:53.080113+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:40:58.503975+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:03.934935+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:09.355937+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:14.799896+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:20.291918+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:25.858186+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:31.344606+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:36.814420+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:42.364319+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:47.802167+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:53.298124+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:41:58.731978+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:42:04.153894+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:42:09.626756+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:42:54.880925+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:04.932071+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:10.415697+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:15.910858+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:21.392597+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:26.905277+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:32.367167+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:37.827049+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:43.329122+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:48.812847+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:54.342743+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:43:59.804627+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:05.450834+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:10.925881+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:16.397284+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:21.866270+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:27.357043+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:32.805002+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:38.207601+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:43.666310+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:49.124578+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:44:54.647931+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:35:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:00.083029+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:05.630481+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:11.095565+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:16.608062+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:22.144270+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:27.806169+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:33.277915+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:38.954982+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:44.456607+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:49.938179+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:45:55.711071+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:46:17.300623+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:46:28.414369+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:46:33.895270+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:46:39.435565+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:46:44.923344+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:46:50.369359+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:46:55.870138+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:01.337360+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:06.840360+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:12.298262+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:17.771895+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:23.308036+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:28.817928+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:34.326463+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:39.772634+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:45.265542+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:50.799413+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:47:56.259413+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:01.743243+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:07.429231+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:12.846727+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:18.340448+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:23.842551+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:29.344097+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:34.754358+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:40.233270+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:45.651183+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:51.281083+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:48:56.764219+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:49:02.255221+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:49:07.869704+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:49:13.353708+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    },
+    {
+      "ts_utc": "2026-10-12T14:49:18.826602+00:00",
+      "action": "WAIT",
+      "reason": "market_gate \u2014 trend=bearish, no completed 5-minute breakout",
+      "side": "",
+      "signal_id": "none:2026-10-12T14:40:00+00:00"
+    }
+  ],
+  "extra": {
+    "shutdown": true,
+    "instrument_key": "MCX_FO|571445"
+  }
+}

@@ -10,7 +10,14 @@ from typing import Any, Optional
 import pandas as pd
 
 from config import EngineConfig
-from feeds import EconomicEvent, events_known_as_of, validate_candle_frame, value_at_or_before
+from feeds import (
+    EconomicEvent,
+    events_known_as_of,
+    resample_ohlcv,
+    validate_candle_frame,
+    value_at_or_before,
+)
+from market_signals import evaluate_market_signal
 from strategy import build_signal_from_market
 from trading import ExecutionEngine, PerformanceReport, RiskManager, build_performance
 
@@ -163,61 +170,88 @@ def run_backtest(
         daily_hit = risk.daily_loss_reached(now_utc)
 
         visible_events = events_known_as_of(events, now_utc, strict_retrieval=True)
+        strategy_mode = str(getattr(cfg, "strategy_mode", "trend_breakout") or "").lower()
+        decision_side = "NO_TRADE"
+        decision_reason = ""
+        breakout_key = ""
+        news_related = False
 
-        dxy_v, _ = value_at_or_before(dxy, now_utc, max_age=max_age)
-        y_v, _ = value_at_or_before(yields, now_utc, max_age=max_age)
-        data_ok = dxy_v is not None and y_v is not None and validate_candle_frame(completed)
+        if strategy_mode == "trend_breakout":
+            # Build 15m from the same 5m history (synthetic/backtest input is typically 5m)
+            hist_15 = resample_ohlcv(completed, 15) if int(cfg.timeframe_minutes) == 5 else completed
+            msig = evaluate_market_signal(
+                completed, hist_15,
+                lookback=int(cfg.gold_breakout_lookback_bars),
+                atr_period=int(cfg.atr_period),
+                ema_fast=int(getattr(cfg, "trend_ema_fast", 20)),
+                ema_slow=int(getattr(cfg, "trend_ema_slow", 50)),
+                data_valid=validate_candle_frame(completed),
+            )
+            if daily_hit:
+                decision_reason = "daily_loss_limit"
+            elif exe.has_open_position or pending is not None:
+                decision_reason = "already_pending_or_open"
+            elif not msig.valid:
+                decision_reason = ",".join(msig.reasons) or "no_setup"
+            elif msig.signal_id and msig.signal_id == exe.last_breakout_key:
+                decision_reason = "duplicate_signal"
+            else:
+                decision_side = "BUY" if msig.direction == "bullish" else "SELL"
+                breakout_key = msig.signal_id
+                decision_reason = "trend_breakout"
+            # Backtest does not require live news DB confirmation (research path)
+        else:
+            dxy_v, _ = value_at_or_before(dxy, now_utc, max_age=max_age)
+            y_v, _ = value_at_or_before(yields, now_utc, max_age=max_age)
+            data_ok = dxy_v is not None and y_v is not None and validate_candle_frame(completed)
+            signal = build_signal_from_market(
+                now_utc=now_utc,
+                events=visible_events,
+                dxy=dxy,
+                yields=yields,
+                gold_candles=completed,
+                data_is_valid=data_ok,
+                daily_loss_limit_reached=daily_hit,
+                has_open_position=exe.has_open_position or pending is not None,
+                real_yields=real_yields,
+                cfg=cfg,
+                last_breakout_key=exe.last_breakout_key,
+            )
+            decision_side = signal.decision
+            decision_reason = signal.reason
+            breakout_key = str(signal.meta.get("breakout_key") or "")
+            news_related = bool(
+                signal.meta.get("inside_news_block") or signal.meta.get("news_day")
+            )
 
-        signal = build_signal_from_market(
-            now_utc=now_utc,
-            events=visible_events,
-            dxy=dxy,
-            yields=yields,
-            gold_candles=completed,
-            data_is_valid=data_ok,
-            daily_loss_limit_reached=daily_hit,
-            has_open_position=exe.has_open_position or pending is not None,
-            real_yields=real_yields,
-            cfg=cfg,
-            last_breakout_key=exe.last_breakout_key,
-        )
-
-        if signal.decision == "NO_TRADE":
+        if decision_side == "NO_TRADE":
             rejects.append({
                 "time": now_utc.isoformat(),
-                "reason": signal.reason,
-                "bias": signal.bias,
-                "dxy": signal.dxy_direction,
-                "yield": signal.yield_direction,
+                "reason": decision_reason,
             })
         elif exe.has_open_position or pending is not None:
             rejects.append({
                 "time": now_utc.isoformat(),
                 "reason": "already_pending_or_open",
-                "signal": signal.decision,
+                "signal": decision_side,
             })
         else:
-            # Decision uses completed bar close context; fill deferred to next open.
-            # Use mid of close only for preliminary plan rejection checks.
             mid_c = float(bar["close"])
             prelim_bid = mid_c - half - slip
             prelim_ask = mid_c + half + slip
-            plan = risk.build_trade_plan(signal.decision, prelim_bid, prelim_ask, completed)
+            plan = risk.build_trade_plan(decision_side, prelim_bid, prelim_ask, completed)
             if plan.rejected:
                 rejects.append({
                     "time": now_utc.isoformat(),
                     "reason": plan.reject_reason,
-                    "signal": signal.decision,
+                    "signal": decision_side,
                 })
             else:
-                news_related = bool(
-                    signal.meta.get("inside_news_block") or signal.meta.get("news_day")
-                )
                 pending = {
-                    "side": signal.decision,
+                    "side": decision_side,
                     "plan": plan,
                     "completed": completed.copy(),
-                    "breakout_key": str(signal.meta.get("breakout_key") or ""),
+                    "breakout_key": breakout_key,
                     "news_related": news_related,
                     "decision_time": now_utc.isoformat(),
                 }
