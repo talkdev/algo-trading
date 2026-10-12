@@ -11,8 +11,11 @@ IMPORTANT
 * OHLC candles cannot reproduce queue position, actual partial fills, or the exact
   tick-by-tick path. Costs are modelled as a user-specified percentage per executed
   side. Intrabar stop and daily-loss checks use a conservative paired-OHLC envelope.
-* The Engle-Granger threshold defaults to 0.05. A CLI override is research-only and
-  does not establish profitability or statistical significance.
+* The baseline Engle-Granger threshold defaults to 0.05. The separate
+  `research_activity` profile bypasses that gate with OLS residuals only to test
+  trade generation; it is not evidence of cointegration or profitability.
+* `--aligned-csv` supports offline replay of an exported aligned-front file without
+  API credentials or network calls.
 * Detailed console diagnostics plus aligned-front and per-session CSV audits are
   written for troubleshooting. This script does not guarantee profit.
 
@@ -38,7 +41,7 @@ import json
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -78,6 +81,7 @@ class StrategyConfig:
     # Research knob only. The finalized baseline remains 5%; weakening it is not
     # evidence of cointegration and must be validated walk-forward.
     cointegration_pvalue_threshold: float = 0.05
+    relationship_filter: str = "engle_granger"  # or research-only "ols_residual"
     entry_z: float = 2.0
     target_z: float = 0.0
     stop_z: float = 3.0
@@ -98,6 +102,7 @@ class OpenPosition:
     signal_time: pd.Timestamp
     entry_time: pd.Timestamp
     entry_z: float
+    entry_open_z: float
     alpha: float
     beta: float
     pvalue: float
@@ -441,11 +446,54 @@ def _regular_session_filter(df: pd.DataFrame) -> pd.DataFrame:
     out["bar_end"] = out.index + pd.Timedelta(minutes=BAR_MINUTES)
     out["session_date"] = [ts.date() for ts in out.index]
     # NSE equity-derivatives regular session. Keep only completed five-minute bars.
+    # Historical 15:30 closes and the 15:40 close implemented from 2026-08-03
+    # are both represented by the final candle's *end* time.
     out = out[
         (out.index.time >= dtime(9, 15))
         & (out["bar_end"].dt.time <= dtime(15, 40))
     ]
     return out
+
+
+def load_aligned_front_csv(path: Path) -> pd.DataFrame:
+    """Load an exported aligned-front CSV for offline, no-API replay."""
+    try:
+        frame = pd.read_csv(path)
+    except (OSError, pd.errors.ParserError) as exc:
+        raise BacktestError(f"Could not read aligned CSV {path}: {exc}") from exc
+    required = {
+        "bar_end", "bar_start", "session_date", "expiry", "is_expiry_day",
+        "n_open", "n_high", "n_low", "n_close", "b_open", "b_high", "b_low", "b_close",
+        "n_lot_size", "b_lot_size", "n_scale", "b_scale", "n_adj_close", "b_adj_close",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise BacktestError(f"Aligned CSV is missing required columns: {', '.join(missing)}")
+    for column in ("bar_start", "bar_end"):
+        frame[column] = pd.to_datetime(frame[column], errors="coerce", utc=True).dt.tz_convert(IST)
+    for column in ("session_date", "expiry"):
+        frame[column] = pd.to_datetime(frame[column], errors="coerce").dt.date
+    if frame[["bar_start", "bar_end", "session_date", "expiry"]].isna().any().any():
+        raise BacktestError("Aligned CSV contains invalid timestamps or dates.")
+    expiry_values = frame["is_expiry_day"].astype(str).str.strip().str.lower()
+    if not expiry_values.isin({"true", "false", "1", "0"}).all():
+        raise BacktestError("Aligned CSV has unrecognized is_expiry_day values.")
+    frame["is_expiry_day"] = expiry_values.isin({"true", "1"})
+    numeric = [
+        "n_open", "n_high", "n_low", "n_close", "b_open", "b_high", "b_low", "b_close",
+        "n_lot_size", "b_lot_size", "n_scale", "b_scale", "n_adj_close", "b_adj_close",
+    ]
+    for column in numeric:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if frame[numeric].isna().any().any() or not np.isfinite(frame[numeric].to_numpy(dtype=float)).all():
+        raise BacktestError("Aligned CSV contains missing or non-finite price/scale/lot values.")
+    if (frame[["n_open", "n_high", "n_low", "n_close", "b_open", "b_high", "b_low", "b_close", "n_scale", "b_scale", "n_adj_close", "b_adj_close"]] <= 0).any().any():
+        raise BacktestError("Aligned CSV contains non-positive prices or adjustment scales.")
+    if (frame[["n_lot_size", "b_lot_size"]] <= 0).any().any():
+        raise BacktestError("Aligned CSV contains non-positive lot sizes.")
+    if frame["bar_end"].duplicated().any():
+        raise BacktestError("Aligned CSV contains duplicate bar_end timestamps.")
+    return frame.set_index("bar_end").sort_index()
 
 
 def _roll_scales(
@@ -582,10 +630,19 @@ def fetch_upstox_front_month(
     metas_n, metas_b = discover_contracts(api, data_start, data_end)
     histories_n: dict[date, pd.DataFrame] = {}
     histories_b: dict[date, pd.DataFrame] = {}
+    # A listed monthly future is only needed near its own expiry. Fetch a generous
+    # 150-calendar-day contract window (including roll overlap) instead of asking
+    # every contract for the entire multi-year backtest range.
     for expiry, meta in metas_n.items():
-        histories_n[expiry] = api.fetch_contract_history(meta, data_start, min(data_end, expiry))
+        contract_start = max(data_start, expiry - timedelta(days=150))
+        contract_end = min(data_end, expiry)
+        print(f"History NIFTY {meta.trading_symbol}: {contract_start}..{contract_end}")
+        histories_n[expiry] = api.fetch_contract_history(meta, contract_start, contract_end)
     for expiry, meta in metas_b.items():
-        histories_b[expiry] = api.fetch_contract_history(meta, data_start, min(data_end, expiry))
+        contract_start = max(data_start, expiry - timedelta(days=150))
+        contract_end = min(data_end, expiry)
+        print(f"History BANKNIFTY {meta.trading_symbol}: {contract_start}..{contract_end}")
+        histories_b[expiry] = api.fetch_contract_history(meta, contract_start, contract_end)
     # Trim any empty contract responses before continuous-series construction.
     histories_n = {e: f for e, f in histories_n.items() if not f.empty}
     histories_b = {e: f for e, f in histories_b.items() if not f.empty}
@@ -748,11 +805,39 @@ def _notional(pos: OpenPosition, px_n: float, px_b: float) -> float:
     return abs(pos.nifty_units * px_n) + abs(pos.bank_units * px_b)
 
 
+def build_model_cache(
+    front: pd.DataFrame,
+    test_start: date,
+    test_end: date,
+    lookback_sessions: int,
+) -> dict[date, dict[str, Any]]:
+    """Fit daily OLS/EG models once so research variants reuse identical history."""
+    sessions = sorted(set(front["session_date"]))
+    cache: dict[date, dict[str, Any]] = {}
+    for session in [d for d in sessions if test_start <= d <= test_end]:
+        prior = [d for d in sessions if d < session]
+        train_sessions = prior[-lookback_sessions:]
+        if len(train_sessions) < lookback_sessions:
+            cache[session] = {
+                "alpha": np.nan, "beta": np.nan, "pvalue": 1.0, "valid": False, "nobs": 0,
+                "coint_statistic": np.nan, "critical_1pct": np.nan,
+                "critical_5pct": np.nan, "critical_10pct": np.nan,
+                "r_squared": np.nan, "level_correlation": np.nan,
+                "return_correlation": np.nan, "residual_std": np.nan,
+            }
+        else:
+            train = front[front["session_date"].isin(train_sessions)]
+            # Threshold=1.0 stores the raw p-value; each variant applies its own gate later.
+            cache[session] = fit_daily_model(train, pvalue_threshold=1.0)
+    return cache
+
+
 def run_backtest(
     front: pd.DataFrame,
     test_start: date,
     test_end: date,
     cfg: StrategyConfig,
+    model_cache: dict[date, dict[str, Any]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Run an event-driven OHLC backtest; entries use next-bar open to avoid look-ahead."""
     if front.empty:
@@ -772,6 +857,9 @@ def run_backtest(
     trades: list[dict[str, Any]] = []
     daily_rows: list[dict[str, Any]] = []
     model_rows: list[dict[str, Any]] = []
+    rejected_entries_open_stop = 0
+    rejected_entries_signal_faded = 0
+    rejected_entries_missing_open_z = 0
     halted_for_day = False
 
     def close_position(
@@ -793,6 +881,7 @@ def run_backtest(
             "exit_time": when.isoformat(),
             "side": "LONG_SPREAD" if pos.side > 0 else "SHORT_SPREAD",
             "entry_z": pos.entry_z,
+            "entry_open_z": pos.entry_open_z,
             "exit_z": z_exit,
             "beta": pos.beta,
             "cointegration_pvalue": pos.pvalue,
@@ -826,7 +915,9 @@ def run_backtest(
             continue
         prior_sessions = [d for d in unique_sessions if d < session]
         train_sessions = prior_sessions[-cfg.lookback_sessions:]
-        if len(train_sessions) < cfg.lookback_sessions:
+        if model_cache is not None and session in model_cache:
+            model = dict(model_cache[session])
+        elif len(train_sessions) < cfg.lookback_sessions:
             model = {
                 "alpha": np.nan, "beta": np.nan, "pvalue": 1.0, "valid": False, "nobs": 0,
                 "coint_statistic": np.nan, "critical_1pct": np.nan,
@@ -836,18 +927,28 @@ def run_backtest(
             }
         else:
             train = front[front["session_date"].isin(train_sessions)]
-            model = fit_daily_model(train, cfg.cointegration_pvalue_threshold)
+            model = fit_daily_model(train, pvalue_threshold=1.0)
         alpha = float(model["alpha"])
         beta = float(model["beta"])
         pvalue = float(model["pvalue"])
-        model_valid = bool(model["valid"])
+        finite_ols = bool(np.isfinite(alpha) and np.isfinite(beta))
+        cointegration_valid = bool(
+            finite_ols and np.isfinite(pvalue)
+            and pvalue < cfg.cointegration_pvalue_threshold
+        )
+        if cfg.relationship_filter == "ols_residual":
+            model_valid = finite_ols
+        else:
+            model_valid = cointegration_valid
         model_rows.append({
             "session_date": session.isoformat(),
             "alpha": alpha,
             "beta": beta,
             "cointegration_pvalue": pvalue,
             "cointegration_pvalue_threshold": cfg.cointegration_pvalue_threshold,
-            "cointegration_valid": model_valid,
+            "relationship_filter": cfg.relationship_filter,
+            "cointegration_valid": cointegration_valid,
+            "relationship_filter_passed": model_valid,
             "coint_statistic": model.get("coint_statistic", np.nan),
             "critical_1pct": model.get("critical_1pct", np.nan),
             "critical_5pct": model.get("critical_5pct", np.nan),
@@ -863,8 +964,11 @@ def run_backtest(
         # Re-express the rolling signal history using this session's locked
         # alpha/beta. For an invalid model, its Z is diagnostic only.
         if np.isfinite(alpha) and np.isfinite(beta):
-            residual = np.log(front["n_adj_close"].where(front["n_adj_close"] > 0)) \
-                - beta * np.log(front["b_adj_close"].where(front["b_adj_close"] > 0)) - alpha
+            # Only the previous Z-window plus today's bars are needed. Restricting
+            # this computation keeps multi-year walk-forward variant sweeps tractable.
+            model_scope = front.loc[:day_rows.index[-1]].tail(cfg.z_window + len(day_rows))
+            residual = np.log(model_scope["n_adj_close"].where(model_scope["n_adj_close"] > 0)) \
+                - beta * np.log(model_scope["b_adj_close"].where(model_scope["b_adj_close"] > 0)) - alpha
             mean_prev = residual.rolling(cfg.z_window, min_periods=cfg.z_window).mean().shift(1)
             std_prev = residual.rolling(cfg.z_window, min_periods=cfg.z_window).std(ddof=1).shift(1)
         else:
@@ -927,19 +1031,41 @@ def run_backtest(
                 pending_exit = None
 
             # Execute an entry signalled at the prior completed-bar close, at this
-            # bar's open. This avoids filling at a price known only after the close.
+            # bar's open. Revalidate the open Z first: cancel if the signal faded
+            # before execution or the stop was already crossed at the open. This
+            # avoids zero-duration phantom trades that would enter and stop at the
+            # identical opening price.
             if pending_entry is not None and position is None and not daily_halted:
                 signal = pending_entry
                 pending_entry = None
                 contiguous = signal["signal_time"] == bar_start
                 entry_time_allowed = bar_start.time() <= cfg.latest_entry
-                if (
+                eligible_context = (
                     contiguous
                     and entry_time_allowed
                     and not is_expiry_day
                     and model_valid
                     and not daily_halted
-                ):
+                )
+                entry_open_z_ok = False
+                if eligible_context:
+                    if not np.isfinite(z_open):
+                        rejected_entries_missing_open_z += 1
+                    elif signal["side"] > 0:
+                        if z_open <= -cfg.stop_z:
+                            rejected_entries_open_stop += 1
+                        elif z_open <= -cfg.entry_z:
+                            entry_open_z_ok = True
+                        else:
+                            rejected_entries_signal_faded += 1
+                    elif signal["side"] < 0:
+                        if z_open >= cfg.stop_z:
+                            rejected_entries_open_stop += 1
+                        elif z_open >= cfg.entry_z:
+                            entry_open_z_ok = True
+                        else:
+                            rejected_entries_signal_faded += 1
+                if eligible_context and entry_open_z_ok:
                     px_n, px_b = float(row["n_open"]), float(row["b_open"])
                     sizing = choose_lot_size(
                         beta, px_n, px_b, int(row["n_lot_size"]), int(row["b_lot_size"]), cfg
@@ -958,6 +1084,7 @@ def run_backtest(
                             signal_time=signal["signal_time"],
                             entry_time=bar_start,
                             entry_z=float(signal["z"]),
+                            entry_open_z=float(z_open),
                             alpha=alpha,
                             beta=beta,
                             pvalue=pvalue,
@@ -1114,7 +1241,8 @@ def run_backtest(
                 "zscore": z_close if np.isfinite(z_close) else np.nan,
                 "diagnostic_zscore_counterfactual": diagnostic_z if np.isfinite(diagnostic_z) else np.nan,
                 "cointegration_pvalue": pvalue,
-                "cointegration_valid": model_valid,
+                "cointegration_valid": cointegration_valid,
+                "relationship_filter_passed": model_valid,
                 "position_side": 0 if position is None else position.side,
                 "daily_halted": daily_halted,
                 "expiry_day": is_expiry_day,
@@ -1137,7 +1265,8 @@ def run_backtest(
             "zscore": np.nan,
             "diagnostic_zscore_counterfactual": np.nan,
             "cointegration_pvalue": pvalue,
-            "cointegration_valid": model_valid,
+            "cointegration_valid": cointegration_valid,
+            "relationship_filter_passed": model_valid,
             "position_side": 0,
             "daily_halted": daily_halted,
             "expiry_day": bool(day_rows["is_expiry_day"].any()),
@@ -1196,9 +1325,19 @@ def run_backtest(
         "test_end": test_end.isoformat(),
         "initial_equity_rupees": cfg.margin_pool,
         "cointegration_pvalue_threshold": cfg.cointegration_pvalue_threshold,
+        "relationship_filter": cfg.relationship_filter,
+        "entry_z_threshold": cfg.entry_z,
+        "target_z_threshold": cfg.target_z,
+        "stop_z_threshold": cfg.stop_z,
+        "max_residual_rupees": cfg.max_residual_rupees,
+        "max_nifty_lots": cfg.max_nifty_lots,
         "final_equity_rupees": float(equity),
+        "gross_pnl_rupees": float(pd.to_numeric(trades_df["gross_pnl_rupees"], errors="coerce").sum()) if len(trades_df) else 0.0,
         "net_pnl_rupees": float(equity - cfg.margin_pool),
         "num_trades": int(len(trades_df)),
+        "rejected_entries_open_stop": int(rejected_entries_open_stop),
+        "rejected_entries_signal_faded_by_open": int(rejected_entries_signal_faded),
+        "rejected_entries_missing_open_z": int(rejected_entries_missing_open_z),
         "win_rate": float((trades_df["net_pnl_rupees"] > 0).mean()) if len(trades_df) else 0.0,
         "average_net_trade_pnl_rupees": avg_trade_pnl,
         "average_winning_trade_rupees": avg_win,
@@ -1230,7 +1369,10 @@ def collect_run_diagnostics(
 
     model_df = models.copy()
     model_df["session_date"] = model_df["session_date"].astype(str)
-    model_valid = model_df["cointegration_valid"].astype(str).str.lower().eq("true")
+    cointegration_valid = model_df["cointegration_valid"].astype(str).str.lower().eq("true")
+    model_valid = model_df.get(
+        "relationship_filter_passed", model_df["cointegration_valid"]
+    ).astype(str).str.lower().eq("true")
     pvalues = pd.to_numeric(model_df["cointegration_pvalue"], errors="coerce")
     betas = pd.to_numeric(model_df["beta"], errors="coerce")
     beta_changes = betas.diff().abs().dropna()
@@ -1242,7 +1384,9 @@ def collect_run_diagnostics(
     bars["z_counterfactual"] = pd.to_numeric(
         bars.get("diagnostic_zscore_counterfactual", np.nan), errors="coerce"
     )
-    bars["model_valid_bool"] = bars["cointegration_valid"].astype(str).str.lower().eq("true")
+    bars["model_valid_bool"] = bars.get(
+        "relationship_filter_passed", bars["cointegration_valid"]
+    ).astype(str).str.lower().eq("true")
     bars["expiry_bool"] = bars["expiry_day"].astype(str).str.lower().eq("true")
     bars["entry_time_ok"] = bars["local_ts"].dt.strftime("%H:%M") <= cfg.latest_entry.strftime("%H:%M")
     bars["eligible_close"] = bars["entry_time_ok"] & ~bars["expiry_bool"]
@@ -1340,8 +1484,10 @@ def collect_run_diagnostics(
     summary = {
         "diagnostic_test_sessions": int(len(model_df)),
         "diagnostic_valid_model_sessions": int(model_valid.sum()),
+        "diagnostic_cointegration_valid_sessions": int(cointegration_valid.sum()),
         "diagnostic_invalid_model_sessions": int((~model_valid).sum()),
         "diagnostic_cointegration_threshold": cfg.cointegration_pvalue_threshold,
+        "diagnostic_relationship_filter": cfg.relationship_filter,
         "diagnostic_pvalue_min": float(pvalues.min()) if pvalues.notna().any() else None,
         "diagnostic_pvalue_median": float(pvalues.median()) if pvalues.notna().any() else None,
         "diagnostic_pvalue_max": float(pvalues.max()) if pvalues.notna().any() else None,
@@ -1387,16 +1533,19 @@ def print_run_diagnostics(
     print("=" * 96)
     print(json.dumps(diagnostics, indent=2, allow_nan=True))
     if diagnostics.get("diagnostic_valid_model_sessions", 0) == 0:
-        print(
-            "BLOCKER: no session passed the Engle-Granger gate. Under this configuration, "
-            "the actual strategy cannot enter; sizing and execution are downstream."
-        )
+        if cfg.relationship_filter == "engle_granger":
+            print(
+                "BLOCKER: no session passed the Engle-Granger gate. Under this configuration, "
+                "the strategy cannot enter; sizing and execution are downstream."
+            )
+        else:
+            print("BLOCKER: no session produced a finite OLS model; the strategy cannot enter.")
     invalid_signal_closes = int(diagnostics.get("diagnostic_invalid_model_signal_closes", 0) or 0)
     if invalid_signal_closes:
         print(
             f"NOTE: {invalid_signal_closes} OLS-residual threshold closes occurred on "
-            "sessions where cointegration failed. These are counterfactual diagnostics; "
-            "they were NOT traded."
+            "sessions that failed the selected relationship filter. These are counterfactual "
+            "diagnostics; they were NOT traded."
         )
     beta_min = diagnostics.get("diagnostic_beta_min")
     beta_max = diagnostics.get("diagnostic_beta_max")
@@ -1407,7 +1556,7 @@ def print_run_diagnostics(
     columns = [
         "session_date", "training_bars", "alpha", "beta", "cointegration_pvalue",
         "coint_statistic", "critical_5pct", "r_squared", "return_correlation",
-        "cointegration_valid", "diagnostic_z_min", "diagnostic_z_max",
+        "cointegration_valid", "relationship_filter_passed", "diagnostic_z_min", "diagnostic_z_max",
         "invalid_model_signal_closes", "valid_model_long_closes", "valid_model_short_closes",
     ]
     columns = [c for c in columns if c in session_diag.columns]
@@ -1423,10 +1572,233 @@ def print_run_diagnostics(
     with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 240):
         print(display.to_string(index=False, na_rep="NaN"))
     print("\nInterpretation:")
-    print(f"  Baseline EG gate: p-value < {cfg.cointegration_pvalue_threshold:g}")
+    if cfg.relationship_filter == "engle_granger":
+        print(f"  Engle-Granger gate: p-value < {cfg.cointegration_pvalue_threshold:g}")
+    else:
+        print("  OLS-residual-only gate: Engle-Granger is disabled (research-only; not cointegration evidence).")
     print(f"  Entry thresholds: Z <= {-cfg.entry_z:g} / Z >= {cfg.entry_z:g}; target Z={cfg.target_z:g}; stop +/-{cfg.stop_z:g}")
     print(f"  Size gate: NIFTY lots {cfg.base_nifty_lots}-{cfg.max_nifty_lots}; residual <= Rs {cfg.max_residual_rupees:,.0f}; gross <= Rs {cfg.margin_pool * cfg.max_gross_multiple:,.0f}")
-    print("  Counterfactual signals are never executed while the cointegration gate is false.")
+    if cfg.relationship_filter == "engle_granger":
+        print("  OLS counterfactual signals are not executed when the Engle-Granger gate fails.")
+    else:
+        print("  Research warning: OLS-residual-only trades do not pass an Engle-Granger cointegration gate.")
+
+
+def run_research_sweep(
+    front: pd.DataFrame,
+    test_start: date,
+    test_end: date,
+    base_cfg: StrategyConfig,
+    model_cache: dict[date, dict[str, Any]],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Compare separate research variants; choose by train P&L, report later splits.
+
+    The sweep reports both the best overall row (which may be no-trade) and the
+    best row with at least one training trade. Neither is applied to the baseline.
+    It is chronological: 60% selection/training, 20% validation, 20% final holdout.
+    """
+    sessions = sorted(d for d in set(front["session_date"]) if test_start <= d <= test_end)
+    if len(sessions) < 10:
+        raise BacktestError("Research sweep needs at least 10 in-range trading sessions.")
+    n_train = max(1, int(len(sessions) * 0.60))
+    n_valid = max(1, int(len(sessions) * 0.20))
+    if n_train + n_valid >= len(sessions):
+        n_valid = max(1, len(sessions) - n_train - 1)
+    train_sessions = sessions[:n_train]
+    validation_sessions = sessions[n_train:n_train + n_valid]
+    holdout_sessions = sessions[n_train + n_valid:]
+    if not train_sessions or not validation_sessions or not holdout_sessions:
+        raise BacktestError("Could not form non-empty train/validation/holdout splits.")
+    train_start, train_end = train_sessions[0], train_sessions[-1]
+    validation_start, validation_end = validation_sessions[0], validation_sessions[-1]
+    holdout_start, holdout_end = holdout_sessions[0], holdout_sessions[-1]
+
+    relationships = [
+        ("EG_p05", "engle_granger", 0.05),
+        ("EG_p20_RESEARCH", "engle_granger", 0.20),
+        ("EG_p35_RESEARCH", "engle_granger", 0.35),
+        ("EG_p50_RESEARCH", "engle_granger", 0.50),
+        ("OLS_RESIDUAL_ONLY_RESEARCH", "ols_residual", base_cfg.cointegration_pvalue_threshold),
+    ]
+    residual_limits = [75_000.0, 150_000.0, 300_000.0]
+    max_nifty_lots_values = [6, 8]
+    candidate_rows: list[dict[str, Any]] = []
+    candidate_cfgs: dict[str, StrategyConfig] = {}
+    print("\nStarting research-only parameter sweep; baseline rules remain unchanged.")
+    print(f"Chronological splits: train {train_start}..{train_end} ({len(train_sessions)} sessions), "
+          f"validation {validation_start}..{validation_end} ({len(validation_sessions)}), "
+          f"holdout {holdout_start}..{holdout_end} ({len(holdout_sessions)}).")
+    if len(train_sessions) < 252:
+        print("WARNING: fewer than 252 training sessions; variant ranking is highly noisy and likely overfit.")
+    print("Objective: highest training-period net rupee P&L after configured costs; validation/holdout are report-only.")
+
+    variant_number = 0
+    total_variants = len(relationships) * len(residual_limits) * len(max_nifty_lots_values)
+    for relation_label, relation_filter, p_threshold in relationships:
+        for residual_limit in residual_limits:
+            for max_lots in max_nifty_lots_values:
+                variant_number += 1
+                variant_id = f"{relation_label}_res{int(residual_limit)}_maxN{max_lots}"
+                cfg = replace(
+                    base_cfg,
+                    relationship_filter=relation_filter,
+                    cointegration_pvalue_threshold=p_threshold,
+                    max_residual_rupees=residual_limit,
+                    max_nifty_lots=max_lots,
+                )
+                _, _, _, result = run_backtest(
+                    front, train_start, train_end, cfg, model_cache=model_cache
+                )
+                candidate_cfgs[variant_id] = cfg
+                candidate_rows.append({
+                    "variant_id": variant_id,
+                    "relationship_filter": relation_filter,
+                    "cointegration_pvalue_threshold": p_threshold,
+                    "max_residual_rupees": residual_limit,
+                    "max_nifty_lots": max_lots,
+                    "train_start": train_start.isoformat(),
+                    "train_end": train_end.isoformat(),
+                    "train_sessions": len(train_sessions),
+                    "train_gross_pnl_rupees": result["gross_pnl_rupees"],
+                    "train_costs_rupees": result["total_cost_rupees"],
+                    "train_net_pnl_rupees": result["net_pnl_rupees"],
+                    "train_trades": result["num_trades"],
+                    "train_max_drawdown_fraction": result["max_daily_drawdown_fraction"],
+                    "train_profit_factor_net": result["profit_factor_net"],
+                    "validation_gross_pnl_rupees": np.nan,
+                    "validation_costs_rupees": np.nan,
+                    "validation_net_pnl_rupees": np.nan,
+                    "validation_trades": np.nan,
+                    "validation_max_drawdown_fraction": np.nan,
+                    "holdout_gross_pnl_rupees": np.nan,
+                    "holdout_costs_rupees": np.nan,
+                    "holdout_net_pnl_rupees": np.nan,
+                    "holdout_trades": np.nan,
+                    "holdout_max_drawdown_fraction": np.nan,
+                    "selected_by_train_pnl": False,
+                    "selected_active_by_train_pnl": False,
+                })
+                if variant_number % 5 == 0 or variant_number == total_variants:
+                    print(f"  Evaluated {variant_number}/{total_variants} variants")
+
+    sweep = pd.DataFrame(candidate_rows).sort_values(
+        ["train_net_pnl_rupees", "train_trades"], ascending=[False, False]
+    ).reset_index(drop=True)
+    selected_id = str(sweep.iloc[0]["variant_id"])
+    selected_cfg = candidate_cfgs[selected_id]
+    sweep.loc[sweep.index[0], "selected_by_train_pnl"] = True
+    _, _, _, validation_result = run_backtest(
+        front, validation_start, validation_end, selected_cfg, model_cache=model_cache
+    )
+    _, _, _, holdout_result = run_backtest(
+        front, holdout_start, holdout_end, selected_cfg, model_cache=model_cache
+    )
+    sweep.loc[0, "validation_gross_pnl_rupees"] = validation_result["gross_pnl_rupees"]
+    sweep.loc[0, "validation_costs_rupees"] = validation_result["total_cost_rupees"]
+    sweep.loc[0, "validation_net_pnl_rupees"] = validation_result["net_pnl_rupees"]
+    sweep.loc[0, "validation_trades"] = validation_result["num_trades"]
+    sweep.loc[0, "validation_max_drawdown_fraction"] = validation_result["max_daily_drawdown_fraction"]
+    sweep.loc[0, "holdout_gross_pnl_rupees"] = holdout_result["gross_pnl_rupees"]
+    sweep.loc[0, "holdout_costs_rupees"] = holdout_result["total_cost_rupees"]
+    sweep.loc[0, "holdout_net_pnl_rupees"] = holdout_result["net_pnl_rupees"]
+    sweep.loc[0, "holdout_trades"] = holdout_result["num_trades"]
+    sweep.loc[0, "holdout_max_drawdown_fraction"] = holdout_result["max_daily_drawdown_fraction"]
+
+    # Also validate the highest-training-P&L candidate that actually traded in
+    # training. This prevents a zero/no-trade row from hiding the best active
+    # research alternative while preserving the original baseline selection.
+    active_rows = sweep[sweep["train_trades"].fillna(0) > 0]
+    active_meta: dict[str, Any] = {"selected_active_variant_id": None}
+    if not active_rows.empty:
+        active_idx = int(active_rows.index[0])
+        active_id = str(sweep.loc[active_idx, "variant_id"])
+        active_cfg = candidate_cfgs[active_id]
+        sweep.loc[active_idx, "selected_active_by_train_pnl"] = True
+        if active_idx == 0:
+            active_validation_result = validation_result
+            active_holdout_result = holdout_result
+        else:
+            _, _, _, active_validation_result = run_backtest(
+                front, validation_start, validation_end, active_cfg, model_cache=model_cache
+            )
+            _, _, _, active_holdout_result = run_backtest(
+                front, holdout_start, holdout_end, active_cfg, model_cache=model_cache
+            )
+        sweep.loc[active_idx, "validation_gross_pnl_rupees"] = active_validation_result["gross_pnl_rupees"]
+        sweep.loc[active_idx, "validation_costs_rupees"] = active_validation_result["total_cost_rupees"]
+        sweep.loc[active_idx, "validation_net_pnl_rupees"] = active_validation_result["net_pnl_rupees"]
+        sweep.loc[active_idx, "validation_trades"] = active_validation_result["num_trades"]
+        sweep.loc[active_idx, "validation_max_drawdown_fraction"] = active_validation_result["max_daily_drawdown_fraction"]
+        sweep.loc[active_idx, "holdout_gross_pnl_rupees"] = active_holdout_result["gross_pnl_rupees"]
+        sweep.loc[active_idx, "holdout_costs_rupees"] = active_holdout_result["total_cost_rupees"]
+        sweep.loc[active_idx, "holdout_net_pnl_rupees"] = active_holdout_result["net_pnl_rupees"]
+        sweep.loc[active_idx, "holdout_trades"] = active_holdout_result["num_trades"]
+        sweep.loc[active_idx, "holdout_max_drawdown_fraction"] = active_holdout_result["max_daily_drawdown_fraction"]
+        active_meta = {
+            "selected_active_variant_id": active_id,
+            "selected_active_relationship_filter": active_cfg.relationship_filter,
+            "selected_active_cointegration_pvalue_threshold": active_cfg.cointegration_pvalue_threshold,
+            "selected_active_max_residual_rupees": active_cfg.max_residual_rupees,
+            "selected_active_max_nifty_lots": active_cfg.max_nifty_lots,
+            "selected_active_train_trades": int(sweep.loc[active_idx, "train_trades"]),
+            "selected_active_train_gross_pnl_rupees": float(sweep.loc[active_idx, "train_gross_pnl_rupees"]),
+            "selected_active_train_costs_rupees": float(sweep.loc[active_idx, "train_costs_rupees"]),
+            "selected_active_train_net_pnl_rupees": float(sweep.loc[active_idx, "train_net_pnl_rupees"]),
+            "selected_active_validation_trades": int(active_validation_result["num_trades"]),
+            "selected_active_validation_gross_pnl_rupees": float(active_validation_result["gross_pnl_rupees"]),
+            "selected_active_validation_costs_rupees": float(active_validation_result["total_cost_rupees"]),
+            "selected_active_validation_net_pnl_rupees": float(active_validation_result["net_pnl_rupees"]),
+            "selected_active_holdout_trades": int(active_holdout_result["num_trades"]),
+            "selected_active_holdout_gross_pnl_rupees": float(active_holdout_result["gross_pnl_rupees"]),
+            "selected_active_holdout_costs_rupees": float(active_holdout_result["total_cost_rupees"]),
+            "selected_active_holdout_net_pnl_rupees": float(active_holdout_result["net_pnl_rupees"]),
+        }
+
+    meta = {
+        "variants_tested": int(total_variants),
+        "selection_objective": "highest net rupee P&L on chronological training split after configured costs",
+        "selection_train_start": train_start.isoformat(),
+        "selection_train_end": train_end.isoformat(),
+        "selection_train_sessions": int(len(train_sessions)),
+        "validation_start": validation_start.isoformat(),
+        "validation_end": validation_end.isoformat(),
+        "validation_sessions": int(len(validation_sessions)),
+        "holdout_start": holdout_start.isoformat(),
+        "holdout_end": holdout_end.isoformat(),
+        "holdout_sessions": int(len(holdout_sessions)),
+        "selected_variant_id": selected_id,
+        "selected_relationship_filter": selected_cfg.relationship_filter,
+        "selected_cointegration_pvalue_threshold": selected_cfg.cointegration_pvalue_threshold,
+        "selected_max_residual_rupees": selected_cfg.max_residual_rupees,
+        "selected_max_nifty_lots": selected_cfg.max_nifty_lots,
+        "selected_train_gross_pnl_rupees": float(sweep.loc[0, "train_gross_pnl_rupees"]),
+        "selected_train_costs_rupees": float(sweep.loc[0, "train_costs_rupees"]),
+        "selected_train_net_pnl_rupees": float(sweep.loc[0, "train_net_pnl_rupees"]),
+        "selected_validation_gross_pnl_rupees": float(validation_result["gross_pnl_rupees"]),
+        "selected_validation_costs_rupees": float(validation_result["total_cost_rupees"]),
+        "selected_validation_net_pnl_rupees": float(validation_result["net_pnl_rupees"]),
+        "selected_validation_trades": int(validation_result["num_trades"]),
+        "selected_holdout_gross_pnl_rupees": float(holdout_result["gross_pnl_rupees"]),
+        "selected_holdout_costs_rupees": float(holdout_result["total_cost_rupees"]),
+        "selected_holdout_net_pnl_rupees": float(holdout_result["net_pnl_rupees"]),
+        "selected_holdout_trades": int(holdout_result["num_trades"]),
+        **active_meta,
+        "warning": "Research ranking only. Neither selected variant is auto-applied; short samples and repeated testing overfit.", 
+    }
+    print("\nResearch sweep top 10 by training net P&L (NOT a production recommendation):")
+    print(sweep.head(10)[[
+        "variant_id", "train_gross_pnl_rupees", "train_costs_rupees", "train_net_pnl_rupees",
+        "train_trades", "train_max_drawdown_fraction", "validation_net_pnl_rupees",
+        "validation_trades", "holdout_net_pnl_rupees", "holdout_trades",
+    ]].to_string(index=False, float_format=lambda value: f"{value:,.2f}"))
+    print("\nOverall winner selected on training only; separate validation/holdout results:")
+    print(json.dumps(meta, indent=2))
+    if active_meta.get("selected_active_variant_id") is not None:
+        print("\nBest trade-producing candidate selected on training only (research-only):")
+        print(json.dumps(active_meta, indent=2))
+    else:
+        print("\nNo candidate generated a training trade.")
+    return sweep, meta
 
 
 def synthetic_front(n_sessions: int = 150, bars_per_session: int = 77, seed: int = 7) -> tuple[pd.DataFrame, date, date]:
@@ -1492,6 +1864,7 @@ def write_outputs(
     summary: dict[str, Any],
     front: pd.DataFrame,
     session_diagnostics: pd.DataFrame,
+    research_sweep: pd.DataFrame | None,
     output_dir: Path,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1502,6 +1875,8 @@ def write_outputs(
     front_export.index.name = "bar_end"
     front_export.reset_index().to_csv(output_dir / "aligned_front_month.csv", index=False)
     session_diagnostics.to_csv(output_dir / "session_diagnostics.csv", index=False)
+    if research_sweep is not None:
+        research_sweep.to_csv(output_dir / "research_sweep.csv", index=False)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
     print(f"\nWrote: {output_dir / 'trades.csv'}")
@@ -1509,6 +1884,8 @@ def write_outputs(
     print(f"Wrote: {output_dir / 'daily_models.csv'}")
     print(f"Wrote: {output_dir / 'aligned_front_month.csv'}")
     print(f"Wrote: {output_dir / 'session_diagnostics.csv'}")
+    if research_sweep is not None:
+        print(f"Wrote: {output_dir / 'research_sweep.csv'}")
     print(f"Wrote: {output_dir / 'summary.json'}")
 
 
@@ -1517,11 +1894,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default="env.txt", help="Private KEY=VALUE file; only UPSTOX_ACCESS_TOKEN is read.")
     parser.add_argument("--start-date", type=_parse_date, help="First out-of-sample date (YYYY-MM-DD).")
     parser.add_argument("--end-date", type=_parse_date, help="Last out-of-sample date (YYYY-MM-DD).")
+    parser.add_argument("--aligned-csv", type=Path, help="Offline replay from an exported aligned_front_month.csv; no API credentials or network request are used.")
+    parser.add_argument("--profile", choices=("baseline", "research_activity"), default="baseline",
+                        help="baseline keeps the original EG gate; research_activity is OLS-residual-only to demonstrate backtest trade generation, not a live-trading recommendation.")
     parser.add_argument("--lookback-sessions", type=int, default=60, help="EOD calibration lookback in trading sessions.")
     parser.add_argument("--z-window", type=int, default=50, help="Number of previous completed aligned bars for Z-score.")
     parser.add_argument(
         "--cointegration-pvalue-threshold", type=float, default=0.05,
-        help="Research override for EG p-value gate (baseline 0.05; changing it is a strategy change, not proof of profitability).",
+        help="EG p-value gate (baseline 0.05; a higher threshold is research-only and does not establish cointegration).",
+    )
+    parser.add_argument(
+        "--relationship-filter", choices=("engle_granger", "ols_residual"), default=None,
+        help="Optional override; otherwise baseline uses Engle-Granger and research_activity uses OLS-residual-only.",
     )
     parser.add_argument("--entry-z", type=float, default=2.0)
     parser.add_argument("--target-z", type=float, default=0.0)
@@ -1530,20 +1914,23 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-gross-multiple", type=float, default=4.0)
     parser.add_argument("--daily-loss-fraction", type=float, default=0.03)
     parser.add_argument("--cost-per-side", type=float, default=0.0005,
-                        help="Cost fraction per execution side per leg; 0.0005 = 0.05%.")
+                        help="Cost fraction per execution side per leg; 0.0005 = 0.05%%.")
     parser.add_argument("--output-dir", default="backtest_output")
     parser.add_argument("--cache-dir", default="backtest_cache")
     parser.add_argument("--synthetic-demo", action="store_true", help="Run an offline synthetic smoke test.")
     parser.add_argument("--quiet-diagnostics", action="store_true", help="Suppress the detailed console diagnostics (CSV reports are still written).")
+    parser.add_argument("--research-sweep", action="store_true", help="Run separate p-value/OLS-filter and sizing variants with a chronological train/validation/holdout report.")
     return parser
 
 
 def main() -> int:
     args = make_parser().parse_args()
+    profile_relationship = "engle_granger" if args.profile == "baseline" else "ols_residual"
     cfg = StrategyConfig(
         lookback_sessions=args.lookback_sessions,
         z_window=args.z_window,
         cointegration_pvalue_threshold=args.cointegration_pvalue_threshold,
+        relationship_filter=args.relationship_filter or profile_relationship,
         entry_z=args.entry_z,
         target_z=args.target_z,
         stop_z=args.stop_z,
@@ -1556,12 +1943,24 @@ def main() -> int:
         raise BacktestError("lookback-sessions and z-window must be >= 2.")
     if not 0.0 < cfg.cointegration_pvalue_threshold <= 1.0:
         raise BacktestError("--cointegration-pvalue-threshold must be in (0, 1].")
+    if cfg.entry_z <= 0 or cfg.stop_z <= cfg.entry_z:
+        raise BacktestError("Require entry-z > 0 and stop-z > entry-z so an entry has a valid stop buffer.")
 
     if args.synthetic_demo:
+        if args.aligned_csv is not None:
+            raise BacktestError("Use either --synthetic-demo or --aligned-csv, not both.")
         front, start, end = synthetic_front()
         test_start = args.start_date or start
         test_end = args.end_date or end
         warnings = ["Synthetic data only: this run is a software smoke test, not market evidence."]
+    elif args.aligned_csv is not None:
+        if args.start_date is None or args.end_date is None:
+            raise BacktestError("Offline replay requires both --start-date and --end-date.")
+        if args.start_date > args.end_date:
+            raise BacktestError("--start-date must be on/before --end-date.")
+        front = load_aligned_front_csv(args.aligned_csv)
+        test_start, test_end = args.start_date, args.end_date
+        warnings = ["Offline replay from aligned CSV; no API request or credential read was performed."]
     else:
         if args.start_date is None or args.end_date is None:
             raise BacktestError("For Upstox history, provide both --start-date and --end-date.")
@@ -1574,9 +1973,29 @@ def main() -> int:
 
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
+    print(f"Profile: {args.profile}; relationship filter: {cfg.relationship_filter}")
+    if cfg.relationship_filter == "ols_residual":
+        print("WARNING: OLS-residual-only profile bypasses Engle-Granger; research/backtest only, not evidence of cointegration.")
     print(f"Aligned bars: {len(front):,}; sessions: {front['session_date'].nunique():,}")
     print("No forward-fill is used. Historical entries fill at next-bar open; no orders are sent.")
-    trades, equity, models, summary = run_backtest(front, test_start, test_end, cfg)
+    print("Computing the daily OLS/Engle-Granger model cache once...")
+    model_cache = build_model_cache(front, test_start, test_end, cfg.lookback_sessions)
+    trades, equity, models, summary = run_backtest(
+        front, test_start, test_end, cfg, model_cache=model_cache
+    )
+    sweep_df: pd.DataFrame | None = None
+    if args.research_sweep:
+        sweep_df, sweep_meta = run_research_sweep(
+            front, test_start, test_end, cfg, model_cache
+        )
+        summary["research_sweep"] = sweep_meta
+    summary["strategy_profile"] = args.profile
+    summary["data_source"] = "aligned_csv_offline" if args.aligned_csv is not None else ("synthetic" if args.synthetic_demo else "upstox_history")
+    summary["profile_note"] = (
+        "Effective OLS-residual-only filter bypasses Engle-Granger; research/backtest only, not evidence of cointegration or a live-trading recommendation."
+        if cfg.relationship_filter == "ols_residual"
+        else "Effective Engle-Granger filter; baseline gate retained."
+    )
     summary["aligned_bars"] = int(len(front))
     summary["aligned_sessions"] = int(front["session_date"].nunique())
     summary["lookback_sessions"] = cfg.lookback_sessions
@@ -1586,7 +2005,8 @@ def main() -> int:
     diagnostics, session_diagnostics = collect_run_diagnostics(front, equity, models, cfg)
     summary.update(diagnostics)
     write_outputs(
-        trades, equity, models, summary, front, session_diagnostics, Path(args.output_dir)
+        trades, equity, models, summary, front, session_diagnostics,
+        sweep_df, Path(args.output_dir)
     )
     if not args.quiet_diagnostics:
         print_run_diagnostics(diagnostics, session_diagnostics, cfg)

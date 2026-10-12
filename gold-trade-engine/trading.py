@@ -46,6 +46,8 @@ class DailyRiskState:
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
     trading_costs: float = 0.0
+    trades_today: int = 0
+    consecutive_losses: int = 0
     blocked: bool = False
     block_reason: str = ""
 
@@ -147,6 +149,26 @@ class RiskManager:
         self.equity += float(pnl)
         self.daily.realized_pnl += float(pnl)
         self.daily.unrealized_pnl = 0.0
+        if float(pnl) < 0:
+            self.daily.consecutive_losses += 1
+        else:
+            self.daily.consecutive_losses = 0
+
+    def register_entry(self) -> None:
+        """Count a filled entry toward max_trades_per_day."""
+        self.daily.trades_today += 1
+
+    def trades_limit_reached(self) -> bool:
+        limit = int(getattr(self.cfg, "max_trades_per_day", 0) or 0)
+        if limit <= 0:
+            return False
+        return int(self.daily.trades_today) >= limit
+
+    def consecutive_loss_limit_reached(self) -> bool:
+        limit = int(getattr(self.cfg, "max_consecutive_losses", 0) or 0)
+        if limit <= 0:
+            return False
+        return int(self.daily.consecutive_losses) >= limit
 
     def entry_price_for_side(self, side: str, bid: float, ask: float) -> float:
         return float(ask) if side.upper() in ("BUY", "LONG") else float(bid)
@@ -746,6 +768,7 @@ class ExecutionEngine:
         )
         self.position = pos
         self.risk.open_positions = 1
+        self.risk.register_entry()
         self.last_breakout_key = breakout_key or self.last_breakout_key
         self.fills.append(Fill(
             side=plan.side, quantity=filled_qty, price=fill_price,
@@ -1235,6 +1258,8 @@ class ExecutionEngine:
             "realized_pnl": d.realized_pnl,
             "unrealized_pnl": d.unrealized_pnl,
             "trading_costs": d.trading_costs,
+            "trades_today": d.trades_today,
+            "consecutive_losses": d.consecutive_losses,
             "blocked": d.blocked,
             "block_reason": d.block_reason,
             "open_positions": self.risk.open_positions,
@@ -1262,6 +1287,8 @@ class ExecutionEngine:
                 realized_pnl=float(data.get("realized_pnl") or 0),
                 unrealized_pnl=float(data.get("unrealized_pnl") or 0),
                 trading_costs=float(data.get("trading_costs") or 0),
+                trades_today=int(data.get("trades_today") or 0),
+                consecutive_losses=int(data.get("consecutive_losses") or 0),
                 blocked=bool(data.get("blocked")),
                 block_reason=str(data.get("block_reason") or ""),
             )

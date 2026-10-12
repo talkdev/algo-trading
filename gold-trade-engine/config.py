@@ -51,12 +51,29 @@ CONFIG: dict[str, Any] = {
     "minimum_dxy_change_pct": 0.03,
     "minimum_yield_change_bps": 2.0,
     "minimum_real_yield_change_bps": 2.0,
-    # Gold confirmation
-    "gold_breakout_lookback_bars": 6,
+    # Gold confirmation / market signal (15m trend + 5m breakout)
+    "strategy_mode": "trend_breakout",  # trend_breakout | legacy_macro
+    "gold_breakout_lookback_bars": 20,
+    "trend_timeframe_minutes": 15,
+    "trend_ema_fast": 20,
+    "trend_ema_slow": 50,
+    "require_news_confirmation": True,
+    "news_freshness_minutes": 45.0,
+    "news_db_path": "",                 # default: engine/gold_signals.db
+    "flatten_before_close_minutes": 5,  # mandatory flatten before market_close
+    # Embedded producers (monitor-gold + commodity-events inside main.py)
+    "run_embedded_producers": True,
+    "enable_monitor_producer": True,
+    "enable_news_producer": True,
+    "monitor_refresh_seconds": 60.0,
+    "news_poll_interval_seconds": 60.0,
+    "news_producer_no_telegram": False,
     # Risk management
     "risk_per_trade_pct": 0.25,
     "maximum_daily_loss_pct": 1.0,
     "maximum_open_positions": 1,
+    "max_trades_per_day": 5,
+    "max_consecutive_losses": 3,
     # Execution assumptions
     "maximum_spread_points": 50.0,
     "reward_risk_ratio": 2.0,
@@ -76,6 +93,8 @@ CONFIG: dict[str, Any] = {
     "use_real_yield": False,         # no live real-yield feed wired yet
     "enforce_risk_budget": True,     # fixed lots must still fit risk_per_trade_pct
     "trading_day_tz": "Asia/Kolkata",
+    # Yahoo macros are research-oriented; observation timestamps gate entries.
+    # Live mode additionally requires allow_yahoo_in_live=true.
     "yahoo_macros": True,
     "macro_stale_minutes": 4320,
     "macro_trade_max_age_minutes": 60,   # new entries require fresher macros
@@ -164,10 +183,26 @@ class EngineConfig:
     minimum_dxy_change_pct: float = 0.03
     minimum_yield_change_bps: float = 2.0
     minimum_real_yield_change_bps: float = 2.0
-    gold_breakout_lookback_bars: int = 6
+    strategy_mode: str = "trend_breakout"
+    gold_breakout_lookback_bars: int = 20
+    trend_timeframe_minutes: int = 15
+    trend_ema_fast: int = 20
+    trend_ema_slow: int = 50
+    require_news_confirmation: bool = True
+    news_freshness_minutes: float = 45.0
+    news_db_path: str = ""
+    flatten_before_close_minutes: int = 5
+    run_embedded_producers: bool = True
+    enable_monitor_producer: bool = True
+    enable_news_producer: bool = True
+    monitor_refresh_seconds: float = 60.0
+    news_poll_interval_seconds: float = 60.0
+    news_producer_no_telegram: bool = False
     risk_per_trade_pct: float = 0.25
     maximum_daily_loss_pct: float = 1.0
     maximum_open_positions: int = 1
+    max_trades_per_day: int = 5
+    max_consecutive_losses: int = 3
     maximum_spread_points: float = 50.0
     reward_risk_ratio: float = 2.0
     atr_period: int = 14
@@ -329,6 +364,9 @@ class EngineConfig:
             errors.append(f"sizing_mode unsupported: {self.sizing_mode}")
         if self.news_mode not in ("filtered", "aware"):
             errors.append(f"news_mode unsupported: {self.news_mode}")
+        if str(self.strategy_mode or "").lower() not in ("trend_breakout", "legacy_macro"):
+            errors.append(f"strategy_mode unsupported: {self.strategy_mode}")
+        self.strategy_mode = str(self.strategy_mode or "trend_breakout").lower()
         if self.gold_symbol.upper() not in MCX_VALUE_PER_PRICE_UNIT:
             errors.append(
                 f"gold_symbol '{self.gold_symbol}' not in verified multipliers "
@@ -390,6 +428,22 @@ class EngineConfig:
         _bool("require_broker_funds", self.require_broker_funds)
         _bool("allow_yahoo_in_live", self.allow_yahoo_in_live)
         _bool("calendar_stream", self.calendar_stream)
+        _bool("require_news_confirmation", self.require_news_confirmation)
+        _bool("run_embedded_producers", self.run_embedded_producers)
+        _bool("enable_monitor_producer", self.enable_monitor_producer)
+        _bool("enable_news_producer", self.enable_news_producer)
+        _bool("news_producer_no_telegram", self.news_producer_no_telegram)
+        _finite("news_freshness_minutes", self.news_freshness_minutes, positive=True)
+        _finite("monitor_refresh_seconds", self.monitor_refresh_seconds, lo=15, hi=600)
+        _finite("news_poll_interval_seconds", self.news_poll_interval_seconds, lo=30, hi=900)
+        _int_field("max_trades_per_day", self.max_trades_per_day, lo=0, hi=100)
+        _int_field("max_consecutive_losses", self.max_consecutive_losses, lo=0, hi=50)
+        _int_field("trend_timeframe_minutes", self.trend_timeframe_minutes, lo=5, hi=60)
+        _int_field("trend_ema_fast", self.trend_ema_fast, lo=2, hi=200)
+        _int_field("trend_ema_slow", self.trend_ema_slow, lo=3, hi=400)
+        _int_field("flatten_before_close_minutes", self.flatten_before_close_minutes, lo=0, hi=120)
+        if int(self.trend_ema_fast) >= int(self.trend_ema_slow):
+            errors.append("trend_ema_fast must be < trend_ema_slow")
 
         _finite("risk_per_trade_pct", self.risk_per_trade_pct, lo=0.01, hi=100)
         _finite("maximum_daily_loss_pct", self.maximum_daily_loss_pct, lo=0.01, hi=100)

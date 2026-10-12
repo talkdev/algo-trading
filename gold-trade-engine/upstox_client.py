@@ -186,21 +186,49 @@ class UpstoxClient:
             return _safe_json(resp)
         raise last_error if last_error else UpstoxAPIError(0, None, url)
 
+    @staticmethod
+    def _extract_quote_row(data: Optional[dict], instrument_key: str) -> Optional[dict]:
+        """
+        Upstox quote payloads are keyed by trading-symbol form (e.g. MCX_FO:GOLDM26NOVFUT),
+        not by instrument_key (MCX_FO|571445). Match either key or instrument_token.
+        """
+        if not data or not isinstance(data, dict):
+            return None
+        rows = data.get("data")
+        if not isinstance(rows, dict) or not rows:
+            return None
+        if instrument_key in rows and isinstance(rows[instrument_key], dict):
+            return rows[instrument_key]
+        # Symbol-form key: MCX_FO|nnn → often returned as MCX_FO:SYMBOL
+        alt = instrument_key.replace("|", ":", 1)
+        if alt in rows and isinstance(rows[alt], dict):
+            return rows[alt]
+        for row in rows.values():
+            if not isinstance(row, dict):
+                continue
+            token = str(row.get("instrument_token") or row.get("instrument_key") or "")
+            if token == instrument_key:
+                return row
+        if len(rows) == 1:
+            only = next(iter(rows.values()))
+            return only if isinstance(only, dict) else None
+        return None
+
     def ltp(self, instrument_key: str) -> Optional[float]:
         data = self._request("GET", "/v2/market-quote/ltp",
                              params={"instrument_key": instrument_key})
+        row = self._extract_quote_row(data, instrument_key)
+        if not row:
+            return None
         try:
-            return float(data["data"][instrument_key]["last_price"])
+            return float(row["last_price"])
         except (KeyError, TypeError, ValueError):
             return None
 
     def quote(self, instrument_key: str) -> Optional[dict]:
         data = self._request("GET", "/v2/market-quote/quotes",
                              params={"instrument_key": instrument_key})
-        try:
-            return data["data"][instrument_key]
-        except (KeyError, TypeError):
-            return None
+        return self._extract_quote_row(data, instrument_key)
 
     def bid_ask(self, instrument_key: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
         """

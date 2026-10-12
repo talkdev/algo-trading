@@ -861,25 +861,27 @@ class NewsDecisionEngine:
                     epsilon=float(getattr(cfg, "surprise_epsilon", 0.0)),
                 )
                 ctx.surprise_active = True
-            # P0 #17: scheduled release in window without actual must not
-            # fall through to macro-only trading when surprise is required.
-            if bool(getattr(cfg, "surprise_required_in_window", True)):
-                pending = find_pending_release_in_window(
-                    now_utc, visible,
-                    importance_required=importance,
-                    reaction_minutes=reaction_m,
-                    block_after_minutes=block_after,
+
+        # Enforce independently of whether a surprise object was built: a
+        # scheduled high-impact release inside the reaction window without
+        # actual/forecast must block — never fall through to macro-only.
+        if bool(getattr(cfg, "surprise_required_in_window", True)):
+            pending = find_pending_release_in_window(
+                now_utc, visible,
+                importance_required=importance,
+                reaction_minutes=reaction_m,
+                block_after_minutes=block_after,
+            )
+            if pending is not None:
+                ctx.pending_release_without_actual = True
+                if isinstance(pending, EconomicEvent):
+                    ctx.pending_release_name = pending.event_name
+                else:
+                    ctx.pending_release_name = str(pending.get("event_name") or "")
+                ctx.allow_new_entries = False
+                ctx.reason = (
+                    f"surprise_pending_actual:{ctx.pending_release_name or 'event'}"
                 )
-                if pending is not None:
-                    ctx.pending_release_without_actual = True
-                    if isinstance(pending, EconomicEvent):
-                        ctx.pending_release_name = pending.event_name
-                    else:
-                        ctx.pending_release_name = str(pending.get("event_name") or "")
-                    ctx.allow_new_entries = False
-                    ctx.reason = (
-                        f"surprise_pending_actual:{ctx.pending_release_name or 'event'}"
-                    )
         return ctx
 
     def evaluate_macros(
@@ -1050,6 +1052,22 @@ class NewsDecisionEngine:
         if not macros.data_valid:
             decision.reason = macros.reason or "macros_invalid"
             return decision
+        if news.pending_release_without_actual or (
+            bool(getattr(self.cfg, "surprise_required_in_window", True))
+            and find_pending_release_in_window(
+                now_utc, events_known_as_of(self.events, now_utc),
+                importance_required=self.cfg.news_importance_required,
+                reaction_minutes=float(getattr(self.cfg, "surprise_reaction_minutes", 180)),
+                block_after_minutes=float(self.cfg.news_block_after_minutes),
+            ) is not None
+        ):
+            decision.reason = news.reason or "surprise_pending_actual"
+            decision.bias = get_gold_bias(
+                macros.dxy_direction, macros.yield_direction,
+                macros.real_yield_direction, self.cfg.use_real_yield,
+            )
+            return decision
+
         if not news.allow_new_entries:
             decision.reason = news.reason or "news_block"
             decision.bias = get_gold_bias(
@@ -1058,7 +1076,6 @@ class NewsDecisionEngine:
             )
             return decision
 
-        
         macro_bias = get_gold_bias(
             macros.dxy_direction, macros.yield_direction,
             macros.real_yield_direction, self.cfg.use_real_yield,
@@ -1066,6 +1083,7 @@ class NewsDecisionEngine:
 
         # When a fresh high-impact actual is in the reaction window, require
         # surprise classification (and usually agreement with macro bias).
+        # Missing actuals are already blocked above via pending_release check.
         bias = macro_bias
         bias_reason = "macro_only"
         if news.surprise_active and news.surprise is not None:

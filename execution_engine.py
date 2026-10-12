@@ -408,6 +408,7 @@ class LiveOrderExecutor:
             time_module.sleep(1)
 
         # v61: cancel + confirm resting entry (P59-05: cancel alone races fill).
+        st_out = ""
         if order_id:
             try:
                 outcome = self._cancel_and_confirm(order_id, {})
@@ -425,9 +426,12 @@ class LiveOrderExecutor:
                     f"could not cancel/confirm unfilled order {order_id}: {ce}"
                 )
 
+        # cancel_confirm is included so execute_leg_entry can safely re-quote
+        # only after a confirmed cancel (live 2026-10-12 BUY PUT timeout).
         raise RuntimeError(
             f"order {order_id} did not reach a confirmed filled state "
-            f"(last status='{last_status or 'unknown'}'); refusing to book a "
+            f"(last status='{last_status or 'unknown'}', "
+            f"cancel_confirm={st_out or 'n/a'}); refusing to book a "
             f"phantom fill at {fallback:.2f}"
         )
 
@@ -800,9 +804,10 @@ class LiveOrderExecutor:
 
         qty              = lots * self.config.lot_size
         transaction_type = "SELL" if leg["action"] == "SELL" else "BUY"
-        # Short credit legs: cross deeper (5 ticks) so a one-tick stale
-        # bid does not bounce as immediate `rejected` (live 2026-10-01).
-        _agg = 5 if transaction_type == "SELL" else 2
+        # Cross 5 ticks on both sides: thin BUY limits (ask+2) were timing
+        # out unfilled then cancelled (live 2026-10-12 PUT 22500).
+        # SELL keeps 5 so a one-tick stale bid does not bounce as rejected.
+        _agg = 5
         fallback_px = float(leg.get("exec_price", 0) or 0)
         limit_price = self._aggressive_limit_price(
             chain, leg["strike"], leg["option_type"],
@@ -838,49 +843,57 @@ class LiveOrderExecutor:
                     expected_qty=qty,
                 )
             except RuntimeError as _rej:
-                # One wider re-quote for SELL rejects only — never double
-                # a BUY that already risked capital, and never escalate a
-                # non-reject failure (e.g. phantom / partial).
+                # One wider re-quote when the resting order is gone:
+                #  - SELL broker reject (existing path)
+                #  - fill-timeout after cancel_confirm=CANCELLED (BUY+SELL)
+                # Never double a live BUY (unknown cancel / partial / phantom).
                 _msg = str(_rej).lower()
                 _is_reject = (
                     "terminated as 'rejected'" in _msg
                     or "terminated as \"rejected\"" in _msg
                     or " — rejected" in _msg
                 )
-                if transaction_type != "SELL" or not _is_reject:
+                _cancel_cleared = "cancel_confirm=cancelled" in _msg
+                _unsafe = (
+                    "partial fill" in _msg
+                    or "filled_quantity missing" in _msg
+                    or "cancel_confirm=unknown" in _msg
+                    or "cancel_confirm=filled" in _msg
+                )
+                _allow_requote = (
+                    not _unsafe
+                    and (
+                        _cancel_cleared
+                        or (transaction_type == "SELL" and _is_reject)
+                    )
+                )
+                if not _allow_requote:
                     raise
                 self.logger.warning(
-                    f"[LIVE] ENTRY SELL rejected — re-quoting through "
-                    f"market-protection: {_rej}"
+                    f"[LIVE] ENTRY {transaction_type} unfilled — re-quoting "
+                    f"through market-protection: {_rej}"
                 )
                 try:
                     self.client.cancel_order(order_id)
                 except Exception:
                     pass
-                opt = (chain or {}).get(float(leg["strike"]), {}).get(
-                    str(leg["option_type"]), {}
-                ) if chain else {}
-                ltp = (
-                    float(opt.get("ltp", 0) or 0)
-                    or float(opt.get("bid", 0) or 0)
-                    or float(opt.get("ask", 0) or 0)
-                    or fallback_px
+                wide = self._escalate_exit_price(
+                    chain, leg, transaction_type, fallback_px, attempt=1,
                 )
-                pct = float(getattr(self.config, "market_protection_pct", 2.0))
-                wide = self.client.synthetic_market_price(ltp, "SELL", pct)
                 if wide <= 0:
                     wide = self._aggressive_limit_price(
                         chain, leg["strike"], leg["option_type"],
-                        "SELL", fallback_px, aggressiveness=8,
+                        transaction_type, fallback_px, aggressiveness=8,
                     )
                 placed = self._place_order_reconciled(
                     instrument_key=instrument_key, leg=leg,
-                    transaction_type="SELL", qty=qty,
+                    transaction_type=transaction_type, qty=qty,
                     limit_price=wide, phase="ENTRY",
                 )
                 order_id = placed.get("order_id", "")
                 self.logger.info(
-                    f"[LIVE] ENTRY SELL RETRY {leg['option_type'].upper()} "
+                    f"[LIVE] ENTRY {transaction_type} RETRY "
+                    f"{leg['option_type'].upper()} "
                     f"{leg['strike']:.0f} @ limit={wide:.2f} "
                     f"order_id={order_id} tag={placed.get('tag')}"
                 )

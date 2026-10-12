@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -82,6 +83,18 @@ from upstox_client import (
     token_expiry,
     update_env_file,
 )
+from market_snapshot import (
+    build_engine_snapshot,
+    contract_from_mcx_context,
+    persist_snapshot,
+)
+from market_signals import evaluate_market_signal
+from news_assessment import assess_news
+from decision_gates import evaluate_entry_gates
+from trade_journal import TradeJournal
+from config import KILL_SWITCH_FILE, ENGINE_DIR
+from producers import HUB as PRODUCER_HUB
+from eod_report import write_eod_report
 
 UTC = timezone.utc
 log = logging.getLogger("gold_news")
@@ -101,10 +114,16 @@ def setup_logging(verbose: bool = False) -> None:
             datefmt="%Y-%m-%d %H:%M:%S",
             force=True,
         )
-    # Keep noisy HTTP libs quieter unless --verbose
+    # Keep noisy HTTP libs / embedded producers quieter unless --verbose
     if not verbose:
         logging.getLogger("urllib3").setLevel(logging.WARNING)
         logging.getLogger("requests").setLevel(logging.WARNING)
+        logging.getLogger("gold").setLevel(logging.WARNING)
+        logging.getLogger("ai-worker").setLevel(logging.WARNING)
+        logging.getLogger("gold_news.calendar.manager").setLevel(logging.WARNING)
+        logging.getLogger("gold_news.producers").setLevel(logging.WARNING)
+        logging.getLogger("gold_news.trading").setLevel(logging.WARNING)
+        logging.getLogger("gold_news.diag").setLevel(logging.WARNING)
 
 
 # -------------------------------------------------------------------------------- session / ops
@@ -115,23 +134,32 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
     return int(h), int(m)
 
 
-def _in_entry_window(now_utc: datetime, cfg: EngineConfig) -> bool:
-    """
-    True if now is within [market_open, entry_cutoff] AND before market_close
-    in trading_day_tz (same-day MCX session; overnight sessions rejected by validate).
-    """
+def _local_session_minutes(now_utc: datetime, cfg: EngineConfig) -> tuple[int, int, int, int]:
+    """Return (now_mins, open_mins, cutoff_mins, close_mins) in trading_day_tz."""
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(cfg.trading_day_tz or "Asia/Kolkata")
     local = now_utc.astimezone(tz) if now_utc.tzinfo else now_utc.replace(tzinfo=UTC).astimezone(tz)
     oh, om = _parse_hhmm(cfg.market_open)
     cut_h, cut_m = _parse_hhmm(cfg.entry_cutoff)
     close_h, close_m = _parse_hhmm(cfg.market_close)
-    mins = local.hour * 60 + local.minute
-    open_m = oh * 60 + om
-    cutoff_m = cut_h * 60 + cut_m
-    close_m_total = close_h * 60 + close_m
-    # Entries only until cutoff, and never at/after close
+    now_m = local.hour * 60 + local.minute
+    return now_m, oh * 60 + om, cut_h * 60 + cut_m, close_h * 60 + close_m
+
+
+def _in_entry_window(now_utc: datetime, cfg: EngineConfig) -> bool:
+    """
+    True if now is within [market_open, entry_cutoff] AND before market_close
+    in trading_day_tz (same-day MCX session; overnight sessions rejected by validate).
+    """
+    mins, open_m, cutoff_m, close_m_total = _local_session_minutes(now_utc, cfg)
     return open_m <= mins <= cutoff_m and mins < close_m_total
+
+
+def _past_flatten_cutoff(now_utc: datetime, cfg: EngineConfig) -> bool:
+    """True when within flatten_before_close_minutes of market_close (or after)."""
+    mins, _o, _cut, close_m = _local_session_minutes(now_utc, cfg)
+    lead = int(getattr(cfg, "flatten_before_close_minutes", 5) or 0)
+    return mins >= (close_m - lead)
 
 
 def _acquire_process_lock(lock_path: Path, *, instrument_key: str = ""):
@@ -189,14 +217,17 @@ def _check_min_order_affordable(cfg: EngineConfig, risk: RiskManager,
                                 tick_size: float = 1.0) -> dict:
     """Fail closed when even one fixed lot exceeds margin / risk budget at a ref price."""
     # Use a conservative high reference for GOLD-scale quotes.
-    ref = 72_000.0 if cfg.gold_symbol.upper() == "GOLD" else 72_000.0
-    # Synthetic flat candles for ATR so plan construction can run
+    # GOLDM trades ~1e5; keep affordability on a realistic ATR band, not tick×N
+    # (MCX tick can be 1 or 100 — tick×5 would invent a 500–1500pt stop and false-fail).
+    ref = 150_000.0 if str(cfg.gold_symbol).upper().startswith("GOLDM") else 72_000.0
     import pandas as pd
     idx = pd.date_range("2026-01-05", periods=max(cfg.atr_period + 2, 8), freq="5min", tz="UTC")
     mid = ref
+    # ~40pt half-range ≈ typical quiet 5m GOLDM ATR band for a smoke check
+    half = max(float(tick_size) if tick_size and tick_size < 50 else 40.0, 20.0)
     candles = pd.DataFrame({
-        "open": mid, "high": mid + max(tick_size * 5, 5),
-        "low": mid - max(tick_size * 5, 5), "close": mid,
+        "open": mid, "high": mid + half,
+        "low": mid - half, "close": mid,
     }, index=idx)
     plan = risk.build_trade_plan("BUY", mid - 1, mid + 1, candles, spread_points=2.0)
     if plan.rejected:
@@ -355,14 +386,39 @@ def run_selftest() -> int:
           nd.evaluate_news(now + timedelta(hours=4)).allow_new_entries)
 
     # calendar feed manager (CSV-only path, no API keys required)
+    cal_path = Path(DEFAULT_CALENDAR)
+    check(
+        "sample_data/calendar.csv present",
+        cal_path.is_file() and cal_path.stat().st_size > 0,
+        f"path={cal_path} exists={cal_path.exists()}",
+    )
     mgr = CalendarFeedManager(
-        local_calendar_path=str(DEFAULT_CALENDAR),
+        local_calendar_path=str(cal_path),
         primary="csv", secondary="", enable_stream=False,
         schedule_refresh_hours=6.0,
     )
     n = mgr.load_calendar()
     check("calendar manager loads local CSV", n >= 1,
-          f"n={n} path={DEFAULT_CALENDAR} exists={Path(DEFAULT_CALENDAR).exists()}")
+          f"n={n} path={cal_path} exists={cal_path.exists()}")
+    # Explicit CSV primary: start() baseline + freshness must be OK
+    mgr.start()
+    fresh = mgr.calendar_freshness(max_age_hours=12.0)
+    check(
+        "csv calendar freshness ok after start",
+        fresh.get("ok") is True and int(fresh.get("event_count") or 0) >= 1,
+        str(fresh),
+    )
+    # Simulate failed remote: age clock must not advance on unhealthy refresh
+    aged = datetime.now(tz=UTC) - timedelta(hours=13)
+    mgr.last_successful_refresh = aged
+    mgr._last_schedule_refresh = aged
+    mgr.stats["last_refresh_healthy"] = False
+    stale = mgr.calendar_freshness(max_age_hours=12.0)
+    check(
+        "calendar_max_age_hours blocks stale schedule",
+        stale.get("ok") is False and any("age_" in r for r in (stale.get("reasons") or [])),
+        str(stale),
+    )
     status = mgr.tick()
     check("calendar manager tick", "event_count" in status)
 
@@ -439,6 +495,7 @@ def run_selftest() -> int:
             surprise_reaction_minutes=180, require_surprise_macro_agree=True,
             stale_data_minutes=60, macro_stale_minutes=4320,
             macro_trade_max_age_minutes=10_000, use_real_yield=False,
+            gold_breakout_lookback_bars=6, strategy_mode="legacy_macro",
         ),
         events=[released],
     )
@@ -466,6 +523,7 @@ def run_selftest() -> int:
             surprise_reaction_minutes=180, require_surprise_macro_agree=True,
             stale_data_minutes=60, macro_stale_minutes=4320,
             macro_trade_max_age_minutes=10_000, use_real_yield=False,
+            gold_breakout_lookback_bars=6, strategy_mode="legacy_macro",
         ),
         events=[inline_ev],
     )
@@ -476,8 +534,10 @@ def run_selftest() -> int:
     check("inline surprise blocks",
           dec_inline.decision == "NO_TRADE", dec_inline.reason)
 
-    # generate_signal gates
-    cfg = EngineConfig.from_mapping(news_mode="filtered")
+    # generate_signal gates (legacy path; keep lookback aligned with fixture length)
+    cfg = EngineConfig.from_mapping(
+        news_mode="filtered", gold_breakout_lookback_bars=6, strategy_mode="legacy_macro",
+    )
     res = generate_signal(
         now_utc=now, events=[ev], dxy_direction="down", yield_direction="down",
         gold_candles=candles, data_is_valid=True, daily_loss_limit_reached=False,
@@ -708,6 +768,16 @@ def run_selftest() -> int:
             "use_real_yield unknown blocks bias",
             get_gold_bias("down", "down", "unknown", True) == "mixed",
         )
+        # Observation age comes from series index — not wall-clock fetch time
+        from feeds import series_observation_age_minutes
+        stale_idx = pd.DatetimeIndex([datetime(2026, 1, 1, tzinfo=UTC)])
+        stale_s = pd.Series([100.0], index=stale_idx)
+        age_s = series_observation_age_minutes(stale_s, datetime(2026, 1, 2, tzinfo=UTC))
+        check(
+            "macro observation age from series index",
+            age_s is not None and age_s >= 24 * 60 - 1,
+            f"age={age_s}",
+        )
         # Affordability helper rejects GOLD @ 5L / 10% margin
         aff = _check_min_order_affordable(
             EngineConfig.from_mapping(
@@ -731,8 +801,83 @@ def run_selftest() -> int:
         )
         check("default GOLDM affordable", aff2["ok"], aff2["reason"])
 
+    # New modules: market signals / news assessment / gates / journal
+    from market_signals import evaluate_market_signal, classify_breakout_5m
+    from news_assessment import assess_news, reco_to_score, news_supports_side, NewsAssessment
+    from decision_gates import evaluate_entry_gates
+    from trade_journal import TradeJournal
+    check("reco Strong Buy = +2", reco_to_score("Strong Buy") == 2)
+    check("reco Sell = -1", reco_to_score("Sell") == -1)
+    # Breakout must exclude evaluation candle (valid OHLC throughout)
+    idx20 = pd.date_range("2026-01-05", periods=25, freq="5min", tz="UTC")
+    closes = list(range(100, 125))
+    highs = [c + 1 for c in closes]
+    lows = [c - 1 for c in closes]
+    # Last bar breaks above prior window high (exclude self); keep OHLC consistent
+    closes[-1] = 130
+    highs[-1] = 131
+    lows[-1] = 124
+    brk_df = pd.DataFrame({
+        "open": closes, "high": highs, "low": lows, "close": closes, "volume": [1] * 25,
+    }, index=idx20)
+    brk, lvl, _ = classify_breakout_5m(brk_df, lookback=20)
+    check("5m breakout up excludes self", brk == "up", f"brk={brk} lvl={lvl}")
+    na = NewsAssessment(bias="bullish", score=1.5, fresh=True, conflicting=False)
+    check("news supports BUY", news_supports_side(na, "BUY"))
+    check("news rejects SELL when bullish", not news_supports_side(na, "SELL"))
+    from market_signals import MarketSignal
+    msig_ok = MarketSignal(
+        direction="bullish", trend="bullish", breakout="up", regime="trending",
+        valid=True, data_valid=True, signal_id="up:test",
+    )
+    gate = evaluate_entry_gates(
+        now_utc=datetime(2026, 3, 10, 6, 30, tzinfo=UTC),
+        signal=msig_ok, news=na,
+        session_ok=True, mcx_data_valid=True,
+        event_block_active=False, broker_ok=True, risk_ok=True,
+        require_news_confirmation=True,
+    )
+    check("all gates pass → BUY", gate.action == "BUY", gate.reason)
+    gate_news = evaluate_entry_gates(
+        now_utc=datetime(2026, 3, 10, 6, 30, tzinfo=UTC),
+        signal=msig_ok,
+        news=NewsAssessment(bias="unknown", fresh=False),
+        session_ok=True, mcx_data_valid=True,
+        event_block_active=False, broker_ok=True, risk_ok=True,
+        require_news_confirmation=True,
+    )
+    check(
+        "news gate blocks without confirmation",
+        gate_news.action == "WAIT" and str(gate_news.reason).startswith("news_gate"),
+        gate_news.reason,
+    )
+    import tempfile as _tmpmod
+    with _tmpmod.TemporaryDirectory() as tmpj:
+        tj = TradeJournal(Path(tmpj) / "tj.db")
+        tj.log_decision(gate)
+        tj.log_signal(msig_ok)
+        check("trade journal writes", (Path(tmpj) / "tj.db").exists())
+    # Empty news db → unknown (not confirmatory)
+    miss = assess_news(Path("no_such_gold_signals.db"))
+    check("missing news db → unknown", miss.bias == "unknown")
+
+    # Session flatten cutoff helper
+    flat_cfg = EngineConfig.from_mapping(
+        market_open="09:00", market_close="23:30", entry_cutoff="23:00",
+        flatten_before_close_minutes=5, trading_day_tz="Asia/Kolkata",
+    )
+    # 23:26 IST ≈ past flatten (23:25); use a known UTC offset day
+    from zoneinfo import ZoneInfo
+    ist = ZoneInfo("Asia/Kolkata")
+    before_flat = datetime(2026, 3, 10, 23, 20, tzinfo=ist).astimezone(UTC)
+    after_flat = datetime(2026, 3, 10, 23, 26, tzinfo=ist).astimezone(UTC)
+    check("flatten cutoff not yet", not _past_flatten_cutoff(before_flat, flat_cfg))
+    check("flatten cutoff active", _past_flatten_cutoff(after_flat, flat_cfg))
+    check("live_armed default false",
+          EngineConfig.from_file().live_armed is False)
+
     # synthetic backtest end-to-end
-    data = generate_synthetic_dataset(n_bars=400, seed=7)
+    data = generate_synthetic_dataset(n_bars=600, seed=7)
     cfg_bt = EngineConfig.from_mapping(
         news_mode="aware", initial_equity=500_000,
         risk_per_trade_pct=1.0, maximum_spread_points=1000,
@@ -740,6 +885,9 @@ def run_selftest() -> int:
         value_per_price_unit=10.0, estimated_cost_per_unit=5.0,
         maximum_daily_loss_pct=5.0, margin_pct_of_notional=0.05,
         backtest_slippage_points=1.0, backtest_fee_per_lot=2.0,
+        strategy_mode="trend_breakout",
+        gold_breakout_lookback_bars=20,
+        require_news_confirmation=False,
     )
     result = run_backtest(
         data["gold"], data["dxy"], data["yields"], data["events"],
@@ -757,6 +905,14 @@ def run_selftest() -> int:
           result.meta.get("macro_max_age_minutes") == float(
               getattr(cfg_bt, "macro_trade_max_age_minutes", 60) or 60
           ))
+    # Out-of-sample split: second half must still run without crash
+    gold_all = data["gold"]
+    mid = gold_all.index[len(gold_all) // 2]
+    oos = run_backtest(
+        gold_all.loc[mid:], data["dxy"], data["yields"], data["events"],
+        cfg=cfg_bt, real_yields=data["real_yields"], bid_ask_spread=2.0,
+    )
+    check("OOS backtest runs", oos.performance is not None)
     print(result.performance)
 
     # front-month chain helper (offline, no network)
@@ -776,6 +932,20 @@ def run_selftest() -> int:
         as_of=date(2026, 1, 1), until=date(2026, 1, 25),
     )
     check("contract roll chain length", len(chain) >= 2, f"n={len(chain)}")
+
+    # Upstox quote payloads use symbol keys, not instrument_key
+    from upstox_client import UpstoxClient
+    qrow = UpstoxClient._extract_quote_row(
+        {"data": {
+            "MCX_FO:GOLDM26NOVFUT": {
+                "last_price": 100.0,
+                "instrument_token": "MCX_FO|571445",
+                "depth": {"buy": [{"price": 99.0}], "sell": [{"price": 101.0}]},
+            }
+        }},
+        "MCX_FO|571445",
+    )
+    check("quote extract by instrument_token", qrow is not None and qrow["last_price"] == 100.0)
 
     if errors:
         print(f"\n{len(errors)} failure(s): {errors}")
@@ -817,6 +987,8 @@ def build_cfg(args: argparse.Namespace, file_cfg: dict | None = None) -> EngineC
         overrides["maximum_spread_points"] = args.spread
     if getattr(args, "yahoo_macros", False):
         overrides["yahoo_macros"] = True
+    if getattr(args, "no_producers", False):
+        overrides["run_embedded_producers"] = False
 
     calendar = getattr(args, "calendar", None)
     if calendar and str(calendar) != str(DEFAULT_CALENDAR):
@@ -842,6 +1014,21 @@ def run_paper_or_live(cfg: EngineConfig, *, once: bool = False) -> int:
       2. Loop — process calendar updates, refresh market data, decide, size, paper/live order
       3. Reconnect is handled inside CalendarFeedManager / TE stream
     """
+    # Mark producers stopping as soon as Ctrl-C hits (Chromium often dies in the same tick).
+    def _on_interrupt(signum, frame):  # noqa: ANN001
+        try:
+            PRODUCER_HUB.request_stop()
+        except Exception:  # noqa: BLE001
+            pass
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _on_interrupt)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _on_interrupt)
+    except Exception:  # noqa: BLE001
+        pass
+
     live = cfg.is_live
     yahoo_macros = bool(cfg.yahoo_macros)
     startup = CycleDiagnostics(0, mode=cfg.mode)
@@ -1205,13 +1392,49 @@ def run_paper_or_live(cfg: EngineConfig, *, once: bool = False) -> int:
         f"blocked={risk.daily.blocked} orders={'REAL' if live else 'SIMULATED'} "
         f"open_pos={exe.has_open_position} product={cfg.product}",
     )
+    journal = TradeJournal()
+    startup.step(
+        "JOURNAL", OK,
+        f"trade_journal={journal.path} strategy_mode={cfg.strategy_mode} "
+        f"contract={cfg.gold_symbol} key={ctx.instrument_key}",
+    )
+
+    # Embed monitor-gold + commodity-events (single process day-to-day run)
+    if bool(getattr(cfg, "run_embedded_producers", True)):
+        try:
+            token = str(getattr(cfg, "access_token", "") or "")
+            PRODUCER_HUB.start(
+                access_token=token,
+                gold_symbol=str(cfg.gold_symbol),
+                instrument_key=str(ctx.instrument_key),
+                news_db=str(getattr(cfg, "news_db_path", "") or "") or str(ENGINE_DIR / "gold_signals.db"),
+                monitor_refresh_seconds=float(getattr(cfg, "monitor_refresh_seconds", 60) or 60),
+                news_interval_seconds=float(getattr(cfg, "news_poll_interval_seconds", 60) or 60),
+                enable_monitor=bool(getattr(cfg, "enable_monitor_producer", True)),
+                enable_news=bool(getattr(cfg, "enable_news_producer", True)),
+                news_no_telegram=bool(getattr(cfg, "news_producer_no_telegram", False)),
+            )
+            pst = PRODUCER_HUB.status()
+            startup.step(
+                "PRODUCERS", OK,
+                f"monitor={pst.get('started') and getattr(cfg, 'enable_monitor_producer', True)} "
+                f"news={getattr(cfg, 'enable_news_producer', True)} "
+                f"json=monitor_snapshot.json db=gold_signals.db",
+            )
+        except Exception as exc:  # noqa: BLE001
+            startup.step("PRODUCERS", WARN, f"start failed (trading continues): {exc}")
+    else:
+        startup.step("PRODUCERS", INFO, "run_embedded_producers=false — run collectors separately if needed")
+
     startup.end()
 
     log.info(
-        "Entering %s loop on %s — detailed per-cycle board follows every %.1fs",
+        "Entering %s loop on %s — detailed per-cycle board follows every %.1fs "
+        "(producers embedded=%s)",
         "LIVE" if live else "PAPER", ctx.instrument_key, cfg.poll_seconds,
+        bool(getattr(cfg, "run_embedded_producers", True)),
     )
-    state = {"dxy": dxy, "yields": yields}
+    state = {"dxy": dxy, "yields": yields, "eod_report_written": False}
     cycle_no = 0
     try:
         while True:
@@ -1225,7 +1448,11 @@ def run_paper_or_live(cfg: EngineConfig, *, once: bool = False) -> int:
                     yahoo_macros=yahoo_macros,
                     state=state,
                     tick_size=float(ctx.tick_size or 1.0),
+                    journal=journal,
+                    contract_info=ctx,
                 )
+            except KeyboardInterrupt:
+                raise
             except Exception as exc:  # noqa: BLE001
                 # P0 #14: unexpected cycle exception → persistent halt + reconcile
                 exe.emergency_halt = True
@@ -1254,8 +1481,33 @@ def run_paper_or_live(cfg: EngineConfig, *, once: bool = False) -> int:
             if once:
                 break
             time.sleep(cfg.poll_seconds)
+    except KeyboardInterrupt:
+        log.info("Ctrl-C — shutting down cleanly")
     finally:
+        # Signal producers before anything else so scrapes treat closed browsers as expected.
+        try:
+            PRODUCER_HUB.request_stop()
+        except Exception:  # noqa: BLE001
+            pass
         log.info("Shutting down — persist state, keep broker protection, release lock")
+        try:
+            if not state.get("eod_report_written"):
+                write_eod_report(
+                    journal_path=journal.path,
+                    trading_day=risk.trading_day_of(datetime.now(tz=UTC)),
+                    equity=risk.equity,
+                    realized_pnl=risk.daily.realized_pnl,
+                    trades_today=risk.daily.trades_today,
+                    blocked=risk.daily.blocked,
+                    extra={"shutdown": True, "instrument_key": ctx.instrument_key},
+                )
+                state["eod_report_written"] = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("EOD report on shutdown failed: %s", exc)
+        try:
+            PRODUCER_HUB.stop(timeout=25.0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("producer shutdown: %s", exc)
         try:
             exe.save_runtime_state()
             exe.save_risk_ledger()
@@ -1267,14 +1519,35 @@ def run_paper_or_live(cfg: EngineConfig, *, once: bool = False) -> int:
     return 0
 
 
+def _publish_board(diag: "CycleDiagnostics", **fields: Any) -> None:
+    """Attach / refresh the compact console BoardView on this cycle."""
+    from console_board import BoardView
+    base = diag.board if isinstance(diag.board, BoardView) else BoardView(
+        cycle_no=diag.cycle_no, mode=diag.mode, now_utc=diag.now_utc,
+    )
+    for k, v in fields.items():
+        if hasattr(base, k):
+            setattr(base, k, v)
+    diag.board = base
+
+
 def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionEngine,
            dxy, yields, cfg: EngineConfig, risk: RiskManager,
            exe: ExecutionEngine, cal_mgr: Optional[CalendarFeedManager] = None,
            *, cycle_no: int = 1, yahoo_macros: bool = False,
-           state: Optional[dict] = None, tick_size: float = 1.0) -> None:
+           state: Optional[dict] = None, tick_size: float = 1.0,
+           journal: Optional[TradeJournal] = None,
+           contract_info=None) -> None:
     now = datetime.now(tz=UTC)
     diag = CycleDiagnostics(cycle_no, now_utc=now, mode=cfg.mode)
     diag.begin()
+    _publish_board(
+        diag,
+        symbol=str(cfg.gold_symbol),
+        instrument_key=instrument_key,
+        max_trades=int(getattr(cfg, "max_trades_per_day", 0) or 0),
+        trades_today=int(risk.daily.trades_today),
+    )
 
     # ---- 1) Calendar tick ----
     if cal_mgr is None:
@@ -1313,29 +1586,37 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
                 exe.emergency_halt = True
                 diag.step("CALENDAR.GATE", FAIL, "calendar tick failed — entries halted")
 
-    # Calendar freshness gate (configured calendar_max_age_hours)
+    # Calendar freshness gate — always enforce calendar_max_age_hours when required.
+    # Failed refreshes must not leave old events tradeable.
     cal_unhealthy = False
     if cal_mgr is not None and bool(getattr(cfg, "require_live_calendar", True)):
-        last_ok = getattr(cal_mgr, "_last_schedule_refresh", None) or getattr(
-            cal_mgr, "last_successful_refresh", None
-        )
         max_age_h = float(getattr(cfg, "calendar_max_age_hours", 12) or 12)
-        if last_ok is not None:
-            age_h = (now - (last_ok if last_ok.tzinfo else last_ok.replace(tzinfo=UTC))).total_seconds() / 3600.0
-            if age_h > max_age_h:
-                cal_unhealthy = True
-                diag.step(
-                    "CALENDAR.FRESHNESS", FAIL,
-                    f"schedule age={age_h:.1f}h > max={max_age_h}h — block entries",
-                )
-        events_n = len(cal_mgr.snapshot()) if hasattr(cal_mgr, "snapshot") else 0
-        if events_n < 1 or cal_status.get("error"):
-            cal_unhealthy = True
-        if cal_unhealthy and cfg.is_live:
+        fresh = cal_mgr.calendar_freshness(now, max_age_hours=max_age_h)
+        if cal_status.get("error"):
+            fresh = dict(fresh)
+            fresh["ok"] = False
+            fresh["reasons"] = list(fresh.get("reasons") or []) + ["tick_error"]
+        cal_unhealthy = not fresh.get("ok")
+        if cal_unhealthy:
+            diag.step(
+                "CALENDAR.FRESHNESS", FAIL,
+                f"UNHEALTHY age_h={fmt_num(fresh.get('age_hours'), 1)} "
+                f"max={max_age_h} events={fresh.get('event_count')} "
+                f"primary={fresh.get('primary')} "
+                f"reasons={','.join(fresh.get('reasons') or [])} — block entries",
+            )
+            # Block entries in paper and live — stale calendar is never eligible
             exe.emergency_halt = True
+        else:
+            diag.step(
+                "CALENDAR.FRESHNESS", OK,
+                f"age_h={fmt_num(fresh.get('age_hours'), 1)} max={max_age_h} "
+                f"events={fresh.get('event_count')} primary={fresh.get('primary')}",
+            )
 
     # ---- 2) Macro refresh ----
-    # Live mode: Yahoo is research-only unless explicitly allowlisted
+    # Yahoo is research-oriented; live requires allow_yahoo_in_live.
+    # Freshness for entries uses observation timestamps, not fetch-attempt time.
     live_yahoo_ok = bool(getattr(cfg, "allow_yahoo_in_live", False))
     use_yahoo = yahoo_macros and (not cfg.is_live or live_yahoo_ok)
     if cfg.is_live and yahoo_macros and not live_yahoo_ok:
@@ -1346,7 +1627,9 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
         exe.emergency_halt = True
         use_yahoo = False
     try:
-        before_dxy_n, before_yld_n = len(dxy), len(yields)
+        from feeds import series_observation_age_minutes
+        before_dxy_age = series_observation_age_minutes(dxy, now)
+        before_yld_age = series_observation_age_minutes(yields, now)
         dxy, yields = refresh_macros(
             dxy, yields,
             allow_yahoo=use_yahoo,
@@ -1355,16 +1638,35 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
         )
         if state is not None:
             state["dxy"], state["yields"] = dxy, yields
-        refreshed = (len(dxy) != before_dxy_n) or (len(yields) != before_yld_n)
-        dxy_src = "csv" if cfg.dxy_csv else ("yahoo/cache" if yahoo_macros else "none")
-        yld_src = "csv" if cfg.yield_csv else ("yahoo/cache" if yahoo_macros else "none")
+        dxy_age = series_observation_age_minutes(dxy, now)
+        yld_age = series_observation_age_minutes(yields, now)
+        obs_improved = (
+            (dxy_age is not None and before_dxy_age is not None and dxy_age < before_dxy_age - 0.5)
+            or (yld_age is not None and before_yld_age is not None and yld_age < before_yld_age - 0.5)
+        )
+        dxy_src = "csv" if cfg.dxy_csv else ("yahoo" if use_yahoo else ("yahoo/cache" if yahoo_macros else "none"))
+        yld_src = "csv" if cfg.yield_csv else ("yahoo" if use_yahoo else ("yahoo/cache" if yahoo_macros else "none"))
+        # Trade gate uses observation age (macro_trade_max_age); soft health uses macro_stale
+        trade_max = float(getattr(cfg, "macro_trade_max_age_minutes", 60) or 60)
         st_d, det_d = series_health(
             "DXY", dxy, now, stale_limit_minutes=float(cfg.macro_stale_minutes), source=dxy_src,
         )
         st_y, det_y = series_health(
             "US10Y", yields, now, stale_limit_minutes=float(cfg.macro_stale_minutes), source=yld_src,
         )
-        diag.step("MACROS.DXY", st_d, det_d + (f" refreshed={refreshed}" if refreshed else ""))
+        if dxy_age is None or yld_age is None or dxy_age > trade_max or yld_age > trade_max or dxy_age < -2 or yld_age < -2:
+            diag.step(
+                "MACROS.OBS_AGE", FAIL,
+                f"observation age dxy={fmt_num(dxy_age, 0)}m yld={fmt_num(yld_age, 0)}m "
+                f"trade_max={trade_max:.0f}m — entries blocked by strategy gate",
+            )
+        else:
+            diag.step(
+                "MACROS.OBS_AGE", OK,
+                f"observation age dxy={fmt_num(dxy_age, 0)}m yld={fmt_num(yld_age, 0)}m "
+                f"trade_max={trade_max:.0f}m obs_refreshed={obs_improved}",
+            )
+        diag.step("MACROS.DXY", st_d, det_d)
         diag.step("MACROS.US10Y", st_y, det_y)
     except Exception as exc:  # noqa: BLE001
         diag.step("MACROS", FAIL, f"refresh failed: {exc}")
@@ -1374,20 +1676,21 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
     candle_source = "intraday"
     gold = pd.DataFrame()
     completed = pd.DataFrame()
+    raw = pd.DataFrame()
     bar_age = None
     gold_ok = False
     candles_usable = False
     try:
         raw = client.intraday(instrument_key, "1minute")
+        today = now.date() if hasattr(now, "date") else datetime.now(tz=UTC).date()
         if raw.empty:
             candle_source = "historical_fallback"
-            today = datetime.now().date()
             diag.step(
                 "GOLD.INTRADAY", WARN,
-                "intraday empty — falling back to historical 1m (last 3 days)",
+                "intraday empty — falling back to historical 1m (last 5 days)",
             )
             raw = client.historical(
-                instrument_key, "1minute", today, today - timedelta(days=3),
+                instrument_key, "1minute", today, today - timedelta(days=5),
             )
         else:
             last_1m = raw.index[-1]
@@ -1402,6 +1705,23 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
                     "GOLD.INTRADAY", st,
                     f"bars={len(raw)} last={last_1m} age={fmt_num(age_1m, 1)}m source={candle_source}",
                 )
+                # Stitch prior sessions so 15m EMA50 has warmup beyond today's session
+                try:
+                    hist = client.historical(
+                        instrument_key, "1minute",
+                        today - timedelta(days=1),
+                        today - timedelta(days=7),
+                    )
+                    if hist is not None and not hist.empty:
+                        raw = pd.concat([hist, raw]).sort_index()
+                        raw = raw[~raw.index.duplicated(keep="last")]
+                        candle_source = "intraday+history"
+                        diag.step(
+                            "GOLD.HISTORY", OK,
+                            f"stitched prior 1m bars={len(hist)} total_1m={len(raw)}",
+                        )
+                except Exception as hexc:  # noqa: BLE001
+                    diag.step("GOLD.HISTORY", WARN, f"warmup stitch skipped: {hexc}")
         if not raw.empty:
             gold = resample_ohlcv(raw, cfg.timeframe_minutes)
         if gold.empty:
@@ -1453,12 +1773,19 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
 
     last_bar = completed.iloc[-1]
     stale_lim = float(cfg.stale_data_minutes)
-    bar_fresh = bar_age is not None and bar_age <= stale_lim and bar_age >= -2
+    # Index is bar-open (left label); freshness is age since the bar *closed*.
+    tf_m = int(cfg.timeframe_minutes)
+    completion_age = (bar_age - tf_m) if bar_age is not None else None
+    bar_fresh = (
+        completion_age is not None
+        and completion_age <= stale_lim
+        and completion_age >= -2
+    )
     if not gold_ok:
         candle_st = FAIL
-    elif bar_age is not None and bar_age > max(stale_lim * 12, 120):
+    elif completion_age is not None and completion_age > max(stale_lim * 12, 120):
         candle_st = WARN
-    elif bar_age is not None and bar_age > stale_lim:
+    elif completion_age is not None and completion_age > stale_lim:
         candle_st = PARTIAL
     else:
         candle_st = OK
@@ -1468,7 +1795,7 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
         f"completed={len(completed)} need>={need} last={completed.index[-1]} "
         f"O={fmt_num(last_bar['open'],2)} H={fmt_num(last_bar['high'],2)} "
         f"L={fmt_num(last_bar['low'],2)} C={fmt_num(last_bar['close'],2)} "
-        f"age={fmt_num(bar_age,1)}m stale_limit={stale_lim:.0f}m "
+        f"closed_age={fmt_num(completion_age,1)}m stale_limit={stale_lim:.0f}m "
         f"valid={gold_ok} fresh={bar_fresh}",
     )
 
@@ -1520,6 +1847,76 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
 
     # Quote degraded (incomplete book) == quote failed for safety (P0 #13)
     quote_safety_event = quote_failed or quote_degraded
+    _publish_board(
+        diag,
+        bid=bid, ask=ask, ltp=ltp, spread=spread if not quote_safety_event else None,
+        quote_ok=not quote_safety_event and bid is not None and ask is not None,
+        bar_o=float(last_bar["open"]), bar_h=float(last_bar["high"]),
+        bar_l=float(last_bar["low"]), bar_c=float(last_bar["close"]),
+        bar_age_m=completion_age, candles_ok=bool(candles_usable and gold_ok),
+        history_ok=("intraday+history" in candle_source) or candle_source == "historical_fallback",
+        candles_5m=len(completed),
+    )
+
+    # ---- 5a) Mandatory session flatten (before new entries; after quote known) ----
+    if exe.has_open_position and _past_flatten_cutoff(now, cfg):
+        diag.step(
+            "FLATTEN", WARN,
+            f"session flatten cutoff — closing before market_close={cfg.market_close}",
+        )
+        try:
+            exe.monitor(
+                now, mon_bid, mon_ask,
+                data_valid=True, allow_software_exits=False,
+            )
+            # Force close via daily-style path
+            if exe.has_open_position:
+                closed = exe._close(now, mon_bid, mon_ask, "session_flatten")
+                if journal is not None:
+                    journal.log_position("session_flatten", exe.position)
+                    journal.log_risk("session_flatten", "mandatory_eod")
+                    journal.log_decision({
+                        "action": "EXIT", "reason": "session_flatten",
+                        "side": "", "signal_id": "", "system_state": "EXIT_PENDING",
+                        "timestamp_utc": now.isoformat(),
+                    })
+                if closed is None and exe.has_open_position:
+                    exe.emergency_halt = True
+                    diag.step("FLATTEN", FAIL, "flatten incomplete — halt + reconcile")
+                    rep = exe.reconcile_broker(instrument_key, discover_orphans=True)
+                    diag.step(
+                        "FLATTEN.RECONCILE",
+                        OK if rep.get("ok") and int(rep.get("broker_net_qty") or 0) == 0 else FAIL,
+                        f"broker_net={rep.get('broker_net_qty')} ok={rep.get('ok')}",
+                    )
+                else:
+                    diag.step("FLATTEN", OK, "position closed for session — EXIT")
+        except Exception as exc:  # noqa: BLE001
+            exe.emergency_halt = True
+            diag.step("FLATTEN", FAIL, f"{exc}")
+
+    # EOD report once past flatten cutoff when flat
+    if (
+        state is not None
+        and not state.get("eod_report_written")
+        and _past_flatten_cutoff(now, cfg)
+        and not exe.has_open_position
+        and journal is not None
+    ):
+        try:
+            write_eod_report(
+                journal_path=journal.path,
+                trading_day=risk.trading_day_of(now),
+                equity=risk.equity,
+                realized_pnl=risk.daily.realized_pnl,
+                trades_today=risk.daily.trades_today,
+                blocked=risk.daily.blocked,
+                extra={"instrument_key": instrument_key, "trigger": "flatten_cutoff"},
+            )
+            state["eod_report_written"] = True
+            diag.step("EOD.REPORT", OK, "daily report archived under reports/")
+        except Exception as exc:  # noqa: BLE001
+            diag.step("EOD.REPORT", WARN, str(exc))
 
     # ---- 5) Open position monitor (ALWAYS runs — even on quote outage) ----
     if exe.has_open_position:
@@ -1588,177 +1985,358 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
 
     # ---- 6) Risk gates ----
     daily_hit = risk.daily_loss_reached(now)
+    trades_hit = risk.trades_limit_reached()
+    consec_hit = risk.consecutive_loss_limit_reached()
     if daily_hit:
         diag.step("RISK.DAILY", FAIL, "daily loss limit reached — no new entries")
+    elif trades_hit:
+        diag.step(
+            "RISK.DAILY", FAIL,
+            f"max_trades_per_day={getattr(cfg, 'max_trades_per_day', 0)} reached "
+            f"(trades_today={risk.daily.trades_today})",
+        )
+    elif consec_hit:
+        diag.step(
+            "RISK.DAILY", FAIL,
+            f"max_consecutive_losses={getattr(cfg, 'max_consecutive_losses', 0)} reached",
+        )
     else:
         diag.step(
             "RISK.DAILY", OK,
             f"daily_loss_ok equity≈{cfg.initial_equity:,.0f} "
-            f"limit={cfg.maximum_daily_loss_pct}%",
+            f"limit={cfg.maximum_daily_loss_pct}% trades={risk.daily.trades_today}/"
+            f"{getattr(cfg, 'max_trades_per_day', 0)}",
         )
 
-    # ---- 7) Decision engine (news + surprise + macros + breakout) ----
-    try:
-        decision = news_engine.decide(
-            now_utc=now,
-            dxy=dxy,
-            yields=yields,
-            gold_candles=completed,
-            daily_loss_limit_reached=daily_hit,
-            has_open_position=exe.has_open_position,
-            last_breakout_key=exe.last_breakout_key,
-            gold_data_valid=gold_ok,
+    # HOLD: open position — manage only, no new entries
+    if exe.has_open_position and not _past_flatten_cutoff(now, cfg):
+        side_h = getattr(exe.position, "side", "?") if exe.position else "?"
+        pos = exe.position
+        diag.step(
+            "DECISION", INFO,
+            f"action=HOLD system_state={'LONG_OPEN' if side_h == 'BUY' else 'SHORT_OPEN'} "
+            f"side={side_h} — managing open position",
         )
-    except Exception as exc:  # noqa: BLE001
-        diag.step("DECISION", FAIL, f"news_engine.decide crashed: {exc}")
+        # Journal HOLD periodically (not every 5s poll)
+        if journal is not None and (cycle_no % 12 == 1):
+            journal.log_decision({
+                "action": "HOLD",
+                "reason": "open_position",
+                "side": side_h,
+                "signal_id": str(exe.last_breakout_key or ""),
+                "system_state": "LONG_OPEN" if side_h == "BUY" else "SHORT_OPEN",
+                "timestamp_utc": now.isoformat(),
+            })
+        diag.step("RISK.PLAN", SKIP, "HOLD — no new entry")
+        diag.step("EXECUTION", SKIP, "position open")
+        _publish_board(
+            diag,
+            has_position=True, position_side=str(side_h),
+            position_entry=getattr(pos, "entry_price", None),
+            position_stop=getattr(pos, "stop_price", None),
+            position_target=getattr(pos, "target_price", None),
+            decision="HOLD",
+            system_state="LONG_OPEN" if side_h == "BUY" else "SHORT_OPEN",
+            decision_reason="managing open position — no new entries",
+            trades_today=int(risk.daily.trades_today),
+        )
         diag.end()
         return
 
-    news = decision.news
-    macros = decision.macros
-    if news.inside_block:
-        diag.step(
-            "NEWS.GATE", WARN,
-            f"INSIDE BLOCK — entries={'allowed' if news.allow_new_entries else 'BLOCKED'} "
-            f"mode={cfg.news_mode} event={news.nearest_event_name or '-'} "
-            f"mins={fmt_num(news.minutes_from_event, 1)} "
-            f"window={news.block_window_start_utc or '-'} → {news.block_window_end_utc or '-'} "
-            f"reason={news.reason}",
-        )
-    else:
-        upcoming_n = len(news.relevant_upcoming or [])
-        diag.step(
-            "NEWS.GATE", OK,
-            f"clear allow_entries={news.allow_new_entries} "
-            f"nearest={news.nearest_event_name or '-'} "
-            f"mins={fmt_num(news.minutes_from_event, 1)} "
-            f"upcoming_24h={upcoming_n} reason={news.reason}",
-        )
+    # ---- 7) Decision path ----
+    strategy_mode = str(getattr(cfg, "strategy_mode", "trend_breakout") or "trend_breakout").lower()
+    approved_side = ""
+    breakout_key = ""
+    news_related = False
 
-    sur = news.surprise
-    if news.surprise_active and sur is not None:
-        st = OK if sur.gold_bias in ("bullish", "bearish") else (
-            WARN if sur.surprise == "inline" else PARTIAL
-        )
-        diag.step(
-            "SURPRISE", st,
-            f"event={sur.event_name} actual={fmt_num(sur.actual, 4)} "
-            f"forecast={fmt_num(sur.forecast, 4)} Δ={fmt_num(sur.delta, 4)} "
-            f"class={sur.surprise} polarity={sur.polarity} "
-            f"gold_bias={sur.gold_bias} age_min={fmt_num(sur.minutes_since_release, 1)} "
-            f"reason={sur.reason}",
-        )
-    else:
-        diag.step(
-            "SURPRISE", SKIP,
-            f"no high-impact actual in reaction window "
-            f"({cfg.surprise_reaction_minutes}m) — macro-only bias path",
-        )
-
-    if not macros.data_valid:
-        diag.step(
-            "MACROS.BIAS", FAIL if "stale" in (macros.reason or "") else PARTIAL,
-            f"INVALID — {macros.reason} "
-            f"dxy_age={fmt_num(macros.dxy_age_minutes, 0)}m "
-            f"yield_age={fmt_num(macros.yield_age_minutes, 0)}m",
-        )
-    else:
-        diag.step(
-            "MACROS.BIAS", OK,
-            f"dxy={macros.dxy_direction}({fmt_num(macros.dxy_change_pct, 4)}%) "
-            f"yield={macros.yield_direction}({fmt_num(macros.yield_change_bps, 2)}bps) "
-            f"real_yield={macros.real_yield_direction} "
-            f"as_of={macros.effective_as_of_utc or '-'} "
-            f"→ combined_bias={decision.bias}",
-        )
-
-    sig_meta = (decision.signal.meta if decision.signal else {}) or {}
-    diag.step(
-        "SIGNAL",
-        OK if decision.decision in ("BUY", "SELL") else INFO,
-        f"decision={decision.decision} reason={decision.reason} bias={decision.bias} "
-        f"macro_bias={sig_meta.get('macro_bias', '-')} "
-        f"bias_reason={sig_meta.get('bias_reason', '-')} "
-        f"breakout_key={sig_meta.get('breakout_key', '-')}",
-    )
-
-    if decision.decision == "NO_TRADE":
-        diag.step("RISK.PLAN", SKIP, "no trade signal — plan not built")
-        diag.step("EXECUTION", SKIP, "no order submitted")
-        if quote_degraded:
-            diag.step("NOTE", WARN, "quotes degraded — entries would be blocked")
-        diag.end()
-        return
-
-    # Block NEW entries on degraded/crossed/missing quotes (still monitored above).
-    if quote_degraded or quote_failed or bid is None or ask is None or ask < bid:
-        diag.step(
-            "RISK.PLAN", FAIL,
-            "quote_degraded_block_entry — need live bid/ask before BUY/SELL",
-        )
-        diag.step("EXECUTION", SKIP, "entry blocked (incomplete quote)")
-        diag.end()
-        return
-    # Session / entry-cutoff gate (exchange-local Asia/Kolkata).
-    if bool(getattr(cfg, "enforce_session_hours", True)):
-        if not _in_entry_window(now, cfg):
-            diag.step(
-                "RISK.PLAN", FAIL,
-                f"outside_session_or_past_cutoff "
-                f"open={cfg.market_open} cutoff={cfg.entry_cutoff} close={cfg.market_close}",
+    if strategy_mode == "trend_breakout":
+        # Market snapshot (5m + 15m completed candles; MCX only for trading)
+        from market_snapshot import ContractInfo
+        if contract_info is not None:
+            try:
+                cinfo = contract_from_mcx_context(contract_info, cfg)
+            except Exception:  # noqa: BLE001
+                cinfo = ContractInfo(
+                    symbol=cfg.gold_symbol, instrument_key=instrument_key,
+                    lot_size=int(cfg.lot_size), tick_size=float(tick_size),
+                    value_per_price_unit=float(cfg.value_per_price_unit),
+                )
+        else:
+            cinfo = ContractInfo(
+                symbol=cfg.gold_symbol, instrument_key=instrument_key,
+                lot_size=int(cfg.lot_size), tick_size=float(tick_size),
+                value_per_price_unit=float(cfg.value_per_price_unit),
             )
-            diag.step("EXECUTION", SKIP, "entry blocked (session)")
+        mon_snap = PRODUCER_HUB.latest_monitor_snap() if PRODUCER_HUB.started else None
+        snap = build_engine_snapshot(
+            cfg=cfg, contract=cinfo, raw_1m=raw,
+            bid=bid, ask=ask, ltp=ltp, now_utc=now, quote_source="upstox",
+            monitor_snap=mon_snap,
+        )
+        # Contract mismatch: monitor MCX key ≠ engine key → block entries
+        pst = PRODUCER_HUB.status() if PRODUCER_HUB.started else {}
+        if pst.get("contract_mismatch"):
+            snap.mcx_data_valid = False
+            snap.reasons.append(
+                f"monitor_contract_mismatch engine={instrument_key} "
+                f"monitor={pst.get('monitor_mcx_key')}"
+            )
+        try:
+            persist_snapshot(snap)
+        except Exception as exc:  # noqa: BLE001
+            diag.step("SNAPSHOT", WARN, f"persist failed: {exc}")
+        diag.step(
+            "SNAPSHOT",
+            OK if snap.mcx_data_valid else FAIL,
+            f"mcx_valid={snap.mcx_data_valid} q={snap.quote.valid} "
+            f"5m={snap.candles_5m.valid}({snap.candles_5m.bars}) "
+            f"15m={snap.candles_15m.valid}({snap.candles_15m.bars}) "
+            f"ctx={len(snap.context)} reasons={','.join(snap.reasons)}",
+        )
+        # Producer health: embedded monitor + news threads
+        from market_snapshot import SNAPSHOT_PATH
+        from producers import MONITOR_JSON
+        mon_age = None
+        if MONITOR_JSON.exists():
+            mon_age = max(0.0, (now - datetime.fromtimestamp(
+                MONITOR_JSON.stat().st_mtime, tz=UTC,
+            )).total_seconds())
+        mon_ok = bool(pst.get("monitor_last_ok")) and not pst.get("monitor_error")
+        diag.step(
+            "PRODUCER.MONITOR",
+            OK if mon_ok and (mon_age is None or mon_age < 180) else (
+                WARN if PRODUCER_HUB.started else PARTIAL
+            ),
+            f"cycles={pst.get('monitor_cycles', 0)} age_s={fmt_num(mon_age, 0) if mon_age is not None else 'n/a'} "
+            f"err={pst.get('monitor_error') or '-'} mismatch={pst.get('contract_mismatch')}",
+        )
+        snap_age_s: Optional[float] = None
+        if SNAPSHOT_PATH.exists():
+            snap_age_s = max(0.0, (now - datetime.fromtimestamp(
+                SNAPSHOT_PATH.stat().st_mtime, tz=UTC,
+            )).total_seconds())
+        diag.step(
+            "PRODUCER.ENGINE_SNAP",
+            OK if snap.collector_healthy and (snap_age_s is None or snap_age_s < 300)
+            else (WARN if snap_age_s is not None else FAIL),
+            f"file={SNAPSHOT_PATH.name} age_s={fmt_num(snap_age_s, 0) if snap_age_s is not None else 'n/a'} "
+            f"healthy={snap.collector_healthy}",
+        )
+
+        news_db = str(getattr(cfg, "news_db_path", "") or "") or str(ENGINE_DIR / "gold_signals.db")
+        news_a = assess_news(
+            news_db, now_utc=now,
+            freshness_minutes=float(getattr(cfg, "news_freshness_minutes", 45) or 45),
+        )
+        news_path = Path(news_db)
+        news_age_s: Optional[float] = None
+        if news_path.exists():
+            news_age_s = max(0.0, (now - datetime.fromtimestamp(
+                news_path.stat().st_mtime, tz=UTC,
+            )).total_seconds())
+        diag.step(
+            "PRODUCER.NEWS_DB",
+            OK if news_a.fresh else (WARN if news_path.exists() else PARTIAL),
+            f"path={news_path.name} age_s={fmt_num(news_age_s, 0) if news_age_s is not None else 'missing'} "
+            f"fresh={news_a.fresh} items={news_a.item_count}",
+        )
+        diag.step(
+            "NEWS.ASSESS",
+            OK if news_a.fresh and news_a.bias in ("bullish", "bearish") else (
+                WARN if news_a.fresh else PARTIAL
+            ),
+            f"bias={news_a.bias} score={news_a.score:.2f} fresh={news_a.fresh} "
+            f"conflict={news_a.conflicting} n={news_a.item_count} "
+            f"reasons={','.join(news_a.reasons)}",
+        )
+        if journal is not None:
+            journal.log_news(news_a)
+
+        msig = evaluate_market_signal(
+            snap.frame_5m if snap.frame_5m is not None else completed,
+            snap.frame_15m if snap.frame_15m is not None else pd.DataFrame(),
+            lookback=int(cfg.gold_breakout_lookback_bars),
+            atr_period=int(cfg.atr_period),
+            ema_fast=int(getattr(cfg, "trend_ema_fast", 20)),
+            ema_slow=int(getattr(cfg, "trend_ema_slow", 50)),
+            data_valid=snap.mcx_data_valid,
+        )
+        diag.step(
+            "SIGNAL",
+            OK if msig.valid else INFO,
+            f"dir={msig.direction} trend={msig.trend} brk={msig.breakout} "
+            f"regime={msig.regime} atr={fmt_num(msig.atr, 2)} id={msig.signal_id or '-'} "
+            f"reasons={','.join(msig.reasons)}",
+        )
+        if journal is not None:
+            journal.log_signal(msig)
+
+        # Calendar event blackout (reuse news engine window)
+        ev_ctx = news_engine.evaluate_news(now)
+        event_block = bool(ev_ctx.inside_block and str(cfg.news_mode).lower() == "filtered")
+        diag.step(
+            "EVENT",
+            WARN if event_block else OK,
+            f"block={event_block} nearest={ev_ctx.nearest_event_name or '-'} "
+            f"reason={ev_ctx.reason}",
+        )
+
+        session_ok = (not bool(getattr(cfg, "enforce_session_hours", True))) or _in_entry_window(now, cfg)
+        kill = KILL_SWITCH_FILE.exists()
+        gate = evaluate_entry_gates(
+            now_utc=now,
+            signal=msig,
+            news=news_a,
+            session_ok=session_ok and not _past_flatten_cutoff(now, cfg),
+            session_detail=f"open={cfg.market_open} cut={cfg.entry_cutoff} close={cfg.market_close}",
+            mcx_data_valid=snap.mcx_data_valid and not quote_degraded and not quote_failed,
+            data_detail=",".join(snap.reasons),
+            event_block_active=event_block,
+            event_detail=ev_ctx.reason,
+            broker_ok=not exe.state_corrupt and getattr(client, "auth_ok", True) is not False,
+            broker_detail="ok" if not exe.state_corrupt else "state_corrupt",
+            risk_ok=(
+                not daily_hit and not trades_hit and not consec_hit
+                and not exe.has_open_position
+            ),
+            risk_detail=(
+                "daily_loss" if daily_hit else
+                "max_trades" if trades_hit else
+                "consecutive_losses" if consec_hit else
+                ("has_position" if exe.has_open_position else "ok")
+            ),
+            emergency_halt=bool(exe.emergency_halt),
+            kill_switch=kill,
+            last_signal_id=str(exe.last_breakout_key or ""),
+            require_news_confirmation=bool(getattr(cfg, "require_news_confirmation", True)),
+        )
+        for g in gate.gates:
+            diag.step(
+                f"GATE.{g.name}",
+                OK if g.passed else FAIL,
+                g.detail,
+            )
+        diag.step(
+            "DECISION",
+            OK if gate.action in ("BUY", "SELL") else INFO,
+            f"action={gate.action} state={gate.system_state} reason={gate.reason} "
+            f"side={gate.side} sid={gate.signal_id} "
+            f"line={gate.meta.get('decision_line', '')}",
+        )
+        if journal is not None:
+            journal.log_decision(gate)
+
+        # DXY / yield latest for context row
+        dxy_last = float(dxy.iloc[-1]) if dxy is not None and len(dxy) else None
+        yld_last = float(yields.iloc[-1]) if yields is not None and len(yields) else None
+        from console_board import gate_rows_from_decision
+        _publish_board(
+            diag,
+            candles_15m=int(snap.candles_15m.bars or 0),
+            candles_5m=int(snap.candles_5m.bars or 0),
+            trend=msig.trend, breakout=msig.breakout, direction=msig.direction,
+            regime=msig.regime, atr=msig.atr, ema_fast=msig.ema_fast, ema_slow=msig.ema_slow,
+            news_bias=news_a.bias, news_score=float(news_a.score),
+            news_fresh=bool(news_a.fresh), news_items=int(news_a.item_count),
+            news_detail=",".join(news_a.reasons[:3]),
+            news_db_ok=bool(news_a.fresh or news_a.item_count),
+            monitor_ok=bool(pst.get("monitor_last_ok")) and not pst.get("monitor_error"),
+            calendar_ok=not bool(cal_unhealthy),
+            macros_ok=dxy_last is not None and yld_last is not None,
+            dxy=dxy_last, us10y=yld_last,
+            gate_rows=gate_rows_from_decision(gate),
+            decision=str(gate.action), system_state=str(gate.system_state),
+            decision_reason=str(gate.reason),
+            trades_today=int(risk.daily.trades_today),
+        )
+
+        if gate.action not in ("BUY", "SELL"):
+            diag.step("RISK.PLAN", SKIP, f"no entry — {gate.reason}")
+            diag.step("EXECUTION", SKIP, "no order submitted")
             diag.end()
             return
-    # Gold candle must be fresh enough for a new entry (not weekend leftover).
-    entry_bar_max = float(getattr(cfg, "gold_entry_max_age_minutes", 30) or 30)
-    if bar_age is not None and bar_age > entry_bar_max:
-        diag.step(
-            "RISK.PLAN", FAIL,
-            f"gold_candle_stale_for_entry age={bar_age:.0f}m > {entry_bar_max:.0f}m",
-        )
-        diag.step("EXECUTION", SKIP, "entry blocked (stale gold)")
-        diag.end()
-        return
-    if exe.state_corrupt:
-        diag.step("EXECUTION", FAIL, "state_corrupt — operator recovery required")
-        diag.end()
-        return
-    if exe.emergency_halt:
-        diag.step("EXECUTION", FAIL, "emergency_halt active — reconcile broker before new entries")
-        if cfg.is_live:
-            rep = exe.reconcile_broker(instrument_key)
-            diag.step(
-                "RECONCILE", FAIL if not rep.get("ok") else WARN,
-                f"local={rep.get('local_signed_qty')} broker={rep.get('broker_net_qty')} "
-                f"reason={rep.get('reason', 'halt')}",
+        approved_side = gate.action
+        breakout_key = gate.signal_id
+        news_related = True
+        # Use 5m completed frame for ATR plan
+        plan_candles = snap.frame_5m if snap.frame_5m is not None and not snap.frame_5m.empty else completed
+    else:
+        # ---- legacy_macro path (retained, disabled by default) ----
+        try:
+            decision = news_engine.decide(
+                now_utc=now, dxy=dxy, yields=yields, gold_candles=completed,
+                daily_loss_limit_reached=daily_hit,
+                has_open_position=exe.has_open_position,
+                last_breakout_key=exe.last_breakout_key,
+                gold_data_valid=gold_ok,
             )
+        except Exception as exc:  # noqa: BLE001
+            diag.step("DECISION", FAIL, f"news_engine.decide crashed: {exc}")
+            diag.end()
+            return
+        news = decision.news
+        diag.step(
+            "SIGNAL",
+            OK if decision.decision in ("BUY", "SELL") else INFO,
+            f"legacy decision={decision.decision} reason={decision.reason} bias={decision.bias}",
+        )
+        if decision.decision == "NO_TRADE":
+            diag.step("EXECUTION", SKIP, "legacy NO_TRADE")
+            diag.end()
+            return
+        if quote_degraded or quote_failed or bid is None or ask is None:
+            diag.step("EXECUTION", SKIP, "quote degraded")
+            diag.end()
+            return
+        if bool(getattr(cfg, "enforce_session_hours", True)) and not _in_entry_window(now, cfg):
+            diag.step("EXECUTION", SKIP, "session")
+            diag.end()
+            return
+        if exe.emergency_halt or exe.state_corrupt or KILL_SWITCH_FILE.exists():
+            exe.emergency_halt = True
+            diag.step("EXECUTION", FAIL, "halt/corrupt/kill")
+            diag.end()
+            return
+        approved_side = decision.decision
+        breakout_key = str((decision.signal.meta if decision.signal else {}) or {}).get("breakout_key") or ""
+        news_related = bool(news.inside_block) or bool(news.surprise_active)
+        plan_candles = completed
+
+    if exe.emergency_halt or exe.state_corrupt:
+        diag.step("EXECUTION", FAIL, "halt or corrupt — no entry")
         diag.end()
         return
-
-    from config import KILL_SWITCH_FILE
     if KILL_SWITCH_FILE.exists():
         exe.emergency_halt = True
-        diag.step("EXECUTION", FAIL, f"KILL_SWITCH active ({KILL_SWITCH_FILE.name})")
+        diag.step("EXECUTION", FAIL, "KILL_SWITCH active")
         diag.end()
         return
-
-    if cal_mgr and news.nearest_event_id:
-        cal_mgr.mark_signal_time(news.nearest_event_id, now)
-        diag.step("LATENCY", INFO, f"signal timestamp recorded for event={news.nearest_event_id}")
+    if quote_degraded or quote_failed or bid is None or ask is None or ask < bid:
+        diag.step("EXECUTION", SKIP, "incomplete quote")
+        diag.end()
+        return
 
     # ---- 8) Risk plan ----
     try:
         plan = risk.build_trade_plan(
-            decision.decision, bid, ask, completed, spread_points=spread,
+            approved_side, bid, ask, plan_candles, spread_points=spread,
         )
         if plan.rejected:
             diag.step(
                 "RISK.PLAN", FAIL,
-                f"REJECTED — {plan.reject_reason} side={decision.decision} "
+                f"REJECTED — {plan.reject_reason} side={approved_side} "
                 f"spread={fmt_num(spread, 2)}",
             )
+            if journal is not None:
+                journal.log_risk("plan_rejected", plan.reject_reason)
             diag.step("EXECUTION", SKIP, "plan rejected — no order")
+            _publish_board(
+                diag, plan_side=approved_side, plan_entry=getattr(plan, "entry_price", None),
+                plan_stop=getattr(plan, "stop_price", None),
+                plan_target=getattr(plan, "target_price", None),
+                plan_rejected=str(plan.reject_reason),
+                decision="WAIT", decision_reason=f"plan rejected: {plan.reject_reason}",
+            )
             diag.end()
             return
         diag.step(
@@ -1768,22 +2346,26 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
             f"SL={fmt_num(plan.stop_price, 2)} TP={fmt_num(plan.target_price, 2)} "
             f"risk_budget={fmt_num(plan.risk_budget, 2)}",
         )
+        _publish_board(
+            diag, plan_side=plan.side, plan_entry=plan.entry_price,
+            plan_stop=plan.stop_price, plan_target=plan.target_price,
+        )
     except Exception as exc:  # noqa: BLE001
         diag.step("RISK.PLAN", FAIL, f"{exc}")
         diag.end()
         return
 
     # ---- 9) Execution ----
-    breakout_key = str(sig_meta.get("breakout_key") or "")
     try:
         trade = exe.open_trade(
             plan, now, instrument_key=instrument_key,
             breakout_key=breakout_key,
-            news_related=bool(news.inside_block) or bool(news.surprise_active),
+            news_related=news_related,
             tick_size=tick_size,
         )
         if trade is None:
             diag.step("EXECUTION", WARN, "open_trade returned None (rejected by execution layer)")
+            _publish_board(diag, decision_reason="order not accepted by execution layer")
         else:
             diag.step(
                 "EXECUTION", OK,
@@ -1791,8 +2373,34 @@ def _cycle(client: UpstoxClient, instrument_key: str, news_engine: NewsDecisionE
                 f"@ {fmt_num(getattr(trade, 'entry_price', plan.entry_price), 2)} "
                 f"order_id={getattr(trade, 'order_id', '-')}",
             )
+            _publish_board(
+                diag, decision=plan.side, system_state="ORDER_PENDING",
+                decision_reason=f"opened {plan.side} @ {getattr(trade, 'entry_price', plan.entry_price)}",
+                has_position=True, position_side=plan.side,
+                position_entry=getattr(trade, "entry_price", plan.entry_price),
+                position_stop=getattr(trade, "stop_price", plan.stop_price),
+                position_target=getattr(trade, "target_price", plan.target_price),
+                trades_today=int(risk.daily.trades_today),
+            )
+            if journal is not None:
+                journal.log_order(
+                    order_id=str(getattr(trade, "order_id", "") or ""),
+                    side=plan.side, quantity=int(plan.quantity),
+                    status="opened",
+                    payload={"signal_id": breakout_key},
+                )
+                journal.log_position("open", trade)
+                journal.log_fill(
+                    order_id=str(getattr(trade, "order_id", "") or ""),
+                    side=plan.side, quantity=int(getattr(trade, "quantity", plan.quantity)),
+                    price=float(getattr(trade, "entry_price", plan.entry_price)),
+                    tag="entry",
+                )
     except Exception as exc:  # noqa: BLE001
         diag.step("EXECUTION", FAIL, f"order failed: {exc}")
+        if journal is not None:
+            journal.log_risk("order_failed", str(exc))
+        _publish_board(diag, decision_reason=f"order failed: {exc}")
 
     diag.end()
 
@@ -1873,15 +2481,20 @@ class StepResult:
 
 
 class CycleDiagnostics:
-    """Collects and prints a full health board for one engine cycle."""
+    """Collects cycle health; compact mode prints a single console board."""
+
+    # Set False via --verbose for the old line-by-line audit dump
+    compact_default: bool = True
 
     def __init__(self, cycle_no: int, now_utc: Optional[datetime] = None,
-                 mode: str = "paper"):
+                 mode: str = "paper", *, compact: Optional[bool] = None):
         self.cycle_no = cycle_no
         self.now_utc = now_utc or datetime.now(tz=UTC)
         self.mode = mode
         self.steps: list[StepResult] = []
         self._step_no = 0
+        self.compact = self.compact_default if compact is None else bool(compact)
+        self.board: Any = None  # console_board.BoardView
 
     def step(self, name: str, status: str, detail: str, **data: Any) -> StepResult:
         self._step_no += 1
@@ -1892,6 +2505,8 @@ class CycleDiagnostics:
             data=data,
         )
         self.steps.append(result)
+        if self.compact and self.cycle_no > 0:
+            return result
         line = f"  [{result.step:<22}] {result.status:<8} {result.detail}"
         if result.status == FAIL:
             log.error(line)
@@ -1902,6 +2517,8 @@ class CycleDiagnostics:
         return result
 
     def begin(self) -> None:
+        if self.compact and self.cycle_no > 0:
+            return
         stamp = self.now_utc.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
         bar = "=" * 78
         log.info(bar)
@@ -1919,6 +2536,15 @@ class CycleDiagnostics:
         for s in self.steps:
             if _STATUS_ORDER.get(s.status, 9) < _STATUS_ORDER.get(worst, 9):
                 worst = s.status
+
+        if self.compact and self.cycle_no > 0 and self.board is not None:
+            try:
+                from console_board import print_board
+                print_board(self.board, clear=True)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("console board render failed: %s", exc)
+            return counts
+
         bar = "-" * 78
         log.info(bar)
         log.info(
@@ -2518,6 +3144,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override fixed lots (default from config.json: 1)")
     p.add_argument("--once", action="store_true", help="Single paper/live cycle then exit")
     p.add_argument(
+        "--no-producers", action="store_true",
+        help="Do not start embedded monitor-gold / commodity-events threads",
+    )
+    p.add_argument(
         "--audit", action="store_true",
         help="Audit/validation run: probe every component (safe on weekends; "
              "session-closed → WARN, broken wiring → FAIL)",
@@ -2566,6 +3196,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.selftest:
         return run_selftest()
+
+    # Compact dashboard unless --verbose (keeps the old step-by-step audit dump)
+    CycleDiagnostics.compact_default = not bool(args.verbose)
 
     if args.audit:
         cfg = build_cfg(args)
@@ -2671,8 +3304,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     cfg = build_cfg(args)
     log.info("Loaded config %s -> mode=%s fixed_lots=%s",
              args.config, cfg.mode, cfg.fixed_lots)
-    return run_paper_or_live(cfg, once=args.once)
+    try:
+        return run_paper_or_live(cfg, once=args.once)
+    except KeyboardInterrupt:
+        log.info("Interrupted")
+        return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

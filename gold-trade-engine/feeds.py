@@ -783,6 +783,34 @@ def _save_series_csv(series: pd.Series, path: Path, value_col: str) -> None:
     df.to_csv(path, index=False)
 
 
+def series_observation_time(series: pd.Series) -> Optional[datetime]:
+    """UTC timestamp of the last observation in a macro series (not fetch time)."""
+    if series is None or getattr(series, "empty", True):
+        return None
+    try:
+        t = pd.Timestamp(series.index[-1]).to_pydatetime()
+        if t.tzinfo is None:
+            return t.replace(tzinfo=UTC)
+        return t.astimezone(UTC)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def series_observation_age_minutes(
+    series: pd.Series, now_utc: Optional[datetime] = None,
+) -> Optional[float]:
+    """Age of the last observation vs wall clock. Future stamps → negative."""
+    obs = series_observation_time(series)
+    if obs is None:
+        return None
+    now_utc = now_utc or datetime.now(tz=UTC)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=UTC)
+    else:
+        now_utc = now_utc.astimezone(UTC)
+    return (now_utc - obs).total_seconds() / 60.0
+
+
 def load_macros(
     dxy_csv: str = "",
     yield_csv: str = "",
@@ -794,49 +822,75 @@ def load_macros(
     Load DXY + US10Y for the decision engine.
 
     Order: explicit CSV → on-disk Yahoo cache → live Yahoo fetch (if allowed).
+
+    Yahoo is research-oriented. Freshness for trading is always the observation
+    timestamp on the series index — never the wall-clock time of this load.
+    Loading a cache does NOT mark macros as freshly fetched.
     """
     dxy = load_dxy(dxy_csv) if dxy_csv else pd.Series(dtype=float)
     yld = load_yield(yield_csv) if yield_csv else pd.Series(dtype=float)
+    fetched_live = False
 
     if dxy.empty and DEFAULT_DXY_CACHE.exists():
         try:
             dxy = load_dxy(str(DEFAULT_DXY_CACHE))
-            log.info("Loaded DXY cache (%d pts) from %s", len(dxy), DEFAULT_DXY_CACHE)
+            age = series_observation_age_minutes(dxy)
+            log.info(
+                "Loaded DXY cache (%d pts) from %s last_obs_age=%s",
+                len(dxy), DEFAULT_DXY_CACHE,
+                f"{age:.0f}m" if age is not None else "unknown",
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("DXY cache unreadable: %s", exc)
 
     if yld.empty and DEFAULT_YIELD_CACHE.exists():
         try:
             yld = normalize_tnx_yield(load_yield(str(DEFAULT_YIELD_CACHE)))
-            log.info("Loaded US10Y cache (%d pts) from %s", len(yld), DEFAULT_YIELD_CACHE)
+            age = series_observation_age_minutes(yld)
+            log.info(
+                "Loaded US10Y cache (%d pts) from %s last_obs_age=%s",
+                len(yld), DEFAULT_YIELD_CACHE,
+                f"{age:.0f}m" if age is not None else "unknown",
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("US10Y cache unreadable: %s", exc)
 
     if allow_yahoo:
         if dxy.empty:
-            log.info("Fetching DXY from Yahoo…")
+            log.info("Fetching DXY from Yahoo (research feed)…")
             dxy = fetch_dxy_yahoo()
             if persist_cache and not dxy.empty:
                 _save_series_csv(dxy, DEFAULT_DXY_CACHE, "dxy")
                 log.info("Cached DXY → %s (%d pts)", DEFAULT_DXY_CACHE, len(dxy))
+            if not dxy.empty:
+                fetched_live = True
         if yld.empty:
-            log.info("Fetching US10Y from Yahoo…")
+            log.info("Fetching US10Y from Yahoo (research feed)…")
             yld = fetch_us10y_yahoo()
             if persist_cache and not yld.empty:
                 _save_series_csv(yld, DEFAULT_YIELD_CACHE, "us10y_yield_pct")
                 log.info("Cached US10Y → %s (%d pts)", DEFAULT_YIELD_CACHE, len(yld))
+            if not yld.empty:
+                fetched_live = True
 
-    if not dxy.empty and not yld.empty:
-        mark_macros_fresh()
+    # Only record a fetch attempt time after a live Yahoo pull — never for cache hits.
+    if fetched_live:
+        mark_macros_fetch_attempted()
     return dxy, yld
 
 
 _LAST_MACRO_FETCH_UTC: Optional[datetime] = None
 
 
-def mark_macros_fresh(when: Optional[datetime] = None) -> None:
+def mark_macros_fetch_attempted(when: Optional[datetime] = None) -> None:
+    """Record wall-clock of a Yahoo HTTP attempt (rate-limit only — not observation age)."""
     global _LAST_MACRO_FETCH_UTC
     _LAST_MACRO_FETCH_UTC = when or datetime.now(tz=UTC)
+
+
+# Back-compat alias — MUST NOT be used to claim observation freshness.
+def mark_macros_fresh(when: Optional[datetime] = None) -> None:
+    mark_macros_fetch_attempted(when)
 
 
 def refresh_macros(
@@ -848,31 +902,19 @@ def refresh_macros(
     prefer_csv: bool = False,
 ) -> tuple[pd.Series, pd.Series]:
     """
-    Refresh Yahoo macros when observations (not just fetch attempts) are stale.
+    Refresh Yahoo macros when *observations* are stale (not fetch-attempt time).
 
-    ``prefer_csv=True`` never replaces configured CSV series with Yahoo (P0 #23).
-    Freshness is based on the last observation timestamp in each series.
+    ``prefer_csv=True`` never replaces configured CSV series with Yahoo.
+    Yahoo remains a research-oriented source; entry eligibility still uses
+    ``macro_trade_max_age_minutes`` against observation timestamps.
     """
     global _LAST_MACRO_FETCH_UTC
     if not allow_yahoo or prefer_csv:
         return dxy, yields
     now = datetime.now(tz=UTC)
 
-    def _obs_age_min(series: pd.Series) -> Optional[float]:
-        if series is None or series.empty:
-            return None
-        try:
-            t = pd.Timestamp(series.index[-1]).to_pydatetime()
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=UTC)
-            else:
-                t = t.astimezone(UTC)
-            return (now - t).total_seconds() / 60.0
-        except Exception:  # noqa: BLE001
-            return None
-
-    dxy_age = _obs_age_min(dxy)
-    yld_age = _obs_age_min(yields)
+    dxy_age = series_observation_age_minutes(dxy, now)
+    yld_age = series_observation_age_minutes(yields, now)
     # Skip fetch if both observations are still within max_age
     if (
         dxy_age is not None and yld_age is not None
@@ -880,7 +922,7 @@ def refresh_macros(
         and dxy_age < max_age_minutes and yld_age < max_age_minutes
     ):
         return dxy, yields
-    # Also respect a minimum wall-clock gap between Yahoo calls
+    # Rate-limit Yahoo HTTP attempts (independent of observation freshness)
     if _LAST_MACRO_FETCH_UTC is not None:
         since = (now - _LAST_MACRO_FETCH_UTC).total_seconds() / 60.0
         if since < min(5.0, max_age_minutes):
@@ -888,15 +930,23 @@ def refresh_macros(
 
     fresh_dxy = fetch_dxy_yahoo()
     fresh_yld = fetch_us10y_yahoo()
-    _LAST_MACRO_FETCH_UTC = now
+    mark_macros_fetch_attempted(now)
     if not fresh_dxy.empty:
         dxy = fresh_dxy
         _save_series_csv(dxy, DEFAULT_DXY_CACHE, "dxy")
-        log.info("Refreshed DXY (%d pts, last=%s)", len(dxy), dxy.index[-1])
+        log.info(
+            "Refreshed DXY (%d pts, last_obs=%s age=%.0fm)",
+            len(dxy), dxy.index[-1],
+            series_observation_age_minutes(dxy, now) or -1,
+        )
     if not fresh_yld.empty:
         yields = fresh_yld
         _save_series_csv(yields, DEFAULT_YIELD_CACHE, "us10y_yield_pct")
-        log.info("Refreshed US10Y (%d pts, last=%s)", len(yields), yields.index[-1])
+        log.info(
+            "Refreshed US10Y (%d pts, last_obs=%s age=%.0fm)",
+            len(yields), yields.index[-1],
+            series_observation_age_minutes(yields, now) or -1,
+        )
     return dxy, yields
 
 
@@ -1600,16 +1650,26 @@ class CalendarFeedManager:
 
     def start(self) -> list[EconomicEvent]:
         """Load baseline + API snapshot; start stream if available."""
-        self.load_calendar()
+        n_local = self.load_calendar()
+        # Explicit CSV primary: local load counts as a successful refresh baseline.
+        # auto/remote: local seed alone must NOT satisfy calendar_max_age_hours.
+        if self.primary == "csv" and n_local > 0:
+            now = datetime.now(tz=UTC)
+            self.last_successful_refresh = now
+            self._last_schedule_refresh = now
+            self.stats["last_refresh_healthy"] = True
+            self.stats["primary"] = "csv"
         self.refresh_schedule(force=True)
         if self.enable_stream:
             self.connect_calendar_stream()
         self.persist()
         log.info(
-            "CalendarFeedManager ready: %d events | primary=%s stream=%s | %s",
+            "CalendarFeedManager ready: %d events | primary=%s stream=%s | "
+            "last_ok=%s | %s",
             len(self.events),
             self.stats.get("primary"),
             self._stream_started,
+            self.last_successful_refresh.isoformat() if self.last_successful_refresh else "none",
             "TE+FMP keys from env.txt" if (self.te.configured() or self.fmp.configured())
             else "no TE/FMP keys — using local CSV only",
         )
@@ -1741,30 +1801,51 @@ class CalendarFeedManager:
         provider_order = self._provider_order()
         primary_ok = False
         primary_name = ""
+        remote_attempted = False
+        remote_ok = False
         for name in provider_order:
             if name == "trading_economics" and self.te.configured():
+                remote_attempted = True
                 primary_events = self.te.fetch_calendar(start, end)
                 primary_name = "trading_economics"
                 primary_ok = bool(primary_events)
                 if primary_ok:
+                    remote_ok = True
                     self.stats["primary"] = primary_name
                     break
                 log.warning("TE calendar fetch returned 0 events — trying next provider")
                 continue
             if name == "fmp" and self.fmp.configured():
+                remote_attempted = True
                 primary_events = self.fmp.fetch_calendar(start, end)
                 primary_name = "fmp"
                 primary_ok = bool(primary_events)
                 if primary_ok:
+                    remote_ok = True
                     self.stats["primary"] = primary_name
                     break
                 log.warning("FMP calendar fetch returned 0 events — trying next provider")
                 continue
             if name == "csv":
-                # CSV is local seed; treat as ok only if we already have / load events
+                # Re-load local CSV; CSV fallback after failed remote is NOT a healthy refresh
                 primary_name = "csv"
                 self.stats["primary"] = "csv"
-                primary_ok = True  # local file path — events may already be loaded
+                csv_n = 0
+                try:
+                    if self.local_calendar_path and Path(self.local_calendar_path).exists():
+                        from_csv = load_calendar(self.local_calendar_path)
+                        primary_events = from_csv
+                        csv_n = len(from_csv)
+                    elif not primary_events and self.events:
+                        csv_n = len(self.events)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("CSV calendar reload failed: %s", exc)
+                    csv_n = 0
+                # Explicit primary=csv → healthy when file has events.
+                # auto/remote fallback to CSV → keep events but do NOT mark healthy.
+                primary_ok = csv_n > 0 and (
+                    self.primary == "csv" or not remote_attempted
+                )
                 break
 
         # Secondary for comparison / fill gaps
@@ -1785,24 +1866,28 @@ class CalendarFeedManager:
             self.events = merged
             count = len(self.events)
 
-        # P0 #16: only mark successful refresh when provider returned events
-        # (or CSV primary with non-empty in-memory schedule). Empty/failed
-        # remote fetch must NOT reset freshness clock.
-        fetch_healthy = primary_ok and (count > 0) and (
-            bool(primary_events) or primary_name == "csv"
+        # Freshness clock advances only on a real successful provider fetch:
+        # - remote provider returned events, OR
+        # - CSV path when primary is explicitly csv, OR no remote was attempted
+        # Failed remote + leftover CSV must NOT reset the clock.
+        csv_ok = (
+            primary_name == "csv" and count > 0
+            and (self.primary == "csv" or not remote_attempted)
         )
+        fetch_healthy = bool(count > 0) and (remote_ok or csv_ok)
         self.stats["last_refresh_healthy"] = fetch_healthy
         self.stats["last_refresh_primary"] = primary_name
         self.stats["last_refresh_event_count"] = count
+        self.stats["remote_ok"] = remote_ok
         self.stats["schedule_refreshes"] = int(self.stats.get("schedule_refreshes", 0)) + 1
         if fetch_healthy:
             self._last_schedule_refresh = now
             self.last_successful_refresh = now
         else:
             log.warning(
-                "Schedule refresh unhealthy: primary=%s fetched=%d total=%d — "
-                "freshness clock NOT updated",
-                primary_name, len(primary_events), count,
+                "Schedule refresh unhealthy: primary=%s fetched=%d total=%d "
+                "remote_ok=%s — freshness clock NOT updated (stale events may remain)",
+                primary_name, len(primary_events), count, remote_ok,
             )
         self.persist()
         log.info(
@@ -1810,6 +1895,46 @@ class CalendarFeedManager:
             count, self.stats.get("primary"), self.stats.get("secondary"), fetch_healthy,
         )
         return count
+
+    def calendar_freshness(
+        self, now_utc: Optional[datetime] = None, *, max_age_hours: float = 12.0,
+    ) -> dict[str, Any]:
+        """
+        Authoritative freshness report for entry gating.
+
+        ``ok`` is False when there has never been a successful refresh, the
+        last success is older than ``max_age_hours``, the in-memory schedule is
+        empty, or the last refresh was marked unhealthy.
+        """
+        now_utc = now_utc or datetime.now(tz=UTC)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=UTC)
+        else:
+            now_utc = now_utc.astimezone(UTC)
+        last = self.last_successful_refresh
+        events_n = len(self.snapshot())
+        age_h: Optional[float] = None
+        if last is not None:
+            lt = last if last.tzinfo else last.replace(tzinfo=UTC)
+            age_h = (now_utc - lt.astimezone(UTC)).total_seconds() / 3600.0
+        reasons: list[str] = []
+        if events_n < 1:
+            reasons.append("empty_schedule")
+        if last is None:
+            reasons.append("never_refreshed_successfully")
+        elif age_h is not None and age_h > float(max_age_hours):
+            reasons.append(f"age_{age_h:.1f}h_gt_max_{float(max_age_hours):.1f}h")
+        if self.stats.get("last_refresh_healthy") is False and last is None:
+            reasons.append("last_refresh_unhealthy")
+        return {
+            "ok": not reasons,
+            "age_hours": age_h,
+            "max_age_hours": float(max_age_hours),
+            "event_count": events_n,
+            "last_successful_refresh": last.isoformat() if last else None,
+            "primary": self.stats.get("primary"),
+            "reasons": reasons,
+        }
 
     def poll_near_release(self, now_utc: Optional[datetime] = None) -> int:
         """
