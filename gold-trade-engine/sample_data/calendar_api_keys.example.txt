@@ -1,4 +1,0 @@
-# Copy these keys into the repo-root env.txt (NOT into this folder).
-TRADING_ECONOMICS_KEY=your_te_key
-TRADING_ECONOMICS_SECRET=your_te_secret
-FMP_API_KEY=your_fmp_key

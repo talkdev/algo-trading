@@ -58,7 +58,7 @@
 #  -----
 #     python backtest_engine.py
 #         Default: every NSE trading day from 2026-09-08 through today (IST),
-#         skipping weekends and nse_holidays.json. Up to 5 days in parallel
+#         skipping weekends and nse_holidays.json. Up to 10 days in parallel
 #         (queued); results print only after every day finishes.
 #         Console output is ONLY the per-day trade report blocks plus the
 #         daily-profit summary table.
@@ -117,7 +117,7 @@ from core import (  # noqa: E402
 DEFAULT_BACKTEST_START = date(2026, 9, 8)
 # Cap concurrent day processes so a long range does not spawn one worker per
 # session (memory / disk thrash). Remaining days queue until a slot frees.
-PARALLEL_DAY_WORKERS = 5
+PARALLEL_DAY_WORKERS = 10
 
 # The engine modules are imported lazily inside build_engines() so that the
 # simulated clock is installed before any of them capture a timestamp.
