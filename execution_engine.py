@@ -1513,6 +1513,27 @@ class ExecutionEngine:
             )
         return round(brokerage_pts + pct_pts + spread_pts, 3)
 
+    def _credit_capture_covers_friction(
+        self,
+        entry_credit: float,
+        liq_premium: float,
+        open_legs: List[dict],
+        chain: dict,
+        min_frac: float = 0.0,
+    ) -> bool:
+        """True when a credit harvest is still green after round-trip costs.
+
+        Scratch rotations and early time-targets were booking 2–4% of credit
+        then paying a second ticket's costs — the close printed CLOSE_TARGET
+        while net rupees were red.
+        """
+        if float(entry_credit or 0.0) <= 0:
+            return False
+        achieved = float(entry_credit) - float(liq_premium)
+        rt = self._round_trip_cost_pts(open_legs, chain)
+        need = max(float(rt or 0.0), float(entry_credit) * max(min_frac, 0.0))
+        return achieved + 1e-12 >= need
+
     def _compute_current_premium(
         self, legs: List[dict], chain: dict
     ) -> float:
@@ -2485,8 +2506,38 @@ class ExecutionEngine:
             # requiring mat alone scalp-exited Oct6 LONG_CALL at +1pt while
             # ADX printed 41-44 UPTREND and spot ran another +100pt.
             _mat_ok = _mat or _adx >= _adx_strong
+            try:
+                _dn_used = float(_sig.get("day_down_used_pct") or 0.0)
+            except (TypeError, ValueError):
+                _dn_used = 0.0
+            try:
+                _up_used = float(_sig.get("day_up_used_pct") or 0.0)
+            except (TypeError, ValueError):
+                _up_used = 0.0
+            # Strong ADX + spent session on our side is still the trend even
+            # when the 15-min label flickers RANGE (0DTE dumps were being
+            # peak-faded at +10% with the move unfinished).
+            try:
+                _esp = float(position.get("entry_spot") or 0.0)
+            except (TypeError, ValueError):
+                _esp = 0.0
+            _spent_with_us = (
+                (_dir < 0 and _dn_used >= 50.0)
+                or (_dir > 0 and _up_used >= 50.0)
+            ) and _adx >= 22.0
+            _follow_through = (
+                _adx >= 18.0
+                and _esp > 0
+                and spot > 0
+                and (
+                    (_dir < 0 and spot <= _esp - 20.0)
+                    or (_dir > 0 and spot >= _esp + 20.0)
+                )
+            )
             _persist = bool(
-                _dir != 0 and _trend_side_ok and _brk_ok and _mat_ok and _adx >= _death
+                _dir != 0 and _brk_ok and _adx >= _death
+                and (_mat_ok or _follow_through)
+                and (_trend_side_ok or _spent_with_us or _follow_through)
             )
         except Exception:
             _persist = False
@@ -2658,7 +2709,17 @@ class ExecutionEngine:
                 # there scalp-exits runners (Oct6 LONG_CALL +1pt / 17m while
                 # spot continued +100pt). Once soft HWM exists or persist
                 # dies, free-trade BE is correct.
+                # Morning: even an armed BE lock is not allowed to harvest
+                # while the directional thesis is still live — 0DTE dumps
+                # were being scaled out at +10% with 200pts of trend left.
                 if (
+                    _persist
+                    and (not _trend_against)
+                    and current_time < dtime(13, 0)
+                ):
+                    new_level = None
+                    ratchet_reason = None
+                elif (
                     _persist
                     and (not activated)
                     and (not _hwm_soft_ok)
@@ -2748,6 +2809,11 @@ class ExecutionEngine:
             and _peak_aged
             and _faded
             and _mature
+            and not (
+                _persist
+                and (not _trend_against)
+                and current_time < dtime(13, 0)
+            )
         ):
             self.logger.info(
                 f"DEBIT PEAK-FADE HARVEST: {position['strategy_name']} "
@@ -3855,14 +3921,18 @@ class ExecutionEngine:
                     entry_credit > 0
                     and (entry_credit - liq_premium) >= 0.15 * entry_credit
                 )
+                _is_sym = ("CONDOR" in _rot_name or "BUTTERFLY" in _rot_name)
                 _fade_scratch = (
                     (_rot_fade_label or _open_low_at_high or _open_high_at_low)
                     and entry_credit > 0
                     and liq_premium <= entry_credit * 1.10
+                    and (
+                        _is_sym
+                        or self._credit_capture_covers_friction(
+                            entry_credit, liq_premium, open_legs, chain
+                        )
+                    )
                 )
-                # IC→trend: only when underwater. IC→two-way fade: banked or
-                # scratch is enough — the pin already collected; the extreme
-                # is a different trade.
                 _ic_rotate = (
                     (_ic_to_trend and _underwater)
                     or (_ic_to_fade and (_banked or _fade_scratch or _underwater))
@@ -5108,6 +5178,7 @@ class ExecutionEngine:
             "Position ID":     position["position_id"][:16] + "...",
             "Hold Time (min)": f"{hold_minutes:.1f}",
             "Exit Reason":     reason,
+            "Exit Detail":     str((context or {}).get("reason_detail") or ""),
             "Exit Priority":   f"{priority} ({priority_name})",
             "Exit Premium":    f"{exit_premium:.2f}pts",
             "Entry Credit":    f"{realised_credit:.2f}pts realised "
@@ -5122,6 +5193,7 @@ class ExecutionEngine:
         self.logger.info(
             f"POSITION CLOSED: {position['strategy_name']} "
             f"reason={reason} priority={priority} "
+            f"detail={(context or {}).get('reason_detail')} "
             f"net_pnl=Rs{net_pnl_rs:.2f} result={result} "
             f"hold={hold_minutes:.1f}min"
         )

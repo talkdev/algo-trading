@@ -3729,7 +3729,7 @@ class StrategyEngine:
                     and self.PIN_LOC_LO <= _loc <= self.PIN_LOC_HI
                     and self._session_range_allows_pin(signals, _rng)
                     and vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
-                    and current_time < dtime(12, 0)
+                    and current_time < dtime(11, 0)
                 )
                 if not _pin_eligible:
                     self.logger.info(
@@ -3756,7 +3756,7 @@ class StrategyEngine:
                     and self.PIN_LOC_LO <= _loc <= self.PIN_LOC_HI
                     and self._session_range_allows_pin(signals, _rng)
                     and vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
-                    and current_time < dtime(12, 0)
+                    and current_time < dtime(11, 0)
                 )
                 if not _pin_eligible:
                     self.logger.info(
@@ -3802,7 +3802,7 @@ class StrategyEngine:
              and self._soft_location_evidence(signals, "BEAR"))
         )
         if (_pin_or and _pin_adx and _pin_loc and _pin_rng and _pin_vol
-                and current_time < dtime(12, 0) and not _event
+                and current_time < dtime(11, 0) and not _event
                 and not _grind_away):
             spot       = float(signals.get("spot") or 0)
             atm_strike = int(signals.get("atm_strike") or 0)
@@ -4776,6 +4776,8 @@ class StrategyEngine:
             # print and held the Sep25 NARROW-OR pin in range_wait.
             if adx_15 < 12.0:
                 return False, "condor_requires_flat_adx_ge_12"
+            if current_time >= dtime(11, 0):
+                return False, "condor_blocked_after_morning_pin_window"
             if bool(signals.get("two_way_auction")):
                 return False, "condor_banned_on_two_way_auction"
             # v52: pin needs a NARROW OR. MODERATE was the live IC catch-all.
