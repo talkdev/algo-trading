@@ -4038,31 +4038,12 @@ class StrategyEngine:
             return None
         _off_high = float(_hi) - _spot
         _spend_soft = self._side_day_spend_pct(signals, "BULL")
-        # Soft-extreme chase on the direct BULL map (skips range soft-lean
-        # `_away_side_allowed`). Oct14 10:56: EMA flipped BULLISH →
-        # PREMIUM_SELL_BULL BPS at loc≈0.72 / spend≈92% / off_high≈25pt
-        # → CLOSE_STOP. Pullbacks ≥40pts off the high stay open.
-        _soft_hi = float(getattr(self, "RANGE_SOFT_LEAN_HI", 0.58))
-        if (
-            _loc >= _soft_hi
-            and _spend_soft >= 70.0
-            and _off_high < 40.0
-        ):
-            try:
-                self.market_engine.state["session_upside_spent_latch"] = True
-            except Exception:
-                pass
-            return (
-                f"spent_upside_chase_no_puts_up_{_spend_soft:.0f}"
-                f"_off_{_off_high:.0f}_loc_{_loc:.2f}"
-            )
-        # Location chase — do not require sided spend% (replay day_up often
-        # sits 60-75% while the tape is still glued to the high; Sep30).
-        if _off_high >= 40.0 or _loc < 0.80:
-            return None
         # With-trend harvest (0DTE only): PREMIUM_SELL_BULL + HIGH + ADX
-        # at/above strong + quiet/crushing IV is selling puts into a
-        # continuing grind (Oct6), not the Sep30 weekly at-highs chase.
+        # at/above strong + quiet/crushing IV is a defined-risk put spread
+        # into a confirmed grind, even when spot is close to the session high.
+        # Evaluate this before the soft-extreme chase return below; otherwise
+        # the shared high-location fence makes the existing harvest exception
+        # unreachable on the strongest 0DTE trends (e.g. Oct 6, 10:56).
         try:
             _adx_h = float(signals.get("adx_15") or 0.0)
         except (TypeError, ValueError):
@@ -4083,13 +4064,39 @@ class StrategyEngine:
         _conf_h = str(signals.get("confidence_level") or "").upper()
         _iv_h = str(signals.get("iv_behavior") or "")
         _fr_h = str(signals.get("final_regime") or "")
-        if (
+        _measured_0dte_harvest = (
             _dte_h == 0
             and _fr_h == "PREMIUM_SELL_BULL"
             and _conf_h == "HIGH"
             and _adx_h >= _strong_h
             and _iv_h in ("STABLE", "DECLINING", "CRUSHING", "")
+        )
+        # Soft-extreme chase on the direct BULL map (skips range soft-lean
+        # `_away_side_allowed`). Oct14 10:56: EMA flipped BULLISH →
+        # PREMIUM_SELL_BULL BPS at loc≈0.72 / spend≈92% / off_high≈25pt
+        # → CLOSE_STOP. Pullbacks ≥40pts off the high stay open.
+        _soft_hi = float(getattr(self, "RANGE_SOFT_LEAN_HI", 0.58))
+        if (
+            _loc >= _soft_hi
+            and _spend_soft >= 70.0
+            and _off_high < 40.0
+            and not _measured_0dte_harvest
         ):
+            try:
+                self.market_engine.state["session_upside_spent_latch"] = True
+            except Exception:
+                pass
+            return (
+                f"spent_upside_chase_no_puts_up_{_spend_soft:.0f}"
+                f"_off_{_off_high:.0f}_loc_{_loc:.2f}"
+            )
+        # Location chase — do not require sided spend% (replay day_up often
+        # sits 60-75% while the tape is still glued to the high; Sep30).
+        if _off_high >= 40.0 or _loc < 0.80:
+            return None
+        # The measured 0DTE harvest bypasses location chase only; all other
+        # spent-high structures still fail closed.
+        if _measured_0dte_harvest:
             return None
         _spend = self._side_day_spend_pct(signals, "BULL")
         _why = (

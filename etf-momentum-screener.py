@@ -88,6 +88,7 @@ DEFAULT_CAPITAL_INR = 1_000_000.0  # illustrative ₹10 lakh
 DEFAULT_MIN_TURNOVER_INR = 10_000_000.0  # ₹1 crore median/day; configurable
 DEFAULT_MAX_PARTICIPATION_PCT = 2.0  # one day's hypothetical order / median daily traded value
 DEFAULT_MAX_NAME_PCT = 5.0
+DEFAULT_MIN_SCORE = 0.0  # only ETFs with residual score above this may enter the model
 DEFAULT_MAX_REBALANCE_TURNOVER_PCT = 25.0
 DEFAULT_MAX_PRICE_AGE_DAYS = 5
 # Before 18:00 IST, exclude today. At/after 18:00 request today, but do not
@@ -1164,9 +1165,11 @@ class PortfolioPlan:
 def build_portfolio_plan(
     ranked: Sequence[RankedStock], size: int, capital_inr: float, participation: float,
     name_cap: float, beta_cap: float, holdings: Optional[Mapping[str, float]],
-    max_rebalance_turnover: float,
+    max_rebalance_turnover: float, min_score: float = DEFAULT_MIN_SCORE,
 ) -> PortfolioPlan:
-    selected = select_top_candidates(ranked, size)
+    # Negative residual momentum is never bought: the ranking is kept for display,
+    # but only ETFs whose score is above min_score can be selected.
+    selected = select_top_candidates([s for s in ranked if s.result.score > min_score], size)
     model = constrained_weights(selected, capital_inr, participation, name_cap, beta_cap)
     rank = {s.symbol: i for i, s in enumerate(ranked, 1)}
     stocks = {s.symbol: s for s in ranked}
@@ -1237,6 +1240,7 @@ def print_screen(
     month_end_gap_days: int = DEFAULT_MONTH_END_GAP_DAYS, requested_start: Optional[date] = None,
     requested_end: Optional[date] = None,
     discoveries: Optional[Mapping[str, DiscoveryStamp]] = None,
+    min_score: float = DEFAULT_MIN_SCORE,
 ) -> None:
     def pct(value: float) -> str:
         return f"{100 * value:.2f}%"
@@ -1273,7 +1277,9 @@ def print_screen(
     print(f"  Each model position ≤ {participation_pct:g}% of its ETF's median daily traded value (₹{capital:,.0f} model capital).")
     print("  EOD data does not establish a future execution price or fill.")
     print("\n3) HOW THE MODEL MONEY IS DIVIDED")
-    print(f"  Choose up to {size} by score; every ETF that passes the checks is scored independently.")
+    eligible_n = sum(1 for s in ranked if s.result.score > min_score)
+    print(f"  Choose up to {size} by score from the {eligible_n} ETFs with score above {min_score:g}")
+    print(f"  (of {len(ranked)} scored). ETFs with score ≤ {min_score:g} are shown in the table but never bought.")
     print("  IV starting weights = bigger shares for ETFs with steadier unusual returns.")
     print(f"  Model cap: each ETF ≤ {name_pct:g}% of capital.")
     print(f"              conservative positive-beta exposure ≤ {beta_cap:g} per ₹1 TOTAL model capital.")
@@ -1387,6 +1393,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         help="max hypothetical per-ETF order / median daily traded value, default 2%%")
     parser.add_argument("--max-name-pct", type=float, default=DEFAULT_MAX_NAME_PCT, help="default 5%% of capital")
     parser.add_argument("--max-beta", type=float, default=BETA_UPPER_BOUND, help="positive-beta budget, default 1.3")
+    parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
+                        help="only ETFs with residual score above this may enter the model, default 0")
     parser.add_argument("--max-rebalance-turnover-pct", type=float,
                         default=DEFAULT_MAX_REBALANCE_TURNOVER_PCT,
                         help="only when holdings supplied, default 25%% of capital")
@@ -1454,6 +1462,8 @@ def run_screen(args: argparse.Namespace) -> int:
         cap_pct = optional_float(env_value(values, "MAX_MONTHLY_RESIDUAL_VOLATILITY_PCT"),
                                  DEFAULT_MAX_MONTHLY_RESIDUAL_VOLATILITY * 100,
                                  "MAX_MONTHLY_RESIDUAL_VOLATILITY_PCT")
+    if not np.isfinite(args.min_score):
+        raise ScreenerError("--min-score must be finite.")
     if not np.isfinite(cap_pct) or not 0 < cap_pct <= 100:
         raise ScreenerError("Residual-volatility cap must be finite and in (0,100] percent.")
     size = args.portfolio_size
@@ -1508,7 +1518,7 @@ def run_screen(args: argparse.Namespace) -> int:
     plan = build_portfolio_plan(
         ranked, size, args.capital_inr, args.max_participation_pct / 100,
         args.max_name_pct / 100, args.max_beta,
-        holdings, args.max_rebalance_turnover_pct / 100,
+        holdings, args.max_rebalance_turnover_pct / 100, args.min_score,
     )
     long_discoveries, report_id = record_report_discoveries(
         args.state_db_file, now_ist, as_of, plan.members,
@@ -1523,6 +1533,7 @@ def run_screen(args: argparse.Namespace) -> int:
         args.max_beta,
         holdings, args.max_rebalance_turnover_pct, names, categories, sorted(long_categories),
         args.month_end_max_gap_days, start_date, end_date, long_discoveries,
+        min_score=args.min_score,
     )
     return 0
 
