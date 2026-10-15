@@ -6,9 +6,9 @@ database.
 Dry run by default. Nothing is written unless you pass --apply, and --apply
 takes a full copy of the file first.
 
-    python3 clean_db_market_hours.py                  # show what would go
-    python3 clean_db_market_hours.py --apply          # do it
-    python3 clean_db_market_hours.py --apply --include-logs
+    python Misc/clean-db.py                  # show what would go
+    python Misc/clean-db.py --apply          # do it
+    python Misc/clean-db.py --apply --include-logs
 
 Two timestamp formats live in this database - ISO like
 '2026-09-08T09:15:23.220199+05:30' and bare '09:15:00' - so the hour and
@@ -21,6 +21,15 @@ import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from core import (  # noqa: E402
+    is_live_primary_path,
+    live_writer_lock_held,
+    open_sqlite_readonly,
+    protect_sqlite_connection,
+)
 
 # recorded market data
 MARKET = [
@@ -51,8 +60,10 @@ def hhmm(col: str) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--db", default="data/nifty_algo_v3.db")
     ap.add_argument("--open", dest="mkt_open", default="09:15")
     ap.add_argument("--close", dest="mkt_close", default="15:30")
@@ -60,6 +71,12 @@ def main() -> int:
     ap.add_argument("--include-logs", action="store_true",
                     help="also prune api_call_log and audit_log")
     ap.add_argument("--no-backup", action="store_true")
+    ap.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="VACUUM after delete. Refused on the live primary: a kill "
+             "during VACUUM rewrites the whole btree.",
+    )
     args = ap.parse_args()
 
     db = Path(args.db)
@@ -68,7 +85,7 @@ def main() -> int:
         return 1
 
     targets = MARKET + (LOGS if args.include_logs else [])
-    con = sqlite3.connect(db)
+    con = open_sqlite_readonly(db)
     present = {r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -100,6 +117,7 @@ def main() -> int:
 
     print("  " + "-" * 62)
     print(f"  {'total to delete':24}{total_out:>9}\n")
+    con.close()
 
     if not args.include_logs:
         print("  api_call_log and audit_log left alone (--include-logs to prune)\n")
@@ -112,26 +130,24 @@ def main() -> int:
         print("  dry run - nothing written. Re-run with --apply.\n")
         return 0
 
-    lock = Path(str(db) + ".writer.lock")
-    if lock.exists():
-        try:
-            fh = open(lock, "a+b")
-            import msvcrt
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-            fh.close()
-        except OSError:
-            print("  refused: the live engine holds this database. Stop main.py first.\n")
-            return 1
+    if live_writer_lock_held(db):
+        print("  refused: the live engine holds this database. Stop main.py first.\n")
+        return 1
+
+    if args.vacuum and is_live_primary_path(db):
+        print(
+            "  refused: VACUUM on the live primary. Deletes stay in WAL "
+            "until main.py's session-end RESTART checkpoint. "
+            "Pass --vacuum only on a copy, never nifty_algo_v3.db.\n"
+        )
+        return 1
 
     if not args.no_backup:
         bak = db.with_name(
             f"{db.stem}.{datetime.now():%Y%m%d_%H%M%S}.bak{db.suffix}")
-        src = sqlite3.connect(f"file:{db.resolve().as_posix()}?mode=ro", uri=True)
+        src = open_sqlite_readonly(db)
         dst = sqlite3.connect(str(bak))
         try:
-            src.execute("PRAGMA query_only=ON")
             src.backup(dst)
         finally:
             dst.close()
@@ -139,13 +155,21 @@ def main() -> int:
         print(f"  backup: {bak.name}  ({bak.stat().st_size / 1e6:.1f} MB)")
 
     before = db.stat().st_size
-    with con:
-        for table, where, _ in plan:
-            con.execute(f"DELETE FROM '{table}' WHERE {where}",
-                        (args.mkt_open, args.mkt_close))
-    print(f"  deleted {total_out} row(s); vacuuming...")
-    con.execute("VACUUM")
-    con.close()
+    wcon = sqlite3.connect(str(db), timeout=60)
+    protect_sqlite_connection(wcon)
+    try:
+        with wcon:
+            for table, where, _ in plan:
+                wcon.execute(
+                    f"DELETE FROM '{table}' WHERE {where}",
+                    (args.mkt_open, args.mkt_close),
+                )
+        print(f"  deleted {total_out} row(s)")
+        if args.vacuum:
+            print("  vacuuming...")
+            wcon.execute("VACUUM")
+    finally:
+        wcon.close()
     after = db.stat().st_size
     print(f"  {before / 1e6:.1f} MB -> {after / 1e6:.1f} MB\n")
     return 0

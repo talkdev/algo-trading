@@ -62,8 +62,8 @@
 #         (queued); results print only after every day finishes.
 #         Console output is ONLY the per-day trade report blocks plus the
 #         daily-profit summary table.
-#         If config.db_path is empty/corrupt, auto-falls back to data/per_day/.
-#     python backtest_engine.py --db data/per_day
+#         Default data: data/per_day shards (not the live primary).
+#     python backtest_engine.py --db data/nifty_algo_v3.db
 #     python backtest_engine.py --audit
 #     python backtest_engine.py --from 2026-09-08 --to 2026-09-11
 #     python backtest_engine.py --from 2026-08-01 --to 2026-09-05 \
@@ -108,7 +108,10 @@ from core import (  # noqa: E402
     RateLimiter,
     get_high_impact_events,
     get_nse_holidays,
+    is_live_primary_path,
+    live_writer_lock_held,
     load_config,
+    open_sqlite_readonly,
     today_ist,
 )
 
@@ -240,9 +243,12 @@ class HistoricalStore:
         self.path = db_path
         if not Path(db_path).exists():
             raise FileNotFoundError(db_path)
-        self.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        self.conn.execute("PRAGMA query_only=ON")
-        self.conn.row_factory = sqlite3.Row
+        if is_live_primary_path(db_path) and live_writer_lock_held(db_path):
+            raise RuntimeError(
+                f"{Path(db_path).name} is open for write by main.py. "
+                "Replay the per-day shards instead of the live primary."
+            )
+        self.conn = open_sqlite_readonly(db_path)
 
     def _q(self, sql: str, params: tuple = ()) -> List[dict]:
         try:
@@ -997,9 +1003,7 @@ class LiveAbortMirror:
         if not p.exists():
             return cls(events, window_sec=window_sec)
         try:
-            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-            conn.execute("PRAGMA query_only=ON")
-            conn.row_factory = sqlite3.Row
+            conn = open_sqlite_readonly(p)
             rows = conn.execute(
                 "SELECT strategy_name, entry_time FROM positions "
                 "WHERE trading_date=? AND status='ABORTED' "
@@ -1334,9 +1338,7 @@ def load_calibration_as_of(
         if not pth or not Path(pth).is_file():
             continue
         try:
-            con = sqlite3.connect(f"file:{pth}?mode=ro", uri=True)
-            con.execute("PRAGMA query_only=ON")
-            con.row_factory = sqlite3.Row
+            con = open_sqlite_readonly(pth)
             if cutoff:
                 row = con.execute(
                     "SELECT * FROM calibration_state WHERE is_valid=1 "
@@ -3195,9 +3197,8 @@ def _db_has_chain_snapshots(path: str) -> bool:
     if not p.is_file() or p.stat().st_size <= 0:
         return False
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con = open_sqlite_readonly(path)
         try:
-            con.execute("PRAGMA query_only=ON")
             # Full-table COUNT(*) is what fails on the half-corrupt primary
             # (LIMIT 1 / first-day GROUP BY can still succeed). Prefer that
             # probe so we fall back to per_day shards.
@@ -3226,18 +3227,13 @@ def _per_day_shard_dir(config) -> Path:
 
 
 def _default_replay_sources(config) -> List[str]:
-    """Pick the live DB when usable; otherwise the per-day shard directory.
+    """Default replay source: per-day shards, not the live primary.
 
-    Live sessions keep writing to config.db_path. When that file is empty
-    (fresh install) or SQLite-corrupt (disk full / crash mid-write), the
-    operator still has self-contained session shards under data/per_day/
-    from split_db_per_day.py. Default `python backtest_engine.py` must
-    find those without requiring a manual --db every time.
+    `python backtest_engine.py` with no --db reads data/per_day/*.db so a
+    live session and a replay cannot share nifty_algo_v3.db. Pass
+    --db data/nifty_algo_v3.db only when the engine is down and you
+    explicitly want the primary.
     """
-    primary = str(Path(config.db_path).expanduser())
-    if _db_has_chain_snapshots(primary):
-        return [primary]
-
     shard_dir = _per_day_shard_dir(config)
     shards: List[str] = []
     if shard_dir.is_dir():
@@ -3245,21 +3241,29 @@ def _default_replay_sources(config) -> List[str]:
             if _db_has_chain_snapshots(str(p)):
                 shards.append(str(p))
     if shards:
-        why = (
-            "missing or empty"
-            if not Path(primary).is_file()
-            else "unreadable or corrupt"
-        )
         print(
-            f"  [backtest] primary DB has no usable option_chain_snapshot "
-            f"({why}): {primary}"
-        )
-        print(
-            f"  [backtest] falling back to {len(shards)} session shard(s) "
-            f"under {shard_dir}"
+            f"  [backtest] using {len(shards)} session shard(s) under {shard_dir}"
         )
         return shards
-    return [primary]
+
+    primary = str(Path(config.db_path).expanduser())
+    if live_writer_lock_held(primary):
+        print(
+            "  [backtest] no per-day shards and the live primary is locked "
+            "— stop main.py or run split_db_per_day.py first"
+        )
+        return []
+    if _db_has_chain_snapshots(primary):
+        print(
+            f"  [backtest] no shards under {shard_dir}; "
+            f"using live primary {primary}"
+        )
+        return [primary]
+    print(
+        f"  [backtest] no usable shards under {shard_dir} "
+        f"and no option_chain_snapshot in {primary}"
+    )
+    return []
 
 
 def _open_store(db_paths: List[str]):
@@ -3307,15 +3311,7 @@ _ENGINE_IMPORTS = (
 
 
 def _ro_sqlite(path: Path) -> sqlite3.Connection:
-    uri = f"{Path(path).resolve().as_uri()}?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=15)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA query_only=ON")
-    try:
-        con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-    except (AttributeError, sqlite3.Error):
-        pass
-    return con
+    return open_sqlite_readonly(path, timeout=15)
 
 
 def _unlink_sqlite(path: Path) -> None:
@@ -3945,7 +3941,7 @@ def main() -> int:
     ap.add_argument(
         "--db", default=None, nargs="+",
         help="database path(s), or a directory of per-day databases "
-             "(default: config.db_path). Several sessions in one run is what "
+             "(default: data/per_day shards). Several sessions in one run is what "
              "makes the Sharpe, Sortino and period drawdown mean anything.",
     )
     ap.add_argument("--from", dest="d_from", default=None, help="first date YYYY-MM-DD")
@@ -4017,13 +4013,15 @@ def main() -> int:
     # PATCH_V14: --db takes one path, several, or a directory of per-day
     # splits. Multiple sources are served through MultiStore so the run has a
     # single ledger and a single set of period statistics.
-    # When --db is omitted, prefer config.db_path only if it still has readable
-    # chain snapshots; otherwise fall back to data/per_day shards (primary DB
-    # is often empty on a fresh clone or SQLite-corrupt after a crash).
+    # When --db is omitted, use data/per_day shards. The live primary is
+    # only opened if there are no shards (and it is not writer-locked).
     if args.db:
         _requested = list(args.db)
     else:
         _requested = _default_replay_sources(config)
+    if not _requested:
+        print("\n  No replay source (no per-day shards, live primary unusable).\n")
+        return 1
     try:
         db_paths = _resolve_db_paths(_requested)
     except FileNotFoundError as exc:

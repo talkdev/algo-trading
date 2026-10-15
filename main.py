@@ -156,6 +156,7 @@ class MainEngine:
         self._last_calibration_time  = 0.0
         self._last_status_print_time = 0.0
         self._eod_done               = False
+        self._wal_checkpointed       = False
         self._stop_request_flatten   = False
         self._stop_file = Path(self.config.log_dir) / "algo.stop"
 
@@ -992,6 +993,8 @@ class MainEngine:
         #   _soft_halt_alerted  the soft threshold would never page again
         #   _eod_done           EOD tasks (calibration, daily summary, the
         #                       final flatten) would never run again
+        #   _wal_checkpointed   next session must copy WAL into the primary
+        #                       again after that day's last write
         #   _feed_stale*        yesterday's stale feed would still be blocking
         #                       entries at today's open
         # The main loop normally exits after 15:35, so this only matters for a
@@ -1000,6 +1003,7 @@ class MainEngine:
         self._halt_action_done      = False
         self._soft_halt_alerted     = False
         self._eod_done              = False
+        self._wal_checkpointed      = False
         self._feed_stale            = False
         self._feed_stale_alerted    = False
         self._cycle_in_progress     = False
@@ -2067,6 +2071,41 @@ class MainEngine:
             f"trades={summary['trades_executed']}"
         )
 
+    def _checkpoint_primary(self, reason: str) -> None:
+        """Copy WAL into the main .db while SQLite is idle.
+
+        Used after the session's last write and again before process exit
+        (the second call is a no-op). Replay scratch DBs are skipped.
+        Never TRUNCATE and never from the signal handler.
+        """
+        if self.replay_mode:
+            return
+        if getattr(self, "_wal_checkpointed", False):
+            return
+        db = getattr(self, "db", None)
+        if db is None or getattr(db, "_conn", None) is None:
+            return
+        try:
+            result = db.checkpoint(mode="RESTART")
+            busy = log = ckpt = None
+            if result is not None:
+                busy, log, ckpt = result
+            self.logger.info(
+                f"WAL checkpoint ({reason}): RESTART "
+                f"busy={busy} log={log} checkpointed={ckpt}"
+            )
+            if busy:
+                self.logger.warning(
+                    f"WAL checkpoint ({reason}) busy=1 — some frames "
+                    f"may still sit in the WAL; will retry before exit"
+                )
+                return
+            self._wal_checkpointed = True
+        except Exception as e:
+            self.logger.error(
+                f"WAL checkpoint ({reason}) failed: {e}", exc_info=True
+            )
+
     # ─────────────────────────────────────────────────────────────────────
     # END OF DAY TASKS
     # ─────────────────────────────────────────────────────────────────────
@@ -2127,6 +2166,7 @@ class MainEngine:
         # runs after this one: stopping the sender thread here would leave the
         # rest of the process sending inline.
         self._telegram_notify_stopped(reason="end of day")
+        self._checkpoint_primary("end of session")
 
     # ─────────────────────────────────────────────────────────────────────
     # GRACEFUL SHUTDOWN
@@ -2222,6 +2262,7 @@ class MainEngine:
             f"Restart engine to resume."
         )
         self.logger.info("Shutdown complete.")
+        self._checkpoint_primary("graceful shutdown")
         # Do NOT close the DB here. run()'s finally block still needs it
         # for the Telegram stop snapshot / trade report (live 2026-10-01:
         # close-then-snapshot → 'NoneType' object has no attribute
@@ -2724,12 +2765,12 @@ class MainEngine:
 
                 self._sleep(max(0.2, 1.0 - loop_duration))
 
-            # Clean loop exit (Ctrl+C flag, stop-file, EOD). Close is in
-            # finally and never checkpoint-truncates the primary.
+            # Clean loop exit (Ctrl+C flag, stop-file, EOD). Checkpoint
+            # (RESTART, not TRUNCATE) runs in finally while SQLite is idle.
             if self._signal_received is not None:
                 self.logger.info(
                     f"Received signal {self._signal_received} — "
-                    "SQLite idle, shutting down without checkpoint-truncate."
+                    "SQLite idle, shutting down."
                 )
             if not self._eod_done:
                 self.perform_graceful_shutdown()
@@ -2770,6 +2811,10 @@ class MainEngine:
                 self.telegram.close(timeout=8.0)
             except Exception as e:
                 self.logger.debug(f"telegram shutdown error: {e}")
+            try:
+                self._checkpoint_primary("process exit")
+            except Exception:
+                pass
             try:
                 self.db.close()
             except Exception:

@@ -3112,6 +3112,93 @@ def stray_live_siblings(db_path: Path) -> List[Path]:
     return sorted(p for p in parent.iterdir() if pattern.match(p.name))
 
 
+def is_live_primary_path(path) -> bool:
+    """True for the engine's live nifty_algo_v3.db (not a per-day shard)."""
+    p = Path(path)
+    if p.name == DEFAULT_DB_PATH.name:
+        return True
+    try:
+        return p.resolve() == Path(DEFAULT_DB_PATH).resolve()
+    except OSError:
+        return False
+
+
+def live_writer_lock_held(db_path) -> bool:
+    """True when main.py currently owns the application writer lock.
+
+    The ``.writer.lock`` file is left on disk after a clean exit, so
+    existence is not ownership. Try a non-blocking exclusive lock.
+    """
+    lock = Path(str(db_path) + ".writer.lock")
+    if not lock.exists():
+        return False
+    fh = None
+    try:
+        fh = open(lock, "a+b")
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+
+def sqlite_readonly_uri(path) -> str:
+    return f"file:{Path(path).resolve().as_posix()}?mode=ro"
+
+
+def protect_sqlite_connection(con: sqlite3.Connection) -> sqlite3.Connection:
+    """Disable close-checkpoint and autocheckpoint on this connection.
+
+    A default sqlite3 close of the last connection checkpoints the WAL
+    into the main file (historically TRUNCATE). A kill in that window
+    left nifty_algo_v3.db malformed with an empty WAL. Refuses to return
+    an unprotected connection.
+    """
+    try:
+        con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+    except (AttributeError, sqlite3.Error) as exc:
+        try:
+            con.close()
+        except Exception:
+            pass
+        raise sqlite3.DatabaseError(
+            "Cannot disable SQLite checkpoint-on-close. Refusing this "
+            "connection because close() would rewrite the main file."
+        ) from exc
+    try:
+        con.execute("PRAGMA wal_autocheckpoint=0")
+    except sqlite3.Error:
+        pass
+    return con
+
+
+def open_sqlite_readonly(
+    path, *, timeout: float = 60.0
+) -> sqlite3.Connection:
+    """Read-only open that cannot checkpoint or autocheckpoint the source."""
+    con = sqlite3.connect(
+        sqlite_readonly_uri(path), uri=True, timeout=timeout
+    )
+    protect_sqlite_connection(con)
+    con.execute("PRAGMA query_only=ON")
+    con.execute("PRAGMA busy_timeout=60000")
+    con.row_factory = sqlite3.Row
+    return con
+
+
 class Database:
     """
     Thread-safe SQLite database wrapper.
@@ -3148,16 +3235,17 @@ class Database:
                 check_same_thread=False,
                 timeout=60,
             )
-            self._disable_checkpoint_on_close()
+            protect_sqlite_connection(self._conn)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL;")
+            # Re-assert after journal_mode; WAL open must not autocheckpoint.
+            self._conn.execute("PRAGMA wal_autocheckpoint=0;")
             # FULL: every commit reaches the disk before returning.
             self._conn.execute("PRAGMA synchronous=FULL;")
             # Keep the session in the WAL. Default autocheckpoint=1000 copies
             # into the main btree during live writes — the same window a
             # manual cancel used to tear. Next open applies the WAL.
             # Close does not checkpoint (NO_CKPT_ON_CLOSE, set above).
-            self._conn.execute("PRAGMA wal_autocheckpoint=0;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._conn.execute("PRAGMA busy_timeout=60000;")
             self._conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache
@@ -3189,15 +3277,8 @@ class Database:
         except OSError:
             return
         try:
-            con = sqlite3.connect(
-                f"file:{path}?mode=ro", uri=True, timeout=30
-            )
+            con = open_sqlite_readonly(path, timeout=30)
             try:
-                con.execute("PRAGMA query_only=ON")
-                try:
-                    con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-                except (AttributeError, sqlite3.Error):
-                    pass
                 has_chain = con.execute(
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type='table' AND name='option_chain_snapshot' "
@@ -3722,13 +3803,7 @@ class Database:
 
     def _disable_checkpoint_on_close(self) -> None:
         """SQLite checkpoints when the last connection closes unless told not to."""
-        try:
-            self._conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-        except (AttributeError, sqlite3.Error) as exc:
-            raise sqlite3.DatabaseError(
-                "Cannot disable SQLite checkpoint-on-close. Refusing to open "
-                f"{self.db_path} because a close would rewrite the main file."
-            ) from exc
+        protect_sqlite_connection(self._conn)
 
     def _acquire_writer_lock(self) -> None:
         """One writer for this database path. Released on close or process exit."""
@@ -3774,21 +3849,32 @@ class Database:
         except OSError:
             pass
 
-    def checkpoint(self) -> None:
-        """Optional PASSIVE checkpoint. Not used on the live write path.
+    def checkpoint(self, mode: str = "RESTART"):
+        """Copy WAL frames into the main ``.db`` file.
 
-        PASSIVE copies WAL frames into the main file but does not truncate
-        the WAL. A kill during PASSIVE can still tear the btree; live
-        persist must not call this every cycle.
+        Call only when the writer is idle (end of session / process exit).
+        Never from a signal handler and never every cycle.
+
+        PASSIVE / FULL / RESTART are allowed. RESTART is the default: it
+        finishes the copy and resets the WAL so it does not grow without
+        bound. TRUNCATE is refused — a kill after the btree rewrite and
+        before WAL reset is how the live primary went malformed.
         """
+        mode_u = str(mode or "RESTART").upper()
+        if mode_u == "TRUNCATE":
+            raise sqlite3.DatabaseError(
+                "wal_checkpoint(TRUNCATE) is disabled; use RESTART"
+            )
+        if mode_u not in ("PASSIVE", "FULL", "RESTART"):
+            mode_u = "RESTART"
         with self._lock:
             conn = getattr(self, "_conn", None)
             if conn is None:
-                return
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except Exception:
-                pass
+                return None
+            row = conn.execute(f"PRAGMA wal_checkpoint({mode_u})").fetchone()
+            if row is None:
+                return None
+            return (int(row[0]), int(row[1]), int(row[2]))
 
 
 # ─────────────────────────────────────────────
