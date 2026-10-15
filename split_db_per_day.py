@@ -40,9 +40,18 @@
 #
 #  LIVE-PRIMARY SAFETY
 #  -------------------
-#  The live file is never written. A read-only SQLite backup() snapshot is
-#  taken first; every ATTACH / fingerprint / copy runs against that snapshot.
-#  journal_mode=OFF applies only to the per-day temp shard, never to source.
+#  Sequence (do not invert):
+#    1. main.py ends the session, WAL-checkpoints RESTART, closes, drops
+#       the writer lock.
+#    2. This script refuses to start while nifty_algo_v3.db.writer.lock
+#       is held (--allow-live to snapshot a running engine anyway).
+#    3. A read-only SQLite backup() snapshot is taken. The live file is
+#       never written. journal_mode=OFF applies only to the per-day temp
+#       shard. Source connections set NO_CKPT_ON_CLOSE so close cannot
+#       TRUNCATE the live WAL.
+#
+#  Hook it after main.py in Misc/run_weekday_open.cmd, not inside the
+#  trading process and not as a 15:40 Scheduled Task that can overlap EOD.
 #
 # ============================================================================
 
@@ -57,6 +66,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from core import live_writer_lock_held, open_sqlite_readonly, protect_sqlite_connection
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TABLE MAP
@@ -116,6 +127,10 @@ CRITICAL_FINGERPRINT = (
 )
 
 
+def writer_lock_held(db_path: Path) -> bool:
+    return live_writer_lock_held(db_path)
+
+
 def _as_ro_uri(path: str | Path) -> str:
     """SQLite URI for a read-only attach/open. Forward slashes on Windows."""
     return f"file:{Path(path).resolve().as_posix()}?mode=ro"
@@ -129,16 +144,11 @@ def open_db(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
             "It snapshots with a read-only backup and writes shards only."
         )
     if readonly:
-        con = sqlite3.connect(_as_ro_uri(path), uri=True, timeout=60)
-        con.execute("PRAGMA query_only=ON")
-    else:
-        con = sqlite3.connect(path, timeout=60)
+        return open_sqlite_readonly(path, timeout=60)
+    con = sqlite3.connect(path, timeout=60)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=60000")
-    try:
-        con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-    except (AttributeError, sqlite3.Error):
-        pass
+    protect_sqlite_connection(con)
     return con
 
 
@@ -158,14 +168,8 @@ def snapshot_readonly(src_path: Path) -> Path:
     src_path = Path(src_path).resolve()
     snap = src_path.with_name(f"{src_path.name}.split_snap.{os.getpid()}")
     remove_db_trio(snap)
-    src = sqlite3.connect(_as_ro_uri(src_path), uri=True, timeout=60)
+    src = open_sqlite_readonly(src_path, timeout=60)
     try:
-        src.execute("PRAGMA query_only=ON")
-        src.execute("PRAGMA busy_timeout=60000")
-        try:
-            src.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-        except (AttributeError, sqlite3.Error):
-            pass
         dst = sqlite3.connect(str(snap), timeout=60)
         try:
             src.backup(dst)
@@ -847,11 +851,26 @@ def main() -> int:
         action="store_true",
         help="exit 0 even if a shard is missing yesterday's VIX (do not use for go-live)",
     )
+    ap.add_argument(
+        "--allow-live",
+        action="store_true",
+        help="snapshot even if the live engine holds the writer lock "
+             "(not recommended; wait for main.py to exit)",
+    )
     args = ap.parse_args()
 
     src_path = Path(args.src)
     if not src_path.exists():
         print(f"\n  No source database at {src_path}\n", file=sys.stderr)
+        return 1
+    if not args.allow_live and writer_lock_held(src_path):
+        print(
+            f"\n  Refusing to split: {src_path.name}.writer.lock is held.\n"
+            f"  Wait for main.py to finish the session (WAL checkpoint + "
+            f"close) so the live btree is not snapshotted mid-write.\n"
+            f"  Pass --allow-live only if you accept a backup() of a live WAL.\n",
+            file=sys.stderr,
+        )
         return 1
 
     out_dir = Path(args.out)

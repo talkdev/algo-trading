@@ -80,14 +80,16 @@ def _ro_uri(path: Path) -> str:
 
 
 def open_ro(path: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(_ro_uri(Path(path)), uri=True, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA busy_timeout=60000")
-    return con
+    sys.path.insert(0, str(BASE))
+    from core import open_sqlite_readonly  # noqa: WPS433
+    return open_sqlite_readonly(path, timeout=30)
 
 
 def open_rw(path: Path) -> sqlite3.Connection:
+    sys.path.insert(0, str(BASE))
+    from core import protect_sqlite_connection  # noqa: WPS433
     con = sqlite3.connect(str(path))
+    protect_sqlite_connection(con)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=60000")
     con.execute("PRAGMA journal_mode=WAL")
@@ -339,17 +341,17 @@ def is_locked_by_writer(path: Path) -> bool:
     """True when another process holds a SQLite write lock on the primary."""
     if not path.exists():
         return False
+    sys.path.insert(0, str(BASE))
+    from core import live_writer_lock_held, protect_sqlite_connection  # noqa: WPS433
+    if live_writer_lock_held(path):
+        return True
     try:
         con = sqlite3.connect(str(path), timeout=0.25)
         try:
-            # Close must not checkpoint. The first restore probe did
-            # BEGIN IMMEDIATE and then closed, which merged the live WAL
-            # into the damaged main file and deleted the WAL.
-            try:
-                con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-            except (AttributeError, sqlite3.Error):
-                pass
-            con.execute("PRAGMA wal_autocheckpoint=0")
+            # Close must not checkpoint. An earlier probe used BEGIN
+            # IMMEDIATE then closed without NO_CKPT_ON_CLOSE, which merged
+            # the live WAL into a damaged main file and deleted the WAL.
+            protect_sqlite_connection(con)
             con.execute("BEGIN IMMEDIATE")
             con.rollback()
         finally:
@@ -367,14 +369,8 @@ def verify_with_wal(path: Path) -> Tuple[bool, str]:
     if not path.exists():
         return False, "missing"
     try:
-        con = sqlite3.connect(_ro_uri(path), uri=True, timeout=30)
+        con = open_ro(path)
         try:
-            con.execute("PRAGMA query_only=ON")
-            con.execute("PRAGMA busy_timeout=60000")
-            try:
-                con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-            except (AttributeError, sqlite3.Error):
-                pass
             row = con.execute("PRAGMA integrity_check").fetchone()
             msg = str(row[0] if row else "unknown")
             if msg != "ok":
@@ -427,7 +423,7 @@ def today_stats(path: Path, today: str) -> Dict[str, int]:
     if not path.exists():
         return out
     try:
-        con = sqlite3.connect(_ro_uri(path), uri=True, timeout=15)
+        con = open_ro(path)
     except sqlite3.Error:
         return out
     try:
@@ -482,8 +478,7 @@ def salvage_to(
     """Copy every table that still SELECTs into a new file. Never writes src."""
     remove_db_trio(out_path)
     totals: Dict[str, int] = {}
-    src = sqlite3.connect(str(src_path), timeout=30)
-    src.row_factory = sqlite3.Row
+    src = open_ro(src_path)
     dst = open_rw(out_path)
     try:
         tables: List[str] = []
