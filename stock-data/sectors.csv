@@ -1,0 +1,501 @@
+symbol,sector
+360ONE,Financial Services
+3MINDIA,Industrial
+ABB,Capital Goods
+ACC,Cement
+ACMESOLAR,Renewable Energy
+AIAENG,Industrial
+APLAPOLLO,Steel
+AUBANK,Banking
+AWL,FMCG
+AADHARHFC,NBFC
+AARTIIND,Chemicals
+AAVAS,NBFC
+ABBOTINDIA,Pharma
+ACE,Capital Goods
+ACUTAAS,Chemicals
+ADANIENSOL,Energy
+ADANIENT,Diversified
+ADANIGREEN,Renewable Energy
+ADANIPORTS,Infrastructure
+ADANIPOWER,Power
+ATGL,Energy
+ABCAPITAL,Financial Services
+ABFRL,Retail
+ABLBL,Retail
+ABREL,Realty
+ABSLAMC,Asset Management
+CPPLUS,Consumer Durables
+AEGISLOG,Logistics
+AEGISVOPAK,Logistics
+AFCONS,Infrastructure
+AFFLE,IT
+AJANTPHARM,Pharma
+ALKEM,Pharma
+ABDL,FMCG
+ARE&M,Auto Ancillary
+AMBER,Consumer Durables
+AMBUJACEM,Cement
+ANANDRATHI,Financial Services
+ANANTRAJ,Realty
+ANGELONE,Financial Services
+ANTHEM,Pharma
+ANURAS,Chemicals
+APARINDS,Electricals
+APOLLOHOSP,Healthcare
+APOLLOTYRE,Auto Ancillary
+APTUS,NBFC
+ASAHIINDIA,Auto Ancillary
+ASHOKLEY,Auto
+ASIANPAINT,Paints
+ASTERDM,Healthcare
+ASTRAL,Building Materials
+ATHERENERG,Auto
+ATUL,Chemicals
+AUROPHARMA,Pharma
+AIIL,Financial Services
+DMART,Retail
+AXISBANK,Banking
+BEML,Defence
+BLS,Services
+BSE,Financial Services
+BAJAJ-AUTO,Auto
+BAJFINANCE,NBFC
+BAJAJFINSV,Financial Services
+BAJAJHLDNG,Financial Services
+BAJAJHFL,NBFC
+BALKRISIND,Auto Ancillary
+BALRAMCHIN,Sugar
+BANDHANBNK,Banking
+BANKBARODA,Banking
+BANKINDIA,Banking
+MAHABANK,Banking
+BATAINDIA,Footwear
+BAYERCROP,Chemicals
+BELRISE,Auto Ancillary
+BERGEPAINT,Paints
+BDL,Defence
+BEL,Defence
+BHARATFORG,Auto Ancillary
+BHEL,Capital Goods
+BPCL,Energy
+BHARTIARTL,Telecom
+BHARTIHEXA,Telecom
+BIKAJI,FMCG
+GROWW,Financial Services
+BIOCON,Pharma
+BSOFT,IT
+BLUEDART,Logistics
+BLUEJET,Pharma
+BLUESTARCO,Consumer Durables
+BBTC,Diversified
+BOSCHLTD,Auto Ancillary
+FIRSTCRY,Retail
+BRIGADE,Realty
+BRITANNIA,FMCG
+MAPMYINDIA,IT
+CCL,FMCG
+CESC,Power
+CGPOWER,Capital Goods
+CIEINDIA,Auto Ancillary
+CRISIL,Financial Services
+CANFINHOME,NBFC
+CANBK,Banking
+CANHLIFE,Insurance
+CAPLIPOINT,Pharma
+CGCL,NBFC
+CARBORUNIV,Industrial
+CARTRADE,Retail
+CASTROLIND,Energy
+CEATLTD,Auto Ancillary
+CEMPRO,Infrastructure
+CENTRALBK,Banking
+CDSL,Financial Services
+CHALET,Hotels
+CHAMBLFERT,Fertilizers
+CHENNPETRO,Energy
+CHOICEIN,Financial Services
+CHOLAHLDNG,Financial Services
+CHOLAFIN,NBFC
+CIPLA,Pharma
+CUB,Banking
+CLEAN,Chemicals
+COALINDIA,Mining
+COCHINSHIP,Defence
+COFORGE,IT
+COHANCE,Pharma
+COLPAL,FMCG
+CAMS,Financial Services
+CONCORDBIO,Pharma
+CONCOR,Logistics
+COROMANDEL,Fertilizers
+CRAFTSMAN,Auto Ancillary
+CREDITACC,NBFC
+CROMPTON,Consumer Durables
+CUMMINSIND,Capital Goods
+CYIENT,IT
+DCMSHRIRAM,Diversified
+DLF,Realty
+DOMS,Consumer Goods
+DABUR,FMCG
+DALBHARAT,Cement
+DATAPATTNS,Defence
+DEEPAKFERT,Chemicals
+DEEPAKNTR,Chemicals
+DELHIVERY,Logistics
+DEVYANI,QSR
+DIVISLAB,Pharma
+DIXON,Consumer Durables
+LALPATHLAB,Healthcare
+DRREDDY,Pharma
+EIDPARRY,FMCG
+EIHOTEL,Hotels
+EICHERMOT,Auto
+ELECON,Capital Goods
+ELGIEQUIP,Capital Goods
+EMAMILTD,FMCG
+EMCURE,Pharma
+EMMVEE,Renewable Energy
+ENDURANCE,Auto Ancillary
+ENGINERSIN,Engineering
+ERIS,Pharma
+ESCORTS,Auto
+ETERNAL,Consumer Internet
+EXIDEIND,Auto Ancillary
+NYKAA,Retail
+FEDERALBNK,Banking
+FACT,Fertilizers
+FINCABLES,Electricals
+FSL,IT
+FIVESTAR,NBFC
+FORCEMOT,Auto
+FORTIS,Healthcare
+GAIL,Energy
+GVT&D,Capital Goods
+GMRAIRPORT,Infrastructure
+GABRIEL,Auto Ancillary
+GALLANTT,Steel
+GRSE,Defence
+GICRE,Insurance
+GILLETTE,FMCG
+GLAND,Pharma
+GLAXO,Pharma
+GLENMARK,Pharma
+MEDANTA,Healthcare
+GODIGIT,Insurance
+GPIL,Steel
+GODFRYPHLP,FMCG
+GODREJCP,FMCG
+GODREJIND,Diversified
+GODREJPROP,Realty
+GRANULES,Pharma
+GRAPHITE,Industrial
+GRASIM,Cement
+GRAVITA,Metals
+GESHIP,Logistics
+FLUOROCHEM,Chemicals
+GMDCLTD,Mining
+HEG,Industrial
+HBLENGINE,Capital Goods
+HCLTECH,IT
+HDBFS,NBFC
+HDFCAMC,Asset Management
+HDFCBANK,Banking
+HDFCLIFE,Insurance
+HFCL,Telecom Equipment
+HAVELLS,Consumer Durables
+HEROMOTOCO,Auto
+HEXT,IT
+HSCL,Chemicals
+HINDALCO,Metals
+HAL,Defence
+HINDCOPPER,Metals
+HINDPETRO,Energy
+HINDUNILVR,FMCG
+HINDZINC,Metals
+POWERINDIA,Capital Goods
+HOMEFIRST,NBFC
+HONASA,FMCG
+HONAUT,Industrial
+HUDCO,NBFC
+HYUNDAI,Auto
+ICICIBANK,Banking
+ICICIGI,Insurance
+ICICIAMC,Asset Management
+ICICIPRULI,Insurance
+IDBI,Banking
+IDFCFIRSTB,Banking
+IFCI,NBFC
+IIFL,Financial Services
+IRB,Infrastructure
+IRCON,Infrastructure
+ITCHOTELS,Hotels
+ITC,FMCG
+ITI,Telecom Equipment
+INDGN,Healthcare
+INDIACEM,Cement
+INDIAMART,Consumer Internet
+INDIANB,Banking
+IEX,Financial Services
+INDHOTEL,Hotels
+IOC,Energy
+IOB,Banking
+IRCTC,Railways
+IRFC,NBFC
+IREDA,NBFC
+IGL,Energy
+INDUSTOWER,Telecom Infrastructure
+INDUSINDBK,Banking
+NAUKRI,Consumer Internet
+INFY,IT
+INOXWIND,Renewable Energy
+INTELLECT,IT
+INDIGO,Aviation
+IGIL,Services
+IKS,Healthcare
+IPCALAB,Pharma
+JBCHEPHARM,Pharma
+JKCEMENT,Cement
+JBMA,Auto Ancillary
+JKTYRE,Auto Ancillary
+JMFINANCIL,Financial Services
+JSWCEMENT,Cement
+JSWDULUX,Paints
+JSWENERGY,Power
+JSWINFRA,Infrastructure
+JSWSTEEL,Steel
+JAINREC,Metals
+JPPOWER,Power
+J&KBANK,Banking
+JINDALSAW,Steel
+JSL,Steel
+JINDALSTEL,Steel
+JIOFIN,Financial Services
+JUBLFOOD,QSR
+JUBLINGREA,FMCG
+JUBLPHARMA,Pharma
+JWL,Railways
+JYOTICNC,Capital Goods
+KPRMILL,Textiles
+KEI,Electricals
+KPITTECH,IT
+KAJARIACER,Building Materials
+KPIL,Infrastructure
+KALYANKJIL,Jewellery
+KARURVYSYA,Banking
+KAYNES,Electronics
+KEC,Infrastructure
+KFINTECH,Financial Services
+KIRLOSENG,Capital Goods
+KOTAKBANK,Banking
+KIMS,Healthcare
+LTF,NBFC
+LTTS,IT
+LGEINDIA,Consumer Durables
+LICHSGFIN,NBFC
+LTFOODS,FMCG
+LTM,IT
+LT,Infrastructure
+LATENTVIEW,IT
+LAURUSLABS,Pharma
+THELEELA,Hotels
+LEMONTREE,Hotels
+LENSKART,Retail
+LICI,Insurance
+LINDEINDIA,Chemicals
+LLOYDSME,Metals
+LODHA,Realty
+LUPIN,Pharma
+MMTC,Trading
+MRF,Auto Ancillary
+MGL,Energy
+M&MFIN,NBFC
+M&M,Auto
+MANAPPURAM,NBFC
+MRPL,Energy
+MANKIND,Pharma
+MARICO,FMCG
+MARUTI,Auto
+MFSL,Insurance
+MAXHEALTH,Healthcare
+MAZDOCK,Defence
+MEESHO,Consumer Internet
+MINDACORP,Auto Ancillary
+MSUMI,Auto Ancillary
+MOTILALOFS,Financial Services
+MPHASIS,IT
+MCX,Financial Services
+MUTHOOTFIN,NBFC
+NATCOPHARM,Pharma
+NBCC,Infrastructure
+NCC,Infrastructure
+NHPC,Power
+NLCINDIA,Power
+NMDC,Mining
+NSLNISP,Steel
+NTPCGREEN,Renewable Energy
+NTPC,Power
+NH,Healthcare
+NATIONALUM,Metals
+NAVA,Metals
+NAVINFLUOR,Chemicals
+NESTLEIND,FMCG
+NETWEB,IT Hardware
+NEULANDLAB,Pharma
+NEWGEN,IT
+NAM-INDIA,Asset Management
+NIVABUPA,Insurance
+NUVAMA,Financial Services
+NUVOCO,Cement
+OBEROIRLTY,Realty
+ONGC,Energy
+OIL,Energy
+OLAELEC,Auto
+OLECTRA,Auto
+PAYTM,Financial Services
+ONESOURCE,Pharma
+OFSS,IT
+POLICYBZR,Insurance
+PCBL,Chemicals
+PGEL,Consumer Durables
+PIIND,Chemicals
+PNBHOUSING,NBFC
+PTCIL,Industrial
+PVRINOX,Media
+PAGEIND,Textiles
+PARADEEP,Fertilizers
+PATANJALI,FMCG
+PERSISTENT,IT
+PETRONET,Energy
+PFIZER,Pharma
+PHOENIXLTD,Realty
+PWL,Consumer Internet
+PIDILITIND,Chemicals
+PINELABS,Financial Services
+PIRAMALFIN,NBFC
+PPLPHARMA,Pharma
+POLYMED,Healthcare
+POLYCAB,Electricals
+POONAWALLA,NBFC
+PFC,NBFC
+POWERGRID,Power
+PREMIERENE,Renewable Energy
+PRESTIGE,Realty
+PNB,Banking
+RRKABEL,Electricals
+RBLBANK,Banking
+RECLTD,NBFC
+RHIM,Industrial
+RITES,Railways
+RADICO,FMCG
+RVNL,Railways
+RAILTEL,Telecom
+RAINBOW,Healthcare
+RKFORGE,Auto Ancillary
+REDINGTON,IT Distribution
+RELIANCE,Energy
+RPOWER,Power
+SBFC,NBFC
+SBICARD,Financial Services
+SBILIFE,Insurance
+SJVN,Power
+SRF,Chemicals
+SAGILITY,IT
+SAILIFE,Pharma
+SAMMAANCAP,NBFC
+MOTHERSON,Auto Ancillary
+SAPPHIRE,QSR
+SARDAEN,Steel
+SAREGAMA,Media
+SCHAEFFLER,Auto Ancillary
+SCHNEIDER,Capital Goods
+SCI,Logistics
+SHREECEM,Cement
+SHRIRAMFIN,NBFC
+SHYAMMETL,Steel
+ENRIN,Industrial
+SIEMENS,Capital Goods
+SIGNATURE,Realty
+SOBHA,Realty
+SOLARINDS,Chemicals
+SONACOMS,Auto Ancillary
+SONATSOFTW,IT
+STARHEALTH,Insurance
+SBIN,Banking
+SAIL,Steel
+SUMICHEM,Chemicals
+SUNPHARMA,Pharma
+SUNTV,Media
+SUNDARMFIN,NBFC
+SUPREMEIND,Building Materials
+SPLPETRO,Chemicals
+SUZLON,Renewable Energy
+SWANCORP,Textiles
+SWIGGY,Consumer Internet
+SYNGENE,Pharma
+SYRMA,Electronics
+TBOTEK,IT
+TVSMOTOR,Auto
+TATACAP,NBFC
+TATACHEM,Chemicals
+TATACOMM,Telecom
+TCS,IT
+TATACONSUM,FMCG
+TATAELXSI,IT
+TATAINVEST,Financial Services
+TMCV,Auto
+TMPV,Auto
+TATAPOWER,Power
+TATASTEEL,Steel
+TATATECH,IT
+TTML,Telecom
+TECHM,IT
+TECHNOE,Infrastructure
+TEGA,Capital Goods
+TEJASNET,Telecom Equipment
+TENNIND,Auto Ancillary
+NIACL,Insurance
+RAMCOCEM,Cement
+THERMAX,Capital Goods
+TIMKEN,Industrial
+TITAGARH,Railways
+TITAN,Consumer Durables
+TORNTPHARM,Pharma
+TORNTPOWER,Power
+TARIL,Electricals
+TRAVELFOOD,FMCG
+TRENT,Retail
+TRIDENT,Textiles
+TRITURBINE,Capital Goods
+TIINDIA,Auto Ancillary
+UCOBANK,Banking
+UNOMINDA,Auto Ancillary
+UPL,Chemicals
+UTIAMC,Asset Management
+ULTRACEMCO,Cement
+UNIONBANK,Banking
+UBL,FMCG
+UNITDSPR,FMCG
+URBANCO,Financial Services
+USHAMART,Consumer Durables
+VTL,Textiles
+VBL,FMCG
+VEDL,Metals
+VIJAYA,Healthcare
+VMM,Retail
+IDEA,Telecom
+VOLTAS,Consumer Durables
+WAAREEENER,Renewable Energy
+WELCORP,Metals
+WELSPUNLIV,Textiles
+WHIRLPOOL,Consumer Durables
+WIPRO,IT
+WOCKPHARMA,Pharma
+YESBANK,Banking
+ZFCVINDIA,Auto Ancillary
+ZEEL,Media
+ZENTEC,Defence
+ZENSARTECH,IT
+ZYDUSLIFE,Pharma
+ZYDUSWELL,FMCG
+ECLERX,IT

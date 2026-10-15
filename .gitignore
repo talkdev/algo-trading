@@ -1,17 +1,26 @@
+# ============================================================
 # Python
+# ============================================================
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *$py.class
+*.egg-info/
+build/
+dist/
 
+# ============================================================
 # Virtual environments
+# ============================================================
 .venv/
 venv/
 env/
 ENV/
 
-# Credentials and secrets
+# ============================================================
+# Secrets and credentials
+# ============================================================
 env.txt
 .env
 .env.*
@@ -21,78 +30,83 @@ token.json
 gdrive_credentials.json
 gdrive_token.json
 *-service-account.json
+**/gen-lang-client-*.json
 
-# Logs
+# ============================================================
+# Logs, PIDs, editor, OS
+# ============================================================
 /logs/
 *.log
 *.log.*
-
-# Generated reports and exports
-/reports/
-/backtest_results/
-/stock-data/*
-# Patch scripts
-patch*.py
-patch_*.py
-
-# Calendars (user populated)
-nse_holidays.json
-high_impact_events.json
-
-# IDEs
+*.pid
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Build
-build/
-dist/
-*.egg-info/
-
-# Temp
+# ============================================================
+# Temp / crash leftovers
+# ============================================================
 *.tmp
 *.bak
 *.orig
+*.lock
 
-# Engine runtime recovery (local position / halt / risk)
-gold-trade-engine/runtime_state.json
-gold-trade-engine/runtime_state.json.bak
-gold-trade-engine/runtime_state.json.tmp
-gold-trade-engine/risk_ledger.json
-gold-trade-engine/engine.lock
-
-
-# ============================================================
-# DATABASES
-# ============================================================
-
-# Ignore database files directly inside /data/
-# Example: data/nifty_algo_v3.db
-/data/*
-
-/output/*
-*.pid
-
-patch.py
-# Ignore SQLite temporary/locking files everywhere
+# SQLite sidecars — runtime only, not a restorable backup
 *.db-wal
 *.db-shm
 *.db-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 
+# ============================================================
+# Generated output
+# ============================================================
+/reports/
+/output/
+/backtest_results/
+/backtest_cache/
+/backtest_output/
 
-# Misc: ignore by default (notes, credentials); allow registrar scripts only
-/Misc/**
-!/Misc/register_*.ps1
+# stock-tsmom / screener working tree
+/stock-data/cache/
+/stock-data/logs/
+/stock-data/reports/
+/stock-data/*.sqlite3
+/stock-data/*.lock
+/stock-data/env.txt*
 
-# Google / GCP client secrets (never commit)
-**/gen-lang-client-*.json
+# Root runtime DBs
+/*.sqlite3
 
-/backtest_cache/*
-/backtest_output/*
+# ============================================================
+# data/ is tracked. Git has no size glob, so files currently
+# over 100 MB (GitHub hard limit) are listed below.
+# ============================================================
+
+# Live primary (~1.8 GB) and crash/split copies
+/data/nifty_algo_v3.db
+/data/nifty_algo_v3.db.*
+
+# Recovery dump (~1.9 GB)
+/data/recovery/from_corrupt.db
+
+# Per-day shards currently over 100 MB
+/data/per_day/nifty_algo_2026-09-23.db
+/data/per_day/nifty_algo_2026-09-24.db
+/data/per_day/nifty_algo_2026-09-25.db
+/data/per_day/nifty_algo_2026-09-28.db
+/data/per_day/nifty_algo_2026-09-29.db
+
+# ============================================================
+# Misc: automation scripts only
+# ============================================================
+/Misc/*
+!/Misc/*.py
+!/Misc/*.ps1
+!/Misc/*.cmd

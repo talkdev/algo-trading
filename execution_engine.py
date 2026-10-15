@@ -2276,6 +2276,52 @@ class ExecutionEngine:
     # v5 — NET-DEBIT (LONG-PREMIUM) EXIT LADDER
     # ─────────────────────────────────────────────────────────────────────
 
+    def _hard_profit_take_exit(
+        self,
+        position: dict,
+        liq_premium: float,
+        current_premium: float,
+    ) -> Optional[Tuple[str, int, dict]]:
+        """Close any open ticket once liquidation profit hits the hard bar.
+
+        Measured on the mark you can actually trade (liq), not mid. Credit
+        books: (gross_credit - liq) / gross_credit. Debit books:
+        (owned_value - entry_value) / entry_value. Fires before trail,
+        persist, delta, and time-ladder so a hard-profit print is always banked.
+        """
+        thresh = float(getattr(self.config, "hard_profit_take_pct", 0.25) or 0.25)
+        thresh = min(max(thresh, 0.05), 1.00)
+        entry_credit = float(position.get("entry_credit") or 0.0)
+        is_debit = (
+            entry_credit < 0
+            or str(position.get("strategy_type") or "").upper() == "BUY"
+        )
+        if is_debit:
+            entry_value = abs(entry_credit)
+            if entry_value <= 0:
+                return None
+            value = -float(liq_premium)
+            profit_pct = (value - entry_value) / entry_value
+        else:
+            gross_credit = float(position.get("gross_credit") or entry_credit)
+            if gross_credit <= 0:
+                return None
+            profit_pct = (gross_credit - float(liq_premium)) / gross_credit
+        if profit_pct + 1e-12 < thresh:
+            return None
+        self.logger.info(
+            f"HARD PROFIT TAKE: {position.get('strategy_name')} "
+            f"profit={profit_pct*100:.1f}% >= {thresh*100:.0f}% "
+            f"liq={float(liq_premium):.2f}"
+        )
+        return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
+            "current_premium": current_premium,
+            "liquidation_premium": liq_premium,
+            "profit_pct": profit_pct,
+            "hard_profit_take_pct": thresh,
+            "reason_detail": f"hard_profit_take_{thresh*100:.0f}pct",
+        }
+
     # PATCH_V12: the debit ladder takes the live signals (optional,
     # so every existing caller keeps working) for the trend-persist
     # hold below.
@@ -2455,7 +2501,7 @@ class ExecutionEngine:
         be_level = entry_value + rt_cost
         large_frac = float(getattr(cfg, "momentum_hwm_large_frac", 0.60))
         giveback = float(getattr(cfg, "momentum_hwm_giveback_frac", 0.15))
-        soft_frac = float(getattr(cfg, "momentum_hwm_soft_frac", 0.30))
+        soft_frac = float(getattr(cfg, "momentum_hwm_soft_frac", 0.25))
         soft_gb = float(getattr(cfg, "momentum_hwm_soft_giveback_frac", 0.40))
         pull_frac = float(getattr(cfg, "momentum_hwm_pullback_frac", 0.03))
         fade_pull_frac = float(
@@ -2528,13 +2574,37 @@ class ExecutionEngine:
         # or fat alone held soft peaks through mid-day weaken until a
         # labelled flip that often never printed.
         _thesis_dead = (not _persist) or _trend_against
+        # Lock-level HWM counts as soft enough to enter management. Soft
+        # frac alone (0.30) left Oct14 LONG_PUT peak +26% (HWM 210 vs soft
+        # 217) outside the ratchet while persist stayed ON — free-trade
+        # giveback. lock trigger and soft_frac are now aligned at 0.25;
+        # keep hwm>=lock here so a future soft raise cannot re-open the hole.
+        _hwm_soft_ok = (
+            hwm >= soft_hwm - 1e-9
+            or (lock > 0 and hwm >= lock - 1e-9)
+        )
+        # Pullback proof before treating a soft peak as mature under persist
+        # (Sep22 mid-climb scalp if age alone matured the trail).
+        _fade_pts_pre = max(fade_pull_frac * hwm, 1.0) if hwm > 0 else 1.0
+        _faded_pre = (
+            hwm > entry_value
+            and float(value_mid or 0.0) <= (hwm - _fade_pts_pre)
+        )
         _mature = (
             hwm >= fat_hwm - 1e-9
             or current_time >= dtime(14, 0)
             or (
                 _thesis_dead
-                and hwm >= soft_hwm - 1e-9
+                and _hwm_soft_ok
                 and _peak_aged
+            )
+            or (
+                # Aged soft/lock peak that has already given back fade_pull
+                # — bank under persist without waiting for 14:00 / fat
+                # (Oct14 LONG_PUT 13:15 peak → free-trade to 14:00 loss).
+                _hwm_soft_ok
+                and _peak_aged
+                and _faded_pre
             )
         )
 
@@ -2548,15 +2618,15 @@ class ExecutionEngine:
         elif (
             activated
             or value_mid >= lock
-            or hwm >= soft_hwm - 1e-9
+            or _hwm_soft_ok
         ):
-            # Arm from HWM once a soft peak has printed — not only when
+            # Arm from HWM once a soft/lock peak has printed — not only when
             # *current* mid is still above the lock trigger. Sep21 LONG_CALL
             # printed ~1.22–1.28× HWM then pulled below the 1.25× trigger;
             # the old `value_mid >= lock or activated` gate skipped the
             # entire ratchet and free-traded the giveback.
             if (
-                hwm >= soft_hwm - 1e-9
+                _hwm_soft_ok
                 and _peak_aged
                 and _mature
                 and _persist
@@ -2571,7 +2641,7 @@ class ExecutionEngine:
                 ratchet_reason = "momentum_stale_peak_trail"
             elif (
                 _thesis_dead
-                and hwm >= soft_hwm - 1e-9
+                and _hwm_soft_ok
                 and _peak_aged
                 and _mature
             ):
@@ -2591,7 +2661,7 @@ class ExecutionEngine:
                 if (
                     _persist
                     and (not activated)
-                    and hwm < soft_hwm - 1e-9
+                    and (not _hwm_soft_ok)
                     and (not _trend_against)
                 ):
                     new_level = None
@@ -2888,6 +2958,11 @@ class ExecutionEngine:
         opening_straddle = float(position.get("opening_straddle_at_entry") or 0)
         profit_lock_activated = bool(position.get("profit_lock_activated"))
         profit_lock_stop_level = position.get("profit_lock_stop_level")
+
+        _hard_take = self._hard_profit_take_exit(
+            position, liq_premium, current_premium)
+        if _hard_take is not None:
+            return _hard_take
 
         # ── v5: a net-debit position runs its own ladder ─────────────────
         # Everything below is written for a structure that was SOLD: premium

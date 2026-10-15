@@ -310,24 +310,42 @@ class StrategyEngine:
                 _pullback_resell = True
 
         if last_side == "BULL" and "BULL" in new_sides:
-            if signals.get("afternoon_low_fade"):
-                return None
             try:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
+            # Fade tag only waives while price is still at that extreme.
+            # A sticky afternoon_low_fade after the flush must not re-arm
+            # puts mid-range / at highs.
+            if (
+                signals.get("afternoon_low_fade")
+                and _loc <= float(getattr(self, "TWO_WAY_FADE_LO", 0.20))
+            ):
+                return None
             if _stopped and _loc >= self.RANGE_SOFT_LEAN_HI:
                 return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             if _loc >= 0.80 and not _pullback_resell:
                 return f"same_side_chase_puts_at_high_loc_{_loc:.2f}"
             return None
         if last_side == "BEAR" and "BEAR" in new_sides:
-            if signals.get("afternoon_high_fade"):
-                return None
             try:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
+            # After a banked BEAR credit, only a fresh high-extreme fade is
+            # a new trade. Mid/low reloads (Oct14 13:29 BCS after 13:00
+            # TARGET while sticky afternoon_high_fade was still true) are
+            # same-direction doubles into the already-harvested move.
+            if _harvested:
+                _fresh_hi = (
+                    bool(signals.get("afternoon_high_fade"))
+                    and _loc >= float(getattr(self, "TWO_WAY_FADE_HI", 0.80))
+                )
+                if not _fresh_hi:
+                    return (
+                        f"same_side_reload_after_bear_harvest_loc_{_loc:.2f}"
+                    )
+                return None
             if _stopped and _loc <= self.RANGE_SOFT_LEAN_LO:
                 return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             if _loc <= 0.20 and not _pullback_resell:
@@ -2322,7 +2340,9 @@ class StrategyEngine:
         # noon so a bounce into the first extreme is not sold as a fade.
         if two_way:
             _hi_start = dtime(10, 45)
-            _hi_thresh = 0.85 if current_time < dtime(12, 15) else 0.80
+            # Match TWO_WAY_FADE_HI (0.80). Pre-12:15 0.85 delayed Oct14-class
+            # highs that printed loc≈0.80 for minutes before the rewrite fired.
+            _hi_thresh = 0.80
         elif after_fb or after_extreme:
             _hi_start = dtime(12, 0)
             _hi_thresh = 0.90 if current_time < dtime(12, 15) else 0.80
@@ -2338,15 +2358,16 @@ class StrategyEngine:
             (not _two_sided) and _measured_trend and _tr_dir > 0
             and not _struct_bear
         )
+        _pos_r = round(float(pos or 0.0), 2)
         if (current_time >= _hi_start and current_time <= dtime(14, 0)
-                and pos >= _hi_thresh and not _hi_trend_veto):
+                and _pos_r >= _hi_thresh and not _hi_trend_veto):
             signals["afternoon_high_fade"] = True
             signals["final_regime"] = "PREMIUM_SELL_BEAR"
             # OPT_V32: fade is the edge — do not size-discount it.
             signals["weekly_range_size_discount"] = 1.0
             return
         if (current_time >= _hi_start and current_time <= dtime(14, 0)
-                and pos >= _hi_thresh and _hi_trend_veto):
+                and _pos_r >= _hi_thresh and _hi_trend_veto):
             signals["fade_vetoed_by_trend"] = (
                 f"high_fade_vetoed_one_way_uptrend_adx_{_tr_adx:.0f}"
             )
@@ -2486,12 +2507,15 @@ class StrategyEngine:
             signals.get("afternoon_high_fade") or signals.get("afternoon_low_fade")
         ):
             _tw_rng, _tw_loc, _, _ = self._session_range_pos(signals)
+            # Round to 2dp so loc logged as 0.80 arms the fade (raw 0.796
+            # used to miss >=0.80 and sit in two_way_wait — Oct14 12:19-12:28).
+            _tw_loc_r = round(float(_tw_loc or 0.0), 2)
             if _tw_rng >= 85.0:
-                if _tw_loc >= 0.80:
+                if _tw_loc_r >= 0.80:
                     signals["afternoon_high_fade"] = True
                     signals["final_regime"] = "PREMIUM_SELL_BEAR"
                     final_regime = "PREMIUM_SELL_BEAR"
-                elif _tw_loc <= 0.20:
+                elif _tw_loc_r <= 0.20:
                     _spike_at_open = False
                     if bool(signals.get("day_low_is_open_spike")):
                         try:
@@ -2700,6 +2724,34 @@ class StrategyEngine:
             _sup = self._spent_upside_chase_put_refusal(signals)
             if _sup:
                 return "NO_TRADE", _sup
+            # Extreme-high BPS on the direct BULL map needs trend ADX
+            # (same bar as range soft-extreme). Oct14 10:56 booked here
+            # after EMA flipped BULLISH with adx≈18 → CLOSE_STOP.
+            if not bool(signals.get("afternoon_low_fade")):
+                try:
+                    _tw_e, _loc_e, _, _ = self._session_range_pos(signals)
+                except Exception:
+                    _tw_e, _loc_e = 0.0, 0.5
+                _adx_tr = float(
+                    getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+                )
+                _soft_hi_e = float(
+                    getattr(self, "RANGE_SOFT_LEAN_HI", 0.58)
+                )
+                _spend_e = self._side_day_spend_pct(signals, "BULL")
+                if (
+                    _tw_e >= 50.0
+                    and _loc_e >= _soft_hi_e
+                    and _spend_e >= 70.0
+                    and (
+                        (not adx_15_mature)
+                        or float(adx_15 or 0.0) < _adx_tr
+                    )
+                ):
+                    return "NO_TRADE", (
+                        f"bull_map_spent_weak_adx_{_spend_e:.0f}"
+                        f"_adx_{adx_15:.0f}"
+                    )
             _sdp = self._spent_downside_bounce_put_refusal(signals)
             if _sdp:
                 return "NO_TRADE", _sdp
@@ -2963,8 +3015,11 @@ class StrategyEngine:
     # at 0.58/0.42 with EMA/VWAP evidence books the away-side vertical.
     RANGE_SOFT_LEAN_HI   = 0.58
     RANGE_SOFT_LEAN_LO   = 0.42
-    TWO_WAY_FADE_HI      = 0.85
-    TWO_WAY_FADE_LO      = 0.15
+    # Aligned with _map_regime_to_strategy two-way rewrite (loc≥0.80 / ≤0.20).
+    # 0.85/0.15 waited past real session extremes that never printed 0.85
+    # (live 2026-10-14: loc peaked ~0.80 from 12:19, BCS only at 12:28).
+    TWO_WAY_FADE_HI      = 0.80
+    TWO_WAY_FADE_LO      = 0.20
     TWO_WAY_MIN_RANGE    = 85.0
     BUTTERFLY_ADX_MAX    = 18.0
     CONDOR_PIN_ADX_MAX   = 20.0
@@ -3157,32 +3212,27 @@ class StrategyEngine:
     def _side_spend_exhausted(self, signals: dict, side: str) -> bool:
         """True when that side of the straddle day-move is already spent.
 
-        Base bar is 100% (peak-aware). Extra: BULL warmup at the extreme high
-        (loc≥0.90, ADX still dark) with upside already ≥85% is a chase —
-        live/replay 2026-10-05 09:45 BPS day_up≈90%/loc≈0.93/ADX=0 → stop.
-        Milder warmup BULL leans (Sep9-class loc≪0.90) and all BEAR warmup
-        (Sep22 day_down≈98%) keep the 100% bar only.
+        Base bar is 100% (peak-aware). Extra: BULL at the soft-extreme high
+        band (loc≥0.70) with upside already ≥85% is a chase whether EMA is
+        dark or lit — live/replay 2026-10-05 09:45 BPS day_up≈90%/loc≈0.93
+        → stop; live 2026-10-14 10:49 warmup BPS −₹720, then 10:56 after
+        EMA flipped BULLISH the warmup-only fence lifted and BPS stopped
+        again. Milder leans (loc≪0.70, Sep9-class) and all BEAR warmup
+        (Sep22 day_down≈98%) keep the 100% bar only. Tagged afternoon_low
+        fades still bypass via `_away_side_allowed`.
         """
         spend = self._side_day_spend_pct(signals, side)
         if spend >= 100.0:
             return True
         if side != "BULL":
             return False
-        if str(signals.get("ema_structure") or "") not in (
-            "", "INSUFFICIENT_DATA",
-        ):
-            return False
-        try:
-            _adx = float(signals.get("adx_15") or 0.0)
-        except (TypeError, ValueError):
-            _adx = 0.0
-        if _adx >= 12.0:
-            return False
         try:
             _, _loc, _, _ = self._session_range_pos(signals)
         except Exception:
             return False
-        return bool(_loc >= 0.90 and spend >= 85.0)
+        # Soft-lean HI band (0.58), not only 0.70 — Oct14 booked at loc=0.69.
+        return bool(_loc >= float(getattr(self, "RANGE_SOFT_LEAN_HI", 0.58))
+                    and spend >= 70.0)
 
     def _away_side_allowed(self, signals: dict, side: str) -> bool:
         """P0: spent-side away leans are refused unless a tagged extreme fade owns them.
@@ -3537,11 +3587,12 @@ class StrategyEngine:
         # opposite fade and the with-trend vertical alike).
         _tw = bool(signals.get("two_way_auction"))
         if _tw:
-            if _rng >= self.TWO_WAY_MIN_RANGE and _loc >= self.TWO_WAY_FADE_HI:
+            _loc_r = round(float(_loc or 0.0), 2)
+            if _rng >= self.TWO_WAY_MIN_RANGE and _loc_r >= self.TWO_WAY_FADE_HI:
                 self.logger.info("Range resolution: two_way_high_prefer_bear_call")
                 signals["afternoon_high_fade"] = True
                 return BEAR_CALL_SPREAD, f"two_way_high_fade_loc_{_loc:.2f}"
-            if _rng >= self.TWO_WAY_MIN_RANGE and _loc <= self.TWO_WAY_FADE_LO:
+            if _rng >= self.TWO_WAY_MIN_RANGE and _loc_r <= self.TWO_WAY_FADE_LO:
                 # Oct1 12:10: spike-low + hugging printed low is a knife
                 # catch. Sep18 non-spike fades stay allowed.
                 try:
@@ -3654,6 +3705,19 @@ class StrategyEngine:
                         "NO_TRADE",
                         f"range_soft_lean_bull_day_up_spent_"
                         f"{self._side_day_spend_pct(signals, 'BULL'):.0f}",
+                    )
+                # Spent soft lean + weak ADX is a chase (Oct14 10:56 BPS at
+                # loc=0.69 / spend≈93 / adx=18 — slipped under the old
+                # loc≥0.70 extreme fence by 0.01 and CLOSE_STOP −₹658).
+                # Strong ADX still allows a with-trend put credit.
+                _spend_sl = self._side_day_spend_pct(signals, "BULL")
+                if _spend_sl >= 70.0 and (
+                    (not adx_15_mature) or adx_15 < _adx_trend
+                ):
+                    return (
+                        "NO_TRADE",
+                        f"range_soft_lean_bull_spent_weak_adx_"
+                        f"{_spend_sl:.0f}_adx_{adx_15:.0f}",
                     )
                 # Pin band owns mid-range (BT Sep25 10:28:14 BPS −₹1.4k).
                 # Soft lean 0.58 overlaps pin 0.40–0.60; any soft lean here
@@ -3973,6 +4037,25 @@ class StrategyEngine:
         if _spot <= 0.0 or _hi <= 0.0:
             return None
         _off_high = float(_hi) - _spot
+        _spend_soft = self._side_day_spend_pct(signals, "BULL")
+        # Soft-extreme chase on the direct BULL map (skips range soft-lean
+        # `_away_side_allowed`). Oct14 10:56: EMA flipped BULLISH →
+        # PREMIUM_SELL_BULL BPS at loc≈0.72 / spend≈92% / off_high≈25pt
+        # → CLOSE_STOP. Pullbacks ≥40pts off the high stay open.
+        _soft_hi = float(getattr(self, "RANGE_SOFT_LEAN_HI", 0.58))
+        if (
+            _loc >= _soft_hi
+            and _spend_soft >= 70.0
+            and _off_high < 40.0
+        ):
+            try:
+                self.market_engine.state["session_upside_spent_latch"] = True
+            except Exception:
+                pass
+            return (
+                f"spent_upside_chase_no_puts_up_{_spend_soft:.0f}"
+                f"_off_{_off_high:.0f}_loc_{_loc:.2f}"
+            )
         # Location chase — do not require sided spend% (replay day_up often
         # sits 60-75% while the tape is still glued to the high; Sep30).
         if _off_high >= 40.0 or _loc < 0.80:
@@ -8990,11 +9073,13 @@ class StrategyEngine:
         if not ok:
             signals["_momentum_refuse_reason"] = why
             return None
-        # After banking a BEAR credit TARGET/PROFIT, mid-day LONG_PUT at
-        # the already-spent lows chases a move the vertical cashed
-        # (Sep22 default: BCS → LONG_PUT −₹1.8k). Bull-credit → LONG_CALL
-        # continuation is a different trade (Sep11: BPS → LONG_CALL +₹9.7k)
-        # and is not blocked here. Late-window with-side stays open.
+        # After banking a BEAR credit TARGET/PROFIT, mid-day LONG_PUT is
+        # same-direction double exposure on a move the vertical already
+        # cashed (Sep22 BCS→LONG_PUT −₹1.8k; live 2026-10-14 BCS +₹934 then
+        # LONG_PUT at 13:03/13:08 on a 50–70pt extension still gave the
+        # peak back). Only a true IV crash (EXPANDING/SPIKING + strong ADX)
+        # or the late window may continue. Bull-credit → LONG_CALL stays
+        # open (Sep11 +₹9.7k).
         _xr_h = str(_st.get("last_exit_reason") or "")
         _harvested_credit = (
             _xr_h.startswith("CLOSE_TARGET")
@@ -9012,25 +9097,18 @@ class StrategyEngine:
             except Exception:
                 _loc_h = 0.5
             try:
-                _spot_h = float(signals.get("spot") or 0.0)
-                _xspot_h = float(_st.get("last_exit_spot") or 0.0)
+                _adx_h = float(signals.get("adx_15") or 0.0)
             except (TypeError, ValueError):
-                _spot_h = _xspot_h = 0.0
-            _need_h = max(
-                float(
-                    getattr(self.config, "reentry_material_move_pts", 15.0)
-                    or 15.0
-                ),
-                (_spot_h * 0.0012) if _spot_h > 0 else 15.0,
+                _adx_h = 0.0
+            _ivb_h = str(signals.get("iv_behavior") or "")
+            _crash_cont = (
+                _ivb_h in ("EXPANDING", "SPIKING")
+                and _adx_h >= 40.0
             )
-            _new_low = (
-                _spot_h > 0 and _xspot_h > 0 and _spot_h <= (_xspot_h - _need_h)
-            )
-            # Block when pinned to the lows without a fresh breakdown.
-            if _loc_h <= 0.25 and not _new_low:
+            if not _crash_cont:
                 signals["_momentum_refuse_reason"] = (
                     f"momentum_skipped_after_bear_credit_harvest_"
-                    f"loc_{_loc_h:.2f}_no_new_low"
+                    f"loc_{_loc_h:.2f}_no_crash_continuation"
                 )
                 return None
         # Bull-credit → LONG_CALL continuation is intentionally NOT

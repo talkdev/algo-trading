@@ -1038,7 +1038,10 @@ class Config:
     #                 persist → medium giveback.
     momentum_hwm_large_frac:       float = 0.60
     momentum_hwm_giveback_frac:    float = 0.15
-    momentum_hwm_soft_frac:        float = 0.30
+    # Soft bar aligned with lock_trigger (0.25). 0.30 left Oct14 LONG_PUT
+    # peak at +26% unmanaged under persist (HWM 210 vs soft 217) and the
+    # runner free-traded the giveback to flat/loss.
+    momentum_hwm_soft_frac:        float = 0.25
     momentum_hwm_soft_giveback_frac: float = 0.32
     # Late-aft partial fat arm disabled by default (0). softfix_v65m50/52
     # showed Oct1/Sep22 mid-climb scalp when armed after 13:00–13:45.
@@ -1311,6 +1314,10 @@ class Config:
     # ladder and is not affected.
     profit_lock_pct_dte1plus_after_1330: float = 0.15
     profit_lock_pct_dte1plus_after_1415: float = 0.10
+    # Immediate bank: once liquidation P&L reaches this fraction of the
+    # ticket (credit received, or debit paid), close the open trade. No
+    # trail, persist hold, or time-ladder may keep it open past this print.
+    hard_profit_take_pct:                float = 0.25
     # Iron condor / butterfly: pin trades rarely print 22%+ same-day decay.
     # Live Sep16/17 held ~7–11% winners to HARD_EXIT with lock never armed.
     profit_lock_pct_symmetric:           float = 0.10
@@ -1793,6 +1800,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         price_stop_straddle_mult=_get_float(env, "PRICE_STOP_STRADDLE_MULT", 0.42),
         profit_lock_pct_dte0=_get_float(env, "PROFIT_LOCK_PCT_DTE0", 0.40),
         profit_lock_pct_dte1plus=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS", 0.22),  # PATCH_V12: was 0.25
+        hard_profit_take_pct=min(max(_get_float(env, "HARD_PROFIT_TAKE_PCT", 0.40), 0.05), 1.00),
         cheap_buyback_pts=_get_float(env, "CHEAP_BUYBACK_PTS", 5.0),
         cheap_buyback_after_time=_get_time(env, "CHEAP_BUYBACK_AFTER_TIME", dtime(13, 0)),
 
@@ -1926,7 +1934,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_lock_keep_frac=min(max(_get_float(env, "MOMENTUM_LOCK_KEEP_FRAC", 0.50), 0.10), 0.95),
         momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 0.60), 0.25), 2.00),
         momentum_hwm_giveback_frac=min(max(_get_float(env, "MOMENTUM_HWM_GIVEBACK_FRAC", 0.15), 0.05), 0.50),
-        momentum_hwm_soft_frac=min(max(_get_float(env, "MOMENTUM_HWM_SOFT_FRAC", 0.30), 0.10), 1.00),
+        momentum_hwm_soft_frac=min(max(_get_float(env, "MOMENTUM_HWM_SOFT_FRAC", 0.25), 0.10), 1.00),
         momentum_hwm_soft_giveback_frac=min(
             max(_get_float(env, "MOMENTUM_HWM_SOFT_GIVEBACK_FRAC", 0.32), 0.10), 0.60
         ),
@@ -5240,6 +5248,7 @@ def _self_test() -> None:
         "spot_proximity_pts":        config.spot_proximity_pts,
         "profit_lock_pct_dte0":      config.profit_lock_pct_dte0,
         "profit_lock_pct_dte1plus":  config.profit_lock_pct_dte1plus,
+        "hard_profit_take_pct":      config.hard_profit_take_pct,
         "cheap_buyback_pts":         config.cheap_buyback_pts,
         "phantom_trade_tracking":    config.phantom_trade_tracking,
         "db_path":                   str(config.db_path),
