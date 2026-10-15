@@ -1,7 +1,7 @@
 {
   "provider": "scdlds",
   "source_url": "https://quantfin.scdlds.com/Data/Factor_Data/ff5.csv",
-  "retrieved_at_utc": "2026-10-15T18:13:38.862389+00:00",
+  "retrieved_at_utc": "2026-10-15T18:28:24.142884+00:00",
   "source_units": "decimal",
   "normalized_units": "decimal returns",
   "first_month": "2003-10",

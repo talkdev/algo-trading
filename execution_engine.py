@@ -4493,6 +4493,27 @@ class ExecutionEngine:
                 _s_for_ladder = str(position.get("strategy_name") or "")
             except Exception:
                 _s_for_ladder = ""
+            # A high-confidence directional credit entry has a stronger
+            # continuation case than a range harvest. Ask it to reach a
+            # larger profit before the close-time ladder loosens; keep the
+            # original, faster ladder for range trades and debits.
+            _entry_regime = str(position.get("final_regime_at_entry") or "")
+            _entry_conf = str(position.get("confidence_at_entry") or "").upper()
+            _measured_trend_credit = (
+                _entry_conf == "HIGH"
+                and (
+                    (_s_for_ladder == "BULL_PUT_SPREAD"
+                     and _entry_regime == "PREMIUM_SELL_BULL")
+                    or (_s_for_ladder == "BEAR_CALL_SPREAD"
+                        and _entry_regime == "PREMIUM_SELL_BEAR")
+                )
+            )
+            if _measured_trend_credit:
+                _ladder_weekly = [
+                    (dtime(12, 0),  0.50),
+                    (dtime(13, 0),  0.40),
+                    (dtime(14, 0),  0.30),
+                ]
             if _s_for_ladder in ("IRON_CONDOR", "IRON_BUTTERFLY"):
                 time_targets = list(_ladder_symmetric)
             elif _dte_i == 1:
