@@ -1,8 +1,8 @@
 {
   "instrument_key": "NSE_EQ|INF204KB14I2",
   "requested_start": "2023-09-01",
-  "requested_end": "2026-10-15",
-  "retrieved_at_utc": "2026-10-15T17:31:06.466033+00:00",
+  "requested_end": "2026-10-18",
+  "retrieved_at_utc": "2026-10-18T16:43:27.010119+00:00",
   "first_session": "2023-09-01",
-  "last_session": "2026-10-14"
+  "last_session": "2026-10-16"
 }
