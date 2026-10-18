@@ -435,6 +435,105 @@ class LiveOrderExecutor:
             f"phantom fill at {fallback:.2f}"
         )
 
+    def _work_entry_order(
+        self, order_id: str, instrument_key: str, transaction_type: str,
+        qty: int, initial_price: float, fallback: float,
+        *, max_wait_sec: float = 30.0, phase: str = "ENTRY",
+        cancel_on_timeout: bool = True,
+    ) -> float:
+        """Keep an entry or exit order live and walk its LIMIT toward the book.
+
+        Repricing an existing order avoids the cancel/re-place churn that
+        caused missed entries. The configured market-protection percentage
+        bounds how far the ladder may move from fresh LTP; at the deadline we
+        cancel only after checking whether a fill won the race.
+        """
+        tick = float(getattr(self.config, "tick_size", 0.05) or 0.05)
+        interval = 2.5
+        deadline = time_module.monotonic() + max_wait_sec
+        next_reprice = time_module.monotonic() + interval
+        limit_price = float(initial_price)
+        last_status = ""
+
+        while time_module.monotonic() < deadline:
+            try:
+                details = self.client.get_order_details(order_id) or {}
+                status = str(details.get("status") or details.get("order_status") or "").strip().lower()
+                last_status = status or last_status
+                filled = details.get("filled_quantity")
+                pending = details.get("pending_quantity")
+                price = float(details.get("average_price") or 0.0)
+                try:
+                    fully_filled = (
+                        filled is not None and float(filled) + 1e-9 >= float(qty)
+                        and (pending is None or float(pending or 0) == 0)
+                    )
+                except (TypeError, ValueError):
+                    fully_filled = False
+                if status in self._TERMINAL_OK and fully_filled and price > 0:
+                    return price
+                if status in self._TERMINAL_BAD:
+                    raise RuntimeError(
+                        f"{phase.lower()} order {order_id} terminated as '{status}'"
+                    )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                self.logger.debug(f"entry fill poll failed for {order_id}: {exc}")
+
+            now = time_module.monotonic()
+            if now >= next_reprice:
+                try:
+                    quote_data = self.client.get_full_quote([instrument_key]) or {}
+                    quote = quote_data.get(instrument_key) or next(
+                        (v for v in quote_data.values() if isinstance(v, dict)), {}
+                    )
+                    ltp = float(quote.get("last_price") or quote.get("ltp") or 0.0)
+                    depth = quote.get("depth") or {}
+                    asks = depth.get("sell") or []
+                    bids = depth.get("buy") or []
+                    ask = float((asks[0] or {}).get("price") or 0.0) if asks else 0.0
+                    bid = float((bids[0] or {}).get("price") or 0.0) if bids else 0.0
+                    if transaction_type == "BUY":
+                        target = max(limit_price + 2 * tick, ask + 2 * tick if ask else 0.0)
+                    else:
+                        target = min(limit_price - 2 * tick, bid - 2 * tick if bid else limit_price - 2 * tick)
+                    if ltp > 0:
+                        protection = float(getattr(self.config, "market_protection_pct", 2.0))
+                        cap = self.client.synthetic_market_price(ltp, transaction_type, protection)
+                        if cap > 0:
+                            if transaction_type == "BUY":
+                                target = min(target, max(limit_price, cap))
+                            else:
+                                target = max(target, min(limit_price, cap))
+                    target = max(tick, round(round(target / tick) * tick, 2))
+                    if abs(target - limit_price) >= tick:
+                        self.client.modify_order(order_id, qty, target)
+                        self.logger.info(
+                            f"[LIVE] {phase} repriced in place order={order_id} "
+                            f"{limit_price:.2f}->{target:.2f} status={last_status or 'unknown'}"
+                        )
+                        limit_price = target
+                except Exception as exc:
+                    # Do not submit a second order if a modify response is
+                    # ambiguous; continue checking the original order id.
+                    self.logger.warning(
+                        f"{phase.lower()} reprice failed for {order_id}; keeping order live: {exc}"
+                    )
+                next_reprice = now + interval
+            time_module.sleep(0.5)
+
+        if not cancel_on_timeout:
+            return 0.0
+        outcome = self._cancel_and_confirm(order_id, {})
+        if outcome.get("state") == "FILLED" and float(outcome.get("price") or 0) > 0:
+            # Re-read quantity before booking; a partial fill is not a full leg.
+            return self._get_fill_price(order_id, fallback, retries=2, expected_qty=qty)
+        raise RuntimeError(
+            f"{phase.lower()} order {order_id} remained {last_status or 'unfilled'} for "
+            f"{max_wait_sec:.0f}s; cancel_confirm={outcome.get('state', 'UNKNOWN')}"
+        )
+
     # ── v6: dispatch ledger, reconcile-on-lost-response, exit escalation ───
 
     def _alert(self, level: str, text: str) -> None:
@@ -836,76 +935,14 @@ class LiveOrderExecutor:
 
         fill_price = float(placed.get("fill_price") or 0.0)
         if fill_price <= 0:
-            try:
-                fill_price = self._get_fill_price(
-                    order_id,
-                    fallback=fallback_px,
-                    expected_qty=qty,
-                )
-            except RuntimeError as _rej:
-                # One wider re-quote when the resting order is gone:
-                #  - SELL broker reject (existing path)
-                #  - fill-timeout after cancel_confirm=CANCELLED (BUY+SELL)
-                # Never double a live BUY (unknown cancel / partial / phantom).
-                _msg = str(_rej).lower()
-                _is_reject = (
-                    "terminated as 'rejected'" in _msg
-                    or "terminated as \"rejected\"" in _msg
-                    or " — rejected" in _msg
-                )
-                _cancel_cleared = "cancel_confirm=cancelled" in _msg
-                _unsafe = (
-                    "partial fill" in _msg
-                    or "filled_quantity missing" in _msg
-                    or "cancel_confirm=unknown" in _msg
-                    or "cancel_confirm=filled" in _msg
-                )
-                _allow_requote = (
-                    not _unsafe
-                    and (
-                        _cancel_cleared
-                        or (transaction_type == "SELL" and _is_reject)
-                    )
-                )
-                if not _allow_requote:
-                    raise
-                self.logger.warning(
-                    f"[LIVE] ENTRY {transaction_type} unfilled — re-quoting "
-                    f"through market-protection: {_rej}"
-                )
-                try:
-                    self.client.cancel_order(order_id)
-                except Exception:
-                    pass
-                wide = self._escalate_exit_price(
-                    chain, leg, transaction_type, fallback_px, attempt=1,
-                )
-                if wide <= 0:
-                    wide = self._aggressive_limit_price(
-                        chain, leg["strike"], leg["option_type"],
-                        transaction_type, fallback_px, aggressiveness=8,
-                    )
-                placed = self._place_order_reconciled(
-                    instrument_key=instrument_key, leg=leg,
-                    transaction_type=transaction_type, qty=qty,
-                    limit_price=wide, phase="ENTRY",
-                )
-                order_id = placed.get("order_id", "")
-                self.logger.info(
-                    f"[LIVE] ENTRY {transaction_type} RETRY "
-                    f"{leg['option_type'].upper()} "
-                    f"{leg['strike']:.0f} @ limit={wide:.2f} "
-                    f"order_id={order_id} tag={placed.get('tag')}"
-                )
-                if order_id and not self.config.paper_trade_mode:
-                    time_module.sleep(0.45)
-                fill_price = float(placed.get("fill_price") or 0.0)
-                if fill_price <= 0:
-                    fill_price = self._get_fill_price(
-                        order_id,
-                        fallback=fallback_px,
-                        expected_qty=qty,
-                    )
+            fill_price = self._work_entry_order(
+                order_id=order_id,
+                instrument_key=instrument_key,
+                transaction_type=transaction_type,
+                qty=qty,
+                initial_price=limit_price,
+                fallback=fallback_px,
+            )
 
         tag = placed.get("tag")
         if tag and fill_price > 0:
@@ -1008,13 +1045,19 @@ class LiveOrderExecutor:
 
             fill_price = float(placed.get("fill_price") or 0.0)
             if fill_price <= 0:
-                outcome    = self._await_fill(
-                    order_id, fallback, wait_sec, expected_qty=qty,
+                fill_price = self._work_entry_order(
+                    order_id=order_id,
+                    instrument_key=instrument_key,
+                    transaction_type=transaction_type,
+                    qty=qty,
+                    initial_price=limit_price,
+                    fallback=fallback,
+                    max_wait_sec=max(wait_sec, 12.0),
+                    phase="EXIT",
+                    cancel_on_timeout=False,
                 )
-                fill_price = float(outcome.get("price") or 0.0)
-                last_state = str(outcome.get("status") or outcome.get("state") or "")
-                if outcome.get("state") == "FILLED":
-                    fill_price = float(outcome.get("price") or 0.0)
+                if fill_price <= 0:
+                    last_state = "open after adaptive repricing"
 
             if fill_price > 0:
                 tag = placed.get("tag")
