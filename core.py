@@ -221,6 +221,7 @@ DEFAULT_HOLIDAYS_FILE = BASE_DIR / "nse_holidays.json"
 INSTRUMENT_KEY_NIFTY_SPOT = "NSE_INDEX|Nifty 50"
 INSTRUMENT_KEY_INDIA_VIX  = "NSE_INDEX|India VIX"
 UPSTOX_BASE_URL           = "https://api.upstox.com/v2"
+UPSTOX_HFT_BASE_URL       = "https://api-hft.upstox.com"
 
 API_ENDPOINTS = {
     "profile":           "/user/profile",
@@ -232,6 +233,7 @@ API_ENDPOINTS = {
     "option_contracts":  "/option/contract",
     "option_chain":      "/option/chain",
     "place_order":       "/order/place",
+    "modify_order":      "/order/modify",
     "cancel_order":      "/order/cancel",
     "order_details":     "/order/details",
     "positions":         "/portfolio/short-term-positions",
@@ -1649,7 +1651,10 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         "quote":      {"per_second": 8,  "per_minute": 120, "per_30min": 1200},
         "historical": {"per_second": 5,  "per_minute": 60,  "per_30min": 600},
         "chain":      {"per_second": 3,  "per_minute": 30,  "per_30min": 300},
-        "order":      {"per_second": 3,  "per_minute": 30,  "per_30min": 200},
+        # Upstox applies the combined order-write bucket to place/modify/cancel.
+        # Order status reads use the standard API bucket below.
+        "order":      {"per_second": 10, "per_minute": 500, "per_30min": 2000},
+        "order_read": {"per_second": 50, "per_minute": 500, "per_30min": 2000},
         "default":    {"per_second": 5,  "per_minute": 60,  "per_30min": 600},
     }
 
@@ -4072,7 +4077,12 @@ class UpstoxClient:
         path = API_ENDPOINTS[endpoint_key]
         if path_params:
             path = path.format(**path_params)
-        url = f"{UPSTOX_BASE_URL}{path}"
+        if endpoint_key == "modify_order":
+            # Order modification is on the current v3 HFT route. Other
+            # existing order operations continue using the configured v2 API.
+            url = f"{UPSTOX_HFT_BASE_URL}/v3{path}"
+        else:
+            url = f"{UPSTOX_BASE_URL}{path}"
 
         wait_time = self.rate_limiter.wait_if_needed(category)
         if wait_time > 0.5:
@@ -4283,8 +4293,28 @@ class UpstoxClient:
         params = {"order_id": order_id}
         data = self._request(
             "GET", "order_details",
-            category="order",
+            category="order_read",
             params=params,
+        )
+        return data.get("data", {})
+
+    def modify_order(self, order_id: str, quantity: int, price: float) -> dict:
+        """Modify the price of an open LIMIT order without cancelling it."""
+        if self.config.paper_trade_mode:
+            raise RuntimeError(
+                "modify_order() called while PAPER_TRADE_MODE=True. Refusing."
+            )
+        body = {
+            "order_id": str(order_id),
+            "quantity": int(quantity),
+            "validity": "DAY",
+            "price": float(price),
+            "order_type": "LIMIT",
+            "disclosed_quantity": 0,
+            "trigger_price": 0.0,
+        }
+        data = self._request(
+            "PUT", "modify_order", category="order", json_body=body,
         )
         return data.get("data", {})
 
