@@ -16,8 +16,8 @@
      filters.
   5. Builds portfolios three ways:
         Version A  = Pure TSMOM   (hold every qualifying ETF, equal-weighted)
-        Version B  = TSMOM + Ranking (top 3 by momentum)   <- traded by default
-        Benchmark C= Ranking only (top 3 regardless of +2% threshold)
+        Version B  = TSMOM + Ranking (top MAX_HOLDINGS=5) <- traded by default
+        Benchmark C= Ranking only (top MAX_HOLDINGS, no threshold)
   6. Sizes positions: inverse-volatility / equal-weight, dynamic liquidity cap,
      60-day Ledoit-Wolf (constant-correlation shrinkage) covariance, 8% annual
      portfolio volatility target, remainder in cash.
@@ -135,7 +135,7 @@ MIN_HISTORY_BARS = 252             # a fund needs >= 252 sessions to signal
 # --- Risk / sizing parameters (Step 4/6) --------------------------------------
 VOL_WINDOW = 60                    # volatility & covariance window
 COV_WINDOW = 60
-MAX_HOLDINGS = 3                   # ranking versions B and C
+MAX_HOLDINGS = 5                   # ranking versions B and C (user 2026-10-19: 5 ETFs)
 POS_CAP_ABS = 0.25                 # absolute ceiling 25% per ETF
 POS_CAP_LIQ_FRAC = 0.15            # 15% of p25 daily traded value
 VOL_TARGET = 0.15                  # 8% annualised portfolio volatility
@@ -267,6 +267,17 @@ LOT_SELECTION = "FIFO"             # "FIFO" or "HIFO" (HIFO realises least gain)
 TAX_DEFER_EXITS = False            # tax-aware exit deferral hypothesis (explicit rule)
 TAX_DEFER_MONTHS = 1               # ... defer only if lot is within N months of LTCG
 TAX_DEFER_MOM_FLOOR = -0.02        # ... and momentum is only slightly negative
+
+# --- Daily SIP accumulation (user request 2026-10-19) -------------------------
+# The portfolio is BUILT by buying SIP_UNITS shares of EACH selected ETF every
+# trading day (user schedules the script at 3:00 PM).  The monthly rebalance
+# only SELLS: exits per the existing rulebook (momentum <= 0, 200-DMA overlay,
+# dropped out of the top-N, data-integrity gate).  No lump-sum buys at the
+# rebalance and no weight trims/top-ups — pure accumulation ("exits only").
+SIP_MODE = True                    # daily accumulation mode
+SIP_UNITS = 1                      # shares of EACH selected ETF per trading day
+SIP_BASKET_KEY = "sip_basket"      # meta key: comma-separated selected symbols
+SIP_RISK_PAUSE = ("SEVERE", "EXTREME")   # daily buys paused in these risk states
 
 # --- Drawdown thresholds SCALE WITH THE VOL TARGET (audit: tuning section) -----
 DD_REVIEW_MULT = 1.00              # e.g. 8% target -> 10% review
@@ -1074,7 +1085,7 @@ class UpstoxClient:
         url = f"{UPSTOX_BASE}/market-quote/quotes?instrument_key={urllib.parse.quote(instrument_key, safe='|')}"
         resp = self._request(url)
         data = resp.get("data") or {}
-        out = {"ltp": None, "bid": None, "ask": None}
+        out = {"ltp": None, "bid": None, "ask": None, "ts": None}
         for _k, v in data.items():
             if not isinstance(v, dict):
                 continue
@@ -1086,6 +1097,8 @@ class UpstoxClient:
                 out["bid"] = float(buy[0]["price"])
             if sell and isinstance(sell[0], dict) and sell[0].get("price"):
                 out["ask"] = float(sell[0]["price"])
+            out["ts"] = (v.get("timestamp") or v.get("last_trade_time")
+                         or v.get("last_trade_timestamp"))
             break
         return out
 
@@ -1251,18 +1264,27 @@ class DataManager:
             f *= float(r["factor"])
         return f
 
-    def update_symbol(self, symbol: str, years: int = 11) -> int:
-        """Fetch missing daily bars for one symbol into price_daily. Returns bars stored."""
+    def update_symbol(self, symbol: str, years: int = 11, force: bool = False) -> int:
+        """
+        Fetch missing daily bars for one symbol into price_daily. Returns bars stored.
+        force=True (audit 2026-10-19): PURGE the symbol's stored bars first and
+        re-download the full history — the only way to heal a series that mixes
+        synthetic demo rows with real ones (a merged splice can never be trusted,
+        and the freshness shortcut would otherwise say 'already up to date').
+        """
         row = self.db.one("SELECT instrument_key FROM etf_universe WHERE symbol=?", (symbol,))
         key = row["instrument_key"] if row else f"NSE_EQ|{symbol}"
         to_date = TODAY
         from_date = to_date - dt.timedelta(days=int(years * 365.25))
-        last = self.db.one("SELECT MAX(date) AS d FROM price_daily WHERE symbol=?", (symbol,))
-        if last and last["d"]:
-            ld = parse_date(last["d"])
-            if (to_date - ld).days <= 3:
-                return 0
-            from_date = ld - dt.timedelta(days=5)   # small overlap, upsert handles it
+        if force:
+            self.db.execute("DELETE FROM price_daily WHERE symbol=?", (symbol,))
+        else:
+            last = self.db.one("SELECT MAX(date) AS d FROM price_daily WHERE symbol=?", (symbol,))
+            if last and last["d"]:
+                ld = parse_date(last["d"])
+                if (to_date - ld).days <= 3:
+                    return 0
+                from_date = ld - dt.timedelta(days=5)   # small overlap, upsert handles it
         try:
             bars = self.client.historical_daily(key, from_date, to_date)
         except UpstoxError as e:
@@ -1312,7 +1334,7 @@ class DataManager:
                 n += 1
         return n
 
-    def update_all(self, years: int = 11, only: list = None) -> dict:
+    def update_all(self, years: int = 11, only: list = None, force: bool = False) -> dict:
         P.section("MARKET DATA — DOWNLOAD & REFRESH", "\U0001F4E5")
         symbols = only or [r["symbol"] for r in self.db.query(
             "SELECT symbol FROM etf_universe WHERE status='ACTIVE' ORDER BY symbol")]
@@ -1320,7 +1342,7 @@ class DataManager:
         total = len(symbols)
         for i, sym in enumerate(symbols, 1):
             try:
-                n = self.update_symbol(sym, years=years)
+                n = self.update_symbol(sym, years=years, force=force)
             except UpstoxError as e:
                 P.err(f"Stopping data refresh: {e}")
                 if "RATE_LIMIT" in str(e):
@@ -1481,6 +1503,44 @@ def row_adj(r):
         return r[1]
 
 
+def series_integrity_issue(rows) -> str:
+    """
+    Data-integrity gate (audit 2026-10-19).  Flags a price series as UNTRUSTABLE
+    when it shows signs of a synthetic/real splice or unadjusted corporate action:
+      - any daily |move| > 40% in the trailing 260 bars (an unleveraged ETF
+        cannot legitimately do this; a splice/split can),
+      - trailing 60-day annualised vol > 150%,
+      - |12-1 momentum| > 300%.
+    Accepts raw values or price rows (any column shape).  Returns '' when sane.
+    """
+    vals = []
+    for r in rows:
+        try:
+            v = float(r) if isinstance(r, (int, float)) else float(row_adj(r))
+        except Exception:
+            continue
+        vals.append(v)
+    seg = vals[-260:]
+    if len(seg) < 30:
+        return ""
+    for i in range(1, len(seg)):
+        if seg[i - 1] and abs(seg[i] / seg[i - 1] - 1.0) > 0.40:
+            return ("implausible daily price jump — series looks spliced or "
+                    "unadjusted")
+    rets = [seg[i] / seg[i - 1] - 1.0 for i in range(1, len(seg)) if seg[i - 1]]
+    w = rets[-60:]
+    if len(w) >= 30:
+        m = sum(w) / len(w)
+        vol = math.sqrt(sum((x - m) ** 2 for x in w) / (len(w) - 1)) * math.sqrt(252.0)
+        if vol > 1.50:
+            return f"implausible volatility ({vol:.0%} annualised) — series looks spliced"
+    if len(seg) >= 253 and seg[-253]:
+        mom = seg[-22] / seg[-253] - 1.0
+        if abs(mom) > 3.0:
+            return f"implausible 12-1 momentum ({mom:+.0%}) — series looks spliced"
+    return ""
+
+
 def date_returns(rows) -> dict:
     """{date: simple return} from rows of (date, adj_close[, ...]). Works with
     sqlite Rows, tuples or dicts — always date-aligned (audit bug #9)."""
@@ -1599,6 +1659,54 @@ def decide(momentum: float, holding: bool, entry: float = ENTRY_THRESHOLD,
         if momentum > entry:
             return "ELIGIBLE_BUY", f"uptrend confirmed ({fmt_pct(momentum)} > {fmt_pct(entry)}) — buy candidate"
         return "CASH", f"trend too weak ({fmt_pct(momentum)} <= {fmt_pct(entry)}) — stay in cash"
+
+
+# --- Daily SIP helpers (user request 2026-10-19) -------------------------------
+
+def derisk_sell_qty(qty: int, level: str) -> int:
+    """Units to SELL when a risk trigger fires: SEVERE -> half, EXTREME -> all.
+    REVIEW never sells.  A 1-unit position cannot be halved -> 0 (noted)."""
+    qty = int(qty)
+    if qty <= 0:
+        return 0
+    if level == "EXTREME":
+        return qty
+    if level == "SEVERE":
+        return qty // 2
+    return 0
+
+
+def sip_buys_allowed(state: str) -> bool:
+    """Daily SIP buys pause while the risk engine is in SEVERE/EXTREME."""
+    return state not in SIP_RISK_PAUSE
+
+
+def quote_session_date(ts) -> Optional[str]:
+    """Best-effort 'YYYY-MM-DD' from a quote timestamp (ISO string or epoch)."""
+    if ts is None:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    if s.replace(".", "", 1).isdigit():
+        try:
+            x = float(s)
+            if x > 1e12:                       # epoch milliseconds
+                x /= 1000.0
+            return date_str(dt.datetime.fromtimestamp(x).date())
+        except Exception:
+            return None
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return None
+
+
+def quote_is_today(ts, today: str) -> Optional[bool]:
+    """True/False when the quote timestamp is readable; None = unknown format."""
+    d = quote_session_date(ts)
+    if d is None:
+        return None
+    return d == today
 
 
 # ==============================================================================
@@ -1921,6 +2029,17 @@ class PortfolioBuilder:
         gate_eq = equity if equity and equity > 0 else CAPITAL   # sane default
         decisions = []
         for st in stats_list:
+            # audit 2026-10-19: never trade a series that fails the integrity
+            # gate — held names EXIT (risk first), others are blocked outright
+            issue = series_integrity_issue(st.get("rows") or [])
+            if issue:
+                if st["symbol"] in holding_symbols:
+                    dec, reason = ("EXIT",
+                                   f"data integrity: {issue} — exit and block re-entry")
+                else:
+                    dec, reason = ("BLOCKED", f"data integrity: {issue}")
+                decisions.append((st, dec, reason))
+                continue
             dec, reason = decide(st["momentum"], st["symbol"] in holding_symbols,
                                  entry=entry, exit_thr=exit_thr)
             if st["symbol"] in CASH_PROXY_SYMBOLS and dec in ("ELIGIBLE_BUY", "HOLD"):
@@ -2398,6 +2517,21 @@ class Broker:
     def set_cash(self, v: float):
         self.db.meta_set("cash_balance", v)
 
+    def sleeve_daily_return(self, as_of: str) -> float:
+        """Per-day cash-sleeve return (audit 2.6).  LIQUID_ETF mode uses the
+        real sleeve history; falls back to the flat T-bill proxy with a warning.
+        Lives on Broker because Broker.accrue_cash_interest needs it (hotfix
+        2026-10-19: it used to live only on TradingCycle -> AttributeError)."""
+        if CASH_SLEEVE_MODE == "LIQUID_ETF":
+            rows = self.db.query(
+                "SELECT date, adj_close FROM price_daily WHERE symbol=? AND date<=? "
+                "ORDER BY date DESC LIMIT 2", (CASH_SLEEVE_SYMBOL, as_of))
+            if len(rows) == 2 and rows[1]["adj_close"]:
+                return rows[0]["adj_close"] / rows[1]["adj_close"] - 1.0
+            P.warn(f"{CASH_SLEEVE_SYMBOL} history missing — cash sleeve using flat "
+                   f"{fmt_pct(CASH_RATE_PRETAX, 2)} (labelled proxy).")
+        return (1.0 + CASH_RATE_PRETAX) ** (1.0 / 252.0) - 1.0
+
     def accrue_cash_interest(self):
         """Audit bug #5: the paper account must earn the cash benchmark —
         otherwise a 20% drawdown lock can literally never release."""
@@ -2704,15 +2838,9 @@ class TradingCycle:
         self.risk = RiskEngine(db)
 
     def sleeve_daily_return(self, as_of: str) -> float:
-        """Per-day cash-sleeve return (audit 2.6).  LIQUID_ETF mode uses the
-        real sleeve history; falls back to the flat T-bill proxy with a warning."""
-        if CASH_SLEEVE_MODE == "LIQUID_ETF":
-            rows = self.data.series(CASH_SLEEVE_SYMBOL, as_of, 30, "adj_close")
-            if len(rows) >= 2 and rows[-2][1]:
-                return rows[-1][1] / rows[-2][1] - 1.0
-            P.warn(f"{CASH_SLEEVE_SYMBOL} history missing — cash sleeve using flat "
-                   f"{fmt_pct(CASH_RATE_PRETAX, 2)} (labelled proxy).")
-        return (1.0 + CASH_RATE_PRETAX) ** (1.0 / 252.0) - 1.0
+        """Per-day cash-sleeve return (audit 2.6) — Broker owns the single
+        implementation (it does the interest accrual); kept callable here too."""
+        return self.broker.sleeve_daily_return(as_of)
 
     # ------------------------------------------------------------------ #
     def latest_prices(self) -> dict:
@@ -2729,6 +2857,244 @@ class TradingCycle:
         if not dates:
             return today_str()
         return last_month_end_date(dates) or dates[-1]
+
+    # ---------------- Daily SIP machinery (user request 2026-10-19) ----------
+    def sip_basket(self) -> list:
+        """The currently selected ETFs (the daily buy list).  Stored at each
+        monthly rebalance; derived once from the current signal if missing."""
+        raw = self.db.meta_get(SIP_BASKET_KEY, "") or ""
+        syms = [s.strip() for s in raw.split(",") if s.strip()]
+        if syms:
+            return syms
+        as_of = self.last_month_end()
+        stats = self.collect_stats(as_of)
+        if not stats:
+            return []
+        sel = self.builder.select(stats, set(self.broker.holdings().keys()),
+                                  TRADE_STRATEGY,
+                                  equity=self.broker.equity(self.latest_prices()))
+        syms = [s["symbol"] for s in sel["chosen"]]
+        if syms:
+            self.db.meta_set(SIP_BASKET_KEY, ",".join(syms))
+            P.info(f"SIP basket initialized from the {as_of} signal: {', '.join(syms)}")
+        return syms
+
+    def _live_quotes(self, symbols):
+        """Live LTP / spread / session-day flags from Upstox quotes.
+        Returns (ltp_map, spread_map, today_flag_map).  Empty maps offline —
+        callers then fall back to the latest close, honestly labelled."""
+        qmap, qspread, tflag = {}, {}, {}
+        symbols = [s for s in dict.fromkeys(symbols) if s]
+        if not symbols:
+            return qmap, qspread, tflag
+        try:
+            client = UpstoxClient(load_env())
+        except Exception as e:
+            P.note(f"Live quotes unavailable ({e}) — fills use the latest close.")
+            return qmap, qspread, tflag
+        for sym in symbols:
+            key_row = self.db.one(
+                "SELECT instrument_key FROM etf_universe WHERE symbol=?", (sym,))
+            key = (key_row["instrument_key"] if key_row else "") or f"NSE_EQ|{sym}"
+            try:
+                q = client.quote(key)
+                if q.get("ltp"):
+                    qmap[sym] = float(q["ltp"])
+                    if q.get("bid") and q.get("ask"):
+                        qspread[sym] = min(
+                            abs(float(q["ask"]) - float(q["bid"])) / qmap[sym] * 10000.0,
+                            SPREAD_MAX_BPS)
+                    tflag[sym] = quote_is_today(q.get("ts"), today_str())
+                time.sleep(HTTP_SLEEP)
+            except Exception as e:
+                P.warn(f"quote {sym} failed ({e})")
+        return qmap, qspread, tflag
+
+    def sell_fraction(self, sym: str, price: float, level: str, as_of: str,
+                      reason: str) -> dict:
+        """Risk de-risk sell: SEVERE halves the position, EXTREME liquidates it.
+        Large orders are sliced to 15% of p25 daily value per session; the
+        remainder is queued in pending_trades (same rule as exit slicing)."""
+        h = self.broker.holdings().get(sym)
+        if not h or h["qty"] <= 0:
+            return {"status": "SKIP", "reason": "no position"}
+        qty = derisk_sell_qty(h["qty"], level)
+        if qty <= 0:
+            return {"status": "SKIP",
+                    "reason": f"{h['qty']} unit(s) too small to {level.lower()}"}
+        if not price or price <= 0:
+            price = h["avg_cost"]
+        p25 = self.filters.liquidity_p25(sym, as_of)
+        max_qty = int(POS_CAP_LIQ_FRAC * p25 / price) if price > 0 else 0
+        qty_now, remain = qty, 0
+        if max_qty > 0 and qty > max_qty:
+            qty_now, remain = max_qty, qty - max_qty
+            self.db.execute(
+                "INSERT INTO pending_trades(signal_as_of,exec_after,symbol,side,"
+                "target_qty,reason,status,created) VALUES(?,?,?,?,?,?,?,?)",
+                (as_of, today_str(), sym, "SELL", remain,
+                 f"de-risk slice ({level}) — remainder queued", "PENDING", now_iso()))
+            P.warn(f"SELL {sym}: {qty_now} of {qty} units today (liquidity slice); "
+                   f"{remain} queued for the next session.")
+        res = self.broker.execute(sym, "SELL", qty_now, price, as_of,
+                                  reason=reason, spread_bps=8.0)
+        self.broker.print_order_ticket(res, sym,
+                                       universe_map().get(sym, {}).get("name", sym),
+                                       "SELL")
+        return res
+
+    def apply_derisk(self, risk_ctx: dict, prices: dict) -> int:
+        """Execute the risk engine's verdicts as real sells (audit 2026-10-19
+        daily-SIP mode): SEVERE sells half ONCE when it fires; EXTREME sells
+        everything and keeps the book empty while the lock is on."""
+        fired = {lv for lv, _ in (risk_ctx.get("events") or [])}
+        n = 0
+        if "SEVERE" in fired and "EXTREME" not in fired:
+            P.section("RISK DE-RISK — SEVERE (halving positions)", "\U0001F6E1")
+            for sym in sorted(self.broker.holdings()):
+                self.sell_fraction(sym, prices.get(sym, 0.0), "SEVERE", today_str(),
+                                   "risk SEVERE — halve position")
+                n += 1
+        if "EXTREME" in fired or (self.risk.all_cash and self.broker.holdings()):
+            if "EXTREME" in fired:
+                P.section("RISK DE-RISK — EXTREME (moving to 100% cash)", "\U0001F6E1")
+            for sym in sorted(self.broker.holdings()):
+                self.sell_fraction(sym, prices.get(sym, 0.0), "EXTREME", today_str(),
+                                   "risk EXTREME — move to cash")
+                n += 1
+        return n
+
+    def consume_pending_sells(self, prices: dict) -> int:
+        """Next-session worker for queued SELL remainders (sliced exits/de-risks).
+        Stands down while the monthly signal is still OPEN — in that window the
+        rebalance re-drive owns the exits and must not be doubled up."""
+        rows = self.db.query(
+            "SELECT * FROM pending_trades WHERE status='PENDING' AND side='SELL' "
+            "AND symbol<>'*' AND exec_after < ?", (today_str(),))
+        if not rows:
+            return 0
+        as_of = self.last_month_end()
+        if self.db.meta_get("last_trade_signal", "") != as_of:
+            return 0                      # open signal: run() re-drives exits
+        n = 0
+        for r in rows:
+            sym = r["symbol"]
+            h = self.broker.holdings().get(sym)
+            if not h or h["qty"] <= 0:
+                self.db.execute("UPDATE pending_trades SET status='DONE' WHERE id=?",
+                                (r["id"],))
+                continue
+            qty = min(int(r["target_qty"]), int(h["qty"]))
+            price = prices.get(sym) or h["avg_cost"]
+            res = self.broker.execute(sym, "SELL", qty, price, today_str(),
+                                      reason=r["reason"] or "queued exit remainder")
+            self.broker.print_order_ticket(res, sym,
+                                           universe_map().get(sym, {}).get("name", sym),
+                                           "SELL")
+            left = int(r["target_qty"]) - qty
+            if left <= 0:
+                self.db.execute("UPDATE pending_trades SET status='DONE' WHERE id=?",
+                                (r["id"],))
+            else:
+                self.db.execute("UPDATE pending_trades SET target_qty=? WHERE id=?",
+                                (left, r["id"]))
+            n += 1
+        return n
+
+    def sip_day(self) -> int:
+        """One trading day of accumulation: SIP_UNITS of each selected ETF."""
+        P.section("DAILY SIP — ACCUMULATION", "\U0001F4E6")
+        basket = self.sip_basket()
+        if not basket:
+            P.warn("No selected basket yet — run the monthly rebalance first.")
+            return 0
+        P.kv("Selected basket", ", ".join(basket))
+        if not sip_buys_allowed(self.risk.state):
+            P.warn(f"Risk state {self.risk.state} — daily buys paused until recovery.")
+            return 0
+        prices = self.latest_prices()
+        qmap, qspread, tflag = self._live_quotes(basket)
+        session_today = None
+        for f in tflag.values():
+            if f is not None:
+                session_today = f
+                break
+        if session_today is False:
+            P.ok("Market holiday / non-trading day — no SIP buys today.")
+            return 0
+        if session_today is None:
+            if parse_date(today_str()).weekday() >= 5:
+                P.ok("Weekend — no SIP buys today.")
+                return 0
+            P.warn("Could not verify today's session from quotes — assuming a "
+                   "trading day (weekday).")
+        if not qmap:
+            P.warn("No live quotes — SIP fills use the LAST CLOSE (honest fallback).")
+        bought = 0
+        for sym in basket:
+            try:
+                issue = series_integrity_issue(
+                    self.data.series(sym, today_str(), 260, "adj_close") or [])
+            except Exception:
+                issue = ""
+            if issue:
+                P.warn(f"BUY {sym} skipped — data integrity: {issue}")
+                continue
+            px = qmap.get(sym) or prices.get(sym)
+            if not px:
+                P.warn(f"BUY {sym} skipped — no price available.")
+                continue
+            need = px * SIP_UNITS * 1.01
+            if self.broker.cash() < need:
+                P.warn(f"BUY {sym} skipped — not enough cash "
+                       f"({fmt_cr(self.broker.cash())} < {fmt_cr(need)}).")
+                continue
+            res = self.broker.execute(sym, "BUY", SIP_UNITS, px, today_str(),
+                                      reason="daily SIP accumulation",
+                                      spread_bps=qspread.get(sym, 8.0))
+            self.broker.print_order_ticket(res, sym,
+                                           universe_map().get(sym, {}).get("name", sym),
+                                           "BUY")
+            if res.get("status") == "FILLED":
+                bought += 1
+        P.ok(f"SIP done — {bought} buy order(s) of {SIP_UNITS} unit(s) placed today.")
+        return bought
+
+    def run_daily(self, force_exec: bool = False) -> float:
+        """The 3:00 PM daily run: risk check + de-risk sells + queued remainders,
+        monthly rebalance when due (exits only), then the daily SIP buys."""
+        P.section("DAILY TRADING CYCLE (SIP)", "\U0001F4C5")
+        mode = "PAPER TRADING (simulated — no real money)" if PAPER_TRADE else "LIVE TRADING"
+        P.info(f"Mode: {mode}   |   Today: {today_str()}")
+        self.broker.accrue_cash_interest()
+        prices = self.latest_prices()
+        ctx = self.risk.update(self.broker.equity(prices), "daily")
+        for level, msg in ctx["events"]:
+            P.warn(f"RISK [{level}]: {msg}")
+        self.apply_derisk(ctx, self.latest_prices())
+        self.consume_pending_sells(self.latest_prices())
+        as_of = self.last_month_end()
+        if force_exec or self.db.meta_get("last_trade_signal", "") != as_of:
+            P.info(f"Month-end signal {as_of} is due — running the monthly rebalance.")
+            self.run(force_exec=force_exec)
+        else:
+            P.ok(f"The {as_of} month-end rebalance is up to date. "
+                 f"Next signal after the next completed month-end.")
+        self.sip_day()
+        prices = self.latest_prices()
+        cash = self.broker.cash()
+        hv = self.broker.holdings_value(prices)
+        eq = cash + hv
+        self.risk.snapshot(today_str(), cash, hv, eq)
+        P.section("ACCOUNT STATUS", "\U0001F4B0")
+        P.kv("Cash", fmt_cr(cash))
+        P.kv("Holdings value", fmt_cr(hv))
+        P.kv("Total equity", fmt_cr(eq), val_color=_C.GREEN)
+        P.kv("Risk state", self.risk.state)
+        dd = 1 - eq / self.risk.peak if self.risk.peak else 0.0
+        P.kv("Drawdown from peak", fmt_pct(dd, signed=False))
+        log(f"daily cycle done: equity={eq:.2f} cash={cash:.2f}")
+        return eq
 
     def collect_stats(self, as_of: str, lookback: int = LOOKBACK, skip: int = SKIP,
                       entry: float = ENTRY_THRESHOLD, exit_thr: float = EXIT_THRESHOLD):
@@ -2868,7 +3234,8 @@ class TradingCycle:
         if today > exec_date:
             P.warn(f"Note: this is a LATE execution (planned {exec_date}, today {today}) — "
                    f"fills use the latest available price.")
-        self.db.execute("UPDATE pending_trades SET status='DONE' WHERE status='PENDING'")
+        self.db.execute("UPDATE pending_trades SET status='DONE' WHERE status='PENDING' "
+                        "AND symbol='*'")   # sliced SELL remainders survive for the daily worker
         prices = self.latest_prices()
         eq_before = self.broker.equity(prices)
         risk_ctx = self.risk.update(eq_before, "cycle-start")
@@ -2884,31 +3251,43 @@ class TradingCycle:
         selection = self.builder.select(stats, holding_syms, strategy,
                                         equity=self.broker.equity(self.latest_prices()))
         self.print_signal_console(selection, as_of, strategy)
-        risk_scale = self.risk.risk_scale()
-        if REGIME_SCALING:
-            # audit 3.5: halve the vol target while the broad market is below
-            # its 200-day average (explicit rule, tested as a hypothesis)
-            bench = None
-            for cand in ("NIFTYBEES", "HDFCSENSEX", "MONIFTY500"):
-                rows = self.data.series(cand, as_of, 210, "adj_close")
-                if rows and len(rows) >= 200:
-                    bench = [r[1] for r in rows]
-                    break
-            if bench and bench[-1] < sum(bench[-200:]) / 200.0:
-                risk_scale *= 0.5
-                P.info("bear regime (benchmark below 200-day avg) — vol target halved")
+        if SIP_MODE:
+            # user 2026-10-19: rebalance SELLS exits only; the portfolio is
+            # built by the daily SIP.  The chosen set is the daily buy list.
+            self.db.meta_set(SIP_BASKET_KEY,
+                             ",".join(s["symbol"] for s in selection["chosen"]))
+            P.info(f"SIP mode — the rebalance only SELLS exits. The portfolio is "
+                   f"built by buying {SIP_UNITS} unit(s) of each selected ETF "
+                   f"every trading day.")
+            P.kv("Selected SIP basket",
+                 ", ".join(s["symbol"] for s in selection["chosen"]) or "(none)")
+        else:
+            risk_scale = self.risk.risk_scale()
+            if REGIME_SCALING:
+                # audit 3.5: halve the vol target while the broad market is below
+                # its 200-day average (explicit rule, tested as a hypothesis)
+                bench = None
+                for cand in ("NIFTYBEES", "HDFCSENSEX", "MONIFTY500"):
+                    rows = self.data.series(cand, as_of, 210, "adj_close")
+                    if rows and len(rows) >= 200:
+                        bench = [r[1] for r in rows]
+                        break
+                if bench and bench[-1] < sum(bench[-200:]) / 200.0:
+                    risk_scale *= 0.5
+                    P.info("bear regime (benchmark below 200-day avg) — vol target halved")
 
-        sized = self.builder.size(selection["chosen"], eq_before,
-                                  risk_scale=risk_scale, strategy=strategy)
-        self.print_portfolio_plan(sized, eq_before)
+            sized = self.builder.size(selection["chosen"], eq_before,
+                                      risk_scale=risk_scale, strategy=strategy)
+            self.print_portfolio_plan(sized, eq_before)
 
         # ---- build target basket (execute at the LATEST traded price = next session) ----
         latest_px = self.latest_prices()
         target = {}
-        for st in selection["chosen"]:
-            w = sized["weights"].get(st["symbol"], 0.0)
-            target[st["symbol"]] = {"weight": w, "close": latest_px.get(st["symbol"], st["close"]),
-                                    "spread_bps": st["spread_bps"], "name": st["name"]}
+        if not SIP_MODE:
+            for st in selection["chosen"]:
+                w = sized["weights"].get(st["symbol"], 0.0)
+                target[st["symbol"]] = {"weight": w, "close": latest_px.get(st["symbol"], st["close"]),
+                                        "spread_bps": st["spread_bps"], "name": st["name"]}
         # exits are mandatory sells
         for st in selection["exits"]:
             target.setdefault(st["symbol"], {"weight": 0.0,
@@ -3480,6 +3859,17 @@ class Backtester:
             holding_syms = set(holdings.keys())
             decs = []
             for st in stats:
+                # audit 2026-10-19: same integrity gate as the live engine
+                i_chk = pos_at(st["symbol"], date)
+                issue = series_integrity_issue(
+                    sym_adj[st["symbol"]][max(0, (i_chk or 0) - 259):(i_chk or 0) + 1])
+                if issue:
+                    if st["symbol"] in holding_syms:
+                        dec, reason = "EXIT", f"data integrity: {issue} — exit and block re-entry"
+                    else:
+                        dec, reason = "SKIPPED", f"data integrity: {issue}"
+                    decs.append((st, dec, reason))
+                    continue
                 dec, reason = decide(st["momentum"], st["symbol"] in holding_syms,
                                      entry=entry, exit_thr=exit_thr)
                 # exit overlay (audit 2.5): 200-day average break forces EXITS
@@ -3921,8 +4311,8 @@ def print_backtest_result(res: dict, title: str = "BACKTEST RESULT"):
     p = res["params"]
     P.kv("Period", f"{res['start']}  ->  {res['end']}   ({res['years']:.1f} years)")
     P.kv("Strategy", {"A": "A — Pure TSMOM (all qualifying ETFs)",
-                      "B": "B — TSMOM + Ranking (top 3)",
-                      "C": "C — Ranking only (top 3, no threshold)"}[res["strategy"]])
+                      "B": f"B — TSMOM + Ranking (top {MAX_HOLDINGS})",
+                      "C": f"C — Ranking only (top {MAX_HOLDINGS}, no threshold)"}[res["strategy"]])
     P.kv("Parameters", f"lookback {p['lookback']} | skip {p['skip']} | "
                        f"entry {fmt_pct(p['entry'],0)} | exit {fmt_pct(p['exit'],0)}")
     P.kv("Cost scenario", f"{res['cost_case']}  (avg spread {res['avg_spread_bps']:.1f} bps)")
@@ -4646,6 +5036,14 @@ def generate_synthetic_data(db: Db, years: int = 11, n_symbols: int = 28, seed: 
     """
     rng = random.Random(seed)
     P.section("SYNTHETIC DATA GENERATOR (demo mode)", "\U0001F9EA")
+    # audit 2026-10-19: NEVER write synthetic rows into a database that holds
+    # real market data — the merge corrupts every series it touches
+    n_real = db.one("SELECT COUNT(*) AS c FROM price_daily")["c"]
+    if n_real and db.meta_get("data_origin") != "SYNTHETIC":
+        P.err("REFUSING to generate synthetic prices: this database already "
+              "holds REAL market data. Demo runs on its own database "
+              "(stock-data/tsmom-demo.db).")
+        return False
     P.warn("Generating SYNTHETIC prices — for demonstration only, clearly tagged in the DB.")
     universe = ETF_UNIVERSE[:n_symbols]
     n_days = int(years * 252)
@@ -5099,6 +5497,81 @@ def cmd_selftest(db: Db):
           and abs(dd10[2] - DD_EXTREME_MULT * 0.08) < 1e-9,
           f"{dd10} vs mults {(DD_REVIEW_MULT, DD_SEVERE_MULT, DD_EXTREME_MULT)}")
 
+    # --- audit 2026-10-19: data-integrity gate (synthetic/real splice detector) ---
+    clean = [100.0 * (1.001 ** i) for i in range(300)]
+    spliced = [3000.0 + i for i in range(200)] + [17.0 + 0.01 * i for i in range(100)]
+    wild = clean[:240] + [clean[239] * (1 + 0.05 if i % 2 else 1 - 0.05)
+                          for i in range(60)]
+    check("audit 2026-10-19: clean series passes the integrity gate",
+          series_integrity_issue(clean) == "")
+    check("audit 2026-10-19: spliced series is flagged",
+          "jump" in series_integrity_issue(spliced), series_integrity_issue(spliced))
+    check("audit 2026-10-19: implausible vol is flagged",
+          "volatility" in series_integrity_issue(wild), series_integrity_issue(wild))
+    # gate in live selection: corrupt+held -> EXIT, corrupt+free -> BLOCKED
+    global EXIT_OVERLAY_200DMA
+    dbsub8 = Db(DATA_DIR / "selftest_integ.db")
+    fe8 = FilterEngine(dbsub8)
+    pb8 = PortfolioBuilder(dbsub8, fe8)
+    mk8 = lambda sym, mom, vals: {"symbol": sym, "momentum": mom, "vol": 0.15,
+                                  "liq_p25": 1e8, "adj": list(vals), "index_family": sym,
+                                  "rows": [(f"2026-{i//28+1:02d}-{i%28+1:02d}", v, v, 1e7)
+                                           for i, v in enumerate(vals)]}
+    pool8 = [mk8("SPLICEDHELD", 0.50, spliced), mk8("SPLICEDFREE", 0.50, spliced),
+             mk8("CLEANONE", 0.05, clean)]
+    sel8 = pb8.select(pool8, {"SPLICEDHELD"}, "B", equity=1e8)
+    dec8 = {st["symbol"]: dec for st, dec, _r in sel8["decisions"]}
+    check("audit 2026-10-19: corrupt held name forced OUT, corrupt free name BLOCKED",
+          dec8.get("SPLICEDHELD") == "EXIT" and dec8.get("SPLICEDFREE") == "BLOCKED"
+          and dec8.get("CLEANONE") == "ELIGIBLE_BUY", f"{dec8}")
+    dbsub8.close()
+    try:
+        os.remove(DATA_DIR / "selftest_integ.db")
+    except Exception:
+        pass
+    # demo guard: generator refuses to write into a real database
+    dbsub9 = Db(DATA_DIR / "selftest_demoguard.db")
+    dbsub9.execute(
+        "INSERT INTO price_daily(symbol,date,open,high,low,close,adj_close,volume,traded_value) "
+        "VALUES('REALX','2026-01-01',1,1,1,1,1,1,1)")
+    dbsub9.meta_set("data_origin", "REAL")
+    ok_gen = generate_synthetic_data(dbsub9, years=1, n_symbols=2, seed=1)
+    n_after = dbsub9.one("SELECT COUNT(*) AS c FROM price_daily")["c"]
+    check("audit 2026-10-19: demo generator refuses to pollute a REAL database",
+          ok_gen is False and n_after == 1, f"ret={ok_gen} rows={n_after}")
+    dbsub9.close()
+    try:
+        os.remove(DATA_DIR / "selftest_demoguard.db")
+    except Exception:
+        pass
+    # reset-paper restores a clean paper slate
+    dbsub10 = Db(DATA_DIR / "selftest_reset.db")
+    for t in ("positions", "orders"):
+        try:
+            dbsub10.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+    dbsub10.execute(
+        "INSERT INTO orders(ts,signal_as_of,exec_date,symbol,side,qty,price,value,slippage,"
+        "charges,status,mode,order_type,reason) VALUES('t','t','t','X','BUY',1,1,1,0,0,'FILLED','PAPER','MARKET','x')")
+    dbsub10.meta_set("risk_all_cash", "1")
+    save_pt = globals()["PAPER_TRADE"]
+    globals()["PAPER_TRADE"] = True
+    try:
+        cmd_reset_paper(dbsub10)
+    finally:
+        globals()["PAPER_TRADE"] = save_pt
+    n_ord = dbsub10.one("SELECT COUNT(*) AS c FROM orders")["c"]
+    cash_ok = (abs(float(dbsub10.meta_get("cash_balance")) - STARTING_CAPITAL) < 1e-6
+               and abs(float(dbsub10.meta_get("cash")) - STARTING_CAPITAL) < 1e-6)
+    check("audit 2026-10-19: reset-paper clears the journal and restores capital",
+          n_ord == 0 and cash_ok, f"orders={n_ord} cash={dbsub10.meta_get('cash')}")
+    dbsub10.close()
+    try:
+        os.remove(DATA_DIR / "selftest_reset.db")
+    except Exception:
+        pass
+
     # --- cash sleeve (audit 2.6): real sleeve returns with labelled fallback ---
     global CASH_SLEEVE_MODE
     save_csm = CASH_SLEEVE_MODE
@@ -5177,6 +5650,67 @@ def cmd_selftest(db: Db):
     finally:
         EXIT_OVERLAY_200DMA = save_ov
 
+    # --- Daily SIP mode (user request 2026-10-19) ----------------------------
+    check("sip: config is 5 ETFs, 1 unit/day, SIP mode on",
+          MAX_HOLDINGS == 5 and SIP_MODE is True and SIP_UNITS == 1,
+          f"MAX_HOLDINGS={MAX_HOLDINGS} SIP_MODE={SIP_MODE} SIP_UNITS={SIP_UNITS}")
+    check("sip: SEVERE halves, EXTREME liquidates, REVIEW never sells",
+          derisk_sell_qty(101, "SEVERE") == 50 and derisk_sell_qty(101, "EXTREME") == 101
+          and derisk_sell_qty(101, "REVIEW") == 0 and derisk_sell_qty(1, "SEVERE") == 0
+          and derisk_sell_qty(0, "EXTREME") == 0)
+    check("sip: daily buys pause only in SEVERE/EXTREME",
+          (not sip_buys_allowed("SEVERE")) and (not sip_buys_allowed("EXTREME"))
+          and sip_buys_allowed("NORMAL") and sip_buys_allowed("REVIEW"))
+    check("sip: quote session date parses ISO + epoch, rejects garbage",
+          quote_session_date("2026-10-19T15:00:00.000+05:30") == "2026-10-19"
+          and quote_session_date("2026-10-19T15:00:00+0530") == "2026-10-19"
+          and quote_session_date(1792360800000) is not None
+          and quote_session_date("garbage") is None and quote_session_date(None) is None)
+    check("sip: quote_is_today is tri-state (unknown stays unknown)",
+          quote_is_today("2026-10-19T15:00:00.000+05:30", "2026-10-19") is True
+          and quote_is_today("2026-10-18T15:00:00.000+05:30", "2026-10-19") is False
+          and quote_is_today(None, "2026-10-19") is None)
+    dbsub11 = Db(DATA_DIR / "selftest_sip.db")
+    try:
+        dbsub11.meta_set("cash_balance", "100000")
+        dbsub11.meta_set("equity_peak", "100000")
+        dbsub11.execute(
+            "INSERT INTO positions(symbol,qty,avg_cost,updated) VALUES(?,?,?,?)",
+            ("NIFTYBEES", 100, 100.0, now_iso()))
+        dbsub11.execute(
+            "INSERT INTO price_daily(symbol,date,open,high,low,close,adj_close,"
+            "volume,traded_value) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("NIFTYBEES", today_str(), 100.0, 100.0, 100.0, 100.0, 100.0, 1e6, 1e8))
+        cyc11 = TradingCycle(dbsub11)
+        dbsub11.meta_set("last_trade_signal", cyc11.last_month_end())
+        dbsub11.execute(
+            "INSERT INTO pending_trades(signal_as_of,exec_after,symbol,side,"
+            "target_qty,reason,status,created) VALUES(?,?,?,?,?,?,?,?)",
+            ("2026-01-01", "2026-01-02", "NIFTYBEES", "SELL", 40,
+             "test remainder", "PENDING", now_iso()))
+        n_sip = cyc11.consume_pending_sells({"NIFTYBEES": 101.0})
+        left = dbsub11.one("SELECT qty FROM positions WHERE symbol='NIFTYBEES'")["qty"]
+        check("sip: queued SELL remainder consumed on the next session",
+              n_sip == 1 and left == 60, f"consumed={n_sip} left={left}")
+        dbsub11.meta_set(SIP_BASKET_KEY, "AAA,BBB,CCC")
+        check("sip: basket meta roundtrip",
+              dbsub11.meta_get(SIP_BASKET_KEY, "") == "AAA,BBB,CCC")
+        # regression: interest accrual calls sleeve_daily_return — it used to
+        # live only on TradingCycle, so day-2 of any schedule crashed with
+        # AttributeError ('Broker' object has no attribute 'sleeve_daily_return')
+        dbsub11.meta_set("last_interest_date", "2026-01-01")
+        before_cash = float(dbsub11.meta_get("cash_balance"))
+        earned = cyc11.broker.accrue_cash_interest()
+        check("hotfix: cash-interest accrual works on day 2 (Broker owns sleeve)",
+              earned > 0 and float(dbsub11.meta_get("cash_balance")) > before_cash,
+              f"earned={earned:.4f}")
+    finally:
+        dbsub11.close()
+        try:
+            os.remove(DATA_DIR / "selftest_sip.db")
+        except Exception:
+            pass
+
     P.raw()
     if failed == 0:
         P.ok(f"ALL {passed} SELF TESTS PASSED \U0001F389")
@@ -5212,7 +5746,7 @@ def cmd_scan(db: Db, try_live: bool = True):
     scanner.show_universe_table()
 
 
-def cmd_update(db: Db, years: int = 11):
+def cmd_update(db: Db, years: int = 11, force: bool = False):
     try:
         env = load_env()
         client = UpstoxClient(env)
@@ -5220,8 +5754,15 @@ def cmd_update(db: Db, years: int = 11):
         P.err(str(e))
         return
     dm = DataManager(db, client)
+    heal = force
     if db.meta_get("data_origin") == "SYNTHETIC":
-        P.warn("Database holds SYNTHETIC data. Real download will merge real bars alongside.")
+        heal = True
+        P.warn("Database holds SYNTHETIC demo rows mixed with prices. "
+               "They will be PURGED and re-downloaded from Upstox — synthetic "
+               "and real prices are NEVER merged (a spliced series produces "
+               "nonsense like -99% momentum; see audit 2026-10-19).")
+    if heal and not db.meta_get("data_origin") == "SYNTHETIC":
+        P.warn("--force-data: purging stored prices and re-downloading full history.")
     n_ca = dm.load_corporate_actions()
     n_nav = dm.load_nav_data()
     if n_ca:
@@ -5233,16 +5774,55 @@ def cmd_update(db: Db, years: int = 11):
         P.note("No NAV files found (stock-data/nav/*.csv with symbol,date,nav) — "
                "the iNAV filter will be skipped and the reason recorded.")
     try:
-        dm.update_all(years=years)
+        dm.update_all(years=years, force=heal)
+        if heal:
+            db.meta_set("data_origin", "REAL")
+            P.ok("Data origin set to REAL — synthetic rows are gone.")
     except UpstoxError as e:
         P.err(str(e))
         P.note("Tip: for an offline end-to-end trial run  ->  python tsmom.py demo")
     dm.coverage_table()
 
 
+def cmd_reset_paper(db: Db):
+    """
+    Heal a poisoned PAPER journal (audit 2026-10-19): when synthetic and real
+    prices were mixed, fills, P&L and the risk lock are all fiction — the only
+    honest fix is a clean paper slate.  Market data is kept.
+    """
+    P.section("RESET PAPER LEDGER", "\U0001F9ED")
+    if not PAPER_TRADE:
+        P.err("Refusing: PAPER_TRADE is False. Never wipe a LIVE journal automatically.")
+        return
+    P.warn("This ERASES the paper journal: positions, orders, pending trades, "
+           "decisions, tax lots, snapshots and risk state.")
+    P.note("Kept: ETF universe, price history, corporate actions, NAV data.")
+    for t in ("positions", "orders", "pending_trades", "decisions",
+              "tax_lots", "snapshots", "risk_events"):
+        try:
+            db.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+    for k in ("cash", "risk_state", "risk_halved", "risk_all_cash",
+              "risk_trigger_date", "risk_count_REVIEW", "risk_count_SEVERE",
+              "risk_count_EXTREME", "equity_peak", "last_trade_signal",
+              "last_trade_run", "last_interest_date", "interest_earned_total"):
+        try:
+            db.execute("DELETE FROM meta WHERE key=?", (k,))
+        except Exception:
+            pass
+    db.meta_set("cash_balance", str(float(STARTING_CAPITAL)))   # Broker reads this
+    db.meta_set("cash", str(float(STARTING_CAPITAL)))           # legacy alias
+    db.meta_set("equity_peak", str(float(STARTING_CAPITAL)))
+    P.ok(f"Paper ledger reset — starting capital restored to "
+         f"{fmt_rs(STARTING_CAPITAL)}. Run 'python tsmom.py trade' for a fresh cycle.")
+
+
 def cmd_trade(db: Db, force_exec: bool = False):
+    """Daily entry point (user schedules this at 3:00 PM): risk check, queued
+    remainders, monthly rebalance when due (SIP: exits only), then SIP buys."""
     cyc = TradingCycle(db)
-    cyc.run(force_exec=force_exec)
+    cyc.run_daily(force_exec=force_exec)
 
 
 def cmd_load_data(db: Db):
@@ -5731,8 +6311,9 @@ def main(argv=None):
     parser.add_argument("command", nargs="?", default="run",
                         choices=["run", "scan", "update", "trade", "monitor",
                                  "backtest", "status", "report", "demo", "selftest",
-                                 "live", "load-data", "reconcile", "tune"],
-                        help="what to do (default: run = scan+update+trade+status)")
+                                 "live", "load-data", "reconcile", "tune",
+                                 "reset-paper"],
+                        help="what to do (default: run = scan+update+daily SIP cycle+status)")
     parser.add_argument("--years", type=int, default=11, help="years of history to download")
     parser.add_argument("--force-exec", action="store_true",
                         help="execute at the latest price even if not the exact next session")
@@ -5740,6 +6321,9 @@ def main(argv=None):
     parser.add_argument("--confirm", action="store_true",
                         help="required together with 'live' to send REAL orders")
     parser.add_argument("--seed", type=int, default=7, help="synthetic data seed")
+    parser.add_argument("--force-data", action="store_true",
+                        help="purge stored prices and re-download full history "
+                             "(heals synthetic/real splices)")
     args = parser.parse_args(argv)
 
     db = Db()
@@ -5753,7 +6337,7 @@ def main(argv=None):
         elif args.command == "update":
             P.banner()
             cmd_scan(db, try_live=True)
-            cmd_update(db, years=args.years)
+            cmd_update(db, years=args.years, force=args.force_data)
         elif args.command == "trade":
             P.banner()
             cmd_trade(db, force_exec=args.force_exec)
@@ -5772,6 +6356,9 @@ def main(argv=None):
         elif args.command == "report":
             P.banner()
             cmd_report(db)
+        elif args.command == "reset-paper":
+            P.banner()
+            cmd_reset_paper(db)
         elif args.command == "load-data":
             P.banner()
             cmd_load_data(db)
@@ -5780,9 +6367,13 @@ def main(argv=None):
             cmd_reconcile(db)
         elif args.command == "demo":
             P.banner()
-            generate_synthetic_data(db, seed=args.seed)
-            cmd_scan(db, try_live=False)
-            db2 = db
+            # audit 2026-10-19: demo NEVER touches the real database —
+            # synthetic rows spliced into real series corrupt every signal
+            db2 = Db(DATA_DIR / "tsmom-demo.db")
+            P.warn(f"Demo runs on its own database: {DATA_DIR / 'tsmom-demo.db'} "
+                   f"(your real stock-data/tsmom.db is untouched).")
+            generate_synthetic_data(db2, seed=args.seed)
+            cmd_scan(db2, try_live=False)
             prices, meta = load_prices_from_db(db2)
             bt = Backtester(prices, meta, BASELINE_PARAMS, strategy="B")
             print_backtest_result(bt.run(), "DEMO BACKTEST (synthetic data) — Strategy B")
@@ -5812,7 +6403,7 @@ def main(argv=None):
         else:  # run
             P.banner()
             cmd_scan(db)
-            cmd_update(db, years=args.years)
+            cmd_update(db, years=args.years, force=args.force_data)
             prices = {r["symbol"] for r in db.query("SELECT DISTINCT symbol FROM price_daily")}
             if not prices:
                 P.warn("No downloaded prices — trying synthetic demo data so you can "

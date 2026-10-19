@@ -1,0 +1,10 @@
+{
+  "date": "2026-10-19",
+  "entries_today": 0,
+  "consecutive_losses": 0,
+  "daily_pnl": 0.0,
+  "last_processed_bar_ts": null,
+  "last_signal_ts": null,
+  "last_decision": null,
+  "history": []
+}
