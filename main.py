@@ -1535,8 +1535,26 @@ class MainEngine:
                                 signals = dict(signals)
                                 signals["_feed_stale"] = True
                             decision = self.strategy_engine.decide(signals)
+                            _long_only = bool(
+                                getattr(self.config, "long_options_only", False)
+                            )
+                            _strategy = str(
+                                decision.get("strategy_name") or ""
+                            ).upper()
+                            _long_only_blocked = (
+                                _long_only
+                                and decision.get("action") == "ENTER"
+                                and _strategy not in ("LONG_CALL", "LONG_PUT")
+                            )
+                            if _long_only_blocked:
+                                self.logger.info(
+                                    "LONG_OPTIONS_ONLY=true: blocked new %s entry; "
+                                    "only LONG_CALL/LONG_PUT are allowed",
+                                    _strategy or "unknown-strategy",
+                                )
                             if (
                                 decision.get("action") == "ENTER"
+                                and not _long_only_blocked
                                 and not self._feed_stale
                                 and self.running
                             ):
