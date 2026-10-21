@@ -636,6 +636,14 @@ def ensure_pit_fundamentals_populated(conn: sqlite3.Connection, prices_df: pd.Da
     anchored to each stock's real trailing fundamental/operating return profile are stored.
     """
     cur = conn.cursor()
+    proxy_n = int(cur.execute("SELECT COUNT(*) FROM fundamentals_pit WHERE data_source='CALIBRATED_PIT_SQLITE'").fetchone()[0])
+    actual_n = int(cur.execute("SELECT COUNT(DISTINCT symbol) FROM fundamentals_pit WHERE data_source IS NOT NULL AND data_source!='CALIBRATED_PIT_SQLITE'").fetchone()[0])
+    if proxy_n and actual_n < max(1, int(cur.execute("SELECT COUNT(*) FROM instruments").fetchone()[0])-5) and os.environ.get("ALLOW_CALIBRATED_PIT", "0") != "1":
+        raise RuntimeError(
+            f"Found {proxy_n:,} generated CALIBRATED_PIT_SQLITE fundamental rows and only {actual_n} verified-source symbols. "
+            "These estimates are not historical company filings. For a research-only run, set ALLOW_CALIBRATED_PIT=1; "
+            "for an investable-quality backtest, import verified point-in-time fundamentals first."
+        )
     inst_df = pd.read_sql_query("SELECT * FROM instruments", conn)
     all_dates = prices_df.index
     min_data_yr = int(all_dates.min().year) if len(all_dates) > 0 else 2013
@@ -654,6 +662,13 @@ def ensure_pit_fundamentals_populated(conn: sqlite3.Connection, prices_df: pd.Da
         f"[SQLite Fundamentals] Populating Point-in-Time (May/Nov {min_data_yr}-{max_data_yr}) "
         f"3-Track Fundamental Database..."
     )
+    actual_symbols = int(cur.execute("SELECT COUNT(DISTINCT symbol) FROM fundamentals_pit WHERE data_source IS NOT NULL AND data_source!='CALIBRATED_PIT_SQLITE'").fetchone()[0])
+    if actual_symbols < max(1, len(inst_df)-5) and os.environ.get("ALLOW_CALIBRATED_PIT", "0") != "1":
+        raise RuntimeError(
+            "No sufficiently complete verified historical fundamentals feed is available. "
+            "The previous fallback generated sector-calibrated estimates; this has been disabled by default. "
+            "Import point-in-time filings for the universe, or set ALLOW_CALIBRATED_PIT=1 only for explicitly labeled research experiments."
+        )
 
     # Sector baseline fundamental profiles (indian NSE empirical medians)
     sector_profiles = {
@@ -1113,7 +1128,10 @@ class IndianTaxAwarePortfolio:
             if w_tgt < w_act - 1e-5:
                 px = float(current_prices[sym])
                 sell_val_target = (w_act - w_tgt) * nav_before
-                shares_to_sell = sell_val_target / px
+                # NSE cash equities trade in whole shares; round down the requested trim.
+                shares_to_sell = min(self.get_position_shares(sym), float(math.floor(sell_val_target / px)))
+                if shares_to_sell < 1.0:
+                    continue
                 sym_lots = self.lots.get(sym, [])
 
                 # Sort lots: (1) STCG loss, (2) LTCG loss, (3) LTCG gain, (4) STCG gain
@@ -1201,7 +1219,11 @@ class IndianTaxAwarePortfolio:
             if buy_notional <= 10.0:
                 continue
             px = float(current_prices[sym])
-            sh = buy_notional / px
+            # NSE cash equities trade in whole shares, not fractional units.
+            sh = float(math.floor(buy_notional / px))
+            if sh < 1.0:
+                continue
+            buy_notional = sh * px
             fee = buy_notional * cost_rate
             self.cash -= buy_notional + fee
             cost_paid += fee
@@ -1858,7 +1880,7 @@ class NseVramqcV3Backtester:
         peak_bench = self.cfg.initial_corpus_inr
 
         print(
-            f"[Backtest Execution] Running 10-Year Simulation ({bt_dates[0].strftime('%Y-%m-%d')} "
+            f"[Backtest Execution] Running Backtest ({bt_dates[0].strftime('%Y-%m-%d')} "
             f"to {bt_dates[-1].strftime('%Y-%m-%d')}, {len(bt_dates):,} NSE trading days)..."
         )
         t0 = time.time()
@@ -2081,7 +2103,7 @@ class NseVramqcV3Backtester:
         )
         self.conn.commit()
 
-        print(f"[Backtest Complete] Simulated 10 years in {time.time() - t0:.2f}s. Saved to SQLite.")
+        print(f"[Backtest Complete] Simulated {len(bt_dates):,} sessions over {(bt_dates[-1]-bt_dates[0]).days/365.25:.2f} calendar years in {time.time()-t0:.2f}s. Saved to SQLite.")
         return {
             "portfolio": portfolio_net,
             "intra_month_stops": intra_month_stops_triggered,
@@ -2146,7 +2168,7 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
 
     # Compute Exact Performance Metrics
     n_days = len(nav_df)
-    years = n_days / 252.0
+    years = max((pd.to_datetime(nav_df["trade_date"].iloc[-1]) - pd.to_datetime(nav_df["trade_date"].iloc[0])).days / 365.25, 1/365.25)
     init_cap = cfg.initial_corpus_inr
 
     final_gross = float(nav_df["portfolio_nav_gross"].iloc[-1])
@@ -2171,13 +2193,14 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
     down_net = float(np.sqrt(252 * np.mean(np.minimum(0.0, ret_net - rf_d) ** 2)) * 100.0)
     down_bench = float(np.sqrt(252 * np.mean(np.minimum(0.0, ret_bench - rf_d) ** 2)) * 100.0)
 
-    sharpe_gross = (cagr_gross - cfg.risk_free_rate_annual * 100.0) / max(vol_gross, 1e-6)
-    sharpe_net = (cagr_net - cfg.risk_free_rate_annual * 100.0) / max(vol_net, 1e-6)
-    sharpe_bench = (cagr_bench - cfg.risk_free_rate_annual * 100.0) / max(vol_bench, 1e-6)
-
-    sortino_gross = (cagr_gross - cfg.risk_free_rate_annual * 100.0) / max(down_gross, 1e-6)
-    sortino_net = (cagr_net - cfg.risk_free_rate_annual * 100.0) / max(down_net, 1e-6)
-    sortino_bench = (cagr_bench - cfg.risk_free_rate_annual * 100.0) / max(down_bench, 1e-6)
+    rf_daily = (1.0 + cfg.risk_free_rate_annual) ** (1.0 / 252.0) - 1.0
+    # Conventional daily-return Sharpe and annualized arithmetic-excess Sortino.
+    sharpe_gross = float((ret_gross.mean() - rf_daily) / max(ret_gross.std(), 1e-12) * math.sqrt(252))
+    sharpe_net = float((ret_net.mean() - rf_daily) / max(ret_net.std(), 1e-12) * math.sqrt(252))
+    sharpe_bench = float((ret_bench.mean() - rf_daily) / max(ret_bench.std(), 1e-12) * math.sqrt(252))
+    sortino_gross = float((ret_gross.mean() - rf_daily) * 252 / max(down_gross / 100.0, 1e-12))
+    sortino_net = float((ret_net.mean() - rf_daily) * 252 / max(down_net / 100.0, 1e-12))
+    sortino_bench = float((ret_bench.mean() - rf_daily) * 252 / max(down_bench / 100.0, 1e-12))
 
     max_dd_net = float(nav_df["drawdown_net_pct"].min())
     max_dd_bench = float(nav_df["benchmark_dd_pct"].min())
@@ -2217,7 +2240,7 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
     sep = "=" * 96
     subsep = "-" * 96
     print("\n" + sep)
-    print("  NSE V-RAMQC v3.0 — 10-YEAR INSTITUTIONAL BACKTEST REPORT (UPSTOX API v2 + SQLITE)")
+    print("  NSE V-RAMQC v3.0 — HISTORICAL BACKTEST REPORT (UPSTOX API v2 + SQLITE)")
     print(sep)
     print(f"  Config File          : {cfg.env_file} (Upstox Base URL: {cfg.upstox_base_url})")
     print(f"  SQLite Database      : {cfg.sqlite_db_path}")
@@ -2234,8 +2257,13 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
         f"Zero Debt, Zero Gold/Commodities)"
     )
     print(sep)
+    proxy_rows = int(conn.execute("SELECT COUNT(*) FROM fundamentals_pit WHERE data_source='CALIBRATED_PIT_SQLITE'").fetchone()[0])
+    if proxy_rows:
+        print(f"  WARNING: {proxy_rows:,} generated/calibrated fundamental rows are proxies, NOT actual historical filings.")
+        print("           Quality-based results are research-only; do not treat as a validated live-performance estimate.")
+    print("  WARNING: current/static stock universe may contain survivorship bias; historical index membership is not reconstructed.")
 
-    print("\n  [1] EXECUTIVE 10-YEAR CORPUS & RISK-ADJUSTED PERFORMANCE SUMMARY")
+    print("\n  [1] EXECUTIVE HISTORICAL CORPUS & RISK-ADJUSTED PERFORMANCE SUMMARY")
     print(subsep)
     print(
         f"  {'Metric':<38} | {'V-RAMQC v3.0 (Gross)':>18} | {'V-RAMQC v3.0 (Net*)':>18} | {'Nifty 500 Index':>15}"
@@ -2322,7 +2350,7 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
     )
 
     # 2. ASCII Equity Curve
-    print("\n  [2] 10-YEAR CORPUS GROWTH TRAJECTORY (₹1.00 CRORE INITIAL INVESTMENT)")
+    print("\n  [2] HISTORICAL CORPUS GROWTH TRAJECTORY (₹1.00 CRORE INITIAL INVESTMENT)")
     print(subsep)
     print(render_ascii_equity_curve(nav_df))
 
@@ -2455,6 +2483,7 @@ def deployment_schema(conn):
     CREATE TABLE IF NOT EXISTS orders(local_id TEXT PRIMARY KEY, broker_id TEXT, ts TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, qty INTEGER NOT NULL, status TEXT NOT NULL, mode TEXT NOT NULL, ref_price REAL, fill_price REAL, message TEXT);
     CREATE TABLE IF NOT EXISTS daily_nav(day TEXT PRIMARY KEY, contributions REAL NOT NULL, cash REAL NOT NULL, market_value REAL NOT NULL, nav REAL NOT NULL, unrealized_pnl REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS deployment_reports(day TEXT PRIMARY KEY, report TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS closed_trades(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, qty INTEGER NOT NULL, buy_avg REAL NOT NULL, sell_price REAL NOT NULL, realized_pnl REAL NOT NULL, closed_at TEXT NOT NULL, reason TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS deployment_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """)
     conn.execute("INSERT OR IGNORE INTO acct_state VALUES(1,0,?)", (dt.datetime.now().isoformat(timespec='seconds'),))
@@ -2554,12 +2583,13 @@ def rebalance_contribution(cfg,conn,weights,keys,prices,trade_day,mode):
     total_gap=sum(x[1] for x in gaps)
     if total_gap<=0:
         conn.execute("UPDATE contributions SET status='CASH_CARRY' WHERE month=?",(month,)); conn.commit(); return 0
-    contribution=float(row[0]); budget=min(acc_cash,contribution)
+    contribution=float(row[0]); budget=acc_cash
     invested=0.0
-    # Pro-rata target-gap buys; integer shares, iterative spend cap.
+    allocation_budget=min(budget,total_gap)
+    # Pro-rata only across actual underweights; never spend more than total target gaps.
     for symbol,gap in sorted(gaps,key=lambda x:x[1],reverse=True):
         px=prices[symbol]
-        allocation=min(budget-invested, budget*gap/total_gap)
+        allocation=min(allocation_budget-invested, allocation_budget*gap/total_gap)
         qty=int(allocation/(px*(1+SLIPPAGE_BPS/10000)))
         if qty<1: continue
         status,fill=send_order(cfg,conn,symbol,keys.get(symbol), 'BUY',qty,px,mode)
@@ -2580,17 +2610,36 @@ def rebalance_contribution(cfg,conn,weights,keys,prices,trade_day,mode):
     conn.commit(); return invested
 
 
+def _paper_close_position(conn, symbol, qty, avg_cost, fill, reason):
+    now=dt.datetime.now().isoformat(timespec='seconds')
+    proceeds=int(qty)*float(fill)
+    pnl=proceeds-int(qty)*float(avg_cost)
+    conn.execute('INSERT INTO closed_trades(symbol,qty,buy_avg,sell_price,realized_pnl,closed_at,reason) VALUES(?,?,?,?,?,?,?)',
+                 (symbol,int(qty),float(avg_cost),float(fill),pnl,now,reason))
+    conn.execute("UPDATE positions SET status='CLOSED',last_price=?,updated=? WHERE symbol=?",(fill,now,symbol))
+    conn.execute('UPDATE acct_state SET cash=cash+?,updated=? WHERE id=1',(proceeds,now))
+
+
 def check_stops(cfg,conn,prices,keys,mode):
     """Daily-close stop check only; not intraday protection."""
-    for symbol,qty,stop in conn.execute("SELECT symbol,qty,stop_price FROM positions WHERE status='HOLD'").fetchall():
+    for symbol,qty,stop,avg in conn.execute("SELECT symbol,qty,stop_price,avg_cost FROM positions WHERE status='HOLD'").fetchall():
         px=prices.get(symbol)
         if px is None or px>float(stop): continue
         status,fill=send_order(cfg,conn,symbol,keys.get(symbol),'SELL',int(qty),px,mode)
-        if mode=='PAPER':
-            conn.execute("UPDATE positions SET status='CLOSED',last_price=?,updated=? WHERE symbol=?",
-              (fill,dt.datetime.now().isoformat(timespec='seconds'),symbol))
-            conn.execute('UPDATE acct_state SET cash=cash+? WHERE id=1',(int(qty)*float(fill),))
+        if mode=='PAPER': _paper_close_position(conn,symbol,qty,avg,fill,'STOP_CLOSE')
     conn.commit()
+
+
+def exit_names_not_in_signal(cfg,conn,weights,keys,prices,mode):
+    """Sell paper holdings omitted by the latest valid V-RAMQC target snapshot."""
+    if not weights: return 0
+    n=0
+    for symbol,qty,avg in conn.execute("SELECT symbol,qty,avg_cost FROM positions WHERE status='HOLD'").fetchall():
+        if symbol in weights or symbol not in prices: continue
+        status,fill=send_order(cfg,conn,symbol,keys.get(symbol),'SELL',int(qty),prices[symbol],mode)
+        if mode=='PAPER': _paper_close_position(conn,symbol,qty,avg,fill,'SIGNAL_EXIT')
+        n+=1
+    conn.commit(); return n
 
 
 def save_report(conn,prices,day,folder):
@@ -2599,9 +2648,14 @@ def save_report(conn,prices,day,folder):
     positions=conn.execute("SELECT symbol,qty,avg_cost,stop_price FROM positions WHERE status='HOLD' ORDER BY symbol").fetchall()
     mv=sum(int(q)*prices.get(s,0) for s,q,_,_ in positions); unreal=sum(int(q)*(prices.get(s,0)-float(a)) for s,q,a,_ in positions)
     nav=cash+mv
+    realized=float(conn.execute('SELECT COALESCE(SUM(realized_pnl),0) FROM closed_trades').fetchone()[0])
+    proxy_count=int(conn.execute("SELECT COUNT(*) FROM fundamentals_pit WHERE data_source='CALIBRATED_PIT_SQLITE'").fetchone()[0])
     report=[f'V-RAMQC {"LIVE" if LIVE_TRADING_ENABLED else "PAPER"} DAILY REPORT | {day}',
+      'PAPER SIMULATION ONLY — no exchange orders are sent.' if not LIVE_TRADING_ENABLED else 'LIVE MODE',
+      *([f'RESEARCH-ONLY WARNING: {proxy_count:,} generated fundamental proxies; not verified company filings.'] if proxy_count else []),
+      'Stop checks use daily closes; they are not intraday stop orders.',
       f'Total contributions: ₹{invested:,.2f}',f'Cash ledger: ₹{cash:,.2f}',f'Holdings value: ₹{mv:,.2f}',
-      f'Portfolio NAV: ₹{nav:,.2f}',f'Unrealized P/L: ₹{unreal:,.2f}',f'Net P/L vs contributions: ₹{nav-invested:,.2f}',
+      f'Portfolio NAV: ₹{nav:,.2f}',f'Realized P/L: ₹{realized:,.2f}',f'Unrealized P/L: ₹{unreal:,.2f}',f'Net P/L vs contributions: ₹{nav-invested:,.2f}',
       f'Open holdings: {len(positions)}','', 'SYMBOL | QTY | PRICE | AVG COST | STOP | UNREALIZED P/L']
     for s,q,a,st in positions:
         px=prices.get(s,0); report.append(f'{s} | {q} | {px:.2f} | {a:.2f} | {st:.2f} | ₹{(px-float(a))*int(q):,.2f}')
@@ -2613,6 +2667,8 @@ def save_report(conn,prices,day,folder):
 
 
 def deployment_main():
+    if LIVE_TRADING_ENABLED:
+        raise RuntimeError('LIVE MODE IS NOT ENABLED FOR USE: holdings reconciliation, broker-confirmed fill processing, safe retries/idempotency, and verified live stop execution must be completed and tested first. Keep LIVE_TRADING_ENABLED=False.')
     root=os.path.dirname(os.path.abspath(__file__))
     folder=os.path.join(root,'stock-data'); os.makedirs(folder,exist_ok=True)
     import logging
@@ -2642,7 +2698,11 @@ def deployment_main():
         NseVramqcV3Backtester(cfg,conn).run_backtest()
         weights,keys=targets_latest(conn); prices,day=mark_prices(conn)
         if not day: raise RuntimeError('No cached daily prices available')
+        age=(dt.date.today()-dt.date.fromisoformat(day)).days
+        if age>5: raise RuntimeError(f'Stale cached market data: latest session {day} is {age} calendar days old; refusing new trades.')
         check_stops(cfg,conn,prices,keys,mode)
+        exited=exit_names_not_in_signal(cfg,conn,weights,keys,prices,mode)
+        if exited: print(f'[Paper] Signal exits: {exited} positions')
         spent=rebalance_contribution(cfg,conn,weights,keys,prices,day,mode)
         if spent: print(f'Monthly contribution allocated: ₹{spent:,.2f}')
         save_report(conn,prices,day,folder)

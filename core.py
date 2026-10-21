@@ -1022,6 +1022,10 @@ class Config:
     # Anti-chase protection comes from OR-break freshness, the IV
     # gates and the stop — not from a cap that bans trend days.
     momentum_day_move_max_pct:     float = 200.0
+    # A spent move at a session extreme needs a larger extension before the
+    # long-premium substitute is refused; this is a general volatility-aware
+    # threshold, not a session-specific rule.
+    momentum_spent_extreme_peak_pct: float = 135.0
     # Buy option, not a vol-spike top: India VIX must not be gapping up.
     momentum_vix_gap_max_pct:      float = 12.0
     # Premium paid, as a fraction of spot, for a strike that is neither a
@@ -1937,6 +1941,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_or_break_frac=min(max(_get_float(env, "MOMENTUM_OR_BREAK_FRAC", 0.15), 0.0), 1.00),
         momentum_vwap_buffer_pts=min(max(_get_float(env, "MOMENTUM_VWAP_BUFFER_PTS", 8.0), 0.0), 60.0),
         momentum_day_move_max_pct=min(max(_get_float(env, "MOMENTUM_DAY_MOVE_MAX_PCT", 200.0), 10.0), 400.0),  # PATCH_V12: was 90.0
+        momentum_spent_extreme_peak_pct=min(max(_get_float(env, "MOMENTUM_SPENT_EXTREME_PEAK_PCT", 135.0), 100.0), 300.0),
         momentum_vix_gap_max_pct=min(max(_get_float(env, "MOMENTUM_VIX_GAP_MAX_PCT", 12.0), 0.5), 100.0),
         momentum_prem_min_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MIN_PCT_OF_SPOT", 0.0018), 0.0002), 0.01),
         momentum_prem_max_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MAX_PCT_OF_SPOT", 0.0090), 0.001), 0.03),

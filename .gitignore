@@ -114,3 +114,5 @@ rr.txt
 !/Misc/*.py
 !/Misc/*.ps1
 !/Misc/*.cmd
+/data/per_day/nifty_algo_2026-10-06.db
+/stock-data/vramqc_deployment.db

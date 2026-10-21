@@ -626,34 +626,241 @@ class UpstoxDataManager:
 # 4. POINT-IN-TIME FUNDAMENTAL TABLE BUILDER (STAGE 2 & STAGE 3 INPUTS)
 # ==============================================================================
 
+# ---------------- Yahoo Finance research-only fundamentals provider ----------------
+YFINANCE_RESEARCH_ONLY = True
+
+
+def _yf_norm_name(value):
+    return ''.join(ch.lower() for ch in str(value) if ch.isalnum())
+
+
+def _yf_frame_records(frame):
+    out={}
+    if frame is None or getattr(frame,'empty',True): return out
+    for col in frame.columns:
+        try: period=pd.Timestamp(col).date().isoformat()
+        except Exception: continue
+        rec={}
+        for metric,val in frame[col].items():
+            try: v=float(val)
+            except (TypeError,ValueError): continue
+            if np.isfinite(v): rec[_yf_norm_name(metric)]=v
+        out[period]=rec
+    return out
+
+
+def _yf_pick(rec, *names):
+    if not rec: return None
+    for name in names:
+        key=_yf_norm_name(name)
+        if key in rec: return rec[key]
+    # Fallback to controlled suffix/substring matching for Yahoo label variants.
+    for name in names:
+        key=_yf_norm_name(name)
+        for got,val in rec.items():
+            if got==key or got.endswith(key): return val
+    return None
+
+
+def _yf_sum(records, metric_names):
+    vals=[]
+    for r in records:
+        v=_yf_pick(r,*metric_names)
+        if v is not None: vals.append(v)
+    return float(sum(vals)) if len(vals)==len(records) and records else None
+
+
+def populate_yfinance_fundamentals(conn, inst_df, prices_df):
+    """Build research-only, estimated-availability snapshots from Yahoo annual/quarterly statements."""
+    try:
+        import yfinance as yf
+    except ImportError as exc:
+        raise RuntimeError('Install yfinance first: python -m pip install yfinance') from exc
+    conn.execute('''CREATE TABLE IF NOT EXISTS yfinance_statement_cache(symbol TEXT PRIMARY KEY,fetched_at TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL)''')
+    conn.commit()
+    reconst=[]
+    for yr in range(int(prices_df.index.min().year),int(prices_df.index.max().year)+1):
+        for mo in (5,11):
+            dates=[d for d in prices_df.index if d.year==yr and d.month==mo]
+            if dates: reconst.append(pd.Timestamp(dates[-1]))
+    rows=[]; usable=0
+    for ix,(sym,meta) in enumerate(inst_df.iterrows(),1):
+        cached=conn.execute('SELECT payload,status FROM yfinance_statement_cache WHERE symbol=?',(sym,)).fetchone()
+        pack=None
+        if cached and cached[1]=='OK' and os.environ.get('YFINANCE_REFRESH','0')!='1':
+            try: pack=json.loads(cached[0])
+            except Exception: pack=None
+        if pack is None:
+            try:
+                ticker=yf.Ticker(str(sym)+'.NS'); pack={}
+                for freq,attrs in [('annual',('income_stmt','balance_sheet','cashflow')),
+                                   ('quarterly',('quarterly_income_stmt','quarterly_balance_sheet','quarterly_cashflow'))]:
+                    pack[freq]={}
+                    for kind,attr in zip(('income','balance','cashflow'),attrs):
+                        pack[freq][kind]=_yf_frame_records(getattr(ticker,attr,None))
+                divs={}
+                try:
+                    ds=ticker.dividends
+                    for date,val in ds.items(): divs[pd.Timestamp(date).date().isoformat()]=float(val)
+                except Exception: pass
+                pack['dividends']=divs
+                status='OK' if any(pack[f][k] for f in ('annual','quarterly') for k in pack[f]) else 'EMPTY'
+                conn.execute('INSERT OR REPLACE INTO yfinance_statement_cache VALUES(?,?,?,?)',
+                  (sym,dt.datetime.now().isoformat(timespec='seconds'),json.dumps(pack),status)); conn.commit()
+                if status!='OK': continue
+                time.sleep(0.75)
+            except Exception as exc:
+                conn.execute('INSERT OR REPLACE INTO yfinance_statement_cache VALUES(?,?,?,?)',
+                  (sym,dt.datetime.now().isoformat(timespec='seconds'),'{}','ERROR:'+str(exc)[:200])); conn.commit(); continue
+        events={}
+        for freq,lag in [('quarterly',60),('annual',120)]:
+            blocks=pack.get(freq,{})
+            periods=set(k for b in blocks.values() for k in b)
+            for per in periods:
+                try: pdte=dt.date.fromisoformat(per)
+                except Exception: continue
+                e=events.setdefault((freq,per),{'period':pdte,'available':pdte+dt.timedelta(days=lag),'freq':freq})
+                for kind in ('income','balance','cashflow'): e[kind]=blocks.get(kind,{}).get(per,{})
+        qevents=sorted([e for e in events.values() if e['freq']=='quarterly'],key=lambda x:x['period'])
+        aevents=sorted([e for e in events.values() if e['freq']=='annual'],key=lambda x:x['period'])
+        if not events: continue
+        divs=pack.get('dividends',{})
+        usable+=1
+        for rdate in reconst:
+            avail=[e for e in events.values() if e['available']<=rdate.date()]
+            if not avail: continue
+            qavail=[e for e in qevents if e['available']<=rdate.date()]
+            aavail=[e for e in aevents if e['available']<=rdate.date()]
+            chosen=max(avail,key=lambda x:(x['available'],x['period']))
+            q4=qavail[-4:] if len(qavail)>=4 else []
+            qprev=qavail[-8:-4] if len(qavail)>=8 else []
+            flow_events=q4 if q4 else ([aavail[-1]] if aavail else [chosen])
+            def fsum(block,names,events0=None): return _yf_sum([e.get(block,{}) for e in (events0 if events0 is not None else flow_events)],names)
+            net_names=('Net Income','Net Income Common Stockholders','Net Income From Continuing Operations')
+            rev_names=('Total Revenue','Operating Revenue','Revenue')
+            ebit_names=('EBIT','Operating Income')
+            ebitda_names=('EBITDA','Normalized EBITDA')
+            cfo_names=('Operating Cash Flow','Cash Flow From Continuing Operating Activities')
+            pat=fsum('income',net_names); revenue=fsum('income',rev_names); ebit=fsum('income',ebit_names); ebitda=fsum('income',ebitda_names)
+            interest=fsum('income',('Interest Expense','Interest Expense Non Operating'))
+            cfo=fsum('cashflow',cfo_names)
+            if len(aavail)>=3: cfo3=fsum('cashflow',cfo_names,aavail[-3:])
+            elif len(qavail)>=12: cfo3=fsum('cashflow',cfo_names,qavail[-12:])
+            else: cfo3=None
+            pat3=fsum('income',net_names,aavail[-3:]) if len(aavail)>=3 else (fsum('income',net_names,qavail[-12:]) if len(qavail)>=12 else None)
+            bal_candidates=[e for e in avail if e.get('balance')]
+            bal=max(bal_candidates,key=lambda x:(x['available'],x['period'])).get('balance',{}) if bal_candidates else {}
+            assets=_yf_pick(bal,'Total Assets'); equity=_yf_pick(bal,'Stockholders Equity','Total Stockholder Equity','Total Equity Gross Minority Interest')
+            debt=_yf_pick(bal,'Total Debt')
+            if debt is None:
+                longdebt=_yf_pick(bal,'Long Term Debt And Capital Lease Obligation','Long Term Debt'); shortdebt=_yf_pick(bal,'Current Debt','Short Term Debt')
+                debt=(longdebt or 0)+(shortdebt or 0) if longdebt is not None or shortdebt is not None else None
+            currliab=_yf_pick(bal,'Current Liabilities'); cash=_yf_pick(bal,'Cash Cash Equivalents And Short Term Investments','Cash And Cash Equivalents','Cash Financial')
+            capital=assets-currliab if assets is not None and currliab is not None else None
+            roce=100*ebit/capital if ebit is not None and capital and capital>0 else None
+            roe=100*pat/equity if pat is not None and equity else None; roa=100*pat/assets if pat is not None and assets else None
+            nde=(debt-cash)/equity if debt is not None and cash is not None and equity else None
+            ndebitda=(debt-cash)/ebitda if debt is not None and cash is not None and ebitda else None
+            icr=abs(ebit/interest) if ebit is not None and interest not in (None,0) else None
+            opm=100*ebit/revenue if ebit is not None and revenue else None
+            accr=(pat-cfo)/assets if pat is not None and cfo is not None and assets else None
+            ebitda_assets=ebitda/assets if ebitda is not None and assets else None
+            # 3-year median ROCE from available annual filings, not current-year extrapolation.
+            rocehist=[]
+            for ae in aavail[-3:]:
+                ai=_yf_pick(ae.get('income',{}),*ebit_names); ab=ae.get('balance',{})
+                aa=_yf_pick(ab,'Total Assets'); acl=_yf_pick(ab,'Current Liabilities')
+                if ai is not None and aa is not None and acl is not None and aa>acl: rocehist.append(100*ai/(aa-acl))
+            roce3=float(np.median(rocehist)) if len(rocehist)>=2 else None
+            # Earnings/revenue surprise proxies use quarterly YoY TTM, or annual YoY where available.
+            if q4 and qprev:
+                prevpat=fsum('income',net_names,qprev); prevrev=fsum('income',rev_names,qprev)
+            elif len(aavail)>=2:
+                prevpat=fsum('income',net_names,[aavail[-2]]); prevrev=fsum('income',rev_names,[aavail[-2]])
+            else: prevpat=prevrev=None
+            sue=(pat/prevpat-1) if pat is not None and prevpat not in (None,0) else None
+            revgrowth=(revenue/prevrev-1) if revenue is not None and prevrev not in (None,0) else None
+            olderrev=fsum('income',rev_names,[aavail[-2]]) if len(aavail)>=3 else None
+            olderolder=fsum('income',rev_names,[aavail[-3]]) if len(aavail)>=3 else None
+            oldgrowth=(olderrev/olderolder-1) if olderrev is not None and olderolder not in (None,0) else None
+            revacc=(revgrowth-oldgrowth) if revgrowth is not None and oldgrowth is not None else None
+            annual_growth=[]
+            for j in range(1,len(aavail)):
+                x=_yf_pick(aavail[j].get('income',{}),*rev_names); y=_yf_pick(aavail[j-1].get('income',{}),*rev_names)
+                if x is not None and y not in (None,0): annual_growth.append(x/y-1)
+            revstability=(1.0/(1.0+float(np.std(annual_growth))) if len(annual_growth)>=2 else None)
+            sh_events=[]
+            for e in (qavail+aavail):
+                sh=_yf_pick(e.get('balance',{}),'Ordinary Shares Number','Share Issued','Common Stock Shares Outstanding')
+                if sh is not None: sh_events.append((e['period'],sh))
+            sh_events.sort()
+            shares=sh_events[-1][1] if sh_events else None
+            older_sh=next((v for d,v in reversed(sh_events[:-1]) if (sh_events[-1][0]-d).days>=650),None) if sh_events else None
+            dilution=shares/older_sh-1 if shares is not None and older_sh else None
+            px=float(prices_df.loc[rdate,sym]) if sym in prices_df.columns and pd.notna(prices_df.loc[rdate,sym]) else None
+            mcap=px*shares if px and shares else None
+            capex=fsum('cashflow',('Capital Expenditure',))
+            fcf_y=(cfo+capex)/mcap if cfo is not None and capex is not None and mcap else None
+            earn_y=pat/mcap if pat is not None and mcap else None
+            dsum=sum(float(v) for d,v in divs.items() if (rdate.date()-dt.date.fromisoformat(d)).days<=365 and dt.date.fromisoformat(d)<=rdate.date())
+            div_y=dsum/px if px else None
+            retention=(1.0-abs(dsum*shares)/pat if pat and shares else None) if pat and pat>0 else None
+            trk=str(meta.get('track','Track_A_NonBFSI'))
+            vals=(sym,rdate.strftime('%Y-%m-%d'),trk,roce,roce3,roe,roa,ebitda_assets,None,opm,nde,ndebitda,icr,accr,cfo3,pat,pat3,
+                  None,None,None,None,None,revstability,sue,revacc,div_y,dilution,fcf_y,earn_y,retention,None,None,None,None,
+                  'YFINANCE_RESEARCH_ESTIMATED_AVAILABILITY')
+            rows.append(vals)
+        if ix%20==0: print(f'[yfinance] {ix}/{len(inst_df)} symbols scanned; {usable} have statement history.')
+    if rows:
+        conn.executemany('''INSERT OR REPLACE INTO fundamentals_pit(
+          symbol,reconstitution_date,track,roce_ttm,roce_3y_med,roe_ttm,roa_ttm,ebitda_to_assets,ppop_to_assets,opm_ttm,
+          net_debt_to_equity,net_debt_to_ebitda,icr_ttm,accrual_ratio,cfo_3y_sum,core_pat_ttm,core_pat_3y_sum,net_npa,
+          gnpa_change_1y,crar_buffer_bps,solvency_ratio,cost_to_income,rev_cagr_stability,sue_core,rev_accel,div_yield,
+          share_dilution_2y,fcf_yield,earnings_yield,retention_ratio,promoter_pledge_pct,pledge_change_1y,asm_gsm_stage,
+          audit_clean,data_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',rows)
+        conn.commit()
+    print(f'[yfinance] Stored {len(rows):,} snapshots for {usable} symbols. Filing dates are estimated; not point-in-time validated.')
+    return len(rows)
+
+
 def ensure_pit_fundamentals_populated(conn: sqlite3.Connection, prices_df: pd.DataFrame) -> None:
     """
     Ensures the SQLite `fundamentals_pit` table has semi-annual Point-in-Time (May & Nov)
     fundamental records for each instrument across Track A (Non-BFSI), Track B1 (Lending),
     and Track B2 (Non-Lending BFSI).
-    If external fundamental filings are already imported into `fundamentals_pit`, they are
-    preserved untouched. Otherwise, deterministic, sector-and-track-calibrated PIT records
-    anchored to each stock's real trailing fundamental/operating return profile are stored.
+    Default source is yfinance annual/quarterly statements in RESEARCH-ONLY mode.
+    These are not validated point-in-time filing vintages; see provider caveats in reports.
     """
     cur = conn.cursor()
     inst_df = pd.read_sql_query("SELECT * FROM instruments", conn)
     all_dates = prices_df.index
     min_data_yr = int(all_dates.min().year) if len(all_dates) > 0 else 2013
     max_data_yr = int(all_dates.max().year) if len(all_dates) > 0 else 2026
-
-    cur.execute(
-        "SELECT COUNT(DISTINCT symbol), MIN(reconstitution_date) FROM fundamentals_pit WHERE data_source = 'CALIBRATED_PIT_SQLITE'"
-    )
-    row_f = cur.fetchone()
-    existing_f_syms = row_f[0] or 0
-    min_f_date = str(row_f[1] or "9999-12-31")
-    if existing_f_syms >= len(inst_df) - 5 and int(min_f_date[:4]) <= min_data_yr + 1:
+    provider=os.environ.get('FUNDAMENTALS_PROVIDER','yfinance').strip().lower()
+    if provider == 'yfinance':
+        conn.execute("DELETE FROM fundamentals_pit WHERE data_source='CALIBRATED_PIT_SQLITE'")
+        if os.environ.get('YFINANCE_REFRESH','0')=='1':
+            conn.execute("DELETE FROM fundamentals_pit WHERE data_source LIKE 'YFINANCE_RESEARCH%'")
+        conn.commit()
+        old_count=int(conn.execute("SELECT COUNT(DISTINCT symbol) FROM fundamentals_pit WHERE data_source LIKE 'YFINANCE_RESEARCH%'").fetchone()[0])
+        if old_count >= len(inst_df)-5 and os.environ.get('YFINANCE_REFRESH','0')!='1':
+            print(f'[yfinance] Reusing cached research-only statements for {old_count}/{len(inst_df)} symbols.')
+            return
+        if old_count:
+            conn.execute("DELETE FROM fundamentals_pit WHERE data_source LIKE 'YFINANCE_RESEARCH%'"); conn.commit()
+        print(f'[yfinance] Pulling annual/quarterly statements for {len(inst_df)} symbols. RESEARCH ONLY: filing dates/vintages are not provided.')
+        stored=populate_yfinance_fundamentals(conn,inst_df,prices_df)
+        if stored <= 0:
+            raise RuntimeError('yfinance returned no usable NSE statements. Check package, symbols, internet access, and Yahoo throttling.')
         return
-
-    print(
-        f"[SQLite Fundamentals] Populating Point-in-Time (May/Nov {min_data_yr}-{max_data_yr}) "
-        f"3-Track Fundamental Database..."
-    )
+    if provider == 'verified':
+        n=int(conn.execute("SELECT COUNT(DISTINCT symbol) FROM fundamentals_pit WHERE data_source NOT LIKE 'YFINANCE_RESEARCH%' AND data_source!='CALIBRATED_PIT_SQLITE'").fetchone()[0])
+        if n < len(inst_df)-5:
+            raise RuntimeError(f'FUNDAMENTALS_PROVIDER=verified requested, but only {n}/{len(inst_df)} verified-source symbols exist in fundamentals_pit.')
+        return
+    if provider != 'calibrated_proxy' or os.environ.get('ALLOW_CALIBRATED_PIT','0')!='1':
+        raise RuntimeError('Unknown/unsafe fundamentals provider. Use default yfinance (research-only), import complete verified rows and select verified, or explicitly use calibrated_proxy with ALLOW_CALIBRATED_PIT=1.')
+    print('[WARNING] Explicit calibrated proxy fundamentals enabled; this run is research-only and not a valid historical fundamental test.')
 
     # Sector baseline fundamental profiles (indian NSE empirical medians)
     sector_profiles = {
@@ -1113,7 +1320,10 @@ class IndianTaxAwarePortfolio:
             if w_tgt < w_act - 1e-5:
                 px = float(current_prices[sym])
                 sell_val_target = (w_act - w_tgt) * nav_before
-                shares_to_sell = sell_val_target / px
+                # NSE cash equities trade in whole shares; round down the requested trim.
+                shares_to_sell = min(self.get_position_shares(sym), float(math.floor(sell_val_target / px)))
+                if shares_to_sell < 1.0:
+                    continue
                 sym_lots = self.lots.get(sym, [])
 
                 # Sort lots: (1) STCG loss, (2) LTCG loss, (3) LTCG gain, (4) STCG gain
@@ -1201,7 +1411,11 @@ class IndianTaxAwarePortfolio:
             if buy_notional <= 10.0:
                 continue
             px = float(current_prices[sym])
-            sh = buy_notional / px
+            # NSE cash equities trade in whole shares, not fractional units.
+            sh = float(math.floor(buy_notional / px))
+            if sh < 1.0:
+                continue
+            buy_notional = sh * px
             fee = buy_notional * cost_rate
             self.cash -= buy_notional + fee
             cost_paid += fee
@@ -1365,9 +1579,15 @@ class NseVramqcV3Backtester:
             f_row = pit_f.loc[sym]
             if med_adtv_126[sym] < adtv_floor:
                 continue
-            if int(f_row["asm_gsm_stage"]) >= 2 or int(f_row["audit_clean"]) == 0:
+            # Yahoo has no reliable historical ASM/audit/pledge series; NULL means unknown,
+            # not cleared. This bypass is research-only and disclosed in the report.
+            if pd.notna(f_row["asm_gsm_stage"]) and int(f_row["asm_gsm_stage"]) >= 2:
                 continue
-            if float(f_row["promoter_pledge_pct"]) > 5.0 or float(f_row["pledge_change_1y"]) > 1.0:
+            if pd.notna(f_row["audit_clean"]) and int(f_row["audit_clean"]) == 0:
+                continue
+            if pd.notna(f_row["promoter_pledge_pct"]) and float(f_row["promoter_pledge_pct"]) > 5.0:
+                continue
+            if pd.notna(f_row["pledge_change_1y"]) and float(f_row["pledge_change_1y"]) > 1.0:
                 continue
             u_t.append(sym)
 
@@ -1389,6 +1609,9 @@ class NseVramqcV3Backtester:
         for sym, row in sub_f.iterrows():
             trk = row["track"]
             if trk == "Track_A_NonBFSI":
+                required = ["core_pat_ttm", "core_pat_3y_sum", "roce_ttm", "roce_3y_med", "roe_ttm", "net_debt_to_equity", "net_debt_to_ebitda", "icr_ttm", "cfo_3y_sum", "accrual_ratio", "ebitda_to_assets", "sue_core", "rev_accel", "div_yield", "share_dilution_2y", "fcf_yield", "earnings_yield", "retention_ratio", "rev_cagr_stability"]
+                if any(pd.isna(row.get(k)) for k in required):
+                    continue
                 if row["core_pat_ttm"] <= 0 or row["core_pat_3y_sum"] <= 0:
                     continue
                 if max(row["roce_3y_med"], row["roe_ttm"]) < 12.0:
@@ -1404,6 +1627,9 @@ class NseVramqcV3Backtester:
                 u_star_syms.append(sym)
 
             elif trk == "Track_B1_Lending_BFSI":
+                required = ["core_pat_ttm", "roe_ttm", "roa_ttm", "net_npa", "gnpa_change_1y", "crar_buffer_bps"]
+                if any(pd.isna(row.get(k)) for k in required):
+                    continue
                 if row["core_pat_ttm"] <= 0 or row["roe_ttm"] < 12.0:
                     continue
                 is_nbfc = any(
@@ -1418,6 +1644,9 @@ class NseVramqcV3Backtester:
                 u_star_syms.append(sym)
 
             elif trk == "Track_B2_NonLending_BFSI":
+                required = ["core_pat_ttm", "core_pat_3y_sum", "roe_ttm", "opm_ttm", "solvency_ratio"]
+                if any(pd.isna(row.get(k)) for k in required):
+                    continue
                 if row["core_pat_ttm"] <= 0 or row["core_pat_3y_sum"] <= 0 or row["roe_ttm"] < 14.0:
                     continue
                 if row["opm_ttm"] < 25.0 and row["solvency_ratio"] < 1.70:
@@ -1858,7 +2087,7 @@ class NseVramqcV3Backtester:
         peak_bench = self.cfg.initial_corpus_inr
 
         print(
-            f"[Backtest Execution] Running 10-Year Simulation ({bt_dates[0].strftime('%Y-%m-%d')} "
+            f"[Backtest Execution] Running Backtest ({bt_dates[0].strftime('%Y-%m-%d')} "
             f"to {bt_dates[-1].strftime('%Y-%m-%d')}, {len(bt_dates):,} NSE trading days)..."
         )
         t0 = time.time()
@@ -2081,7 +2310,7 @@ class NseVramqcV3Backtester:
         )
         self.conn.commit()
 
-        print(f"[Backtest Complete] Simulated 10 years in {time.time() - t0:.2f}s. Saved to SQLite.")
+        print(f"[Backtest Complete] Simulated {len(bt_dates):,} sessions over {(bt_dates[-1]-bt_dates[0]).days/365.25:.2f} calendar years in {time.time()-t0:.2f}s. Saved to SQLite.")
         return {
             "portfolio": portfolio_net,
             "intra_month_stops": intra_month_stops_triggered,
@@ -2146,7 +2375,7 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
 
     # Compute Exact Performance Metrics
     n_days = len(nav_df)
-    years = n_days / 252.0
+    years = max((pd.to_datetime(nav_df["trade_date"].iloc[-1]) - pd.to_datetime(nav_df["trade_date"].iloc[0])).days / 365.25, 1/365.25)
     init_cap = cfg.initial_corpus_inr
 
     final_gross = float(nav_df["portfolio_nav_gross"].iloc[-1])
@@ -2171,13 +2400,14 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
     down_net = float(np.sqrt(252 * np.mean(np.minimum(0.0, ret_net - rf_d) ** 2)) * 100.0)
     down_bench = float(np.sqrt(252 * np.mean(np.minimum(0.0, ret_bench - rf_d) ** 2)) * 100.0)
 
-    sharpe_gross = (cagr_gross - cfg.risk_free_rate_annual * 100.0) / max(vol_gross, 1e-6)
-    sharpe_net = (cagr_net - cfg.risk_free_rate_annual * 100.0) / max(vol_net, 1e-6)
-    sharpe_bench = (cagr_bench - cfg.risk_free_rate_annual * 100.0) / max(vol_bench, 1e-6)
-
-    sortino_gross = (cagr_gross - cfg.risk_free_rate_annual * 100.0) / max(down_gross, 1e-6)
-    sortino_net = (cagr_net - cfg.risk_free_rate_annual * 100.0) / max(down_net, 1e-6)
-    sortino_bench = (cagr_bench - cfg.risk_free_rate_annual * 100.0) / max(down_bench, 1e-6)
+    rf_daily = (1.0 + cfg.risk_free_rate_annual) ** (1.0 / 252.0) - 1.0
+    # Conventional daily-return Sharpe and annualized arithmetic-excess Sortino.
+    sharpe_gross = float((ret_gross.mean() - rf_daily) / max(ret_gross.std(), 1e-12) * math.sqrt(252))
+    sharpe_net = float((ret_net.mean() - rf_daily) / max(ret_net.std(), 1e-12) * math.sqrt(252))
+    sharpe_bench = float((ret_bench.mean() - rf_daily) / max(ret_bench.std(), 1e-12) * math.sqrt(252))
+    sortino_gross = float((ret_gross.mean() - rf_daily) * 252 / max(down_gross / 100.0, 1e-12))
+    sortino_net = float((ret_net.mean() - rf_daily) * 252 / max(down_net / 100.0, 1e-12))
+    sortino_bench = float((ret_bench.mean() - rf_daily) * 252 / max(down_bench / 100.0, 1e-12))
 
     max_dd_net = float(nav_df["drawdown_net_pct"].min())
     max_dd_bench = float(nav_df["benchmark_dd_pct"].min())
@@ -2217,7 +2447,7 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
     sep = "=" * 96
     subsep = "-" * 96
     print("\n" + sep)
-    print("  NSE V-RAMQC v3.0 — 10-YEAR INSTITUTIONAL BACKTEST REPORT (UPSTOX API v2 + SQLITE)")
+    print("  NSE V-RAMQC v3.0 — HISTORICAL BACKTEST REPORT (UPSTOX API v2 + SQLITE)")
     print(sep)
     print(f"  Config File          : {cfg.env_file} (Upstox Base URL: {cfg.upstox_base_url})")
     print(f"  SQLite Database      : {cfg.sqlite_db_path}")
@@ -2234,8 +2464,18 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
         f"Zero Debt, Zero Gold/Commodities)"
     )
     print(sep)
+    proxy_rows = int(conn.execute("SELECT COUNT(*) FROM fundamentals_pit WHERE data_source='CALIBRATED_PIT_SQLITE'").fetchone()[0])
+    yf_rows = int(conn.execute("SELECT COUNT(*) FROM fundamentals_pit WHERE data_source LIKE 'YFINANCE_RESEARCH%'").fetchone()[0])
+    if proxy_rows:
+        print(f"  WARNING: {proxy_rows:,} calibrated fundamental rows are generated proxies, NOT actual historical filings.")
+        print("           Quality-based results are research-only; do not treat as a validated live-performance estimate.")
+    if yf_rows:
+        print(f"  RESEARCH-ONLY: {yf_rows:,} yfinance-derived fundamental snapshots; filing dates are estimated and current Yahoo history may be revised.")
+        print("                Yahoo does not provide the historical as-known filing vintage; unavailable quality/governance fields are not verified.")
+    print("  WARNING: current/static stock universe may contain survivorship bias; historical index membership is not reconstructed.")
+    print("  WARNING: signal-date close fills are optimistic; verify next-session execution, corporate actions and dividends before use.")
 
-    print("\n  [1] EXECUTIVE 10-YEAR CORPUS & RISK-ADJUSTED PERFORMANCE SUMMARY")
+    print("\n  [1] EXECUTIVE HISTORICAL CORPUS & RISK-ADJUSTED PERFORMANCE SUMMARY")
     print(subsep)
     print(
         f"  {'Metric':<38} | {'V-RAMQC v3.0 (Gross)':>18} | {'V-RAMQC v3.0 (Net*)':>18} | {'Nifty 500 Index':>15}"
@@ -2322,7 +2562,7 @@ def display_backtest_results_on_screen(cfg: BacktestConfig, conn: sqlite3.Connec
     )
 
     # 2. ASCII Equity Curve
-    print("\n  [2] 10-YEAR CORPUS GROWTH TRAJECTORY (₹1.00 CRORE INITIAL INVESTMENT)")
+    print("\n  [2] HISTORICAL CORPUS GROWTH TRAJECTORY (₹1.00 CRORE INITIAL INVESTMENT)")
     print(subsep)
     print(render_ascii_equity_curve(nav_df))
 

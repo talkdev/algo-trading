@@ -8224,6 +8224,72 @@ class StrategyEngine:
             _mom_dte = int(_mom_dte if _mom_dte is not None else -1)
         except (TypeError, ValueError):
             _mom_dte = -1
+        # A directional credit chase can be correctly refused at a spent
+        # session extreme, then immediately re-entered as long premium by the
+        # substitute path.  The long ticket has different risk, but it is
+        # still chasing the same exhausted move.  For non-expiry trades, keep
+        # that substitute only when the move is still strongly confirmed by
+        # price, EMA, ADX and tape while volatility is not working against the
+        # buyer.  Use the directional peak, not only the current day-move
+        # gauge: the latter can cool below its threshold while price remains
+        # near the extreme.  Mid-range and stable-vol continuation, and
+        # 0DTE's own tighter exhaustion rules, are unaffected.
+        try:
+            if direction > 0:
+                _spent_peak = float(
+                    signals.get("day_up_used_peak_pct")
+                    or signals.get("day_up_used_pct")
+                    or 0.0
+                )
+            else:
+                _spent_peak = float(
+                    signals.get("day_down_used_peak_pct")
+                    or signals.get("day_down_used_pct")
+                    or 0.0
+                )
+            _, _spent_loc, _, _ = self._session_range_pos(signals)
+        except (TypeError, ValueError):
+            _spent_peak, _spent_loc = 0.0, 0.5
+        _spent_vol = str(signals.get("vol_regime") or "")
+        _spent_iv = str(signals.get("iv_behavior") or "")
+        _spent_peak_min = float(
+            getattr(cfg, "momentum_spent_extreme_peak_pct", 135.0)
+        )
+        _spent_at_extreme = (
+            _spent_peak >= _spent_peak_min
+            and _spent_vol in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+            and _spent_iv in ("DECLINING", "CRUSHING")
+            and (
+                (direction > 0 and _spent_loc >= 0.75)
+                or (direction < 0 and _spent_loc <= 0.25)
+            )
+        )
+        _px_aligned = (
+            (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+            or (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+        )
+        _tape_confirmed = str(signals.get("tape_state") or "") in (
+            "TREND_ON", "TREND_STRENGTHENING"
+        )
+        _spent_adx_min = max(
+            40.0,
+            1.5 * float(getattr(cfg, "adx_strong_threshold", 28.0)),
+        )
+        _spent_trend_confirmed = (
+            adx >= _spent_adx_min
+            and _px_aligned
+            and _ema_align
+            and _tape_confirmed
+        ) or adx >= 50.0
+        if (
+            _mom_dte >= 1
+            and _spent_at_extreme
+            and not _spent_trend_confirmed
+        ):
+            return False, (
+                "momentum_spent_move_extreme_without_confirmation_"
+                f"peak_{_spent_peak:.0f}_loc_{_spent_loc:.2f}"
+            ), 0
         # 0DTE LONG_CALL into rich, quiet premium after upside is spent:
         # vol already says SELL and IV is crushing — buying the call is
         # inverted (Oct6 scratch −₹4; post-BPS chase −₹196). Do not waive

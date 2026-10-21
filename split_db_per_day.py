@@ -69,6 +69,100 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from core import live_writer_lock_held, open_sqlite_readonly, protect_sqlite_connection
 
+
+# GitHub rejects individual files at 100,000,000 bytes (100 MB decimal).
+# Large per-day shards are kept locally but automatically added to .gitignore.
+GIT_IGNORE_SIZE_LIMIT_BYTES = 100_000_000
+GIT_IGNORE_SECTION = "# Per-day shards currently over 100 MB"
+
+
+def _find_repo_root(start: Path) -> Path:
+    """Find the Git repository root, falling back to the script directory."""
+    start = start.resolve()
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    for candidate in (start, *start.parents):
+        if (candidate / ".gitignore").is_file():
+            return candidate
+    return start
+
+
+def update_gitignore_for_large_shards(out_dir: Path) -> List[Tuple[str, int]]:
+    """Add output .db shards >=100 MB to the repository .gitignore.
+
+    Entries are root-anchored paths, for example:
+        /data/per_day/nifty_algo_2026-10-21.db
+
+    Existing entries are preserved and never duplicated. Files are not deleted
+    or modified. Only .db files directly inside ``out_dir`` are considered.
+    """
+    repo_root = _find_repo_root(Path(__file__).resolve().parent)
+    gitignore_path = repo_root / ".gitignore"
+    out_dir = Path(out_dir).resolve()
+    large_entries: List[Tuple[str, int]] = []
+
+    if not out_dir.is_dir():
+        return large_entries
+
+    for shard in sorted(out_dir.glob("*.db")):
+        try:
+            size_bytes = shard.stat().st_size
+        except OSError as exc:
+            print(f"  .gitignore: could not inspect {shard.name}: {exc}", file=sys.stderr)
+            continue
+
+        if size_bytes < GIT_IGNORE_SIZE_LIMIT_BYTES:
+            continue
+
+        try:
+            relative_path = shard.resolve().relative_to(repo_root.resolve())
+        except ValueError:
+            print(
+                f"  .gitignore: skipped {shard} because it is outside the repository root",
+                file=sys.stderr,
+            )
+            continue
+
+        entry = "/" + relative_path.as_posix().lstrip("/")
+        large_entries.append((entry, size_bytes))
+
+    if not large_entries:
+        return []
+
+    try:
+        existing_text = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+    except OSError as exc:
+        print(f"  .gitignore: could not read {gitignore_path}: {exc}", file=sys.stderr)
+        return []
+
+    existing_lines = existing_text.splitlines()
+    existing_entries = {line.strip() for line in existing_lines}
+    missing = [(entry, size) for entry, size in large_entries if entry not in existing_entries]
+    if not missing:
+        return []
+
+    # Append the section only if it is not already present. A trailing newline
+    # is ensured so existing .gitignore content is not merged with a new entry.
+    output = existing_text
+    if output and not output.endswith(("\n", "\r")):
+        output += "\n"
+    if GIT_IGNORE_SECTION not in existing_lines:
+        if output and output.strip():
+            output += "\n"
+        output += GIT_IGNORE_SECTION + "\n"
+
+    for entry, _size in missing:
+        output += entry + "\n"
+
+    try:
+        gitignore_path.write_text(output, encoding="utf-8", newline="\n")
+    except OSError as exc:
+        print(f"  .gitignore: could not update {gitignore_path}: {exc}", file=sys.stderr)
+        return []
+
+    return missing
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  TABLE MAP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1016,6 +1110,17 @@ def main() -> int:
                 f"{size_kb:>10,.1f} KB  {format_fidelity(fid)}"
             )
             rebuilt += 1
+
+        # Keep .gitignore synchronized after splitting. In verify-only mode we
+        # intentionally do not modify any files.
+        if not args.verify_only:
+            ignored_shards = update_gitignore_for_large_shards(out_dir)
+            if ignored_shards:
+                print("  .gitignore: added oversized shard(s):")
+                for entry, size_bytes in ignored_shards:
+                    print(f"    {entry} ({size_bytes / 1_000_000:.2f} MB)")
+            else:
+                print("  .gitignore: no new oversized shard entries needed")
 
         elapsed = time.time() - t0
         print()
