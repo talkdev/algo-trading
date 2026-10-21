@@ -102,6 +102,9 @@ desktop.ini
 /data/per_day/nifty_algo_2026-09-25.db
 /data/per_day/nifty_algo_2026-09-28.db
 /data/per_day/nifty_algo_2026-09-29.db
+/data/per_day/nifty_algo_2026-10-19.db
+/data/per_day/nifty_algo_2026-10-21.db
+/vramqc_nse_backtest.db
 
 # ============================================================
 # Misc: automation scripts only
