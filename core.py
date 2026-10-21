@@ -266,14 +266,18 @@ ENV_TEMPLATE = """# ────────────────────
 # `load_config()` in core.py. Those defaults reproduce the previously
 # shipped env.txt values exactly, so behaviour is unchanged.
 #
-# Extra/unknown keys in this file are ignored by the engine. Your API
-# key / secret / redirect URI are NOT needed here either: they are only
-# used on the Upstox login page when you generate the token below.
+# Optional master switch: LONG_OPTIONS_ONLY=true allows only LONG_CALL and
+# LONG_PUT entries; existing position management and all strategy/risk logic
+# remain unchanged. Your API key / secret / redirect URI are NOT needed here.
 #
 # Daily ritual: paste today's token after UPSTOX_ACCESS_TOKEN= and run.
 # ─────────────────────────────────────────────
 
 UPSTOX_ACCESS_TOKEN=
+
+# Optional: block new credit spreads/condors; allow only long calls and puts.
+# Defaults to false (existing strategy behaviour).
+LONG_OPTIONS_ONLY=false
 """
 
 
@@ -911,6 +915,8 @@ class Config:
     # Post-decision lot clamp (FORCE_LOTS in env). None/0 = off; >=1 forces
     # that many lots on fills after all gates/sizing have already run.
     force_lots:                Optional[int] = None
+    # Master entry filter: allow only LONG_CALL / LONG_PUT when enabled.
+    long_options_only:         bool = False
     # Structure economics.
     wing_cost_frac_max:        float = 0.50
     condor_weak_side_min_frac: float = 0.30
@@ -1902,6 +1908,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         force_lots=(
             (lambda _n: _n if _n >= 1 else None)(_get_int(env, "FORCE_LOTS", 0))
         ),
+        long_options_only=_get_bool(env, "LONG_OPTIONS_ONLY", False),
         wing_cost_frac_max=min(max(_get_float(env, "WING_COST_FRAC_MAX", 0.50), 0.10), 0.70),
         condor_weak_side_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),
         # v4.2 fresh-weekly (DTE >= 2) intraday premium selling
