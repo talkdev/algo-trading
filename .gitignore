@@ -116,3 +116,8 @@ rr.txt
 !/Misc/*.cmd
 /data/per_day/nifty_algo_2026-10-06.db
 /stock-data/vramqc_deployment.db
+/data/per_day/nifty_algo_2026-10-22.db
+/data/per_day/nifty_algo_2026-10-23.db
+/data/per_day/nifty_algo_2026-10-26.db
+/data/per_day/nifty_algo_2026-10-27.db
+/data/client_secret_1095533226346-ibjlk7t0t40ftto3dh22fgr927puajsf.apps.googleusercontent.com.json

@@ -58,11 +58,16 @@
 #  -----
 #     python backtest_engine.py
 #         Default: every NSE trading day from 2026-09-08 through today (IST),
-#         skipping weekends and nse_holidays.json. Up to 10 days in parallel
-#         (queued); results print only after every day finishes.
+#         skipping weekends and nse_holidays.json. Up to 15 day-shards in
+#         parallel (one process per shard, queued); results print only after
+#         every day finishes.
 #         Console output is ONLY the per-day trade report blocks plus the
 #         daily-profit summary table.
 #         Default data: data/per_day shards (not the live primary).
+#     python backtest_engine.py --workers 15
+#         Cap concurrent shard processes (default 15).
+#     python backtest_engine.py --cycle-stride 2
+#         Hunt-only: every 2nd snapshot while flat (open books still full).
 #     python backtest_engine.py --db data/nifty_algo_v3.db
 #     python backtest_engine.py --audit
 #     python backtest_engine.py --from 2026-09-08 --to 2026-09-11
@@ -75,6 +80,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
 import io
 import json
@@ -118,9 +124,10 @@ from core import (  # noqa: E402
 # Default quiet parallel range: every NSE trading day from this date through
 # the IST calendar day the script is launched on.
 DEFAULT_BACKTEST_START = date(2026, 9, 8)
-# Cap concurrent day processes so a long range does not spawn one worker per
-# session (memory / disk thrash). Remaining days queue until a slot frees.
-PARALLEL_DAY_WORKERS = 10
+# Cap concurrent day-shard processes so a long range does not spawn one
+# worker per session (memory / disk thrash). Remaining days queue until a
+# slot frees. Each worker opens only its matching per-day .db when possible.
+PARALLEL_DAY_WORKERS = 15
 
 # The engine modules are imported lazily inside build_engines() so that the
 # simulated clock is installed before any of them capture a timestamp.
@@ -560,6 +567,15 @@ SESSION_PARITY_NOTES: Dict[str, str] = {
 }
 
 
+_SHARD_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def _date_from_shard_path(path: str) -> Optional[str]:
+    """ISO date encoded in a per-day shard filename, else None."""
+    m = _SHARD_DATE_RE.search(Path(path).name)
+    return m.group(1) if m else None
+
+
 class MultiStore:
     """PATCH_V14: several per-session databases behind one store interface.
 
@@ -582,20 +598,52 @@ class MultiStore:
     session is read from the database that actually holds it, and a date no
     database holds falls back to the first so the existing error paths
     ("only N snapshots - skipped") still fire instead of a KeyError.
+
+    Per-day shard filenames (`nifty_algo_YYYY-MM-DD.db`) are mapped without
+    opening every DB for a full tradable_dates scan — stores open lazily on
+    first load_day / probe for that date.
     """
 
     def __init__(self, paths: List[str]):
-        self.stores: List[HistoricalStore] = []
-        self._owner: Dict[str, HistoricalStore] = {}
-        for pth in paths:
-            st = HistoricalStore(pth)
-            self.stores.append(st)
+        self._paths: List[str] = [str(p) for p in paths]
+        self._store_by_path: Dict[str, HistoricalStore] = {}
+        self._owner: Dict[str, str] = {}  # trading_date -> path
+        self._unscoped_paths: List[str] = []
+        for pth in self._paths:
+            day = _date_from_shard_path(pth)
+            if day:
+                self._owner.setdefault(day, pth)
+            else:
+                self._unscoped_paths.append(pth)
+        # Non-sharded paths still need an eager tradable scan (legacy primary).
+        for pth in self._unscoped_paths:
+            st = self._open_path(pth)
             for d in st.tradable_dates(None, None):
-                self._owner.setdefault(str(d), st)
-        self.path = self.stores[0].path if self.stores else ""
+                self._owner.setdefault(str(d), pth)
+        self.path = self._paths[0] if self._paths else ""
+
+    def _open_path(self, pth: str) -> HistoricalStore:
+        st = self._store_by_path.get(pth)
+        if st is None:
+            st = HistoricalStore(pth)
+            self._store_by_path[pth] = st
+        return st
+
+    @property
+    def stores(self) -> List[HistoricalStore]:
+        """Opened stores only (lazy). Prefer `_paths` for the full set."""
+        return list(self._store_by_path.values()) or [
+            self._open_path(self._paths[0])
+        ] if self._paths else []
 
     def _for(self, trading_date: str) -> HistoricalStore:
-        return self._owner.get(str(trading_date)) or self.stores[0]
+        td = str(trading_date)
+        pth = self._owner.get(td)
+        if pth is None and self._paths:
+            pth = self._paths[0]
+        if pth is None:
+            raise FileNotFoundError(f"no store for {td}")
+        return self._open_path(pth)
 
     def load_day(self, trading_date: str,
                  market_hours_only: bool = True) -> "DaySlice":
@@ -604,16 +652,21 @@ class MultiStore:
 
     def tradable_dates(self, d_from: Optional[str],
                        d_to: Optional[str]) -> List[str]:
-        out = set()
-        for st in self.stores:
-            out.update(str(d) for d in st.tradable_dates(d_from, d_to))
-        return sorted(out)
+        out = set(self._owner.keys())
+        # Ensure unscoped DBs are fully indexed (already done in __init__).
+        dates = sorted(out)
+        if d_from:
+            dates = [d for d in dates if d >= str(d_from)]
+        if d_to:
+            dates = [d for d in dates if d <= str(d_to)]
+        return dates
 
     def audit(self) -> dict:
         days: List[dict] = []
         candles: Dict[str, int] = {}
         seen = set()
-        for st in self.stores:
+        for pth in self._paths:
+            st = self._open_path(pth)
             a = st.audit()
             for d in a.get("days", []):
                 key = str(d.get("trading_date"))
@@ -627,7 +680,17 @@ class MultiStore:
 
     def recorded_sessions(self, dates: List[str]) -> Dict[str, dict]:
         out: Dict[str, dict] = {}
-        for st in self.stores:
+        needed = set(str(d) for d in (dates or []))
+        paths = set()
+        if needed:
+            for d in needed:
+                p = self._owner.get(d)
+                if p:
+                    paths.add(p)
+        else:
+            paths.update(self._paths)
+        for pth in paths or self._paths:
+            st = self._open_path(pth)
             for k, v in st.recorded_sessions(dates).items():
                 out.setdefault(k, v)
         return out
@@ -678,6 +741,21 @@ class DaySlice:
             self.by_time_exp[ct][str(r["expiry"])].append(r)
         self.cycles.sort()
 
+        # Pre-build Upstox-shaped bars + time index for O(log n) bars_until.
+        self._bar_times: List[str] = []
+        self._upstox_bars: List[list] = []
+        for c in self.candles:
+            ct = str(c["candle_time"])
+            if len(ct) == 5:
+                ct += ":00"
+            self._bar_times.append(ct)
+            self._upstox_bars.append([
+                f"{self.trading_date}T{ct}+05:30",
+                float(c["open"]), float(c["high"]),
+                float(c["low"]), float(c["close"]),
+                int(c["volume"] or 0), 0,
+            ])
+
     def cycle_dt(self, capture_time: str) -> datetime:
         try:
             return datetime.fromisoformat(capture_time).replace(tzinfo=None)
@@ -714,21 +792,9 @@ class DaySlice:
 
     def bars_until(self, cutoff: datetime) -> List[list]:
         """1-minute candles up to the simulated clock, in Upstox list shape."""
-        out = []
         cut = cutoff.strftime("%H:%M:%S")
-        for c in self.candles:
-            ct = str(c["candle_time"])
-            if len(ct) == 5:
-                ct += ":00"
-            if ct > cut:
-                break
-            out.append([
-                f"{self.trading_date}T{ct}+05:30",
-                float(c["open"]), float(c["high"]),
-                float(c["low"]), float(c["close"]),
-                int(c["volume"] or 0), 0,
-            ])
-        return out
+        n = bisect.bisect_right(self._bar_times, cut)
+        return self._upstox_bars[:n]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -746,9 +812,13 @@ class ReplayClient:
         self.clock = clock
         self.day: Optional[DaySlice] = None
         self.cycle: Optional[str] = None
+        self._chain_cache_key: Optional[tuple] = None
+        self._chain_cache_val: Optional[list] = None
 
     def point(self, day: DaySlice, capture_time: str) -> None:
         self.day, self.cycle = day, capture_time
+        self._chain_cache_key = None
+        self._chain_cache_val = None
 
     # -- market data ------------------------------------------------------
     def get_ltp(self, instrument_keys) -> dict:
@@ -798,12 +868,20 @@ class ReplayClient:
     def get_option_chain(self, instrument_key: str, expiry_date: str) -> list:
         if not self.day:
             return []
-        by_strike: Dict[float, dict] = {}
         # expiry_date is a REQUEST, not a hint: serving a different series
         # than the one asked for silently mixes two chains together.
         want = str(expiry_date)[:10] if expiry_date else None
+        cache_key = (self.cycle, want)
+        if (
+            cache_key == self._chain_cache_key
+            and self._chain_cache_val is not None
+        ):
+            return self._chain_cache_val
+        by_strike: Dict[float, dict] = {}
         rows = self.day.snapshot(self.cycle, want)
         if not rows and want:
+            self._chain_cache_key = cache_key
+            self._chain_cache_val = []
             return []
         for r in rows:
             k = float(r["strike"])
@@ -826,7 +904,10 @@ class ReplayClient:
                     "vega": float(r["vega"] or 0),
                 },
             }
-        return list(by_strike.values())
+        out = list(by_strike.values())
+        self._chain_cache_key = cache_key
+        self._chain_cache_val = out
+        return out
 
     # -- anything that trades ---------------------------------------------
     def _blocked(self, *a, **k):
@@ -1375,6 +1456,7 @@ class BacktestRunner:
         abort_mirror: Optional[LiveAbortMirror] = None,
         live_db_path: Optional[str] = None,
         mirror_live_aborts: bool = False,
+        cycle_stride: int = 1,
     ):
         self.store = store
         self.config = config
@@ -1388,6 +1470,9 @@ class BacktestRunner:
         self.live_db_path = live_db_path
         # Default OFF: verify latest code on tape, do not copy live ABORTs.
         self.mirror_live_aborts = bool(mirror_live_aborts)
+        # Hunt-only: pump every Nth snapshot when flat. Open books still
+        # see every cycle so exits stay live-faithful. 1 = full fidelity.
+        self.cycle_stride = max(1, int(cycle_stride or 1))
         # ── v7: per-trade console report ──────────────────────────────────
         # trade_report overrides TRADE_REPORT_MODE from the config
         # (each_cycle | on_change | off); None keeps the configured mode.
@@ -1529,8 +1614,13 @@ class BacktestRunner:
     def _calibration_source_paths(self) -> List[str]:
         paths: List[str] = []
         store = self.store
-        if hasattr(store, "stores"):
-            paths.extend(str(s.path) for s in store.stores if getattr(s, "path", None))
+        # MultiStore keeps filename-mapped paths without opening every DB.
+        if getattr(store, "_paths", None):
+            paths.extend(str(p) for p in store._paths)
+        elif hasattr(store, "stores"):
+            paths.extend(
+                str(s.path) for s in store.stores if getattr(s, "path", None)
+            )
         elif getattr(store, "path", None):
             paths.append(str(store.path))
         try:
@@ -1757,7 +1847,24 @@ class BacktestRunner:
         st["daily_pnl"] = 0.0
         st["daily_halted"] = False
 
-        for capture_time in day.cycles:
+        stride = max(1, int(self.cycle_stride or 1))
+        n_cycles = len(day.cycles)
+        for _ci, capture_time in enumerate(day.cycles):
+            # Stride only while flat — once a ticket is open, pump every
+            # snapshot so exits match live monitoring resolution.
+            if stride > 1 and _ci not in (0, n_cycles - 1) and _ci % stride != 0:
+                try:
+                    _busy = self.db.query_one(
+                        "SELECT 1 AS x FROM positions "
+                        "WHERE trading_date=? AND status IN "
+                        "('OPEN','PENDING_ENTRY') LIMIT 1",
+                        (trading_date,),
+                    )
+                except Exception:
+                    _busy = True
+                if not _busy:
+                    continue
+
             dt = day.cycle_dt(capture_time)
             self.clock.set(dt)
             self.client.point(day, capture_time)
@@ -1774,35 +1881,51 @@ class BacktestRunner:
                 continue
 
             self.results.cycles += 1
+            # Harvest / capital / equity: every cycle while a ticket is
+            # open (or pending), else every 15th pumped cycle. Always
+            # refreshed at end-of-day below.
             try:
-                day_pnl = float(engine.compute_total_daily_pnl() or 0)
-                st = engine.market_engine.state
-                st["current_capital"] = (
-                    self.results.starting_capital
-                    + sum(
+                _open_now = bool(self.db.query_one(
+                    "SELECT 1 AS x FROM positions "
+                    "WHERE trading_date=? AND status IN "
+                    "('OPEN','PENDING_ENTRY') LIMIT 1",
+                    (trading_date,),
+                ))
+            except Exception:
+                _open_now = True
+            _mark = _open_now or (self.results.cycles % 15 == 0)
+
+            if _mark:
+                self._harvest_closed(trading_date)
+                try:
+                    day_pnl = float(engine.compute_total_daily_pnl() or 0)
+                    st = engine.market_engine.state
+                    st["current_capital"] = (
+                        self.results.starting_capital
+                        + sum(
+                            v for d, v in self.results.daily_pnl.items()
+                            if d != trading_date
+                        )
+                        + day_pnl
+                    )
+                except Exception:
+                    day_pnl = 0.0
+
+                try:
+                    _prior = sum(
                         v for d, v in self.results.daily_pnl.items()
                         if d != trading_date
                     )
-                    + day_pnl
-                )
-            except Exception:
-                pass
-
-            try:
-                _prior = sum(
-                    v for d, v in self.results.daily_pnl.items()
-                    if d != trading_date
-                )
-                _eq = (
-                    self.results.starting_capital
-                    + _prior
-                    + float(engine.compute_total_daily_pnl() or 0)
-                )
-                self.results.mark_equity(f"{trading_date} {dt:%H:%M}", _eq)
-            except Exception:
-                pass
-
-            self._harvest_closed(trading_date)
+                    _eq = (
+                        self.results.starting_capital
+                        + _prior
+                        + float(day_pnl)
+                    )
+                    self.results.mark_equity(
+                        f"{trading_date} {dt:%H:%M}", _eq
+                    )
+                except Exception:
+                    pass
 
             try:
                 state = engine.market_engine.state
@@ -1838,7 +1961,31 @@ class BacktestRunner:
             except Exception as exc:
                 if self.verbose:
                     print(f"  end-of-data flatten failed: {exc}")
-            self._harvest_closed(trading_date)
+
+        # Always refresh harvest / capital / equity at EOD (throttle may
+        # have deferred marks while flat).
+        self._harvest_closed(trading_date)
+        try:
+            day_pnl = float(engine.compute_total_daily_pnl() or 0)
+            st = engine.market_engine.state
+            st["current_capital"] = (
+                self.results.starting_capital
+                + sum(
+                    v for d, v in self.results.daily_pnl.items()
+                    if d != trading_date
+                )
+                + day_pnl
+            )
+            _prior = sum(
+                v for d, v in self.results.daily_pnl.items()
+                if d != trading_date
+            )
+            self.results.mark_equity(
+                f"{trading_date} {day.cycle_dt(day.cycles[-1]):%H:%M}",
+                self.results.starting_capital + _prior + float(day_pnl),
+            )
+        except Exception:
+            pass
 
         self._ingest_rejections(trading_date)
 
@@ -3187,25 +3334,26 @@ def _resolve_db_paths(requested: List[str]) -> List[str]:
 def _db_has_chain_snapshots(path: str) -> bool:
     """True when path is readable and holds at least one chain snapshot.
 
-    Corrupt / locked / empty primary DBs return False so the harness can
-    fall back to per-day shards instead of printing a false 'fresh install'
-    audit. A bare `SELECT 1 ... LIMIT 1` can succeed on a partially-corrupt
-    file while the GROUP BY / COUNT(*) the audit needs still raises
-    'database disk image is malformed' — probe with that heavier query.
+    Per-day shards (integrity-checked at split time) use a cheap EXISTS.
+    The live primary still uses full-table COUNT(*) so a half-corrupt
+    primary fails closed and we fall back to shards.
     """
     p = Path(path)
     if not p.is_file() or p.stat().st_size <= 0:
         return False
+    deep = p.name == "nifty_algo_v3.db" or _date_from_shard_path(str(p)) is None
     try:
         con = open_sqlite_readonly(path)
         try:
-            # Full-table COUNT(*) is what fails on the half-corrupt primary
-            # (LIMIT 1 / first-day GROUP BY can still succeed). Prefer that
-            # probe so we fall back to per_day shards.
+            if deep:
+                row = con.execute(
+                    "SELECT COUNT(*) FROM option_chain_snapshot"
+                ).fetchone()
+                return row is not None and int(row[0] or 0) > 0
             row = con.execute(
-                "SELECT COUNT(*) FROM option_chain_snapshot"
+                "SELECT 1 FROM option_chain_snapshot LIMIT 1"
             ).fetchone()
-            return row is not None and int(row[0] or 0) > 0
+            return row is not None
         finally:
             con.close()
     except sqlite3.Error:
@@ -3233,12 +3381,22 @@ def _default_replay_sources(config) -> List[str]:
     live session and a replay cannot share nifty_algo_v3.db. Pass
     --db data/nifty_algo_v3.db only when the engine is down and you
     explicitly want the primary.
+
+    Dated `nifty_algo_YYYY-MM-DD.db` names are accepted by filename when
+    non-empty (split integrity already checked); other .db files still get
+    a chain-snapshot probe.
     """
     shard_dir = _per_day_shard_dir(config)
     shards: List[str] = []
     if shard_dir.is_dir():
         for p in sorted(shard_dir.glob("*.db")):
-            if _db_has_chain_snapshots(str(p)):
+            if _date_from_shard_path(str(p)):
+                try:
+                    if p.stat().st_size > 0:
+                        shards.append(str(p))
+                except OSError:
+                    continue
+            elif _db_has_chain_snapshots(str(p)):
                 shards.append(str(p))
     if shards:
         print(
@@ -3270,6 +3428,31 @@ def _open_store(db_paths: List[str]):
     if len(db_paths) > 1:
         return MultiStore(db_paths)
     return HistoricalStore(db_paths[0])
+
+
+def _db_paths_for_day(db_paths: List[str], day: str) -> List[str]:
+    """Pin a parallel worker to the matching per-day shard when present.
+
+    Prefer ``nifty_algo_YYYY-MM-DD.db`` (split_db_per_day naming). Fall back
+    to any path whose filename contains the ISO date, else the full list
+    (MultiStore / single primary) so non-sharded replays still work.
+    """
+    if not db_paths:
+        return []
+    day = str(day or "").strip()
+    if not day:
+        return list(db_paths)
+    preferred = f"nifty_algo_{day}.db"
+    for p in db_paths:
+        if Path(p).name.lower() == preferred.lower():
+            return [p]
+    hits = [
+        p for p in db_paths
+        if _date_from_shard_path(p) == day or day in Path(p).name
+    ]
+    if hits:
+        return hits if len(hits) == 1 else hits
+    return list(db_paths)
 
 
 def format_live_parity(probe: dict) -> str:
@@ -3497,8 +3680,17 @@ def format_live_primary(probe: dict) -> str:
     return f"FAIL  prev_vix={pvs}  prev_close={pcs}  ({why}){extra}"
 
 
-def preflight_engine_boot(config: Config) -> List[Tuple[str, bool, str]]:
-    """Everything main.py needs at startup except the Upstox token."""
+def preflight_engine_boot(
+    config: Config,
+    *,
+    construct_engine: bool = False,
+) -> List[Tuple[str, bool, str]]:
+    """Everything main.py needs at startup except the Upstox token.
+
+    ``construct_engine`` (opt-in via --strict-preflight) builds a throwaway
+    MainEngine; default skips it because imports already prove the modules
+    load and each worker/runner constructs for real.
+    """
     rows: List[Tuple[str, bool, str]] = []
 
     env_path = Path(ENV_FILE)
@@ -3566,6 +3758,12 @@ def preflight_engine_boot(config: Config) -> List[Tuple[str, bool, str]]:
         rows.append(("MainEngine construct", False, "skipped — import failed"))
         return rows
 
+    if not construct_engine:
+        rows.append(
+            ("MainEngine construct", True, "skipped (use --strict-preflight)")
+        )
+        return rows
+
     fd, scratch = tempfile.mkstemp(prefix="bt_preflight_", suffix=".db")
     os.close(fd)
     scratch_path = Path(scratch)
@@ -3611,6 +3809,8 @@ def preflight_live_parity(
     dates: List[str],
     allow_unfaithful: bool,
     config: Optional[Config] = None,
+    *,
+    construct_engine: bool = False,
 ) -> int:
     """Refuse to replay unless live would also start (minus the token).
 
@@ -3628,7 +3828,9 @@ def preflight_live_parity(
     bad = 0
 
     if config is not None:
-        for label, ok, detail in preflight_engine_boot(config):
+        for label, ok, detail in preflight_engine_boot(
+            config, construct_engine=construct_engine
+        ):
             tag = "PASS" if ok else "FAIL"
             print(f"  {label:<24s}  {tag}  {detail}")
             if not ok:
@@ -3676,7 +3878,11 @@ def preflight_live_parity(
 
 
 def _parallel_day_worker(job: dict) -> dict:
-    """Replay a single session in a child process.
+    """Replay a single session shard in its own child process.
+
+    Each job receives only that day's DB path when a per-day shard exists, so
+    up to PARALLEL_DAY_WORKERS isolated processes run concurrently without
+    every worker opening the full shard set.
 
     Returns the end-of-day trade-report text and that day's settled P&L.
     All other console noise (engine dashboards, gap warnings, cycle blocks)
@@ -3689,13 +3895,22 @@ def _parallel_day_worker(job: dict) -> dict:
     sink = io.StringIO()
     try:
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            import dataclasses
             config = load_config()
+            _replace: dict = {}
             if job.get("capital") is not None:
-                import dataclasses
-                config = dataclasses.replace(
-                    config, starting_capital=float(job["capital"])
+                _replace["starting_capital"] = float(job["capital"])
+            if "force_lots" in job:
+                _fl = job.get("force_lots")
+                _replace["force_lots"] = (
+                    int(_fl) if _fl is not None and int(_fl) >= 1 else None
                 )
-            store = _open_store(list(job["db_paths"]))
+            if _replace:
+                config = dataclasses.replace(config, **_replace)
+            day_paths = list(job.get("db_paths") or [])
+            if not day_paths:
+                raise FileNotFoundError(f"no database path for {day}")
+            store = _open_store(day_paths)
             runner = BacktestRunner(
                 store,
                 config,
@@ -3710,6 +3925,7 @@ def _parallel_day_worker(job: dict) -> dict:
                 cycle_reports=False,
                 live_db_path=job.get("live_db_path"),
                 mirror_live_aborts=bool(job.get("mirror_live_aborts")),
+                cycle_stride=int(job.get("cycle_stride") or 1),
             )
             res = runner.run([day])
             report = "\n\n".join(
@@ -3734,6 +3950,7 @@ def _parallel_day_worker(job: dict) -> dict:
             "trades": trades, "rejections": rejections,
             "truncated": truncated[0] if truncated else "",
             "unfaithful": unfaithful[0] if unfaithful else "",
+            "shard": day_paths[0] if day_paths else "",
         }
     except Exception as exc:
         return {
@@ -3751,38 +3968,58 @@ def run_parallel_quiet(
     config: Config,
     args,
 ) -> int:
-    """Replay sessions with at most PARALLEL_DAY_WORKERS concurrent processes.
+    """Replay each session shard in its own process (up to N concurrent).
 
-    All jobs are submitted up front; the pool runs only N at a time. Reports
-    and the P&L table print only after every day has finished.
+    All jobs are submitted up front; the pool runs only ``--workers``
+    (default PARALLEL_DAY_WORKERS=15) at a time. Each worker prefers that
+    day's per-day ``.db`` shard. Reports and the P&L table print only after
+    every day has finished.
     """
     if not dates:
         return 1
 
-    jobs = [
-        {
-            "day": d,
-            "db_paths": db_paths,
-            "fill_edge": float(args.fill_edge),
-            "stress_exit": float(args.stress_exit),
-            "fill_mode": str(getattr(args, "fill_mode", "live") or "live"),
-            "live_db_path": str(getattr(config, "db_path", "") or ""),
-            "mirror_live_aborts": bool(
-                getattr(args, "mirror_live_aborts", False)
-            ),
-            "capital": args.capital,
-            "allow_unfaithful": bool(getattr(args, "allow_unfaithful", False)),
-            "trade_report": (
-                args.trade_report
-                or getattr(config, "trade_report_mode", "each_cycle")
-                or "each_cycle"
-            ),
-        }
-        for d in dates
-    ]
+    _force_lots = getattr(args, "force_lots", None)
+    if _force_lots is None:
+        _force_lots = getattr(config, "force_lots", None)
+
+    jobs = []
+    for d in dates:
+        day_paths = _db_paths_for_day(db_paths, d)
+        jobs.append(
+            {
+                "day": d,
+                "db_paths": day_paths,
+                "fill_edge": float(args.fill_edge),
+                "stress_exit": float(args.stress_exit),
+                "fill_mode": str(getattr(args, "fill_mode", "live") or "live"),
+                "live_db_path": str(getattr(config, "db_path", "") or ""),
+                "mirror_live_aborts": bool(
+                    getattr(args, "mirror_live_aborts", False)
+                ),
+                "capital": args.capital,
+                "force_lots": _force_lots,
+                "cycle_stride": int(getattr(args, "cycle_stride", 1) or 1),
+                "allow_unfaithful": bool(
+                    getattr(args, "allow_unfaithful", False)
+                ),
+                "trade_report": (
+                    args.trade_report
+                    or getattr(config, "trade_report_mode", "each_cycle")
+                    or "each_cycle"
+                ),
+            }
+        )
 
     by_date: Dict[str, dict] = {}
-    workers = max(1, min(int(PARALLEL_DAY_WORKERS), len(jobs)))
+    requested = int(
+        getattr(args, "workers", None) or PARALLEL_DAY_WORKERS
+    )
+    workers = max(1, min(requested, len(jobs)))
+    pinned = sum(1 for j in jobs if len(j["db_paths"]) == 1)
+    print(
+        f"  [backtest] parallel: {len(jobs)} session(s), "
+        f"{workers} process(es), {pinned}/{len(jobs)} pinned to own shard"
+    )
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
         futures = {pool.submit(_parallel_day_worker, job): job["day"]
@@ -3994,7 +4231,30 @@ def main() -> int:
              "0 = natural engine sizing (recommended for P&L hunts); "
              "N>=1 clamps every fill to N lots. Live env.txt is unchanged.",
     )
+    ap.add_argument(
+        "--workers", type=int, default=PARALLEL_DAY_WORKERS,
+        help=f"max concurrent per-day shard processes in quiet parallel "
+             f"mode (default {PARALLEL_DAY_WORKERS}). Each process opens "
+             f"only its matching data/per_day shard when available.",
+    )
+    ap.add_argument(
+        "--cycle-stride", type=int, default=1,
+        help="hunt-only: pump every Nth snapshot while flat (default 1 = "
+             "full fidelity). Open positions still see every cycle. "
+             "P&L with stride>1 is not go-live evidence.",
+    )
+    ap.add_argument(
+        "--strict-preflight",
+        action="store_true",
+        help="also construct a throwaway MainEngine during preflight "
+             "(slower; default skips construct after imports pass).",
+    )
     args = ap.parse_args()
+    if args.workers is not None and int(args.workers) < 1:
+        print("\n  --workers must be >= 1\n")
+        return 1
+    args.workers = max(1, int(args.workers or PARALLEL_DAY_WORKERS))
+    args.cycle_stride = max(1, int(args.cycle_stride or 1))
 
     if args.test:
         return self_test()
@@ -4069,12 +4329,19 @@ def main() -> int:
         if not dates:
             print_audit(store)
             return 1
+        _strict = bool(getattr(args, "strict_preflight", False))
         pre = preflight_live_parity(
             store, dates, bool(getattr(args, "allow_unfaithful", False)),
             config,
+            construct_engine=_strict,
         )
         if pre:
             return pre
+        if int(getattr(args, "cycle_stride", 1) or 1) > 1:
+            print(
+                f"  [backtest] cycle_stride="
+                f"{int(args.cycle_stride)} (hunt mode — not go-live P&L)"
+            )
         return run_parallel_quiet(dates, db_paths, config, args)
 
     if len(db_paths) > 1:
@@ -4085,9 +4352,11 @@ def main() -> int:
         print_audit(store)
         return 1
 
+    _strict = bool(getattr(args, "strict_preflight", False))
     pre = preflight_live_parity(
         store, dates, bool(getattr(args, "allow_unfaithful", False)),
         config,
+        construct_engine=_strict,
     )
     if pre:
         return pre
@@ -4110,6 +4379,12 @@ def main() -> int:
               + ("  (--trade-report=on_change for a quiet run)"
                  if _tr_mode == "each_cycle" else ""))
         print()
+    if int(getattr(args, "cycle_stride", 1) or 1) > 1:
+        print(
+            f"  cycle_stride={int(args.cycle_stride)} "
+            f"(hunt mode — not go-live P&L)"
+        )
+        print()
 
     runner = BacktestRunner(
         store, config,
@@ -4123,6 +4398,7 @@ def main() -> int:
         trade_report=args.trade_report,
         live_db_path=str(getattr(config, "db_path", "") or ""),
         mirror_live_aborts=bool(getattr(args, "mirror_live_aborts", False)),
+        cycle_stride=int(getattr(args, "cycle_stride", 1) or 1),
     )
     res = runner.run(dates)
     print_report(res, config, args, store=store)

@@ -35,6 +35,8 @@
 #     python split_db_per_day.py --dates 2026-09-21 2026-09-22
 #     python split_db_per_day.py --force          # rebuild even if unchanged
 #     python split_db_per_day.py --verify-only    # fingerprint compare, no write
+#     python split_db_per_day.py --workers 8      # parallel day rebuilds (default 8)
+#     python split_db_per_day.py --vacuum         # optional VACUUM on new shards
 #
 #     python backtest_engine.py --db data/per_day --from 2026-09-08 --to 2026-09-22
 #
@@ -59,15 +61,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sqlite3
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from core import live_writer_lock_held, open_sqlite_readonly, protect_sqlite_connection
+
+# Concurrent rebuilds of independent day shards (one process per day).
+# Source is a read-only snapshot; each worker writes only its own temp→final
+# path via atomic replace after integrity_check.
+DEFAULT_SPLIT_WORKERS = 8
 
 
 # GitHub rejects individual files at 100,000,000 bytes (100 MB decimal).
@@ -692,32 +701,46 @@ def build_day(
     date: str,
     *,
     include_global: bool = False,
+    vacuum: bool = False,
 ) -> Dict[str, Any]:
     """
     Atomically write one per-day database.
 
     Writes to a temp file first; only replaces `out_path` after integrity
     check + fingerprint match against the source. Never deletes an existing
-    shard until the replacement is ready.
+    shard until the replacement is ready. Optional VACUUM (off by default)
+    shrinks the file but is not required for correctness.
     """
-    tmp_path = out_path.with_suffix(out_path.suffix + f".{os.getpid()}.tmp")
+    # Unique temp name so parallel workers never collide on the same path.
+    tmp_path = out_path.parent / (
+        f"{out_path.stem}.{date.replace('-', '')}.{os.getpid()}.tmp"
+    )
     if tmp_path.exists():
-        tmp_path.unlink()
+        remove_db_trio(tmp_path)
 
     counts: Dict[str, int] = {}
     integrity = "unknown"
 
     src_ro = open_db(src_path, readonly=True)
     try:
+        try:
+            src_ro.execute("PRAGMA cache_size=-65536")
+            src_ro.execute("PRAGMA mmap_size=268435456")
+        except sqlite3.Error:
+            pass
         # Freeze the expected fingerprint BEFORE the copy. Re-reading the
         # live DB afterwards races with an in-session writer (WAL growth)
         # and falsely rejects a correct shard.
         src_fp = fingerprint_source(src_ro, date)
 
         dst = sqlite3.connect(str(tmp_path))
+        # journal_mode=OFF / synchronous=OFF apply ONLY to this temp shard.
+        # The live primary is never opened writable from this script.
         dst.execute("PRAGMA journal_mode=OFF")
         dst.execute("PRAGMA synchronous=OFF")
         dst.execute("PRAGMA temp_store=MEMORY")
+        dst.execute("PRAGMA cache_size=-131072")  # ~128 MB page cache
+        dst.execute("PRAGMA locking_mode=EXCLUSIVE")
         try:
             with dst:
                 for stmt in schema_sql(src_ro, include_global=include_global):
@@ -731,7 +754,8 @@ def build_day(
                 # is treated as a literal filename because this connection
                 # is not opened with uri=True (Windows: "unable to open
                 # database: file:C:/...?mode=ro"). The snapshot is a
-                # private copy — not the live primary.
+                # private copy — not the live primary. Multiple workers may
+                # ATTACH the same snapshot read-only concurrently.
                 dst.execute(
                     "ATTACH DATABASE ? AS src",
                     (str(Path(src_path).resolve()),),
@@ -832,7 +856,8 @@ def build_day(
                         pass
 
             integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
-            if integrity == "ok":
+            # VACUUM is optional compaction — integrity already gates replace.
+            if integrity == "ok" and vacuum:
                 dst.execute("VACUUM")
         finally:
             dst.close()
@@ -840,10 +865,7 @@ def build_day(
         src_ro.close()
 
     if integrity != "ok":
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+        remove_db_trio(tmp_path)
         raise RuntimeError(
             f"{date}: integrity_check failed ({integrity}); shard not replaced"
         )
@@ -852,21 +874,62 @@ def build_day(
     if not fingerprints_equal(src_fp, new_fp or {}):
         if not _critical_match(src_fp, new_fp or {}):
             hint = _diff_hint(src_fp, new_fp)
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+            remove_db_trio(tmp_path)
             raise RuntimeError(
                 f"{date}: new shard fingerprint mismatch vs source "
                 f"({hint}); not replacing {out_path.name}"
             )
 
+    # Atomic replace: existing shard stays intact until this succeeds.
     os.replace(str(tmp_path), str(out_path))
     return {
         "counts": counts,
         "integrity": integrity,
         "fingerprint": new_fp,
     }
+
+
+def _rebuild_day_worker(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Child-process entry: rebuild one day shard from the shared snapshot."""
+    date = str(job["date"])
+    out_path = Path(job["out_path"])
+    try:
+        result = build_day(
+            Path(job["src_path"]),
+            out_path,
+            date,
+            include_global=bool(job.get("include_global")),
+            vacuum=bool(job.get("vacuum")),
+        )
+        fid = shard_fidelity(
+            out_path,
+            date,
+            expect_prev_close=bool(job.get("expect_prev_close")),
+        )
+        size = out_path.stat().st_size if out_path.is_file() else 0
+        rows = sum(int(v or 0) for v in (result.get("counts") or {}).values())
+        return {
+            "date": date,
+            "ok": True,
+            "action": str(job.get("action") or "CREATED"),
+            "rows": rows,
+            "size": size,
+            "fidelity_ok": bool(fid.get("ok")),
+            "fidelity": format_fidelity(fid),
+            "had_existing": bool(job.get("had_existing")),
+        }
+    except Exception as exc:
+        return {
+            "date": date,
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "fidelity_ok": False,
+            "fidelity": "",
+            "size": 0,
+            "rows": 0,
+            "action": "FAIL",
+            "had_existing": bool(job.get("had_existing")),
+        }
 
 
 def _critical_match(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
@@ -951,7 +1014,24 @@ def main() -> int:
         help="snapshot even if the live engine holds the writer lock "
              "(not recommended; wait for main.py to exit)",
     )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_SPLIT_WORKERS,
+        help=(
+            f"max concurrent day-shard rebuild processes "
+            f"(default {DEFAULT_SPLIT_WORKERS}). Fingerprint skip/verify "
+            f"stays in the parent; only rebuilds run in parallel."
+        ),
+    )
+    ap.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="VACUUM each new shard after integrity_check (slower, smaller files). "
+             "Default skips VACUUM — correctness uses integrity_check + atomic replace.",
+    )
     args = ap.parse_args()
+    args.workers = max(1, int(args.workers or DEFAULT_SPLIT_WORKERS))
 
     src_path = Path(args.src)
     if not src_path.exists():
@@ -1017,13 +1097,16 @@ def main() -> int:
         print(
             f"  Mode   : "
             f"{'verify-only' if args.verify_only else ('force-rebuild' if args.force else 'skip-if-unchanged')}"
-            f"{' +global' if args.include_global else ''}\n"
+            f"{' +global' if args.include_global else ''}"
+            f"{' +vacuum' if args.vacuum else ''}"
+            f"  workers={args.workers}\n"
         )
 
         skipped = rebuilt = failed = verified_ok = verified_bad = 0
         fidelity_bad = 0
         total_bytes = 0
         t0 = time.time()
+        rebuild_jobs: List[Dict[str, Any]] = []
 
         for d in dates:
             out_path = out_dir / f"nifty_algo_{d}.db"
@@ -1038,13 +1121,13 @@ def main() -> int:
 
             existing_fp = fingerprint_shard(out_path, d)
             same = fingerprints_equal(src_fp, existing_fp or {})
+            expect_prev = (
+                (src_fp.get("context") or {}).get("ctx_close") is not None
+            )
 
             if args.verify_only:
-                src_has_close = (
-                    (src_fp.get("context") or {}).get("ctx_close") is not None
-                )
                 fid = shard_fidelity(
-                    out_path, d, expect_prev_close=src_has_close
+                    out_path, d, expect_prev_close=expect_prev
                 )
                 if not fid.get("ok"):
                     fidelity_bad += 1
@@ -1064,10 +1147,7 @@ def main() -> int:
                 size_kb = out_path.stat().st_size / 1024
                 total_bytes += out_path.stat().st_size
                 fid = shard_fidelity(
-                    out_path, d,
-                    expect_prev_close=(
-                        (src_fp.get("context") or {}).get("ctx_close") is not None
-                    ),
+                    out_path, d, expect_prev_close=expect_prev
                 )
                 if not fid.get("ok"):
                     fidelity_bad += 1
@@ -1078,38 +1158,71 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            try:
-                result = build_day(
-                    work_src,
-                    out_path,
-                    d,
-                    include_global=bool(args.include_global),
-                )
-            except Exception as exc:
-                print(f"  {d}: FAIL  {exc}")
-                failed += 1
-                continue
+            rebuild_jobs.append(
+                {
+                    "date": d,
+                    "src_path": str(work_src),
+                    "out_path": str(out_path),
+                    "include_global": bool(args.include_global),
+                    "vacuum": bool(args.vacuum),
+                    "expect_prev_close": expect_prev,
+                    "had_existing": existing_fp is not None,
+                    "action": "REPLACED" if existing_fp is not None else "CREATED",
+                }
+            )
 
-            size_kb = out_path.stat().st_size / 1024
-            total_bytes += out_path.stat().st_size
-            rows = sum(
-                int(v or 0)
-                for k, v in (result.get("counts") or {}).items()
-            )
-            action = "REPLACED" if existing_fp is not None else "CREATED"
-            fid = shard_fidelity(
-                out_path, d,
-                expect_prev_close=(
-                    (src_fp.get("context") or {}).get("ctx_close") is not None
-                ),
-            )
-            if not fid.get("ok"):
-                fidelity_bad += 1
+        # Rebuilds only — fingerprint decisions already made above. Each
+        # worker writes a unique temp file then atomically replaces its
+        # own out_path; the shared snapshot is read-only.
+        if rebuild_jobs and not args.verify_only:
+            workers = max(1, min(int(args.workers), len(rebuild_jobs)))
             print(
-                f"  {d}: {action:8s}  {rows:>10,} rows  "
-                f"{size_kb:>10,.1f} KB  {format_fidelity(fid)}"
+                f"  Rebuilding {len(rebuild_jobs)} shard(s) with "
+                f"{workers} process(es) ..."
             )
-            rebuilt += 1
+            if workers == 1:
+                results = [_rebuild_day_worker(j) for j in rebuild_jobs]
+            else:
+                ctx = mp.get_context("spawn")
+                results = []
+                with ProcessPoolExecutor(
+                    max_workers=workers, mp_context=ctx
+                ) as pool:
+                    futs = {
+                        pool.submit(_rebuild_day_worker, j): j["date"]
+                        for j in rebuild_jobs
+                    }
+                    for fut in as_completed(futs):
+                        try:
+                            results.append(fut.result())
+                        except Exception as exc:
+                            results.append(
+                                {
+                                    "date": futs[fut],
+                                    "ok": False,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                    "fidelity_ok": False,
+                                    "size": 0,
+                                    "rows": 0,
+                                    "action": "FAIL",
+                                }
+                            )
+            for row in sorted(results, key=lambda r: str(r.get("date") or "")):
+                d = str(row.get("date") or "")
+                if not row.get("ok"):
+                    print(f"  {d}: FAIL  {row.get('error')}")
+                    failed += 1
+                    continue
+                total_bytes += int(row.get("size") or 0)
+                size_kb = int(row.get("size") or 0) / 1024
+                if not row.get("fidelity_ok"):
+                    fidelity_bad += 1
+                print(
+                    f"  {d}: {str(row.get('action') or 'CREATED'):8s}  "
+                    f"{int(row.get('rows') or 0):>10,} rows  "
+                    f"{size_kb:>10,.1f} KB  {row.get('fidelity') or ''}"
+                )
+                rebuilt += 1
 
         # Keep .gitignore synchronized after splitting. In verify-only mode we
         # intentionally do not modify any files.
