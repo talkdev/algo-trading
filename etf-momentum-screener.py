@@ -27,7 +27,8 @@
      need PAPER_TRADE=False in the config AND the --confirm flag ('live'
      command); simulated fills use realistic slippage + full statutory charges.
   8. Tracks tax lots (STCG 20% / LTCG 12.5% above Rs 1.25 L), dividends,
-     drawdown risk triggers (10% review / 15% halve / 20% cash) and re-entry.
+     drawdown risk triggers (at the 15% vol target: 15% review / 22.5% halve /
+     30% cash — they scale with VOL_TARGET) and re-entry.
   9. Backtests 10+ years with the last 20% held out-of-sample, parameter grid
      (lookback 126/189/252 x entry 0/1/2/3/5%), cost and cash-rate scenarios.
 
@@ -170,7 +171,7 @@
     since 2022/2024 the SEBI/RBI overseas-investment freeze has stopped new
     unit creation, so those six trade at REAL premiums (measured 2-22% norm,
     31-111% blow-off Sep-Oct-2026); premiums above the cap are buy-BANNED
-    (BSE investor caution 29-Sep-2026; price bands anchor to T-1 NAV from
+    (BSE investor caution late-Sep-2026; price bands anchor to T-1 NAV from
     1-Apr-2027), never mislabelled as corrupt data.  Only a >300% gap or a
     >20% one-step NAV jump is treated as a broken mapping.
     the daily update / 'load-data' AUTO-CREATE stock-data/nav/*.csv from
@@ -329,7 +330,7 @@ GLOBAL_ETF_PREMIUM_CAP = 0.20    # 'GLOBAL INDICES' buys banned above a +20% mar
                                  # blow-off 31-111% (VRO 14-Oct: FANG+ +59.5%, S&P500
                                  # Top50 +58.9%, HKTECH +31.1%, MON100 +15.3%, HSBeES
                                  # +4.6%; Mint 9-Sep: Q50 +96%; DSIJ 24-Oct: up to
-                                 # +111.8%).  BSE formally cautioned (29-Sep-2026):
+                                 # +111.8%).  BSE formally cautioned (late-Sep-2026):
                                  # "abrupt fall in price ... on enhancement of overseas
                                  # investment limits or on migration of the base price
                                  # for ETF price bands to the T-1 NAV effective
@@ -338,6 +339,17 @@ GLOBAL_ETF_PREMIUM_CAP = 0.20    # 'GLOBAL INDICES' buys banned above a +20% mar
                                  # before Apr-2027).  Domestic funds keep the 0.40/
                                  # 0.75% bands — APs create units freely, premiums
                                  # stay under 1%.
+                                 # CAP VALUE measured 28-Oct-2026 night (external
+                                 # audit lever 3, R20 variants): banning the 4
+                                 # blow-offs (what 0.20 does today) costs -0.48pp
+                                 # CAGR vs full tradability (11.98 vs 12.46) —
+                                 # cheap insurance.  Tightening to ~8% would ALSO
+                                 # ban MON100 (+15%, stable ~12% 52-wk avg, deepest
+                                 # liquidity): measured -2.76pp CAGR (9.70) — NOT
+                                 # worth it; a ~13% premium snap on one <=25% seat
+                                 # is a ~3% one-time hit the monthly trend exits
+                                 # can ride out, vs a permanent -2.3pp/yr.
+                                 # 0.20 stays.
                                  # Backtest caveat: nav_data stores no history, so
                                  # backtests never see premiums — measured CAGRs
                                  # implicitly include buying at premium (true in 2026,
@@ -668,6 +680,27 @@ TAX_DEFER_EXITS = False            # tax-aware exit deferral hypothesis (explici
 TAX_DEFER_MONTHS = 1               # ... defer only if lot is within N months of LTCG
 TAX_DEFER_MOM_FLOOR = -0.02        # ... and momentum is only slightly negative
 
+# --- audit v10 (external audit, 2026-10-28) — three new EXPERIMENT knobs -----
+# All default False.  A default flips ONLY if the variant harness measures a
+# clear win on the current binary (experiments/results_variants.json R20 rows,
+# full + OOS windows); no theory-only changes.
+SEAT_FILL_RELAXED = False          # fill empty basket seats from next-ranked names,
+                                   # relaxing ONLY the correlation cap (family cap
+                                   # and trend/liquidity gates still apply) — the
+                                   # auditor's lever for the 3-of-5-seats problem
+PARK_BENCH_TREND = False           # park the plan's uninvested weight in NIFTYBEES
+                                   # while NIFTYBEES itself passes trend+overlay,
+                                   # instead of leaving it in plain cash
+DD_SLEEVE_SCALE = False            # scale drawdown triggers by the CURRENT invested
+                                   # fraction (floor 0.35) — a half-cash book no
+                                   # longer needs a ~43% holdings crash to 'halve'
+REPLAN_TRICKLE_DAYS = 3            # near-replan guard: with the next month-end
+                                   # re-plan this many market sessions away or fewer,
+                                   # deploy only the INR floor (no autofill lift) —
+                                   # a basket bought 1-2 sessions before it re-ranks
+                                   # risks instant round-trip fees + STCG churn for
+                                   # ~0.2pp of lag saved (exec-lag W4-W6 math)
+
 # --- Daily deployment (user direction 2026-10-28 — the ONE master switch) ------
 # INVEST_PER_DAY is the ONLY money that ever buys.  Every run deploys up to
 # this amount across the target-plan gaps (each name's slice is PROPORTIONAL
@@ -686,6 +719,16 @@ TAX_DEFER_MOM_FLOOR = -0.02        # ... and momentum is only slightly negative
 # data-integrity gate).  Whether a sale's proceeds are re-deployed is
 # entirely INVEST_PER_DAY's decision — pure_amount semantics (user choice).
 INVEST_PER_DAY = 5000.0            # rupees per RUN, journaled per calendar day.
+                                   # audit v11 P1-3 note: 5000 < MIN_TRADE_VALUE
+                                   # (2000) x MAX_HOLDINGS (5), so one run can
+                                   # place at most ONE min-sized order from the
+                                   # floor budget — by design a slow trickle
+                                   # buys one name per run, day_slices()
+                                   # concentrates on the largest gap first, and
+                                   # the basket completes over a few runs.  The
+                                   # AUTOFILL pace (budget = max(floor,
+                                   # gap / sessions-to-re-plan)) is what deploys
+                                   # the plan fast when the month is young.
                                    #   FLOOR, not a hard cap (user choice 2026-10-28):
                                    #   if the plan cannot fill before the next
                                    #   re-plan at this floor, today's budget rises to
@@ -1776,8 +1819,16 @@ class Scanner:
             # rebuilt; discovery dates reset" — it never rebuilds anything,
             # and on a fresh install the youth is NORMAL.  Say the true thing,
             # once a week (it fired on every daily run otherwise).
-            if (oldest_px and oldest_px["d"] and first["f"] > oldest_px["d"]
-                    and (parse_date(first["f"]) - parse_date(oldest_px["d"])).days > 30):
+            # audit v11 P1-1: this summary runs BEFORE the day's price download,
+            # so on a true fresh install price_daily is EMPTY and the old
+            # oldest_px condition silently skipped the note.  A journal whose
+            # first_seen IS today, with no prices yet, is the fresh-install
+            # signature — emit the same honesty note from the journal side.
+            _olin = oldest_px and oldest_px["d"]
+            _mismatch = (_olin and first["f"] > oldest_px["d"]
+                         and (parse_date(first["f"]) - parse_date(oldest_px["d"])).days > 30)
+            _fresh = (not _olin) and first["f"] == today_str()
+            if _mismatch or _fresh:
                 _ln = self.db.meta_get("last_journal_note", "")
                 try:
                     _emit = (not _ln) or (parse_date(today_str())
@@ -1785,9 +1836,11 @@ class Scanner:
                 except Exception:
                     _emit = True
                 if _emit:
+                    _pxf = (f"while price history runs back to {oldest_px['d']}"
+                            if _olin else
+                            "(prices are being downloaded in this very first run)")
                     P.note(f"Heads-up (weekly): the discovery journal only started "
-                           f"{first['f']} while price history runs back to "
-                           f"{oldest_px['d']} — perfectly normal on a fresh install "
+                           f"{first['f']} {_pxf} — perfectly normal on a fresh install "
                            f"or after a data restore.  It only means backtest "
                            f"headline CAGR may read 3-5% optimistic until the "
                            f"journal has aged about a year; live trading is "
@@ -2754,6 +2807,38 @@ def signal_momentum(adj: list, i: int, lookback: int = LOOKBACK, skip: int = SKI
     return (sum(vals) / len(vals)) if vals else None
 
 
+def market_sessions_to(db, frm: str, to: str) -> int:
+    """COUNT of downloaded market sessions in (frm, to] — audit v10: the old
+    calendar-days x 5/7 guess mis-counted holidays and long weekends."""
+    r = db.one("SELECT COUNT(DISTINCT date) AS n FROM price_daily "
+               "WHERE date>? AND date<=?", (frm, to))
+    return int((r or {"n": 0})["n"] or 0)
+
+
+def sessions_to_calendar(today: str, target: str) -> int:
+    """Weekdays minus known NSE holidays strictly in (today, target] — the
+    CALENDAR count, independent of the price table.  Audit v11 P0-1
+    (2026-10-28): the v10 helper market_sessions_to() counts downloaded bars,
+    which can NEVER contain a future date, so a start-of-day run always saw 0
+    sessions left, the near-replan trickle fired on every run, and the
+    autofill pace (audit v4, measured W4-W6) was unreachable all month."""
+    hols = set()
+    try:
+        hp = BASE_DIR / "nse_holidays.json"
+        if hp.exists():
+            hols = set(json.loads(hp.read_text()))
+    except Exception:
+        pass
+    t = parse_date(today); n = parse_date(target)
+    cnt = 0
+    d = t + dt.timedelta(days=1)
+    while d <= n:
+        if d.weekday() < 5 and d.isoformat() not in hols:
+            cnt += 1
+        d += dt.timedelta(days=1)
+    return cnt
+
+
 def deploy_sessions_left(days_left) -> int:
     """Audit v4 L6 (2026-10-28): never lift the daily budget to the whole plan
     in fewer than 3 market days — a one-day blast concentrates entry timing
@@ -2821,7 +2906,26 @@ def day_slices(gaps: dict, budget: float, caps: dict = None) -> dict:
             if todo[s] < MIN_TRADE_VALUE or room < MIN_TRADE_VALUE:
                 del todo[s]
         if applied < MIN_TRADE_VALUE:
-            break                                # dust remainder stops
+            # audit v11 P0-2 (2026-10-28 console audit): when the daily budget
+            # split across N plan names drops EVERY share under MIN_TRADE_VALUE
+            # (5000/3 = 1667 on the 2026-10-28 run), the loop applied nothing
+            # and bought ZERO into a half-empty Rs 5.3 L plan.  Concentrate the
+            # whole remainder on the single largest-gap name instead — one
+            # order, one round-trip (audit v5 #3's one-order-per-day and the
+            # min-trade floor both stay intact).  Tomorrow's run then fills the
+            # next-largest gap; the basket completes over a few runs.
+            if todo and remaining >= MIN_TRADE_VALUE:
+                for _big in sorted(todo, key=lambda s: -todo[s]):
+                    _room = caps.get(_big, float("inf")) - out.get(_big, 0.0)
+                    _alloc = min(todo[_big], remaining, _room)
+                    if _alloc >= MIN_TRADE_VALUE:
+                        out[_big] = out.get(_big, 0.0) + _alloc
+                        todo[_big] -= _alloc
+                        remaining -= _alloc
+                        applied = _alloc
+                        break
+            if applied < MIN_TRADE_VALUE:
+                break                            # dust remainder stops
     return {s: v for s, v in out.items() if v >= MIN_TRADE_VALUE}
 
 
@@ -3613,6 +3717,13 @@ class PortfolioBuilder:
         if ROTATION_RULE and strategy in ("B", "C"):
             chosen = self._apply_rotation(pool,   # (F13: redundant ternary removed)
                                           holding_symbols, MAX_HOLDINGS)
+        # audit v10: corr-relaxed seat fill (default off — pending R20I).
+        # NOTE: strategy A builds pool_a, B/C build pool — the fill needs the
+        # SAME pool the strict pass drew from (v10 first cut referenced `pool`
+        # unconditionally -> NameError under strategy A)
+        _fill_pool = pool_a if strategy == "A" else pool
+        _fill_k = MAX_HOLDINGS * 10 if strategy == "A" else MAX_HOLDINGS
+        chosen = self._seat_fill(chosen, _fill_pool, _fill_k)
         return {"chosen": chosen, "decisions": decisions, "exits": exits,
                 "holds": holds, "eligible": eligible}
 
@@ -3651,6 +3762,27 @@ class PortfolioBuilder:
             cand = out + [st]
             if self._corr_ok(cand):
                 out.append(st)
+        return out
+
+    def _seat_fill(self, out: list, ranked_pool: list, k: int) -> list:
+        """audit v10 (external, 2026-10-28): a strict correlation pass can leave
+        basket seats EMPTY (3 of 5 on 28-Oct).  This fills the leftovers in rank
+        order, relaxing ONLY the correlation cap — the one-per-family rule and
+        every upstream trend/liquidity/premium gate still applied.  Default OFF;
+        flips only on a measured harness win (R20 rows)."""
+        if not SEAT_FILL_RELAXED or len(out) >= k:
+            return out
+        for st in ranked_pool:
+            if len(out) >= k:
+                break
+            if st in out:
+                continue
+            fam = universe_map().get(st["symbol"], {}).get("index_family", st["symbol"])
+            if ONE_PER_INDEX_FAMILY and any(
+                    universe_map().get(s["symbol"], {}).get("index_family") == fam
+                    for s in out):
+                continue
+            out.append(st)
         return out
 
     def _corr_ok(self, chosen: list) -> bool:
@@ -4578,8 +4710,12 @@ class RiskEngine:
         for k, v in self.trigger_counts.items():
             self.db.meta_set(f"risk_count_{k}", v)
 
-    def update(self, equity: float, context: str = "") -> dict:
-        """Daily monitoring of portfolio drawdown."""
+    def update(self, equity: float, context: str = "",
+               invested_frac: float = None) -> dict:
+        """Daily monitoring of portfolio drawdown.  invested_frac (hv/eq) is used
+        only when DD_SLEEVE_SCALE is on (audit v10 knob): drawdown triggers scale
+        by the invested fraction so a half-cash book doesn't need a ~43%
+        holdings crash to halve."""
         events = []
         if equity > self.peak:
             self.peak = equity
@@ -4622,6 +4758,14 @@ class RiskEngine:
                 # below cannot re-lock the account on the OLD drawdown
                 dd = 1.0 - equity / self.peak if self.peak > 0 else 0.0
         dd_review, dd_severe, dd_extreme = dd_thresholds(self.vol_target)
+        if DD_SLEEVE_SCALE and invested_frac is not None:
+            # audit v10: sleeve-aware triggers — effective thresholds shrink
+            # with the invested fraction (floored at 0.35 to stop near-cash
+            # noise re-triggering daily)
+            _inv = max(invested_frac, 0.35)
+            dd_review *= _inv
+            dd_severe *= _inv
+            dd_extreme *= _inv
         if dd >= dd_extreme and not self.all_cash:
             self.all_cash = True
             self.state = "EXTREME"
@@ -5262,15 +5406,33 @@ class TradingCycle:
         # backtested next-session execution — ~1pp CAGR per 10 sessions of lag.
         # Budget = max(floor, remaining-plan / market-days-to-re-plan).
         pool0 = sum(v["gap"] for v in plan.values())
+        # audit v11 P0-1: sessions to the re-plan come from the CALENDAR
+        # (weekdays minus NSE holidays).  The v10 DB count was always 0 — the
+        # price table has no future dates — which made the trickle fire every
+        # day and the autofill unreachable for the whole month.  +1 = today.
         try:
-            # audit v4 L6: never lift to the whole plan in fewer than 3 market
-            # days — a one-day blast concentrates entry timing (whole-plan lump)
-            sessions_left = deploy_sessions_left(round(
-                (parse_date(next_month_end_hint()) - parse_date(today_str())).days * 5 / 7))
+            _mend = next_month_end_hint()
+            _sessions_real = 1 + sessions_to_calendar(today_str(), _mend)
         except Exception:
-            sessions_left = deploy_sessions_left(None)
-        budget_today = autofill_budget(INVEST_PER_DAY, pool0, sessions_left)
-        if budget_today > INVEST_PER_DAY and plan:
+            _sessions_real = 0
+        sessions_left = deploy_sessions_left(_sessions_real or None)
+        # near-replan guard (auditor point 4): with the month-end re-plan only
+        # REPLAN_TRICKLE_DAYS sessions away, buying the whole plan into a basket
+        # that re-ranks in a day or two burns round-trip fees + 20.8% STCG on
+        # rotated names.  Deploy just the floor until the fresh list.
+        _trickle = 0 < _sessions_real <= REPLAN_TRICKLE_DAYS
+        if _trickle:
+            budget_today = INVEST_PER_DAY
+        else:
+            budget_today = autofill_budget(INVEST_PER_DAY, pool0, sessions_left)
+        if _trickle and plan:
+            _sw = "session" if _sessions_real == 1 else "sessions"
+            P.note(f"Month-end re-plan is only {_sessions_real} market {_sw} "
+                   f"away — deploying just the daily floor {fmt_rs(INVEST_PER_DAY)} "
+                   f"({fmt_cr(pool0)} of plan waits) so freshly-bought names aren't "
+                   f"churned by next week's re-pick. Full-speed buying resumes "
+                   f"with the new signal.")
+        if (not _trickle) and budget_today > INVEST_PER_DAY and plan:
             P.note(f"Budget lifted to {fmt_rs(budget_today)} today: {fmt_cr(pool0)} "
                    f"still to buy across ~{sessions_left} market day(s) before the "
                    f"{next_month_end_hint()} re-plan.  (Your floor stays "
@@ -5326,8 +5488,16 @@ class TradingCycle:
                 caps[_s] = POS_CAP_LIQ_FRAC * _p25
         slices = day_slices({s: v["gap"] for s, v in plan.items()}, remaining, caps)
         if not slices and plan:
-            P.ok("Nothing sizeable left to buy today — every remaining gap is "
-                 "below the minimum trade value.")
+            # audit v11 P0-3: name the REAL constraint.  After the P0-2
+            # concentration fallback, reaching this line means one of: today's
+            # budget was already used by an earlier run, every remaining gap is
+            # below the minimum order, or today's per-name liquidity caps are
+            # spent.  Do NOT blame the gaps themselves — a 175k gap is not dust.
+            P.ok(f"Nothing was bought from the plan this run — either today's "
+                 f"budget was already used by an earlier run, every remaining "
+                 f"gap is below the {fmt_rs(MIN_TRADE_VALUE)} minimum order, or "
+                 f"today's per-name liquidity caps are already spent (the "
+                 f"reason lines above name the specific case).")
         for sym, slice_val in sorted(slices.items(), key=lambda kv: -kv[1]):
             if remaining < MIN_TRADE_VALUE:
                 break
@@ -5335,7 +5505,8 @@ class TradingCycle:
             if caps.get(sym) and slice_val >= caps[sym] - 1.0:
                 P.info(f"{sym}: today's buy is capped at 15% of its quiet-day "
                        f"trading ({fmt_cr(caps[sym])}) — the rest waits for "
-                       f"tomorrow (one order per day per ETF).")
+                       f"the next run (one slice per ETF per run; re-running "
+                       f"today tops up the same names safely).")
             # audit v4 §3.5: an order placed by an EARLIER run today and
             # still open at the broker counts as committed — never stack a
             # second order on the same name the same day
@@ -5516,17 +5687,28 @@ class TradingCycle:
             # audit §6: report against PRE-BUY equity (eq0 above), not after
             # today's purchases
             eq_pre = eq0 if eq0 > 0 else max(eq - deployed, 1.0)
+            # audit v10 (external): on re-runs this line counted only the LAST
+            # run (Rs 19k) while the DAY had already deployed Rs 1.36L — show
+            # both, so resumptions never read as fresh full deployment
+            _dt = self.db.one("SELECT COUNT(*) AS n, COALESCE(SUM(value),0) AS v "
+                              "FROM orders WHERE exec_date=? AND side='BUY' "
+                              "AND status='FILLED'", (today_str(),))
+            _dn, _dv = (_dt["n"] or 0), (_dt["v"] or 0.0)
+            _day = (f" | today across all runs: {fmt_cr(_dv)} in {_dn} order(s)"
+                    if _dv > deployed + 1.0 else "")
             P.kv("Money invested today",
-                 f"{fmt_rs(deployed)} across {bought} ETF(s) "
-                 f"— {fmt_pct(safe_div(deployed, max(eq_pre, 1.0), 0.0))} of the "
-                 f"{fmt_cr(eq_pre)} total you had before buying")
+                 f"{fmt_rs(deployed)} across {bought} ETF(s) this run"
+                 f" — {fmt_pct(safe_div(deployed, max(eq_pre, 1.0), 0.0))} of the "
+                 f"{fmt_cr(eq_pre)} total you had before buying{_day}")
         elif parked_names:
             P.ok("Nothing was bought — the undelivered plan money is parked "
                  "because those ETFs are falling (above), not because the "
                  "plan is full.")
         else:
-            P.ok("Nothing was invested — the budget was spent earlier today, "
-                 "the ETFs are full, or the checks above said no.")
+            P.ok("Nothing was invested this run — the specific reason is on "
+                 "the lines above (budget used by an earlier run today, "
+                 "positions already full, a filter/liquidity block, or the "
+                 "remainder below the minimum order).")
         return bought
 
     def daily_exit_guard(self):
@@ -5607,7 +5789,10 @@ class TradingCycle:
                       "(no orders placed). Fix the Upstox token/network and rerun.")
                 return self.broker.equity(self.latest_prices())
         prices = self.latest_prices()
-        ctx = self.risk.update(self.broker.equity(prices), "daily")
+        _eqd = self.broker.equity(prices)
+        _hvd = self.broker.holdings_value(prices)
+        ctx = self.risk.update(_eqd, "daily",
+                               invested_frac=(_hvd / _eqd) if _eqd > 0 else None)
         for level, msg in ctx["events"]:
             P.warn(f"SAFETY ALERT ({level}): {msg}")
         self.apply_derisk(ctx, self.latest_prices())
@@ -5758,7 +5943,7 @@ class TradingCycle:
                        + ", ".join(f"{s} {fmt_pct(d)}" for s, d in _globs)
                        + " — these global ETFs trade ABOVE what they are really "
                          "worth because SEBI's overseas-investment freeze stopped "
-                         "new units (BSE warned 29-Sep-2026: the premium can snap "
+                         "new units (BSE warned late-Sep-2026: the premium can snap "
                          "shut overnight; price bands anchor to NAV from "
                          "1-Apr-2027).  Buys stay banned above the 20% cap and "
                          "resume automatically when the premium cools under it.")
@@ -6017,7 +6202,10 @@ class TradingCycle:
                         "AND symbol='*'")   # sliced SELL remainders survive for the daily worker
         prices = self.latest_prices()
         eq_before = self.broker.equity(prices)
-        risk_ctx = self.risk.update(eq_before, "cycle-start")
+        _hv0 = self.broker.holdings_value(self.latest_prices())
+        risk_ctx = self.risk.update(eq_before, "cycle-start",
+                                    invested_frac=(_hv0 / eq_before)
+                                    if eq_before > 0 else None)
         for level, msg in risk_ctx["events"]:
             P.warn(f"RISK [{level}]: {msg}")
         if risk_ctx["all_cash"]:
@@ -6048,6 +6236,20 @@ class TradingCycle:
             sized = self.builder.size(selection["chosen"], eq_before,
                                       risk_scale=self._current_risk_scale(as_of),
                                       strategy=strategy)
+            # audit v10 PARK_BENCH_TREND (default off — pending R20J): the
+            # plan's leftover weight rides NIFTYBEES while NIFTYBEES itself is
+            # in an uptrend above its 200-DMA, instead of idling in cash
+            if PARK_BENCH_TREND and "NIFTYBEES" not in sized["weights"]:
+                _bs = next((s for s in stats if s["symbol"] == "NIFTYBEES"), None)
+                if _bs is not None and (_bs["momentum"] or 0) > ENTRY_THRESHOLD:
+                    _bseg = [row_adj(r) for r in (_bs.get("rows") or [])][-200:]
+                    _bok = not _bseg or _bseg[-1] >= sum(_bseg) / len(_bseg)
+                    _left = 1.0 - sum(sized["weights"].values())
+                    if _bok and _left > 0.02:
+                        sized["weights"]["NIFTYBEES"] = _left
+                        P.note(f"Parking the plan's leftover {fmt_pct(_left)} in "
+                               f"NIFTYBEES (it passes its own trend test) — it "
+                               f"leaves automatically when its trend breaks.")
             self.db.meta_set(SIP_TARGETS_KEY, json.dumps(sized["weights"]))
             self.db.meta_set(DEPLOY_SKIP_KEY, "{}")   # fresh plan = fresh chances
             if sized["weights"] and not quiet:
@@ -6268,7 +6470,8 @@ class TradingCycle:
         cash = self.broker.cash()
         hv = self.broker.holdings_value(prices)
         eq = cash + hv
-        self.risk.update(eq, "cycle-end")
+        self.risk.update(eq, "cycle-end",
+                         invested_frac=(hv / eq) if eq > 0 else None)
         self.risk.snapshot(today_str(), cash, hv, eq)
         if exits_outstanding == 0:
             # audit v4 L4: a re-derived (override) basket must ALSO satisfy the
@@ -6283,7 +6486,10 @@ class TradingCycle:
                    f"{as_of} signal stays OPEN until they finish, so rerun "
                    f"'python etf-momentum-screener.py trade' on the next session.")
         self.db.meta_set("last_trade_run", now_iso())
-        P.section("PORTFOLIO AFTER THIS CYCLE", "\U0001F4CA")
+        # audit v11 P2-1: this is the state after the month-end SELLS — the
+        # daily buying runs later (deploy_day under run_daily).  Title it so.
+        P.section("PORTFOLIO AFTER MONTHLY REBALANCE (before today's buying)",
+                  "\U0001F4CA")
         rows = []
         for sym, h in sorted(self.broker.holdings().items()):
             px = prices.get(sym, h["avg_cost"])
@@ -6718,6 +6924,19 @@ class Backtester:
                     continue
                 if corr_ok(out + [st]):
                     out.append(st)
+            # audit v10 seat_fill (live mirror: PortfolioBuilder._seat_fill):
+            # relax ONLY the correlation cap to fill empty seats, in rank order
+            if self.params.get("seat_fill") and len(out) < k:
+                for st in ranked:
+                    if len(out) >= k:
+                        break
+                    if st in out:
+                        continue
+                    fam = st["index_family"]
+                    if ONE_PER_INDEX_FAMILY and any(s["index_family"] == fam
+                                                    for s in out):
+                        continue
+                    out.append(st)
             return out
 
         sched = self.params.get("param_schedule")   # [(from_date, params), ...]
@@ -6959,6 +7178,21 @@ class Backtester:
                 if tot > _sc > 0:
                     for s in sec:
                         out_w[s] *= _sc / tot
+            # park_bench param (audit v10, external auditor lever 1c): the plan's
+            # uninvested weight rides the benchmark ETF while the benchmark
+            # itself passes trend + 200-DMA overlay — instead of idling in cash
+            if (self.params.get("park_bench", False) and bench_sym
+                    and bench_sym not in out_w and bench_sym in sym_adj):
+                _left = 1.0 - sum(out_w.values())
+                _bp = pos_at(bench_sym, date)
+                if _left > 0.02 and _bp is not None:
+                    _bm = signal_momentum(sym_adj[bench_sym], _bp, lookback, skip)
+                    _bseg = sym_adj[bench_sym][max(0, _bp - 200):_bp + 1]
+                    _bok = _bm is not None and _bm > entry
+                    if _bok and EXIT_OVERLAY_200DMA and _bseg:
+                        _bok = _bseg[-1] >= sum(_bseg) / len(_bseg)
+                    if _bok:
+                        out_w[bench_sym] = _left
             return out_w
 
         # benchmark series (first large ETF or equal basket) for regime tagging
@@ -7294,6 +7528,15 @@ class Backtester:
             dd = 1.0 - eq / peak if peak > 0 else 0.0
             if self.risk_on:
                 dd_rev_m, dd_sev_m, dd_ext_m = dd_thresholds(VOL_TARGET)
+                # audit v10 knob (external auditor point 6): with ~half the book
+                # in cash, TOTAL-equity triggers need a ~43% holdings crash to
+                # halve — scale thresholds by the current invested fraction
+                # (floor 0.35 so a near-empty book doesn't trip on noise)
+                if self.params.get("dd_sleeve_scale", False):
+                    _inv = max(hv / eq, 0.35) if eq > 0 else 1.0
+                    dd_rev_m *= _inv
+                    dd_sev_m *= _inv
+                    dd_ext_m *= _inv
                 if dd >= dd_ext_m and not all_cash_mode:
                     all_cash_mode = True
                     lock_date = date
@@ -7529,8 +7772,11 @@ def print_backtest_result(res: dict, title: str = "BACKTEST RESULT"):
     P.table(["Metric", "Value"], rows, aligns=["<", ">"])
     ev = res["risk_events"]
     P.sub("Risk trigger events (Step 9)")
-    P.info(f"10% reviews: {ev.get('REVIEW',0)}   |   15% halvings: {ev.get('SEVERE',0)}   |   "
-           f"20% cash-outs: {ev.get('EXTREME',0)}   |   recoveries: {ev.get('RECOVERY',0)}")
+    _dr, _ds, _dx = dd_thresholds()
+    P.info(f"{fmt_pct(_dr,0)} reviews: {ev.get('REVIEW',0)}   |   "
+           f"{fmt_pct(_ds,0)} halvings: {ev.get('SEVERE',0)}   |   "
+           f"{fmt_pct(_dx,0)} cash-outs: {ev.get('EXTREME',0)}   |   "
+           f"recoveries: {ev.get('RECOVERY',0)}")
     P.note("Drawdown triggers are risk controls, NOT guaranteed stop-losses — "
            "gaps and illiquid markets can produce larger losses.")
     # external audit 2026-10-27 (F11.1/F15): honesty block — what these numbers
@@ -8065,9 +8311,10 @@ def run_full_backtest(db: Db, quick: bool = False):
                    "ranking is a drag.")
     P.note("Survivorship-bias caveat: this universe is today's listed ETF set. "
            "Delisted/merged funds are missing, so real point-in-time results would be "
-           "LOWER. Bias direction: CAGR here is an OVER-estimate; a worst-decile "
-           "delisting scenario typically costs a few tens of bps per year on a "
-           "3-holding portfolio.")
+           "LOWER. Bias direction: CAGR here is an OVER-estimate. Same honesty as the "
+           "scanner's discovery-journal note — the gap is UNMEASURED on this data; "
+           "treat the headline CAGR as up to ~3-5% optimistic until the journal has "
+           "aged about a year.")
     P.note("Dividend treatment: raw Upstox prices carry no distributions, so nothing is "
            "compounded (conservative). Load distributions into corporate_actions with "
            "note='DIV...' and the reinvestment is haircut by the slab rate "
@@ -8161,12 +8408,15 @@ def cmd_status(db: Db):
     P.sub("Recent orders (order book)")
     orows = []
     for r in db.query("SELECT * FROM orders ORDER BY id DESC LIMIT 15"):
+        # audit v10 (external): SKIPPED/REJECTED rows were undiagnosable from
+        # the console — the reason IS stored, now show it
+        _rsn = (r["reason"] or "")[:42] if r["status"] not in ("FILLED",) else ""
         orows.append([r["exec_date"], r["symbol"], r["side"], fmt_num(r["qty"], 0),
                       f"Rs {(r['price'] or 0):.2f}", fmt_cr(r["value"] or 0),
-                      r["status"], r["mode"]])
+                      r["status"], r["mode"], _rsn])
     if orows:
-        P.table(["Date", "Symbol", "Side", "Qty", "Price", "Value", "Status", "Mode"], orows,
-                aligns=["<", "<", "<", ">", ">", ">", "<", "<"])
+        P.table(["Date", "Symbol", "Side", "Qty", "Price", "Value", "Status", "Mode", "Why"],
+                orows, aligns=["<", "<", "<", ">", ">", ">", "<", "<", "<"])
     else:
         P.info("Order book is empty — no trades have been made yet.")
     tax = TaxEngine(db).year_tax_summary()
@@ -8178,6 +8428,20 @@ def cmd_status(db: Db):
                 aligns=["<", ">", ">", ">"])
         P.note(f"LTCG exemption Rs 1.25 L/yr applied | STCG {fmt_pct(STCG_RATE,0)} | "
                f"LTCG {fmt_pct(LTCG_RATE,2)} above exemption")
+        # audit v10 (external lever 5): passive March harvest reminder.  Never an
+        # automatic order — selling just for tax would churn the book; you decide
+        # which long-term seat to lift and rebuy.
+        _fy_now = financial_year(dt.date.today())
+        if dt.date.today().month == 3 and _fy_now in tax:
+            _room = LTCG_EXEMPTION - tax[_fy_now].get("ltcg", 0.0)
+            if _room > 1000:
+                P.note(f"LTCG harvest window: {fmt_cr(_room)} of the Rs 1.25 L "
+                       f"long-term exemption is still unused this FY.  Any holding "
+                       f"bought 12+ months ago and sitting on a profit can be SOLD "
+                       f"AND RE-BOUGHT before 31-Mar to book that gain tax-free "
+                       f"(losses realised in the same FY also net off).  This is a "
+                       f"reminder, not an order — the engine never sells for tax "
+                       f"on its own.")
     # discovery dates recap — one line; the full table lives under 'scan'
     dcnt = db.one("SELECT COUNT(*) AS c, MIN(discovered_on) AS f, "
                   "MAX(discovered_on) AS l FROM discovery_log")
@@ -9935,9 +10199,11 @@ def cmd_selftest(db: Db):
     _s3b = day_slices({"A": 100000, "B": 100000, "C": 100000}, 90000,
                       {"B": 20000})
     _s3c = day_slices({"A": 10000, "B": 10000}, 90000)      # gaps clip total
-    _s3d = day_slices({"A": 99999, "B": 99999, "C": 99999}, 5000)  # dust budget
+    _s3d = day_slices({"A": 99999, "B": 99999, "C": 99999}, 1500)  # true dust budget
     check("v5#3: day_slices — one slice/ETF, proportional, caps clip and "
-          "redistribute, gaps clip, dust budget idles",
+          "redistribute, gaps clip; a budget under MIN_TRADE_VALUE idles "
+          "(a merely UNSPLITTABLE budget concentrates per audit v11 P0-2 "
+          "— covered by the v11 test below)",
           _s3a == {"A": 50000.0, "B": 50000.0, "C": 50000.0}
           and abs(sum(_s3b.values()) - 90000) < 1e-6 and _s3b["B"] == 20000.0
           and _s3b["A"] == _s3b["C"] == 35000.0
@@ -10088,6 +10354,135 @@ def cmd_selftest(db: Db):
             os.remove(DATA_DIR / "selftest_stale.db")
         except Exception:
             pass
+
+    # --- audit v10 (external audit 2026-10-28 night) -------------------------
+    # seat fill: strict pass leaves seats; relaxed fills in rank order; the
+    # family cap survives the relaxation
+    dbsub20 = Db(DATA_DIR / "selftest_seatfill.db")
+    try:
+        bb20 = PortfolioBuilder(dbsub20, FilterEngine(dbsub20))
+        _mk = lambda s, m, fam: {"symbol": s, "momentum": m, "index_family": fam,
+                                 "vol": 0.2, "liq_p25": 1e7, "rows": []}
+        _rank = [_mk("A", 0.50, "f1"), _mk("B", 0.40, "f2"), _mk("C", 0.30, "f3")]
+        _save_sf = globals()["SEAT_FILL_RELAXED"]
+        _save_um = globals()["universe_map"]
+        # the helper resolves families via the registry -> point it at a tiny
+        # synthetic map (A/D share family f1)
+        globals()["universe_map"] = lambda: {
+            "A": {"index_family": "f1"}, "B": {"index_family": "f2"},
+            "C": {"index_family": "f3"}, "D": {"index_family": "f1"}}
+        try:
+            globals()["SEAT_FILL_RELAXED"] = False
+            _strict = bb20._seat_fill([_rank[0]], _rank, 3)
+            globals()["SEAT_FILL_RELAXED"] = True
+            _relaxed = bb20._seat_fill([_rank[0]], _rank, 3)
+            _famdup = [_mk("D", 0.20, "f1")]
+            _relaxed_fam = bb20._seat_fill(list(_rank), _rank + _famdup, 5)
+        finally:
+            globals()["SEAT_FILL_RELAXED"] = _save_sf
+            globals()["universe_map"] = _save_um
+        check("v10: seat fill inert when off, fills in rank order when on, "
+              "family cap survives the relaxation",
+              [s["symbol"] for s in _strict] == ["A"]
+              and [s["symbol"] for s in _relaxed] == ["A", "B", "C"]
+              and [s["symbol"] for s in _relaxed_fam] == ["A", "B", "C"],
+              f"strict={[s['symbol'] for s in _strict]} "
+              f"relaxed={[s['symbol'] for s in _relaxed]} "
+              f"fam={[s['symbol'] for s in _relaxed_fam]}")
+    finally:
+        dbsub20.close()
+        try:
+            os.remove(DATA_DIR / "selftest_seatfill.db")
+        except Exception:
+            pass
+
+    # sleeve-scaled drawdown triggers (invested_frac halves the trigger depth)
+    dbsub21 = Db(DATA_DIR / "selftest_ddsleeve.db")
+    try:
+        _save_ds = globals()["DD_SLEEVE_SCALE"]
+        try:
+            globals()["DD_SLEEVE_SCALE"] = True
+            re21 = RiskEngine(dbsub21, vol_target=0.15)
+            re21.peak = 1000000.0
+            re21.update(860000.0, "test", invested_frac=0.5)
+            # 14% total dd; thresholds scaled x max(0.5, 0.35) -> severe at
+            # 11.25%, so a 14% dip must halve a half-cash book
+            _t1 = re21.halved
+            re22 = RiskEngine(dbsub21, vol_target=0.15)
+            re22.state, re22.halved, re22.all_cash = "NORMAL", False, False
+            re22.peak = 1000000.0
+            re22.update(860000.0, "test", invested_frac=1.0)
+            # fully invested -> classic depths: a 14% dip must NOT even review
+            _t2 = re22.halved or re22.state != "NORMAL"
+        finally:
+            globals()["DD_SLEEVE_SCALE"] = _save_ds
+        check("v10: sleeve scaling halves a half-cash book at 14% dd but leaves "
+              "a fully-invested book on the classic depths",
+              _t1 and not _t2, f"half-cash-halved={_t1} full-invested-moved={_t2}")
+    finally:
+        dbsub21.close()
+        try:
+            os.remove(DATA_DIR / "selftest_ddsleeve.db")
+        except Exception:
+            pass
+
+    # real market-session count + near-replan trickle boundary
+    dbsub22 = Db(DATA_DIR / "selftest_sessions.db")
+    try:
+        for _d in ("2026-10-28", "2026-10-29", "2026-10-30"):
+            dbsub22.execute(
+                "INSERT INTO price_daily(symbol,date,open,high,low,close,"
+                "adj_close,volume,traded_value) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("X", _d, 1, 1, 1, 1.0, 1.0, 1, 1))
+        _n1 = market_sessions_to(dbsub22, "2026-10-28", "2026-10-30")
+        _n2 = market_sessions_to(dbsub22, "2026-10-30", "2026-10-30")
+        _tri = (1 + _n1) <= REPLAN_TRICKLE_DAYS
+        check("v10: sessions counted off the real market calendar (no 5/7 guess); "
+              "near-replan trickle arms at the boundary",
+              _n1 == 2 and _n2 == 0 and _tri,
+              f"n1={_n1} n2={_n2} trickle={_tri}")
+    finally:
+        dbsub22.close()
+        try:
+            os.remove(DATA_DIR / "selftest_sessions.db")
+        except Exception:
+            pass
+
+    # --- audit v11 (2026-10-28 console audit) --------------------------------
+    # P0-1: sessions-to-replan must come from the CALENDAR, not the price table
+    # (a start-of-day run has no future bars; the v10 helper always returned 0,
+    # trapping every run in trickle mode and killing the autofill pace).
+    _exp = 0
+    _d = parse_date("2026-10-28") + dt.timedelta(days=1)
+    _hols_test = set()
+    try:
+        _hp = BASE_DIR / "nse_holidays.json"
+        if _hp.exists():
+            _hols_test = set(json.loads(_hp.read_text()))
+    except Exception:
+        pass
+    while _d <= parse_date("2026-10-30"):
+        if _d.weekday() < 5 and _d.isoformat() not in _hols_test:
+            _exp += 1
+        _d += dt.timedelta(days=1)
+    _cal = sessions_to_calendar("2026-10-28", "2026-10-30")
+    check("v11: sessions_to_calendar works on an EMPTY price table and equals "
+          "the weekday-minus-holiday count (the v10 DB-count bug it fixes)",
+          _cal == _exp and _cal >= 2, f"cal={_cal} expected={_exp}")
+
+    # P0-2: a budget below MIN_TRADE_VALUE x basket size must CONCENTRATE on
+    # the largest gap, not buy nothing (2026-10-28: 5000 over 3x 175k gaps
+    # produced zero orders into a half-empty Rs 5.3 L plan).
+    _c1 = day_slices({"A": 175000, "B": 175000, "C": 175000}, 5000)
+    _c2 = day_slices({"A": 175000, "B": 175000, "C": 175000}, 5000,
+                     caps={"A": 1000, "B": 1000})  # caps block: still buys C
+    _c3 = day_slices({"A": 1000, "B": 900}, 5000)   # sub-min GAPS: still nothing
+    check("v11: day_slices concentrates a too-small-to-split budget on the "
+          "largest uncapped gap; sub-min gaps honestly stay unfilled",
+          sum(_c1.values()) == 5000 and len(_c1) == 1
+          and sum(_c2.values()) == 5000 and list(_c2) == ["C"]
+          and _c3 == {},
+          f"c1={_c1} c2={_c2} c3={_c3}")
 
     P.raw()
     if failed == 0:
@@ -10446,7 +10841,7 @@ def cmd_navdiag(db: Db, symbols=None):
            "against the fund's own NAV (AMFI/fund site), correct it, run 'update'.  "
            "BUY-BANNED verdicts are NOT data faults: the fund's NAV is real — the "
            "ETF trades above worth because SEBI's overseas-investment freeze blocks "
-           "new units (BSE caution 29-Sep-2026; price bands anchor to NAV from "
+           "new units (BSE caution late-Sep-2026; price bands anchor to NAV from "
            "1-Apr-2027).  Buying auto-resumes when the premium cools.")
 
 
@@ -10534,8 +10929,8 @@ def cmd_monitor(db: Db):
     broker.accrue_cash_interest()
     risk = RiskEngine(db)
     eq = broker.equity(prices)
-    ctx = risk.update(eq)
     hv = broker.holdings_value(prices)
+    ctx = risk.update(eq, invested_frac=(hv / eq) if eq > 0 else None)
     risk.snapshot(today_str(), broker.cash(), hv, eq)
     P.kv("Equity", fmt_cr(eq))
     P.kv("Drawdown", fmt_pct(ctx["drawdown"]))

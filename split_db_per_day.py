@@ -721,6 +721,10 @@ def build_day(
     counts: Dict[str, int] = {}
     integrity = "unknown"
 
+    # Pre-read fingerprint / schema / context on a single RO handle, then
+    # CLOSE it before ATTACH. On Windows, EXCLUSIVE (or even a second open)
+    # against the same snapshot while src_ro is live → "database is locked"
+    # (Oct28 rebuild failure with only bot_controller running).
     src_ro = open_db(src_path, readonly=True)
     try:
         try:
@@ -728,141 +732,154 @@ def build_day(
             src_ro.execute("PRAGMA mmap_size=268435456")
         except sqlite3.Error:
             pass
-        # Freeze the expected fingerprint BEFORE the copy. Re-reading the
-        # live DB afterwards races with an in-session writer (WAL growth)
-        # and falsely rejects a correct shard.
         src_fp = fingerprint_source(src_ro, date)
-
-        dst = sqlite3.connect(str(tmp_path))
-        # journal_mode=OFF / synchronous=OFF apply ONLY to this temp shard.
-        # The live primary is never opened writable from this script.
-        dst.execute("PRAGMA journal_mode=OFF")
-        dst.execute("PRAGMA synchronous=OFF")
-        dst.execute("PRAGMA temp_store=MEMORY")
-        dst.execute("PRAGMA cache_size=-131072")  # ~128 MB page cache
-        dst.execute("PRAGMA locking_mode=EXCLUSIVE")
-        try:
-            with dst:
-                for stmt in schema_sql(src_ro, include_global=include_global):
-                    try:
-                        dst.execute(stmt)
-                    except sqlite3.Error as exc:
-                        if "already exists" not in str(exc).lower():
-                            raise
-
-                # ATTACH the snapshot by filesystem path. A file: URI here
-                # is treated as a literal filename because this connection
-                # is not opened with uri=True (Windows: "unable to open
-                # database: file:C:/...?mode=ro"). The snapshot is a
-                # private copy — not the live primary. Multiple workers may
-                # ATTACH the same snapshot read-only concurrently.
-                dst.execute(
-                    "ATTACH DATABASE ? AS src",
-                    (str(Path(src_path).resolve()),),
-                )
-                try:
-                    for table, col in BY_DATE:
-                        if not table_exists(src_ro, table):
-                            counts[table] = 0
-                            continue
-                        where = f" WHERE {date_predicate(col)}"
-                        counts[table] = _copy_via_attach(
-                            dst, src_path, table, where, (date,)
-                        )
-
-                    pos_ids = (
-                        [
-                            str(r[0])
-                            for r in dst.execute(
-                                'SELECT position_id FROM "positions"'
-                            ).fetchall()
-                            if r[0]
-                        ]
-                        if table_exists(dst, "positions")
-                        else []
-                    )
-
-                    for table, key_col, _parent, _pk in BY_FK:
-                        if not table_exists(src_ro, table):
-                            counts[table] = 0
-                            continue
-                        if not pos_ids:
-                            counts[table] = 0
-                            continue
-                        n = 0
-                        for i in range(0, len(pos_ids), 400):
-                            chunk = pos_ids[i:i + 400]
-                            q = ",".join("?" for _ in chunk)
-                            n += _copy_via_attach(
-                                dst,
-                                src_path,
-                                table,
-                                f' WHERE "{key_col}" IN ({q})',
-                                tuple(chunk),
-                            )
-                        counts[table] = n
-
-                    if include_global:
-                        for table in GLOBAL:
-                            if not table_exists(src_ro, table):
-                                counts[table] = 0
-                                continue
-                            counts[table] = _copy_via_attach(
-                                dst, src_path, table, "", ()
-                            )
-
-                    # Previous-session last 1m candle (gap detection).
-                    # Kept under its ORIGINAL trading_date so
-                    # HistoricalStore.load_day's `trading_date < ?` finds it.
-                    counts["intraday_candles:context"] = 0
-                    ctx = _prev_context(src_ro, date)
-                    if ctx.get("ctx_date") and table_exists(
-                        dst, "intraday_candles"
-                    ):
-                        cols = table_columns(dst, "intraday_candles")
-                        colq = ", ".join(f'"{c}"' for c in cols)
-                        dst.execute(
-                            f'INSERT INTO "intraday_candles" ({colq}) '
-                            f'SELECT {colq} FROM src."intraday_candles" '
-                            f"WHERE substr(trading_date, 1, 10) = ? "
-                            f"AND interval_min = 1 AND candle_time = ? "
-                            f"LIMIT 1",
-                            (ctx["ctx_date"], ctx["ctx_time"]),
-                        )
-                        counts["intraday_candles:context"] = int(
-                            dst.execute("SELECT changes()").fetchone()[0] or 0
-                        )
-                        if counts["intraday_candles:context"] == 0:
-                            row = src_ro.execute(
-                                'SELECT * FROM "intraday_candles" '
-                                "WHERE substr(trading_date,1,10) < ? "
-                                "AND interval_min = 1 "
-                                "ORDER BY trading_date DESC, candle_time DESC "
-                                "LIMIT 1",
-                                (date,),
-                            ).fetchone()
-                            if row is not None:
-                                ph = ", ".join("?" for _ in cols)
-                                dst.execute(
-                                    f'INSERT INTO "intraday_candles" '
-                                    f"({colq}) VALUES ({ph})",
-                                    tuple(row[c] for c in cols),
-                                )
-                                counts["intraday_candles:context"] = 1
-                finally:
-                    try:
-                        dst.execute("DETACH DATABASE src")
-                    except sqlite3.Error:
-                        pass
-
-            integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
-            # VACUUM is optional compaction — integrity already gates replace.
-            if integrity == "ok" and vacuum:
-                dst.execute("VACUUM")
-        finally:
-            dst.close()
+        schema_stmts = list(schema_sql(src_ro, include_global=include_global))
+        src_tables = {
+            t for t, _ in BY_DATE if table_exists(src_ro, t)
+        } | {
+            t for t, *_ in BY_FK if table_exists(src_ro, t)
+        } | {
+            t for t in GLOBAL if table_exists(src_ro, t)
+        }
+        ctx = _prev_context(src_ro, date)
     finally:
         src_ro.close()
+
+    dst = sqlite3.connect(str(tmp_path), timeout=60)
+    # journal_mode=OFF / synchronous=OFF apply ONLY to this temp shard.
+    # The live primary is never opened writable from this script.
+    dst.execute("PRAGMA journal_mode=OFF")
+    dst.execute("PRAGMA synchronous=OFF")
+    dst.execute("PRAGMA temp_store=MEMORY")
+    dst.execute("PRAGMA cache_size=-131072")  # ~128 MB page cache
+    dst.execute("PRAGMA busy_timeout=60000")
+    # Do NOT set locking_mode=EXCLUSIVE before ATTACH — that tries to
+    # exclusively lock the attached snapshot and deadlocks on Windows.
+    try:
+        with dst:
+            for stmt in schema_stmts:
+                try:
+                    dst.execute(stmt)
+                except sqlite3.Error as exc:
+                    if "already exists" not in str(exc).lower():
+                        raise
+
+            # ATTACH the snapshot by filesystem path. A file: URI here
+            # is treated as a literal filename because this connection
+            # is not opened with uri=True (Windows: "unable to open
+            # database: file:C:/...?mode=ro"). The snapshot is a
+            # private copy — not the live primary. Multiple workers may
+            # ATTACH the same snapshot read-only concurrently.
+            dst.execute(
+                "ATTACH DATABASE ? AS src",
+                (str(Path(src_path).resolve()),),
+            )
+            try:
+                for table, col in BY_DATE:
+                    if table not in src_tables:
+                        counts[table] = 0
+                        continue
+                    where = f" WHERE {date_predicate(col)}"
+                    counts[table] = _copy_via_attach(
+                        dst, src_path, table, where, (date,)
+                    )
+
+                pos_ids = (
+                    [
+                        str(r[0])
+                        for r in dst.execute(
+                            'SELECT position_id FROM "positions"'
+                        ).fetchall()
+                        if r[0]
+                    ]
+                    if table_exists(dst, "positions")
+                    else []
+                )
+
+                for table, key_col, _parent, _pk in BY_FK:
+                    if table not in src_tables:
+                        counts[table] = 0
+                        continue
+                    if not pos_ids:
+                        counts[table] = 0
+                        continue
+                    n = 0
+                    for i in range(0, len(pos_ids), 400):
+                        chunk = pos_ids[i:i + 400]
+                        q = ",".join("?" for _ in chunk)
+                        n += _copy_via_attach(
+                            dst,
+                            src_path,
+                            table,
+                            f' WHERE "{key_col}" IN ({q})',
+                            tuple(chunk),
+                        )
+                    counts[table] = n
+
+                if include_global:
+                    for table in GLOBAL:
+                        if table not in src_tables:
+                            counts[table] = 0
+                            continue
+                        counts[table] = _copy_via_attach(
+                            dst, src_path, table, "", ()
+                        )
+
+                # Previous-session last 1m candle (gap detection).
+                # Kept under its ORIGINAL trading_date so
+                # HistoricalStore.load_day's `trading_date < ?` finds it.
+                counts["intraday_candles:context"] = 0
+                if ctx.get("ctx_date") and table_exists(
+                    dst, "intraday_candles"
+                ):
+                    cols = table_columns(dst, "intraday_candles")
+                    colq = ", ".join(f'"{c}"' for c in cols)
+                    dst.execute(
+                        f'INSERT INTO "intraday_candles" ({colq}) '
+                        f'SELECT {colq} FROM src."intraday_candles" '
+                        f"WHERE substr(trading_date, 1, 10) = ? "
+                        f"AND interval_min = 1 AND candle_time = ? "
+                        f"LIMIT 1",
+                        (ctx["ctx_date"], ctx["ctx_time"]),
+                    )
+                    counts["intraday_candles:context"] = int(
+                        dst.execute("SELECT changes()").fetchone()[0] or 0
+                    )
+                    if counts["intraday_candles:context"] == 0:
+                        row = dst.execute(
+                            'SELECT * FROM src."intraday_candles" '
+                            "WHERE substr(trading_date,1,10) < ? "
+                            "AND interval_min = 1 "
+                            "ORDER BY trading_date DESC, candle_time DESC "
+                            "LIMIT 1",
+                            (date,),
+                        ).fetchone()
+                        if row is not None:
+                            ph = ", ".join("?" for _ in cols)
+                            dst.execute(
+                                f'INSERT INTO "intraday_candles" '
+                                f"({colq}) VALUES ({ph})",
+                                tuple(row[i] for i in range(len(cols))),
+                            )
+                            counts["intraday_candles:context"] = 1
+            finally:
+                try:
+                    dst.execute("DETACH DATABASE src")
+                except sqlite3.Error:
+                    pass
+
+            # Exclusive only on the temp shard after the snapshot is detached.
+            try:
+                dst.execute("PRAGMA locking_mode=EXCLUSIVE")
+            except sqlite3.Error:
+                pass
+
+        integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        # VACUUM is optional compaction — integrity already gates replace.
+        if integrity == "ok" and vacuum:
+            dst.execute("VACUUM")
+    finally:
+        dst.close()
 
     if integrity != "ok":
         remove_db_trio(tmp_path)
@@ -1175,6 +1192,14 @@ def main() -> int:
         # worker writes a unique temp file then atomically replaces its
         # own out_path; the shared snapshot is read-only.
         if rebuild_jobs and not args.verify_only:
+            # Drop the parent's RO handle on the snapshot before workers
+            # ATTACH it (same Windows lock class as src_ro+ATTACH in-process).
+            if src is not None:
+                try:
+                    src.close()
+                except Exception:
+                    pass
+                src = None
             workers = max(1, min(int(args.workers), len(rebuild_jobs)))
             print(
                 f"  Rebuilding {len(rebuild_jobs)} shard(s) with "
