@@ -1,0 +1,668 @@
+{
+ "ABSLPSE": {
+  "isin": "INF209KB19Z4",
+  "code": "152620",
+  "scheme": "Aditya Birla Sun Life Nifty PSE ETF",
+  "source": "amfi-isin"
+ },
+ "ALPHA": {
+  "isin": "INF174KA1IA5",
+  "code": "149397",
+  "scheme": "Kotak Nifty Alpha 50 ETF",
+  "source": "amfi-isin"
+ },
+ "ALPHAETF": {
+  "isin": "INF769K01KU7",
+  "code": "152134",
+  "scheme": "Mirae Asset Nifty 200 Alpha 30 ETF",
+  "source": "amfi-isin"
+ },
+ "ALPL30IETF": {
+  "isin": "INF109KC17V7",
+  "code": "148456",
+  "scheme": "ICICI Prudential Nifty Alpha Low- Volatility 30 ETF",
+  "source": "amfi-isin"
+ },
+ "AONETMMQ50": {
+  "isin": "INF1J2R01148",
+  "code": "153957",
+  "scheme": "ANGEL ONE NIFTY TOTAL MARKET MOMENTUM QUALITY 50 ETF",
+  "source": "amfi-isin"
+ },
+ "AONETOTAL": {
+  "isin": "INF1J2R01015",
+  "code": "153332",
+  "scheme": "ANGEL ONE NIFTY TOTAL MARKET ETF",
+  "source": "amfi-isin"
+ },
+ "AUTOIETF": {
+  "isin": "INF109KC10V2",
+  "code": "149463",
+  "scheme": "ICICI Prudential Nifty Auto ETF",
+  "source": "amfi-isin"
+ },
+ "BANK10ADD": {
+  "isin": "INF740KA1YH2",
+  "code": "154256",
+  "scheme": "DSP BSE Top 10 Banks ETF",
+  "source": "amfi-isin"
+ },
+ "BANKNIFTY1": {
+  "isin": "INF174KA1ZB7",
+  "code": "133122",
+  "scheme": "Kotak Nifty Bank ETF",
+  "source": "amfi-isin"
+ },
+ "BFSI": {
+  "isin": "INF769K01HI8",
+  "code": "149105",
+  "scheme": "Mirae Asset Nifty Financial Services ETF",
+  "source": "amfi-isin"
+ },
+ "CEMNTGROWW": {
+  "isin": "INF666M01PH7",
+  "code": "154476",
+  "scheme": "Groww Nifty Cements ETF",
+  "source": "amfi-isin"
+ },
+ "CHEMICAL": {
+  "isin": "INF174KA1XV0",
+  "code": "153934",
+  "scheme": "Kotak Nifty Chemicals ETF",
+  "source": "amfi-isin"
+ },
+ "COMMOIETF": {
+  "isin": "INF109KC19O8",
+  "code": "151207",
+  "scheme": "ICICI Prudential Nifty Commodities ETF",
+  "source": "amfi-isin"
+ },
+ "CONS": {
+  "isin": "INF174KA1ZF8",
+  "code": "150492",
+  "scheme": "Kotak Nifty India Consumption ETF",
+  "source": "amfi-isin"
+ },
+ "CONSUMER": {
+  "isin": "INF769K01NS5",
+  "code": "153191",
+  "scheme": "Mirae Asset Nifty India New Age Consumption ETF",
+  "source": "amfi-isin"
+ },
+ "CPSEETF": {
+  "isin": "INF457M01133",
+  "code": "140107",
+  "scheme": "CPSE ETF",
+  "source": "amfi-isin"
+ },
+ "DEFENCE": {
+  "isin": "INF769K01QC2",
+  "code": "154182",
+  "scheme": "Mirae Asset BSE India Defence ETF",
+  "source": "amfi-isin"
+ },
+ "DIVIDEND": {
+  "isin": "INF769K01PY8",
+  "code": "154061",
+  "scheme": "Mirae Asset BSE 500 Dividend Leaders 50 ETF",
+  "source": "amfi-isin"
+ },
+ "DIVOPPBEES": {
+  "isin": "INF204KA1MS3",
+  "code": "128639",
+  "scheme": "Nippon India ETF Nifty Dividend Opportunities 50",
+  "source": "amfi-isin"
+ },
+ "EBBETF0430": {
+  "isin": "INF754K01KO2",
+  "code": "147849",
+  "scheme": "Bharat Bond ETF - April 2030",
+  "source": "amfi-isin"
+ },
+ "ECAPINSURE": {
+  "isin": "INF754K01TX4",
+  "code": "153180",
+  "scheme": "Edelweiss BSE Capital Markets & Insurance ETF",
+  "source": "amfi-isin"
+ },
+ "ELM250": {
+  "isin": "INF754K01VV4",
+  "code": "153841",
+  "scheme": "Edelweiss Nifty LargeMidcap 250 ETF",
+  "source": "amfi-isin"
+ },
+ "EMULTIMQ": {
+  "isin": "INF754K01TF1",
+  "code": "152981",
+  "scheme": "Edelweiss Nifty500 Multicap Momentum Quality 50 ETF",
+  "source": "amfi-isin"
+ },
+ "EQUAL200": {
+  "isin": "INF769K01OA1",
+  "code": "153379",
+  "scheme": "Mirae Asset BSE 200 Equal Weight ETF",
+  "source": "amfi-isin"
+ },
+ "ESG": {
+  "isin": "INF769K01GS9",
+  "code": "148572",
+  "scheme": "Mirae Asset Nifty 100 ESG Sector Leaders ETF",
+  "source": "amfi-isin"
+ },
+ "EVINDIA": {
+  "isin": "INF769K01LQ3",
+  "code": "152715",
+  "scheme": "Mirae Asset Nifty EV and New Age Automotive ETF",
+  "source": "amfi-isin"
+ },
+ "FINIETF": {
+  "isin": "INF109KC17L8",
+  "code": "150879",
+  "scheme": "ICICI Prudential Nifty Financial Services Ex-Bank ETF",
+  "source": "amfi-isin"
+ },
+ "FLEXIADD": {
+  "isin": "INF740KA1WU9",
+  "code": "153874",
+  "scheme": "DSP Nifty500 Flexicap Quality 30 ETF",
+  "source": "amfi-isin"
+ },
+ "FMCGIETF": {
+  "isin": "INF109KC19V3",
+  "code": "149072",
+  "scheme": "ICICI Prudential Nifty FMCG ETF",
+  "source": "amfi-isin"
+ },
+ "GROWWHOSPI": {
+  "isin": "INF666M01OD9",
+  "code": "154199",
+  "scheme": "Groww BSE Hospitals ETF",
+  "source": "amfi-isin"
+ },
+ "GROWWLOVOL": {
+  "isin": "INF666M01LB9",
+  "code": "153583",
+  "scheme": "Groww Nifty 500 Low Volatility 50 ETF",
+  "source": "amfi-isin"
+ },
+ "GROWWN200": {
+  "isin": "INF666M01JV1",
+  "code": "153329",
+  "scheme": "Groww Nifty 200 ETF",
+  "source": "amfi-isin"
+ },
+ "GROWWNET": {
+  "isin": "INF666M01LI4",
+  "code": "153625",
+  "scheme": "Groww Nifty India Internet ETF",
+  "source": "amfi-isin"
+ },
+ "GROWWPOWER": {
+  "isin": "INF666M01LM6",
+  "code": "153744",
+  "scheme": "Groww BSE Power ETF",
+  "source": "amfi-isin"
+ },
+ "GROWWRAIL": {
+  "isin": "INF666M01JJ6",
+  "code": "153229",
+  "scheme": "Groww Nifty India Railways PSU ETF",
+  "source": "amfi-isin"
+ },
+ "HDFCBSE500": {
+  "isin": "INF179KC1EZ4",
+  "code": "151376",
+  "scheme": "HDFC BSE 500 ETF",
+  "source": "amfi-isin"
+ },
+ "HDFCGROWTH": {
+  "isin": "INF179KC1DJ0",
+  "code": "150621",
+  "scheme": "HDFC NIFTY GROWTH SECTORS 15 ETF",
+  "source": "amfi-isin"
+ },
+ "HDFCQUAL": {
+  "isin": "INF179KC1DL6",
+  "code": "150620",
+  "scheme": "HDFC NIFTY100 QUALITY 30 ETF",
+  "source": "amfi-isin"
+ },
+ "HDFCSENSEX": {
+  "isin": "INF179KC1HX2",
+  "code": "135854",
+  "scheme": "HDFC BSE Sensex ETF",
+  "source": "amfi-isin"
+ },
+ "HDFCSML250": {
+  "isin": "INF179KC1FB2",
+  "code": "151375",
+  "scheme": "HDFC NIFTY Smallcap 250 ETF",
+  "source": "amfi-isin"
+ },
+ "HEALTHCARE": {
+  "isin": "INF769K01QA6",
+  "code": "154169",
+  "scheme": "Mirae Asset Nifty 500 Healthcare ETF",
+  "source": "amfi-isin"
+ },
+ "HEALTHY": {
+  "isin": "INF209KB10C2",
+  "code": "149262",
+  "scheme": "Aditya Birla Sun Life Nifty Healthcare ETF",
+  "source": "amfi-isin"
+ },
+ "HNGSNGBEES": {
+  "isin": "INF204KB19I1",
+  "code": "140095",
+  "scheme": "Nippon India ETF Hang Seng BeES",
+  "source": "amfi-isin"
+ },
+ "HYBRIDETF": {
+  "isin": "INF769K01RJ5",
+  "code": "154497",
+  "scheme": "Mirae Asset Nifty200 Momentum 30 Plus 8-13 yr G-Sec 50:50 ETF",
+  "source": "amfi-isin"
+ },
+ "ICICIB22": {
+  "isin": "INF109KB15Y7",
+  "code": "141957",
+  "scheme": "BHARAT 22 ETF",
+  "source": "amfi-isin"
+ },
+ "INFRA": {
+  "isin": "INF769K01QB4",
+  "code": "154181",
+  "scheme": "Mirae Asset Nifty India Infrastructure & Logistics ETF",
+  "source": "amfi-isin"
+ },
+ "INFRAIETF": {
+  "isin": "INF109KC16E5",
+  "code": "150526",
+  "scheme": "ICICI Prudential Nifty Infrastructure ETF",
+  "source": "amfi-isin"
+ },
+ "INSUREIETF": {
+  "isin": "INF109K1A567",
+  "code": "154503",
+  "scheme": "ICICI Prudential BSE Insurance ETF",
+  "source": "amfi-isin"
+ },
+ "ITBEES": {
+  "isin": "INF204KB15V2",
+  "code": "148408",
+  "scheme": "Nippon India ETF Nifty IT",
+  "source": "amfi-isin"
+ },
+ "LARGEMID50": {
+  "isin": "INF769K01RK3",
+  "code": "154626",
+  "scheme": "Mirae Asset BSE LargeMid (60:40) Stable Dividend 50 ETF",
+  "source": "amfi-isin"
+ },
+ "LIQUIDCASE": {
+  "isin": "INF0R8F01034",
+  "code": "152327",
+  "scheme": "Zerodha Nifty 1D Rate Liquid ETF",
+  "source": "amfi-isin"
+ },
+ "LOWVOL1": {
+  "isin": "INF174KA1IY5",
+  "code": "150000",
+  "scheme": "Kotak Nifty 100 Low Volatility 30 ETF",
+  "source": "amfi-isin"
+ },
+ "LTGILTBEES": {
+  "isin": "INF204KB1882",
+  "code": "139496",
+  "scheme": "Nippon India ETF Nifty 8-13 yr G-Sec Long Term Gilt",
+  "source": "amfi-isin"
+ },
+ "MAFANG": {
+  "isin": "INF769K01HF4",
+  "code": "148927",
+  "scheme": "Mirae Asset NYSE FANG+ ETF",
+  "source": "amfi-isin"
+ },
+ "MAHKTECH": {
+  "isin": "INF769K01HS7",
+  "code": "149379",
+  "scheme": "Mirae Asset Hang Seng TECH ETF",
+  "source": "amfi-isin"
+ },
+ "MAKEINDIA": {
+  "isin": "INF769K01IB1",
+  "code": "149786",
+  "scheme": "Mirae Asset Nifty India Manufacturing ETF",
+  "source": "amfi-isin"
+ },
+ "MASPTOP50": {
+  "isin": "INF769K01HP3",
+  "code": "149169",
+  "scheme": "Mirae Asset S&P 500 Top 50 ETF",
+  "source": "amfi-isin"
+ },
+ "METALIETF": {
+  "isin": "INF109KC19W1",
+  "code": "152769",
+  "scheme": "ICICI Prudential Nifty Metal ETF",
+  "source": "amfi-isin"
+ },
+ "MIDBANKADD": {
+  "isin": "INF740KA1ZH9",
+  "code": "154528",
+  "scheme": "DSP BSE MidSmall Private Banks ETF",
+  "source": "amfi-isin"
+ },
+ "MIDCAP": {
+  "isin": "INF174KA1ZC5",
+  "code": "149757",
+  "scheme": "Kotak Nifty Midcap 50 ETF",
+  "source": "amfi-isin"
+ },
+ "MIDCAPETF": {
+  "isin": "INF769K01IC9",
+  "code": "149918",
+  "scheme": "Mirae Asset Nifty Midcap 150 ETF",
+  "source": "amfi-isin"
+ },
+ "MIDQ50ADD": {
+  "isin": "INF740KA1ZF3",
+  "code": "149403",
+  "scheme": "DSP Nifty Midcap 150 Quality 50 ETF",
+  "source": "amfi-isin"
+ },
+ "MIDSELIETF": {
+  "isin": "INF109KC10W0",
+  "code": "139519",
+  "scheme": "ICICI Prudential BSE Midcap Select ETF",
+  "source": "amfi-isin"
+ },
+ "MIDSMALL": {
+  "isin": "INF769K01LJ8",
+  "code": "152634",
+  "scheme": "Mirae Asset Nifty MidSmallcap400 Momentum Quality 100 ETF",
+  "source": "amfi-isin"
+ },
+ "MNC": {
+  "isin": "INF174KA1JF2",
+  "code": "150531",
+  "scheme": "Kotak Nifty MNC ETF",
+  "source": "amfi-isin"
+ },
+ "MOCAPITAL": {
+  "isin": "INF247L01EV3",
+  "code": "153406",
+  "scheme": "Motilal Oswal Nifty Capital Market ETF",
+  "source": "amfi-isin"
+ },
+ "MODEFENCE": {
+  "isin": "INF247L01DJ0",
+  "code": "152846",
+  "scheme": "Motilal Oswal Nifty India Defence ETF",
+  "source": "amfi-isin"
+ },
+ "MOENERGY": {
+  "isin": "INF247L01GH7",
+  "code": "153931",
+  "scheme": "Motilal Oswal Nifty Energy ETF",
+  "source": "amfi-isin"
+ },
+ "MOHEALTH": {
+  "isin": "INF247L01BB1",
+  "code": "150445",
+  "scheme": "Motilal Oswal BSE Healthcare ETF",
+  "source": "amfi-isin"
+ },
+ "MOINFRA": {
+  "isin": "INF247L01FL1",
+  "code": "153564",
+  "scheme": "Motilal Oswal BSE India Infrastructure ETF",
+  "source": "amfi-isin"
+ },
+ "MOM100": {
+  "isin": "INF247L01023",
+  "code": "114456",
+  "scheme": "Motilal Oswal Nifty Midcap 100 ETF",
+  "source": "amfi-isin"
+ },
+ "MOMENTUM30": {
+  "isin": "INF174KA1XS6",
+  "code": "153904",
+  "scheme": "Kotak Nifty 200 Momentum 30 ETF",
+  "source": "amfi-isin"
+ },
+ "MOMENTUM50": {
+  "isin": "INF247L01DK8",
+  "code": "152874",
+  "scheme": "Motilal Oswal Nifty 500 Momentum 50 ETF",
+  "source": "amfi-isin"
+ },
+ "MOMIDMTM": {
+  "isin": "INF247L01FQ0",
+  "code": "153694",
+  "scheme": "Motilal Oswal Nifty Midcap 150 Momentum 50 ETF",
+  "source": "amfi-isin"
+ },
+ "MOMMIDCAP": {
+  "isin": "INF769K01RC0",
+  "code": "154471",
+  "scheme": "Mirae Asset BSE Midcap 150 Momentum 30 ETF",
+  "source": "amfi-isin"
+ },
+ "MON100": {
+  "isin": "INF247L01AP3",
+  "code": "114984",
+  "scheme": "Motilal Oswal Nasdaq 100 ETF",
+  "source": "amfi-isin"
+ },
+ "MONIFTY500": {
+  "isin": "INF247L01BU1",
+  "code": "152106",
+  "scheme": "Motilal Oswal Nifty 500 ETF",
+  "source": "amfi-isin"
+ },
+ "MONQ50": {
+  "isin": "INF247L01AU3",
+  "code": "149438",
+  "scheme": "Motilal Oswal Nasdaq Q50 ETF",
+  "source": "amfi-isin"
+ },
+ "MOQUALITY": {
+  "isin": "INF247L01BH8",
+  "code": "150520",
+  "scheme": "Motilal Oswal BSE Quality ETF",
+  "source": "amfi-isin"
+ },
+ "MOREALTY": {
+  "isin": "INF247L01CI4",
+  "code": "152541",
+  "scheme": "Motilal Oswal Nifty Realty ETF",
+  "source": "amfi-isin"
+ },
+ "MOSERVICE": {
+  "isin": "INF247L01GJ3",
+  "code": "154033",
+  "scheme": "Motilal Oswal Nifty Services Sector ETF",
+  "source": "amfi-isin"
+ },
+ "MOTOUR": {
+  "isin": "INF247L01FP2",
+  "code": "153618",
+  "scheme": "Motilal Oswal Nifty India Tourism ETF",
+  "source": "amfi-isin"
+ },
+ "MOVALUE": {
+  "isin": "INF247L01BE5",
+  "code": "150517",
+  "scheme": "Motilal Oswal BSE Enhanced Value ETF",
+  "source": "amfi-isin"
+ },
+ "MSCI360": {
+  "isin": "INF579M01BP5",
+  "code": "154366",
+  "scheme": "360 ONE MSCI India ETF",
+  "source": "amfi-isin"
+ },
+ "MULTICAP": {
+  "isin": "INF769K01LX9",
+  "code": "152811",
+  "scheme": "Mirae Asset Nifty500 Multicap 50:25:25 ETF",
+  "source": "amfi-isin"
+ },
+ "NEXT50IETF": {
+  "isin": "INF109KC1NS5",
+  "code": "144587",
+  "scheme": "ICICI Prudential Nifty Next 50 ETF",
+  "source": "amfi-isin"
+ },
+ "NIFTY100EW": {
+  "isin": "INF174KA1UW4",
+  "code": "153315",
+  "scheme": "Kotak Nifty 100 Equal Weight ETF",
+  "source": "amfi-isin"
+ },
+ "NIFTYBEES": {
+  "isin": "INF204KB14I2",
+  "code": "140084",
+  "scheme": "Nippon India ETF Nifty 50 BeES",
+  "source": "amfi-isin"
+ },
+ "NIFTYQLITY": {
+  "isin": "INF209KB15K4",
+  "code": "150497",
+  "scheme": "Aditya Birla Sun Life Nifty 200 Quality 30 ETF",
+  "source": "amfi-isin"
+ },
+ "NV20IETF": {
+  "isin": "INF109KC11V0",
+  "code": "139455",
+  "scheme": "ICICI Prudential Nifty50 Value 20 ETF",
+  "source": "amfi-isin"
+ },
+ "NXT100CASE": {
+  "isin": "INF0R8F01257",
+  "code": "154764",
+  "scheme": "Zerodha Nifty Next 100 ETF",
+  "source": "amfi-isin"
+ },
+ "OILIETF": {
+  "isin": "INF109KC18W3",
+  "code": "152748",
+  "scheme": "ICICI Prudential Nifty Oil & Gas ETF",
+  "source": "amfi-isin"
+ },
+ "PHARMABEES": {
+  "isin": "INF204KC1089",
+  "code": "149008",
+  "scheme": "Nippon India Nifty Pharma ETF",
+  "source": "amfi-isin"
+ },
+ "PSUBANKADD": {
+  "isin": "INF740KA1SY9",
+  "code": "151888",
+  "scheme": "DSP Nifty PSU Bank ETF",
+  "source": "amfi-isin"
+ },
+ "PVTBANIETF": {
+  "isin": "INF109KC18U7",
+  "code": "147530",
+  "scheme": "ICICI Prudential Nifty Private Bank ETF",
+  "source": "amfi-isin"
+ },
+ "SBIBPB": {
+  "isin": "INF200KB1712",
+  "code": "153435",
+  "scheme": "SBI BSE PSU BANK ETF",
+  "source": "amfi-isin"
+ },
+ "SBINEQWETF": {
+  "isin": "INF200KB1282",
+  "code": "152749",
+  "scheme": "SBI Nifty50 Equal Weight ETF",
+  "source": "amfi-isin"
+ },
+ "SECLEDBETA": {
+  "isin": "INF789F1AH42",
+  "code": "154698",
+  "scheme": "UTI BSE India Sector Leaders Exchange Traded Fund",
+  "source": "amfi-isin"
+ },
+ "SELECTIPO": {
+  "isin": "INF769K01ON4",
+  "code": "153384",
+  "scheme": "Mirae Asset BSE Select IPO ETF",
+  "source": "amfi-isin"
+ },
+ "SHARIABEES": {
+  "isin": "INF732E01128",
+  "code": "140094",
+  "scheme": "Nippon India ETF Nifty 50 Shariah BeES",
+  "source": "amfi-isin"
+ },
+ "SMALLCAP": {
+  "isin": "INF769K01LC3",
+  "code": "152455",
+  "scheme": "Mirae Asset Nifty Smallcap 250 Momentum Quality 100 ETF",
+  "source": "amfi-isin"
+ },
+ "SML100CASE": {
+  "isin": "INF0R8F01141",
+  "code": "153837",
+  "scheme": "Zerodha Nifty Smallcap 100 ETF",
+  "source": "amfi-isin"
+ },
+ "SNXT30BEES": {
+  "isin": "INF204KC1EZ3",
+  "code": "153569",
+  "scheme": "Nippon India BSE Sensex Next 30 ETF",
+  "source": "amfi-isin"
+ },
+ "TATAGOLD": {
+  "isin": "INF277KA1976",
+  "code": "152284",
+  "scheme": "Tata Gold Exchange Traded Fund",
+  "source": "amfi-isin"
+ },
+ "TATSILV": {
+  "isin": "INF277KA1984",
+  "code": "152285",
+  "scheme": "Tata Silver Exchange Traded Fund",
+  "source": "amfi-isin"
+ },
+ "TOP100CASE": {
+  "isin": "INF0R8F01067",
+  "code": "152667",
+  "scheme": "Zerodha Nifty 100 ETF",
+  "source": "amfi-isin"
+ },
+ "TOP10ADD": {
+  "isin": "INF740KA1UR9",
+  "code": "152812",
+  "scheme": "DSP Nifty Top 10 Equal Weight ETF",
+  "source": "amfi-isin"
+ },
+ "TOP15IETF": {
+  "isin": "INF109K1A344",
+  "code": "153617",
+  "scheme": "ICICI Prudential Nifty Top 15 Equal Weight ETF",
+  "source": "amfi-isin"
+ },
+ "TOP20": {
+  "isin": "INF769K01PZ5",
+  "code": "154060",
+  "scheme": "Mirae Asset Nifty Top 20 Equal Weight ETF",
+  "source": "amfi-isin"
+ },
+ "VAL30IETF": {
+  "isin": "INF109KC16X5",
+  "code": "152932",
+  "scheme": "ICICI Prudential Nifty200 Value 30 ETF",
+  "source": "amfi-isin"
+ },
+ "VALUE": {
+  "isin": "INF769K01QV2",
+  "code": "154299",
+  "scheme": "Mirae Asset Nifty 500 Value 50 ETF",
+  "source": "amfi-isin"
+ }
+}

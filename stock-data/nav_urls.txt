@@ -1,0 +1,115 @@
+# Direct NAV URLs for all 111 tracked ETFs — built 28-Oct-2026 from the AMFI
+# snapshot you provided (ISIN-matched, no guessing). mfapi returns JSON;
+# 'history' = full daily NAV series, 'latest' = just today's NAV.
+# FORMAT: ETF SYMBOL ; SCHEME CODE ; ISIN ; SCHEME NAME ; HISTORY URL ; LATEST URL
+ABSLPSE;152620;INF209KB19Z4;Aditya Birla Sun Life Nifty PSE ETF;https://api.mfapi.in/mf/152620;https://api.mfapi.in/mf/152620/latest
+ALPHA;149397;INF174KA1IA5;Kotak Nifty Alpha 50 ETF;https://api.mfapi.in/mf/149397;https://api.mfapi.in/mf/149397/latest
+ALPHAETF;152134;INF769K01KU7;Mirae Asset Nifty 200 Alpha 30 ETF;https://api.mfapi.in/mf/152134;https://api.mfapi.in/mf/152134/latest
+ALPL30IETF;148456;INF109KC17V7;ICICI Prudential Nifty Alpha Low- Volatility 30 ETF;https://api.mfapi.in/mf/148456;https://api.mfapi.in/mf/148456/latest
+AONETMMQ50;153957;INF1J2R01148;ANGEL ONE NIFTY TOTAL MARKET MOMENTUM QUALITY 50 ETF;https://api.mfapi.in/mf/153957;https://api.mfapi.in/mf/153957/latest
+AONETOTAL;153332;INF1J2R01015;ANGEL ONE NIFTY TOTAL MARKET ETF;https://api.mfapi.in/mf/153332;https://api.mfapi.in/mf/153332/latest
+AUTOIETF;149463;INF109KC10V2;ICICI Prudential Nifty Auto ETF;https://api.mfapi.in/mf/149463;https://api.mfapi.in/mf/149463/latest
+BANK10ADD;154256;INF740KA1YH2;DSP BSE Top 10 Banks ETF;https://api.mfapi.in/mf/154256;https://api.mfapi.in/mf/154256/latest
+BANKNIFTY1;133122;INF174KA1ZB7;Kotak Nifty Bank ETF;https://api.mfapi.in/mf/133122;https://api.mfapi.in/mf/133122/latest
+BFSI;149105;INF769K01HI8;Mirae Asset Nifty Financial Services ETF;https://api.mfapi.in/mf/149105;https://api.mfapi.in/mf/149105/latest
+CEMNTGROWW;154476;INF666M01PH7;Groww Nifty Cements ETF;https://api.mfapi.in/mf/154476;https://api.mfapi.in/mf/154476/latest
+CHEMICAL;153934;INF174KA1XV0;Kotak Nifty Chemicals ETF;https://api.mfapi.in/mf/153934;https://api.mfapi.in/mf/153934/latest
+COMMOIETF;151207;INF109KC19O8;ICICI Prudential Nifty Commodities ETF;https://api.mfapi.in/mf/151207;https://api.mfapi.in/mf/151207/latest
+CONS;150492;INF174KA1ZF8;Kotak Nifty India Consumption ETF;https://api.mfapi.in/mf/150492;https://api.mfapi.in/mf/150492/latest
+CONSUMER;153191;INF769K01NS5;Mirae Asset Nifty India New Age Consumption ETF;https://api.mfapi.in/mf/153191;https://api.mfapi.in/mf/153191/latest
+CPSEETF;140107;INF457M01133;CPSE ETF;https://api.mfapi.in/mf/140107;https://api.mfapi.in/mf/140107/latest
+DEFENCE;154182;INF769K01QC2;Mirae Asset BSE India Defence ETF;https://api.mfapi.in/mf/154182;https://api.mfapi.in/mf/154182/latest
+DIVIDEND;154061;INF769K01PY8;Mirae Asset BSE 500 Dividend Leaders 50 ETF;https://api.mfapi.in/mf/154061;https://api.mfapi.in/mf/154061/latest
+DIVOPPBEES;128639;INF204KA1MS3;Nippon India ETF Nifty Dividend Opportunities 50;https://api.mfapi.in/mf/128639;https://api.mfapi.in/mf/128639/latest
+EBBETF0430;147849;INF754K01KO2;Bharat Bond ETF - April 2030;https://api.mfapi.in/mf/147849;https://api.mfapi.in/mf/147849/latest
+ECAPINSURE;153180;INF754K01TX4;Edelweiss BSE Capital Markets & Insurance ETF;https://api.mfapi.in/mf/153180;https://api.mfapi.in/mf/153180/latest
+ELM250;153841;INF754K01VV4;Edelweiss Nifty LargeMidcap 250 ETF;https://api.mfapi.in/mf/153841;https://api.mfapi.in/mf/153841/latest
+EMULTIMQ;152981;INF754K01TF1;Edelweiss Nifty500 Multicap Momentum Quality 50 ETF;https://api.mfapi.in/mf/152981;https://api.mfapi.in/mf/152981/latest
+EQUAL200;153379;INF769K01OA1;Mirae Asset BSE 200 Equal Weight ETF;https://api.mfapi.in/mf/153379;https://api.mfapi.in/mf/153379/latest
+ESG;148572;INF769K01GS9;Mirae Asset Nifty 100 ESG Sector Leaders ETF;https://api.mfapi.in/mf/148572;https://api.mfapi.in/mf/148572/latest
+EVINDIA;152715;INF769K01LQ3;Mirae Asset Nifty EV and New Age Automotive ETF;https://api.mfapi.in/mf/152715;https://api.mfapi.in/mf/152715/latest
+FINIETF;150879;INF109KC17L8;ICICI Prudential Nifty Financial Services Ex-Bank ETF;https://api.mfapi.in/mf/150879;https://api.mfapi.in/mf/150879/latest
+FLEXIADD;153874;INF740KA1WU9;DSP Nifty500 Flexicap Quality 30 ETF;https://api.mfapi.in/mf/153874;https://api.mfapi.in/mf/153874/latest
+FMCGIETF;149072;INF109KC19V3;ICICI Prudential Nifty FMCG ETF;https://api.mfapi.in/mf/149072;https://api.mfapi.in/mf/149072/latest
+GROWWHOSPI;154199;INF666M01OD9;Groww BSE Hospitals ETF;https://api.mfapi.in/mf/154199;https://api.mfapi.in/mf/154199/latest
+GROWWLOVOL;153583;INF666M01LB9;Groww Nifty 500 Low Volatility 50 ETF;https://api.mfapi.in/mf/153583;https://api.mfapi.in/mf/153583/latest
+GROWWN200;153329;INF666M01JV1;Groww Nifty 200 ETF;https://api.mfapi.in/mf/153329;https://api.mfapi.in/mf/153329/latest
+GROWWNET;153625;INF666M01LI4;Groww Nifty India Internet ETF;https://api.mfapi.in/mf/153625;https://api.mfapi.in/mf/153625/latest
+GROWWPOWER;153744;INF666M01LM6;Groww BSE Power ETF;https://api.mfapi.in/mf/153744;https://api.mfapi.in/mf/153744/latest
+GROWWRAIL;153229;INF666M01JJ6;Groww Nifty India Railways PSU ETF;https://api.mfapi.in/mf/153229;https://api.mfapi.in/mf/153229/latest
+HDFCBSE500;151376;INF179KC1EZ4;HDFC BSE 500 ETF;https://api.mfapi.in/mf/151376;https://api.mfapi.in/mf/151376/latest
+HDFCGROWTH;150621;INF179KC1DJ0;HDFC NIFTY GROWTH SECTORS 15 ETF;https://api.mfapi.in/mf/150621;https://api.mfapi.in/mf/150621/latest
+HDFCQUAL;150620;INF179KC1DL6;HDFC NIFTY100 QUALITY 30 ETF;https://api.mfapi.in/mf/150620;https://api.mfapi.in/mf/150620/latest
+HDFCSENSEX;135854;INF179KC1HX2;HDFC BSE Sensex ETF;https://api.mfapi.in/mf/135854;https://api.mfapi.in/mf/135854/latest
+HDFCSML250;151375;INF179KC1FB2;HDFC NIFTY Smallcap 250 ETF;https://api.mfapi.in/mf/151375;https://api.mfapi.in/mf/151375/latest
+HEALTHCARE;154169;INF769K01QA6;Mirae Asset Nifty 500 Healthcare ETF;https://api.mfapi.in/mf/154169;https://api.mfapi.in/mf/154169/latest
+HEALTHY;149262;INF209KB10C2;Aditya Birla Sun Life Nifty Healthcare ETF;https://api.mfapi.in/mf/149262;https://api.mfapi.in/mf/149262/latest
+HNGSNGBEES;140095;INF204KB19I1;Nippon India ETF Hang Seng BeES;https://api.mfapi.in/mf/140095;https://api.mfapi.in/mf/140095/latest
+HYBRIDETF;154497;INF769K01RJ5;Mirae Asset Nifty200 Momentum 30 Plus 8-13 yr G-Sec 50:50 ETF;https://api.mfapi.in/mf/154497;https://api.mfapi.in/mf/154497/latest
+ICICIB22;141957;INF109KB15Y7;BHARAT 22 ETF;https://api.mfapi.in/mf/141957;https://api.mfapi.in/mf/141957/latest
+INFRA;154181;INF769K01QB4;Mirae Asset Nifty India Infrastructure & Logistics ETF;https://api.mfapi.in/mf/154181;https://api.mfapi.in/mf/154181/latest
+INFRAIETF;150526;INF109KC16E5;ICICI Prudential Nifty Infrastructure ETF;https://api.mfapi.in/mf/150526;https://api.mfapi.in/mf/150526/latest
+INSUREIETF;154503;INF109K1A567;ICICI Prudential BSE Insurance ETF;https://api.mfapi.in/mf/154503;https://api.mfapi.in/mf/154503/latest
+ITBEES;148408;INF204KB15V2;Nippon India ETF Nifty IT;https://api.mfapi.in/mf/148408;https://api.mfapi.in/mf/148408/latest
+LARGEMID50;154626;INF769K01RK3;Mirae Asset BSE LargeMid (60:40) Stable Dividend 50 ETF;https://api.mfapi.in/mf/154626;https://api.mfapi.in/mf/154626/latest
+LIQUIDCASE;152327;INF0R8F01034;Zerodha Nifty 1D Rate Liquid ETF;https://api.mfapi.in/mf/152327;https://api.mfapi.in/mf/152327/latest
+LOWVOL1;150000;INF174KA1IY5;Kotak Nifty 100 Low Volatility 30 ETF;https://api.mfapi.in/mf/150000;https://api.mfapi.in/mf/150000/latest
+LTGILTBEES;139496;INF204KB1882;Nippon India ETF Nifty 8-13 yr G-Sec Long Term Gilt;https://api.mfapi.in/mf/139496;https://api.mfapi.in/mf/139496/latest
+MAFANG;148927;INF769K01HF4;Mirae Asset NYSE FANG+ ETF;https://api.mfapi.in/mf/148927;https://api.mfapi.in/mf/148927/latest
+MAHKTECH;149379;INF769K01HS7;Mirae Asset Hang Seng TECH ETF;https://api.mfapi.in/mf/149379;https://api.mfapi.in/mf/149379/latest
+MAKEINDIA;149786;INF769K01IB1;Mirae Asset Nifty India Manufacturing ETF;https://api.mfapi.in/mf/149786;https://api.mfapi.in/mf/149786/latest
+MASPTOP50;149169;INF769K01HP3;Mirae Asset S&P 500 Top 50 ETF;https://api.mfapi.in/mf/149169;https://api.mfapi.in/mf/149169/latest
+METALIETF;152769;INF109KC19W1;ICICI Prudential Nifty Metal ETF;https://api.mfapi.in/mf/152769;https://api.mfapi.in/mf/152769/latest
+MIDBANKADD;154528;INF740KA1ZH9;DSP BSE MidSmall Private Banks ETF;https://api.mfapi.in/mf/154528;https://api.mfapi.in/mf/154528/latest
+MIDCAP;149757;INF174KA1ZC5;Kotak Nifty Midcap 50 ETF;https://api.mfapi.in/mf/149757;https://api.mfapi.in/mf/149757/latest
+MIDCAPETF;149918;INF769K01IC9;Mirae Asset Nifty Midcap 150 ETF;https://api.mfapi.in/mf/149918;https://api.mfapi.in/mf/149918/latest
+MIDQ50ADD;149403;INF740KA1ZF3;DSP Nifty Midcap 150 Quality 50 ETF;https://api.mfapi.in/mf/149403;https://api.mfapi.in/mf/149403/latest
+MIDSELIETF;139519;INF109KC10W0;ICICI Prudential BSE Midcap Select ETF;https://api.mfapi.in/mf/139519;https://api.mfapi.in/mf/139519/latest
+MIDSMALL;152634;INF769K01LJ8;Mirae Asset Nifty MidSmallcap400 Momentum Quality 100 ETF;https://api.mfapi.in/mf/152634;https://api.mfapi.in/mf/152634/latest
+MNC;150531;INF174KA1JF2;Kotak Nifty MNC ETF;https://api.mfapi.in/mf/150531;https://api.mfapi.in/mf/150531/latest
+MOCAPITAL;153406;INF247L01EV3;Motilal Oswal Nifty Capital Market ETF;https://api.mfapi.in/mf/153406;https://api.mfapi.in/mf/153406/latest
+MODEFENCE;152846;INF247L01DJ0;Motilal Oswal Nifty India Defence ETF;https://api.mfapi.in/mf/152846;https://api.mfapi.in/mf/152846/latest
+MOENERGY;153931;INF247L01GH7;Motilal Oswal Nifty Energy ETF;https://api.mfapi.in/mf/153931;https://api.mfapi.in/mf/153931/latest
+MOHEALTH;150445;INF247L01BB1;Motilal Oswal BSE Healthcare ETF;https://api.mfapi.in/mf/150445;https://api.mfapi.in/mf/150445/latest
+MOINFRA;153564;INF247L01FL1;Motilal Oswal BSE India Infrastructure ETF;https://api.mfapi.in/mf/153564;https://api.mfapi.in/mf/153564/latest
+MOM100;114456;INF247L01023;Motilal Oswal Nifty Midcap 100 ETF;https://api.mfapi.in/mf/114456;https://api.mfapi.in/mf/114456/latest
+MOMENTUM30;153904;INF174KA1XS6;Kotak Nifty 200 Momentum 30 ETF;https://api.mfapi.in/mf/153904;https://api.mfapi.in/mf/153904/latest
+MOMENTUM50;152874;INF247L01DK8;Motilal Oswal Nifty 500 Momentum 50 ETF;https://api.mfapi.in/mf/152874;https://api.mfapi.in/mf/152874/latest
+MOMIDMTM;153694;INF247L01FQ0;Motilal Oswal Nifty Midcap 150 Momentum 50 ETF;https://api.mfapi.in/mf/153694;https://api.mfapi.in/mf/153694/latest
+MOMMIDCAP;154471;INF769K01RC0;Mirae Asset BSE Midcap 150 Momentum 30 ETF;https://api.mfapi.in/mf/154471;https://api.mfapi.in/mf/154471/latest
+MON100;114984;INF247L01AP3;Motilal Oswal Nasdaq 100 ETF;https://api.mfapi.in/mf/114984;https://api.mfapi.in/mf/114984/latest
+MONIFTY500;152106;INF247L01BU1;Motilal Oswal Nifty 500 ETF;https://api.mfapi.in/mf/152106;https://api.mfapi.in/mf/152106/latest
+MONQ50;149438;INF247L01AU3;Motilal Oswal Nasdaq Q50 ETF;https://api.mfapi.in/mf/149438;https://api.mfapi.in/mf/149438/latest
+MOQUALITY;150520;INF247L01BH8;Motilal Oswal BSE Quality ETF;https://api.mfapi.in/mf/150520;https://api.mfapi.in/mf/150520/latest
+MOREALTY;152541;INF247L01CI4;Motilal Oswal Nifty Realty ETF;https://api.mfapi.in/mf/152541;https://api.mfapi.in/mf/152541/latest
+MOSERVICE;154033;INF247L01GJ3;Motilal Oswal Nifty Services Sector ETF;https://api.mfapi.in/mf/154033;https://api.mfapi.in/mf/154033/latest
+MOTOUR;153618;INF247L01FP2;Motilal Oswal Nifty India Tourism ETF;https://api.mfapi.in/mf/153618;https://api.mfapi.in/mf/153618/latest
+MOVALUE;150517;INF247L01BE5;Motilal Oswal BSE Enhanced Value ETF;https://api.mfapi.in/mf/150517;https://api.mfapi.in/mf/150517/latest
+MSCI360;154366;INF579M01BP5;360 ONE MSCI India ETF;https://api.mfapi.in/mf/154366;https://api.mfapi.in/mf/154366/latest
+MULTICAP;152811;INF769K01LX9;Mirae Asset Nifty500 Multicap 50:25:25 ETF;https://api.mfapi.in/mf/152811;https://api.mfapi.in/mf/152811/latest
+NEXT50IETF;144587;INF109KC1NS5;ICICI Prudential Nifty Next 50 ETF;https://api.mfapi.in/mf/144587;https://api.mfapi.in/mf/144587/latest
+NIFTY100EW;153315;INF174KA1UW4;Kotak Nifty 100 Equal Weight ETF;https://api.mfapi.in/mf/153315;https://api.mfapi.in/mf/153315/latest
+NIFTYBEES;140084;INF204KB14I2;Nippon India ETF Nifty 50 BeES;https://api.mfapi.in/mf/140084;https://api.mfapi.in/mf/140084/latest
+NIFTYQLITY;150497;INF209KB15K4;Aditya Birla Sun Life Nifty 200 Quality 30 ETF;https://api.mfapi.in/mf/150497;https://api.mfapi.in/mf/150497/latest
+NV20IETF;139455;INF109KC11V0;ICICI Prudential Nifty50 Value 20 ETF;https://api.mfapi.in/mf/139455;https://api.mfapi.in/mf/139455/latest
+NXT100CASE;154764;INF0R8F01257;Zerodha Nifty Next 100 ETF;https://api.mfapi.in/mf/154764;https://api.mfapi.in/mf/154764/latest
+OILIETF;152748;INF109KC18W3;ICICI Prudential Nifty Oil & Gas ETF;https://api.mfapi.in/mf/152748;https://api.mfapi.in/mf/152748/latest
+PHARMABEES;149008;INF204KC1089;Nippon India Nifty Pharma ETF;https://api.mfapi.in/mf/149008;https://api.mfapi.in/mf/149008/latest
+PSUBANKADD;151888;INF740KA1SY9;DSP Nifty PSU Bank ETF;https://api.mfapi.in/mf/151888;https://api.mfapi.in/mf/151888/latest
+PVTBANIETF;147530;INF109KC18U7;ICICI Prudential Nifty Private Bank ETF;https://api.mfapi.in/mf/147530;https://api.mfapi.in/mf/147530/latest
+SBIBPB;153435;INF200KB1712;SBI BSE PSU BANK ETF;https://api.mfapi.in/mf/153435;https://api.mfapi.in/mf/153435/latest
+SBINEQWETF;152749;INF200KB1282;SBI Nifty50 Equal Weight ETF;https://api.mfapi.in/mf/152749;https://api.mfapi.in/mf/152749/latest
+SECLEDBETA;154698;INF789F1AH42;UTI BSE India Sector Leaders Exchange Traded Fund;https://api.mfapi.in/mf/154698;https://api.mfapi.in/mf/154698/latest
+SELECTIPO;153384;INF769K01ON4;Mirae Asset BSE Select IPO ETF;https://api.mfapi.in/mf/153384;https://api.mfapi.in/mf/153384/latest
+SHARIABEES;140094;INF732E01128;Nippon India ETF Nifty 50 Shariah BeES;https://api.mfapi.in/mf/140094;https://api.mfapi.in/mf/140094/latest
+SMALLCAP;152455;INF769K01LC3;Mirae Asset Nifty Smallcap 250 Momentum Quality 100 ETF;https://api.mfapi.in/mf/152455;https://api.mfapi.in/mf/152455/latest
+SML100CASE;153837;INF0R8F01141;Zerodha Nifty Smallcap 100 ETF;https://api.mfapi.in/mf/153837;https://api.mfapi.in/mf/153837/latest
+SNXT30BEES;153569;INF204KC1EZ3;Nippon India BSE Sensex Next 30 ETF;https://api.mfapi.in/mf/153569;https://api.mfapi.in/mf/153569/latest
+TATAGOLD;152284;INF277KA1976;Tata Gold Exchange Traded Fund;https://api.mfapi.in/mf/152284;https://api.mfapi.in/mf/152284/latest
+TATSILV;152285;INF277KA1984;Tata Silver Exchange Traded Fund;https://api.mfapi.in/mf/152285;https://api.mfapi.in/mf/152285/latest
+TOP100CASE;152667;INF0R8F01067;Zerodha Nifty 100 ETF;https://api.mfapi.in/mf/152667;https://api.mfapi.in/mf/152667/latest
+TOP10ADD;152812;INF740KA1UR9;DSP Nifty Top 10 Equal Weight ETF;https://api.mfapi.in/mf/152812;https://api.mfapi.in/mf/152812/latest
+TOP15IETF;153617;INF109K1A344;ICICI Prudential Nifty Top 15 Equal Weight ETF;https://api.mfapi.in/mf/153617;https://api.mfapi.in/mf/153617/latest
+TOP20;154060;INF769K01PZ5;Mirae Asset Nifty Top 20 Equal Weight ETF;https://api.mfapi.in/mf/154060;https://api.mfapi.in/mf/154060/latest
+VAL30IETF;152932;INF109KC16X5;ICICI Prudential Nifty200 Value 30 ETF;https://api.mfapi.in/mf/152932;https://api.mfapi.in/mf/152932/latest
+VALUE;154299;INF769K01QV2;Mirae Asset Nifty 500 Value 50 ETF;https://api.mfapi.in/mf/154299;https://api.mfapi.in/mf/154299/latest
