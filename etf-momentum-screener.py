@@ -251,7 +251,7 @@ REPORT_DIR = DATA_DIR / "reports"
 ENV_PATH = BASE_DIR / "env.txt"
 
 # --- Trading mode -------------------------------------------------------------
-PAPER_TRADE = True                 # PAPER BY DEFAULT (user direction 2026-10-28,
+PAPER_TRADE = False                 # PAPER BY DEFAULT (user direction 2026-10-28,
                                    #   reversing the same morning's live-by-default):
                                    #   True = every run SIMULATES orders (no real
                                    #   money).  Real trading needs BOTH steps:
@@ -275,7 +275,7 @@ LIVE_CASH_SLEEVE = True            # audit v5 #4 (2026-10-28, user said apply):
                                    #   had this).  Sleeve sells happen only to FUND
                                    #   real buys.  Set False to opt out (a plain
                                    #   note about idle cash is printed instead).
-STARTING_CAPITAL = 1000000.0       # Rs 10 lakh paper capital
+STARTING_CAPITAL = 10000   # Rs 10 lakh paper capital
 
 # --- Signal parameters (Step 2/3) ---------------------------------------------
 LOOKBACK = 252                     # momentum lookback in trading sessions
