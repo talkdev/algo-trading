@@ -261,8 +261,9 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 
 ---
 
-*Last updated: audit v17, 30-Oct-2026 (USER DIRECTION: the bot now owns ONLY the ETFs it bought itself + the STARTING_CAPITAL you assign it. Idle-cash parking REMOVED — no sweep ever again; your broker balance is a ceiling, never the ledger; every other holding is read-only; risk peak re-based to the bot's own book; reconcile compares only its own symbols. Rows 149-153, actions 117-118. Selftest count: 137.*
+*Last updated: audit v17, 30-Oct-2026 (USER DIRECTION: the bot now owns ONLY the ETFs it bought itself + the STARTING_CAPITAL you assign it. Idle-cash parking REMOVED — no sweep ever again; your broker balance is a ceiling, never the ledger; every other holding is read-only; risk peak re-based to the bot's own book; reconcile compares only its own symbols. Rows 149-153, actions 117-119. Selftest count: 137.*
 
 *Previous: audit v16, 30-Oct-2026 (T+1 settlement gaps in the broker feed stopped deleting same-day positions/re-fabricating a crash; 'safe to re-run' is now conditional; status flags drawdown-vs-state contradictions with timestamps; sleeve parking split out of all money-spent panels; sleeve sweep uses the live quote; per-line small-fill reasons; history-cap noted in coverage. Rows 145-148, actions 115-116. Selftest count: 135.*
 
 *Previous: audit v15, 30-Oct-2026 (SIP orphan-sell of own picks fixed; failed exits keep the signal open; sub-minimum budget honest + loud; EDIS loud explainer; plan-lag warning; rotation labels. Rows 139-144, actions 113-114. Selftest count: 131.*
+| 119 | **Do not manually top up an ETF the bot already owns** (e.g. adding more SML100CASE in the Upstox app). The broker shows one position per symbol, so the bot cannot tell your extra units from its own and will manage/sell the whole lot. Manual buys are safe in any ETF the bot does NOT own — those are ignored entirely. If you did top one up, sell the bot's share or tell me and I'll add a per-symbol quantity rule. |
