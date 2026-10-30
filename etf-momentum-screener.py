@@ -101,9 +101,10 @@
      1. Month-end check says the trend is gone: the 12-month gain slipped to
         0 or below, OR the price fell under its 200-day average, OR the ETF
         dropped out of the top 5, OR its data looks broken.  Sold fully.
-     2. Safety rules can fire ANY day, not just month-end: portfolio −10% from
-        its peak warns, −15% sells half of every holding, −20% sells
-        everything.  These beat the calendar by design.
+    2. Safety rules can fire ANY day, not just month-end: portfolio −15% from
+       its peak warns (review), −22.5% sells half of every holding, −30%
+       sells everything.  These beat the calendar by design.  (The levels are
+       1x / 1.5x / 2x the 15% volatility target — edit VOL_TARGET to retune.)
      3. Small sells may wait up to a month if the holding is about to turn
         1 year old (much lower tax on the profit) — the script says so when
         it waits.
@@ -512,6 +513,16 @@ NAV_SCHEME_CODES = {  # symbol: mfapi scheme code (AMFI-verified, 27-Oct-2026)
 NAV_CALL_SLEEP_SEC = 1.2         # throttle between per-scheme calls (429 storms)
 NAV_MAX_429 = 3                  # consecutive HTTP 429s -> stop hammering the mirror
 
+# audit v13 #1 (2026-10-30): symbols the Upstox instrument master matched by
+# NAME for 109/111 entries but missed these two despite both being plain "EQ"
+# NSE listings (SBI BSE PSU Bank listed 24-Mar-2025, SBI Nifty50 Equal Weight
+# listed 22-Jul-2024).  We keep their ISINs so verification can fall back to
+# an ISIN match; both ISINs from public exchange listings.
+ETF_KNOWN_ISIN = {
+    "SBIBPB": "INF200KB1712",
+    "SBINEQWETF": "INF200KB1282",
+}
+
 # --- Cash & tax (Step 8) -------------------------------------------------------
 CASH_RATE_PRETAX = 0.053           # RBI 91-day T-bill ~5.30%
 SLAB_RATE = 0.30                   # assumed income-tax slab for dividends/interest
@@ -543,6 +554,10 @@ CHARGES = {
     "sebi_pct": 0.000001,          # 0.0001%
     "ipft_pct": 0.000001,          # 0.0001%
     "gst_pct": 0.18,               # 18% on brokerage+exchange+SEBI
+    "dp_sell_flat": 15.93,         # demat (DP) charge, SELL side only: flat Rs
+                                   # 13.50 + 18% GST per scrip per day (discount-
+                                   # broker schedule; audit v13 #4; verify your
+                                   # plan vs contract note — ledger #103)
 }
 STT_EXEMPT_CATEGORIES = {"COMMODITY", "DEBT"}   # gold/silver/liquid/gilt: no STT
 
@@ -557,7 +572,8 @@ STT_EXEMPT_CATEGORIES = {"COMMODITY", "DEBT"}   # gold/silver/liquid/gilt: no ST
 #                            Rs 1.25 L exemption (>12m).
 # DEBT (liquid/gilt/bond):   always at slab rate (specified mutual funds).
 # GLOBAL: sources conflict (12 vs 24 months, slab vs 12.5%) -> configured
-#          equity-like here; CONFIRM WITH A CA before filing.
+#          CONSERVATIVELY below (slab short-term, 12.5% long-term, NO
+#          Rs 1.25 L exemption).  CONFIRM WITH A CA before filing.
 # Audit 2.7 (conservative where sources conflict — CONFIRM WITH A CA):
 #   GLOBAL: slab STCG, 12.5% LTCG, NO 1.25 L exemption (some sources differ)
 #   HYBRID: 50:50 fund is NOT >65% Indian equity -> non-equity treatment (slab)
@@ -1779,6 +1795,7 @@ class Scanner:
     def verify_against_upstox(self, instruments: list) -> dict:
         """Match symbols to the live NSE instrument master; return symbol -> key."""
         by_symbol = {}
+        by_isin = {}
         for it in instruments:
             sym = (it.get("trading_symbol") or "").strip()
             if not sym:
@@ -1787,12 +1804,25 @@ class Scanner:
             exch = (it.get("exchange") or "")
             if exch == "NSE" and seg in ("EQ", "NSE_EQ"):
                 by_symbol[sym] = it.get("instrument_key")
+                isin = (it.get("isin") or "").strip()
+                if isin:
+                    by_isin[isin] = it.get("instrument_key")
         found = 0
+        isin_matched = []
         for sym, _info in universe_map().items():
             key = by_symbol.get(sym)
+            # audit v13 #1: a few real NSE "EQ" listings lose the exact-name
+            # match (master naming/segment quirks).  Fall back to their ISIN.
+            if not key and sym in ETF_KNOWN_ISIN:
+                key = by_isin.get(ETF_KNOWN_ISIN[sym])
+                if key:
+                    isin_matched.append(sym)
             if key:
                 found += 1
                 self.db.execute("UPDATE etf_universe SET instrument_key=? WHERE symbol=?", (key, sym))
+        if isin_matched:
+            P.info("Matched via ISIN (plain symbol lookup missed these): "
+                   + ", ".join(sorted(isin_matched)))
         return by_symbol
 
     def show_universe_table(self):
@@ -4086,10 +4116,13 @@ def calc_charges(side: str, value: float, category: str = "EQUITY") -> dict:
     sebi = value * c["sebi_pct"]
     ipft = value * c["ipft_pct"]
     gst = c["gst_pct"] * (brokerage + exchange + sebi)
-    total = brokerage + stt + stamp + exchange + sebi + ipft + gst
+    # audit v13 #4 (2026-10-30): the depository takes a flat fee every time
+    # shares leave the demat account — sells were previously FREE of it.
+    dp = c.get("dp_sell_flat", 0.0) if side.upper() == "SELL" else 0.0
+    total = brokerage + stt + stamp + exchange + sebi + ipft + gst + dp
     return {"brokerage": brokerage, "stt": stt, "stamp": stamp,
             "exchange": exchange, "sebi": sebi, "ipft": ipft, "gst": gst,
-            "total": total}
+            "dp": dp, "total": total}
 
 
 def estimate_spread_bps(liq_p25: float, broad: bool = False) -> float:
@@ -8553,7 +8586,13 @@ def cmd_status(db: Db):
     P.kv("ETFs you hold (worth now)", fmt_cr(hv))
     P.kv("Your total (cash + ETFs)", fmt_cr(eq), val_color=_C.GREEN)
     P.kv("Invested", fmt_pct(safe_div(hv, eq, 0.0)))
-    P.kv("Peak equity", fmt_cr(risk.peak))
+    # audit v13 #5: the very first seed equals STARTING_CAPITAL until the
+    # first confirmed run realises the peak — label that case so it doesn't
+    # read as a phantom all-time-high next to the real total.
+    _peak_seed = (not db.meta_get("risk_last_eval"))
+    P.kv("Peak equity",
+         fmt_cr(risk.peak) + ("  (startup seed — updates from your real book "
+                              "on the first confirmed run)" if _peak_seed else ""))
     dd = max(1 - eq / risk.peak, 0.0) if risk.peak else 0.0
     P.kv("Current drawdown", fmt_pct(dd, signed=False),
          val_color=_C.RED if dd > 0.05 else _C.WHITE)
@@ -9255,6 +9294,42 @@ def cmd_selftest(db: Db):
     check("audit A8: no STT for gold/liquid/gilt", ch_g["stt"] == 0.0)
     check("audit A8: equity ETF STT 0.001% sell only",
           abs(ch_e["stt"] - 1.0) < 1e-9 and ch_b["stt"] == 0.0, f"{ch_e['stt']} / {ch_b['stt']}")
+
+    # v13 #4: demat (DP) charge — flat on SELL only, never on BUY
+    check("audit v13: demat (DP) charge applies per SELL order, not on BUY",
+          abs(ch_e["dp"] - 15.93) < 1e-9 and ch_b["dp"] == 0.0
+          and abs(ch_e["total"] - (ch_e["brokerage"] + ch_e["stt"] + ch_e["stamp"]
+                                   + ch_e["exchange"] + ch_e["sebi"] + ch_e["ipft"]
+                                   + ch_e["gst"] + 15.93)) < 1e-6,
+          f"dp={ch_e['dp']}")
+
+    # v13 #1: instrument-master misses are retried by ISIN (SBIBPB/SBINEQWETF)
+    _dbi = Db(DATA_DIR / "selftest_isin.db")
+    try:
+        _fake_master = [
+            {"trading_symbol": "XGARBAGE", "segment": "EQ", "exchange": "NSE",
+             "instrument_key": "NSE_EQ|DUMMY1", "isin": "INE000000X1"},
+            {"trading_symbol": "SBI ETF BSE PSU BK", "segment": "NSE_EQ",
+             "exchange": "NSE", "instrument_key": "NSE_EQ|INF200KB1712",
+             "isin": "INF200KB1712"},   # odd master name, right ISIN
+        ]
+        for _s in ("SBIBPB", "SBINEQWETF"):
+            _dbi.execute("INSERT INTO etf_universe(symbol,name,status) "
+                         "VALUES (?,?,'ACTIVE')", (_s, _s + " test"))
+        _sc = Scanner(_dbi)
+        _sc.verify_against_upstox(_fake_master)
+        _row = _dbi.query("SELECT instrument_key FROM etf_universe WHERE symbol='SBIBPB'")
+        _ok_isin = bool(_row) and (_row[0]["instrument_key"] or "") == "NSE_EQ|INF200KB1712"
+        _row2 = _dbi.query("SELECT instrument_key FROM etf_universe WHERE symbol='SBINEQWETF'")
+        _ok_noisin = bool(_row2) and not _row2[0]["instrument_key"]
+        check("audit v13: ISIN fallback rescues SBIBPB; unknown ISIN stays empty (fail-safe)",
+              _ok_isin and _ok_noisin, f"SBIBPB={_row[0]['instrument_key'] if _row else None}")
+    finally:
+        _dbi.close()
+        try:
+            os.remove(DATA_DIR / "selftest_isin.db")
+        except Exception:
+            pass
 
     # A8: impact grows with order size (no more flat 2 bps)
     small = impact_bps(10_000.0, 1_000_000.0)
