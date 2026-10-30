@@ -48,3 +48,26 @@ Auditor's operational readings confirmed as intended behavior: decline-y/n is
 manual by USER-LOCK (#115); month-end trickle caps budget near re-plan;
 premium blocks on MONQ50 etc. are KEPT-BY-DESIGN (#25/#26/#91). Hypothesis
 "staggered rebalance tranches" logged as #127 — not yet measured.
+
+## Round 25 (external audit v14, 2026-10-30) — live-execution correctness
+
+Live-console audit on the user's box (LIVE, 2.8% invested, rebalance due).
+Four P0 money-path bugs fixed (each could overpay / false-fill / trade blind),
+plus P1/P2 correctness and a console-truth batch.  All structural fixes
+selftest-verified (128/128); nothing strategy-side touched (standing rule —
+v14 itself found no knob change to justify).
+
+| finding | was | now |
+|---|---|---|
+| synthetic fallback wrote demo prices into the production DB (live could trade on fiction); heal left fake NAV + fake splits | **purge all three + hard SYNTHETIC live gate** | ledger 128 |
+| unverifiable live fill booked as FILLED at the simulated price | UNCONFIRMED until the broker says complete/filled | ledger 129 |
+| live LIMIT = px*1.002 pushed through slippage again | broker gets ref x (1+0.2%) once | ledger 130 |
+| cash-sync failure silently traded on the stale wallet (user saw a Rs 0.5L gap on screen) | fail-closed | ledger 131 |
+| live buys allowed off yesterday's close | same-day quote required | ledger 132 |
+| partially-filled orders not "open" -> duplicates | statuses added | ledger 133 |
+| sip target re-derivation skipped selection filters | real selector re-run | ledger 134 |
+| adopted broker holdings had no tax lots (zero-P&L sells) | conservative lots + deferral off | ledger 135 |
+| GLOBAL LTCG reported at 30% slab | configured 12.5%+cess | ledger 136 |
+
+Ops note (not a bug): the book was 2.8% invested because a live run was
+declined twice — USER-LOCK (#115) means only interactive answers deploy.
