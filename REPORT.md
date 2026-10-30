@@ -117,3 +117,28 @@ defect yet; all of v16 follows from it (135/135 selftests).
 tomorrow's sync heals the box's journal automatically; and verify the
 LIQUIDCASE instrument/price (₹116.69 fill vs a ~₹1,000-quoted liquid ETF —
 check for a split the price series never absorbed).
+
+## Round 28 (user direction, 2026-10-30) — the bot may only touch its own book
+
+The 30-Oct run parked ₹2.29 L of the user's money in LIQUIDCASE.  That was
+"intended" behaviour inherited from the backtest (idle cash earns the liquid
+rate), but the user's account is also their manual-trading account: the money
+was never the bot's to move.  **Parking is removed from the code**, and the
+whole book model is re-scoped so this class of surprise cannot recur.
+
+| rule now | what changed | ledger |
+|---|---|---|
+| no idle-cash sweep, ever | `sleeve_sweep`/`sleeve_unsweep` and the separately-confirmed cash-park offer are deleted; leftover cash just stays free | 149 |
+| the bot owns only what it bought | `bot_symbols` registry filled by its own fills; every other broker holding is read-only (listed, never counted, never traded) | 150 |
+| its cash is its own | ledger = STARTING_CAPITAL − its buys + its sells, re-derived once from its own LIVE order history; your free margin is only a ceiling (`spendable()`) plus one read-only status line | 151 |
+| its risk peak is its own | an inherited whole-account peak is re-based to the bot's own equity before any trigger can fire | 152 |
+| reconcile compares like with like | manual holdings are no longer "MISMATCH" rows | 150 |
+
+**What the user must do (ledger actions 117-118):** set `STARTING_CAPITAL` to
+the rupee amount they want the bot to manage — **at least ₹10,000** (5 planned
+ETFs × the ₹2,000 minimum order), better ₹25,000-50,000 — and, if they want to
+keep investing ~₹5,000 per run, set `INVEST_PER_DAY = 5000` separately (book
+size and deployment speed are two numbers now).  Sell the old LIQUIDCASE park
+themselves: v17 releases it from the bot's book but deliberately will not
+place that sell.  Selftests: 137/137 (new: manual holding untouched, ledger not
+adopted from the broker, peak rebase, parking machinery gone).

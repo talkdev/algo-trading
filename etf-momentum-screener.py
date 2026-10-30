@@ -34,8 +34,33 @@
   9. Backtests 10+ years with the last 20% held out-of-sample, parameter grid
      (lookback 126/189/252 x entry 0/1/2/3/5%), cost and cash-rate scenarios.
 
+ WHAT THIS SCRIPT IS ALLOWED TO TOUCH (user direction 2026-10-30, v17)
+ ----------------------------------------------------------------------
+  * IT OWNS ONLY ITS OWN BOOK.  The ETFs it bought itself (the bot_symbols
+    registry, filled automatically when it buys) plus the STARTING_CAPITAL
+    you assign it — nothing else.  Every other holding and every other rupee
+    in your Upstox account belongs to your own trading: it is never counted
+    in the bot's equity, never sized against, never bought and never sold.
+  * NO IDLE-CASH PARKING.  The liquid-ETF sweep is GONE.  Leftover money is
+    not swept anywhere; it simply stays free for you.  (The old behaviour
+    parked ₹2.34 L of the user's money on 2026-10-30 — removed by request.)
+  * Its cash ledger is its own: STARTING_CAPITAL at birth, minus what it
+    bought, plus what it sold.  Your broker balance is read ONLY as a
+    ceiling before an order (you cannot spend money that is not free) and
+    as a read-only line on the status screen.
+  * The Drawdown / risk peak is measured on that own book.  The first v17
+    run re-bases an inherited whole-account peak automatically (otherwise a
+    ₹2.5 L peak against a ₹5 k book would read as a 98% crash and liquidate).
+
  HOW MONEY MOVES (the one knob that matters — 2026-10-28 redesign)
  -----------------------------------------------------------------
+  * TWO NUMBERS, TWO JOBS (v17): STARTING_CAPITAL = the SIZE of the book you
+    hand the bot; INVEST_PER_DAY = how fast it deploys into that book.  They
+    ship equal (one dial), but a bigger book with a smaller daily tranche is
+    a valid setup, e.g. STARTING_CAPITAL=25000 with INVEST_PER_DAY=5000.
+    The book must be at least MAX_HOLDINGS × MIN_TRADE_VALUE (~10,000 at the
+    defaults) or the per-name slice cannot clear the minimum order size —
+    the console says so in rupees when that happens.
   * INVEST_PER_DAY in the config block below is the ONLY money that ever
     buys; it is a FLOOR.  Each run splits today's budget proportionally
     across the stored target-weight gaps; when the plan cannot fill before
@@ -118,7 +143,8 @@
      so our orders stay small next to what the market trades.  The total
      amount invested is scaled so the portfolio swings about 15% a year —
      the level testing found most comfortable for returns vs sleepless nights.
-     Whatever is not invested stays in cash and quietly earns interest.
+     Whatever is not invested stays as cash in the bot's own book and is
+     NOT parked in any fund (v17) — it waits for the next buy.
      On other days, each run's buys push the portfolio a bit closer to these
      planned shares — never past them.
 
@@ -270,20 +296,29 @@ LIVE_ORDER_TYPE = "LIMIT"          # audit v4 §6/#9: live BUYS go as LIMIT at
                                    #   ask+0.2% buffer — no open-ended market cost
                                    #   tail. Sells stay MARKET (exit discipline).
 LIVE_LIMIT_BUFFER = 0.002          # 0.2% over the reference price for live limits
-LIVE_CASH_SLEEVE = True            # audit v5 #4 (2026-10-28, user said apply):
-                                   #   live idle cash is swept into the liquid ETF
-                                   #   weekly (worth ~2.8pp CAGR during bear regimes
-                                   #   vs earning 0; the backtest & paper mode always
-                                   #   had this).  Sleeve sells happen only to FUND
-                                   #   real buys.  Set False to opt out (a plain
-                                   #   note about idle cash is printed instead).
-STARTING_CAPITAL = 10000             # dual role (user direction 2026-10-29):
-                                   # (1) paper-mode starting cash, (2) the
-                                   # amount you want deployed per run —
-                                   # INVEST_PER_DAY below takes its floor from
-                                   # here for BOTH paper and live.  In live the
-                                   # rest of the money math still reads the
-                                   # broker (cash sync, audit v4 L2).
+BOT_BOOK_ONLY = True               # audit v17 (2026-10-30, USER DIRECTION): the
+                                   #   bot owns ONLY the ETFs it bought itself
+                                   #   (the bot_symbols registry) and ONLY the
+                                   #   STARTING_CAPITAL you assign it.  Every
+                                   #   other rupee and every other security in
+                                   #   your Upstox account is YOURS: not counted
+                                   #   in equity, never sized against, never
+                                   #   bought and never sold by this script.
+                                   #   The idle-cash sweep into a liquid fund is
+                                   #   REMOVED (it parked ₹2.34 L of the user's
+                                   #   money on 2026-10-30).  Idle money simply
+                                   #   stays free for your own trades.
+STARTING_CAPITAL = 10000           # THE ONE NUMBER THAT IS YOURS (user direction
+                                   # 2026-10-29, re-scoped 2026-10-30): the
+                                   # capital you hand this bot.  It is (1) the
+                                   # paper-mode starting cash, (2) the live
+                                   # book's opening cash, and (3) the floor for
+                                   # INVEST_PER_DAY.  Raising it later is a
+                                   # DEPOSIT into the bot's book; lowering it is
+                                   # a WITHDRAWAL.  The bot never reads your
+                                   # broker's total balance into its own ledger
+                                   # (audit v17) — your free margin is only
+                                   # checked as a ceiling before each order.
 
 # --- Signal parameters (Step 2/3) ---------------------------------------------
 LOOKBACK = 252                     # momentum lookback in trading sessions
@@ -2913,33 +2948,6 @@ def live_order_ok(context: str = "") -> bool:
     return ans.strip().lower() == "y"
 
 
-def offer_cash_sweep(db) -> None:
-    """audit v12 return-leak-4 (2026-10-29 live audit): declining the strategy
-    confirmation also skipped the risk-free LIQUIDCASE parking — an 'n' for
-    orders is not an 'n' for earning the liquid rate on idle cash.  Offer the
-    sweep as its OWN separately-confirmed action on any declined live run."""
-    if PAPER_TRADE or not LIVE_CASH_SLEEVE:
-        return
-    try:
-        cyc = TradingCycle(db)
-        if not cyc.broker.sync_live_cash():
-            P.warn("Cash sweep skipped — could not read the broker's cash "
-                   "balance today.")
-            return
-        surplus = cyc.broker.cash() - 2.0 * INVEST_PER_DAY
-        if surplus < 2 * MIN_TRADE_VALUE:
-            return          # nothing meaningful to park; stay quiet
-        if live_order_ok(f"Cash parking only: sweep idle cash "
-                         f"(~{fmt_cr(surplus)}) into {CASH_SLEEVE_SYMBOL} — "
-                         f"liquid fund, sold back automatically when buys "
-                         f"need cash. No strategy orders will be placed by "
-                         f"this confirmation."):
-            cyc.sleeve_sweep()
-    except Exception as e:
-        P.warn(f"Cash-sweep check failed ({e}) — skipped; nothing else "
-               f"affected.")
-
-
 def _nse_holidays() -> set:
     try:
         hp = BASE_DIR / "nse_holidays.json"
@@ -3032,7 +3040,8 @@ def sip_orphan_should_sell(sym: str, target: dict, chosen_syms: set,
     """Held symbol missing from the target map -> orphan sell.  audit v15 P0-2:
     in SIP_MODE the map omits chosen names by design, so a held+CHOSEN holding
     must be KEPT (the live console had the rebalance dumping its own #1/#2
-    fresh picks).  Cash sleeves are never orphans (they ARE the parking)."""
+    fresh picks).  A cash-proxy fund is never an orphan either: since v17 the
+    bot never buys one, and one it does not own is outside its book."""
     if sym in target or sym in CASH_PROXY_SYMBOLS:
         return False
     if sip_mode and sym in chosen_syms:
@@ -4470,11 +4479,167 @@ class Broker:
         self._live_open = {}            # {sym: {"BUY": qty_open, "SELL": qty_open}}
 
     # ----- account state -----
+    # ---- book scope: only the bot's OWN money and ETFs (audit v17) --------
+    # USER DIRECTION 2026-10-30: "the ETF script should only be responsible for
+    # the ETFs bought in the order book / holdings and the starting capital I
+    # provide. Rest it should not tamper with my Upstox account — it is used
+    # for other tradings too."  Hence: an explicit ownership registry, and the
+    # broker's balance is READ as a ceiling, never adopted as the ledger.
+    def bot_symbols(self) -> set:
+        """The ETFs this bot bought itself, persisted across restarts."""
+        try:
+            return set(json.loads(self.db.meta_get("bot_symbols", "[]")))
+        except Exception:
+            return set()
+
+    def bot_own(self, symbol: str, on: bool = True) -> None:
+        s = self.bot_symbols()
+        changed = False
+        if on and symbol not in s:
+            s.add(symbol)
+            changed = True
+        elif not on and symbol in s:
+            s.discard(symbol)
+            changed = True
+        if changed:
+            self.db.meta_set("bot_symbols", json.dumps(sorted(s)))
+
+    def spendable(self) -> float:
+        """Cash this bot may actually spend: its OWN ledger, capped by the
+        broker's free margin.  The cap matters because your manual trades (or
+        a pending payment) can leave less free margin than the bot's book says
+        it owns — the bot must never size an order it cannot pay for."""
+        own = self.cash()
+        if self.paper:
+            return own
+        avail = self.db.meta_get("broker_available_cash")
+        try:
+            avail = float(avail) if avail not in (None, "") else None
+        except (TypeError, ValueError):
+            avail = None
+        return own if avail is None else min(own, avail)
+
+    def migrate_bot_scope(self) -> None:
+        """One-time v17 re-baseline (2026-10-30).  Works out what the bot
+        actually owns from its OWN order history — never from the broker's
+        total holdings — then releases everything else back to the user."""
+        if self.paper or self.db.meta_get("bot_scope_v17") == "done":
+            return
+        if self.db.meta_get("bot_symbols") is not None:
+            # already scoped explicitly (fresh install or a restored DB) —
+            # never overwrite a scope somebody set on purpose
+            self.db.meta_set("bot_scope_v17", "done")
+            self.db.meta_set("bot_capital_base", str(float(STARTING_CAPITAL)))
+            if self.db.meta_get("equity_peak") is not None:
+                # an inherited peak may still describe a whole-account book;
+                # rebasing loses drawdown history but that is FAR cheaper than
+                # a phantom crash selling everything
+                self.db.meta_set("risk_peak_rebase_due", "1")
+                P.warn("Existing book scope adopted — the stored risk peak is "
+                       "re-based to this bot's own equity on the next "
+                       "evaluation (a peak from the whole account would "
+                       "otherwise read as a crash).")
+            return
+        owned_q, cash = {}, float(STARTING_CAPITAL)
+        for r in self.db.query(
+                "SELECT symbol, side, qty, value, charges, status FROM orders "
+                "WHERE mode='LIVE' AND side IN ('BUY','SELL')"):
+            if str(r["status"] or "") in ("REJECTED", "FAILED", "SKIPPED_FILTER"):
+                continue
+            sym = r["symbol"]
+            if sym in CASH_PROXY_SYMBOLS:
+                # the old idle-cash sweep spent YOUR money, not the bot's
+                # capital — it is released, never adopted or sold here
+                continue
+            _st = str(r["status"] or "").upper()
+            _side = str(r["side"]).upper()
+            q = float(r["qty"] or 0)
+            if _st == "FILLED":
+                if _side == "BUY":
+                    cash -= float(r["value"] or 0) + float(r["charges"] or 0)
+                    owned_q[sym] = owned_q.get(sym, 0.0) + q
+                else:
+                    cash += float(r["value"] or 0) - float(r["charges"] or 0)
+                    owned_q[sym] = owned_q.get(sym, 0.0) - q
+            elif _side == "BUY" and _st in ("PENDING", "UNCONFIRMED"):
+                # placed but not verified yet: treat as owned (it may well have
+                # filled) while leaving the cash ledger untouched — the later
+                # resolution applies the fill and the cash together
+                owned_q[sym] = owned_q.get(sym, 0.0) + q
+        # owned = bought-and-not-yet-sold, from the ORDER HISTORY — never from
+        # the (possibly stale/corrupted) positions mirror or the broker's whole
+        # holdings list, either of which could hand us the user's positions.
+        owned = {s for s, q in owned_q.items() if q > 0.5}
+        held = {r["symbol"] for r in
+                self.db.query("SELECT symbol FROM positions WHERE qty>0")}
+        self.db.meta_set("bot_symbols", json.dumps(sorted(owned)))
+        released = sorted(held - owned)
+        for s in released:
+            self.db.execute("DELETE FROM positions WHERE symbol=?", (s,))
+        self.set_cash(max(0.0, round(cash, 2)))
+        self.db.meta_set("bot_capital_base", str(float(STARTING_CAPITAL)))
+        self.db.meta_set("bot_scope_v17", "done")
+        # CRITICAL: the stored risk peak was measured on the WHOLE account.
+        # Against the bot's own (much smaller) book it reads as a ~98% crash
+        # and would EXTREME-sell the bot's positions.  Rebase on next eval.
+        self.db.meta_set("risk_peak_rebase_due", "1")
+        P.section("NEW IN v17 — THE BOT NOW OWNS ONLY ITS OWN BOOK", "\U0001F512")
+        P.kv("This bot's own ETFs", ", ".join(sorted(owned)) or "none yet")
+        P.kv("This bot's own cash",
+             fmt_rs(max(0.0, round(cash, 2)))
+             + f"  ({fmt_rs(STARTING_CAPITAL)} you assigned − what it already "
+               f"bought + what it has sold)")
+        P.note(f"CHECK THIS NUMBER: {fmt_rs(STARTING_CAPITAL)} is the capital "
+               f"this bot will manage from now on.  If that is not what you "
+               f"want, edit STARTING_CAPITAL at the top of the script BEFORE "
+               f"the next confirmed run — raising/lowering it is applied as a "
+               f"deposit/withdrawal into the bot's book, and nothing outside "
+               f"that book is ever spent.")
+        if released:
+            P.warn("RELEASED FROM THE BOT (still in your Upstox account, "
+                   "untouched): " + ", ".join(released)
+                   + " — from now on these are YOUR positions. The bot will "
+                     "not count them, buy them or sell them. If any of them "
+                     "was money the bot parked for you (a liquid/overnight "
+                     "fund), sell it yourself in Upstox whenever you want that "
+                     "cash free for your own trades. The bot no longer parks "
+                     "cash anywhere.")
+        P.note("Every other holding and every other rupee in your Upstox "
+               "account is outside this bot: never counted in its equity, "
+               "never sized against, never traded.")
+
+    def sync_capital_dial(self) -> None:
+        """STARTING_CAPITAL is a live dial (user direction 2026-10-29): raising
+        it is a deposit into the bot's book, lowering it a withdrawal."""
+        if self.paper or self.db.meta_get("bot_scope_v17") != "done":
+            return
+        try:
+            base = float(self.db.meta_get("bot_capital_base", str(STARTING_CAPITAL)))
+        except (TypeError, ValueError):
+            base = float(STARTING_CAPITAL)
+        d = float(STARTING_CAPITAL) - base
+        if abs(d) < 0.01:
+            return
+        if d > 0:
+            self.set_cash(self.cash() + d)
+            P.note(f"STARTING_CAPITAL raised by {fmt_cr(d)} — added to this "
+                   f"bot's own cash (a deposit). It spends only this book.")
+        else:
+            take = min(self.cash(), -d)
+            self.set_cash(self.cash() - take)
+            P.warn(f"STARTING_CAPITAL lowered by {fmt_cr(-d)} — {fmt_cr(take)} "
+                   f"taken out of this bot's cash ledger (a withdrawal). "
+                   f"The shares it already holds are NOT sold; move the money "
+                   f"yourself in Upstox if you want it in your hands.")
+        self.db.meta_set("bot_capital_base", str(float(STARTING_CAPITAL)))
+
     def sync_live_cash(self) -> bool:
-        """Audit v4 L2: in LIVE mode the ledger cash is reset to the broker's
-        real available margin at the start of each run.  Returns True when a
-        live sync happened.  The rerun result is False (and the ledger value
-        kept, loudly) when the API fails — better stale-than-blind."""
+        """audit v17 (2026-10-30): the ledger cash is the BOT'S OWN money —
+        STARTING_CAPITAL minus what it bought plus what it sold.  The broker's
+        free margin is read and kept only as a CEILING (see spendable()); it is
+        never adopted, because most of that balance belongs to the user's own
+        manual trading.  Returns False (no orders today) when the margin
+        cannot be read — the bot must never place an order blind."""
         if self.paper or self.client is None:
             return True
         try:
@@ -4482,15 +4647,19 @@ class Broker:
         except Exception:
             avail = None
         if avail is None:
-            P.err("Could not read the broker's cash balance (funds API failed) — "
-                  "keeping the ledger value. Sizes may be wrong; check Upstox "
-                  "access before trusting today's orders.")
+            P.err("Could not read Upstox's free margin — REFUSING real orders "
+                  "today: an order the account cannot pay for would be rejected "
+                  "or, worse, eat the money you set aside for your own trades.  "
+                  "Fix the token/network and rerun (analysis was still updated).")
             return False
-        ledger = self.cash()
-        if abs(avail - ledger) > 1.0:
-            P.note(f"Cash synced from the broker: ledger {fmt_cr(ledger)} -> "
-                   f"Upstox available {fmt_cr(avail)}.")
-        self.set_cash(avail)
+        self.db.meta_set("broker_available_cash", str(float(avail)))
+        own = self.cash()
+        if avail + 1.0 < own:
+            P.warn(f"Your Upstox free margin ({fmt_cr(avail)}) is LESS than "
+                   f"this bot's own cash ({fmt_cr(own)}) — some of the bot's "
+                   f"money is tied up elsewhere (your other trades or "
+                   f"settlement). Buys are capped at {fmt_cr(avail)} until it "
+                   f"clears; nothing outside the bot's own book is touched.")
         return True
 
     def cash(self) -> float:
@@ -4557,21 +4726,27 @@ class Broker:
         return sym   # unknown to the universe -> adopted as-is, flagged later
 
     def sync_live_book(self) -> bool:
-        """LIVE TRUTH SYNC (user direction 2026-10-28): in live mode the
-        broker's HOLDINGS + POSITIONS + ORDER BOOK decide what we own — never
-        the DB alone.  What this does, in order:
-          1. pulls all three sources from Upstox;
-          2. derives the current holding per symbol
+        """LIVE TRUTH SYNC (user direction 2026-10-28, re-scoped v17
+        2026-10-30): the broker's HOLDINGS + POSITIONS + ORDER BOOK decide
+        what we own AMONG THE ETFs THIS BOT BOUGHT.  Everything else in the
+        account is the user's and is never adopted, counted or traded.  In
+        order:
+          1. one-time v17 scope migration + STARTING_CAPITAL dial check;
+          2. pulls all three sources from Upstox;
+          3. derives the holding per BOT-OWNED symbol
              (delivery holdings + today's fills not yet settled);
-          3. OVERWRITES the DB positions mirror with that truth
-             (journal rows for shares the broker does not hold are dropped);
-          4. records today's OPEN orders per symbol/side so no second order
+          4. OVERWRITES the DB positions mirror with that truth
+             (rows for bot-owned shares the broker no longer holds are dropped);
+          5. records today's OPEN orders per symbol/side so no second order
              is layered on one still working at the broker;
-          5. also syncs the cash from the broker's funds API (audit v4 L2).
+          6. reads the broker's free margin as a CEILING (audit v17 — it is
+             no longer copied into the ledger; that money is the user's).
         Returns False — and callers must place NO orders — when the broker
         cannot be read (no truth, no trading).  Paper mode: untouched, True."""
         if self.paper or self.client is None:
             return True
+        self.migrate_bot_scope()
+        self.sync_capital_dial()
         try:
             hold_rows = self.client.holdings()
             pos_rows = self.client.positions()
@@ -4583,8 +4758,9 @@ class Broker:
             return False
 
         truth, openq = {}, {}
-        known = {r["symbol"] for r in
-                 self.db.query("SELECT symbol FROM etf_universe")}
+        # audit v17: the universe is NOT the book.  Only symbols this bot
+        # bought itself may be adopted, counted, sized against or sold.
+        managed = self.bot_symbols()
         foreign = []
 
         # 1) delivery holdings: quantity + t1_quantity at average_price
@@ -4598,7 +4774,9 @@ class Broker:
                 avg = float(r.get("average_price") or r.get("avg_price") or 0)
             except (TypeError, ValueError):
                 continue
-            if sym not in known:
+            if sym not in managed:
+                # audit v17: NOT this bot's position (it never bought it) —
+                # the user's own holding, invisible to the strategy
                 foreign.append(sym)
                 continue
             if q > 0:
@@ -4609,7 +4787,7 @@ class Broker:
         for r in pos_rows or []:
             sym = self._book_symbol(r.get("trading_symbol") or r.get("tradingsymbol")
                                     or r.get("symbol") or "")
-            if not sym or sym not in known:
+            if not sym or sym not in managed:
                 continue
             try:
                 bought = float(r.get("buy_quantity") or 0)
@@ -4633,7 +4811,7 @@ class Broker:
         for r in order_rows or []:
             sym = self._book_symbol(r.get("trading_symbol") or r.get("tradingsymbol")
                                     or r.get("symbol") or "")
-            if not sym or sym not in known:
+            if not sym or sym not in managed:
                 continue
             st = str(r.get("status") or "").strip().lower()
             if st not in BROKER_OPEN_STATUSES:
@@ -4651,6 +4829,18 @@ class Broker:
         # 4) overwrite the DB positions mirror with the broker truth.
         #    audit v16 P0-A: keep full rows (qty+avg) — same-day fills below
         #    are re-admitted from the journal while the T+1 settlement lags.
+        # audit v17: the positions mirror holds ONLY this bot's own buys.  Any
+        # other row is the user's (e.g. a pre-v17 idle-cash park or a holding
+        # the old adopt-anything sync filed here) — release it, never touch it
+        # at the broker.
+        for r in self.db.query("SELECT symbol, qty FROM positions WHERE qty>0"):
+            if r["symbol"] not in managed:
+                self.db.execute("DELETE FROM positions WHERE symbol=?",
+                                (r["symbol"],))
+                P.warn(f"{r['symbol']} (x{r['qty']:.0f}) is not this bot's own "
+                       f"position — removed from the bot's book.  Your holding "
+                       f"is untouched at the broker; the bot will not count, "
+                       f"buy or sell it.")
         existing = {r["symbol"]: {"qty": r["qty"], "avg_cost": r["avg_cost"]} for r in
                     self.db.query("SELECT symbol, qty, avg_cost FROM positions WHERE qty>0")}
         # audit v16 P0-A (2026-10-30 live console): same-day delivery fills are
@@ -4663,7 +4853,7 @@ class Broker:
             sym_f = self._book_symbol(r.get("trading_symbol") or r.get("tradingsymbol")
                                       or r.get("symbol") or "")
             st_f = str(r.get("status") or "").strip().lower()
-            if sym_f and st_f in ("complete", "filled"):
+            if sym_f in managed and st_f in ("complete", "filled"):
                 ts_f = str(r.get("order_timestamp") or r.get("exchange_timestamp")
                            or r.get("created_at") or "")
                 if ts_f.startswith(today_str()):
@@ -4746,16 +4936,24 @@ class Broker:
                        f"short-term).  The 12-month tax-wait will NOT delay "
                        f"selling it.  If you know the real buy date, fix "
                        f"stock-data/tsmom.db table tax_lots.")
+        try:
+            self.db.meta_set("manual_holdings", json.dumps(sorted(set(foreign))))
+        except Exception:
+            pass
         if foreign:
-            P.note(f"Broker holdings outside this bot's ETF universe "
-                   f"({', '.join(sorted(set(foreign))[:8])}) are left untouched "
-                   f"— not counted, never sold by this bot.")
+            _fs = sorted(set(foreign))
+            P.note(f"HOLDINGS THAT ARE NOT THIS BOT'S ({', '.join(_fs[:8])}"
+                   + (f" +{len(_fs) - 8} more" if len(_fs) > 8 else "")
+                   + ") are yours — not counted in the bot's equity, never "
+                     "sized against, never sold by this bot.  The bot manages "
+                     "only the ETFs it bought itself.")
         if openq:
             P.note("Open orders at the broker right now: "
                    + ", ".join(f"{s} {d['BUY']:.0f} to buy / {d['SELL']:.0f} to sell"
                                for s, d in sorted(openq.items())[:8]))
-        P.ok(f"Broker book synced: {len(truth)} ETF holding(s) adopted from Upstox; "
-             f"journal positions mirror updated.")
+        P.ok(f"Broker book synced: {len(truth)} ETF(s) OF THIS BOT confirmed at "
+             f"Upstox; the journal mirror is updated.  Holdings that are not "
+             f"the bot's are listed, never touched.")
         # audit v14 P0 (2026-10-30): the funds-API failure used to be tolerated
         # here — trading continued on the STALE ledger cash (once a Rs 0.5 L
         # gap was seen on screen).  Cash unreadable -> fail-closed, no orders.
@@ -4946,6 +5144,8 @@ class Broker:
                 self.db.execute("INSERT OR REPLACE INTO positions(symbol,qty,avg_cost,updated) "
                                 "VALUES(?,?,?,?)", (symbol, qty, px, now_iso()))
             self.tax.record_buy(symbol, today_str(), px, qty)
+            # audit v17: buying it is what makes it the bot's — nothing else
+            self.bot_own(symbol, True)
         else:
             cash += (value - charges["total"])
             row = self.db.one("SELECT qty, avg_cost FROM positions WHERE symbol=?", (symbol,))
@@ -4958,6 +5158,7 @@ class Broker:
                                 (left, now_iso(), symbol))
             else:
                 self.db.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+                self.bot_own(symbol, False)     # audit v17: fully sold => released
         self.set_cash(cash)
 
     def print_order_ticket(self, res: dict, symbol: str, name: str, side: str):
@@ -5015,6 +5216,24 @@ class RiskEngine:
         by the invested fraction so a half-cash book doesn't need a ~43%
         holdings crash to halve."""
         events = []
+        # audit v17 (2026-10-30): the book scope changed from "whole Upstox
+        # account" to "this bot's own ETFs + its own cash".  The stored peak
+        # was measured on the whole account, so keeping it would read as a
+        # ~98% crash against the bot's own book and trigger EXTREME selling.
+        if self.db.meta_get("risk_peak_rebase_due") == "1":
+            P.warn(f"Risk peak re-based for the v17 book scope: "
+                   f"{fmt_cr(self.peak)} (whole Upstox account) -> "
+                   f"{fmt_cr(equity)} (this bot's own ETFs + its own cash). "
+                   f"It would otherwise look like a crash and sell everything. "
+                   f"Any risk locks are released.")
+            self.peak = max(equity, 1.0)
+            self.halved = False
+            self.all_cash = False
+            self.state = "NORMAL"
+            self.trigger_date = ""
+            self.db.meta_set("risk_peak_rebased_date", today_str())
+            self.db.meta_set("risk_peak_rebase_due", "")
+            self._save()
         # audit v12 P0-1 (2026-10-29 live audit): a PAPER-lived peak (seeded
         # from the Rs 10 L STARTING_CAPITAL) survives into LIVE mode; with a
         # Rs 3 L broker book that reads as a fabricated ~70% crash — past the
@@ -5439,93 +5658,6 @@ class TradingCycle:
             n += 1
         return n
 
-    # ---- idle-cash sleeve (audit v5 #4, live only) -----------------------
-    # The backtest & paper mode park spare money in the liquid ETF;
-    # leaving live cash at 0% cost ~2.8pp CAGR in the bear-regime print.
-    # Two moves only: park cash weekly, sell back ONLY to fund real buys.
-    # The sleeve is exempt from exits/exit-guard/derisk — it IS the cash.
-    def sleeve_unsweep(self, need: float) -> float:
-        """Sell just enough of the parked sleeve to fund today's buy budget."""
-        if PAPER_TRADE or not LIVE_CASH_SLEEVE:
-            return 0.0
-        sx = CASH_SLEEVE_SYMBOL
-        h = self.broker.holdings().get(sx)
-        if not h or h["qty"] <= 0:
-            return 0.0
-        shortfall = need - self.broker.cash()
-        if shortfall < 2 * MIN_TRADE_VALUE:
-            return 0.0
-        px = self.latest_prices().get(sx)
-        if not px or px <= 0:
-            P.warn(f"Cannot free cash from the {sx} sleeve — no price today.")
-            return 0.0
-        qty = int(min(self.broker.sellable_qty(sx), shortfall / px))
-        if qty <= 0:
-            return 0.0
-        res = self.broker.execute(sx, "SELL", qty, px, today_str(),
-                                  reason="fund today's buys from the idle-cash sleeve")
-        self.broker.print_order_ticket(res, sx, "liquid/idle-cash sleeve", "SELL")
-        if res.get("status") == "FILLED":
-            freed = float(res.get("value") or qty * px)
-            P.note(f"Sold {qty} units of the {sx} sleeve ({fmt_cr(freed)}) to "
-                   f"fund today's buys — exactly what the backtest assumes "
-                   f"spare money does.")
-            return freed
-        return 0.0
-
-    def sleeve_sweep(self) -> int:
-        """Park idle cash (beyond a 2-day budget buffer) in the liquid ETF,
-        at most once a week."""
-        if PAPER_TRADE or not LIVE_CASH_SLEEVE:
-            return 0
-        sx = CASH_SLEEVE_SYMBOL
-        try:
-            last = self.db.meta_get("last_sleeve_sweep", "")
-            if last and (parse_date(today_str()) - parse_date(last)).days < 7:
-                return 0
-        except Exception:
-            pass
-        surplus = self.broker.cash() - 2.0 * INVEST_PER_DAY
-        if surplus < 2 * MIN_TRADE_VALUE:
-            return 0
-        if self.broker.live_open_qty(sx, "BUY") > 0:
-            P.note(f"A {sx} sweep order is already open at the broker — "
-                   f"skipping today's sweep.")
-            return 0
-        # audit v16 P1-A#1 (2026-10-30): the sweep priced off the last SAVED
-        # bar — a day-old close forms a stale LIMIT for a live order.
-        # Prefer today's live sleeve quote; fall back to the last saved bar,
-        # and always SAY which price basis was used.
-        px_src, px = None, None
-        try:
-            _qmap, _qspr, _tfl = self._live_quotes([sx])
-            if _tfl.get(sx) is True and _qmap.get(sx):
-                px, px_src = _qmap[sx], "live quote just now"
-        except Exception:
-            pass
-        if not px:
-            px = self.latest_prices().get(sx)
-            px_src = "last saved bar"
-        if not px or px <= 0:
-            P.warn(f"Cannot sweep idle cash into {sx} — no price today.")
-            return 0
-        P.info(f"{sx} sweep price basis: the {px_src} ({fmt_rs(px)}).")
-        qty = int(surplus / px)
-        if qty <= 0:
-            return 0
-        _otype, _px_send = live_buy_order_px(px)
-        res = self.broker.execute(sx, "BUY", qty, px, today_str(),
-                                  reason="weekly sweep: park idle cash in the liquid sleeve",
-                                  order_type=_otype, limit_px=_px_send)
-        self.broker.print_order_ticket(res, sx, "liquid/idle-cash sleeve", "BUY")
-        if res.get("status") in ("FILLED", "PENDING", "UNCONFIRMED"):
-            self.db.meta_set("last_sleeve_sweep", today_str())
-            P.note(f"Parked {fmt_cr(qty * px)} of idle cash in {sx} (earns the "
-                   f"liquid rate instead of nothing). It is sold back "
-                   f"automatically whenever the day's buys need the cash.")
-            return 1
-        return 0
-
     def deploy_day(self) -> int:
         """One run of accumulation: deploy INVEST_PER_DAY across the target-plan
         gaps, slice sizes PROPORTIONAL to each name's distance from its target
@@ -5535,19 +5667,33 @@ class TradingCycle:
         thinned run can top up but never double-deploy.  Runs at any hour —
         weekends/holidays deploy at the last close (user choice), loudly
         marked; guards, gates and fills unchanged from the SIP engine."""
-        # audit v4 P3 (2026-10-28): live has no liquid sweep — idle cash earns
-        # nothing. Backtests park leftovers in the liquid ETF; the gap is
-        # inherent. Say so plainly, and offer the opt-in sweep instead of
-        # silently mimicking the backtest (user decides).
-        if (not PAPER_TRADE) and (not LIVE_CASH_SLEEVE):
+        # audit v17 (2026-10-30, user direction): idle money is NOT parked in
+        # any fund by this bot — it stays free for the user's own trades, which
+        # is worth more than the liquid rate to them.  Just say where things
+        # stand, once, without suggesting any sweep.
+        if (not PAPER_TRADE) and BOT_BOOK_ONLY:
             _idle = self.broker.cash()
             if _idle > 2 * INVEST_PER_DAY:
-                P.note(f"Idle cash {fmt_cr(_idle)} earns nothing in live mode. "
-                       f"Backtests park spare money in {CASH_SLEEVE_SYMBOL}. Set "
-                       f"LIVE_CASH_SLEEVE=True to sweep weekly, or simply keep "
-                       f"spare cash in a liquid fund at your broker.")
+                P.note(f"This bot is holding {fmt_cr(_idle)} of its own cash "
+                       f"uninvested (the plan cannot place it today).  It does "
+                       f"NOT park it in a fund: no sweep, no order.  That cash, "
+                       f"and the rest of your Upstox balance, stays free for "
+                       f"your own trades.")
         P.section("TODAY'S BUYING — daily budget", "\U0001F4E6")
         basket = self.sip_basket()
+        # audit v17 follow-on (2026-10-30): now that the book is only what the
+        # user assigns, a small assignment can be mathematically unable to buy:
+        # the plan spreads it over MAX_HOLDINGS names, and each slice must
+        # clear MIN_TRADE_VALUE.  Say the arithmetic out loud.
+        _book_eq = self.broker.equity(self.latest_prices())
+        _need_eq = MAX_HOLDINGS * MIN_TRADE_VALUE
+        if BOT_BOOK_ONLY and INVEST_PER_DAY > 0 and 0 < _book_eq < _need_eq:
+            P.warn(f"This bot's whole book is {fmt_cr(_book_eq)}, spread over up "
+                   f"to {MAX_HOLDINGS} ETFs = ~{fmt_cr(_book_eq / MAX_HOLDINGS)} "
+                   f"per name — below the {fmt_rs(MIN_TRADE_VALUE)} minimum order "
+                   f"size, so NO buy can be placed at this size.  Assign at "
+                   f"least {fmt_cr(_need_eq)} of STARTING_CAPITAL (more is "
+                   f"better: 3-5x) or the bot can only analyse and sell.")
         if INVEST_PER_DAY <= 0:
             if basket:
                 P.kv("ETFs to buy into", ", ".join(basket))
@@ -5785,6 +5931,16 @@ class TradingCycle:
             budget_today = INVEST_PER_DAY
         else:
             budget_today = autofill_budget(INVEST_PER_DAY, pool0, sessions_left_eff)
+        # audit v17: the day's budget can never exceed the cash THIS BOT owns
+        # (the user's balance is not available to it any more).  Say so once
+        # instead of letting every order fail one by one.
+        _sp0 = self.broker.spendable()
+        if plan and budget_today > _sp0 + 1.0:
+            P.info(f"Today's budget is capped at {fmt_cr(_sp0)} — that is all "
+                   f"the cash this bot owns right now (budget was "
+                   f"{fmt_rs(budget_today)}).  It never spends money outside "
+                   f"its own book.")
+            budget_today = _sp0
         if _trickle and plan:
             _sw = "session" if _sessions_real == 1 else "sessions"
             P.note(f"Month-end re-plan is only {_sessions_real} market {_sw} "
@@ -5848,10 +6004,8 @@ class TradingCycle:
                      f"budget {budget_today:.0f} < MIN_TRADE_VALUE "
                      f"{MIN_TRADE_VALUE:.0f}; zero orders possible"))
             return 0
-        # audit v5 #4: if live cash can't cover today's buys, sell just enough
-        # of the parked idle-cash sleeve first (matches backtest behaviour)
-        if plan and remaining >= MIN_TRADE_VALUE:
-            self.sleeve_unsweep(remaining)
+        # audit v17: no idle-cash sleeve exists to sell down — buys are funded
+        # strictly from this bot's own cash (spendable()), never from yours.
         bought = 0
         deployed = 0.0
         # audit v5 #3 (2026-10-28): exactly ONE order per ETF per day.  The
@@ -5966,9 +6120,13 @@ class TradingCycle:
                        f"any gap left after it fills is retried tomorrow.")
                 continue
             need = px * qty * 1.01
-            if self.broker.cash() < need:
-                P.warn(f"Not buying {sym} — not enough free cash "
-                       f"(needs {fmt_cr(need)}, have {fmt_cr(self.broker.cash())}).")
+            # audit v17: the budget is this bot's own cash (capped by your
+            # account's free margin) — never your whole Upstox balance
+            if self.broker.spendable() < need:
+                P.warn(f"Not buying {sym} — not enough cash IN THIS BOT'S OWN "
+                       f"BOOK (needs {fmt_cr(need)}, it has "
+                       f"{fmt_cr(self.broker.spendable())}).  Your money "
+                       f"outside the bot is not used.")
                 continue
             # audit F7 (v3): per-tier spread fallback when no live quote
             _sp = qspread.get(sym)
@@ -6040,9 +6198,6 @@ class TradingCycle:
                 "orders": int(dlog.get("orders", 0)) + bought}))
         except Exception:
             pass
-        # audit v5 #4: whatever cash is left idle beyond the buffer gets
-        # parked in the liquid sleeve (weekly cadence inside sleeve_sweep)
-        self.sleeve_sweep()
         _round_note = " (whole-unit rounding, ±1 unit per order)" \
             if deployed > budget_today else ""
         P.ok(f"Today's buying done — {bought} order(s), {fmt_rs(deployed)} "
@@ -6102,8 +6257,10 @@ class TradingCycle:
             _sln, _slv = (_dt_sl["n"] or 0), (_dt_sl["v"] or 0.0)
             _day = (f" | today in strategy: {fmt_cr(_dv)} in {_dn} order(s)"
                     if _dv > deployed + 1.0 else "")
-            _day += (f" | parked in cash sleeve: {fmt_cr(_slv)} in {_sln} "
-                     f"order(s) (overnight parking — NOT market exposure)"
+            # audit v17: no parking any more.  Old rows can still show today;
+            # name them as legacy so they never read as strategy money.
+            _day += (f" | LEGACY idle-cash park earlier today: {fmt_cr(_slv)} "
+                     f"in {_sln} order(s) — that behaviour is REMOVED in v17"
                      if _slv > 1.0 else "")
             P.kv("Money invested today",
                  f"{fmt_rs(deployed)} across {bought} ETF(s) this run"
@@ -6306,10 +6463,11 @@ class TradingCycle:
                 eq_d = cash + hv_d
             else:
                 hv_d, eq_d = hv, eq
-            P.section("ACCOUNT STATUS", "\U0001F4B0")
-            P.kv("Cash on hand", fmt_cr(cash))
-            P.kv("ETFs you hold (worth now)", fmt_cr(hv_d))
-            P.kv("Your total (cash + ETFs)", fmt_cr(eq_d), val_color=_C.GREEN)
+            P.section("ACCOUNT STATUS — THIS BOT'S OWN BOOK", "\U0001F4B0")
+            P.kv("Cash in this bot's book", fmt_cr(cash))
+            P.kv("ETFs this bot holds (worth now)", fmt_cr(hv_d))
+            P.kv("THIS BOT'S TOTAL (its cash + its ETFs)", fmt_cr(eq_d),
+                 val_color=_C.GREEN)
             P.kv("Risk state", self.risk.state)
             dd = max(1 - eq_d / self.risk.peak, 0.0) if self.risk.peak else 0.0
             P.kv("Drawdown from peak", fmt_pct(dd, signed=False))
@@ -6918,7 +7076,7 @@ class TradingCycle:
                          "MARKET", reason))
                     continue
                 qty = int(buy_val / price) if price > 0 else 0
-                cash = self.broker.cash()
+                cash = self.broker.spendable()   # audit v17: own book only
                 max_qty = int(cash / (price * 1.002)) if price > 0 else 0
                 qty = min(qty, max_qty)
                 if qty <= 0:
@@ -6988,9 +7146,10 @@ class TradingCycle:
         if rows:
             P.table(["Symbol", "Name", "Units", "Avg Cost", "LTP", "Value", "P&L"], rows,
                     aligns=["<", "<", ">", ">", ">", ">", ">"])
-        P.kv("Cash in account", fmt_cr(cash))
-        P.kv("ETFs you hold (worth now)", fmt_cr(hv))
-        P.kv("Your total (cash + ETFs)", fmt_cr(eq), val_color=_C.GREEN)
+        P.kv("Cash in this bot's book", fmt_cr(cash))
+        P.kv("ETFs this bot holds (worth now)", fmt_cr(hv))
+        P.kv("THIS BOT'S TOTAL (its cash + its ETFs)", fmt_cr(eq),
+             val_color=_C.GREEN)
         P.kv("Invested fraction", fmt_pct(safe_div(hv, eq, 0.0)))
         dd = 1 - eq / self.risk.peak if self.risk.peak else 0.0
         P.kv("Drawdown from peak", fmt_pct(dd, signed=False),
@@ -8907,22 +9066,35 @@ def cmd_status(db: Db):
     hv = broker.holdings_value(prices)
     eq = cash + hv
     P.kv("Trading mode", "PAPER (simulated)" if PAPER_TRADE else "LIVE")
-    P.kv("Cash on hand", fmt_cr(cash))
-    P.kv("ETFs you hold (worth now)", fmt_cr(hv))
-    P.kv("Your total (cash + ETFs)", fmt_cr(eq), val_color=_C.GREEN)
-    # audit v14 §1/§3 (2026-10-30): "Invested +2.80%" mixed the cash sleeve
-    # with market exposure and the "+" read like profit.  Split it: strategy
-    # ETFs (the engine's real exposure) vs the overnight cash sleeve.
-    _sleeve_v = 0.0
-    for _s in CASH_PROXY_SYMBOLS:
-        _h = broker.holdings().get(_s)
-        if _h:
-            _sleeve_v += _h["qty"] * prices.get(_s, _h["avg_cost"])
-    _strat_v = max(0.0, hv - _sleeve_v)
-    P.kv("Invested in strategy ETFs", fmt_pct(safe_div(_strat_v, eq, 0.0), signed=False))
-    if _sleeve_v > 0:
-        P.kv("Parked in overnight sleeve", fmt_pct(safe_div(_sleeve_v, eq, 0.0), signed=False)
-             + f"  ({CASH_SLEEVE_SYMBOL} — counts as parked cash, not market exposure)")
+    # audit v17 (2026-10-30, user direction): every figure below is THIS BOT'S
+    # OWN BOOK — its own cash + the ETFs it bought itself.  Your other money
+    # and holdings are never folded in.
+    P.kv("Cash in this bot's book", fmt_cr(cash))
+    P.kv("ETFs this bot holds (worth now)", fmt_cr(hv))
+    P.kv("THIS BOT'S TOTAL (its cash + its ETFs)", fmt_cr(eq),
+         val_color=_C.GREEN)
+    P.kv("Invested in strategy ETFs", fmt_pct(safe_div(hv, eq, 0.0), signed=False))
+    if not PAPER_TRADE:
+        # read-only view of the rest of the account, so the two can never be
+        # confused again (the ₹2.34 L park that started this is the example)
+        _av = db.meta_get("broker_available_cash")
+        try:
+            _av = float(_av) if _av not in (None, "") else None
+        except (TypeError, ValueError):
+            _av = None
+        try:
+            _manual = sorted(json.loads(db.meta_get("manual_holdings", "[]")))
+        except Exception:
+            _manual = []
+        P.sub("Your own Upstox account (outside this bot — read only)")
+        P.kv("Free margin in the account",
+             (fmt_cr(_av) + f"  (of which this bot's own cash is {fmt_cr(cash)})")
+             if _av is not None else "not read this run")
+        P.kv("Holdings that are not this bot's",
+             ", ".join(_manual) if _manual else "none")
+        P.note("The bot counts, buys and sells NONE of the above.  It has no "
+               "idle-cash sweep: leftover money simply stays free for your own "
+               "trades.")
     # audit v13 #5: the very first seed equals STARTING_CAPITAL until the
     # first confirmed run realises the peak — label that case so it doesn't
     # read as a phantom all-time-high next to the real total.
@@ -8931,12 +9103,17 @@ def cmd_status(db: Db):
     # flip TODAY (v12 P0-1) — otherwise drawdown 0.00% next to a just-seeded
     # peak looks unexplained.
     _rb = db.meta_get("risk_peak_rebased_date", "")
+    _rebase_due = db.meta_get("risk_peak_rebase_due") == "1"
     _peak_note = ("  (startup seed — updates from your real book "
                   "on the first confirmed run)" if _peak_seed
                   else "  (peak rebased on mode flip today)" if _rb == today_str()
+                  else "  (v17 book scope — will be re-based to THIS BOT'S own "
+                       "equity on the next confirmed run; the stored peak still "
+                       "includes money outside the bot)" if _rebase_due
                   else "")
     P.kv("Peak equity", fmt_cr(risk.peak) + _peak_note)
-    dd = max(1 - eq / risk.peak, 0.0) if risk.peak else 0.0
+    dd = 0.0 if _rebase_due else (
+        max(1 - eq / risk.peak, 0.0) if risk.peak else 0.0)
     P.kv("Current drawdown", fmt_pct(dd, signed=False),
          val_color=_C.RED if dd > 0.05 else _C.WHITE)
     P.kv("Risk state", risk.state)
@@ -8945,7 +9122,12 @@ def cmd_status(db: Db):
     # live console showed 93.28% vs NORMAL with no explanation).  Call out the
     # contradiction and its meaning THE MOMENT the numbers disagree.
     _dr, _ds, _dx = dd_thresholds(VOL_TARGET)
-    if dd >= _dx and risk.state != "EXTREME":
+    if _rebase_due:
+        P.note("Drawdown is not shown yet: the stored risk peak still covers "
+               "your whole Upstox account, while the figures above cover only "
+               "this bot's book.  The peak is re-based automatically on the "
+               "next confirmed run; nothing is sold before that.")
+    elif dd >= _dx and risk.state != "EXTREME":
         P.err(f"Drawdown {fmt_pct(dd, signed=False)} is PAST the all-cash "
               f"trigger ({fmt_pct(_dx, signed=False)}) but the risk state reads "
               f"'{risk.state}' — the engine last saw the book on "
@@ -8983,7 +9165,8 @@ def cmd_status(db: Db):
             P.note(f"Marked at today's fill price (VWAP): {', '.join(marked_today)} — "
                    f"last-close marks return after tonight's close download.")
     else:
-        P.info("No open positions — the account is fully in cash.")
+        P.info("No open positions in this bot's book — its money is all cash. "
+               "(Holdings of yours shown above, if any, are separate.)")
     _mode_now = "PAPER" if PAPER_TRADE else "LIVE"
     P.sub(f"Recent orders — {_mode_now} mode (order book)")
     orows = []
@@ -9183,24 +9366,26 @@ def print_action_panel(db: Db):
                 _mw = "paper money (simulated)" if PAPER_TRADE else "real money"
                 # audit v16 P1-B: split the overnight-cash sweep out of the
                 # "settled real money" claim — parking is not market exposure
-                _fv_strat = fv
-                _fn_strat = fn
                 if side == "BUY" and fn:
+                    # audit v17: the idle-cash sweep is gone.  Orders from
+                    # BEFORE v17 may still sit in today's rows — label them
+                    # legacy so they are never read as strategy deployment.
                     _ph = ",".join("?" * len(CASH_PROXY_SYMBOLS))
                     _sr = db.one(f"SELECT COUNT(*) AS n, COALESCE(SUM(value),0) AS v "
                                  f"FROM orders WHERE exec_date=? AND side='BUY' "
                                  f"AND status='FILLED' AND symbol IN ({_ph})",
                                  (today,) + tuple(CASH_PROXY_SYMBOLS))
+                    _fn_strat = fn - (_sr["n"] or 0)
+                    _fv_strat = fv - (_sr["v"] or 0.0)
                     if (_sr["n"] or 0) > 0:
-                        _fn_strat = fn - (_sr["n"] or 0)
-                        _fv_strat = fv - (_sr["v"] or 0.0)
                         P.ok(f"{side}: {_fn_strat} strategy order(s) SETTLED "
                              f"({fmt_cr(_fv_strat)} {_mw})")
-                        P.ok(f"{side}: {_sr['n']} cash-sleeve order(s) PARKED "
-                             f"({fmt_cr(_sr['v'])} — overnight parking, not "
-                             f"market exposure)")
-                        _fv_strat = None
-                if _fv_strat is not None:
+                        P.ok(f"{side}: {_sr['n']} LEGACY idle-cash park order(s) "
+                             f"({fmt_cr(_sr['v'])}) from the old behaviour — "
+                             f"removed in v17; not market exposure")
+                    else:
+                        P.ok(f"{side}: {fn} order(s) SETTLED ({fmt_cr(fv)} {_mw})")
+                else:
                     P.ok(f"{side}: {fn} order(s) SETTLED ({fmt_cr(fv)} {_mw})")
                 if on_:
                     P.warn(f"{side}: {on_} order(s) open at the broker "
@@ -9277,7 +9462,10 @@ def print_action_panel(db: Db):
             P.table(["Symbol", "Name", "Units", "12-1 momentum", "200-DMA", "Verdict"],
                     health_rows, aligns=["<", "<", ">", ">", "<", "<"])
         if sleeve_rows:
-            P.sub("Cash sleeve (parked money — momentum rules do not apply)")
+            # audit v17: the bot no longer parks cash.  If a cash proxy is in
+            # the book it came from before v17 — say so plainly and do not
+            # treat it as a strategy holding.
+            P.sub("OLD parked cash (pre-v17 leftovers — NOT this bot's plan)")
             _sv_rows = []
             for h in sleeve_rows:
                 _lp = db.one("SELECT close FROM price_daily WHERE symbol=? "
@@ -9286,9 +9474,12 @@ def print_action_panel(db: Db):
                 _sv_rows.append([h["symbol"],
                                  universe_map().get(h["symbol"], {}).get("name", h["symbol"])[:28],
                                  fmt_num(h["qty"], 0), fmt_cr(h["qty"] * _px),
-                                 "overnight parking — swept back when buys need cash"])
+                                 "left over from the removed idle-cash sweep"])
             P.table(["Symbol", "Name", "Units", "Value", "Note"],
                     _sv_rows, aligns=["<", "<", ">", ">", "<"])
+            P.note("v17 removed idle-cash parking.  These units are reported "
+                   "but are no longer managed: sell them yourself in Upstox "
+                   "if you want the cash free.")
 
         # ---- 3. frontrunners not in the basket ------------------------------
         cands = []
@@ -9895,6 +10086,9 @@ def cmd_selftest(db: Db):
         for _s16 in ("OLDPOS", "NEWBUY"):
             _dbf16.execute("INSERT OR REPLACE INTO etf_universe(symbol,status) "
                            "VALUES(?,'ACTIVE')", (_s16,))
+        # v17: the bot must own these, else the scope sync (correctly) treats
+        # them as the user's holdings and releases them
+        _dbf16.meta_set("bot_symbols", json.dumps(["OLDPOS", "NEWBUY"]))
         _dbf16.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
                        "VALUES(?,?,?,?)", ("OLDPOS", 5.0, 100.0, now_iso()))
         _dbf16.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
@@ -10947,15 +11141,18 @@ def cmd_selftest(db: Db):
         _r_paper = _bp.sync_live_cash()
         _bl = Broker(dbsub14, _tax14, client=_FakeClient(), paper=False)
         _r_live = _bl.sync_live_cash()
-        _cash14 = _bl.cash()
+        _cash14 = _bl.cash()          # v17: ledger NOT overwritten by 500000
         _bf = Broker(dbsub14, _tax14, client=_BoomClient(), paper=False)
         _r_fail = _bf.sync_live_cash()
         _cash14b = _bf.cash()
-        check("L2: live ledger syncs from broker funds; paper never calls the API; "
-              "API failure keeps the ledger",
-              _r_paper is True and _r_live is True and _cash14 == 500000.0
-              and _r_fail is False and _cash14b == 500000.0,
+        check("v17: the broker's free margin is never adopted into the bot's "
+              "ledger (paper never calls the API; unreadable margin refuses orders)",
+              _r_paper is True and _r_live is True and _cash14 == 1000000.0
+              and _r_fail is False and _cash14b == 1000000.0,
               f"paper={_r_paper} live={_r_live}->{_cash14} fail={_r_fail}->{_cash14b}")
+        check("v17: spendable() caps the bot's own cash by the broker's margin",
+              _bl.spendable() == 500000.0,
+              f"own={_bl.cash()} avail=500000 spendable={_bl.spendable()}")
     finally:
         dbsub14.close()
         try:
@@ -10967,12 +11164,15 @@ def cmd_selftest(db: Db):
     # y/n in live_order_ok() (user direction; the --confirm flag is gone).
     # This test runs with PAPER_TRADE forced True, so only structural
     # properties of the order path are pinned here.
-    check("L1: live order paths are guard-railed (LIMIT buys; live sleeve on "
-          "since audit v5#4 — paper still untouched)",
-          LIVE_ORDER_TYPE == "LIMIT" and LIVE_CASH_SLEEVE is True
-          and 0 < LIVE_LIMIT_BUFFER <= 0.01,
-          f"ORDER={LIVE_ORDER_TYPE} SLEEVE={LIVE_CASH_SLEEVE} "
-          f"BUFFER={LIVE_LIMIT_BUFFER}")
+    check("L1: live order paths are guard-railed (LIMIT buys, banded buffer) "
+          "and the v17 book scope is ON",
+          LIVE_ORDER_TYPE == "LIMIT" and BOT_BOOK_ONLY is True
+          and 0 < LIVE_LIMIT_BUFFER <= 0.01
+          and not hasattr(TradingCycle, "sleeve_sweep")
+          and not hasattr(TradingCycle, "sleeve_unsweep"),
+          f"ORDER={LIVE_ORDER_TYPE} SCOPE={BOT_BOOK_ONLY} "
+          f"BUFFER={LIVE_LIMIT_BUFFER} "
+          f"sweep={hasattr(TradingCycle, 'sleeve_sweep')}")
     # audit v8 (2026-10-28, user direction): PAPER by default — a bare run must
     # simulate; going live needs the config flip AND --confirm (both guards
     # checked above stay conditional on PAPER_TRADE, so they arm correctly if
@@ -11034,6 +11234,9 @@ def cmd_selftest(db: Db):
         dbsub15.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
                         "VALUES(?,?,?,?)", ("OLDJUNK", 1, 10.0, now_iso()))
         dbsub15.meta_set("cash_balance", "1000000")
+        # v17: the bot owns ETFA and ETFC (it bought them); ETFD is the USER's
+        # holding and must never be adopted, counted or sold
+        dbsub15.meta_set("bot_symbols", json.dumps(["ETFA", "ETFC"]))
         _tr15 = TaxEngine(dbsub15)
         _bl15 = Broker(dbsub15, _tr15, client=_TruthClient(), paper=False)
 
@@ -11046,12 +11249,13 @@ def cmd_selftest(db: Db):
                      == len(h15)
                      and dbsub15.one("SELECT qty FROM positions WHERE symbol='ETFA'")["qty"] == _qa
                      and dbsub15.one("SELECT qty FROM positions WHERE symbol='ETFB'") is None)
-        check("live truth: broker holdings+positions decide what we own; journal "
-              "mirror rewritten; foreign ETFs untouched",
+        check("live truth (v17 scope): broker holdings+positions decide what "
+              "we own AMONG BOT-OWNED ETFs; a manual holding is untouched; "
+              "the bot's ledger is its own, not the broker's 2.5 L",
               _ok15 is True and abs(_qa - 13.0) < 1e-9
               and abs(_aa - (12 * 100.0 + 1 * 101.0) / 13.0) < 1e-6
               and _qc == 3.0 and _mirrored
-              and _bl15.cash() == 250000.0
+              and _bl15.cash() == 1000000.0
               and dbsub15.one("SELECT qty FROM positions WHERE symbol='OLDJUNK'") is None
               and dbsub15.one("SELECT qty FROM positions WHERE symbol='ETFD'") is None,
               f"ETFA={_qa}@{_aa:.4f} ETFC={_qc} cash={_bl15.cash()}")
@@ -11146,81 +11350,95 @@ def cmd_selftest(db: Db):
           and _s3c == {"A": 10000.0, "B": 10000.0} and _s3d == {},
           f"equal={_s3a} capped={_s3b} clipped={_s3c} dust={_s3d}")
 
-    # #4: live idle-cash sleeve — weekly sweep parks surplus; unsweep frees
-    #     cash only to fund real buys; monthly cadence respected
-    class _SleeveClient:
-        def __init__(self, cash=250000.0, hold=None):
-            self._cash, self._hold = cash, (hold or [])
+    # v17 (user direction 2026-10-30): the bot owns ONLY what it bought, and
+    # only its STARTING_CAPITAL.  Everything else in the Upstox account is the
+    # user's — never counted, never sized against, never traded.
+    class _ScopeClient:
+        def __init__(self, cash=250000.0, hold=None, orders=None):
+            self._cash, self._hold, self._orders = cash, (hold or []), (orders or [])
             self.placed = []
         def funds_available(self): return self._cash
         def holdings(self): return list(self._hold)
         def positions(self): return []
-        def orders_book(self): return []
+        def orders_book(self): return list(self._orders)
         def place_order(self, *a, **k):
-            self.placed.append((a, k)); return {"data": {"order_id": "T-1"}}
+            self.placed.append((a, k)); return {"data": {"order_id": "T-9"}}
         def order_details(self, oid):
             return {"data": {"average_price": None, "status": "complete"}}
 
-    dbsub17 = Db(DATA_DIR / "selftest_sleeve.db")
+    dbsub17 = Db(DATA_DIR / "selftest_scope.db")
     try:
-        dbsub17.execute(
-            "INSERT INTO etf_universe(symbol,name,category,index_family,status) "
-            "VALUES(?,?,?,?,?)", (CASH_SLEEVE_SYMBOL, "sleeve", "DEBT",
-                                  "liquid", "ACTIVE"))
-        dbsub17.execute(
-            "INSERT INTO price_daily(symbol,date,open,high,low,close,adj_close,"
-            "volume,traded_value) VALUES(?,?,?,?,?,?,?,?,?)",
-            (CASH_SLEEVE_SYMBOL, today_str(), 100, 100, 100, 100.0, 100.0, 1e7, 1e8))
-        dbsub17.meta_set("cash_balance", "900000")
-        _tax17 = TaxEngine(dbsub17)
-        _bk17 = Broker(dbsub17, _tax17, client=_SleeveClient(900000.0), paper=False)
-        _bk17.sync_live_book()
-        _cyc17 = TradingCycle.__new__(TradingCycle)
-        _cyc17.db, _cyc17.broker, _cyc17.data = dbsub17, _bk17, DataManager(dbsub17, None)
-        # the sleeve engine guards on the GLOBAL live/paper switch, which the
-        # harness forces to paper — flip it for the live-behaviour test
-        _save_pt17a = globals()["PAPER_TRADE"]
-        globals()["PAPER_TRADE"] = False
-        try:
-            _s1 = _cyc17.sleeve_sweep()
-            _cash_after = _bk17.cash()
-            _hqty = _bk17.holdings().get(CASH_SLEEVE_SYMBOL, {}).get("qty", 0)
-            _s2 = _cyc17.sleeve_sweep()      # same-day/weekly cadence blocks
-            _pc_after_sweeps = len(_bk17.client.placed)
-            # unsweep frees cash ONLY to fund buys: need 500k with cash low
-            _freq = 500000.0
-            _cash_before_u = _bk17.cash()
-            _freed = _cyc17.sleeve_unsweep(_freq)
-            _hqty2 = _bk17.holdings().get(CASH_SLEEVE_SYMBOL, {}).get("qty", 0)
-        finally:
-            globals()["PAPER_TRADE"] = _save_pt17a
-        check("v5#4: weekly sweep parks idle cash in the liquid sleeve, once max",
-              _s1 == 1 and _hqty > 0 and _cash_after < 900000
-              and _s2 == 0 and _pc_after_sweeps == 1,
-              f"sweep={_s1} sleeve_qty={_hqty} cash_left={_cash_after:.0f} "
-              f"second={_s2} orders_then={_pc_after_sweeps}")
-        check("v5#4: unsweep sells just enough sleeve to fund today's buys",
-              _freed > 0 and _hqty2 < _hqty
-              and _bk17.cash() > _cash_before_u
-              and _hqty2 >= _hqty - (_freq / 100.0) - 2,
-              f"freed={_freed:.0f} sleeve {_hqty}->{_hqty2}")
-        # paper mode: sleeve engine fully inert
-        _bp17 = Broker(dbsub17, _tax17, client=_SleeveClient(1.0), paper=True)
-        _cyc17.broker = _bp17
-        _save_pt17 = globals()["PAPER_TRADE"]
-        globals()["PAPER_TRADE"] = True
-        try:
-            _pi = _cyc17.sleeve_sweep(), _cyc17.sleeve_unsweep(1e6)
-        finally:
-            globals()["PAPER_TRADE"] = _save_pt17
-        check("v5#4: sleeve engine never fires in paper mode (DB is truth)",
-              _pi == (0, 0.0) and len(_bp17.client.placed) == 0, f"paper={_pi}")
+        for _sym, _nm in (("BOTETF", "Bot ETF"), ("MANUAL", "My ETF"),
+                          (CASH_SLEEVE_SYMBOL, "liquid park")):
+            dbsub17.execute(
+                "INSERT OR REPLACE INTO etf_universe(symbol,name,category,"
+                "index_family,status) VALUES(?,?,?,?,?)",
+                (_sym, _nm, "EQUITY", "nifty", "ACTIVE"))
+        # state left by v16: whole-account cash ledger + a whole-account peak
+        dbsub17.meta_set("cash_balance", "300000")
+        dbsub17.meta_set("equity_peak", "250000")
+        # the bot's own buy (1000 + 5 charges), the old idle-cash park, and a
+        # buy the USER made manually — all three sit in the broker book
+        for _sym, _qty, _val, _chg in (("BOTETF", 10, 1000.0, 5.0),
+                                       (CASH_SLEEVE_SYMBOL, 1959, 228595.0, 40.0)):
+            dbsub17.execute(
+                "INSERT INTO orders(ts,signal_as_of,exec_date,symbol,side,qty,price,"
+                "value,slippage,charges,status,mode,order_type,reason) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (now_iso(), today_str(), today_str(), _sym, "BUY", _qty,
+                 _val / _qty, _val, 0, _chg, "FILLED", "LIVE", "MARKET", "test"))
+        dbsub17.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
+                        "VALUES(?,?,?,?)", ("BOTETF", 10, 100.0, now_iso()))
+        dbsub17.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
+                        "VALUES(?,?,?,?)", (CASH_SLEEVE_SYMBOL, 1959, 116.69, now_iso()))
+        _cl17 = _ScopeClient(cash=250000.0, hold=[
+            {"trading_symbol": "BOTETF", "quantity": 10, "average_price": 100.0},
+            {"trading_symbol": "MANUAL", "quantity": 7, "average_price": 50.0},
+            {"trading_symbol": CASH_SLEEVE_SYMBOL, "quantity": 1959,
+             "average_price": 116.69}])
+        _bk17 = Broker(dbsub17, TaxEngine(dbsub17), client=_cl17, paper=False)
+        _ok17 = _bk17.sync_live_book()
+        _held17 = _bk17.holdings()
+        _rows17 = {r["symbol"] for r in
+                   dbsub17.query("SELECT symbol FROM positions WHERE qty>0")}
+        check("v17: the bot adopts ONLY its own ETFs — a manual holding and an "
+              "old liquid park are left untouched (not counted, not sold)",
+              _ok17 is True and set(_held17) == {"BOTETF"}
+              and _rows17 == {"BOTETF"} and _cl17.placed == []
+              and _bk17.bot_symbols() == {"BOTETF"},
+              f"held={_held17} rows={_rows17} placed={_cl17.placed} "
+              f"owned={_bk17.bot_symbols()}")
+        check("v17: the broker's ₹2.5 L free margin is NOT the bot's money — "
+              "its ledger is its own ₹STARTING_CAPITAL minus its own buy",
+              abs(_bk17.cash() - (STARTING_CAPITAL - 1005.0)) < 1.0
+              and _bk17.spendable() == min(_bk17.cash(), 250000.0),
+              f"cash={_bk17.cash():.2f} spendable={_bk17.spendable():.2f}")
+        # the whole-account risk peak must NOT survive the scope change
+        _rk17 = RiskEngine(dbsub17)
+        _rk17.peak = 250000.0
+        _rk17.update(_bk17.cash() + 1000.0, "selftest")
+        check("v17: a whole-account risk peak is re-based to the bot's own "
+              "book on the next evaluation (else it reads as a ~96% crash)",
+              abs(_rk17.peak - (_bk17.cash() + 1000.0)) < 1.0
+              and _rk17.state == "NORMAL"
+              and not dbsub17.meta_get("risk_peak_rebase_due"),
+              f"peak={_rk17.peak:.0f} state={_rk17.state}")
     finally:
         dbsub17.close()
         try:
-            os.remove(DATA_DIR / "selftest_sleeve.db")
+            os.remove(DATA_DIR / "selftest_scope.db")
         except Exception:
             pass
+
+    # the parking machinery is GONE — not merely switched off
+    check("v17: idle-cash parking is removed from the code (no sweep, no "
+          "unsweep, no separate cash-park offer)",
+          not hasattr(TradingCycle, "sleeve_sweep")
+          and not hasattr(TradingCycle, "sleeve_unsweep")
+          and "offer_cash_sweep" not in globals(),
+          f"sweep={hasattr(TradingCycle, 'sleeve_sweep')} "
+          f"unsweep={hasattr(TradingCycle, 'sleeve_unsweep')} "
+          f"offer={'offer_cash_sweep' in globals()}")
 
     # #6: momentum-gated entry overlay — a strong trend's dip below the
     #     200-DMA is buyable when the floor is set; weak trends still skipped
@@ -11422,9 +11640,13 @@ def cmd_selftest(db: Db):
 
     # 2026-10-29 user direction: one number (STARTING_CAPITAL) is the daily
     # deploy amount in BOTH modes; INVEST_PER_DAY derives from it.
-    check("v12: INVEST_PER_DAY tracks STARTING_CAPITAL (edit one number for "
-          "'how much do I invest per run')",
-          INVEST_PER_DAY == STARTING_CAPITAL,
+    # v17 re-scoped the two numbers: STARTING_CAPITAL is the SIZE OF THE BOOK
+    # the bot may manage, INVEST_PER_DAY is how fast it deploys into it.  They
+    # ship equal (one number to edit), but a larger book with a smaller daily
+    # tranche is now a legitimate setup — the floor may never exceed the book.
+    check("v12/v17: INVEST_PER_DAY is a deployment SPEED against "
+          "STARTING_CAPITAL (the book size); it can never exceed the book",
+          0 < INVEST_PER_DAY <= STARTING_CAPITAL,
           f"INVEST_PER_DAY={INVEST_PER_DAY} STARTING_CAPITAL={STARTING_CAPITAL}")
 
     # audit v12 P0-1: a cross-mode (paper->live) flip rebases the risk peak
@@ -11853,10 +12075,15 @@ def cmd_navdiag(db: Db, symbols=None):
 
 
 def cmd_reconcile(db: Db):
-    """Compare the internal ledger with the broker's positions (live mode safety)."""
+    """Compare THIS BOT'S ledger with the broker, symbol by symbol.
+
+    audit v17 (2026-10-30): the comparison is limited to the ETFs the bot
+    bought itself (bot_symbols).  Your own holdings are listed separately as
+    read-only information — they are never expected to appear in the bot's
+    ledger and a difference there is NOT a mismatch."""
     P.section("BROKER RECONCILIATION", "\U0001F50D")
-    P.warn("LIVE safety check (audit #9): the ledger and the broker can drift apart. "
-           "Always reconcile before trusting the account.")
+    P.warn("LIVE safety check (audit #9): the ledger and the broker can drift "
+           "apart.  Always reconcile before trusting the book.")
     try:
         env = load_env()
     except Exception as e:
@@ -11864,18 +12091,28 @@ def cmd_reconcile(db: Db):
         return
     client = UpstoxClient(env)
     broker = Broker(db, TaxEngine(db), client, paper=PAPER_TRADE)
-    mine = broker.holdings()
+    mine = broker.holdings()          # synced from the broker at call time
+    owned = broker.bot_symbols()
     try:
-        theirs_list = client.positions()
+        holds = client.holdings()
+        poss = client.positions()
     except Exception as e:
-        P.err(f"Could not fetch broker positions: {e}")
+        P.err(f"Could not fetch the broker book: {e}")
         return
-    theirs = {}
-    for pos in theirs_list:
-        sym = (pos.get("trading_symbol") or pos.get("symbol") or "").strip()
-        qty = float(pos.get("quantity") or pos.get("net_quantity") or 0)
-        if sym:
-            theirs[sym] = qty
+    theirs, others = {}, set()
+    for r in list(holds or []) + list(poss or []):
+        sym = (r.get("trading_symbol") or r.get("tradingsymbol")
+               or r.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        try:
+            q = (float(r.get("quantity") or 0) + float(r.get("t1_quantity") or 0))
+        except (TypeError, ValueError):
+            q = 0.0
+        if sym not in owned:
+            others.add(sym)
+            continue
+        theirs[sym] = theirs.get(sym, 0.0) + q
     syms = sorted(set(mine) | set(theirs))
     if not syms:
         P.info("No positions on either side.")
@@ -11891,9 +12128,14 @@ def cmd_reconcile(db: Db):
             aligns=["<", ">", ">", "<"])
     mism = sum(1 for r in rows if r[3].find("MISMATCH") >= 0 if isinstance(r[3], str))
     if mism:
-        P.warn(f"{mism} mismatch(es). Resolve before placing new live orders.")
+        P.warn(f"{mism} mismatch(es) among THIS BOT'S holdings. Resolve before "
+               f"placing new live orders.")
     else:
-        P.ok("Ledger and broker agree.")
+        P.ok("This bot's ledger and the broker agree on every ETF it owns.")
+    if others:
+        P.note("Not the bot's business (yours, never counted or traded): "
+               + ", ".join(sorted(others))[:300]
+               + " — differences there are expected and are NOT mismatches.")
 
 
 def cmd_monitor(db: Db):
@@ -12373,7 +12615,6 @@ def main(argv=None):
                 # audit v4 L1 -> 2026-10-29: runtime y/n replaces --confirm
                 P.note("No real orders placed.  (Set PAPER_TRADE=True at the "
                        "top of the script to simulate instead.)")
-                offer_cash_sweep(db)     # audit v12: risk-free parking ≠ strategy
                 return
             cmd_trade(db, force_exec=args.force_exec)
         elif args.command == "monitor":
@@ -12433,7 +12674,6 @@ def main(argv=None):
                                  "broker fill is fetched and logged.  Run "
                                  "'reconcile' after trading to compare the "
                                  "ledger with the broker."):
-                offer_cash_sweep(db)     # audit v12: risk-free parking ≠ strategy
                 return
             cmd_trade(db, force_exec=args.force_exec)
         else:  # run
@@ -12462,7 +12702,6 @@ def main(argv=None):
                       "by your answer (analysis only this run — the risk "
                       "engine's peak/locks are NOT re-evaluated until you "
                       "answer y).")
-                offer_cash_sweep(db)     # audit v12: separate risk-free confirm
                 cmd_status(db)
                 return
             cmd_trade(db, force_exec=args.force_exec, final_status=False)
