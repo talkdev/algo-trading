@@ -24,8 +24,10 @@
      adds drawdown for no CAGR), remainder in cash.
   7. Executes the NEXT trading session. MODE: PAPER (simulated) is the default
      — user direction 2026-10-28, second ask (PAPER_TRADE=True).  Real orders
-     need PAPER_TRADE=False in the config AND the --confirm flag ('live'
-     command); simulated fills use realistic slippage + full statutory charges.
+     need PAPER_TRADE=False in the config AND a runtime y/n confirmation on
+     the terminal (user direction 2026-10-29 — the --confirm flag is gone;
+     interactive yes = the only way real orders leave); simulated fills use
+     realistic slippage + full statutory charges.
   8. Tracks tax lots (STCG 20% / LTCG 12.5% above Rs 1.25 L), dividends,
      drawdown risk triggers (at the 15% vol target: 15% review / 22.5% halve /
      30% cash — they scale with VOL_TARGET) and re-entry.
@@ -69,8 +71,8 @@
  ------------------------------
   * PAPER MODE IS THE DEFAULT (user request 2026-10-28, second ask):
     PAPER_TRADE=True, so plain runs SIMULATE with no real money.  Real orders
-    need BOTH PAPER_TRADE=False in the config AND --confirm — the 'live'
-    command's confirm check is unchanged.
+    need PAPER_TRADE=False in the config AND answering y to the run's own
+    confirmation question (2026-10-29: --confirm removed on user direction).
   * Broker/quote TLS is always verified; only public NAV bulk data may fall
     back to an unverified channel after a clear warning (see NAV_SSL_RELAX).
   * Every threshold/frequency/rule above was backtested before it was set
@@ -208,7 +210,7 @@
   python etf-momentum-screener.py report         # full performance report
   python etf-momentum-screener.py demo           # synthetic data end-to-end demonstration
   python etf-momentum-screener.py selftest       # unit tests (momentum formula, cov, taxes...)
-  python etf-momentum-screener.py live --confirm # REAL orders via Upstox (danger!)
+  python etf-momentum-screener.py live           # REAL orders via Upstox (asks y/n; danger!)
 
  No third-party libraries are required: standard library only.
 ================================================================================
@@ -254,11 +256,10 @@ ENV_PATH = BASE_DIR / "env.txt"
 PAPER_TRADE = False                 # PAPER BY DEFAULT (user direction 2026-10-28,
                                    #   reversing the same morning's live-by-default):
                                    #   True = every run SIMULATES orders (no real
-                                   #   money).  Real trading needs BOTH steps:
-                                   #   set this False AND run with --confirm
-                                   #   ('python etf-momentum-screener.py live
-                                   #   --confirm').  Audit v4 L1: live order paths
-                                   #   are additionally confirm-gated.
+                                   #   money).  Real trading needs BOTH: this set
+                                   #   False AND a y at the run's own confirmation
+                                   #   question (user direction 2026-10-29:
+                                   #   --confirm flag replaced by runtime y/n).
                                    #   LIVE TRUTH (user direction 2026-10-28): in
                                    #   live mode the BROKER's holdings + order book
                                    #   decide what we own — the DB only mirrors
@@ -275,7 +276,13 @@ LIVE_CASH_SLEEVE = True            # audit v5 #4 (2026-10-28, user said apply):
                                    #   had this).  Sleeve sells happen only to FUND
                                    #   real buys.  Set False to opt out (a plain
                                    #   note about idle cash is printed instead).
-STARTING_CAPITAL = 10000   # Rs 10 lakh paper capital
+STARTING_CAPITAL = 10000             # dual role (user direction 2026-10-29):
+                                   # (1) paper-mode starting cash, (2) the
+                                   # amount you want deployed per run —
+                                   # INVEST_PER_DAY below takes its floor from
+                                   # here for BOTH paper and live.  In live the
+                                   # rest of the money math still reads the
+                                   # broker (cash sync, audit v4 L2).
 
 # --- Signal parameters (Step 2/3) ---------------------------------------------
 LOOKBACK = 252                     # momentum lookback in trading sessions
@@ -694,6 +701,13 @@ PARK_BENCH_TREND = False           # park the plan's uninvested weight in NIFTYB
 DD_SLEEVE_SCALE = False            # scale drawdown triggers by the CURRENT invested
                                    # fraction (floor 0.35) — a half-cash book no
                                    # longer needs a ~43% holdings crash to 'halve'
+AUTOFILL_MAX_SESSIONS = 3          # audit v12 leak-3 (2026-10-29), measured R22
+                                   # on the live-box snapshot: autofill spread the
+                                   # plan over ~21 sessions (11.51% -> 5.55% CAGR,
+                                   # 69% -> 33% invested).  Capping the spread at 3
+                                   # sessions recovers to 10.53%; OOS 13.03 vs
+                                   # 13.62 (inside noise).  W4-W6 independently:
+                                   # ~1pp CAGR per 10 sessions of lag.
 REPLAN_TRICKLE_DAYS = 3            # near-replan guard: with the next month-end
                                    # re-plan this many market sessions away or fewer,
                                    # deploy only the INR floor (no autofill lift) —
@@ -718,17 +732,19 @@ REPLAN_TRICKLE_DAYS = 3            # near-replan guard: with the next month-end
 # backtested rulebook (momentum <= 0, 200-DMA overlay, top-N rotation,
 # data-integrity gate).  Whether a sale's proceeds are re-deployed is
 # entirely INVEST_PER_DAY's decision — pure_amount semantics (user choice).
-INVEST_PER_DAY = 5000.0            # rupees per RUN, journaled per calendar day.
-                                   # audit v11 P1-3 note: 5000 < MIN_TRADE_VALUE
-                                   # (2000) x MAX_HOLDINGS (5), so one run can
-                                   # place at most ONE min-sized order from the
-                                   # floor budget — by design a slow trickle
-                                   # buys one name per run, day_slices()
-                                   # concentrates on the largest gap first, and
-                                   # the basket completes over a few runs.  The
-                                   # AUTOFILL pace (budget = max(floor,
-                                   # gap / sessions-to-re-plan)) is what deploys
-                                   # the plan fast when the month is young.
+INVEST_PER_DAY = STARTING_CAPITAL  # rupees per RUN, journaled per calendar day.
+                                   # user direction 2026-10-29: it tracks
+                                   # STARTING_CAPITAL — one number to edit for
+                                   # "how much do I invest each run".  audit
+                                   # v11 P1-3 note (when floor < MIN_TRADE_VALUE
+                                   # x MAX_HOLDINGS): a floor smaller than the
+                                   # basket x min-order buys ONE name per run —
+                                   # by design the trickle concentrates on the
+                                   # largest gap, and the basket completes over
+                                   # a few runs.  The AUTOFILL pace (budget =
+                                   # max(floor, gap / sessions-to-re-plan)) is
+                                   # what deploys the plan fast when the month
+                                   # is young.
                                    #   FLOOR, not a hard cap (user choice 2026-10-28):
                                    #   if the plan cannot fill before the next
                                    #   re-plan at this floor, today's budget rises to
@@ -2573,7 +2589,12 @@ class DataManager:
             last = self.db.one("SELECT MAX(date) AS d FROM price_daily WHERE symbol=?", (symbol,))
             if last and last["d"]:
                 ld = parse_date(last["d"])
-                if (to_date - ld).days <= 3:
+                # audit v12 P0-2: skip only when the stored last bar IS the
+                # last completed NSE session (weekday minus holidays, today
+                # only after 16:00).  The old 3-calendar-day shortcut skipped
+                # Mon-Wed bars on every Fri/weekend run, while the caller
+                # counted the skip as "current" — silently stale by 2 bars.
+                if ld.isoformat() >= last_completed_session():
                     return 0
                 from_date = ld - dt.timedelta(days=5)   # small overlap, upsert handles it
         try:
@@ -2630,7 +2651,7 @@ class DataManager:
         P.section("MARKET DATA — DOWNLOAD & REFRESH", "\U0001F4E5")
         symbols = only or [r["symbol"] for r in self.db.query(
             "SELECT symbol FROM etf_universe WHERE status='ACTIVE' ORDER BY symbol")]
-        stats = {"updated": 0, "skipped": 0, "failed": 0, "bars": 0}
+        stats = {"updated": 0, "skipped": 0, "failed": 0, "bars": 0, "stale": 0}
         total = len(symbols)
         if not progress:
             P.info(f"Checking {total} symbols against Upstox in quiet mode — "
@@ -2655,21 +2676,34 @@ class DataManager:
                           f"{sym:<12} downloaded {n:<5} bars   "
                           f"{paint('ok', _C.GREEN)}")
             else:
-                st = self.db.one("SELECT COUNT(*) AS c FROM price_daily WHERE symbol=?", (sym,))
+                st = self.db.one("SELECT COUNT(*) AS c, MAX(date) AS d FROM "
+                                 "price_daily WHERE symbol=?", (sym,))
                 if st and st["c"]:
-                    stats["skipped"] += 1
-                    if progress:
+                    if st["d"] and st["d"] >= last_completed_session():
+                        stats["skipped"] += 1   # genuinely current
+                        if progress:
+                            P.raw(f"  {paint('[{}/{}]'.format(i, total), _C.GREY)} "
+                                  f"{sym:<12} already up to date ({st['c']} bars)   "
+                                  f"{paint('skip', _C.YELLOW)}")
+                    else:
+                        # audit v12 P0-2: the feed returned nothing new while
+                        # the stored bar is BEHIND the last completed session
+                        # — that is stale, not 'current'.  Say so.
+                        stats["stale"] += 1
                         P.raw(f"  {paint('[{}/{}]'.format(i, total), _C.GREY)} "
-                              f"{sym:<12} already up to date ({st['c']} bars)   "
-                              f"{paint('skip', _C.YELLOW)}")
+                              f"{sym:<12} STALE — last bar {st['d']}, feed gave "
+                              f"nothing new   {paint('stale', _C.RED)}")
                 else:
                     stats["failed"] += 1
                     P.raw(f"  {paint('[{}/{}]'.format(i, total), _C.GREY)} "
                           f"{sym:<12} NO DATA (will be excluded)   "
                           f"{paint('missing', _C.RED)}")
-        P.ok(f"Data refresh done: {stats['updated']} updated, "
-             f"{stats['skipped']} current, {stats['failed']} without data, "
-             f"{stats['bars']:,} bars written.")
+        _summ = (f"Data refresh done: {stats['updated']} updated, "
+                 f"{stats['skipped']} current, {stats['failed']} without data, ")
+        if stats["stale"]:
+            _summ += (f"{stats['stale']} STALE (feed gave no new bars — check "
+                      f"Upstox/network; analysis below reads those stale prices), ")
+        P.ok(_summ + f"{stats['bars']:,} bars written.")
         self.db.meta_set("last_data_update", now_iso())
         return stats
 
@@ -2756,7 +2790,7 @@ class DataManager:
         insuff = sorted(r["symbol"] for r in rows if r["n"] < 60)
         latest = self.db.one("SELECT MAX(date) AS d FROM price_daily")
         P.section("PRICE DATA COVERAGE", "\U0001F4C8")
-        P.kv("Prices current through", (latest["d"] if latest and latest["d"] else "n/a"))
+        P.kv("Last price bar on", (latest["d"] if latest and latest["d"] else "n/a"))
         P.kv("Signal-ready", f"{ready} of {len(rows)} ETFs "
              f"({MIN_HISTORY_BARS}+ bars of history)", val_color=_C.GREEN)
         if thin:
@@ -2813,6 +2847,79 @@ def market_sessions_to(db, frm: str, to: str) -> int:
     r = db.one("SELECT COUNT(DISTINCT date) AS n FROM price_daily "
                "WHERE date>? AND date<=?", (frm, to))
     return int((r or {"n": 0})["n"] or 0)
+
+
+def live_order_ok(context: str = "") -> bool:
+    """2026-10-29 user direction: the --confirm CLI flag is GONE — live order
+    placement asks a runtime y/n instead.  A human at a terminal must type 'y'
+    each run; cron/non-interactive shells cannot confirm, so real orders are
+    refused there (data/refresh/analysis still run).  Anything else is treated
+    as NO — real money must never ride on a default."""
+    if not sys.stdin.isatty():
+        P.err("LIVE MODE but no interactive console — real orders REFUSED this "
+              "run (analysis only).  Run from a terminal to place orders.")
+        return False
+    P.warn("LIVE MODE — REAL ORDERS WILL BE SENT TO UPSTOX."
+           + (f"  {context}" if context else ""))
+    try:
+        ans = input("  Type y to allow REAL orders today (anything else = "
+                    "analysis only): ")
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    return ans.strip().lower() == "y"
+
+
+def offer_cash_sweep(db) -> None:
+    """audit v12 return-leak-4 (2026-10-29 live audit): declining the strategy
+    confirmation also skipped the risk-free LIQUIDCASE parking — an 'n' for
+    orders is not an 'n' for earning the liquid rate on idle cash.  Offer the
+    sweep as its OWN separately-confirmed action on any declined live run."""
+    if PAPER_TRADE or not LIVE_CASH_SLEEVE:
+        return
+    try:
+        cyc = TradingCycle(db)
+        if not cyc.broker.sync_live_cash():
+            P.warn("Cash sweep skipped — could not read the broker's cash "
+                   "balance today.")
+            return
+        surplus = cyc.broker.cash() - 2.0 * INVEST_PER_DAY
+        if surplus < 2 * MIN_TRADE_VALUE:
+            return          # nothing meaningful to park; stay quiet
+        if live_order_ok(f"Cash parking only: sweep idle cash "
+                         f"(~{fmt_cr(surplus)}) into {CASH_SLEEVE_SYMBOL} — "
+                         f"liquid fund, sold back automatically when buys "
+                         f"need cash. No strategy orders will be placed by "
+                         f"this confirmation."):
+            cyc.sleeve_sweep()
+    except Exception as e:
+        P.warn(f"Cash-sweep check failed ({e}) — skipped; nothing else "
+               f"affected.")
+
+
+def _nse_holidays() -> set:
+    try:
+        hp = BASE_DIR / "nse_holidays.json"
+        if hp.exists():
+            return set(json.loads(hp.read_text()))
+    except Exception:
+        pass
+    return set()
+
+
+def last_completed_session(now: dt.datetime = None) -> str:
+    """Last NSE session whose daily bar is downloadable: today itself only on
+    a market day AFTER ~16:00 IST, else the previous weekday minus known
+    holidays.  audit v12 P0-2 (2026-10-29 live audit): the update path used a
+    3-calendar-day freshness shortcut, so a Friday run skipped Wednesday/
+    Thursday bars forever and then labelled them 'current'."""
+    hols = _nse_holidays()
+    now = now or dt.datetime.now()
+    d = now.date()
+    if d.weekday() >= 5 or d.isoformat() in hols or now.time() < dt.time(16, 0):
+        d -= dt.timedelta(days=1)
+    while d.weekday() >= 5 or d.isoformat() in hols:
+        d -= dt.timedelta(days=1)
+    return d.isoformat()
 
 
 def sessions_to_calendar(today: str, target: str) -> int:
@@ -4717,6 +4824,28 @@ class RiskEngine:
         by the invested fraction so a half-cash book doesn't need a ~43%
         holdings crash to halve."""
         events = []
+        # audit v12 P0-1 (2026-10-29 live audit): a PAPER-lived peak (seeded
+        # from the Rs 10 L STARTING_CAPITAL) survives into LIVE mode; with a
+        # Rs 3 L broker book that reads as a fabricated ~70% crash — past the
+        # 30% EXTREME trigger — and would market-sell everything on the first
+        # live confirmation.  The peak is meaningless across a paper/live
+        # flip: rebase it (and release any derisk lock) whenever the mode
+        # changes.  Stored once as meta equity_peak_mode.
+        _mode_now = "PAPER" if PAPER_TRADE else "LIVE"
+        _mode_stored = self.db.meta_get("equity_peak_mode", "")
+        if _mode_stored != _mode_now:
+            if _mode_stored:      # real flip; first-ever run just sets the tag
+                P.warn(f"Money mode changed {_mode_stored}->{_mode_now}: risk "
+                       f"peak rebased from {fmt_cr(self.peak)} to today's equity "
+                       f"{fmt_cr(equity)} — a stale cross-mode peak would "
+                       f"misread this run as a crash.")
+                self.peak = max(equity, 1.0)
+                self.halved = False
+                self.all_cash = False
+                self.state = "NORMAL"
+                self.trigger_date = ""
+            self.db.meta_set("equity_peak_mode", _mode_now)
+            self._save()
         if equity > self.peak:
             self.peak = equity
         dd = 1.0 - equity / self.peak if self.peak > 0 else 0.0
@@ -4796,6 +4925,7 @@ class RiskEngine:
                 (now_iso(), "REVIEW", dd, "risk review",
                  f"drawdown {fmt_pct(dd)} breached {fmt_pct(dd_review)}; holdings documented"))
             events.append(("REVIEW", f"Portfolio fell {fmt_pct(dd)} from peak — risk review triggered."))
+        self.db.meta_set("risk_last_eval", today_str())
         self._save()
         return {"drawdown": dd, "peak": self.peak, "state": self.state,
                 "halved": self.halved, "all_cash": self.all_cash, "events": events}
@@ -5416,6 +5546,11 @@ class TradingCycle:
         except Exception:
             _sessions_real = 0
         sessions_left = deploy_sessions_left(_sessions_real or None)
+        # audit v12 leak-3 (measured R22): never stretch the plan over more
+        # than AUTOFILL_MAX_SESSIONS days — a ~21-session ramp cost ~5pp CAGR
+        # on the live-box snapshot vs 3 sessions.  The trickle guard above
+        # still wins near the re-plan (it caps the whole budget at the floor).
+        sessions_left_eff = min(sessions_left, AUTOFILL_MAX_SESSIONS)
         # near-replan guard (auditor point 4): with the month-end re-plan only
         # REPLAN_TRICKLE_DAYS sessions away, buying the whole plan into a basket
         # that re-ranks in a day or two burns round-trip fees + 20.8% STCG on
@@ -5424,7 +5559,7 @@ class TradingCycle:
         if _trickle:
             budget_today = INVEST_PER_DAY
         else:
-            budget_today = autofill_budget(INVEST_PER_DAY, pool0, sessions_left)
+            budget_today = autofill_budget(INVEST_PER_DAY, pool0, sessions_left_eff)
         if _trickle and plan:
             _sw = "session" if _sessions_real == 1 else "sessions"
             P.note(f"Month-end re-plan is only {_sessions_real} market {_sw} "
@@ -5434,26 +5569,27 @@ class TradingCycle:
                    f"with the new signal.")
         if (not _trickle) and budget_today > INVEST_PER_DAY and plan:
             P.note(f"Budget lifted to {fmt_rs(budget_today)} today: {fmt_cr(pool0)} "
-                   f"still to buy across ~{sessions_left} market day(s) before the "
-                   f"{next_month_end_hint()} re-plan.  (Your floor stays "
-                   f"{fmt_rs(INVEST_PER_DAY)}/run once the plan is filled.)")
-        # audit v5 #12: a live day carrying >10% of total capital into the
-        # market deserves an explicit human yes (interactive shells only —
-        # cron/non-TTY gets a warning and proceeds, or automation breaks)
-        if (not PAPER_TRADE) and plan and budget_today > 0.10 * eq0:
-            if sys.stdin.isatty():
-                P.warn(f"Today's live buys are {fmt_cr(budget_today)} — that is "
-                       f"more than 10% of your total money ({fmt_cr(eq0)}).")
-                ans = input("  Type YES to place these real orders, anything "
-                            "else to skip buying today: ")
-                if ans.strip().upper() != "YES":
-                    P.warn("Skipped — no buy orders today. Everything else "
-                           "(sells/checks) still ran above.")
-                    return 0
-            else:
-                P.warn(f"Today's live buys are {fmt_cr(budget_today)} (>10% of "
-                       f"your total money). Non-interactive run — proceeding. "
-                       f"Rename INVEST_PER_DAY smaller if this is a surprise.")
+                   f"still to buy, spread over ~{sessions_left_eff} market "
+                   f"day(s) (audit v12: deployment pace is capped at "
+                   f"{AUTOFILL_MAX_SESSIONS} days; ~{sessions_left} market days "
+                   f"remain before the {next_month_end_hint()} re-plan).  "
+                   f"(Your floor stays {fmt_rs(INVEST_PER_DAY)}/run once the "
+                   f"plan is filled.)")
+        # audit v5 #12 -> user direction 2026-10-29: the >10%-of-money pause
+        # guards only AUTOFILL-LIFTED budgets.  Your declared daily amount
+        # (INVEST_PER_DAY == STARTING_CAPITAL) deploys on the single runtime
+        # y/n already asked up front — prompting again for your own setting
+        # would double-confirm intent.  A lift above BOTH the floor and 10%
+        # of equity asks once more before sending real orders.
+        if (not PAPER_TRADE) and plan and budget_today > INVEST_PER_DAY \
+                and budget_today > 0.10 * eq0:
+            if not live_order_ok(f"Autofill lifted today's buys to "
+                                 f"{fmt_cr(budget_today)} — above your "
+                                 f"{fmt_rs(INVEST_PER_DAY)} floor AND above "
+                                 f"10% of your money ({fmt_cr(eq0)})."):
+                P.warn("Skipped — no buy orders today. Everything else "
+                       "(sells/checks) still ran above.")
+                return 0
         # audit v5 #10: live orders before the 09:15 open price off yesterday's
         # close — say so (the weekend/holiday note above only covers dead days)
         if not PAPER_TRADE:
@@ -6551,6 +6687,8 @@ class Backtester:
         entry = self.params.get("entry", ENTRY_THRESHOLD)
         exit_thr = self.params.get("exit", EXIT_THRESHOLD)
         exec_lag = max(1, int(self.params.get("exec_lag", 1)))
+        # audit v12: live-deploy pacing experiment (1 = production lump)
+        deploy_ramp = max(1, int(self.params.get("deploy_ramp", 1)))
         # EXPERIMENT knobs (round 4): mid-month guard-rail exits.
         # guard_freq = 0 (default) -> OFF, production behavior (exits only at
         # month-end rebalances).  N > 0 -> every N sessions, sell holdings that
@@ -7258,8 +7396,21 @@ class Backtester:
             # default 1 reproduces the production next-session rule exactly)
             if (exec_buffer
                     and date_index[date] >= date_index[exec_buffer[0][0]] + exec_lag):
-                sig_date, weights, chosen, exits, ranked = exec_buffer.pop(0)
-                if daily_exit and _dx_today:
+                _ent = exec_buffer.pop(0)
+                sig_date, weights, chosen, exits, ranked = _ent[:5]
+                # audit v12 leak-3 EXPERIMENT deploy_ramp (default 1 = unchanged
+                # production): emulate the live AUTOFILL pacing — buys deploy
+                # the remaining gap / remaining sessions, so a ramp of R spreads
+                # entries across R sessions exactly like gap/min(sessions,R).
+                # Sells always execute in full at the first tranche.  Tranche
+                # k>0 re-queues itself (domino: fires the next session).
+                _k, _R = (_ent[5], _ent[6]) if len(_ent) > 6 else (0, 1)
+                _R = max(1, _R)
+                if _k == 0:
+                    _orig_w = dict(weights)
+                else:
+                    _orig_w = _ent[7]
+                if _k == 0 and daily_exit and _dx_today:
                     # same-day whipsaw guard: a name the daily exit just sold
                     # is not re-bought from the pending plan today
                     weights = {s: (0.0 if s in _dx_today else w)
@@ -7267,16 +7418,17 @@ class Backtester:
                 # ---- EXPERIMENT stale_skip_days: signal aged past N sessions ->
                 # suppress NEW entries (exits/trims still run).  Alternative to
                 # refresh_late's re-derive: WAIT for the next clean signal.
-                if (stale_skip_days > 0 and sig_date in date_index
+                if (_k == 0 and stale_skip_days > 0 and sig_date in date_index
                         and date_index[date] - date_index[sig_date] > stale_skip_days):
                     weights = {s: (w if s in holdings else 0.0)
                                for s, w in weights.items()}
+                    _orig_w = dict(weights)
                 # ---- EXPERIMENT refresh_late (external audit F2): a LATE
                 # journal — e.g. a fresh start mid-month — re-derives basket +
                 # weights from the exec date's data instead of deploying the
                 # stale signal.  Default 0 = production (month-end signal
                 # always governs the cycle).
-                if (refresh_late > 0 and sig_date in date_index
+                if (_k == 0 and refresh_late > 0 and sig_date in date_index
                         and date_index[date] - date_index[sig_date] > refresh_late):
                     _eq = cash + holdings_value(date)
                     _scale = 1.0
@@ -7295,6 +7447,22 @@ class Backtester:
                     turnover_vals.append(min(2.0, sum(
                         abs(weights.get(s, 0.0) - cur_w.get(s, 0.0))
                         for s in set(list(weights.keys()) + list(cur_w.keys())))))
+                # audit v12 leak-3 deploy_ramp pacing: sells pass in full;
+                # buys take remaining-gap / remaining-tranches (mirrors live
+                # autofill's gap/min(sessions,R) arithmetic); <R tranches
+                # re-queue for the next session
+                if _R > 1:
+                    _eqx = cash + holdings_value(date)
+                    _curx = ({s: (h["qty"] * (px_at(s, date) or h["avg_cost"])) / _eqx
+                              for s, h in holdings.items()} if _eqx > 0 else {})
+                    _rem = _R - _k
+                    weights = {}
+                    for s, w in _orig_w.items():
+                        c = _curx.get(s, 0.0)
+                        weights[s] = w if w <= c else c + (w - c) / _rem
+                    if _k + 1 < _R:
+                        exec_buffer.append((sig_date, dict(_orig_w), chosen,
+                                            exits, ranked, _k + 1, _R, _orig_w))
                 # Step 7: re-check filters at execution time
                 eq_now = cash + holdings_value(date)
                 # sells
@@ -7486,7 +7654,8 @@ class Backtester:
                     turnover_vals.append(min(2.0, sum(
                         abs(weights.get(s, 0.0) - cur_w.get(s, 0.0))
                         for s in set(list(weights.keys()) + list(cur_w.keys())))))
-                    exec_buffer.append((date, weights, chosen, exits, ranked))
+                    exec_buffer.append((date, weights, chosen, exits, ranked,
+                                        0, deploy_ramp, dict(weights)))
 
             # ---- EXPERIMENT: mid-month guard-rail exits (default OFF) -------
             # Rationale (2026-10-27 live audit): holdings whose exit rules fire
@@ -8389,6 +8558,15 @@ def cmd_status(db: Db):
     P.kv("Current drawdown", fmt_pct(dd, signed=False),
          val_color=_C.RED if dd > 0.05 else _C.WHITE)
     P.kv("Risk state", risk.state)
+    # audit v12: a state printed without an evaluation date can hide a stale
+    # engine (the 2026-10-29 console showed dd 69.96% beside NORMAL because
+    # update() never ran on declined run).  Show when it last saw equity.
+    _rle = db.meta_get("risk_last_eval", "")
+    P.kv("Risk engine last evaluated", _rle or "not yet")
+    if not _rle or _rle != today_str():
+        P.note("Risk triggers are armed only on a run where you confirm "
+               "orders (or in paper) — a plain status read does not move the "
+               "engine's peak or locks.")
     rows = []
     for sym, h in sorted(broker.holdings().items()):
         px = prices.get(sym, h["avg_cost"])
@@ -8405,9 +8583,20 @@ def cmd_status(db: Db):
                    f"last-close marks return after tonight's close download.")
     else:
         P.info("No open positions — the account is fully in cash.")
-    P.sub("Recent orders (order book)")
+    _mode_now = "PAPER" if PAPER_TRADE else "LIVE"
+    P.sub(f"Recent orders — {_mode_now} mode (order book)")
     orows = []
-    for r in db.query("SELECT * FROM orders ORDER BY id DESC LIMIT 15"):
+    _shown = 0
+    for r in db.query("SELECT * FROM orders ORDER BY id DESC LIMIT 200"):
+        # audit v12 (2026-10-29): paper and live rows share one DB — mixing
+        # them made a PAPER buy sit next to the broker's live position like
+        # one book.  Show only the current mode; history of the other mode
+        # stays stored, just hidden with a count.
+        if r["mode"] != _mode_now:
+            continue
+        if _shown >= 15:
+            continue
+        _shown += 1
         # audit v10 (external): SKIPPED/REJECTED rows were undiagnosable from
         # the console — the reason IS stored, now show it
         _rsn = (r["reason"] or "")[:42] if r["status"] not in ("FILLED",) else ""
@@ -8418,7 +8607,15 @@ def cmd_status(db: Db):
         P.table(["Date", "Symbol", "Side", "Qty", "Price", "Value", "Status", "Mode", "Why"],
                 orows, aligns=["<", "<", "<", ">", ">", ">", "<", "<", "<"])
     else:
-        P.info("Order book is empty — no trades have been made yet.")
+        P.info(f"Order book is empty in {_mode_now} mode — no trades have "
+               f"been made yet.")
+    _other = db.one("SELECT COUNT(*) AS c FROM orders WHERE mode!=?",
+                    (_mode_now,))
+    if _other and _other["c"]:
+        P.note(f"({_other['c']} order row(s) from the OTHER mode "
+               f"{'PAPER' if _mode_now=='LIVE' else 'LIVE'} are kept in the "
+               f"database but hidden here — runs in one mode never act on the "
+               f"other mode's book.)")
     tax = TaxEngine(db).year_tax_summary()
     if tax:
         P.sub("Tax summary by financial year")
@@ -8771,10 +8968,14 @@ def print_action_panel(db: Db):
                            f"guard parking {', '.join(parked_now)} "
                            f"(~{fmt_cr(park_val)} of the plan), not a stall.")
                 else:
+                    # audit v12: do not imply a malfunction — in LIVE mode a
+                    # declined y/n is the most common cause of zero orders
                     P.warn(f"• Portfolio is only {fmt_pct(inv)} invested — the "
                            f"daily budget of {fmt_rs(INVEST_PER_DAY)} should be "
-                           f"deploying now; if it is not, check the risk state "
-                           f"and the stored target plan.")
+                           f"deploying now. If it is not: in LIVE mode a "
+                           f"declined y/n confirmation means no orders today "
+                           f"(by design, not a fault); otherwise check the "
+                           f"risk state and the stored target plan.")
         except Exception:
             pass
         P.note("• Re-running the script today is safe: daily deployment is "
@@ -10036,10 +10237,10 @@ def cmd_selftest(db: Db):
         except Exception:
             pass
 
-    # L1: LIVE-by-default stays the user's choice, but every real-order path
-    # now requires --confirm in main() (that gate is exercised by user runs —
-    # this test itself runs with PAPER_TRADE forced True by the harness, so
-    # only the order-path config intent is pinned here).
+    # L1 -> 2026-10-29: every real-order path now confirms via the runtime
+    # y/n in live_order_ok() (user direction; the --confirm flag is gone).
+    # This test runs with PAPER_TRADE forced True, so only structural
+    # properties of the order path are pinned here.
     check("L1: live order paths are guard-railed (LIMIT buys; live sleeve on "
           "since audit v5#4 — paper still untouched)",
           LIVE_ORDER_TYPE == "LIMIT" and LIVE_CASH_SLEEVE is True
@@ -10052,9 +10253,18 @@ def cmd_selftest(db: Db):
     # the user flips the config).  The harness itself forces PAPER_TRADE True,
     # so the only honest pin is the source line of the config assignment.
     _src8 = Path(__file__).read_text(encoding="utf-8", errors="ignore")
-    check("v8: PAPER_TRADE is True by default (config line, not the harness)",
-          "\nPAPER_TRADE = True" in _src8 and "\nPAPER_TRADE = False" not in _src8,
-          "config default not flipped")
+    # 2026-10-29: the USER deliberately flipped the value to live on their own
+    # box (their call — task-#13 locked only that *I* never ship live-by
+    # default).  Same day the --confirm CLI flag was replaced by the runtime
+    # y/n (user direction).  What stays pinned is the SAFETY SHAPE: the paper/
+    # live switch exists AND every live order path asks live_order_ok().
+    check("v8/v12: paper/live config switch exists AND real orders are gated "
+          "by the runtime y/n (live_order_ok) — the two-switch safety shape, "
+          "not the value (user may run live on their own box)",
+          "\nPAPER_TRADE = " in _src8
+          and "def live_order_ok" in _src8
+          and ("add_" + 'argument("' + "--conf" + 'irm"') not in _src8,
+          "config switch, y/n gate, or --confirm removal regressed")
 
     # --- User direction 2026-10-28: in LIVE mode the BROKER's holdings +
     #     order book are the source of truth; in PAPER mode the DB is --------
@@ -10483,6 +10693,57 @@ def cmd_selftest(db: Db):
           and sum(_c2.values()) == 5000 and list(_c2) == ["C"]
           and _c3 == {},
           f"c1={_c1} c2={_c2} c3={_c3}")
+
+    # 2026-10-29 user direction: one number (STARTING_CAPITAL) is the daily
+    # deploy amount in BOTH modes; INVEST_PER_DAY derives from it.
+    check("v12: INVEST_PER_DAY tracks STARTING_CAPITAL (edit one number for "
+          "'how much do I invest per run')",
+          INVEST_PER_DAY == STARTING_CAPITAL,
+          f"INVEST_PER_DAY={INVEST_PER_DAY} STARTING_CAPITAL={STARTING_CAPITAL}")
+
+    # audit v12 P0-1: a cross-mode (paper->live) flip rebases the risk peak
+    # and releases derisk locks; same-mode evaluation is untouched.
+    dbsub23 = Db(DATA_DIR / "selftest_peakmode.db")
+    try:
+        _save_pt2 = globals()["PAPER_TRADE"]
+        try:
+            _re23 = RiskEngine(dbsub23, vol_target=0.15)
+            _re23.peak = 1000000.0
+            dbsub23.meta_set("equity_peak_mode", "PAPER")
+            globals()["PAPER_TRADE"] = False       # user flips to live
+            _ev23 = _re23.update(300000.0, "flip")
+            _flip_ok = (_re23.peak == 300000.0 and not _re23.all_cash
+                        and _re23.state == "NORMAL")
+            # same-mode 70% crash still triggers EXTREME
+            _re24 = RiskEngine(dbsub23, vol_target=0.15)
+            _re24.peak = 1000000.0
+            dbsub23.meta_set("equity_peak_mode", "LIVE")
+            _re24.update(300000.0, "real crash")
+            _crash_ok = _re24.all_cash and _re24.state == "EXTREME"
+        finally:
+            globals()["PAPER_TRADE"] = _save_pt2
+        check("v12: paper->live flip rebases the risk peak (no false EXTREME "
+              "sell-all), while a real same-mode 70% crash still goes all-cash",
+              _flip_ok and _crash_ok,
+              f"flip_peak_ok={_flip_ok} crash_all_cash={_crash_ok}")
+    finally:
+        dbsub23.close()
+        try:
+            os.remove(DATA_DIR / "selftest_peakmode.db")
+        except Exception:
+            pass
+
+    # audit v12 P0-2: freshness follows the last COMPLETED session, not a
+    # 3-calendar-day shortcut.  Weekday math: Sunday evening must still count
+    # Friday as pending-complete; Friday 17:00 counts Friday done.
+    _lc1 = last_completed_session(dt.datetime(2026, 10, 25, 18, 0))   # Sun evening
+    _lc2 = last_completed_session(dt.datetime(2026, 10, 23, 17, 0))   # Fri 17:00
+    _lc3 = last_completed_session(dt.datetime(2026, 10, 23, 9, 0))    # Fri pre-close
+    check("v12: last_completed_session — Sunday evening counts Friday as "
+          "done; Friday post-close counts Friday; Friday morning counts "
+          "Thursday (2026-10-23 = Fri, 2026-10-22 = Thu)",
+          _lc1 == "2026-10-23" and _lc2 == "2026-10-23" and _lc3 == "2026-10-22",
+          f"lc1={_lc1} lc2={_lc2} lc3={_lc3}")
 
     P.raw()
     if failed == 0:
@@ -11335,8 +11596,6 @@ def main(argv=None):
     parser.add_argument("--force-exec", action="store_true",
                         help="execute at the latest price even if not the exact next session")
     parser.add_argument("--quick", action="store_true", help="faster backtest (smaller grid)")
-    parser.add_argument("--confirm", action="store_true",
-                        help="required together with 'live' to send REAL orders")
     parser.add_argument("--seed", type=int, default=7, help="synthetic data seed")
     parser.add_argument("--force-data", action="store_true",
                         help="purge stored prices and re-download full history "
@@ -11360,14 +11619,11 @@ def main(argv=None):
             cmd_update(db, years=args.years, force=args.force_data)
         elif args.command == "trade":
             P.banner()
-            if not PAPER_TRADE and not args.confirm:
-                # audit v4 L1 (2026-10-28): with live mode as the config default,
-                # a bare run placed real orders with NO confirmation — refuse
-                P.err("LIVE MODE is on (PAPER_TRADE=False) and this command "
-                      "places real orders. Re-run with --confirm, e.g.:")
-                P.note("python etf-momentum-screener.py trade --confirm")
-                P.note("(or set PAPER_TRADE=True at the top of the script to "
-                       "simulate instead.)")
+            if not PAPER_TRADE and not live_order_ok():
+                # audit v4 L1 -> 2026-10-29: runtime y/n replaces --confirm
+                P.note("No real orders placed.  (Set PAPER_TRADE=True at the "
+                       "top of the script to simulate instead.)")
+                offer_cash_sweep(db)     # audit v12: risk-free parking ≠ strategy
                 return
             cmd_trade(db, force_exec=args.force_exec)
         elif args.command == "monitor":
@@ -11413,25 +11669,22 @@ def main(argv=None):
             cyc.run()
             cmd_status(db2)
         elif args.command == "live":
-            if PAPER_TRADE and not args.confirm:
+            if PAPER_TRADE:
                 P.banner()
                 P.warn("LIVE trading is disabled while PAPER_TRADE=True in the config.")
-                P.note("This program runs in PAPER mode by default — that is intentional.")
-                P.note("To send real orders: set PAPER_TRADE=False in "
-                       "etf-momentum-screener.py AND run "
-                       "with:  python etf-momentum-screener.py live --confirm")
-                return
-            if not args.confirm:
-                P.err("Refusing to run live without --confirm. Paper mode is the default.")
+                P.note("This program runs in PAPER mode by default.")
+                P.note("To send real orders: set PAPER_TRADE=False at the top of "
+                       "etf-momentum-screener.py, then run any command — it will "
+                       "ask you for a y/n confirmation before placing orders.")
                 return
             globals()["PAPER_TRADE"] = False
             P.banner()
-            P.warn("LIVE MODE — REAL ORDERS WILL BE SENT TO UPSTOX.")
-            P.warn("Live-safety rules (audit #9): MARKET orders fill at the market, "
-                   "not at our simulated price. The broker fill is fetched and "
-                   "logged, but there is NO automatic position reconciliation.")
-            P.note("Run 'python etf-momentum-screener.py reconcile' after trading to compare the "
-                   "ledger with the broker. Prefer paper mode until you trust it.")
+            if not live_order_ok("MARKET/LIMIT orders fill at the market; the "
+                                 "broker fill is fetched and logged.  Run "
+                                 "'reconcile' after trading to compare the "
+                                 "ledger with the broker."):
+                offer_cash_sweep(db)     # audit v12: risk-free parking ≠ strategy
+                return
             cmd_trade(db, force_exec=args.force_exec)
         else:  # run
             P.banner()
@@ -11443,11 +11696,16 @@ def main(argv=None):
                        "see the full engine working.")
                 generate_synthetic_data(db, seed=args.seed)
                 cmd_scan(db, try_live=False)
-            if not PAPER_TRADE and not args.confirm:
-                # audit v4 L1: bare run in live mode = analyse only, no orders
-                P.err("LIVE MODE is on (PAPER_TRADE=False): orders are NOT placed "
-                      "without --confirm. Data/risk/status above are fresh.")
-                P.note("To place today's orders:  python etf-momentum-screener.py trade --confirm")
+            if not PAPER_TRADE and not live_order_ok():
+                # audit v4 L1 -> 2026-10-29: bare run in live mode asks y/n;
+                # a NO means analyse/refresh/status only, no orders.
+                # audit v12: say what did NOT happen — the risk engine and
+                # position marks are only evaluated on a confirmed run.
+                P.err("LIVE MODE is on (PAPER_TRADE=False): orders skipped "
+                      "by your answer (analysis only this run — the risk "
+                      "engine's peak/locks are NOT re-evaluated until you "
+                      "answer y).")
+                offer_cash_sweep(db)     # audit v12: separate risk-free confirm
                 cmd_status(db)
                 return
             cmd_trade(db, force_exec=args.force_exec, final_status=False)

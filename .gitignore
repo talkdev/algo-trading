@@ -1,5 +1,5 @@
 # ============================================================
-# Python
+# PYTHON
 # ============================================================
 __pycache__/
 *.py[cod]
@@ -11,7 +11,7 @@ build/
 dist/
 
 # ============================================================
-# Virtual environments
+# VIRTUAL ENVIRONMENTS
 # ============================================================
 .venv/
 venv/
@@ -19,7 +19,7 @@ env/
 ENV/
 
 # ============================================================
-# Secrets and credentials
+# SECRETS AND CREDENTIALS
 # ============================================================
 env.txt
 .env
@@ -31,9 +31,10 @@ gdrive_credentials.json
 gdrive_token.json
 *-service-account.json
 **/gen-lang-client-*.json
+/data/client_secret_1095533226346-ibjlk7t0t40ftto3dh22fgr927puajsf.apps.googleusercontent.com.json
 
 # ============================================================
-# Logs, PIDs, editor, OS
+# LOGS, PID FILES, EDITORS AND OS FILES
 # ============================================================
 /logs/
 *.log
@@ -49,14 +50,16 @@ Thumbs.db
 desktop.ini
 
 # ============================================================
-# Temp / crash leftovers
+# TEMPORARY AND CRASH FILES
 # ============================================================
 *.tmp
 *.bak
 *.orig
 *.lock
 
-# SQLite sidecars — runtime only, not a restorable backup
+# ============================================================
+# SQLITE RUNTIME SIDECARS
+# ============================================================
 *.db-wal
 *.db-shm
 *.db-journal
@@ -65,7 +68,7 @@ desktop.ini
 *.sqlite3-journal
 
 # ============================================================
-# Generated output
+# GENERATED OUTPUT AND REPORTS
 # ============================================================
 /reports/
 /output/
@@ -73,51 +76,68 @@ desktop.ini
 /backtest_cache/
 /backtest_output/
 
-# stock-tsmom / screener working tree
+# ============================================================
+# STOCK-DATA WORKING FILES
+# ============================================================
+
+# Cache, logs and generated reports
 /stock-data/cache/
 /stock-data/logs/
 /stock-data/reports/
+
+# Deployment/runtime databases
 /stock-data/*.sqlite3
 /stock-data/*.lock
+
+# Environment/configuration files
 /stock-data/env.txt*
 
-# Root runtime DBs
-/*.sqlite3
+# Generated NAV CSV files only.
+# Other files under stock-data/nav/ remain trackable.
+/stock-data/nav/*.csv
 
 # ============================================================
-# data/ is tracked. Git has no size glob, so files currently
-# over 100 MB (GitHub hard limit) are listed below.
+# LARGE DATABASE FILES
+# GitHub rejects individual files larger than 100 MB.
+# Keep data/ tracked except for explicitly listed large files.
 # ============================================================
 
-# Live primary (~1.8 GB) and crash/split copies
+# Primary database and crash/split copies
 /data/nifty_algo_v3.db
 /data/nifty_algo_v3.db.*
 
-# Recovery dump (~1.9 GB)
+# Recovery dump
 /data/recovery/from_corrupt.db
 
-# Per-day shards currently over 100 MB
+# Oversized per-day database shards
 /data/per_day/nifty_algo_2026-09-23.db
 /data/per_day/nifty_algo_2026-09-24.db
 /data/per_day/nifty_algo_2026-09-25.db
 /data/per_day/nifty_algo_2026-09-28.db
 /data/per_day/nifty_algo_2026-09-29.db
+/data/per_day/nifty_algo_2026-10-06.db
 /data/per_day/nifty_algo_2026-10-19.db
 /data/per_day/nifty_algo_2026-10-21.db
-/vramqc_nse_backtest.db
-
-rr.txt
-# ============================================================
-# Misc: automation scripts only
-# ============================================================
-/Misc/*
-!/Misc/*.py
-!/Misc/*.ps1
-!/Misc/*.cmd
-/data/per_day/nifty_algo_2026-10-06.db
-/stock-data/vramqc_deployment.db
 /data/per_day/nifty_algo_2026-10-22.db
 /data/per_day/nifty_algo_2026-10-23.db
 /data/per_day/nifty_algo_2026-10-26.db
 /data/per_day/nifty_algo_2026-10-27.db
-/data/client_secret_1095533226346-ibjlk7t0t40ftto3dh22fgr927puajsf.apps.googleusercontent.com.json
+
+# Root-level database
+/vramqc_nse_backtest.db
+
+# Stock-data deployment database
+/stock-data/vramqc_deployment.db
+
+# ============================================================
+# MISC DIRECTORY
+# Keep automation scripts; ignore other files.
+/Misc/*
+!/Misc/*.py
+!/Misc/*.ps1
+!/Misc/*.cmd
+
+# ============================================================
+# MISCELLANEOUS
+# ============================================================
+rr.txt
