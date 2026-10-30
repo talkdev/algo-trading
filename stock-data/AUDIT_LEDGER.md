@@ -159,6 +159,10 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 | 142 | EDIS 'UDAPI100500' sell failures used to sit inside an order ticket. Now a loud explainer at failure time (CDSL TPIN daily validation or one-time DDPI) + the exit stays open via #140. User-side fix: action row 114. | v15 P0-4 |
 | 143 | Plan-fill lag surfaced: after 3 consecutive run-days with strategy exposure < 25% of the stored plan, a warning names the four usual causes (declined y/n, sub-min budget, premium guard, trickle). | v15 P1 |
 | 144 | Exit reasons now distinguish ROTATION ('momentum fine, ranked out of top-N') from trend exits — the console no longer looks like it sells healthy trends for no reason. 'Peak rebased on mode flip today' note when the v12 rebase fired this session. | v15 P1 |
+| 145 | P0 **sync_live_book deleted same-day fills** (30-Oct live console): post-buy sync rebuilt truth from holdings+positions only — same-day delivery fills are invisible until T+1 — and DELETED SML100CASE(475u)+LIQUIDCASE(1959u) bought seconds earlier. Journal equity ₹16,828 vs real ₹2.51L → fabricated DD 93.28% next to "Risk state: NORMAL"; a re-run would have EXTREME-liquidated real holdings on a phantom crash. FIX: `_filled_today` set from orderbook (status complete/filled + order_timestamp dated today); vanished-loop skips those; they are re-admitted into the in-run truth from journal rows; loud same-day-fill warning; meta `same_day_t1_pending` | APPLIED — selftest same-day fill kept + stale-date fill does NOT mask a true deletion (135/135) |
+| 146 | P0 **"Re-running today is safe" printed unconditionally** — false on a T+1-pending day. Now conditional: when `same_day_t1_pending` == today it prints the opposite (do NOT re-run; wait for tomorrow's sync) | APPLIED |
+| 147 | P0 **status is read-only, state stales**: dd printed (93.28%) vs state NORMAL with zero explanation. Now: `risk_last_eval` timestamp set in RiskEngine.update(); cmd_status errors when dd ≥ EXTREME trigger with non-EXTREME state (and warns ≥ SEVERE trigger with non-SEVERE state), naming when the engine last judged the book | APPLIED |
+| 148 | P1 bundle: (a) liquid-sleeve buys excluded from "money invested today"/"SETTLED real money" panels — parking is NOT market exposure, printed as its own line (killed the ₹5k-vs-₹2.34L confusion); (b) sleeve sweep priced off the LIVE quote first (was last saved bar only), basis now printed; (c) "₹5,006.50 used of ₹5,000 budget" now says ≈ + whole-unit rounding note; (d) journal-cleaned line names T+1; (e) coverage summary prints the Upstox daily-candle history-cap caveat (avg bars ≈ years, fine for live, NOT the backtest horizon); (f) sub-5%-equity fills get per-line entries with reason | APPLIED |
 
 ---
 
@@ -190,6 +194,8 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 | 112 | "PORTFOLIO AFTER THIS CYCLE" retitled "AFTER MONTHLY REBALANCE (before today's buying)" (buys run later in deploy_day); "session(s)" grammar fix                                         | v11 P2-1/P2-2 |
 | 113 | Raise STARTING_CAPITAL to ₹5,000–10,000 (₹1,000 < ₹2,000 minimum order = the bot can NEVER buy; auditor v15 P0-1) |
 | 114 | Authorise EDIS (daily CDSL TPIN) — or better DDPI (one-time standing) — for the holdings in Upstox, else every SELL fails (v15 P0-4). Test with a small sell after enabling. |
+| 115 | **Do NOT re-run `trade` today (30-Oct)**: the journal on your box was cleaned by the pre-v16 sync bug (cash ₹9,825 correct; SML100CASE+LIQUIDCASE rows missing → fake 93% DD). Tomorrow's `trade`/`status` re-syncs holdings and heals the book automatically. v16 makes the wipe impossible going forward. |
+| 116 | Verify LIQUIDCASE identity/price on your box: `SELECT instrument_key, date, close FROM price_daily WHERE symbol='LIQUIDCASE' ORDER BY date DESC LIMIT 3;` — the live fill landed at ₹116.69 while a Zerodha Nifty-1D liquid ETF usually trades ~₹1,000+; a split adjusts the bars (adj_close) but if the series was never split-adjusted, confirm the instrument is the intended liquid ETF before the next sweep. |
 | 113 | Config note: INVEST_PER_DAY 5000 < MIN_TRADE_VALUE×MAX_HOLDINGS ⇒ floor budget places ONE order/run by design; autofill is the fast path (Option B chosen — note, not a value change) | v11 P1-3      |
 
 ---
@@ -248,4 +254,6 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 
 ---
 
-*Last updated: audit v15, 30-Oct-2026 (SIP orphan-sell of own picks fixed; failed exits keep the signal open; sub-minimum budget honest + loud; EDIS loud explainer; plan-lag warning; rotation labels. Rows 139-144, actions 113-114. Selftest count: 131.*
+*Last updated: audit v16, 30-Oct-2026 (T+1 settlement gaps in the broker feed stopped deleting same-day positions/re-fabricating a crash; 'safe to re-run' is now conditional; status flags drawdown-vs-state contradictions with timestamps; sleeve parking split out of all money-spent panels; sleeve sweep uses the live quote; per-line small-fill reasons; history-cap noted in coverage. Rows 145-148, actions 115-116. Selftest count: 135.*
+
+*Previous: audit v15, 30-Oct-2026 (SIP orphan-sell of own picks fixed; failed exits keep the signal open; sub-minimum budget honest + loud; EDIS loud explainer; plan-lag warning; rotation labels. Rows 139-144, actions 113-114. Selftest count: 131.*

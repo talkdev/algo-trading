@@ -91,3 +91,29 @@ raise STARTING_CAPITAL ≥ ₹5,000 and authorise EDIS/DDPI in Upstox.
 | EDIS leads buried | loud one-glance explainer | ledger 142 |
 | plan-vs-reality lag invisible (2.8% vs 52.1% for days) | 3-day persistent warning | ledger 143 |
 | rotation sells read like trend breaks | labelled | ledger 144 |
+
+## Round 27 (external audit v16, 2026-10-30) — the post-buy sync deleted what you had just bought
+
+The 30-Oct live run placed its first real strategy buy (SML100CASE 475u
+@ ₹10.54 = ₹5,006.50 against the ₹5,000/day floor) and the weekly idle-cash
+sweep parked ₹2.29 L in LIQUIDCASE.  Seconds later `sync_live_book()` rebuilt
+"truth" from Upstox **holdings + positions** — where a delivery buy lands only
+**T+1** — and DELETED both positions.  Journal equity printed ₹16,828 against
+the real ₹2.51 L, i.e. a fabricated 93.28% drawdown beside "Risk state:
+NORMAL".  A `trade` re-run on that book would have triggered the EXTREME
+sell-everything rule against a phantom crash.  This was the highest-stakes
+defect yet; all of v16 follows from it (135/135 selftests).
+
+| finding | was | now |
+|---|---|---|
+| sync wiped same-day delivery fills (T+1 gap) | `_filled_today` from the order book keeps + re-admits them; loud DO-NOT-RERUN warning; selftested keep + stale-date non-mask | ledger 145 |
+| "Re-running today is safe" printed unconditionally | conditional — on a T+1-pending day it says the opposite | ledger 146 |
+| 93.28% printed next to "Risk state: NORMAL" | risk engine stamps `risk_last_eval`; status errors loudly on drawdown/state contradiction | ledger 147 |
+| ₹5k buy + ₹2.29 L sweep read as one "traded" number | sleeve parking split out of every spent-money panel; sweep priced off the live quote; rounding note | ledger 148 |
+| cleanup line indistinguishable from data loss | names T+1 explicitly | ledger 148 |
+| coverage summary silent on the feed's history cap | prints avg depth ≈ years + the candle-cap caveat | ledger 148 |
+
+**User-side asks (ledger actions 115-116):** do NOT re-run `trade` today —
+tomorrow's sync heals the box's journal automatically; and verify the
+LIQUIDCASE instrument/price (₹116.69 fill vs a ~₹1,000-quoted liquid ETF —
+check for a split the price series never absorbed).

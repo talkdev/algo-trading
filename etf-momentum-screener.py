@@ -2826,6 +2826,17 @@ class DataManager:
         P.kv("Last price bar on", (latest["d"] if latest and latest["d"] else "n/a"))
         P.kv("Signal-ready", f"{ready} of {len(rows)} ETFs "
              f"({MIN_HISTORY_BARS}+ bars of history)", val_color=_C.GREEN)
+        # audit v16 P2 (2026-10-30): name the feed's hard history cap and what
+        # it means, so 'yrs in cache' is never read as full history
+        _span = self.db.one("SELECT COUNT(*) AS t, MIN(date) AS f, "
+                            "COUNT(DISTINCT symbol) AS s FROM price_daily")
+        if _span and _span["t"]:
+            _avg = _span["t"] / max(_span["s"] or 1, 1)
+            P.kv("History window",
+                 f"{_span['f']} → today, {_span['t']:,} bars / {_span['s']} ETFs "
+                 f"(avg {_avg:.0f} bars ≈ {_avg / 250:.1f}y).  The Upstox daily "
+                 f"candle feed is capped — this floor covers live signals but "
+                 f"NOT the longer backtest horizon.", val_color=_C.WHITE)
         if thin:
             P.kv("Thin history",
                  f"{len(thin)} funds — excluded from signals until they mature: "
@@ -4637,10 +4648,53 @@ class Broker:
             if side in ("BUY", "SELL"):
                 openq.setdefault(sym, {"BUY": 0.0, "SELL": 0.0})[side] += pend
 
-        # 4) overwrite the DB positions mirror with the broker truth
-        existing = {r["symbol"]: r["qty"] for r in
-                    self.db.query("SELECT symbol, qty FROM positions WHERE qty>0")}
-        vanished = sorted(s for s in existing if s not in truth)
+        # 4) overwrite the DB positions mirror with the broker truth.
+        #    audit v16 P0-A: keep full rows (qty+avg) — same-day fills below
+        #    are re-admitted from the journal while the T+1 settlement lags.
+        existing = {r["symbol"]: {"qty": r["qty"], "avg_cost": r["avg_cost"]} for r in
+                    self.db.query("SELECT symbol, qty, avg_cost FROM positions WHERE qty>0")}
+        # audit v16 P0-A (2026-10-30 live console): same-day delivery fills are
+        # NOT in holdings/positions yet (T+1 settlement) — the orderbook is
+        # the only same-day proof.  Before this fix the vanished-loop deleted
+        # a position FILLED one second earlier, collapsed journal equity, and
+        # printed a fabricated 93% drawdown beside "Risk state: NORMAL".
+        _filled_today = set()
+        for r in order_rows or []:
+            sym_f = self._book_symbol(r.get("trading_symbol") or r.get("tradingsymbol")
+                                      or r.get("symbol") or "")
+            st_f = str(r.get("status") or "").strip().lower()
+            if sym_f and st_f in ("complete", "filled"):
+                ts_f = str(r.get("order_timestamp") or r.get("exchange_timestamp")
+                           or r.get("created_at") or "")
+                if ts_f.startswith(today_str()):
+                    _filled_today.add(sym_f)
+        _t1_hold = sorted(s for s in existing if s not in truth and s in _filled_today)
+        # v16 P0-B: marker for the action panel / status — "safe to re-run" is
+        # false on a T+1-pending day (the pre-fix code would real money-liquidate
+        # via the fabricated drawdown; the guard below keeps even a confused
+        # rerun honest)
+        if _t1_hold:
+            self.db.meta_set("same_day_t1_pending", today_str())
+        else:
+            self.db.meta_set("same_day_t1_pending", "")
+        if _t1_hold:
+            P.err("SAME-DAY FILLS NOT SETTLED YET (T+1): "
+                  + ", ".join(_t1_hold)
+                  + " — bought today, so the broker's holdings report doesn't "
+                    "list them yet (delivery lands next session, after tonight's "
+                    "close).  Keeping them in the journal; the cash ledger is "
+                    "correct.  DO NOT re-run 'trade' today — a fresh sync that "
+                    "missed these would misread the book as a crash and "
+                    "trigger the EXTREME sell-everything rule.  Re-check "
+                    "'status' tomorrow; if the symbols are still missing from "
+                    "the Upstox app too, the orders need a manual look.")
+        vanished = sorted(s for s in existing if s not in truth
+                          and s not in _filled_today)
+        # v16 P0-A (cont.): re-admit the T+1-lagging fills into the in-run
+        # truth too, from the journal rows — otherwise equity in THIS run is
+        # still computed without them (the fabricated drawdown).
+        for s in _t1_hold:
+            truth[s] = dict(existing[s])
         for s in vanished:
             self.db.execute("DELETE FROM positions WHERE symbol=?", (s,))
         for sym, t in truth.items():
@@ -4658,9 +4712,14 @@ class Broker:
         # plain-language report of what changed hands
         if vanished:
             P.warn("Journal cleaned to match the broker: "
-                   + ", ".join(f"{s} (journal said {existing[s]:.0f}, broker holds 0)"
+                   + ", ".join(f"{s} (journal said {existing[s]['qty']:.0f}, broker holds 0)"
                                for s in vanished[:8])
-                   + " — deleted from the portfolio.")
+                   + " — deleted from the portfolio."
+                   # v16 P1-E: name T+1 explicitly so an honest clean-up is
+                   # never misread as holdings loss
+                   + "  (Same-day buys sit one settlement day out of the "
+                     "broker holdings feed; this line now only fires for "
+                     "symbols with NO filled order today.)")
         newat = [s for s in truth if s not in existing]
         if newat:
             P.note("Broker holds ETF(s) the journal did not know — adopted: "
@@ -4982,6 +5041,10 @@ class RiskEngine:
         if equity > self.peak:
             self.peak = equity
         dd = 1.0 - equity / self.peak if self.peak > 0 else 0.0
+        # audit v16 P0-C: status is read-only and can print a drawdown the
+        # stored state predates — record WHEN the engine last judged the book,
+        # so a drawdown/state contradiction carries its timestamp.
+        self.db.meta_set("risk_last_eval", today_str())
         # --- release rules (audit bug #5) ---
         # (a) classic: recover to within REENTRY_BAND of prior peak
         # (b) TIME-BASED: after RISK_RELEASE_DAYS the lock is released at the
@@ -5429,10 +5492,24 @@ class TradingCycle:
             P.note(f"A {sx} sweep order is already open at the broker — "
                    f"skipping today's sweep.")
             return 0
-        px = self.latest_prices().get(sx)
+        # audit v16 P1-A#1 (2026-10-30): the sweep priced off the last SAVED
+        # bar — a day-old close forms a stale LIMIT for a live order.
+        # Prefer today's live sleeve quote; fall back to the last saved bar,
+        # and always SAY which price basis was used.
+        px_src, px = None, None
+        try:
+            _qmap, _qspr, _tfl = self._live_quotes([sx])
+            if _tfl.get(sx) is True and _qmap.get(sx):
+                px, px_src = _qmap[sx], "live quote just now"
+        except Exception:
+            pass
+        if not px:
+            px = self.latest_prices().get(sx)
+            px_src = "last saved bar"
         if not px or px <= 0:
             P.warn(f"Cannot sweep idle cash into {sx} — no price today.")
             return 0
+        P.info(f"{sx} sweep price basis: the {px_src} ({fmt_rs(px)}).")
         qty = int(surplus / px)
         if qty <= 0:
             return 0
@@ -5966,8 +6043,10 @@ class TradingCycle:
         # audit v5 #4: whatever cash is left idle beyond the buffer gets
         # parked in the liquid sleeve (weekly cadence inside sleeve_sweep)
         self.sleeve_sweep()
-        P.ok(f"Today's buying done — {bought} order(s), {fmt_rs(deployed)} used "
-             f"of today's {fmt_rs(budget_today)} budget "
+        _round_note = " (whole-unit rounding, ±1 unit per order)" \
+            if deployed > budget_today else ""
+        P.ok(f"Today's buying done — {bought} order(s), {fmt_rs(deployed)} "
+             f"against today's ≈{fmt_rs(budget_today)} budget{_round_note} "
              f"(today's total: {fmt_rs(already + deployed)}; floor stays "
              f"{fmt_rs(INVEST_PER_DAY)}/run).")
 
@@ -6006,16 +6085,40 @@ class TradingCycle:
             # audit v10 (external): on re-runs this line counted only the LAST
             # run (Rs 19k) while the DAY had already deployed Rs 1.36L — show
             # both, so resumptions never read as fresh full deployment
-            _dt = self.db.one("SELECT COUNT(*) AS n, COALESCE(SUM(value),0) AS v "
-                              "FROM orders WHERE exec_date=? AND side='BUY' "
-                              "AND status='FILLED'", (today_str(),))
+            # audit v16 P1-A/B: the day-total used to fold the idle-cash sweep
+            # (LIQUIDCASE = parking, not market exposure) into "money invested
+            # today" — Rs 2.34 L faces the reader as strategy deployment on a
+            # day where Rs 5k went into picks.  Split the two.
+            _ph = ",".join("?" * len(CASH_PROXY_SYMBOLS))
+            _dt = self.db.one(f"SELECT COUNT(*) AS n, COALESCE(SUM(value),0) AS v "
+                              f"FROM orders WHERE exec_date=? AND side='BUY' "
+                              f"AND status='FILLED' AND symbol NOT IN ({_ph})",
+                              (today_str(),) + tuple(CASH_PROXY_SYMBOLS))
             _dn, _dv = (_dt["n"] or 0), (_dt["v"] or 0.0)
-            _day = (f" | today across all runs: {fmt_cr(_dv)} in {_dn} order(s)"
+            _dt_sl = self.db.one(f"SELECT COUNT(*) AS n, COALESCE(SUM(value),0) AS v "
+                                 f"FROM orders WHERE exec_date=? AND side='BUY' "
+                                 f"AND status='FILLED' AND symbol IN ({_ph})",
+                                 (today_str(),) + tuple(CASH_PROXY_SYMBOLS))
+            _sln, _slv = (_dt_sl["n"] or 0), (_dt_sl["v"] or 0.0)
+            _day = (f" | today in strategy: {fmt_cr(_dv)} in {_dn} order(s)"
                     if _dv > deployed + 1.0 else "")
+            _day += (f" | parked in cash sleeve: {fmt_cr(_slv)} in {_sln} "
+                     f"order(s) (overnight parking — NOT market exposure)"
+                     if _slv > 1.0 else "")
             P.kv("Money invested today",
                  f"{fmt_rs(deployed)} across {bought} ETF(s) this run"
                  f" — {fmt_pct(safe_div(deployed, max(eq_pre, 1.0), 0.0))} of the "
                  f"{fmt_cr(eq_pre)} total you had before buying{_day}")
+            # audit v16 P2: a buy worth <5% of equity is easy to misread as
+            # "nothing happened" — name each small fill with its reason
+            for _r in self.db.query(
+                    "SELECT symbol, qty, price, value, reason FROM orders "
+                    "WHERE exec_date=? AND side='BUY' AND status='FILLED' "
+                    "AND value < ?", (today_str(), 0.05 * max(eq_pre, 1.0))):
+                P.info(f"  {_r['symbol']} x{_r['qty']:.0f} @ {fmt_rs(_r['price'])} "
+                       f"= {fmt_rs(_r['value'])} "
+                       f"({fmt_pct(safe_div(_r['value'], max(eq_pre, 1.0), 0.0))} "
+                       f"of your money) — {(_r['reason'] or '')[:48]}")
         elif parked_names:
             P.ok("Nothing was bought — the undelivered plan money is parked "
                  "because those ETFs are falling (above), not because the "
@@ -8837,6 +8940,25 @@ def cmd_status(db: Db):
     P.kv("Current drawdown", fmt_pct(dd, signed=False),
          val_color=_C.RED if dd > 0.05 else _C.WHITE)
     P.kv("Risk state", risk.state)
+    # audit v16 P0-C (2026-10-30 console): status is read-only by design, so a
+    # printed drawdown can exceed the trigger while the state says NORMAL (the
+    # live console showed 93.28% vs NORMAL with no explanation).  Call out the
+    # contradiction and its meaning THE MOMENT the numbers disagree.
+    _dr, _ds, _dx = dd_thresholds(VOL_TARGET)
+    if dd >= _dx and risk.state != "EXTREME":
+        P.err(f"Drawdown {fmt_pct(dd, signed=False)} is PAST the all-cash "
+              f"trigger ({fmt_pct(_dx, signed=False)}) but the risk state reads "
+              f"'{risk.state}' — the engine last saw the book on "
+              f"{db.meta_get('risk_last_eval', 'never')}.  If today's buys are "
+              f"still in T+1 settlement this line is expected noise (see the "
+              f"'same-day fills' note above); otherwise the next CONFIRMED "
+              f"trade run will act on this drawdown.  Do not run 'trade' until "
+              f"'reconcile' + a fresh 'status' agree.")
+    elif dd >= _ds and risk.state not in ("SEVERE", "EXTREME"):
+        P.warn(f"Drawdown {fmt_pct(dd, signed=False)} is past the half-exit "
+               f"trigger ({fmt_pct(_ds, signed=False)}) but the risk state reads "
+               f"'{risk.state}'.  The next CONFIRMED trade run will sell HALF "
+               f"of every holding.  Check for unsettled same-day fills first.")
     # audit v12: a state printed without an evaluation date can hide a stale
     # engine (the 2026-10-29 console showed dd 69.96% beside NORMAL because
     # update() never ran on declined run).  Show when it last saw equity.
@@ -9059,7 +9181,27 @@ def print_action_panel(db: Db):
                 # audit v8 (2026-10-28): saying "real money" in PAPER mode
                 # misleads — name the true thing in each mode
                 _mw = "paper money (simulated)" if PAPER_TRADE else "real money"
-                P.ok(f"{side}: {fn} order(s) SETTLED ({fmt_cr(fv)} {_mw})")
+                # audit v16 P1-B: split the overnight-cash sweep out of the
+                # "settled real money" claim — parking is not market exposure
+                _fv_strat = fv
+                _fn_strat = fn
+                if side == "BUY" and fn:
+                    _ph = ",".join("?" * len(CASH_PROXY_SYMBOLS))
+                    _sr = db.one(f"SELECT COUNT(*) AS n, COALESCE(SUM(value),0) AS v "
+                                 f"FROM orders WHERE exec_date=? AND side='BUY' "
+                                 f"AND status='FILLED' AND symbol IN ({_ph})",
+                                 (today,) + tuple(CASH_PROXY_SYMBOLS))
+                    if (_sr["n"] or 0) > 0:
+                        _fn_strat = fn - (_sr["n"] or 0)
+                        _fv_strat = fv - (_sr["v"] or 0.0)
+                        P.ok(f"{side}: {_fn_strat} strategy order(s) SETTLED "
+                             f"({fmt_cr(_fv_strat)} {_mw})")
+                        P.ok(f"{side}: {_sr['n']} cash-sleeve order(s) PARKED "
+                             f"({fmt_cr(_sr['v'])} — overnight parking, not "
+                             f"market exposure)")
+                        _fv_strat = None
+                if _fv_strat is not None:
+                    P.ok(f"{side}: {fn} order(s) SETTLED ({fmt_cr(fv)} {_mw})")
                 if on_:
                     P.warn(f"{side}: {on_} order(s) open at the broker "
                            f"({fmt_cr(ov)} may still settle — counted at end of "
@@ -9310,9 +9452,18 @@ def print_action_panel(db: Db):
                            f"risk state and the stored target plan.")
         except Exception:
             pass
-        P.note("• Re-running the script today is safe: daily deployment is "
-               "amount-journaled (tops up, never doubles) and the monthly "
-               "rebalance tracks its signal date.")
+        # audit v16 P0-B: on a day whose fills are still in T+1 settlement,
+        # "safe to re-run" is FALSE — say the opposite, loudly, and name them.
+        _t1_day = (db.meta_get("same_day_t1_pending", "") == today_str())
+        if _t1_day:
+            P.warn("• Do NOT re-run 'trade' today: buys from this run settle "
+                   "into the broker's holdings feed only TOMORROW (T+1).  "
+                   "Positions and cash in the journal are correct; wait for "
+                   "the next session's sync.")
+        else:
+            P.note("• Re-running the script today is safe: daily deployment is "
+                   "amount-journaled (tops up, never doubles) and the monthly "
+                   "rebalance tracks its signal date.")
     except Exception as e:
         P.note(f"(action panel unavailable: {e})")
 
@@ -9729,6 +9880,107 @@ def cmd_selftest(db: Db):
     check("v15 P0-1: INVEST_PER_DAY >= MIN_TRADE_VALUE (else zero buys ever)",
           INVEST_PER_DAY >= MIN_TRADE_VALUE,
           f"INVEST_PER_DAY={INVEST_PER_DAY} MIN_TRADE_VALUE={MIN_TRADE_VALUE}")
+
+    # v16 P0-A/B regression (2026-10-30 live console): the post-buy
+    # sync_live_book rebuilt truth from holdings+positions only — same-day
+    # delivery fills are invisible there until T+1 — and DELETED the ETF just
+    # bought one second earlier (SML100CASE+LIQUIDCASE), collapsing journal
+    # equity and printing a fabricated 93% drawdown beside 'Risk state:
+    # NORMAL'.  Fixture: holdings show only OLDPOS; the order book shows
+    # NEWBUY filled TODAY.  Both must survive the sync.
+    _dbf16 = None
+    try:
+        _p16 = DATA_DIR / "selftest_v16.db"
+        _dbf16 = Db(str(_p16))
+        for _s16 in ("OLDPOS", "NEWBUY"):
+            _dbf16.execute("INSERT OR REPLACE INTO etf_universe(symbol,status) "
+                           "VALUES(?,'ACTIVE')", (_s16,))
+        _dbf16.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
+                       "VALUES(?,?,?,?)", ("OLDPOS", 5.0, 100.0, now_iso()))
+        _dbf16.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
+                       "VALUES(?,?,?,?)", ("NEWBUY", 10.0, 50.0, now_iso()))
+
+        class _FakeClient16:
+            def holdings(self):
+                return [{"tradingsymbol": "OLDPOS", "quantity": 5,
+                         "t1_quantity": 0, "average_price": 100.0}]
+            def positions(self):
+                return [{"tradingsymbol": "OLDPOS", "buy_quantity": 0,
+                         "sell_quantity": 0}]
+            def orders_book(self):
+                return [{"tradingsymbol": "NEWBUY", "status": "complete",
+                         "order_timestamp": f"{today_str()} 09:17:05",
+                         "transaction_type": "BUY",
+                         "quantity": 10, "filled_quantity": 10}]
+            def funds_available(self):
+                return 500.0
+
+        _b16 = Broker(_dbf16, None, client=_FakeClient16(), paper=False)
+        _ok16 = _b16.sync_live_book()
+        _rows16 = {r["symbol"]: r["qty"] for r in
+                   _dbf16.query("SELECT symbol, qty FROM positions WHERE qty>0")}
+        check("v16 P0-A: same-day fill kept by sync (no phantom wipe)",
+              _ok16 and _rows16.get("NEWBUY") == 10.0
+              and _rows16.get("OLDPOS") == 5.0,
+              f"rows={_rows16}")
+        check("v16 P0-B: T+1-pending marker set on the fill day",
+              _dbf16.meta_get("same_day_t1_pending", "") == today_str(),
+              f"marker={_dbf16.meta_get('same_day_t1_pending','-')}")
+        # an orderbook with only an OPEN order must NOT count as settled, and
+        # a fill stamped YESTERDAY (already reflected in holdings) must not
+        # re-admit either — only today's complete/filled rows qualify
+        class _OldClient16(_FakeClient16):
+            def orders_book(self):
+                y = (dt.date.today() - dt.timedelta(days=3)).isoformat()
+                return [{"tradingsymbol": "NEWBUY", "status": "complete",
+                         "order_timestamp": f"{y} 09:17:05",
+                         "transaction_type": "BUY",
+                         "quantity": 10, "filled_quantity": 10}]
+        _b16b = Broker(_dbf16, None, client=_OldClient16(), paper=False)
+        _b16b.sync_live_book()
+        _rows16b = {r["symbol"]: r["qty"] for r in
+                    _dbf16.query("SELECT symbol, qty FROM positions WHERE qty>0")}
+        check("v16 P0-A: stale fill date does NOT mask a vanished holding",
+              _rows16b.get("NEWBUY") is None and _rows16b.get("OLDPOS") == 5.0,
+              f"rows={_rows16b}")
+    finally:
+        if _dbf16 is not None:
+            _dbf16.close()
+        try:
+            os.remove(DATA_DIR / "selftest_v16.db")
+        except Exception:
+            pass
+
+    # v16 P0-C regression: status must call out a drawdown that is past the
+    # liquidation triggers while the stored state still says NORMAL.
+    _dbf17 = None
+    try:
+        import io as _io, contextlib as _cl
+        _p17 = DATA_DIR / "selftest_v17.db"
+        _dbf17 = Db(str(_p17))
+        _dbf17.execute("INSERT INTO positions(symbol,qty,avg_cost,updated) "
+                       "VALUES(?,?,?,?)", ("T17", 1.0, 100.0, now_iso()))
+        _dbf17.execute("INSERT INTO price_daily(symbol,date,open,high,low,close,"
+                       "adj_close,volume,traded_value) VALUES(?,?,?,?,?,?,?,?,?)",
+                       ("T17", today_str(), 100.0, 100.0, 100.0, 100.0, 100.0,
+                        1e6, 1e8))
+        _rg17 = RiskEngine(_dbf17)
+        _rg17.peak, _rg17.state = 100000.0, "NORMAL"     # tiny eq vs stale peak
+        _rg17._save()
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            cmd_status(_dbf17)
+        _out17 = _buf.getvalue()
+        check("v16 P0-C: status flags the drawdown/state contradiction",
+              "PAST the all-cash trigger" in _out17,
+              _out17.strip().splitlines()[-1][:60] if _out17.strip() else "empty")
+    finally:
+        if _dbf17 is not None:
+            _dbf17.close()
+        try:
+            os.remove(DATA_DIR / "selftest_v17.db")
+        except Exception:
+            pass
 
     # A8: impact grows with order size (no more flat 2 bps)
     small = impact_bps(10_000.0, 1_000_000.0)
