@@ -277,7 +277,7 @@ LIVE_CASH_SLEEVE = True            # audit v5 #4 (2026-10-28, user said apply):
                                    #   had this).  Sleeve sells happen only to FUND
                                    #   real buys.  Set False to opt out (a plain
                                    #   note about idle cash is printed instead).
-STARTING_CAPITAL = 10000             # dual role (user direction 2026-10-29):
+STARTING_CAPITAL = 5000             # dual role (user direction 2026-10-29):
                                    # (1) paper-mode starting cash, (2) the
                                    # amount you want deployed per run —
                                    # INVEST_PER_DAY below takes its floor from
@@ -1020,7 +1020,10 @@ class Printer:
         self.raw()
         self.raw(paint("  " + "=" * (w - 4), _C.CYAN, _C.BOLD))
         self.raw(paint("  ||  T S M O M   -   Time Series Momentum on the Nifty ETF Universe", _C.CYAN, _C.BOLD))
-        self.raw(paint("  ||  Paper-Trade Edition  |  Upstox Data  |  SQLite Journal", _C.CYAN, _C.BOLD))
+        # audit v14 §3 (2026-10-30): "Paper-Trade Edition" sat under a LIVE
+        # mode line — misleading.  The edition now follows the actual mode.
+        _edition = "Paper-Trade Edition" if PAPER_TRADE else "LIVE-Trading Edition"
+        self.raw(paint(f"  ||  {_edition}  |  Upstox Data  |  SQLite Journal", _C.CYAN, _C.BOLD))
         self.raw(paint("  " + "=" * (w - 4), _C.CYAN, _C.BOLD))
         self.raw(paint(f"  Today: {TODAY.strftime('%A, %d %B %Y')}   Mode: "
                        + ("PAPER TRADING (no real money)" if PAPER_TRADE else "LIVE TRADING"),
@@ -2952,6 +2955,17 @@ def last_completed_session(now: dt.datetime = None) -> str:
     return d.isoformat()
 
 
+def prev_completed_session(iso_day: str) -> str:
+    """The NSE session BEFORE iso_day (weekends + known holidays skipped).
+    Companion to last_completed_session — used for the one-session grace
+    window on live order freshness (audit v14 P1)."""
+    hols = _nse_holidays()
+    d = parse_date(iso_day) - dt.timedelta(days=1)
+    while d.weekday() >= 5 or d.isoformat() in hols:
+        d -= dt.timedelta(days=1)
+    return d.isoformat()
+
+
 def sessions_to_calendar(today: str, target: str) -> int:
     """Weekdays minus known NSE holidays strictly in (today, target] — the
     CALENDAR count, independent of the price table.  Audit v11 P0-1
@@ -3000,6 +3014,27 @@ def live_buy_order_px(px: float):
     if (not PAPER_TRADE) and LIVE_ORDER_TYPE == "LIMIT":
         return "LIMIT", round(float(px) * (1.0 + LIVE_LIMIT_BUFFER), 2)
     return "MARKET", float(px)
+
+
+def sip_orphan_should_sell(sym: str, target: dict, chosen_syms: set,
+                           sip_mode: bool) -> bool:
+    """Held symbol missing from the target map -> orphan sell.  audit v15 P0-2:
+    in SIP_MODE the map omits chosen names by design, so a held+CHOSEN holding
+    must be KEPT (the live console had the rebalance dumping its own #1/#2
+    fresh picks).  Cash sleeves are never orphans (they ARE the parking)."""
+    if sym in target or sym in CASH_PROXY_SYMBOLS:
+        return False
+    if sip_mode and sym in chosen_syms:
+        return False
+    return True
+
+
+def signal_closeable(exits_outstanding: int, exits_failed: list) -> bool:
+    """A month-end signal may seal (`last_trade_signal` written) only once its
+    exits are physically done — not sliced/queued AND not broker-failed.
+    audit v15 P0-3: an EDIS-rejected exit used to seal the signal anyway and
+    was never retried."""
+    return exits_outstanding == 0 and not exits_failed
 
 
 def day_slices(gaps: dict, budget: float, caps: dict = None) -> dict:
@@ -4359,7 +4394,10 @@ class TaxEngine:
                                         "by_class": {}})
             rules = TAX_RULES["EQUITY"] if cls == "EQUITY" else (
                 TAX_RULES["COMMODITY"] if cls == "COMMODITY" else
-                {"stcg": SLAB_RATE, "ltcg": SLAB_RATE, "exempt": 0.0})
+                # audit v14 P2 (2026-10-30): GLOBAL/HYBRID/DEBT reporting used
+                # slab for BOTH legs — GLOBAL LTCG must be the configured
+                # 12.5%, not 30%.  Use the per-class rules everywhere.
+                tax_rules_for({"GLOBAL": "GLOBAL INDICES"}.get(cls, cls)))
             st_rate, lt_rate, exempt = rules["stcg"], rules["ltcg"], rules["exempt"]
             st_net, lt_net = d["st"], d["lt"]
             c = carry.get(cls)
@@ -4396,6 +4434,9 @@ BROKER_OPEN_STATUSES = {
     "put order req received", "open pending", "modify pending",
     "modify validation pending", "after market order req received",
     "amo req received",
+    # audit v14 P1 (2026-10-30): a partially-filled order still has the
+    # remainder WORKING — missing it here let the next run duplicate it.
+    "partially filled", "partially filled and open",
 }
 
 
@@ -4624,6 +4665,28 @@ class Broker:
         if newat:
             P.note("Broker holds ETF(s) the journal did not know — adopted: "
                    + ", ".join(f"{s} x{truth[s]['qty']:.0f}" for s in newat[:8]))
+        # audit v14 P2 (2026-10-30): holdings adopted from the broker arrive
+        # WITHOUT tax lots — a later sell used to journal zero P&L/tax.  Create
+        # conservative lots (dated TODAY at the broker average => any profit is
+        # taxed as short-term, never flattered), flag the symbol's age as
+        # UNKNOWN, and block the 12-month tax-deferral carve-out for it.
+        for s in newat:
+            lots = self.db.one(
+                "SELECT COUNT(*) AS c FROM tax_lots WHERE symbol=? AND qty>0 "
+                "AND sell_date IS NULL", (s,))
+            t = truth.get(s)
+            if t and t["qty"] > 0 and (not lots or lots["c"] == 0):
+                self.db.execute(
+                    "INSERT INTO tax_lots(symbol,buy_date,buy_price,qty) "
+                    "VALUES(?,?,?,?)", (s, today_str(), t["avg_cost"], t["qty"]))
+                unk = set(json.loads(self.db.meta_get("tax_age_unknown", "[]")))
+                unk.add(s)
+                self.db.meta_set("tax_age_unknown", json.dumps(sorted(unk)))
+                P.warn(f"{s}: no buy history in the journal — a conservative tax "
+                       f"lot was created dated TODAY (any profit counts as "
+                       f"short-term).  The 12-month tax-wait will NOT delay "
+                       f"selling it.  If you know the real buy date, fix "
+                       f"stock-data/tsmom.db table tax_lots.")
         if foreign:
             P.note(f"Broker holdings outside this bot's ETF universe "
                    f"({', '.join(sorted(set(foreign))[:8])}) are left untouched "
@@ -4634,7 +4697,14 @@ class Broker:
                                for s, d in sorted(openq.items())[:8]))
         P.ok(f"Broker book synced: {len(truth)} ETF holding(s) adopted from Upstox; "
              f"journal positions mirror updated.")
-        self.sync_live_cash()
+        # audit v14 P0 (2026-10-30): the funds-API failure used to be tolerated
+        # here — trading continued on the STALE ledger cash (once a Rs 0.5 L
+        # gap was seen on screen).  Cash unreadable -> fail-closed, no orders.
+        if not self.sync_live_cash():
+            P.err("Broker cash unreadable — REFUSING orders today: sizes are "
+                  "computed off the real balance, and I cannot see it.  Fix the "
+                  "Upstox token/network and rerun (analysis was still updated).")
+            return False
         return True
 
 
@@ -4685,7 +4755,13 @@ class Broker:
     # ----- order flow -----
     def execute(self, symbol: str, side: str, qty: float, ref_price: float,
                 signal_as_of: str = "", reason: str = "", spread_bps: float = 8.0,
-                spread_mult: float = 1.0, order_type: str = "MARKET") -> dict:
+                spread_mult: float = 1.0, order_type: str = "MARKET",
+                limit_px: float = None) -> dict:
+        # audit v14 P0 (2026-10-30): limit_px is the price actually SENT to the
+        # broker for live LIMIT orders (deploy_day buffers it with
+        # LIVE_LIMIT_BUFFER).  ref_price drives only the paper/ledger fill
+        # simulation — before this fix the buffered limit price was fed back
+        # through slippage_price(), doubling the slippage on every live buy.
         qty = int(qty)
         if qty <= 0:
             return {"status": "REJECTED", "reason": "quantity is zero"}
@@ -4704,13 +4780,22 @@ class Broker:
                             order_value=qty * ref_price, liq_p25=liq_p25)
         value = px * qty
         charges = calc_charges(side, value, category=category)
-        status = "FILLED"
+        # audit v14 P0: a LIVE order whose placement succeeded but whose fill
+        # could NOT be verified used to keep the default FILLED and apply the
+        # fill at the simulated price — fabricating positions/cash.  Live
+        # orders now start UNCONFIRMED and turn FILLED only on a broker
+        # "complete/filled" status; otherwise resolve_pending_live_orders()
+        # settles them on the next run.
+        status = "FILLED" if self.paper else "UNCONFIRMED"
         fill_note = "filled at simulated price (paper book)" if self.paper else ""
         if not self.paper and self.client is not None:
             key_row = self.db.one("SELECT instrument_key FROM etf_universe WHERE symbol=?", (symbol,))
             key = key_row["instrument_key"] if key_row else f"NSE_EQ|{symbol}"
             try:
-                resp = self.client.place_order(symbol, key, side, qty, px, order_type)
+                send_px = px
+                if (order_type or "").upper() == "LIMIT" and limit_px:
+                    send_px = float(limit_px)          # buffered cap, no extra slip
+                resp = self.client.place_order(symbol, key, side, qty, send_px, order_type)
                 oid = (resp.get("data") or {}).get("order_id", "")
                 fill_note = f"live order id {oid}"
                 # audit #9: reconcile the simulated fill with the broker's actual
@@ -4741,6 +4826,20 @@ class Broker:
             except Exception as e:
                 status = "FAILED"
                 fill_note = f"live order failed: {e}"
+                # audit v15 P0-4 (2026-10-30 console): Upstox delivery SELLS
+                # die on "EDIS is not validated" (UDAPI100500) until the user
+                # authorises CDSL TPIN/OTP — buried in a ticket, this looked
+                # like a generic glitch.  Say it at volume the moment it fires.
+                if side.upper() == "SELL" and ("UDAPI100500" in str(e)
+                                               or "EDIS" in str(e).upper()):
+                    P.err(f"SELL blocked on {symbol}: Upstox has no EDIS "
+                          f"authorisation for this holding today.  "
+                          f"Delivery sales need a daily CDSL EDIS check "
+                          f"(TPIN/OTP) — fix once in the Upstox app "
+                          f"(Profile -> Security -> Authorise sell / EDIS), "
+                          f"and consider DDPI (one-time standing "
+                          f"authorisation, removes the daily dance).  The "
+                          f"signal stays OPEN and retries next run.")
         slip_cost = abs(px - ref_price) * qty
         self.db.execute(
             "INSERT INTO orders(ts,signal_as_of,exec_date,symbol,side,qty,price,value,"
@@ -4877,6 +4976,7 @@ class RiskEngine:
                 self.all_cash = False
                 self.state = "NORMAL"
                 self.trigger_date = ""
+                self.db.meta_set("risk_peak_rebased_date", today_str())
             self.db.meta_set("equity_peak_mode", _mode_now)
             self._save()
         if equity > self.peak:
@@ -5114,7 +5214,22 @@ class TradingCycle:
             return out
         as_of = self.last_month_end()
         stats = self.collect_stats(as_of)
-        chosen = [s for s in stats if s["symbol"] in basket]
+        hold_syms = {r["symbol"] for r in self.db.query(
+            "SELECT symbol FROM positions WHERE qty>0")}
+        # audit v14 P1 (2026-10-30): the re-derivation used to SIZE the stored
+        # basket symbols directly, skipping selection filters (iNAV premium
+        # block, 200-DMA overlay, correlation cap, one-per-index-family).  A
+        # legacy journal could therefore size towards an ETF the selector
+        # would have blocked.  Re-run the real selection and intersect.
+        sel = self.builder.select(stats, hold_syms, TRADE_STRATEGY,
+                                  equity=equity)
+        sel_syms = {c["symbol"] for c in sel} if sel else set()
+        chosen = [s for s in stats if s["symbol"] in basket
+                  and s["symbol"] in sel_syms]
+        dropped = sorted(set(basket) - {s["symbol"] for s in chosen})
+        if dropped:
+            P.warn("Stored plan names failed today's selection filters and are "
+                   "excluded from sizing: " + ", ".join(dropped))
         if not chosen:
             return {}
         sized = self.builder.size(chosen, equity, risk_scale=1.0,
@@ -5322,9 +5437,9 @@ class TradingCycle:
         if qty <= 0:
             return 0
         _otype, _px_send = live_buy_order_px(px)
-        res = self.broker.execute(sx, "BUY", qty, _px_send, today_str(),
+        res = self.broker.execute(sx, "BUY", qty, px, today_str(),
                                   reason="weekly sweep: park idle cash in the liquid sleeve",
-                                  order_type=_otype)
+                                  order_type=_otype, limit_px=_px_send)
         self.broker.print_order_ticket(res, sx, "liquid/idle-cash sleeve", "BUY")
         if res.get("status") in ("FILLED", "PENDING", "UNCONFIRMED"):
             self.db.meta_set("last_sleeve_sweep", today_str())
@@ -5634,9 +5749,27 @@ class TradingCycle:
                        "the open bell.")
         remaining = max(0.0, budget_today - already)
         if plan and remaining < MIN_TRADE_VALUE:
-            P.ok(f"Today's budget ({fmt_rs(budget_today)}) is already fully "
-                 f"invested ({fmt_rs(already)} in {dlog.get('orders', 0)} "
-                 f"order(s)) — nothing left to do; safe to run again anytime.")
+            # audit v15 P0-1 (2026-10-30 console): when the budget is BELOW the
+            # minimum order size the old line claimed "already fully invested"
+            # — with ₹0 placed that was a lie masking a strategy that can
+            # never buy.  Say which case it is.
+            if already >= MIN_TRADE_VALUE:
+                P.ok(f"Today's budget ({fmt_rs(budget_today)}) is already fully "
+                     f"invested ({fmt_rs(already)} in {dlog.get('orders', 0)} "
+                     f"order(s)) — nothing left to do; safe to run again anytime.")
+            else:
+                P.warn(f"Today's budget is {fmt_rs(budget_today)} — BELOW the "
+                       f"minimum order size of {fmt_rs(MIN_TRADE_VALUE)}, so NO "
+                       f"buy can happen today.  This is not 'already invested'; "
+                       f"nothing was placed.  Raise STARTING_CAPITAL (your "
+                       f"daily budget) to at least ₹{MIN_TRADE_VALUE} — better "
+                       f"5-10x — if you intend daily deployment.")
+                self.db.execute(
+                    "INSERT INTO decisions(ts,phase,symbol,decision,reason) "
+                    "VALUES(?,?,?,?,?)",
+                    (now_iso(), "deploy", "-", "BUDGET_BELOW_MINIMUM",
+                     f"budget {budget_today:.0f} < MIN_TRADE_VALUE "
+                     f"{MIN_TRADE_VALUE:.0f}; zero orders possible"))
             return 0
         # audit v5 #4: if live cash can't cover today's buys, sell just enough
         # of the parked idle-cash sleeve first (matches backtest behaviour)
@@ -5690,6 +5823,17 @@ class TradingCycle:
             qty = int(slice_val / px)
             qty = min(qty, int(remaining / px))
             if qty <= 0 or qty * px < MIN_TRADE_VALUE:
+                continue
+            # audit v14 P1 (2026-10-30): in LIVE mode a buy needs TODAY's live
+            # quote.  Falling back to the last close meant the LIMIT the
+            # broker actually receives could be based on yesterday's price.
+            if not PAPER_TRADE and tflag.get(sym) is not True:
+                _wq = ("no live quote received" if sym not in tflag else
+                       ("quote timestamp unreadable" if tflag.get(sym) is None
+                        else "quote timestamp is not from today"))
+                P.warn(f"Not buying {sym} today — {_wq}; live buys need a "
+                       f"same-day Upstox quote.  (Paper mode allows the last "
+                       f"close; live mode never.)")
                 continue
             reason = f"daily budget buy ({fmt_rs(INVEST_PER_DAY)} per run)"
             # external audit F1 (2026-10-28 v3): every purchase passes the
@@ -5756,11 +5900,14 @@ class TradingCycle:
                 _br = self.db.one("SELECT broad FROM etf_universe WHERE symbol=?", (sym,))
                 _sp = estimate_spread_bps(_p25, broad=bool(_br and _br["broad"]))
             # audit v4 #9: live buys are band-limited LIMIT orders
-            # (MARKET tail-risk removed); paper stays modelled as before
+            # (MARKET tail-risk removed); paper stays modelled as before.
+            # audit v14 P0: ref drives only the ledger simulation — the LIMIT
+            # actually reaching the broker is px x (1+LIVE_LIMIT_BUFFER).
             _otype, _px_send = live_buy_order_px(px)
-            res = self.broker.execute(sym, "BUY", qty, _px_send, today_str(),
+            res = self.broker.execute(sym, "BUY", qty, px, today_str(),
                                       reason=reason,
-                                      spread_bps=_sp, order_type=_otype)
+                                      spread_bps=_sp, order_type=_otype,
+                                      limit_px=_px_send)
             self.broker.print_order_ticket(res, sym,
                                            universe_map().get(sym, {}).get("name", sym),
                                            "BUY")
@@ -5939,7 +6086,37 @@ class TradingCycle:
         P.section("DAILY RUN — safety check, month-end sells if due, then today's buying", "\U0001F4C5")
         mode = "SIMULATED (paper trading — no real money)" if PAPER_TRADE else "REAL MONEY (live trading)"
         P.info(f"Mode: {mode}   |   Today: {today_str()}")
-        self.broker.accrue_cash_interest()
+        # audit v14 P0/P1 (2026-10-30): two hard gates BEFORE any live order —
+        #   (a) never trade real money off synthetic demo rows;
+        #   (b) never trade off stale prices: the newest bar must reach the
+        #       last completed NSE session (one session's grace for feeds that
+        #       publish the previous close late).
+        if not PAPER_TRADE:
+            if self.db.meta_get("data_origin") == "SYNTHETIC":
+                P.err("This database still contains SYNTHETIC demo data. "
+                      "REFUSING real orders.  Heal it first: "
+                      "python etf-momentum-screener.py update --force-data")
+                return self.broker.equity(self.latest_prices())
+            _dp_max = self.db.one("SELECT MAX(date) AS d FROM price_daily")["d"]
+            _lcs = last_completed_session()
+            if not _dp_max or _dp_max < prev_completed_session(_lcs):
+                P.err(f"Price data looks stale (newest bar {_dp_max or 'none'}, "
+                      f"last completed session {_lcs}) — REFUSING real orders. "
+                      f"Run 'python etf-momentum-screener.py update' first "
+                      f"(analysis below would also be stale, so the run stops).")
+                return self.broker.equity(self.latest_prices())
+            # audit v15 P0-1 (2026-10-30 console): a daily budget UNDER the
+            # minimum order size can never place a single buy — the run used
+            # to sail on and print 'already fully invested'.  Refuse orders
+            # loudly; analysis continues when the user answers n anyway.
+            if INVEST_PER_DAY < MIN_TRADE_VALUE:
+                P.err(f"CONFIG ERROR: your daily budget (STARTING_CAPITAL = "
+                      f"₹{INVEST_PER_DAY:.0f}) is BELOW the minimum order size "
+                      f"₹{MIN_TRADE_VALUE:.0f} — the strategy is structurally "
+                      f"unable to BUY anything; every buy will skip.  "
+                      f"(Sells/exits still work.)  Raise STARTING_CAPITAL "
+                      f"(₹5,000–10,000 is the tuned range) in the config block "
+                      f"at the top of the script.")
         if not PAPER_TRADE:
             # audit F9: settle journaled PENDING/UNCONFIRMED live orders first —
             # otherwise today's run could duplicate them
@@ -6458,6 +6635,12 @@ class TradingCycle:
         # ---- build target basket (execute at the LATEST traded price = next session) ----
         latest_px = self.latest_prices()
         target = {}
+        # audit v15 P0-2 (2026-10-30): in SIP_MODE the target map never got
+        # the CHOSEN symbols, so every held-and-still-picked ETF fell into
+        # the orphan loop below with weight 0 -> the rebalance SOLD its own
+        # #1/#2 picks (the live console showed SELL PHARMABEES/MOCAPITAL
+        # minutes after re-picking them).  Held-and-chosen is kept, always.
+        _chosen_syms = {st["symbol"] for st in selection["chosen"]}
         if not SIP_MODE:
             for st in selection["chosen"]:
                 w = sized["weights"].get(st["symbol"], 0.0)
@@ -6474,10 +6657,9 @@ class TradingCycle:
         # the backtester does.  Otherwise portfolios silently accumulate orphans.
         for sym, h in self.broker.holdings().items():
             if sym not in target:
-                # audit v5 #4: the idle-cash sleeve (liquid ETF) is NOT an
-                # orphan to rebalance away — it IS the cash parking spot; it
-                # leaves only when buys need the money (sleeve_unsweep)
-                if sym in CASH_PROXY_SYMBOLS:
+                # audit v5 #4 (sleeve) + v15 P0-2 (SIP kept-pick) live inside
+                # sip_orphan_should_sell — one source of truth for both.
+                if not sip_orphan_should_sell(sym, target, _chosen_syms, SIP_MODE):
                     continue
                 px = latest_px.get(sym) or h["avg_cost"]
                 target[sym] = {"weight": 0.0, "close": px,
@@ -6503,6 +6685,9 @@ class TradingCycle:
         holdings = self.broker.holdings()
         trades_done = 0
         exits_outstanding = 0
+        exits_failed = []       # audit v15 P0-3: a FAILED/REJECTED exit used
+                                # to pass silently — the signal was then marked
+                                # done and the exit NEVER retried
         # planned price for late-fill accounting (audit 2.9)
         planned_px = {}
         if today > exec_date:
@@ -6567,7 +6752,11 @@ class TradingCycle:
                 P.warn(f"SELL {sym}: {qty_now} of {qty} units today (liquidity slice); "
                        f"{remain} queued for the next session.")
             if is_exit and TAX_DEFER_EXITS:
-                open_dates = [r["buy_date"] for r in self.db.query(
+                # audit v14 P2: broker-adopted holdings with UNKNOWN age must
+                # not win the 12-month tax-wait (their lots are dated today;
+                # the wait would freeze an exit for ~11 months on made-up age)
+                _unk = set(json.loads(self.db.meta_get("tax_age_unknown", "[]")))
+                open_dates = [] if sym in _unk else [r["buy_date"] for r in self.db.query(
                     "SELECT buy_date FROM tax_lots WHERE symbol=? AND qty>0 "
                     "AND sell_date IS NULL", (sym,))]
                 if open_dates:
@@ -6576,6 +6765,17 @@ class TradingCycle:
                         P.warn(f"SELL {sym} deferred this session — {defer}")
                         continue
             reason_txt = "exit/trim"
+            # audit v15 P1 (2026-10-30): a held name being sold because it fell
+            # out of today's top-N is a ROTATION, not a trend break — say which
+            # (the 'why' column used to read 'exit/trim' for both, so the live
+            # console looked like it was selling healthy trends for no reason).
+            _trend_exit_syms = {st["symbol"] for st in selection["exits"]}
+            if is_exit and sym not in _trend_exit_syms:
+                _qtr, _qa, _qv = _quick_trend(self.db, sym)
+                if _qtr is not None and _qtr > EXIT_THRESHOLD and _qa is not False:
+                    reason_txt += (" | rotation: momentum fine "
+                                   f"({fmt_pct(_qtr)}) but ranked out of the "
+                                   f"top {MAX_HOLDINGS} — sells to follow the basket")
             if planned_px.get(sym):
                 short = (price / planned_px[sym] - 1.0)
                 reason_txt += f" | late-fill shortfall vs planned session: {fmt_pct(short)}"
@@ -6583,6 +6783,9 @@ class TradingCycle:
                                       reason=reason_txt,
                                       spread_bps=tgt["spread_bps"])
             self.broker.print_order_ticket(res, sym, tgt["name"], "SELL")
+            # audit v15 P0-3: failed/rejected exits keep the signal OPEN
+            if is_exit and res.get("status") in ("FAILED", "REJECTED"):
+                exits_failed.append(sym)
             trades_done += 1
         # 2) buys
         eq_now = self.broker.equity(self.latest_prices())
@@ -6642,18 +6845,30 @@ class TradingCycle:
         self.risk.update(eq, "cycle-end",
                          invested_frac=(hv / eq) if eq > 0 else None)
         self.risk.snapshot(today_str(), cash, hv, eq)
-        if exits_outstanding == 0:
+        if signal_closeable(exits_outstanding, exits_failed):
             # audit v4 L4: a re-derived (override) basket must ALSO satisfy the
             # current month-end key, else the next run re-executes the STALE
-            # month-end signal and clobbers the fresh plan (loop forever)
+            # month-end signal and clobbers the fresh plan (loop forever).
+            # audit v15 P0-3: a FAILED/REJECTED exit must ALSO keep the signal
+            # open — the previous run book only watched sliced/queued exits,
+            # so a broker error silently sealed the cycle "up to date".
             _done = as_of
             if as_of_override:
                 _done = last_month_end_date(all_dates) if all_dates else as_of
             self.db.meta_set("last_trade_signal", _done)
         else:
-            P.warn(f"{exits_outstanding} exit order(s) are still sliced/queued — the "
-                   f"{as_of} signal stays OPEN until they finish, so rerun "
-                   f"'python etf-momentum-screener.py trade' on the next session.")
+            _bits = []
+            if exits_outstanding:
+                _bits.append(f"{exits_outstanding} exit order(s) are still "
+                             f"sliced/queued")
+            if exits_failed:
+                _bits.append(f"{len(exits_failed)} exit(s) FAILED or were "
+                             f"rejected ({', '.join(exits_failed)}) — fix the "
+                             f"cause (see the order tickets above; EDIS/DDPI "
+                             f"setup is the usual one on Upstox sells)")
+            P.warn(f"{'; '.join(_bits)} — the {as_of} signal stays OPEN and "
+                   f"retries until done.  Rerun 'python etf-momentum-screener.py "
+                   f"trade' on the next session.")
         self.db.meta_set("last_trade_run", now_iso())
         # audit v11 P2-1: this is the state after the month-end SELLS — the
         # daily buying runs later (deploy_day under run_daily).  Title it so.
@@ -8460,7 +8675,14 @@ def run_full_backtest(db: Db, quick: bool = False):
             res_oos = bt2.run(start_date=split)
             scenarios.append((cost_case, cash_name, res_full, res_oos))
     P.section("SCENARIO MATRIX — chosen params, full sample vs out-of-sample", "\U0001F3AF")
-    out_rows = []
+    # audit v14 §4: this matrix runs cash_sleeve=False while the headline run
+    # uses the configured sleeve — say so, or the numbers look contradictory.
+    P.note("This matrix runs WITHOUT the overnight cash sleeve "
+           "(idle cash earns the flat daily rate), while the headline run above "
+           f"uses the configured sleeve ({CASH_SLEEVE_MODE}).  A cell can "
+           "therefore differ from the headline for the same params.  Fixed "
+           "sweep set; re-running the headline family's sleeve variant is a "
+           "separate experiment, not this table.")
     for cost_case, cash_name, rf, ro in scenarios:
         out_rows.append([
             cost_case, cash_name,
@@ -8585,14 +8807,32 @@ def cmd_status(db: Db):
     P.kv("Cash on hand", fmt_cr(cash))
     P.kv("ETFs you hold (worth now)", fmt_cr(hv))
     P.kv("Your total (cash + ETFs)", fmt_cr(eq), val_color=_C.GREEN)
-    P.kv("Invested", fmt_pct(safe_div(hv, eq, 0.0)))
+    # audit v14 §1/§3 (2026-10-30): "Invested +2.80%" mixed the cash sleeve
+    # with market exposure and the "+" read like profit.  Split it: strategy
+    # ETFs (the engine's real exposure) vs the overnight cash sleeve.
+    _sleeve_v = 0.0
+    for _s in CASH_PROXY_SYMBOLS:
+        _h = broker.holdings().get(_s)
+        if _h:
+            _sleeve_v += _h["qty"] * prices.get(_s, _h["avg_cost"])
+    _strat_v = max(0.0, hv - _sleeve_v)
+    P.kv("Invested in strategy ETFs", fmt_pct(safe_div(_strat_v, eq, 0.0), signed=False))
+    if _sleeve_v > 0:
+        P.kv("Parked in overnight sleeve", fmt_pct(safe_div(_sleeve_v, eq, 0.0), signed=False)
+             + f"  ({CASH_SLEEVE_SYMBOL} — counts as parked cash, not market exposure)")
     # audit v13 #5: the very first seed equals STARTING_CAPITAL until the
     # first confirmed run realises the peak — label that case so it doesn't
     # read as a phantom all-time-high next to the real total.
     _peak_seed = (not db.meta_get("risk_last_eval"))
-    P.kv("Peak equity",
-         fmt_cr(risk.peak) + ("  (startup seed — updates from your real book "
-                              "on the first confirmed run)" if _peak_seed else ""))
+    # audit v15 P1: catch up with a peak that was rebased on a paper->live
+    # flip TODAY (v12 P0-1) — otherwise drawdown 0.00% next to a just-seeded
+    # peak looks unexplained.
+    _rb = db.meta_get("risk_peak_rebased_date", "")
+    _peak_note = ("  (startup seed — updates from your real book "
+                  "on the first confirmed run)" if _peak_seed
+                  else "  (peak rebased on mode flip today)" if _rb == today_str()
+                  else "")
+    P.kv("Peak equity", fmt_cr(risk.peak) + _peak_note)
     dd = max(1 - eq / risk.peak, 0.0) if risk.peak else 0.0
     P.kv("Current drawdown", fmt_pct(dd, signed=False),
          val_color=_C.RED if dd > 0.05 else _C.WHITE)
@@ -8858,7 +9098,14 @@ def print_action_panel(db: Db):
         basket = [s for s in (db.meta_get(SIP_BASKET_KEY, "") or "").split(",") if s]
         health_rows = []
         risky_names = []
+        sleeve_rows = []
         for h in sorted(holdings, key=lambda r: r["symbol"]):
+            # audit v14 §3: the overnight cash sleeve is exempt from momentum
+            # exits — listing LIQUIDCASE here (possibly "AT RISK") is a false
+            # alarm.  It gets its own one-liner instead.
+            if h["symbol"] in CASH_PROXY_SYMBOLS:
+                sleeve_rows.append(h)
+                continue
             mom, above, vol = _quick_trend(db, h["symbol"])
             if mom is None:
                 flag = paint("? no signal yet (short history)", _C.GREY)
@@ -8887,6 +9134,19 @@ def print_action_panel(db: Db):
             P.sub("Holdings — trend right now (today's close; the binding decision is the month-end one)")
             P.table(["Symbol", "Name", "Units", "12-1 momentum", "200-DMA", "Verdict"],
                     health_rows, aligns=["<", "<", ">", ">", "<", "<"])
+        if sleeve_rows:
+            P.sub("Cash sleeve (parked money — momentum rules do not apply)")
+            _sv_rows = []
+            for h in sleeve_rows:
+                _lp = db.one("SELECT close FROM price_daily WHERE symbol=? "
+                             "ORDER BY date DESC LIMIT 1", (h["symbol"],))
+                _px = (_lp["close"] if _lp and _lp["close"] else h["avg_cost"])
+                _sv_rows.append([h["symbol"],
+                                 universe_map().get(h["symbol"], {}).get("name", h["symbol"])[:28],
+                                 fmt_num(h["qty"], 0), fmt_cr(h["qty"] * _px),
+                                 "overnight parking — swept back when buys need cash"])
+            P.table(["Symbol", "Name", "Units", "Value", "Note"],
+                    _sv_rows, aligns=["<", "<", ">", ">", "<"])
 
         # ---- 3. frontrunners not in the basket ------------------------------
         cands = []
@@ -8991,7 +9251,40 @@ def print_action_panel(db: Db):
             pass
         try:
             eq = float(cash_txt) + hv
-            inv = safe_div(hv, eq, 0.0)
+            # audit v14 §1 (2026-10-30): the under-deployment warning must read
+            # STRATEGY exposure, not total-including-sleeve — otherwise one
+            # accepted cash-sweep makes this warning vanish while the engine
+            # is still 3% in the market.
+            _sleeve_v = 0.0
+            for _s in CASH_PROXY_SYMBOLS:
+                _h = next((h for h in holdings if h["symbol"] == _s), None)
+                if _h:
+                    _sleeve_v += _h["qty"] * prices_now.get(_s, _h["avg_cost"])
+            inv = safe_div(max(0.0, hv - _sleeve_v), eq, 0.0)
+            # audit v15 P1 (2026-10-30 console): plan-vs-reality gap silently
+            # persisted: book 2.8% invested against a 52.1% plan for days, with
+            # no line naming it.  Count consecutive lagging days; after 3, warn.
+            try:
+                _tgt_raw = db.meta_get(SIP_TARGETS_KEY, "") or ""
+                _tgt_inv = sum(float(v) for v in json.loads(_tgt_raw).values()) \
+                    if _tgt_raw else 0.0
+            except Exception:
+                _tgt_inv = 0.0
+            if _tgt_inv > 0.05 and inv < 0.25 * _tgt_inv:
+                _lagd = db.meta_get("plan_lag_days", "0")
+                _lagd = (int(_lagd) + 1) if db.meta_get("plan_lag_date") != today_str() \
+                    else int(_lagd)
+                db.meta_set("plan_lag_days", str(_lagd))
+                db.meta_set("plan_lag_date", today_str())
+                if _lagd >= 3:
+                    P.warn(f"• Plan fill is {fmt_pct(inv)} invested against a "
+                           f"{fmt_pct(_tgt_inv)} target plan — lagging for "
+                           f"{_lagd} straight run-days.  Causes to check, in "
+                           f"order: a declined live y/n, the budget floor "
+                           f"below the minimum order size, a premium-guard "
+                           f"block, or a month-end trickle day.")
+            else:
+                db.meta_set("plan_lag_days", "0")
             if eq > 0 and inv < 0.05 and SIP_MODE:
                 if INVEST_PER_DAY <= 0:
                     P.warn(f"• Portfolio is only {fmt_pct(inv)} invested — "
@@ -9330,6 +9623,112 @@ def cmd_selftest(db: Db):
             os.remove(DATA_DIR / "selftest_isin.db")
         except Exception:
             pass
+
+    # v14 P0/P1 regression tests ------------------------------------------------
+    _dbf = Db(DATA_DIR / "selftest_v14.db")
+    try:
+        _taxf = TaxEngine(_dbf)
+        _dbf.meta_set("cash_balance", "1000000")
+        # a) live order whose fill CANNOT be verified must stay UNCONFIRMED
+        #    and must NOT move cash/positions
+        class _DodgyClient:
+            def place_order(self, sym, key, side, qty, price, order_type):
+                return {"data": {"order_id": "V14A1"}}
+            def order_details(self, oid):
+                raise RuntimeError("verification endpoint down")
+        _bf2 = Broker(_dbf, _taxf, client=_DodgyClient(), paper=False)
+        _r_un = _bf2.execute("NIFTYBEES", "BUY", 10, 100.0, reason="v14 test")
+        _pos_un = _dbf.one("SELECT qty FROM positions WHERE symbol='NIFTYBEES'")
+        _cash_un = float(_dbf.meta_get("cash_balance", "0"))
+        check("v14 P0: live order with unverifiable fill stays UNCONFIRMED and "
+              "fabricates NOTHING (cash/book untouched)",
+              _r_un["status"] == "UNCONFIRMED" and not _pos_un
+              and abs(_cash_un - 1000000.0) < 1e-9,
+              f"status={_r_un['status']} cash={_cash_un}")
+        # b) live LIMIT sends the buffered price; the ledger price is the
+        #    slippage-simulated one — no double slippage (v4 #9 + v14 P0)
+        class _CrowClient:
+            def place_order(self, sym, key, side, qty, price, order_type):
+                self.sent = (price, order_type)
+                return {"data": {"order_id": "V14B1"}}
+            def order_details(self, oid):
+                return {"data": {"average_price": "", "status": "open"}}
+        _cw = _CrowClient()
+        _bf3 = Broker(_dbf, _taxf, client=_cw, paper=False)
+        _otv, _pxv = ("LIMIT", 100.20)
+        globals()["PAPER_TRADE"] = False   # make live_buy_order_px honest
+        try:
+            _otv, _pxv = live_buy_order_px(100.0)
+            _r_lim = _bf3.execute("BANKBEES", "BUY", 5, 100.0, reason="v14 limit",
+                                  order_type=_otv, limit_px=_pxv)
+        finally:
+            globals()["PAPER_TRADE"] = True
+        check("v14 P0: live LIMIT order sends ref*(1+buffer) exactly once (no "
+              "slippage stacking on the limit price)",
+              _otv == "LIMIT" and abs(_cw.sent[0] - 100.0 * (1 + LIVE_LIMIT_BUFFER)) < 0.005
+              and _r_lim["status"] == "PENDING",
+              f"sent={_cw.sent} status={_r_lim['status']}")
+        # c) sync_live_book is fail-closed when the funds API dies
+        class _NoFundsClient:
+            def holdings(self): return []
+            def positions(self): return []
+            def orders_book(self): return []
+            def funds_available(self):
+                raise RuntimeError("funds API dead")
+        _bf4 = Broker(_dbf, _taxf, client=_NoFundsClient(), paper=False)
+        check("v14 P0: broker sync fails closed when cash is unreadable "
+              "(never trades on a stale wallet)",
+              _bf4.sync_live_book() is False, "")
+        # d) partially-filled broker orders count as OPEN (no duplicates)
+        check("v14 P1: partially-filled broker orders are treated as open",
+              "partially filled" in BROKER_OPEN_STATUSES,
+              f"{sorted(BROKER_OPEN_STATUSES)[-3:]}")
+        # e) prev_completed_session: Monday's previous completed day is Friday
+        check("v14 P1: prev_completed_session(2026-10-26 Mon) = 2026-10-23 (Fri)",
+              prev_completed_session("2026-10-26") == "2026-10-23",
+              prev_completed_session("2026-10-26"))
+        # f) GLOBAL LTCG report uses the configured 12.5%, not the 30% slab
+        _dbf.execute("INSERT OR REPLACE INTO etf_universe(symbol,name,category,"
+                     "index_family,status) VALUES('MOTEST','g','GLOBAL INDICES',"
+                     "'G','ACTIVE')")
+        _dbf.execute("INSERT INTO tax_lots(symbol,buy_date,buy_price,qty,"
+                     "sell_date,sell_price,pnl,gain_type,tax) "
+                     "VALUES('MOTEST','2024-01-01',100,100,'2025-06-01',150,"
+                     "5000.0,'LTCG',0)")
+        _sum = TaxEngine(_dbf).year_tax_summary()
+        _g = _sum.get("2024-2025") or next((v for k, v in _sum.items()
+                                            if v["by_class"].get("GLOBAL")), None)
+        _gtax = _g["by_class"]["GLOBAL"]["tax"] if _g else None
+        check("v14 P2: GLOBAL LTCG reported at the configured 12.5% (+4% cess), "
+              "NOT the 30% slab",
+              _gtax is not None and abs(_gtax - 5000.0 *
+              tax_rules_for("GLOBAL INDICES")["ltcg"] * (1.0 + CESS_RATE)) < 1.0,
+              f"tax={_gtax} expect={5000.0 * tax_rules_for('GLOBAL INDICES')['ltcg'] * (1.0 + CESS_RATE)}")
+    finally:
+        _dbf.close()
+        try:
+            os.remove(DATA_DIR / "selftest_v14.db")
+        except Exception:
+            pass
+
+    # v15 P0/P1 regression tests ------------------------------------------------
+    # P0-2: the SIP-mode orphan loop must NEVER sell a held name that is in
+    # today's chosen basket (it used to sell the rebalance's own fresh picks).
+    _tg = {"OLDX": {"weight": 0.0}}          # exits got weight 0 in target
+    check("v15 P0-2: held+chosen kept, rotation sells, sleeves never sell",
+          sip_orphan_should_sell("HOLDPICK", _tg, {"HOLDPICK"}, True) is False
+          and sip_orphan_should_sell("DROPPED", _tg, {"HOLDPICK"}, True) is True
+          and sip_orphan_should_sell("LIQUIDCASE", _tg, set(), True) is False
+          and sip_orphan_should_sell("OLDX", _tg, set(), True) is False,
+          "orphan gate")
+    # P0-3: the month-end signal must stay open when any exit failed.
+    check("v15 P0-3: failed exits keep the signal open for retry",
+          signal_closeable(0, []) is True and signal_closeable(1, []) is False
+          and signal_closeable(0, ["PHARMABEES"]) is False, "closeable gate")
+    # P0-1: config sanity — the daily budget must be >= one minimum order.
+    check("v15 P0-1: INVEST_PER_DAY >= MIN_TRADE_VALUE (else zero buys ever)",
+          INVEST_PER_DAY >= MIN_TRADE_VALUE,
+          f"INVEST_PER_DAY={INVEST_PER_DAY} MIN_TRADE_VALUE={MIN_TRADE_VALUE}")
 
     # A8: impact grows with order size (no more flat 2 bps)
     small = impact_bps(10_000.0, 1_000_000.0)
@@ -10848,7 +11247,14 @@ def cmd_scan(db: Db, try_live: bool = True, verbose: bool = True):
             P.info("Downloading NSE instrument master from Upstox to verify symbols...")
             instruments = client.download_instrument_master()
             by = scanner.verify_against_upstox(instruments)
-            hits = sum(1 for s in universe_map() if s in by)
+            # audit v14 §3: count what actually got a key (the ISIN fallback
+            # rescues exact-name misses), not just the raw name lookup.
+            hits = db.one(
+                "SELECT COUNT(*) AS c FROM etf_universe WHERE instrument_key "
+                "IS NOT NULL AND instrument_key != ''")["c"]
+            if hits > sum(1 for s in universe_map() if s in by):
+                P.note(f"({hits - sum(1 for s in universe_map() if s in by)} "
+                       f"matched via the ISIN fallback rather than the symbol name.)")
             P.ok(f"Instrument master matched {hits}/{len(ETF_UNIVERSE)} ETF symbols on NSE.")
         except Exception as e:
             P.warn(f"Could not reach Upstox instrument master ({e}).")
@@ -10874,12 +11280,25 @@ def cmd_update(db: Db, years: int = 11, force: bool = False, verbose: bool = Tru
         return
     dm = DataManager(db, client)
     heal = force
-    if db.meta_get("data_origin") == "SYNTHETIC":
+    _synthetic_heal = db.meta_get("data_origin") == "SYNTHETIC"
+    if _synthetic_heal:
         heal = True
         P.warn("Database holds SYNTHETIC demo rows mixed with prices. "
                "They will be PURGED and re-downloaded from Upstox — synthetic "
                "and real prices are NEVER merged (a spliced series produces "
                "nonsense like -99% momentum; see audit 2026-10-19).")
+        # audit v14 P0 (2026-10-30): the purge only touched price_daily —
+        # synthetic NAV rows and synthetic split factors SURVIVED, so future
+        # real prices were adjusted by fake splits and the iNAV filter compared
+        # real prices to fictional NAVs.  On a synthetic heal, clear ALL THREE.
+        n_syn_ca = db.one("SELECT COUNT(*) AS c FROM corporate_actions "
+                          "WHERE note LIKE 'SYNTHETIC%'")["c"]
+        n_nav_rows = db.one("SELECT COUNT(*) AS c FROM nav_data")["c"]
+        db.execute("DELETE FROM corporate_actions WHERE note LIKE 'SYNTHETIC%'")
+        db.execute("DELETE FROM nav_data")
+        P.note(f"Synthetic purge: {n_syn_ca} fake split factor(s) and "
+               f"{n_nav_rows} synthetic NAV row(s) deleted (NAV re-fetches "
+               f"from real files after the real download).")
     if heal and not db.meta_get("data_origin") == "SYNTHETIC":
         P.warn("--force-data: purging stored prices and re-downloading full history.")
     n_ca = dm.load_corporate_actions()
@@ -11494,18 +11913,22 @@ def cmd_tune(db: Db, quick: bool = False):
         ("on", dict(EXIT_OVERLAY_200DMA=True)),
     ]))
     families.append(("Pairwise correlation cap", [
-        ("0.80", dict(PAIRWISE_CORR_CAP=0.80)),
-        ("0.85 (default)", dict(PAIRWISE_CORR_CAP=0.85)),
-        ("0.90", dict(PAIRWISE_CORR_CAP=0.90)),
+        # audit v14 §4: production 0.70 was missing and 0.85 was mislabelled
+        # "(default)".  0.60/0.65/0.75 stay OUT (ledger-rejected, measured).
+        ("0.70 (default — adopted R1/V4)", dict(PAIRWISE_CORR_CAP=0.70)),
+        ("0.80 (unexplored)", dict(PAIRWISE_CORR_CAP=0.80)),
+        ("0.90 (unexplored)", dict(PAIRWISE_CORR_CAP=0.90)),
     ]))
     families.append(("Rebalance frequency", [
         ("monthly (rulebook)", dict(REBALANCE_FREQ="M")),
         ("quarterly", dict(REBALANCE_FREQ="Q")),
     ]))
     families.append(("Drawdown trigger multiples", [
-        ("tight 1.0/1.5/2.0", dict(DD_REVIEW_MULT=1.0, DD_SEVERE_MULT=1.5, DD_EXTREME_MULT=2.0)),
-        ("rulebook 1.25/1.9/2.5", dict(DD_REVIEW_MULT=1.25, DD_SEVERE_MULT=1.9, DD_EXTREME_MULT=2.5)),
-        ("loose 1.5/2.2/3.0", dict(DD_REVIEW_MULT=1.5, DD_SEVERE_MULT=2.2, DD_EXTREME_MULT=3.0)),
+        # audit v14 §4: labels were backwards — production IS 1.0/1.5/2.0
+        # (=> 15%/22.5%/30% with VOL_TARGET=0.15); "rulebook" never was 1.25/…
+        ("1.0/1.5/2.0 (default — 15%/22.5%/30%)", dict(DD_REVIEW_MULT=1.0, DD_SEVERE_MULT=1.5, DD_EXTREME_MULT=2.0)),
+        ("wider 1.25/1.9/2.5", dict(DD_REVIEW_MULT=1.25, DD_SEVERE_MULT=1.9, DD_EXTREME_MULT=2.5)),
+        ("widest 1.5/2.2/3.0", dict(DD_REVIEW_MULT=1.5, DD_SEVERE_MULT=2.2, DD_EXTREME_MULT=3.0)),
     ]))
     families.append(("Vol blend (60d + 252d)", [
         ("0% (60d only)", dict(VOL_BLEND_252=0.0)),
@@ -11767,10 +12190,17 @@ def main(argv=None):
             cmd_update(db, years=args.years, force=args.force_data, verbose=False)
             prices = {r["symbol"] for r in db.query("SELECT DISTINCT symbol FROM price_daily")}
             if not prices:
-                P.warn("No downloaded prices — trying synthetic demo data so you can "
-                       "see the full engine working.")
-                generate_synthetic_data(db, seed=args.seed)
-                cmd_scan(db, try_live=False)
+                # audit v14 P0 (2026-10-30): this fallback wrote SYNTHETIC demo
+                # rows into the PRODUCTION database; a later live run could
+                # then trade real money off fictional prices.  Removed — point
+                # the user at the isolated demo database instead.
+                P.err("No downloaded prices in the database.  I will NOT invent "
+                      "fake prices here (that pollutes the real journal).")
+                P.note("To watch the engine end-to-end offline: "
+                       "python etf-momentum-screener.py demo   (its own demo DB, "
+                       "your real data is untouched)")
+                P.note("To fill the real database: fix the Upstox token "
+                       "(env.txt) and run:  python etf-momentum-screener.py update")
             if not PAPER_TRADE and not live_order_ok():
                 # audit v4 L1 -> 2026-10-29: bare run in live mode asks y/n;
                 # a NO means analyse/refresh/status only, no orders.
