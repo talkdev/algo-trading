@@ -153,6 +153,12 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 | 136 | year_tax_summary taxed GLOBAL LTCG at the 30% slab; real config is 12.5% (+4% cess, no exemption). Report fixed to per-class rules everywhere. | v14 P2 |
 | 137 | Console truth batch: instrument-master count reads the REAL matched key total (was 109/111 beside an ISIN-rescue line — now shows 111/111 + fallback note); 'Invested' split into strategy-ETF exposure vs overnight sleeve (swept cash no longer fakes a deployed number anywhere — the under-deployment warning reads strategy exposure too); banner edition follows the actual mode; holdings health table no longer flags LIQUIDCASE 'AT RISK' (cash sleeve gets its own block). | v14 §3 |
 | 138 | tune() honesty: correlation family omitted production 0.70 and mislabelled 0.85 'default' -> fixed (0.60/0.65/0.75 stay out, ledger-rejected); DD-multiple labels called production 1.0/1.5/2.0 'tight' and 1.25/1.9/2.5 'rulebook' -> relabelled; scenario matrix now says it runs WITHOUT the cash sleeve (headline uses it). Knob table LIQ drift (said 10th-pctl, code is 25th) reconciled to the CODE (row 17's 'keep 10%' is stale lineage, not a vote). | v14 §4 |
+| 139 | **SIP_MODE rebalance sold its own fresh picks** (live console: SELL on #1/#2 right after re-picking them). The month-end cycle's orphan loop treated every held symbol as weight=0 because SIP_MODE never enters chosen names into the target map. Held+chosen now kept via sip_orphan_should_sell(); chapter copied to module-level for testability. Was a real money bug — DP charge + STCG churn + rebuy of the same names every month. | v15 P0-2 |
+| 140 | Failed/rejected exits still sealed the month-end signal ('up to date', never retried). signal_closeable() = exits all done AND none failed; failure keeps the signal OPEN with a named retry instruction. | v15 P0-3 |
+| 141 | STARTING_CAPITAL=₹1,000 < MIN_TRADE_VALUE=₹2,000 made every buy impossible while the console claimed 'already fully invested (Rs 0 in 0 orders)'. Now: loud config error at live run start, honest 'budget below minimum order size' line + decision journal entry. VALUE belongs to the user — action row 113. | v15 P0-1 |
+| 142 | EDIS 'UDAPI100500' sell failures used to sit inside an order ticket. Now a loud explainer at failure time (CDSL TPIN daily validation or one-time DDPI) + the exit stays open via #140. User-side fix: action row 114. | v15 P0-4 |
+| 143 | Plan-fill lag surfaced: after 3 consecutive run-days with strategy exposure < 25% of the stored plan, a warning names the four usual causes (declined y/n, sub-min budget, premium guard, trickle). | v15 P1 |
+| 144 | Exit reasons now distinguish ROTATION ('momentum fine, ranked out of top-N') from trend exits — the console no longer looks like it sells healthy trends for no reason. 'Peak rebased on mode flip today' note when the v12 rebase fired this session. | v15 P1 |
 
 ---
 
@@ -182,6 +188,8 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 | 80  | Stray parenthesis; "+15%" sign nits; 110→111 count                                                                                                                                      | v9, R8        |
 | 81  | SIP maintenance-mode wording after tranche window (no "session 10 of 10" forever)                                                                                                        | R5            |
 | 112 | "PORTFOLIO AFTER THIS CYCLE" retitled "AFTER MONTHLY REBALANCE (before today's buying)" (buys run later in deploy_day); "session(s)" grammar fix                                         | v11 P2-1/P2-2 |
+| 113 | Raise STARTING_CAPITAL to ₹5,000–10,000 (₹1,000 < ₹2,000 minimum order = the bot can NEVER buy; auditor v15 P0-1) |
+| 114 | Authorise EDIS (daily CDSL TPIN) — or better DDPI (one-time standing) — for the holdings in Upstox, else every SELL fails (v15 P0-4). Test with a small sell after enabling. |
 | 113 | Config note: INVEST_PER_DAY 5000 < MIN_TRADE_VALUE×MAX_HOLDINGS ⇒ floor budget places ONE order/run by design; autofill is the fast path (Option B chosen — note, not a value change) | v11 P1-3      |
 
 ---
@@ -240,4 +248,4 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 
 ---
 
-*Last updated: audit v14, 30-Oct-2026 (live-execution P0s: synthetic live-gate + full purge, unverifiable fills no longer book, LIMIT double-slip removed, cash fail-closed, same-day quote gate; P1 partial-fill/sip-targets; P2 adopted-lots + GLOBAL LTCG; console+tune truth batch. Rows 128-138. Selftest count: 128.*
+*Last updated: audit v15, 30-Oct-2026 (SIP orphan-sell of own picks fixed; failed exits keep the signal open; sub-minimum budget honest + loud; EDIS loud explainer; plan-lag warning; rotation labels. Rows 139-144, actions 113-114. Selftest count: 131.*

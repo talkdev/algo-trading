@@ -3016,6 +3016,27 @@ def live_buy_order_px(px: float):
     return "MARKET", float(px)
 
 
+def sip_orphan_should_sell(sym: str, target: dict, chosen_syms: set,
+                           sip_mode: bool) -> bool:
+    """Held symbol missing from the target map -> orphan sell.  audit v15 P0-2:
+    in SIP_MODE the map omits chosen names by design, so a held+CHOSEN holding
+    must be KEPT (the live console had the rebalance dumping its own #1/#2
+    fresh picks).  Cash sleeves are never orphans (they ARE the parking)."""
+    if sym in target or sym in CASH_PROXY_SYMBOLS:
+        return False
+    if sip_mode and sym in chosen_syms:
+        return False
+    return True
+
+
+def signal_closeable(exits_outstanding: int, exits_failed: list) -> bool:
+    """A month-end signal may seal (`last_trade_signal` written) only once its
+    exits are physically done — not sliced/queued AND not broker-failed.
+    audit v15 P0-3: an EDIS-rejected exit used to seal the signal anyway and
+    was never retried."""
+    return exits_outstanding == 0 and not exits_failed
+
+
 def day_slices(gaps: dict, budget: float, caps: dict = None) -> dict:
     """Split today's deployment budget across plan gaps — exactly ONE slice
     (=> one order) per symbol.  Audit v5 #3 (2026-10-28): the old 3-pass loop
@@ -4805,6 +4826,20 @@ class Broker:
             except Exception as e:
                 status = "FAILED"
                 fill_note = f"live order failed: {e}"
+                # audit v15 P0-4 (2026-10-30 console): Upstox delivery SELLS
+                # die on "EDIS is not validated" (UDAPI100500) until the user
+                # authorises CDSL TPIN/OTP — buried in a ticket, this looked
+                # like a generic glitch.  Say it at volume the moment it fires.
+                if side.upper() == "SELL" and ("UDAPI100500" in str(e)
+                                               or "EDIS" in str(e).upper()):
+                    P.err(f"SELL blocked on {symbol}: Upstox has no EDIS "
+                          f"authorisation for this holding today.  "
+                          f"Delivery sales need a daily CDSL EDIS check "
+                          f"(TPIN/OTP) — fix once in the Upstox app "
+                          f"(Profile -> Security -> Authorise sell / EDIS), "
+                          f"and consider DDPI (one-time standing "
+                          f"authorisation, removes the daily dance).  The "
+                          f"signal stays OPEN and retries next run.")
         slip_cost = abs(px - ref_price) * qty
         self.db.execute(
             "INSERT INTO orders(ts,signal_as_of,exec_date,symbol,side,qty,price,value,"
@@ -4941,6 +4976,7 @@ class RiskEngine:
                 self.all_cash = False
                 self.state = "NORMAL"
                 self.trigger_date = ""
+                self.db.meta_set("risk_peak_rebased_date", today_str())
             self.db.meta_set("equity_peak_mode", _mode_now)
             self._save()
         if equity > self.peak:
@@ -5713,9 +5749,27 @@ class TradingCycle:
                        "the open bell.")
         remaining = max(0.0, budget_today - already)
         if plan and remaining < MIN_TRADE_VALUE:
-            P.ok(f"Today's budget ({fmt_rs(budget_today)}) is already fully "
-                 f"invested ({fmt_rs(already)} in {dlog.get('orders', 0)} "
-                 f"order(s)) — nothing left to do; safe to run again anytime.")
+            # audit v15 P0-1 (2026-10-30 console): when the budget is BELOW the
+            # minimum order size the old line claimed "already fully invested"
+            # — with ₹0 placed that was a lie masking a strategy that can
+            # never buy.  Say which case it is.
+            if already >= MIN_TRADE_VALUE:
+                P.ok(f"Today's budget ({fmt_rs(budget_today)}) is already fully "
+                     f"invested ({fmt_rs(already)} in {dlog.get('orders', 0)} "
+                     f"order(s)) — nothing left to do; safe to run again anytime.")
+            else:
+                P.warn(f"Today's budget is {fmt_rs(budget_today)} — BELOW the "
+                       f"minimum order size of {fmt_rs(MIN_TRADE_VALUE)}, so NO "
+                       f"buy can happen today.  This is not 'already invested'; "
+                       f"nothing was placed.  Raise STARTING_CAPITAL (your "
+                       f"daily budget) to at least ₹{MIN_TRADE_VALUE} — better "
+                       f"5-10x — if you intend daily deployment.")
+                self.db.execute(
+                    "INSERT INTO decisions(ts,phase,symbol,decision,reason) "
+                    "VALUES(?,?,?,?,?)",
+                    (now_iso(), "deploy", "-", "BUDGET_BELOW_MINIMUM",
+                     f"budget {budget_today:.0f} < MIN_TRADE_VALUE "
+                     f"{MIN_TRADE_VALUE:.0f}; zero orders possible"))
             return 0
         # audit v5 #4: if live cash can't cover today's buys, sell just enough
         # of the parked idle-cash sleeve first (matches backtest behaviour)
@@ -6051,6 +6105,18 @@ class TradingCycle:
                       f"Run 'python etf-momentum-screener.py update' first "
                       f"(analysis below would also be stale, so the run stops).")
                 return self.broker.equity(self.latest_prices())
+            # audit v15 P0-1 (2026-10-30 console): a daily budget UNDER the
+            # minimum order size can never place a single buy — the run used
+            # to sail on and print 'already fully invested'.  Refuse orders
+            # loudly; analysis continues when the user answers n anyway.
+            if INVEST_PER_DAY < MIN_TRADE_VALUE:
+                P.err(f"CONFIG ERROR: your daily budget (STARTING_CAPITAL = "
+                      f"₹{INVEST_PER_DAY:.0f}) is BELOW the minimum order size "
+                      f"₹{MIN_TRADE_VALUE:.0f} — the strategy is structurally "
+                      f"unable to BUY anything; every buy will skip.  "
+                      f"(Sells/exits still work.)  Raise STARTING_CAPITAL "
+                      f"(₹5,000–10,000 is the tuned range) in the config block "
+                      f"at the top of the script.")
         if not PAPER_TRADE:
             # audit F9: settle journaled PENDING/UNCONFIRMED live orders first —
             # otherwise today's run could duplicate them
@@ -6569,6 +6635,12 @@ class TradingCycle:
         # ---- build target basket (execute at the LATEST traded price = next session) ----
         latest_px = self.latest_prices()
         target = {}
+        # audit v15 P0-2 (2026-10-30): in SIP_MODE the target map never got
+        # the CHOSEN symbols, so every held-and-still-picked ETF fell into
+        # the orphan loop below with weight 0 -> the rebalance SOLD its own
+        # #1/#2 picks (the live console showed SELL PHARMABEES/MOCAPITAL
+        # minutes after re-picking them).  Held-and-chosen is kept, always.
+        _chosen_syms = {st["symbol"] for st in selection["chosen"]}
         if not SIP_MODE:
             for st in selection["chosen"]:
                 w = sized["weights"].get(st["symbol"], 0.0)
@@ -6585,10 +6657,9 @@ class TradingCycle:
         # the backtester does.  Otherwise portfolios silently accumulate orphans.
         for sym, h in self.broker.holdings().items():
             if sym not in target:
-                # audit v5 #4: the idle-cash sleeve (liquid ETF) is NOT an
-                # orphan to rebalance away — it IS the cash parking spot; it
-                # leaves only when buys need the money (sleeve_unsweep)
-                if sym in CASH_PROXY_SYMBOLS:
+                # audit v5 #4 (sleeve) + v15 P0-2 (SIP kept-pick) live inside
+                # sip_orphan_should_sell — one source of truth for both.
+                if not sip_orphan_should_sell(sym, target, _chosen_syms, SIP_MODE):
                     continue
                 px = latest_px.get(sym) or h["avg_cost"]
                 target[sym] = {"weight": 0.0, "close": px,
@@ -6614,6 +6685,9 @@ class TradingCycle:
         holdings = self.broker.holdings()
         trades_done = 0
         exits_outstanding = 0
+        exits_failed = []       # audit v15 P0-3: a FAILED/REJECTED exit used
+                                # to pass silently — the signal was then marked
+                                # done and the exit NEVER retried
         # planned price for late-fill accounting (audit 2.9)
         planned_px = {}
         if today > exec_date:
@@ -6691,6 +6765,17 @@ class TradingCycle:
                         P.warn(f"SELL {sym} deferred this session — {defer}")
                         continue
             reason_txt = "exit/trim"
+            # audit v15 P1 (2026-10-30): a held name being sold because it fell
+            # out of today's top-N is a ROTATION, not a trend break — say which
+            # (the 'why' column used to read 'exit/trim' for both, so the live
+            # console looked like it was selling healthy trends for no reason).
+            _trend_exit_syms = {st["symbol"] for st in selection["exits"]}
+            if is_exit and sym not in _trend_exit_syms:
+                _qtr, _qa, _qv = _quick_trend(self.db, sym)
+                if _qtr is not None and _qtr > EXIT_THRESHOLD and _qa is not False:
+                    reason_txt += (" | rotation: momentum fine "
+                                   f"({fmt_pct(_qtr)}) but ranked out of the "
+                                   f"top {MAX_HOLDINGS} — sells to follow the basket")
             if planned_px.get(sym):
                 short = (price / planned_px[sym] - 1.0)
                 reason_txt += f" | late-fill shortfall vs planned session: {fmt_pct(short)}"
@@ -6698,6 +6783,9 @@ class TradingCycle:
                                       reason=reason_txt,
                                       spread_bps=tgt["spread_bps"])
             self.broker.print_order_ticket(res, sym, tgt["name"], "SELL")
+            # audit v15 P0-3: failed/rejected exits keep the signal OPEN
+            if is_exit and res.get("status") in ("FAILED", "REJECTED"):
+                exits_failed.append(sym)
             trades_done += 1
         # 2) buys
         eq_now = self.broker.equity(self.latest_prices())
@@ -6757,18 +6845,30 @@ class TradingCycle:
         self.risk.update(eq, "cycle-end",
                          invested_frac=(hv / eq) if eq > 0 else None)
         self.risk.snapshot(today_str(), cash, hv, eq)
-        if exits_outstanding == 0:
+        if signal_closeable(exits_outstanding, exits_failed):
             # audit v4 L4: a re-derived (override) basket must ALSO satisfy the
             # current month-end key, else the next run re-executes the STALE
-            # month-end signal and clobbers the fresh plan (loop forever)
+            # month-end signal and clobbers the fresh plan (loop forever).
+            # audit v15 P0-3: a FAILED/REJECTED exit must ALSO keep the signal
+            # open — the previous run book only watched sliced/queued exits,
+            # so a broker error silently sealed the cycle "up to date".
             _done = as_of
             if as_of_override:
                 _done = last_month_end_date(all_dates) if all_dates else as_of
             self.db.meta_set("last_trade_signal", _done)
         else:
-            P.warn(f"{exits_outstanding} exit order(s) are still sliced/queued — the "
-                   f"{as_of} signal stays OPEN until they finish, so rerun "
-                   f"'python etf-momentum-screener.py trade' on the next session.")
+            _bits = []
+            if exits_outstanding:
+                _bits.append(f"{exits_outstanding} exit order(s) are still "
+                             f"sliced/queued")
+            if exits_failed:
+                _bits.append(f"{len(exits_failed)} exit(s) FAILED or were "
+                             f"rejected ({', '.join(exits_failed)}) — fix the "
+                             f"cause (see the order tickets above; EDIS/DDPI "
+                             f"setup is the usual one on Upstox sells)")
+            P.warn(f"{'; '.join(_bits)} — the {as_of} signal stays OPEN and "
+                   f"retries until done.  Rerun 'python etf-momentum-screener.py "
+                   f"trade' on the next session.")
         self.db.meta_set("last_trade_run", now_iso())
         # audit v11 P2-1: this is the state after the month-end SELLS — the
         # daily buying runs later (deploy_day under run_daily).  Title it so.
@@ -8724,9 +8824,15 @@ def cmd_status(db: Db):
     # first confirmed run realises the peak — label that case so it doesn't
     # read as a phantom all-time-high next to the real total.
     _peak_seed = (not db.meta_get("risk_last_eval"))
-    P.kv("Peak equity",
-         fmt_cr(risk.peak) + ("  (startup seed — updates from your real book "
-                              "on the first confirmed run)" if _peak_seed else ""))
+    # audit v15 P1: catch up with a peak that was rebased on a paper->live
+    # flip TODAY (v12 P0-1) — otherwise drawdown 0.00% next to a just-seeded
+    # peak looks unexplained.
+    _rb = db.meta_get("risk_peak_rebased_date", "")
+    _peak_note = ("  (startup seed — updates from your real book "
+                  "on the first confirmed run)" if _peak_seed
+                  else "  (peak rebased on mode flip today)" if _rb == today_str()
+                  else "")
+    P.kv("Peak equity", fmt_cr(risk.peak) + _peak_note)
     dd = max(1 - eq / risk.peak, 0.0) if risk.peak else 0.0
     P.kv("Current drawdown", fmt_pct(dd, signed=False),
          val_color=_C.RED if dd > 0.05 else _C.WHITE)
@@ -9155,6 +9261,30 @@ def print_action_panel(db: Db):
                 if _h:
                     _sleeve_v += _h["qty"] * prices_now.get(_s, _h["avg_cost"])
             inv = safe_div(max(0.0, hv - _sleeve_v), eq, 0.0)
+            # audit v15 P1 (2026-10-30 console): plan-vs-reality gap silently
+            # persisted: book 2.8% invested against a 52.1% plan for days, with
+            # no line naming it.  Count consecutive lagging days; after 3, warn.
+            try:
+                _tgt_raw = db.meta_get(SIP_TARGETS_KEY, "") or ""
+                _tgt_inv = sum(float(v) for v in json.loads(_tgt_raw).values()) \
+                    if _tgt_raw else 0.0
+            except Exception:
+                _tgt_inv = 0.0
+            if _tgt_inv > 0.05 and inv < 0.25 * _tgt_inv:
+                _lagd = db.meta_get("plan_lag_days", "0")
+                _lagd = (int(_lagd) + 1) if db.meta_get("plan_lag_date") != today_str() \
+                    else int(_lagd)
+                db.meta_set("plan_lag_days", str(_lagd))
+                db.meta_set("plan_lag_date", today_str())
+                if _lagd >= 3:
+                    P.warn(f"• Plan fill is {fmt_pct(inv)} invested against a "
+                           f"{fmt_pct(_tgt_inv)} target plan — lagging for "
+                           f"{_lagd} straight run-days.  Causes to check, in "
+                           f"order: a declined live y/n, the budget floor "
+                           f"below the minimum order size, a premium-guard "
+                           f"block, or a month-end trickle day.")
+            else:
+                db.meta_set("plan_lag_days", "0")
             if eq > 0 and inv < 0.05 and SIP_MODE:
                 if INVEST_PER_DAY <= 0:
                     P.warn(f"• Portfolio is only {fmt_pct(inv)} invested — "
@@ -9580,6 +9710,25 @@ def cmd_selftest(db: Db):
             os.remove(DATA_DIR / "selftest_v14.db")
         except Exception:
             pass
+
+    # v15 P0/P1 regression tests ------------------------------------------------
+    # P0-2: the SIP-mode orphan loop must NEVER sell a held name that is in
+    # today's chosen basket (it used to sell the rebalance's own fresh picks).
+    _tg = {"OLDX": {"weight": 0.0}}          # exits got weight 0 in target
+    check("v15 P0-2: held+chosen kept, rotation sells, sleeves never sell",
+          sip_orphan_should_sell("HOLDPICK", _tg, {"HOLDPICK"}, True) is False
+          and sip_orphan_should_sell("DROPPED", _tg, {"HOLDPICK"}, True) is True
+          and sip_orphan_should_sell("LIQUIDCASE", _tg, set(), True) is False
+          and sip_orphan_should_sell("OLDX", _tg, set(), True) is False,
+          "orphan gate")
+    # P0-3: the month-end signal must stay open when any exit failed.
+    check("v15 P0-3: failed exits keep the signal open for retry",
+          signal_closeable(0, []) is True and signal_closeable(1, []) is False
+          and signal_closeable(0, ["PHARMABEES"]) is False, "closeable gate")
+    # P0-1: config sanity — the daily budget must be >= one minimum order.
+    check("v15 P0-1: INVEST_PER_DAY >= MIN_TRADE_VALUE (else zero buys ever)",
+          INVEST_PER_DAY >= MIN_TRADE_VALUE,
+          f"INVEST_PER_DAY={INVEST_PER_DAY} MIN_TRADE_VALUE={MIN_TRADE_VALUE}")
 
     # A8: impact grows with order size (no more flat 2 bps)
     small = impact_bps(10_000.0, 1_000_000.0)

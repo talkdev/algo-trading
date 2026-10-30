@@ -71,3 +71,23 @@ v14 itself found no knob change to justify).
 
 Ops note (not a bug): the book was 2.8% invested because a live run was
 declined twice — USER-LOCK (#115) means only interactive answers deploy.
+
+## Round 26 (external audit v15, 2026-10-30) — live-run defects, one was a real money bug
+
+Audited FROM A LIVE RUN console.  The SIP_MODE month-end rebalance computed
+SELL orders for its own #1/#2 fresh picks (held names fell into the orphan
+sell map because SIP_MODE never enters chosen names into it) — only a broker
+EDIS failure stopped the churn from executing.  Also: failed exits used to
+seal the signal as done forever; a ₹1,000 daily budget under the ₹2,000
+minimum order size printed "already fully invested"; and EDIS failures were
+buried in ticket text.  All fixed + selftested (131/131).  User-side asks:
+raise STARTING_CAPITAL ≥ ₹5,000 and authorise EDIS/DDPI in Upstox.
+
+| finding | was | now |
+|---|---|---|
+| SIP_MODE rebalance sold held-and-still-picked ETFs | kept via sip_orphan_should_sell | ledger 139 |
+| FAILED/REJECTED exits marked "up to date", never retried | signal stays open + named retry | ledger 140 |
+| ₹1,000/day budget made every buy impossible, console lied | loud config error + honest line | ledger 141 |
+| EDIS leads buried | loud one-glance explainer | ledger 142 |
+| plan-vs-reality lag invisible (2.8% vs 52.1% for days) | 3-day persistent warning | ledger 143 |
+| rotation sells read like trend breaks | labelled | ledger 144 |
