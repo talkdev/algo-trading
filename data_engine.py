@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import statistics
@@ -39,6 +40,11 @@ class TechnicalEngine:
     Used by MarketDataEngine every cycle.
     """
 
+    # Last resampled frame per interval. Keyed by a hash of the 1-minute
+    # OHLC so a later snapshot on the same bars does not rebuild ADX inputs.
+    # The cached frame is the pre-drop aggregate; callers never write it.
+    _resample_cache: Dict[str, tuple] = {}
+
     # ── Bar Resampling ────────────────────────────────────────────────────
 
     @staticmethod
@@ -60,50 +66,24 @@ class TechnicalEngine:
         if bars_1min is None or bars_1min.empty:
             return pd.DataFrame()
         try:
-            df = bars_1min.copy()
-
-            # Build datetime index
-            if "datetime" not in df.columns:
-                if "date" in df.columns and "time" in df.columns:
-                    df["datetime"] = pd.to_datetime(
-                        df["date"].astype(str) + " " + df["time"].astype(str),
-                        errors="coerce",
-                    )
-                elif "time" in df.columns:
-                    today_str = today_ist().isoformat()
-                    df["datetime"] = pd.to_datetime(
-                        today_str + " " + df["time"].astype(str),
-                        errors="coerce",
-                    )
-                else:
-                    return pd.DataFrame()
-
-            # Strip timezone to avoid resampling issues
-            if hasattr(df["datetime"].dtype, "tz") and df["datetime"].dtype.tz is not None:
-                df["datetime"] = df["datetime"].dt.tz_localize(None)
-
-            df = df.set_index("datetime").sort_index()
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
-
-            # Ensure numeric columns
-            for col in ["open", "high", "low", "close", "volume"]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            resampled = (
-                df[["open", "high", "low", "close", "volume"]]
-                .resample(interval, label="left", closed="left")
-                .agg({
-                    "open":   "first",
-                    "high":   "max",
-                    "low":    "min",
-                    "close":  "last",
-                    "volume": "sum",
-                })
-                .dropna(subset=["open", "close"])
+            try:
+                sig = TechnicalEngine._resample_signature(bars_1min, interval)
+            except Exception:
+                sig = None
+            cached = (
+                TechnicalEngine._resample_cache.get(interval)
+                if sig is not None else None
             )
-            resampled = resampled[resampled["open"] > 0]
+            if cached is not None and cached[0] == sig:
+                resampled = cached[1]
+            else:
+                resampled = TechnicalEngine._resample_aggregate(
+                    bars_1min, interval
+                )
+                if resampled is None:
+                    return pd.DataFrame()
+                if sig is not None:
+                    TechnicalEngine._resample_cache[interval] = (sig, resampled)
 
             if drop_forming and not resampled.empty:
                 try:
@@ -127,6 +107,178 @@ class TechnicalEngine:
 
         except Exception:
             return pd.DataFrame()
+
+    @staticmethod
+    def _resample_signature(bars: pd.DataFrame, interval: str) -> bytes:
+        """Identity of the 1-minute input. Same bars → same aggregate."""
+        parts = [str(interval).encode(), str(len(bars)).encode()]
+        for name in ("open", "high", "low", "close", "volume"):
+            if name not in bars.columns:
+                continue
+            arr = pd.to_numeric(bars[name], errors="coerce").to_numpy(
+                dtype="float64"
+            )
+            parts.append(arr.tobytes())
+        if "datetime" in bars.columns and len(bars):
+            try:
+                parts.append(
+                    bars["datetime"].astype("int64").to_numpy().tobytes()
+                )
+            except Exception:
+                parts.append(str(bars["datetime"].iloc[0]).encode())
+                parts.append(str(bars["datetime"].iloc[-1]).encode())
+        elif "time" in bars.columns:
+            parts.append("|".join(map(str, bars["time"])).encode())
+        if "date" in bars.columns and len(bars):
+            parts.append(str(bars["date"].iloc[0]).encode())
+        return hashlib.md5(b"\0".join(parts)).digest()
+
+    @staticmethod
+    def _resample_aggregate(
+        bars_1min: pd.DataFrame, interval: str
+    ) -> Optional[pd.DataFrame]:
+        """Pandas OHLC resample, before the forming-bucket drop."""
+        df = bars_1min.copy()
+
+        # Build datetime index
+        if "datetime" not in df.columns:
+            if "date" in df.columns and "time" in df.columns:
+                df["datetime"] = pd.to_datetime(
+                    df["date"].astype(str) + " " + df["time"].astype(str),
+                    errors="coerce",
+                )
+            elif "time" in df.columns:
+                today_str = today_ist().isoformat()
+                df["datetime"] = pd.to_datetime(
+                    today_str + " " + df["time"].astype(str),
+                    errors="coerce",
+                )
+            else:
+                return None
+
+        # Strip timezone to avoid resampling issues
+        if hasattr(df["datetime"].dtype, "tz") and df["datetime"].dtype.tz is not None:
+            df["datetime"] = df["datetime"].dt.tz_localize(None)
+
+        df = df.set_index("datetime").sort_index()
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        # Ensure numeric columns
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        fast = TechnicalEngine._resample_seconds(df, interval)
+        if fast is not None:
+            return fast
+
+        resampled = (
+            df[["open", "high", "low", "close", "volume"]]
+            .resample(interval, label="left", closed="left")
+            .agg({
+                "open":   "first",
+                "high":   "max",
+                "low":    "min",
+                "close":  "last",
+                "volume": "sum",
+            })
+            .dropna(subset=["open", "close"])
+        )
+        return resampled[resampled["open"] > 0]
+
+    @staticmethod
+    def _resample_seconds(
+        df: pd.DataFrame, interval: str
+    ) -> Optional[pd.DataFrame]:
+        """Fixed-second OHLC bins. Same rows as pandas resample.
+
+        ``300s`` / ``900s`` / ``3600s`` divide a day, so left-closed,
+        left-labeled bins line up with the clock. Returns None for any
+        other interval so the caller uses pandas.
+        """
+        text = str(interval).strip()
+        if len(text) < 2 or not text.endswith("s") or not text[:-1].isdigit():
+            return None
+        width_s = int(text[:-1])
+        if width_s <= 0 or df is None or df.empty:
+            return None
+        try:
+            width = width_s * 1_000_000_000
+            raw = df.index.asi8.astype("int64")
+            # datetime64[us] stores microseconds in asi8. Nanosecond
+            # timestamps for current years are above 1e17.
+            if abs(int(raw[0])) < 10**17:
+                ns = raw * np.int64(1000)
+            else:
+                ns = raw
+            bins = ns // width
+            change = np.flatnonzero(np.diff(bins)) + 1
+            starts = np.concatenate(([0], change))
+            ends = np.concatenate((change, [len(bins)]))
+            cols = {
+                name: df[name].to_numpy(dtype="float64")
+                for name in ("open", "high", "low", "close")
+            }
+            vol_src = df["volume"].to_numpy()
+
+            def _edge(arr: np.ndarray, last: bool) -> np.ndarray:
+                out = np.empty(len(starts), dtype="float64")
+                for i, (a, b) in enumerate(zip(starts, ends)):
+                    sl = arr[a:b]
+                    good = sl[~np.isnan(sl)]
+                    if len(good) == 0:
+                        out[i] = np.nan
+                    else:
+                        out[i] = good[-1] if last else good[0]
+                return out
+
+            high = np.maximum.reduceat(
+                np.where(np.isnan(cols["high"]), -np.inf, cols["high"]),
+                starts,
+            )
+            low = np.minimum.reduceat(
+                np.where(np.isnan(cols["low"]), np.inf, cols["low"]),
+                starts,
+            )
+            vol_out: np.ndarray
+            if np.issubdtype(vol_src.dtype, np.integer):
+                vol_out = np.add.reduceat(vol_src, starts)
+            else:
+                vol_f = vol_src.astype("float64")
+                vol_out = np.zeros(len(starts), dtype="float64")
+                for i, (a, b) in enumerate(zip(starts, ends)):
+                    vol_out[i] = np.nansum(vol_f[a:b])
+            idx = pd.to_datetime(bins[starts] * width, unit="ns")
+            try:
+                idx = pd.DatetimeIndex(idx).astype(df.index.dtype)
+            except (TypeError, ValueError):
+                pass
+
+            def _like(name: str, arr: np.ndarray) -> np.ndarray:
+                src = df[name].dtype
+                if (
+                    np.issubdtype(src, np.integer)
+                    and not np.isnan(arr).any()
+                ):
+                    return arr.astype(src)
+                return arr
+
+            out = pd.DataFrame(
+                {
+                    "open": _like("open", _edge(cols["open"], False)),
+                    "high": _like("high", np.where(np.isfinite(high), high, np.nan)),
+                    "low": _like("low", np.where(np.isfinite(low), low, np.nan)),
+                    "close": _like("close", _edge(cols["close"], True)),
+                    "volume": vol_out,
+                },
+                index=idx,
+            )
+            out.index.name = "datetime"
+            out = out.dropna(subset=["open", "close"])
+            return out[out["open"] > 0]
+        except Exception:
+            return None
 
     # ── ADX ───────────────────────────────────────────────────────────────
 
@@ -360,6 +512,12 @@ class MarketDataEngine:
         # Must exist before _load_or_init_session_state (called here and
         # again on day-roll).
         self._replay_prev_day_vix: Optional[float] = None
+        # Backtest sets this on the scratch book only. Live keeps rewriting
+        # the candle table every cycle so a revised broker bar is stored.
+        self._replay_fast_io = False
+        self._replay_candle_frame: Optional[pd.DataFrame] = None
+        self._replay_candle_vals: Optional[dict] = None
+        self._replay_candle_date: Optional[str] = None
 
         # Load or initialise session state
         self.state: dict = self._load_or_init_session_state()
@@ -803,6 +961,9 @@ class MarketDataEngine:
         self.state["_vrp_none_cycles"]    = 0
         self._first_bar_close_today  = None
         self._first_bar_date         = None
+        self._replay_candle_frame = None
+        self._replay_candle_vals = None
+        self._replay_candle_date = None
         self._vix_fail_count         = 0
         self._api_auth_fail_count    = 0
         self._api_auth_dead          = False
@@ -1015,6 +1176,9 @@ class MarketDataEngine:
 
         bars_1m.sort(key=lambda x: x["timestamp"])
 
+        if getattr(self, "_replay_fast_io", False):
+            return self._replay_commit_candles(trading_date, bars_1m)
+
         if bars_1m:
             rows_to_insert = []
             for b in bars_1m:
@@ -1053,8 +1217,108 @@ class MarketDataEngine:
 
         return self._load_candles_from_db(trading_date)
 
+    def _replay_commit_candles(
+        self, trading_date: str, bars_1m: list
+    ) -> pd.DataFrame:
+        """Store only new or revised 1-minute bars during replay.
+
+        Live rewrites the whole session every cycle because the broker can
+        revise a bar. Recorded bars do not. The in-memory frame is the same
+        one ``_load_candles_from_db`` would build after INSERT OR REPLACE
+        (last row wins on a repeated candle time), and day-move reads it
+        back instead of scanning the scratch table again.
+        """
+        if (
+            getattr(self, "_replay_candle_date", None) != trading_date
+            or self._replay_candle_vals is None
+        ):
+            self._replay_candle_vals = {}
+            self._replay_candle_date = trading_date
+            self._replay_candle_frame = None
+        written: dict = self._replay_candle_vals
+
+        last: Dict[str, tuple] = {}
+        for b in bars_1m:
+            ts = b["timestamp"]
+            try:
+                ts_clean = ts.strftime("%H:%M:%S")
+                h, m, s = ts_clean.split(":")
+                if not (0 <= int(h) <= 23 and 0 <= int(m) <= 59 and 0 <= int(s) <= 59):
+                    continue
+            except Exception:
+                continue
+            last[ts_clean] = (
+                trading_date,
+                ts_clean,
+                1,
+                b["open"], b["high"], b["low"], b["close"],
+                b.get("volume", 0),
+                "upstox_intraday",
+            )
+
+        changed = [rec for ts, rec in last.items() if written.get(ts) != rec]
+        if changed:
+            try:
+                self.db.executemany(
+                    "INSERT OR REPLACE INTO intraday_candles "
+                    "(trading_date, candle_time, interval_min, "
+                    "open, high, low, close, volume, source) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    changed,
+                )
+                for rec in changed:
+                    written[rec[1]] = rec
+            except Exception as e:
+                self.logger.warning(f"Candle insert error: {e}")
+                self._replay_candle_frame = None
+                return self._load_candles_from_db(trading_date)
+
+        if not changed and self._replay_candle_frame is not None:
+            return self._replay_candle_frame
+
+        frame = self._frame_from_candle_rows(trading_date, list(last.values()))
+        self._replay_candle_frame = frame
+        return frame
+
+    def _frame_from_candle_rows(
+        self, trading_date: str, rows: list
+    ) -> pd.DataFrame:
+        """Same columns and filters as ``_load_candles_from_db``."""
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            [
+                {
+                    "time": rec[1],
+                    "open": rec[3],
+                    "high": rec[4],
+                    "low": rec[5],
+                    "close": rec[6],
+                    "volume": rec[7],
+                }
+                for rec in rows
+            ]
+        )
+        df["date"] = trading_date
+        df["datetime"] = pd.to_datetime(
+            df["date"] + " " + df["time"],
+            format="%Y-%m-%d %H:%M:%S",
+            errors="coerce",
+        )
+        if hasattr(df["datetime"].dtype, "tz") and df["datetime"].dtype.tz is not None:
+            df["datetime"] = df["datetime"].dt.tz_localize(None)
+        df = df.dropna(subset=["datetime"])
+        df = df[df["open"] > 0].copy()
+        return df
+
     def _load_candles_from_db(self, trading_date: str) -> pd.DataFrame:
         """Load today's 1-minute candles from database as DataFrame."""
+        if (
+            getattr(self, "_replay_fast_io", False)
+            and getattr(self, "_replay_candle_date", None) == trading_date
+            and self._replay_candle_frame is not None
+        ):
+            return self._replay_candle_frame
         try:
             rows = self.db.query(
                 "SELECT candle_time as time, open, high, low, close, volume "
@@ -1491,9 +1755,13 @@ class MarketDataEngine:
                 (rolling["low"] > 0)
             ]
             if len(valid) >= 15:
+                # Same left-to-right math as a row walk. Arrays avoid
+                # building a Series per bar; the log values stay identical.
+                _hv = valid["high"].to_numpy(dtype=float, copy=False)
+                _lv = valid["low"].to_numpy(dtype=float, copy=False)
                 log_hl_sq = []
-                for _, r in valid.iterrows():
-                    ratio = r["high"] / r["low"]
+                for _i in range(_hv.shape[0]):
+                    ratio = float(_hv[_i]) / float(_lv[_i])
                     if ratio > 1.0001:
                         log_hl_sq.append(math.log(ratio) ** 2)
 
@@ -2224,23 +2492,29 @@ class MarketDataEngine:
         if bars is None or len(bars) < 10:
             return None, False
 
-        cum_pv  = 0.0
+        # Index order, left to right, so the rounded VWAP matches the
+        # previous per-row sum. NIFTY spot volume is 0, so the second
+        # pass is the one that actually runs.
+        _h = bars["high"].to_numpy(dtype=float, copy=False)
+        _l = bars["low"].to_numpy(dtype=float, copy=False)
+        _c = bars["close"].to_numpy(dtype=float, copy=False)
+        _v = bars["volume"].to_numpy(dtype=float, copy=False)
+        n = int(_h.shape[0])
+        cum_pv = 0.0
         cum_vol = 0.0
-        for _, row in bars.iterrows():
-            typical  = (row["high"] + row["low"] + row["close"]) / 3.0
-            cum_pv  += typical * row["volume"]
-            cum_vol += row["volume"]
+        for i in range(n):
+            typical = (float(_h[i]) + float(_l[i]) + float(_c[i])) / 3.0
+            vol = float(_v[i])
+            cum_pv += typical * vol
+            cum_vol += vol
 
         if cum_vol > 0:
             return round(cum_pv / cum_vol, 2), True
 
-        # Volume is zero (NSE index) — use simple average of typical price
-        total = len(bars)
-        avg   = sum(
-            (r["high"] + r["low"] + r["close"]) / 3.0
-            for _, r in bars.iterrows()
-        ) / total
-        return round(avg, 2), True
+        avg = 0.0
+        for i in range(n):
+            avg += (float(_h[i]) + float(_l[i]) + float(_c[i])) / 3.0
+        return round(avg / n, 2), True
 
     def compute_25d_ivs(
         self, chain: dict

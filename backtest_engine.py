@@ -49,7 +49,8 @@
 #     because yesterday's VIX was missing on the shard). Checks:
 #       a) env.txt, nse_holidays.json, high_impact_events.json
 #       b) import + construct MainEngine (same path as main.py)
-#       c) live primary at DB_PATH: readable, yesterday VIX, prior close
+#       c) live primary at DB_PATH: yesterday VIX and prior close
+#          (point queries — the live file is not integrity-scanned here)
 #       d) each replay session: prev_vix, prior close, chain, session_state
 #     Token / Upstox login is the only live check this file skips.
 #     --allow-unfaithful to ignore.
@@ -257,6 +258,14 @@ class HistoricalStore:
                 "Replay the per-day shards instead of the live primary."
             )
         self.conn = open_sqlite_readonly(db_path)
+        # Read-only. A larger page cache and a bounded mmap speed the
+        # per-day chain load. Neither pragma writes the source file.
+        try:
+            self.conn.execute("PRAGMA cache_size=-65536")   # 64MB
+            self.conn.execute("PRAGMA mmap_size=134217728")  # 128MB
+            self.conn.execute("PRAGMA temp_store=MEMORY")
+        except sqlite3.Error:
+            pass
 
     def _q(self, sql: str, params: tuple = ()) -> List[dict]:
         try:
@@ -378,11 +387,18 @@ class HistoricalStore:
 
     def load_day(self, trading_date: str,
                  market_hours_only: bool = True) -> "DaySlice":
-        rows = self._q(
-            "SELECT * FROM option_chain_snapshot WHERE trading_date=? "
-            "ORDER BY capture_time",
-            (trading_date,),
-        )
+        sql = "SELECT * FROM option_chain_snapshot WHERE trading_date=?"
+        params: list = [trading_date]
+        if market_hours_only:
+            # Same HH:MM window as the Python slice below. substr is
+            # 1-based, so position 12 is Python index 11.
+            sql += (
+                " AND substr(capture_time, 12, 5) >= ?"
+                " AND substr(capture_time, 12, 5) <= ?"
+            )
+            params.extend([self.MARKET_OPEN, self.MARKET_CLOSE])
+        sql += " ORDER BY capture_time"
+        rows = self._q(sql, tuple(params))
         if market_hours_only:
             rows = [
                 r for r in rows
@@ -1405,43 +1421,145 @@ class Results:
 #  THE SIMULATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_calibration_as_of(
-    paths: List[str], trading_date: Optional[str]
-) -> Optional[dict]:
-    """Latest valid calibration_state row strictly before session open.
+def _calibration_sources(db_paths: List[str], config) -> List[str]:
+    """Shard files plus the live primary, each path once.
 
-    Per-day shards may hold a later-week row (Sep8 shard ends at Sep21).
-    Using that on Sep8 is lookahead. No row → caller leaves Tier-0 defaults.
+    The parent reads these once and hands each worker a single row.
+    Workers must not open the live primary themselves.
     """
-    cutoff = f"{trading_date}T09:15:00" if trading_date else None
-    best: Optional[dict] = None
-    best_at = ""
+    paths: List[str] = []
+    seen = set()
+
+    def add(p) -> None:
+        if not p:
+            return
+        sp = str(p)
+        if sp in seen:
+            return
+        try:
+            if not Path(sp).is_file():
+                return
+        except OSError:
+            return
+        seen.add(sp)
+        paths.append(sp)
+
+    for p in db_paths or []:
+        add(p)
+    try:
+        add(str(Path(getattr(config, "db_path", "") or "").expanduser()))
+    except Exception:
+        pass
+    try:
+        shard_dir = _per_day_shard_dir(config)
+        if shard_dir.is_dir():
+            for p in sorted(shard_dir.glob("*.db")):
+                add(str(p))
+    except Exception:
+        pass
+    return paths
+
+
+def _read_calibration_rows(paths: List[str]) -> List[dict]:
+    """Every valid calibration_state row from each source. Small table."""
+    rows: List[dict] = []
     for pth in paths:
         if not pth or not Path(pth).is_file():
             continue
         try:
             con = open_sqlite_readonly(pth)
-            if cutoff:
-                row = con.execute(
-                    "SELECT * FROM calibration_state WHERE is_valid=1 "
-                    "AND calibrated_at < ? ORDER BY calibrated_at DESC LIMIT 1",
-                    (cutoff,),
-                ).fetchone()
-            else:
-                row = con.execute(
-                    "SELECT * FROM calibration_state WHERE is_valid=1 "
-                    "ORDER BY calibrated_at DESC LIMIT 1"
-                ).fetchone()
-            con.close()
+            try:
+                fetched = con.execute(
+                    "SELECT * FROM calibration_state WHERE is_valid=1"
+                ).fetchall()
+            finally:
+                con.close()
         except sqlite3.Error:
             continue
-        if not row:
-            continue
-        d = {k: row[k] for k in row.keys() if k != "id"}
+        for row in fetched:
+            d = {}
+            for k in row.keys():
+                if k == "id":
+                    continue
+                v = row[k]
+                if isinstance(v, (bytes, memoryview)):
+                    continue
+                d[k] = v
+            if d.get("calibrated_at"):
+                rows.append(d)
+    return rows
+
+
+def _best_calibration(
+    rows: List[dict], trading_date: Optional[str]
+) -> Optional[dict]:
+    """Latest valid row strictly before session open. No row → None.
+
+    Per-day shards may hold a later-week row (Sep8 shard ends at Sep21).
+    Using that on Sep8 is lookahead. Same rule as the old per-file
+    ``calibrated_at < cutoff ORDER BY calibrated_at DESC LIMIT 1``.
+    """
+    cutoff = f"{trading_date}T09:15:00" if trading_date else None
+    best: Optional[dict] = None
+    best_at = ""
+    for d in rows:
         at = str(d.get("calibrated_at") or "")
+        if cutoff and not (at < cutoff):
+            continue
         if at > best_at:
             best, best_at = d, at
     return best
+
+
+def load_calibration_as_of(
+    paths: List[str], trading_date: Optional[str]
+) -> Optional[dict]:
+    """Latest valid calibration_state row strictly before session open.
+
+    No row → caller leaves Tier-0 defaults.
+    """
+    return _best_calibration(_read_calibration_rows(paths), trading_date)
+
+
+def _relax_scratch_db(db: Database) -> None:
+    """Drop fsync on a throwaway replay book. Never the live primary.
+
+    Live ``Database()`` stays WAL + synchronous=FULL. Commits on this
+    connection stay atomic (rollback journal in RAM), so a failed
+    statement does not leave a partial chain write for the next cycle
+    to read. A kill can tear the temp file; that run does not report P&L.
+
+    The OI-change lookup reads ``option_chain_snapshot`` on this same
+    book every cycle. The composite index keeps that a point lookup as
+    the day's rows accumulate. It is not created on the live primary.
+    """
+    if is_live_primary_path(db.db_path):
+        raise sqlite3.DatabaseError(
+            "Refusing to relax durability on the live primary"
+        )
+    con = db._conn
+    if con is None:
+        raise sqlite3.DatabaseError("scratch database is not open")
+    mode = con.execute("PRAGMA journal_mode=MEMORY").fetchone()
+    got = str(mode[0]).lower() if mode else ""
+    if got != "memory":
+        raise sqlite3.DatabaseError(
+            f"scratch journal_mode stayed {got or 'unknown'}"
+        )
+    con.execute("PRAGMA synchronous=OFF")
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA locking_mode=EXCLUSIVE")
+    con.execute("PRAGMA cache_size=-65536")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chain_replay_oi "
+        "ON option_chain_snapshot(trading_date, strike, expiry, capture_time)"
+    )
+    # The schema also indexes trading_date and (expiry, strike). The OI
+    # lookup uses the composite above. Keeping the other two only slows
+    # the per-cycle chain insert on this throwaway file. Queries still
+    # return the same rows. Live schema is untouched.
+    db.execute("DROP INDEX IF EXISTS idx_chain_date")
+    db.execute("DROP INDEX IF EXISTS idx_chain_expiry")
 
 
 class BacktestRunner:
@@ -1458,6 +1576,8 @@ class BacktestRunner:
         live_db_path: Optional[str] = None,
         mirror_live_aborts: bool = False,
         cycle_stride: int = 1,
+        seed_calibration: Optional[dict] = None,
+        calibration_resolved: bool = False,
     ):
         self.store = store
         self.config = config
@@ -1474,6 +1594,10 @@ class BacktestRunner:
         # Hunt-only: pump every Nth snapshot when flat. Open books still
         # see every cycle so exits stay live-faithful. 1 = full fidelity.
         self.cycle_stride = max(1, int(cycle_stride or 1))
+        # Parent resolves calibration once. When set, this process does
+        # not open the live primary or every other shard to find the row.
+        self._seed_calibration = seed_calibration
+        self._calibration_resolved = bool(calibration_resolved)
         # ── v7: per-trade console report ──────────────────────────────────
         # trade_report overrides TRADE_REPORT_MODE from the config
         # (each_cycle | on_change | off); None keeps the configured mode.
@@ -1555,14 +1679,22 @@ class BacktestRunner:
         fd, self._scratch = tempfile.mkstemp(prefix="bt_", suffix=".db")
         os.close(fd)
         db = Database(Path(self._scratch))
+        _relax_scratch_db(db)
         # Scratch book is empty. Live confidence/vol thresholds come from
         # calibration_state. Seed the latest valid row as-of the session
         # (never a later-day row) so RegimeClassifier sees the live mix.
-        _seed_day = None
-        _pending = getattr(self, "_pending_dates", None) or []
-        if _pending:
-            _seed_day = str(_pending[0])
-        _cal = load_calibration_as_of(self._calibration_source_paths(), _seed_day)
+        # Parallel workers receive that row from the parent. A direct
+        # runner still scans sources itself.
+        if self._calibration_resolved:
+            _cal = self._seed_calibration
+        else:
+            _seed_day = None
+            _pending = getattr(self, "_pending_dates", None) or []
+            if _pending:
+                _seed_day = str(_pending[0])
+            _cal = load_calibration_as_of(
+                self._calibration_source_paths(), _seed_day
+            )
         if _cal:
             try:
                 db.insert("calibration_state", _cal)
@@ -1595,6 +1727,7 @@ class BacktestRunner:
         if self.trade_report_mode is not None:
             engine.trade_reporter.set_mode(self.trade_report_mode)
 
+        engine.market_engine._replay_fast_io = True
         if not self.verbose:
             engine.market_engine._print_cycle_dashboard = lambda *_a, **_k: None
             engine._print_cycle_footer = lambda *_a, **_k: None
@@ -1640,15 +1773,43 @@ class BacktestRunner:
 
     def _teardown(self):
         try:
+            self.db._batch_writes = False
+            self.db.flush_writes()
+        except Exception:
+            pass
+        try:
             self.db.close()
         except Exception:
             pass
         self.clock.uninstall()
-        if self._scratch and Path(self._scratch).exists():
+        # BT_KEEP_SCRATCH_DIR: keep the replay book (strategy_decisions,
+        # cycle_log, positions) for post-run audit instead of deleting it.
+        _keep = os.environ.get("BT_KEEP_SCRATCH_DIR")
+        if _keep and self._scratch and Path(self._scratch).exists():
             try:
-                os.unlink(self._scratch)
-            except OSError:
+                import sqlite3 as _sq
+                os.makedirs(_keep, exist_ok=True)
+                _tag = "_".join(getattr(self, "_pending_dates", None) or []) or "day"
+                _dst = os.path.join(_keep, f"day_{_tag}.db")
+                if os.path.exists(_dst):
+                    os.unlink(_dst)
+                # Close already committed pages into the main file (the
+                # replay journal is in RAM). VACUUM INTO copies that file.
+                _c = _sq.connect(self._scratch)
+                _c.execute("VACUUM INTO ?", (_dst,))
+                _c.close()
+            except Exception:
                 pass
+        if self._scratch:
+            # Journal is in RAM; a commit already folded pages into the
+            # main file. Remove any leftover sidecars anyway.
+            for _sfx in ("", "-wal", "-shm", ".writer.lock"):
+                _p = Path(self._scratch + _sfx)
+                if _p.exists():
+                    try:
+                        os.unlink(_p)
+                    except OSError:
+                        pass
 
     def _harvest_closed(self, trading_date: str) -> None:
         """Pull newly CLOSED rows from the live book into Results."""
@@ -1855,6 +2016,9 @@ class BacktestRunner:
         _open_cached = False
         _progress_every = max(50, n_cycles // 10) if n_cycles else 50
         _t_day0 = time.perf_counter()
+        # Scratch book only. Live Database never sets this, so it still
+        # commits every statement (WAL + synchronous=FULL).
+        self.db._batch_writes = True
         for _ci, capture_time in enumerate(day.cycles):
             # Stride only while flat — once a ticket is open, pump every
             # snapshot so exits match live monitoring resolution.
@@ -1880,6 +2044,13 @@ class BacktestRunner:
                         f"run_one_cycle failed: {exc}"
                     )
                 continue
+            finally:
+                # One commit for the cycle's chain, candles, and logs.
+                # The scratch journal is in RAM; this does not fsync.
+                try:
+                    self.db.flush_writes()
+                except Exception:
+                    pass
 
             self.results.cycles += 1
             if (
@@ -3579,11 +3750,13 @@ def probe_live_primary(db_path: Path) -> dict:
         return out
 
     try:
-        q = con.execute("PRAGMA quick_check").fetchone()
-        if q and str(q[0]) != "ok":
-            out["why"].append(f"quick_check failed: {q[0]}")
-            return out
-
+        # No PRAGMA quick_check / integrity_check. On the live primary that
+        # reads the whole multi-GB file and was most of a batch's startup.
+        # Live startup (Database._assert_file_healthy) still quick_checks
+        # before it writes. Shards were integrity-checked when
+        # split_db_per_day replaced them. This probe only reads the pages
+        # Gate 1 uses: schema, yesterday's VIX, prior close. A corrupt
+        # page on that path raises and fails the preflight.
         tables = {
             str(r[0])
             for r in con.execute(
@@ -3962,6 +4135,8 @@ def _parallel_day_worker(job: dict) -> dict:
                 live_db_path=job.get("live_db_path"),
                 mirror_live_aborts=bool(job.get("mirror_live_aborts")),
                 cycle_stride=int(job.get("cycle_stride") or 1),
+                seed_calibration=job.get("calibration"),
+                calibration_resolved=bool(job.get("calibration_resolved")),
             )
             res = runner.run([day])
             report = "\n\n".join(
@@ -4018,13 +4193,21 @@ def run_parallel_quiet(
     if _force_lots is None:
         _force_lots = getattr(config, "force_lots", None)
 
+    # One pass over shards + the live primary. Each worker receives
+    # the row for its session and does not open the live file for this.
+    cal_sources = _calibration_sources(db_paths, config)
+    cal_rows = _read_calibration_rows(cal_sources)
+
     jobs = []
     for d in dates:
         day_paths = _db_paths_for_day(db_paths, d)
+        _cal = _best_calibration(cal_rows, d)
         jobs.append(
             {
                 "day": d,
                 "db_paths": day_paths,
+                "calibration": dict(_cal) if _cal else None,
+                "calibration_resolved": True,
                 "fill_edge": float(args.fill_edge),
                 "stress_exit": float(args.stress_exit),
                 "fill_mode": str(getattr(args, "fill_mode", "live") or "live"),
@@ -4057,7 +4240,8 @@ def run_parallel_quiet(
     # in-process state and each day completes on its own clock.
     print(
         f"  [backtest] parallel: {len(jobs)} session(s), "
-        f"{workers} process(es), {pinned}/{len(jobs)} pinned to own shard"
+        f"{workers} process(es), {pinned}/{len(jobs)} pinned to own shard, "
+        f"calibration read once from {len(cal_sources)} file(s)"
     )
     sys.stdout.flush()
     ctx = mp.get_context("spawn")

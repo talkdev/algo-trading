@@ -1686,6 +1686,19 @@ class ExecutionEngine:
                 f"FORCE_LOTS: execution sizing {final_lots} → {_force_n}"
             )
             final_lots = _force_n
+        # Conviction scale set by the strategy (counter-regime long) applies
+        # after the clamp, so FORCE_LOTS stays the ceiling, not the size.
+        try:
+            _scale = float(params.get("size_scale") or 1.0)
+        except (TypeError, ValueError):
+            _scale = 1.0
+        if 0 < _scale < 1:
+            _scaled = max(1, int(round(final_lots * _scale)))
+            if _scaled != final_lots:
+                self.logger.info(
+                    f"size_scale {_scale:g}: execution sizing {final_lots} → {_scaled}"
+                )
+            final_lots = _scaled
 
         # ── Check 2: Chain availability ───────────────────────────────────
         chain = self.market_engine.last_chain
@@ -2489,6 +2502,37 @@ class ExecutionEngine:
                 "liquidation_premium": liq_premium,
             }
 
+        # ── D1b: underlying thesis invalidation ─────────────────────────
+        # The premium stop is a % of what was paid, so a fat 12-lot ticket
+        # could give back 35% of premium (≈120 spot pts) before it fired
+        # (Oct22 LONG_CALL −₹48.7k). Measure the thesis on the underlying:
+        # once spot has moved momentum_spot_stop_pct against the side and
+        # the profit lock has not armed, the breakout has failed.
+        try:
+            _ss_pct = float(getattr(cfg, "momentum_spot_stop_pct", 0.0) or 0.0)
+            _ss_esp = float(position.get("entry_spot") or 0.0)
+            _ss_name = str(position.get("strategy_name") or "")
+            _ss_dir = -1 if "PUT" in _ss_name else (1 if "CALL" in _ss_name else 0)
+        except (TypeError, ValueError):
+            _ss_pct, _ss_esp, _ss_dir = 0.0, 0.0, 0
+        if (
+            _ss_pct > 0 and _ss_esp > 0 and spot > 0 and _ss_dir != 0
+            and not activated
+            and (_ss_esp - spot) * _ss_dir >= _ss_esp * _ss_pct
+        ):
+            self.logger.warning(
+                f"DEBIT SPOT INVALIDATION: {_ss_name} spot={spot:.1f} "
+                f"entry_spot={_ss_esp:.1f} limit={_ss_esp * _ss_pct:.1f}pts"
+            )
+            return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                "reason_detail": (
+                    f"momentum_spot_invalidation_{(_ss_esp - spot) * _ss_dir:.0f}"
+                    f"pts_ge_{_ss_esp * _ss_pct:.0f}"
+                ),
+                "current_premium": current_premium,
+                "liquidation_premium": liq_premium,
+            }
+
         # ── D2: high-water-mark profit management ────────────────────────
         # Wrong approaches (both failed Sep22 LONG_PUT):
         #   * Clamp trail to breakeven while "trend persist" → held through
@@ -2914,6 +2958,29 @@ class ExecutionEngine:
         _late_ticket = bool(raw.get("momentum_late")) or (
             "late_window" in str(position.get("selection_reason") or "")
         )
+        # D4b: final-hour cut. A long option still below what was paid with
+        # momentum_final_cut_min left has had its trend window; theta now
+        # accelerates and the close only bleeds it (Sep23 −7% at 60m left →
+        # −20% at the bell, Oct16 −14% → −21%). Tickets opened inside the
+        # cut window are exempt so the entry spread cannot trigger it.
+        _cut_min = float(getattr(cfg, "momentum_final_cut_min", 0) or 0)
+        if _cut_min > 0 and mins_left <= _cut_min and not _late_ticket:
+            try:
+                _et = datetime.fromisoformat(str(position.get("entry_time")))
+                _entry_left = (
+                    datetime.combine(_et.date(), hard_exit)
+                    - datetime.combine(_et.date(), _et.time())
+                ).total_seconds() / 60.0
+            except Exception:
+                _entry_left = _cut_min + 1.0
+            if _entry_left > _cut_min and value < entry_value:
+                return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                    "reason_detail": (
+                        f"momentum_final_hour_cut_{value:.2f}"
+                        f"<{entry_value:.2f}_{mins_left:.0f}m_left"
+                    ),
+                    "minutes_left": mins_left,
+                }
         if mins_left <= window and not _late_ticket:
             if value >= entry_value + rt_cost:
                 return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
@@ -3085,6 +3152,21 @@ class ExecutionEngine:
                 current_premium, liq_premium,
                 signals=signals,  # PATCH_V12: trend-persist hold
             )
+
+        # ── Trend-first flip: the strategy engine qualified a trend long
+        # against this credit (MOMENTUM_TREND_FIRST) and asked for a flat book.
+        _flat_ids = self.market_engine.state.get("trend_first_flatten") or []
+        if str(position.get("position_id")) in [str(x) for x in _flat_ids]:
+            _rest = [x for x in _flat_ids if str(x) != str(position.get("position_id"))]
+            if _rest:
+                self.market_engine.state["trend_first_flatten"] = _rest
+            else:
+                self.market_engine.state.pop("trend_first_flatten", None)
+            _ctx = {"reason_detail": "trend_first_flip", "liq_premium": liq_premium}
+            self.market_engine.state["_tf_flip_closing"] = True
+            if liq_premium <= entry_credit:
+                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, _ctx
+            return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, _ctx
 
         # ── Priority 1: Delta breach ──────────────────────────────────────
         # Short leg delta > 0.40 → close immediately
@@ -5262,7 +5344,40 @@ class ExecutionEngine:
             f"hold={hold_minutes:.1f}min"
         )
 
+    # Entry-gate memory a trend-first flip close must not overwrite.
+    _FLIP_KEEP_PREFIXES = ("last_exit_", "last_stop_")
+    _FLIP_KEEP_KEYS = (
+        "consecutive_stops", "session_mean_reversion_book",
+        "post_bear_debit_bounce_unlock", "post_bull_debit_bounce_unlock",
+        "or_low_reclaim_used", "or_high_reject_used",
+    )
+
     def _update_state_after_close(
+        self, reason: str, net_pnl_rs: float, priority: int
+    ) -> None:
+        """A trend-first flip close books P&L, capital and halts like any
+        close, but leaves the entry-gate memory as it was: the long that asked
+        for the flip was qualified on that state (Sep18: the flipped BPS
+        re-armed after_extreme_fade and refused the put it made room for)."""
+        state = self.market_engine.state
+        if not state.pop("_tf_flip_closing", False):
+            return self._update_state_after_close_core(reason, net_pnl_rs, priority)
+        _keep = {
+            k: v for k, v in state.items()
+            if k.startswith(self._FLIP_KEEP_PREFIXES) or k in self._FLIP_KEEP_KEYS
+        }
+        try:
+            return self._update_state_after_close_core(reason, net_pnl_rs, priority)
+        finally:
+            for k in [
+                k for k in list(state.keys())
+                if (k.startswith(self._FLIP_KEEP_PREFIXES) or k in self._FLIP_KEEP_KEYS)
+                and k not in _keep
+            ]:
+                state.pop(k, None)
+            state.update(_keep)
+
+    def _update_state_after_close_core(
         self, reason: str, net_pnl_rs: float, priority: int
     ) -> None:
         """
@@ -5323,6 +5438,7 @@ class ExecutionEngine:
             _rot_closed = "regime_rotation" in str(reason or "")
         state["last_exit_is_regime_rotation"] = _rot_closed
         _sname_x = str(state.pop("_closing_strategy_name", "") or "")
+        state["last_exit_strategy_name"] = _sname_x
         if "BULL_PUT" in _sname_x:
             state["last_exit_strategy_side"] = "BULL"
         elif "BEAR_CALL" in _sname_x:

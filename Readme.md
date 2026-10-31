@@ -159,6 +159,39 @@ Trend-flip itself is still the underwater measured-trend scratch (`trend_flip_ex
 
 ---
 
+## LONG_OPTIONS_ONLY tuning (2026-10-31)
+
+With `LONG_OPTIONS_ONLY=true` the long-premium path is the book's only expression, not a substitute:
+
+- `decide()` re-routes any credit ENTER through `_long_only_reroute` → `_momentum_decision` (reason prefix `long_only_credit_not_tradeable:`). Before, the credit ENTER was dropped in `main.py` and the long path was never consulted.
+- `_momentum_gate` skips the sell-side marker check (`momentum_sell_side_open`) in long-only mode, and an opposing credit label no longer vetoes a long that matches the price label.
+- `momentum_max_dte` 4 → 7 so a holiday-shifted week (10-19, 5 DTE) is tradeable.
+- `momentum_reload_after_win` (1): one continuation clip after banked winners; on the same side it needs a fresh extreme beyond the last exit (`momentum_reload_needs_fresh_extreme`).
+- Exit D1b `momentum_spot_invalidation_*`: `CLOSE_STOP` once spot is `momentum_spot_stop_pct` (0.33%) against a long ticket and the lock has not armed.
+- Exit D4b `momentum_final_hour_cut_*`: with `momentum_final_cut_min` (60) or less to hard exit, a long ticket still below its entry value is closed (`CLOSE_STOP`). Tickets opened inside that window are exempt.
+- Replay: `BT_KEEP_SCRATCH_DIR=<dir>` saves each day's book as `day_<date>.db`. Scratch `-wal/-shm` files are now removed on teardown.
+- `momentum_counter_regime_size` (0.5): a long against the credit regime label (call under `PREMIUM_SELL_BEAR`, put under `PREMIUM_SELL_BULL`) trades at half the clamped size. It is applied after `FORCE_LOTS` via `params["size_scale"]`.
+
+### Trend-first hybrid (`LONG_OPTIONS_ONLY=false`)
+
+With the credit book on, `momentum_trend_first` (default true) makes the long path primary:
+
+- The momentum gate skips the sell-side marker check, as in long-only mode.
+- A qualifying long pre-empts a credit ENTER (`trend_first_over:`).
+- **Flip.** Only credit verticals are open, the long qualifies, and the slot rule would refuse it. `_trend_first_flip` then sets `state["trend_first_flatten"]` and logs `trend_first_flip:<credit>-><long>`. The execution monitor closes those credits (`reason_detail=trend_first_flip`), and the long enters on the next cycle.
+  - A flip close books P&L but leaves the `last_exit_*` / stop-streak memory unchanged. The long is gated on the same state it qualified on.
+  - Same-side stacks the slot rule already allows keep their credit.
+- Replay does not `PRAGMA quick_check` the live DB. That full-file scan stays on live startup (`Database`), and shards are integrity-checked when `split_db_per_day.py` replaces them. Preflight still point-reads yesterday's VIX and the prior close. The throwaway replay book uses an in-memory journal so cycle writes are not fsynced; the live primary stays WAL + `synchronous=FULL`.
+
+36-day replay (2026-09-08..10-30, 12 lots):
+
+| Book | Total | Days traded | Green | Red | Worst day |
+|---|---:|---:|---:|---:|---:|
+| long-only + counter-regime size | ₹458,070 | 16 | 13 | 3 | −₹14,219 |
+| trend-first hybrid + flip | ₹552,043 | 33 | 25 | 8 | −₹18,372 |
+
+Known weakness: the credit book sold bear-call spreads into the 10-28/10-29/10-30 bull legs (−₹31k together). Tape labels at entry (RANGE, ADX 18–27) match the winning credits, so no label filter separates them.
+
 ## Where the code lives
 
 ```text

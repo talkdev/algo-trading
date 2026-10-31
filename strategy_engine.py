@@ -7869,7 +7869,11 @@ class StrategyEngine:
         # ── substitution only: the sell side must have been refused ──────
         reason = str(block_reason or "").lower()
         markers = tuple(getattr(cfg, "momentum_block_markers", ())) or ()
-        if not any(str(m).lower() in reason for m in markers):
+        # LONG_OPTIONS_ONLY: long premium is the book's only expression, not
+        # a substitute — there is no open sell side for it to defer to.
+        if not self._long_first() and not any(
+            str(m).lower() in reason for m in markers
+        ):
             return False, f"momentum_sell_side_open({reason[:34]})", 0
         # Exhaustion-class sell refusals are not "express the same read long".
         # The sell side already said the move is spent; buying that move is
@@ -8901,13 +8905,52 @@ class StrategyEngine:
                 _dte_lim = int(_dte_lim if _dte_lim is not None else -1)
             except (TypeError, ValueError):
                 _dte_lim = -1
-            # One momentum harvest per session. A banked TARGET/PROFIT
-            # already expressed the window; second clips were the wipe
-            # class (Oct30 12:15 −₹15k, Sep29 11:30 −₹5.5k).
-            return False, "momentum_daily_limit_reached", 0
+            # One momentum harvest per session, plus at most
+            # momentum_reload_after_win continuation clips. A reload is
+            # allowed only when every earlier ticket banked a profit and,
+            # on the same side, price has printed a fresh session extreme
+            # beyond the last exit — a target banked mid-trend is not the
+            # end of the trend (Oct23 put banked 10:28, tape fell another
+            # 120pts 11:20-12:50; Oct21/Oct8 ran 100+pts past the target).
+            # The wipe class (Oct30 12:15 / Sep29 11:30) re-bought a stalled
+            # extreme, which the fresh-extreme proof refuses.
+            _reloads = int(getattr(cfg, "momentum_reload_after_win", 1) or 0)
+            _xside = str(_st_lim.get("last_exit_strategy_side") or "")
+            _won = (
+                _prev_pnl > 0.0
+                and (
+                    _prev_xr.startswith("CLOSE_TARGET")
+                    or _prev_xr.startswith("CLOSE_PROFIT")
+                )
+                and not int(_st_lim.get("consecutive_stops", 0) or 0)
+            )
+            if not (_won and _mom_cnt < _mom_max + _reloads):
+                return False, "momentum_daily_limit_reached", 0
+            _same = (
+                (direction > 0 and _xside == "BULL")
+                or (direction < 0 and _xside == "BEAR")
+            )
+            if _same:
+                try:
+                    _xs = float(_st_lim.get("last_exit_spot") or 0.0)
+                    _rng_r, _loc_r, _, _ = self._session_range_pos(signals)
+                except (TypeError, ValueError):
+                    _xs, _rng_r, _loc_r = 0.0, 0.0, 0.5
+                _beyond = max(10.0, 0.05 * float(_rng_r or 0.0))
+                _fresh = (
+                    _xs > 0
+                    and (spot - _xs) * direction >= _beyond
+                    and (
+                        (direction > 0 and _loc_r >= 0.85)
+                        or (direction < 0 and _loc_r <= 0.15)
+                    )
+                    and _px_aligned
+                )
+                if not _fresh:
+                    return False, "momentum_reload_needs_fresh_extreme", 0
 
         _open_n = self._count_open_positions()
-        if _open_n > 0:
+        if _open_n > 0 and not signals.get("_tf_shadow"):
             _max_slots = int(getattr(cfg, "max_concurrent_positions", 1) or 1)
             if _open_n >= _max_slots:
                 return False, "momentum_position_open", 0
@@ -9405,7 +9448,10 @@ class StrategyEngine:
                     (_lo_fade and BEAR_CALL_SPREAD in _open_names)
                     or (_hi_fade and BULL_PUT_SPREAD in _open_names)
                 )
-                if not _aligned_credit_owns and _open_names:
+                if (
+                    not _aligned_credit_owns and _open_names
+                    and not signals.get("_tf_shadow")
+                ):
                     signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
                     return None
                 # Flat book + location fade alone must not bury aligned debit
@@ -9724,6 +9770,8 @@ class StrategyEngine:
         _harvested_credit = (
             _xr_h.startswith("CLOSE_TARGET")
             or _xr_h.startswith("CLOSE_PROFIT")
+        ) and str(_st.get("last_exit_strategy_name") or "") not in (
+            LONG_CALL, LONG_PUT,
         )
         _last_side_h = str(_st.get("last_exit_strategy_side") or "")
         if (
@@ -9817,6 +9865,22 @@ class StrategyEngine:
                 or _px_md == "STRONG_DOWNTREND"
             )
         )
+        # LONG_OPTIONS_ONLY: the credit label names a structure that can
+        # never be booked, so it owns no book. A long aligned with the
+        # measured price label is the read itself (Oct30: 165 cycles of
+        # call_vs_bear_credit_regime through a 180pt UPTREND).
+        # A long against the credit regime label is a lower-conviction read
+        # (09-23 / 10-22 calls into PREMIUM_SELL_BEAR both stopped), so it
+        # trades at momentum_counter_regime_size of the clamped size.
+        _counter_regime = (
+            (direction > 0 and _final == "PREMIUM_SELL_BEAR")
+            or (direction < 0 and _final == "PREMIUM_SELL_BULL")
+        )
+        if self._long_first():
+            if direction > 0 and _px_md in ("UPTREND", "STRONG_UPTREND"):
+                _final = ""
+            if direction < 0 and _px_md in ("DOWNTREND", "STRONG_DOWNTREND"):
+                _final = ""
         if direction > 0 and _final == "PREMIUM_SELL_BEAR":
             if not (
                 self._post_harvest_trend_continuation(signals)
@@ -9882,6 +9946,17 @@ class StrategyEngine:
                     )
             except (TypeError, ValueError):
                 pass
+        if _counter_regime:
+            _cs = float(getattr(self.config, "momentum_counter_regime_size", 1.0) or 1.0)
+            if 0 < _cs < 1:
+                params["size_scale"] = _cs
+                params["final_lots"] = max(
+                    1, int(round(int(params.get("final_lots") or 1) * _cs))
+                )
+                params["selection_reason"] = (
+                    f"{params.get('selection_reason') or reason}"
+                    f":counter_regime_size_{_cs:g}"
+                )
 
         strat_name = params["strategy_name"]
         self._log_decision(signals, "STRATEGY_SELECTED", reason, strat_name, params)
@@ -10123,7 +10198,140 @@ class StrategyEngine:
             return BEAR_CALL_SPREAD
         return None
 
+    def _long_only(self) -> bool:
+        return bool(getattr(self.config, "long_options_only", False))
+
+    def _long_first(self) -> bool:
+        """Long premium is a primary expression, not a sell-side substitute:
+        LONG_OPTIONS_ONLY, or MOMENTUM_TREND_FIRST with the credit book on."""
+        return self._long_only() or bool(
+            getattr(self.config, "momentum_trend_first", False)
+        )
+
+    def _trend_first_over_credit(
+        self, signals: dict, strategy_name: str, selection_reason: str
+    ) -> Optional[dict]:
+        """MOMENTUM_TREND_FIRST: a qualifying trend long pre-empts a credit
+        ENTER (Oct19/Sep24/Oct30: the credit book held the slot while the
+        long the long-only book took ran +₹29k/+₹39k/+₹41k). None = the
+        credit trade stands."""
+        if self._long_only() or not self._long_first():
+            return None
+        if signals.get("_trend_first_tried"):
+            return None
+        signals["_trend_first_tried"] = True
+        alt = self._momentum_decision(
+            signals,
+            f"trend_first_over:{strategy_name}:{str(selection_reason or '')[:60]}",
+        )
+        if alt is None:
+            signals.pop("_momentum_refuse_reason", None)
+        return alt
+
+    def _long_only_reroute(
+        self, signals: dict, strategy_name: str, selection_reason: str
+    ) -> dict:
+        """LONG_OPTIONS_ONLY: a credit structure can never be booked, so the
+        read that selected it must be expressed long or not at all.
+
+        Without this the credit ENTER reached main.py, was dropped there, and
+        the long-premium path was never consulted — the engine went dark on
+        exactly the cycles where its regime read was cleanest.
+        """
+        reason = (
+            f"long_only_credit_not_tradeable:{strategy_name}:"
+            f"{str(selection_reason or '')[:80]}"
+        )
+        alt = self._momentum_decision(signals, reason)
+        if alt is not None:
+            return alt
+        reason = self._with_momentum_refuse(signals, reason)
+        self._log_decision(signals, "NO_TRADE", reason)
+        self._persist_decision(signals, strategy_name, reason, None, "NO_TRADE")
+        self.market_engine.finalize_cycle_log(
+            "NO_TRADE", reason, self._count_open_positions()
+        )
+        return {"action": "NO_TRADE", "reason": reason}
+
+    def _trend_first_flip(self, signals: dict) -> Optional[dict]:
+        """MOMENTUM_TREND_FIRST with only credit verticals open: if the long
+        book's entry qualifies, flatten the credit this cycle (execution
+        reads trend_first_flatten) and let the long enter on a flat book.
+        Oct30: BCS opened 11:08 into the bull leg, stopped −₹9.2k and held
+        the slot through the 11:25 call the long-only book banked +₹41k;
+        Sep24: an open BCS refused the 12:26 put (+₹39k long-only)."""
+        if self._long_only() or not self._long_first():
+            return None
+        if bool(signals.get("block_new_entries")) or signals.get("spot") is None:
+            return None
+        _st = self.market_engine.state
+        try:
+            _open = list(self.db.query(
+                "SELECT position_id, strategy_name, status FROM positions "
+                "WHERE trading_date=? AND status IN ('OPEN','PENDING_ENTRY')",
+                (today_ist().isoformat(),),
+            ) or [])
+        except Exception:
+            return None
+        if not _open or any(
+            str(p["strategy_name"] or "") in MOMENTUM_STRATEGIES
+            or str(p["status"] or "") != "OPEN"
+            for p in _open
+        ):
+            _st.pop("trend_first_flatten", None)
+            return None
+        _pend = [str(x) for x in (_st.get("trend_first_flatten") or [])]
+        if _pend:
+            if any(str(p["position_id"]) in _pend for p in _open):
+                return {"action": "NO_TRADE", "reason": "trend_first_flatten_pending"}
+            _st.pop("trend_first_flatten", None)
+        signals["_tf_shadow"] = True
+        try:
+            alt = self._momentum_decision(signals, "trend_first_flip")
+        finally:
+            signals.pop("_tf_shadow", None)
+        signals.pop("_momentum_refuse_reason", None)
+        if alt is None or alt.get("action") != "ENTER":
+            return None
+        # Only flip when the slot rule would refuse the long; an allowed
+        # same-side stack keeps its credit (Oct12/Sep28 BCS beside the put).
+        if not self._slot_conflict(str(alt.get("strategy_name") or ""), signals):
+            return None
+        names = ",".join(str(p["strategy_name"] or "") for p in _open)
+        _st["trend_first_flatten"] = [str(p["position_id"]) for p in _open]
+        reason = f"trend_first_flip:{names}->{alt.get('strategy_name')}"
+        self.logger.info(reason)
+        self._log_decision(signals, "NO_TRADE", reason)
+        self._persist_decision(signals, "NONE", reason, None, "NO_TRADE")
+        return {"action": "NO_TRADE", "reason": reason}
+
     def decide(self, signals: dict) -> dict:
+        _flip = self._trend_first_flip(signals)
+        if _flip is not None:
+            return _flip
+        out = self._decide_core(signals)
+        if (
+            out.get("action") == "ENTER"
+            and str(out.get("strategy_name") or "") not in (LONG_CALL, LONG_PUT)
+        ):
+            alt = self._trend_first_over_credit(
+                signals, str(out.get("strategy_name") or ""),
+                str(out.get("reason") or ""),
+            )
+            if alt is not None:
+                return alt
+        if (
+            self._long_only()
+            and out.get("action") == "ENTER"
+            and str(out.get("strategy_name") or "") not in (LONG_CALL, LONG_PUT)
+        ):
+            return self._long_only_reroute(
+                signals, str(out.get("strategy_name") or ""),
+                str(out.get("reason") or ""),
+            )
+        return out
+
+    def _decide_core(self, signals: dict) -> dict:
         # PATCH_V13: session price memory for the closing-hour route. Kept
         # here (not in the data engine) so the series is exactly the set of
         # cycles on which the engine was allowed to act, in live and replay.
@@ -10464,6 +10672,19 @@ class StrategyEngine:
             return {"action": "NO_TRADE", "reason": full_reason}
 
         self._clear_construct_fail()
+        if self._long_only() and strategy_name not in (LONG_CALL, LONG_PUT):
+            # Re-route before the OR-extreme latches below: those burn the
+            # day's one OR fade, and an unbookable credit must not spend it.
+            return self._long_only_reroute(
+                signals, strategy_name, selection_reason
+            )
+        if strategy_name not in (LONG_CALL, LONG_PUT):
+            # Before the OR latches, for the same reason as the re-route.
+            _tf = self._trend_first_over_credit(
+                signals, strategy_name, selection_reason
+            )
+            if _tf is not None:
+                return _tf
         if isinstance(params, dict):
             params["_intent"] = signals.get("_intent")
         # Latch OR extreme once only when we actually hand ENTER to

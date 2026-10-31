@@ -1001,7 +1001,7 @@ class Config:
     # board; banning it left 15-Sep (a -458 crash) with no long-
     # premium route at all. Half risk + 2-lot cap, see below.
     momentum_min_dte:              int   = 0
-    momentum_max_dte:              int   = 4
+    momentum_max_dte:              int   = 7
     # Trend confirmation: the fast (5m) ADX the strategy layer actually
     # consumes, and the OR/VWAP structure that proves it is a breakout and
     # not a drift inside a range.
@@ -1035,6 +1035,11 @@ class Config:
     momentum_min_prem_pts:         float = 20.0
     # Risk ladder on the long premium itself.
     momentum_stop_frac:            float = 0.35
+    # Underlying move against a long option that invalidates the thesis,
+    # as a fraction of entry spot (≈75pts at 22.7k). Sep–Oct winners went at
+    # most ~63pts against before paying (Oct21 put); failed breakouts that
+    # never recovered went 89-137 (Oct22 call, Oct23 reload).
+    momentum_spot_stop_pct:        float = 0.0033
     momentum_lock_trigger:         float = 0.25
     momentum_lock_keep_frac:       float = 0.50
     # Debit high-water-mark protection:
@@ -1069,6 +1074,12 @@ class Config:
     momentum_hwm_peak_age_min:     float = 10.0
     momentum_target_frac:          float = 0.60
     momentum_final_window_min:     int   = 45
+    # Final-hour cut for long premium still below entry (execution D4b).
+    momentum_final_cut_min:        int   = 60
+    # Size multiple for a long that contradicts the credit regime label.
+    momentum_counter_regime_size:  float = 0.5
+    # Credit book on: a qualifying trend long pre-empts a credit ENTER.
+    momentum_trend_first:          bool  = True
     # Sizing: the debit route risks the stop, not the notional, and the
     # weekday/VRP size schedule that disciplines short-premium books is
     # floored here so a high-conviction breakout is not sized into the
@@ -1077,6 +1088,8 @@ class Config:
     momentum_risk_frac_of_budget:  float = 1.00
     momentum_min_lots:             float = 0.60
     momentum_max_trades_per_day:   int   = 1
+    # Continuation clips allowed after banked winners (see _momentum_gate).
+    momentum_reload_after_win:     int   = 1
     momentum_min_minutes_left:     int   = 90
     # Cap on the cash actually committed, as a multiple of the per-trade
     # risk budget: a long option's worst case is its premium, and that is
@@ -1943,7 +1956,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         # ── v5 long-premium momentum expression ───────────────────────────
         momentum_enabled=_get_bool(env, "MOMENTUM_ENABLED", True),
         momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 0),  # PATCH_V12: was 1
-        momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 4),
+        momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 7),
         momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 24.0), 15.0), 60.0),  # PATCH_V12: was 30.0
         momentum_event_adx_min=min(max(_get_float(env, "MOMENTUM_EVENT_ADX_MIN", 32.0), 24.0), 60.0),
         momentum_or_break_frac=min(max(_get_float(env, "MOMENTUM_OR_BREAK_FRAC", 0.15), 0.0), 1.00),
@@ -1982,10 +1995,15 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         ),
         momentum_target_frac=min(max(_get_float(env, "MOMENTUM_TARGET_FRAC", 0.60), 0.10), 3.00),
         momentum_final_window_min=_get_int(env, "MOMENTUM_FINAL_WINDOW_MIN", 45),
+        momentum_final_cut_min=min(max(_get_int(env, "MOMENTUM_FINAL_CUT_MIN", 60), 0), 120),
+        momentum_counter_regime_size=min(max(_get_float(env, "MOMENTUM_COUNTER_REGIME_SIZE", 0.5), 0.1), 1.0),
+        momentum_trend_first=_get_bool(env, "MOMENTUM_TREND_FIRST", True),
         momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
         momentum_risk_frac_of_budget=min(max(_get_float(env, "MOMENTUM_RISK_FRAC_OF_BUDGET", 1.00), 0.10), 1.00),
         momentum_min_lots=min(max(_get_float(env, "MOMENTUM_MIN_LOTS", 0.60), 0.10), 1.00),
         momentum_max_trades_per_day=_get_int(env, "MOMENTUM_MAX_TRADES_PER_DAY", 1),
+        momentum_spot_stop_pct=min(max(_get_float(env, "MOMENTUM_SPOT_STOP_PCT", 0.0033), 0.0), 0.02),
+        momentum_reload_after_win=min(max(_get_int(env, "MOMENTUM_RELOAD_AFTER_WIN", 1), 0), 3),
         momentum_min_minutes_left=_get_int(env, "MOMENTUM_MIN_MINUTES_LEFT", 90),
         momentum_structural_risk_cap_mult=min(
             max(_get_float(env, "MOMENTUM_STRUCTURAL_RISK_CAP_MULT", 2.5), 1.0), 5.0
@@ -3387,18 +3405,37 @@ class Database:
 
     # ── Core Query Methods ────────────────────────────────────────────────
 
+    def _commit_unless_batched(self) -> None:
+        """Commit unless this connection is the replay scratch book.
+
+        Live ``Database`` never sets ``_batch_writes``. The scratch book
+        does, and the replay loop commits once per cycle so a statement
+        still becomes visible to the next cycle's reads. Same-connection
+        reads inside the cycle see the uncommitted rows either way.
+        """
+        if getattr(self, "_batch_writes", False):
+            return
+        self._conn.commit()
+
+    def flush_writes(self) -> None:
+        """Commit a replay batch. No effect on durability settings."""
+        with self._lock:
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                conn.commit()
+
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Execute a single SQL statement with commit."""
         with self._lock:
             cur = self._conn.execute(sql, params)
-            self._conn.commit()
+            self._commit_unless_batched()
             return cur
 
     def executemany(self, sql: str, param_list: list) -> sqlite3.Cursor:
         """Execute a batch SQL statement with commit."""
         with self._lock:
             cur = self._conn.executemany(sql, param_list)
-            self._conn.commit()
+            self._commit_unless_batched()
             return cur
 
     def query(self, sql: str, params: tuple = ()) -> List[dict]:
@@ -3423,7 +3460,7 @@ class Database:
         sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
         with self._lock:
             cur = self._conn.execute(sql, tuple(data.values()))
-            self._conn.commit()
+            self._commit_unless_batched()
             return cur.lastrowid
 
     def update(self, table: str, data: dict, where: dict) -> int:
@@ -3436,7 +3473,7 @@ class Database:
         params = tuple(data.values()) + tuple(where.values())
         with self._lock:
             cur = self._conn.execute(sql, params)
-            self._conn.commit()
+            self._commit_unless_batched()
             return cur.rowcount
 
     def upsert(self, table: str, key: dict, data: dict) -> int:
