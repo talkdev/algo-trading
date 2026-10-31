@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from core import now_ist
+from core import now_ist, by_dte
 
 
 # Classification labels (first-match order in classify()).
@@ -96,12 +96,52 @@ class TapeStateEngine:
 
         now = now_ist()
         cfg = self.config
-        dwell_need = float(getattr(cfg, "regime_entry_dwell_min", 5.0) or 5.0)
+        # Calibrated dwell when present (profitability tuner); else config.
+        try:
+            dwell_need = float(
+                signals.get("cal_regime_entry_dwell_min")
+                if signals.get("cal_regime_entry_dwell_min") is not None
+                else (getattr(cfg, "regime_entry_dwell_min", 5.0) or 5.0)
+            )
+        except (TypeError, ValueError):
+            dwell_need = float(getattr(cfg, "regime_entry_dwell_min", 5.0) or 5.0)
         adx_trend = float(getattr(cfg, "adx_trend_threshold", 20.0) or 20.0)
-        exhausted_pct = float(getattr(cfg, "exhausted_move_pct", 100.0) or 100.0)
-        exh_adx_d0 = float(getattr(cfg, "exhausted_move_adx_floor_dte0", 50.0) or 50.0)
-        exh_pct_d1 = float(getattr(cfg, "exhausted_move_pct_dte1plus", 125.0) or 125.0)
-        exh_adx_d1 = float(getattr(cfg, "exhausted_move_adx_floor_dte1plus", 45.0) or 45.0)
+        # Engine-wide: when ADX already confirms and an OR edge is broken
+        # with-trend, shorten dwell so TREND_ON / STRENGTHENING fire inside
+        # the first half-hour of a real window (not DTE-keyed).
+        try:
+            _adx_now = _f(signals, "adx_15", 0.0)
+            _spot_d = _f(signals, "spot", 0.0)
+            _orh_d = _f(signals, "or_high", 0.0)
+            _orl_d = _f(signals, "or_low", 0.0)
+            _orw_d = _f(signals, "or_width", 0.0)
+            if _orw_d <= 0 and _orh_d > _orl_d > 0:
+                _orw_d = _orh_d - _orl_d
+            _need_d = max(5.0, 0.15 * _orw_d) if _orw_d > 0 else 5.0
+            _brk_hi_d = _orh_d > 0 and _spot_d >= _orh_d + _need_d
+            _brk_lo_d = _orl_d > 0 and _spot_d <= _orl_d - _need_d
+            _px_d = str(signals.get("price_regime") or "")
+            _with_or = (
+                (_brk_hi_d and not _brk_lo_d
+                 and _px_d in ("UPTREND", "STRONG_UPTREND"))
+                or (_brk_lo_d and not _brk_hi_d
+                    and _px_d in ("DOWNTREND", "STRONG_DOWNTREND"))
+            )
+            if _adx_now >= adx_trend and _with_or:
+                dwell_need = min(dwell_need, 1.5)
+        except Exception:
+            pass
+        # Continuous life-blend exhaustion floors (expiry ↔ weekly anchors).
+        exhausted_pct_e = float(getattr(cfg, "exhausted_move_pct", 100.0) or 100.0)
+        exhausted_pct_w = float(
+            getattr(cfg, "exhausted_move_pct_dte1plus", 125.0) or 125.0
+        )
+        exh_adx_e = float(
+            getattr(cfg, "exhausted_move_adx_floor_dte0", 50.0) or 50.0
+        )
+        exh_adx_w = float(
+            getattr(cfg, "exhausted_move_adx_floor_dte1plus", 45.0) or 45.0
+        )
 
         final_regime = signals.get("final_regime")
         px = str(signals.get("price_regime") or "")
@@ -207,6 +247,13 @@ class TapeStateEngine:
             adverse = (imp_up > lim and px_side < 0) or (imp_dn > lim and px_side > 0)
             with_impulse = (imp_up > lim) or (imp_dn > lim)
 
+        _exh_pct = float(by_dte(
+            dte if dte >= 0 else 2, exhausted_pct_e, exhausted_pct_w
+        ))
+        _exh_adx = float(by_dte(
+            dte if dte >= 0 else 2, exh_adx_e, exh_adx_w
+        ))
+
         # 1) TURN_STARTING
         if adverse and (px_flipped or (side != 0 and (
                 (side < 0 and (px_side > 0 or imp_up > lim))
@@ -222,8 +269,7 @@ class TapeStateEngine:
 
         # 2) TREND_EXHAUSTED — only this side's directional spend
         elif self._is_exhausted(
-            dte, side_move, adx, conf,
-            exhausted_pct, exh_adx_d0, exh_pct_d1, exh_adx_d1,
+            side_move, adx, conf, _exh_pct, _exh_adx,
         ):
             label = TREND_EXHAUSTED
             reason = (
@@ -258,7 +304,7 @@ class TapeStateEngine:
             and dwell_min >= dwell_need
             and adx_delta > 0.5
             and adx >= adx_trend
-            and side_move < (exhausted_pct if dte == 0 else exh_pct_d1)
+            and side_move < _exh_pct
             and (
                 (side > 0 and ema in ("BULLISH", "TRANSITIONAL") and px_side >= 0)
                 or (side < 0 and ema in ("BEARISH", "TRANSITIONAL") and px_side <= 0)
@@ -273,8 +319,7 @@ class TapeStateEngine:
             side != 0
             and dwell_min >= dwell_need
             and not self._is_exhausted(
-                dte, side_move, adx, conf,
-                exhausted_pct, exh_adx_d0, exh_pct_d1, exh_adx_d1,
+                side_move, adx, conf, _exh_pct, _exh_adx,
             )
             and (
                 (side > 0 and px_side >= 0)
@@ -310,22 +355,20 @@ class TapeStateEngine:
 
     @staticmethod
     def _is_exhausted(
-        dte: int,
         day_move: float,
         adx: float,
         conf: str,
         exhausted_pct: float,
-        exh_adx_d0: float,
-        exh_pct_d1: float,
-        exh_adx_d1: float,
+        exh_adx: float,
     ) -> bool:
-        """Spent day-move without crash-grade ADX → exhausted chase risk."""
-        if dte == 0:
-            if day_move >= exhausted_pct and adx < exh_adx_d0:
-                return True
-            return False
-        # DTE1+: higher day-move floor; HIGH conf escapes
-        if day_move >= exh_pct_d1 and adx < exh_adx_d1 and conf != "HIGH":
+        """Spent day-move without crash-grade ADX → exhausted chase risk.
+
+        Thresholds are life-blended by the caller via by_dte (no discrete
+        DTE0/1+ branches here). HIGH confidence escapes the weekly-side bar.
+        """
+        if day_move >= exhausted_pct and adx < exh_adx:
+            if conf == "HIGH" and exhausted_pct >= 120.0:
+                return False
             return True
         return False
 
@@ -404,9 +447,10 @@ def entry_when_block_reason(signals: dict, final_regime: Optional[str], config: 
             _dte_h = int(_dte_h if _dte_h is not None else -1)
         except (TypeError, ValueError):
             _dte_h = -1
-        # 0DTE only — weekly at-highs chase (Sep30) must stay refused.
+        # Near-expiry life weight only — weekly at-highs chase stays refused.
+        from core import dte_blend as _dte_blend_h
         _harvest_ok = (
-            _dte_h == 0
+            float(_dte_blend_h(_dte_h if _dte_h >= 0 else 2)) >= 0.9
             and _conf_h == "HIGH"
             and _adx_h >= _adx_strong
             and _iv_h in ("STABLE", "DECLINING", "CRUSHING", "")

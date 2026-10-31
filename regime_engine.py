@@ -1226,31 +1226,39 @@ class RegimeClassifier:
             return VolatilityRegime.NEUTRAL, details
 
         # ── Gate 7: VRP classification ────────────────────────────────────
-
-        # Base thresholds from calibration
-        vrp_sell = self._t("vrp_sell_threshold", "vrp_sell_threshold_default", 2.5)
+        # Life-blended + OR-adjusted sell bar from calibration when available
+        # (continuous by_dte, not a discrete DTE0/1/2+ ladder). Fair stays
+        # on the calibrated base. Beyond max_dte_tradeable, ask for richer
+        # premium continuously.
         vrp_fair = self._t("vrp_fair_threshold", "vrp_fair_threshold_default", 1.5)
-
-        # Intraday book is flat by the hard exit on every session, so the
-        # VRP bar does not tighten with DTE inside the tradeable window.
-        # The old 1.00/1.00/1.05/1.10/1.20 ladder was leftover overnight
-        # gap-risk thinking and made Wednesday/Thursday a different
-        # machine from Monday. Beyond the ceiling, ask for richer premium.
         try:
             _dte_i = int(dte) if dte is not None else 0
         except (TypeError, ValueError):
             _dte_i = 0
         _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+
+        if (
+            self.cal is not None
+            and getattr(self.cal, "is_calibrated", False)
+            and callable(getattr(self.cal, "get_vrp_sell_for_dte", None))
+        ):
+            vrp_sell = float(
+                self.cal.get_vrp_sell_for_dte(_dte_i, or_condition)
+            )
+        else:
+            vrp_sell = self._t(
+                "vrp_sell_threshold", "vrp_sell_threshold_default", 2.5
+            )
+            if or_condition == "WIDE":
+                vrp_sell = vrp_sell * 1.20
+            elif or_condition == "VERY_WIDE":
+                vrp_sell = vrp_sell * 1.50
+            vrp_sell = max(vrp_sell, 1.0)
+
         if _dte_i > _max_dte:
             vrp_sell = vrp_sell * (1.0 + 0.10 * min(_dte_i - _max_dte, 4))
 
-        # OR condition adjustment
-        if or_condition == "WIDE":
-            vrp_sell = vrp_sell * 1.20
-        elif or_condition == "VERY_WIDE":
-            vrp_sell = vrp_sell * 1.50
-
-        vrp_sell = max(vrp_sell, 2.0)
+        vrp_sell = max(vrp_sell, 1.0)
         vrp_very_rich = vrp_sell * 1.30  # STRONG_SELL threshold
 
         details["vrp_sell_adjusted"] = round(vrp_sell, 3)
@@ -2380,18 +2388,15 @@ class RegimeClassifier:
         # substitutes (replay LONG_CALL −₹912). Same rule every DTE/event.
         if event_day and self.config.defined_risk_only_on_event:
             notes_parts.append("EVENT:DEFINED_RISK_ONLY")
-            if conf != ConfidenceLevel.HIGH:
-                return (
-                    FinalRegime.NO_TRADE,
-                    " | ".join(notes_parts + ["EVENT:REQUIRES_HIGH_CONFIDENCE"]),
-                    False,
-                )
             try:
                 _ev_adx = float(signals.get("adx_15") or 0.0)
             except (TypeError, ValueError):
                 _ev_adx = 0.0
             _ev_trend = float(
                 getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+            )
+            _ev_strong = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
             )
             _measured_dir = (
                 price in (
@@ -2400,6 +2405,22 @@ class RegimeClassifier:
                 )
                 and _ev_adx >= _ev_trend
             )
+            # HIGH always; MEDIUM + strong ADX + measured trend also OK
+            # (RBI/Oct7 class — do not blank a confirmed dump/rally).
+            _conf_ok = (
+                conf == ConfidenceLevel.HIGH
+                or (
+                    conf == ConfidenceLevel.MEDIUM
+                    and _measured_dir
+                    and _ev_adx >= _ev_strong
+                )
+            )
+            if not _conf_ok:
+                return (
+                    FinalRegime.NO_TRADE,
+                    " | ".join(notes_parts + ["EVENT:REQUIRES_HIGH_CONFIDENCE"]),
+                    False,
+                )
             if price == PriceRegime.RANGE:
                 pass  # fall through to range tree
             elif _measured_dir:
@@ -2631,9 +2652,126 @@ class RegimeClassifier:
         # contained opening range; directional verticals need their
         # positioning read; event days keep their own path. Overnight
         # gap-risk tables (the old DTE 3/4 branch) do not apply.
+        # Engine-wide: when ADX clears the calibrated wide-OR floor and one
+        # OR edge is broken with-trend, unlock the directional vertical —
+        # condors stay banned, with-trend credit must not stay dark
+        # (Sep29/Oct22/28: RANGE_WIDE_OR_*_NO_TRADE blanketed the window).
         if or_condition in ("WIDE", "VERY_WIDE") and pos not in (
             PositioningRegime.STRONG_RANGE,
         ):
+            _wide_floor = 20.0
+            try:
+                _wide_floor = float(
+                    signals.get("cal_wide_or_trend_adx_floor")
+                    or getattr(self.config, "wide_or_trend_adx_floor", 20.0)
+                    or 20.0
+                )
+            except (TypeError, ValueError):
+                _wide_floor = 20.0
+            if self.cal is not None and getattr(self.cal, "is_calibrated", False):
+                try:
+                    _wide_floor = float(
+                        self.cal.get_lever("wide_or_trend_adx_floor", _wide_floor)
+                    )
+                except Exception:
+                    pass
+            _orh = float(signals.get("or_high") or 0.0)
+            _orl = float(signals.get("or_low") or 0.0)
+            _orw = float(signals.get("or_width") or 0.0)
+            if _orw <= 0 and _orh > _orl > 0:
+                _orw = _orh - _orl
+            _need = max(5.0, 0.15 * _orw) if _orw > 0 else 5.0
+            _brk_hi = _orh > 0 and spot >= _orh + _need
+            _brk_lo = _orl > 0 and spot <= _orl - _need
+            # Soft poke (any print past the OR edge). This tree only runs
+            # while price_regime is still RANGE — lean comes from EMA /
+            # sided spend / VWAP, not an UPTREND label (Oct22/28).
+            _soft_hi = _orh > 0 and spot >= _orh
+            _soft_lo = _orl > 0 and spot <= _orl
+            _ema = str(signals.get("ema_structure") or "")
+            try:
+                _up_sp = float(
+                    signals.get("day_up_used_peak_pct")
+                    or signals.get("day_up_used_pct")
+                    or 0.0
+                )
+                _dn_sp = float(
+                    signals.get("day_down_used_peak_pct")
+                    or signals.get("day_down_used_pct")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                _up_sp, _dn_sp = 0.0, 0.0
+            try:
+                _vd = float(signals.get("vwap_dist_pct") or 0.0)
+            except (TypeError, ValueError):
+                _vd = 0.0
+            _bull_lean = (
+                _ema == "BULLISH"
+                or _up_sp >= 40.0
+                or _vd >= 0.08
+            )
+            _bear_lean = (
+                _ema == "BEARISH"
+                or _dn_sp >= 40.0
+                or _vd <= -0.08
+            )
+            _vol_ok = vol in (
+                VolatilityRegime.SELL_PREMIUM,
+                VolatilityRegime.STRONG_SELL_PREMIUM,
+                VolatilityRegime.NEUTRAL,
+            )
+            _bull_unlock = (
+                adx_15 >= _wide_floor
+                and not _brk_lo
+                and not _soft_lo
+                and (
+                    _brk_hi
+                    or (_soft_hi and _bull_lean)
+                    or (_soft_hi and adx_15 >= _wide_floor + 5.0)
+                    # Gradual grind inside a wide OR: sided spend + lean
+                    # without a fresh edge poke (Oct28 bull window).
+                    or (_bull_lean and _up_sp >= 35.0)
+                )
+            )
+            _bear_unlock = (
+                adx_15 >= _wide_floor
+                and not _brk_hi
+                and not _soft_hi
+                and (
+                    _brk_lo
+                    or (_soft_lo and _bear_lean)
+                    or (_soft_lo and adx_15 >= _wide_floor + 5.0)
+                    or (_bear_lean and _dn_sp >= 35.0)
+                )
+            )
+            if _bull_unlock and _vol_ok:
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    0.85,
+                )
+                return (
+                    FinalRegime.PREMIUM_SELL_BULL,
+                    f"RANGE_WIDE_OR_{or_condition}_TREND_BULL_VERTICAL",
+                )
+            if _bear_unlock and _vol_ok:
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    0.85,
+                )
+                return (
+                    FinalRegime.PREMIUM_SELL_BEAR,
+                    f"RANGE_WIDE_OR_{or_condition}_TREND_BEAR_VERTICAL",
+                )
+            # BUY_OPTIONS + wide OR: tag side for the debit bridge.
+            if (
+                vol == VolatilityRegime.BUY_OPTIONS
+                and adx_15 >= _wide_floor
+                and (_bull_unlock or _bear_unlock)
+            ):
+                signals["wide_or_buy_options_trend"] = (
+                    "BULL" if _bull_unlock else "BEAR"
+                )
             return FinalRegime.NO_TRADE, f"RANGE_WIDE_OR_{or_condition}_NO_TRADE"
 
         # ── UNCLEAR positioning ───────────────────────────────────────────
@@ -3337,11 +3475,64 @@ class RegimeEngine:
             )
             return new_regime
 
+        # Persistence cycles: calibrated lever when available; accelerate
+        # when ADX already confirms a with-trend OR break (engine-wide).
+        _need = int(
+            getattr(self.config, "regime_persistence_cycles", 3) or 3
+        )
+        try:
+            if (
+                self.classifier.cal is not None
+                and getattr(self.classifier.cal, "is_calibrated", False)
+            ):
+                _need = max(
+                    1,
+                    int(round(float(
+                        self.classifier.cal.get_lever(
+                            "regime_persistence_cycles", float(_need)
+                        )
+                    ))),
+                )
+        except Exception:
+            pass
+        try:
+            _adx_p = float(
+                getattr(new_regime, "adx_15", None)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _adx_p = 0.0
+        # Accelerate when ADX confirms a with-trend PREMIUM_SELL (often after
+        # an OR break unlock). Engine-wide — not a DTE0 costume.
+        _px_n = str(getattr(new_regime, "price_regime", "") or "")
+        _fr_n = str(new_regime.final_regime or "")
+        _notes_n = str(getattr(new_regime, "final_regime_notes", "") or "")
+        _or_broke = (
+            "TREND_BULL" in _notes_n
+            or "TREND_BEAR" in _notes_n
+            or "OR_" in _notes_n
+            or "BREAK" in _notes_n.upper()
+        )
+        if (
+            _adx_p >= float(
+                getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+            )
+            and _px_n in (
+                "UPTREND", "STRONG_UPTREND",
+                "DOWNTREND", "STRONG_DOWNTREND",
+            )
+            and (
+                _fr_n.startswith("PREMIUM_SELL")
+                or _or_broke
+            )
+        ):
+            _need = min(_need, 1)
+
         # New regime candidate
         if (self._pending_regime is not None and
                 self._pending_regime.final_regime == new_regime.final_regime):
             self._pending_count += 1
-            if self._pending_count >= self.config.regime_persistence_cycles:
+            if self._pending_count >= _need:
                 self.logger.info(
                     f"Regime confirmed after {self._pending_count} cycles: "
                     f"{new_regime.final_regime}"
@@ -3350,8 +3541,7 @@ class RegimeEngine:
                 self._pending_count  = 0
                 return new_regime
             self.logger.debug(
-                f"Regime pending ({self._pending_count}/"
-                f"{self.config.regime_persistence_cycles}): "
+                f"Regime pending ({self._pending_count}/{_need}): "
                 f"{new_regime.final_regime}"
             )
             return self._current_regime
@@ -3626,6 +3816,25 @@ class RegimeEngine:
         signals["defined_risk_only"]   = confirmed.defined_risk_only
         signals["is_calibrated"]       = confirmed.is_calibrated
         signals["calibration_tier"]    = confirmed.calibration_tier
+        # Propagate profitability levers for tape/strategy consumers
+        cal = self.classifier.cal
+        if cal is not None and getattr(cal, "is_calibrated", False):
+            for _lk in (
+                "regime_persistence_cycles",
+                "regime_entry_dwell_min",
+                "day_move_used_block_pct",
+                "fade_clear_adx",
+                "two_way_trend_release_adx",
+                "wide_or_trend_adx_floor",
+                "spent_chase_loc_cap",
+                "momentum_min_confirm_adx",
+            ):
+                try:
+                    signals[f"cal_{_lk}"] = float(cal.get_lever(
+                        _lk, float(getattr(cal, _lk, 0.0) or 0.0)
+                    ))
+                except Exception:
+                    pass
         if signals.get("straddle_exploded"):
             signals["straddle_exploded"] = True
 

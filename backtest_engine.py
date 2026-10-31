@@ -93,6 +93,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 import uuid
 import warnings
 from collections import Counter, defaultdict
@@ -1849,21 +1850,21 @@ class BacktestRunner:
 
         stride = max(1, int(self.cycle_stride or 1))
         n_cycles = len(day.cycles)
+        # Cache open-book state across cycles so flat sessions do not pay
+        # two SQLite round-trips per snapshot (dominant cost on quiet days).
+        _open_cached = False
+        _progress_every = max(50, n_cycles // 10) if n_cycles else 50
+        _t_day0 = time.perf_counter()
         for _ci, capture_time in enumerate(day.cycles):
             # Stride only while flat — once a ticket is open, pump every
             # snapshot so exits match live monitoring resolution.
-            if stride > 1 and _ci not in (0, n_cycles - 1) and _ci % stride != 0:
-                try:
-                    _busy = self.db.query_one(
-                        "SELECT 1 AS x FROM positions "
-                        "WHERE trading_date=? AND status IN "
-                        "('OPEN','PENDING_ENTRY') LIMIT 1",
-                        (trading_date,),
-                    )
-                except Exception:
-                    _busy = True
-                if not _busy:
-                    continue
+            if (
+                stride > 1
+                and _ci not in (0, n_cycles - 1)
+                and _ci % stride != 0
+                and not _open_cached
+            ):
+                continue
 
             dt = day.cycle_dt(capture_time)
             self.clock.set(dt)
@@ -1881,18 +1882,34 @@ class BacktestRunner:
                 continue
 
             self.results.cycles += 1
+            if (
+                not self.verbose
+                and (_ci == 0 or (_ci + 1) % _progress_every == 0
+                     or _ci + 1 >= n_cycles)
+            ):
+                try:
+                    print(
+                        f"  [backtest] {trading_date} "
+                        f"{_ci + 1}/{n_cycles} {dt:%H:%M} "
+                        f"({time.perf_counter() - _t_day0:.0f}s)"
+                    )
+                    sys.stdout.flush()
+                except Exception:
+                    pass
             # Harvest / capital / equity: every cycle while a ticket is
             # open (or pending), else every 15th pumped cycle. Always
             # refreshed at end-of-day below.
-            try:
-                _open_now = bool(self.db.query_one(
-                    "SELECT 1 AS x FROM positions "
-                    "WHERE trading_date=? AND status IN "
-                    "('OPEN','PENDING_ENTRY') LIMIT 1",
-                    (trading_date,),
-                ))
-            except Exception:
-                _open_now = True
+            if _ci == 0 or self.results.cycles % 5 == 0 or _open_cached:
+                try:
+                    _open_cached = bool(self.db.query_one(
+                        "SELECT 1 AS x FROM positions "
+                        "WHERE trading_date=? AND status IN "
+                        "('OPEN','PENDING_ENTRY') LIMIT 1",
+                        (trading_date,),
+                    ))
+                except Exception:
+                    _open_cached = True
+            _open_now = _open_cached
             _mark = _open_now or (self.results.cycles % 15 == 0)
 
             if _mark:
@@ -1988,6 +2005,25 @@ class BacktestRunner:
             pass
 
         self._ingest_rejections(trading_date)
+
+        # Close the same calibration feedback loop live uses at EOD so
+        # multi-day / future-session replays accumulate phantom, exit-quality,
+        # and regime-accuracy outcomes instead of freezing a startup seed.
+        try:
+            _cal = getattr(engine, "cal_engine", None)
+            if _cal is not None and hasattr(_cal, "run_eod_tasks"):
+                with self._quiet():
+                    _cal.run_eod_tasks(trading_date)
+                _st = getattr(_cal, "state", None)
+                if _st is not None:
+                    try:
+                        engine.regime_engine.calibrator._state = _st
+                        engine.regime_engine.classifier.cal = _st
+                    except Exception:
+                        pass
+        except Exception as _cal_exc:
+            if self.verbose:
+                print(f"  calibration EOD tasks skipped: {_cal_exc}")
 
         try:
             _plog = self.results.replay_session_path.get(trading_date) or [
@@ -4016,14 +4052,21 @@ def run_parallel_quiet(
     )
     workers = max(1, min(requested, len(jobs)))
     pinned = sum(1 for j in jobs if len(j["db_paths"]) == 1)
+    # Every session always runs in a fresh spawned OS process (pool size 1
+    # for a single day, N for many) so Windows / long replays cannot share
+    # in-process state and each day completes on its own clock.
     print(
         f"  [backtest] parallel: {len(jobs)} session(s), "
         f"{workers} process(es), {pinned}/{len(jobs)} pinned to own shard"
     )
+    sys.stdout.flush()
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-        futures = {pool.submit(_parallel_day_worker, job): job["day"]
-                   for job in jobs}
+        futures = {
+            pool.submit(_parallel_day_worker, job): job["day"]
+            for job in jobs
+        }
+        done_n = 0
         for fut in as_completed(futures):
             day = futures[fut]
             try:
@@ -4036,6 +4079,13 @@ def run_parallel_quiet(
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
+            done_n += 1
+            if done_n == 1 or done_n % 5 == 0 or done_n == len(jobs):
+                print(
+                    f"  [backtest] progress {done_n}/{len(jobs)} "
+                    f"(last={day})"
+                )
+                sys.stdout.flush()
 
     # All days finished — print reports + tables in date order.
     ordered = [by_date[d] for d in dates if d in by_date]
@@ -4310,11 +4360,11 @@ def main() -> int:
             print(f"  sources           : {len(db_paths)} databases")
         return print_audit(store)
 
-    # ── default quiet parallel mode ───────────────────────────────────────
-    # No --from/--to: every NSE trading day from 2026-09-08 through today
-    # (IST), weekends and nse_holidays.json excluded, one child process per
-    # day, console output limited to trade reports + the daily P&L table.
-    # Explicit --from/--to keeps the legacy sequential full report.
+    # Every session always runs in a fresh spawned OS process (pool size 1
+    # for one day, N for many). --verbose only widens trade-report detail;
+    # it does not keep the replay in-process.
+    # No --from/--to: every NSE trading day from DEFAULT_BACKTEST_START
+    # through today (IST), weekends and nse_holidays.json excluded.
     default_range = args.d_from is None and args.d_to is None
     if default_range:
         d_from = DEFAULT_BACKTEST_START
@@ -4326,31 +4376,15 @@ def main() -> int:
             d_from.isoformat(), d_to.isoformat()
         ))
         dates = [d for d in calendar if d in available]
-        if not dates:
-            print_audit(store)
-            return 1
-        _strict = bool(getattr(args, "strict_preflight", False))
-        pre = preflight_live_parity(
-            store, dates, bool(getattr(args, "allow_unfaithful", False)),
-            config,
-            construct_engine=_strict,
-        )
-        if pre:
-            return pre
-        if int(getattr(args, "cycle_stride", 1) or 1) > 1:
-            print(
-                f"  [backtest] cycle_stride="
-                f"{int(args.cycle_stride)} (hunt mode — not go-live P&L)"
-            )
-        return run_parallel_quiet(dates, db_paths, config, args)
+    else:
+        dates = store.tradable_dates(args.d_from, args.d_to)
 
-    if len(db_paths) > 1:
-        print(f"  sources           : {len(db_paths)} databases")
-
-    dates = store.tradable_dates(args.d_from, args.d_to)
     if not dates:
         print_audit(store)
         return 1
+
+    if len(db_paths) > 1:
+        print(f"  sources           : {len(db_paths)} databases")
 
     _strict = bool(getattr(args, "strict_preflight", False))
     pre = preflight_live_parity(
@@ -4360,70 +4394,17 @@ def main() -> int:
     )
     if pre:
         return pre
-
-    print()
-    print(hr("═"))
-    print(f"REPLAYING {len(dates)} SESSION(S): {dates[0]} .. {dates[-1]}")
-    print(hr("═"))
-
-    # v7: say what the console is about to do, because each_cycle mode prints
-    # a block per trade per cycle and the final summary ends up a long way
-    # above the bottom of the scrollback.
-    _tr_mode = str(
-        args.trade_report
-        or getattr(config, "trade_report_mode", "each_cycle")
-        or "each_cycle"
-    ).lower()
-    if getattr(config, "trade_report_enabled", True) and _tr_mode != "off":
-        print(f"  per-trade console report : {_tr_mode}"
-              + ("  (--trade-report=on_change for a quiet run)"
-                 if _tr_mode == "each_cycle" else ""))
-        print()
     if int(getattr(args, "cycle_stride", 1) or 1) > 1:
         print(
-            f"  cycle_stride={int(args.cycle_stride)} "
-            f"(hunt mode — not go-live P&L)"
+            f"  [backtest] cycle_stride="
+            f"{int(args.cycle_stride)} (hunt mode — not go-live P&L)"
         )
-        print()
-
-    runner = BacktestRunner(
-        store, config,
-        make_fill_model(
-            config,
-            edge=args.fill_edge,
-            stress_exit=args.stress_exit,
-            mode=str(getattr(args, "fill_mode", "live") or "live"),
-        ),
-        args.verbose,
-        trade_report=args.trade_report,
-        live_db_path=str(getattr(config, "db_path", "") or ""),
-        mirror_live_aborts=bool(getattr(args, "mirror_live_aborts", False)),
-        cycle_stride=int(getattr(args, "cycle_stride", 1) or 1),
-    )
-    res = runner.run(dates)
-    print_report(res, config, args, store=store)
-    if args.csv:
-        write_csv(res, args.csv)
-
-    # ── v9: the final per-day trade report is the very last output ─────────
-    # One block per replayed session in its end-of-day state, printed after
-    # the aggregate statistics - the operator asked to see the day's final
-    # book at the bottom of the terminal, not 13,000 lines up the
-    # scrollback. --trade-report=off (or TRADE_REPORT_ENABLED=false) leaves
-    # this list empty, so a silenced run stays silenced here too.
-    if runner.final_report_lines:
-        print()
-        print(hr("═"))
-        n_sessions = len(runner.final_report_lines)
-        print(f"FINAL PER-DAY TRADE REPORT — {n_sessions} replayed "
-              f"{'session' if n_sessions == 1 else 'sessions'}, each in its "
-              f"end-of-day state")
-        print(hr("═"))
-        for block in runner.final_report_lines:
-            print(block)
-    if res.unfaithful_days and not args.allow_unfaithful:
-        return 2
-    return 0
+    # Verbose → richer per-trade report; still one OS process per day.
+    if bool(getattr(args, "verbose", False)):
+        _tr = str(getattr(args, "trade_report", None) or "").strip().lower()
+        if not _tr or _tr in ("off", "none"):
+            args.trade_report = "on_change"
+    return run_parallel_quiet(dates, db_paths, config, args)
 
 
 if __name__ == "__main__":

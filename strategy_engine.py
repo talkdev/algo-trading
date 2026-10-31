@@ -714,6 +714,22 @@ class StrategyEngine:
     def _get_calibration(self) -> Optional[CalibrationState]:
         return self.cal_engine.state
 
+    def _cal_lever(self, name: str, default: float) -> float:
+        """Calibrated engine lever, else Config/default. Continuous, no DTE forks."""
+        cal = self._get_calibration()
+        if cal is not None and getattr(cal, "is_calibrated", False):
+            try:
+                return float(cal.get_lever(name, default))
+            except Exception:
+                pass
+        cfg_v = getattr(self.config, name, None)
+        if cfg_v is not None:
+            try:
+                return float(cfg_v)
+            except (TypeError, ValueError):
+                pass
+        return float(default)
+
     def _pre_tag_or_extreme_fades(
         self,
         signals: dict,
@@ -775,20 +791,22 @@ class StrategyEngine:
         """True when a measured trend has invalidated the post-fade MR book.
 
         Harvested extreme fades mark the session mean-reversion so we do
-        not buy mid-range premium after a scalp. Once ADX is strong and
-        price/regime agree on a one-way tape, that thesis is dead — the
-        aligned debit is the trade (live 2026-10-08 morning low-fade BPS
-        then ADX~54 DOWNTREND with LONG_PUT dark for 888 cycles).
+        not buy mid-range premium after a scalp. Once ADX clears the
+        calibrated fade_clear_adx and price agrees on a one-way tape, the
+        aligned debit/credit is the trade — engine-wide, not DTE-keyed.
         """
         try:
             adx = float(signals.get("adx_15") or 0.0)
         except (TypeError, ValueError):
             return False
+        _clear = self._cal_lever("fade_clear_adx", 25.0)
         _strong = float(
             getattr(self.config, "adx_strong_threshold", 40.0) or 40.0
         )
-        if adx < _strong:
-            return False
+        if adx < min(_clear, _strong):
+            # Still allow clear when ADX >= fade_clear even if below "strong"
+            if adx < _clear:
+                return False
         px = str(signals.get("price_regime") or "")
         fr = str(signals.get("final_regime") or "")
         st = self.market_engine.state
@@ -800,17 +818,25 @@ class StrategyEngine:
         if (
             (_low or (_mr and _side == "BULL"))
             and px in ("DOWNTREND", "STRONG_DOWNTREND")
-            and fr == "PREMIUM_SELL_BEAR"
+            and (fr == "PREMIUM_SELL_BEAR" or adx >= _clear)
         ):
             return True
         if (
             (_high or (_mr and _side == "BEAR"))
             and px in ("UPTREND", "STRONG_UPTREND")
-            and fr == "PREMIUM_SELL_BULL"
+            and (fr == "PREMIUM_SELL_BULL" or adx >= _clear)
         ):
             return True
-        if px in ("STRONG_DOWNTREND", "STRONG_UPTREND") and adx >= max(
-            _strong, 50.0
+        # Measured trend clears sticky fade when tape confirms or price is
+        # STRONG — plain UPTREND flicker at fade_clear ADX alone is not enough
+        # (avoids reopening spent-chase debits on weak labels).
+        _tape = str(signals.get("tape_state") or "")
+        if px in ("STRONG_DOWNTREND", "STRONG_UPTREND") and adx >= _clear:
+            return True
+        if (
+            px in ("DOWNTREND", "UPTREND", "STRONG_DOWNTREND", "STRONG_UPTREND")
+            and adx >= _clear
+            and _tape in ("TREND_ON", "TREND_STRENGTHENING", "BREAK_FROM_COIL")
         ):
             return True
         return False
@@ -1708,6 +1734,9 @@ class StrategyEngine:
             and not bool(signals.get("failed_break_high"))
             and str(signals.get("price_regime") or "") not in (
                 "DOWNTREND", "STRONG_DOWNTREND",
+                # Bull grind after an open-HIGH wick is BPS, not a lower-
+                # high fade wait (Oct28 10:30–13:00 window).
+                "UPTREND", "STRONG_UPTREND",
             )
             and str(signals.get("final_regime") or "") in (
                 "PREMIUM_SELL_BEAR", "PREMIUM_SELL_RANGE",
@@ -1897,17 +1926,19 @@ class StrategyEngine:
             (final_regime == "PREMIUM_SELL_BEAR" and _dm_px in ("DOWNTREND", "STRONG_DOWNTREND"))
             or (final_regime == "PREMIUM_SELL_BULL" and _dm_px in ("UPTREND", "STRONG_UPTREND"))
         )
-        # Expiry (DTE0): an already-spent day range + plain DOWNTREND/UPTREND
-        # is a late-chop trap (live 2026-09-29: BEAR credit @124% day-move /
-        # MEDIUM / DOWNTREND entered into a bounce and CLOSE_STOP'd in 4 min).
-        # Keep the with-trend exemption only when the tape is STRONG or
-        # confidence is HIGH — otherwise the 125% block stands on expiry.
+        # Near-expiry (high life weight): already-spent day range + plain
+        # DOWNTREND/UPTREND is a late-chop trap. Keep the with-trend
+        # exemption only when STRONG or HIGH confidence — continuous
+        # dte_blend, not a discrete dte==0 branch.
         try:
-            _dm_dte0 = int(actual_dte if actual_dte is not None else -1)
+            _dm_life = float(dte_blend(
+                int(actual_dte) if actual_dte is not None else 2
+            ))
         except (TypeError, ValueError):
-            _dm_dte0 = -1
+            _dm_life = 0.0
+        _dm_block = self._cal_lever("day_move_used_block_pct", 125.0)
         if (
-            _dm_dte0 == 0
+            _dm_life >= 0.9
             and _dm_trend_confirmed
             and _dm_threat >= 100.0
         ):
@@ -1971,7 +2002,7 @@ class StrategyEngine:
         # spend-nulled intent was the Sep22 −₹14k regression.
         if self._away_side_lean_present(signals):
             _dm_range_confirmed = True
-        if _dm_threat >= self.config.day_move_used_block_pct and not (
+        if _dm_threat >= _dm_block and not (
             _dm_trend_confirmed or _dm_range_confirmed
         ):
             return "NO_TRADE", (
@@ -2037,18 +2068,30 @@ class StrategyEngine:
             _strong_w = float(
                 getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
             )
+            _wide_floor = self._cal_lever("wide_or_trend_adx_floor", 20.0)
+            _trend_adx = min(_strong_w, _wide_floor)
+            _notes_w = str(signals.get("final_regime_notes") or "")
+            # Directional credit (BPS/BCS) already selected by regime —
+            # including RANGE_WIDE_OR_*_TREND_*_VERTICAL while the 15m
+            # price label is still RANGE. Condors stay banned (RANGE).
+            _dir_credit = _fr_w in (
+                "PREMIUM_SELL_BULL", "PREMIUM_SELL_BEAR",
+            )
             _trend_side_ok = (
-                (_fr_w == "PREMIUM_SELL_BEAR"
-                 and _px_w in ("DOWNTREND", "STRONG_DOWNTREND"))
+                _dir_credit
+                or (_fr_w == "PREMIUM_SELL_BEAR"
+                    and _px_w in ("DOWNTREND", "STRONG_DOWNTREND"))
                 or (_fr_w == "PREMIUM_SELL_BULL"
                     and _px_w in ("UPTREND", "STRONG_UPTREND"))
-                # Strong ADX preview + directional price: same harvest,
-                # even if final_regime label flickers for a cycle.
-                or (_adx_w >= _strong_w
+                or (_adx_w >= _trend_adx
                     and _px_w in (
                         "DOWNTREND", "STRONG_DOWNTREND",
                         "UPTREND", "STRONG_UPTREND",
                     ))
+                or (
+                    "TREND_BULL_VERTICAL" in _notes_w
+                    or "TREND_BEAR_VERTICAL" in _notes_w
+                )
             )
             if not signals.get("gap_fade_opportunity") and not _trend_side_ok:
                 return "NO_TRADE", f"wide_or_{or_condition}_dangerous_to_sell_premium"
@@ -2214,11 +2257,13 @@ class StrategyEngine:
             except (TypeError, ValueError):
                 _adx_clr = 0.0
             _pr_clr = str(signals.get("price_regime") or "")
+            _rel = self._cal_lever("two_way_trend_release_adx", 22.0)
             if (
-                _adx_clr >= float(
-                    getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
+                _adx_clr >= _rel
+                and _pr_clr in (
+                    "UPTREND", "STRONG_UPTREND",
+                    "DOWNTREND", "STRONG_DOWNTREND",
                 )
-                and _pr_clr in ("UPTREND", "DOWNTREND")
                 and not _chop
             ):
                 _latched = False
@@ -2226,6 +2271,23 @@ class StrategyEngine:
             raw_rng >= _floor
             and (_both_sides or _chop_wide)
         ) or _latched
+        # Measured one-way trend releases sticky two_way so with-trend
+        # credit/debit can fire during a real grind (engine-wide).
+        if active:
+            try:
+                _adx_tw = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_tw = 0.0
+            _pr_tw = str(signals.get("price_regime") or "")
+            if (
+                _adx_tw >= self._cal_lever("two_way_trend_release_adx", 22.0)
+                and _pr_tw in (
+                    "UPTREND", "STRONG_UPTREND",
+                    "DOWNTREND", "STRONG_DOWNTREND",
+                )
+                and not bool(signals.get("choppy_detected"))
+            ):
+                active = False
         signals["two_way_auction"] = active
         if active:
             # OPT_V32: marking two-way must not shrink size; fades boost later.
@@ -2354,9 +2416,33 @@ class StrategyEngine:
         # That bounce into resistance is a fade, not a trend (the 15-min
         # UPTREND label is what is being faded). Same tape at every DTE.
         _struct_bear, _ = self._day_structure_bearish(signals)
+        try:
+            _adx_tv = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx_tv = 0.0
+        _px_tv = str(signals.get("price_regime") or "")
+        _rel_tv = self._cal_lever("two_way_trend_release_adx", 22.0)
+        _tape_tv = str(signals.get("tape_state") or "")
+        # Veto high fade on a confirmed bull grind. Plain UPTREND + calibrated
+        # release ADX is enough — requiring TREND_ON left false high-fades
+        # owning Oct28/30 windows while tape dwell lagged (engine-wide).
         _hi_trend_veto = (
-            (not _two_sided) and _measured_trend and _tr_dir > 0
-            and not _struct_bear
+            (
+                (not _two_sided) and _measured_trend and _tr_dir > 0
+                and not _struct_bear
+            )
+            or (
+                _px_tv in ("UPTREND", "STRONG_UPTREND")
+                and _adx_tv >= _rel_tv
+                and not _struct_bear
+                and (
+                    _tape_tv in (
+                        "TREND_ON", "TREND_STRENGTHENING", "BREAK_FROM_COIL",
+                        "NEUTRAL", "",
+                    )
+                    or _adx_tv >= _rel_tv + 5.0
+                )
+            )
         )
         _pos_r = round(float(pos or 0.0), 2)
         if (current_time >= _hi_start and current_time <= dtime(14, 0)
@@ -2428,7 +2514,20 @@ class StrategyEngine:
                 # measured DOWN tape — including confirmed two-way (Oct5:
                 # two_way low-fade forced PREMIUM_SELL_BULL through the
                 # live dump and blocked bear expression).
-                if _measured_trend and _tr_dir < 0:
+                if (
+                    (_measured_trend and _tr_dir < 0)
+                    or (
+                        _px_tv in ("DOWNTREND", "STRONG_DOWNTREND")
+                        and _adx_tv >= _rel_tv
+                        and (
+                            _tape_tv in (
+                                "TREND_ON", "TREND_STRENGTHENING",
+                                "BREAK_FROM_COIL", "NEUTRAL", "",
+                            )
+                            or _adx_tv >= _rel_tv + 5.0
+                        )
+                    )
+                ):
                     signals["fade_vetoed_by_trend"] = (
                         f"low_fade_vetoed_measured_downtrend_adx_{_tr_adx:.0f}"
                         + ("_two_way" if _two_sided else "")
@@ -2641,11 +2740,17 @@ class StrategyEngine:
                     getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
                 )
             )
+            _notes_u = str(signals.get("final_regime_notes") or "")
+            # Wide-OR trend unlock already chose BPS while price_regime is
+            # still RANGE — do not defer back into RANGE_WIDE_OR_NO_TRADE
+            # (Oct28 bull window).
+            _wide_or_bull = "TREND_BULL_VERTICAL" in _notes_u
             if (
                 _px_u == "RANGE"
                 and not bool(signals.get("afternoon_low_fade"))
                 and not bool(signals.get("neutral_range_vertical"))
                 and not _bull_measured
+                and not _wide_or_bull
             ):
                 strategy, why = self._resolve_range_strategy(
                     dte, or_condition, adx_15, adx_15_mature,
@@ -2804,10 +2909,13 @@ class StrategyEngine:
             # break tickets already set their flags — keep those. Else
             # resolve as a range book so location+tape gates apply.
             _px_b = str(signals.get("price_regime") or "")
+            _notes_b = str(signals.get("final_regime_notes") or "")
+            _wide_or_bear = "TREND_BEAR_VERTICAL" in _notes_b
             if (
                 _px_b == "RANGE"
                 and not bool(signals.get("afternoon_high_fade"))
                 and not bool(signals.get("neutral_range_vertical"))
+                and not _wide_or_bear
             ):
                 strategy, why = self._resolve_range_strategy(
                     dte, or_condition, adx_15, adx_15_mature,
@@ -7716,11 +7824,47 @@ class StrategyEngine:
         # Event days that require HIGH confidence for credit must not let
         # the debit substitute bypass that bar via the "confidence"/"event"
         # markers (live 2026-10-07 RBI MPC: EVENT:REQUIRES_HIGH_CONFIDENCE
-        # kept opening the momentum path every cycle).
+        # kept opening the momentum path every cycle). ONLY_RANGE event
+        # stand-downs keep momentum dark entirely (justified abstention).
         if bool(signals.get("event_day")):
+            _notes_ev = str(signals.get("final_regime_notes") or "").upper()
+            _br_ev = str(block_reason or "").upper()
+            if (
+                "ONLY_RANGE" in _notes_ev
+                or "ONLY_RANGE" in _br_ev
+                or "EVENT:ONLY_RANGE" in _br_ev
+            ):
+                # Measured-trend carve-out: ONLY_RANGE stand-down yields when
+                # ADX already confirms a labelled trend (engine-wide).
+                try:
+                    _adx_ev0 = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_ev0 = 0.0
+                _px_ev0 = str(signals.get("price_regime") or "")
+                _strong_ev0 = float(
+                    getattr(cfg, "adx_strong_threshold", 28.0) or 28.0
+                )
+                if not (
+                    _adx_ev0 >= _strong_ev0
+                    and _px_ev0 in (
+                        "UPTREND", "STRONG_UPTREND",
+                        "DOWNTREND", "STRONG_DOWNTREND",
+                    )
+                ):
+                    return False, "momentum_event_only_range", 0
             _conf = str(signals.get("confidence_level") or "").upper()
-            if _conf != "HIGH":
+            if _conf not in ("HIGH", "MEDIUM"):
                 return False, "momentum_event_needs_high_confidence", 0
+            if _conf == "MEDIUM":
+                try:
+                    _adx_ev = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_ev = 0.0
+                _strong_ev = float(
+                    getattr(cfg, "adx_strong_threshold", 28.0) or 28.0
+                )
+                if _adx_ev < _strong_ev:
+                    return False, "momentum_event_medium_needs_strong_adx", 0
 
         # ── substitution only: the sell side must have been refused ──────
         reason = str(block_reason or "").lower()
@@ -7786,50 +7930,62 @@ class StrategyEngine:
         elif price in ("DOWNTREND", "STRONG_DOWNTREND"):
             direction = -1
         else:
-            # Expiry V-bounce after a spent dump: LONG_CALL on reclaim, not
-            # LONG_PUT at the lows (Sep29 10:30 LP −₹3.4k into the bounce).
-            _exp_dir = 0
+            # Hard-invariant / wide-OR debit bridge may already know side
+            # while the 15m label still prints RANGE (persistence lag).
+            _bridge = signals.get("_momentum_bridge_dir")
             try:
-                if dte_i == 0 and str(
-                    signals.get("confidence_level") or ""
-                ) in ("HIGH", "MEDIUM"):
-                    _dn_e = float(
-                        signals.get("day_down_used_peak_pct")
-                        or signals.get("day_down_used_pct")
-                        or self.market_engine.state.get(
-                            "day_down_used_peak_pct"
-                        )
-                        or 0.0
-                    )
-                    _dm_e = float(
-                        signals.get("day_move_used_pct")
-                        or self.market_engine.state.get("day_move_used_pct")
-                        or 0.0
-                    )
-                    _, _loc_e, _, _ = self._session_range_pos(signals)
-                    if (
-                        (_dn_e >= 100.0 or _dm_e >= 120.0)
-                        and 0.40 <= _loc_e <= 0.80
-                        and str(signals.get("ema_structure") or "")
-                        in ("BULLISH", "TRANSITIONAL", "")
-                    ):
-                        _exp_dir = 1
+                _bridge_i = int(_bridge) if _bridge is not None else 0
             except (TypeError, ValueError):
-                _exp_dir = 0
-            if _exp_dir != 0:
-                direction = _exp_dir
+                _bridge_i = 0
+            if _bridge_i in (1, -1) and bool(
+                signals.get("_momentum_hard_trend_sub")
+            ):
+                direction = _bridge_i
             else:
-                # v56/v57: extreme location OR soft/day-structure intent is a
-                # directional read when ORB still says RANGE/CHOPPY.
-                _lean = self._away_side_intent(signals)
-                if _lean == "BEAR":
-                    direction = -1
-                elif _lean == "BULL":
-                    direction = 1
+                # Expiry V-bounce after a spent dump: LONG_CALL on reclaim, not
+                # LONG_PUT at the lows (Sep29 10:30 LP −₹3.4k into the bounce).
+                _exp_dir = 0
+                try:
+                    if dte_i == 0 and str(
+                        signals.get("confidence_level") or ""
+                    ) in ("HIGH", "MEDIUM"):
+                        _dn_e = float(
+                            signals.get("day_down_used_peak_pct")
+                            or signals.get("day_down_used_pct")
+                            or self.market_engine.state.get(
+                                "day_down_used_peak_pct"
+                            )
+                            or 0.0
+                        )
+                        _dm_e = float(
+                            signals.get("day_move_used_pct")
+                            or self.market_engine.state.get("day_move_used_pct")
+                            or 0.0
+                        )
+                        _, _loc_e, _, _ = self._session_range_pos(signals)
+                        if (
+                            (_dn_e >= 100.0 or _dm_e >= 120.0)
+                            and 0.40 <= _loc_e <= 0.80
+                            and str(signals.get("ema_structure") or "")
+                            in ("BULLISH", "TRANSITIONAL", "")
+                        ):
+                            _exp_dir = 1
+                except (TypeError, ValueError):
+                    _exp_dir = 0
+                if _exp_dir != 0:
+                    direction = _exp_dir
                 else:
-                    return False, (
-                        f"momentum_needs_trend_got_{price or 'NONE'}"
-                    ), 0
+                    # v56/v57: extreme location OR soft/day-structure intent is a
+                    # directional read when ORB still says RANGE/CHOPPY.
+                    _lean = self._away_side_intent(signals)
+                    if _lean == "BEAR":
+                        direction = -1
+                    elif _lean == "BULL":
+                        direction = 1
+                    else:
+                        return False, (
+                            f"momentum_needs_trend_got_{price or 'NONE'}"
+                        ), 0
 
         try:
             adx = float(signals.get("adx_15") or 0.0)
@@ -7897,13 +8053,24 @@ class StrategyEngine:
             except (TypeError, ValueError):
                 _exp_imm_ok = False
             if not _exp_imm_ok:
-                if not self._post_harvest_trend_continuation(signals):
-                    return False, "momentum_adx_immature", 0
-                if (
-                    (direction > 0 and str(self.market_engine.state.get("last_exit_strategy_side") or "") != "BULL")
-                    or (direction < 0 and str(self.market_engine.state.get("last_exit_strategy_side") or "") != "BEAR")
-                ):
-                    return False, "momentum_adx_immature", 0
+                # Hard-invariant bridge: preview ADX already at confirm floor
+                # + labelled trend is enough (Sep23 BCS→LONG_CALL path).
+                _imm_bridge = (
+                    bool(signals.get("_momentum_hard_trend_sub"))
+                    and adx >= self._cal_lever("momentum_min_confirm_adx", 22.0)
+                    and (
+                        (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+                        or (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+                    )
+                )
+                if not _imm_bridge:
+                    if not self._post_harvest_trend_continuation(signals):
+                        return False, "momentum_adx_immature", 0
+                    if (
+                        (direction > 0 and str(self.market_engine.state.get("last_exit_strategy_side") or "") != "BULL")
+                        or (direction < 0 and str(self.market_engine.state.get("last_exit_strategy_side") or "") != "BEAR")
+                    ):
+                        return False, "momentum_adx_immature", 0
 
         if str(signals.get("confidence_level") or "") not in ("HIGH", "MEDIUM"):
             # Live 2026-09-15: 647 IV-EXPANDING/SPIKING cycles were through
@@ -7930,20 +8097,32 @@ class StrategyEngine:
         # PATCH_V12: event-day momentum needs HIGH conviction — the
         # schedule is already softened for the substitute, so the
         # read itself must be unambiguous.
-        if signals.get("event_day") and str(signals.get("confidence_level") or "") != "HIGH":
-            # Same crash-continuation carve-out: an event crash with IV-hot
-            # sell refusal and a measured ADX is the long-put tape.
-            _br_e = str(block_reason or "").lower()
-            if not (
-                (
-                    ("iv_expand" in _br_e)
-                    or ("iv_spik" in _br_e)
-                    or ("straddle_expl" in _br_e)
-                    or bool(signals.get("straddle_exploded"))
+        if signals.get("event_day"):
+            _conf_e = str(signals.get("confidence_level") or "").upper()
+            if _conf_e != "HIGH":
+                # MEDIUM + strong ADX measured trend, or IV-hot crash put.
+                _br_e = str(block_reason or "").lower()
+                _med_ok = (
+                    _conf_e == "MEDIUM"
+                    and adx >= float(
+                        getattr(cfg, "adx_strong_threshold", 28.0) or 28.0
+                    )
+                    and (
+                        (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
+                        or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
+                    )
                 )
-                and adx >= 40.0
-            ):
-                return False, "momentum_event_day_needs_high_confidence", 0
+                _crash_ok = (
+                    (
+                        ("iv_expand" in _br_e)
+                        or ("iv_spik" in _br_e)
+                        or ("straddle_expl" in _br_e)
+                        or bool(signals.get("straddle_exploded"))
+                    )
+                    and adx >= 40.0
+                )
+                if not (_med_ok or _crash_ok):
+                    return False, "momentum_event_day_needs_high_confidence", 0
         # Event-day long premium: require a stronger ADX than the normal
         # debit bar so a marginal print cannot replace a blocked credit
         # book (Sep11 CPI: LONG_CALL at ADX=24 → −₹912).
@@ -7976,6 +8155,14 @@ class StrategyEngine:
         # never looks back.
         _adx_min = float(getattr(cfg, "momentum_late_adx_min", 28.0)) if late \
             else float(getattr(cfg, "momentum_adx_min", 30.0))
+        # Hard-invariant / wide-OR debit bridge: calibrated confirm ADX is
+        # enough — waiting for momentum_adx_min left Sep23/Oct28 dark while
+        # credit correctly refused into the trend.
+        if bool(signals.get("_momentum_hard_trend_sub")) and not late:
+            _adx_min = min(
+                _adx_min,
+                self._cal_lever("momentum_min_confirm_adx", 22.0),
+            )
         if adx < _adx_min:
             # Post-harvest with-trend continuation: trend-threshold ADX is
             # enough (same floor as hard credit invariant). The normal
@@ -8032,6 +8219,12 @@ class StrategyEngine:
             if not signals.get("or_computed") or or_high <= 0 or or_low <= 0:
                 return False, "momentum_no_opening_range_to_confirm", 0
             _need = max(5.0, or_w * float(getattr(cfg, "momentum_or_break_frac", 0.15)))
+            # Hard-invariant / wide-OR debit bridge: soft OR poke is enough
+            # when ADX already confirms — full 0.15-width chase was blanking
+            # Sep9/Oct28 windows while the trend was underway.
+            _hard_or = bool(signals.get("_momentum_hard_trend_sub"))
+            if _hard_or and adx >= self._cal_lever("momentum_min_confirm_adx", 20.0):
+                _need = max(1.0, min(_need, 5.0))
             if direction > 0 and spot < or_high + _need:
                 # Expiry V-bounce reclaim happens inside the morning OR
                 # (Sep29); requiring a fresh OR-high break blanks the call.
@@ -8275,47 +8468,282 @@ class StrategyEngine:
             40.0,
             1.5 * float(getattr(cfg, "adx_strong_threshold", 28.0)),
         )
+        _loc_cap = self._cal_lever("spent_chase_loc_cap", 0.85)
+        _loc_spent = (
+            (direction > 0 and _spent_loc >= _loc_cap)
+            or (direction < 0 and _spent_loc <= (1.0 - _loc_cap))
+        )
+        # Never unlock a spent-extreme chase on ADX alone — that is the
+        # wipe class (late debit into loc≳0.85). Require early-enough
+        # location OR (aligned + tape confirmed + ADX) without bare ADX≥50.
         _spent_trend_confirmed = (
             adx >= _spent_adx_min
             and _px_aligned
             and _ema_align
             and _tape_confirmed
-        ) or adx >= 50.0
-        if (
-            _mom_dte >= 1
-            and _spent_at_extreme
-            and not _spent_trend_confirmed
-        ):
+            and not _loc_spent
+        )
+        if _spent_at_extreme and not _spent_trend_confirmed:
             return False, (
                 "momentum_spent_move_extreme_without_confirmation_"
                 f"peak_{_spent_peak:.0f}_loc_{_spent_loc:.2f}"
             ), 0
-        # 0DTE LONG_CALL into rich, quiet premium after upside is spent:
-        # vol already says SELL and IV is crushing — buying the call is
-        # inverted (Oct6 scratch −₹4; post-BPS chase −₹196). Do not waive
-        # via post_harvest: that carve-out is for DTE≥1 continuation
-        # (Sep11/Sep23). LONG_PUT on a sell-vol dump day (Sep22) is
-        # unaffected (direction < 0).
+        # Loc-cap refuse only when buying premium into a sell-vol crush at
+        # the extreme (wipe class). Do NOT ban crash puts / early trend
+        # debits merely for printing at the session extreme — that wiped
+        # Oct8/Sep22-style continuation.
+        _hard_sub = bool(signals.get("_momentum_hard_trend_sub"))
+        # Hard-invariant debit bridge: only refuse the true wipe class
+        # (loc≳0.92 + spend≥120 + crush IV). Continuation at the highs
+        # after BCS-into-UPTREND refuse is the Sep23/Sep11 ticket.
+        _wipe_loc = (
+            (direction > 0 and _spent_loc >= 0.92)
+            or (direction < 0 and _spent_loc <= 0.08)
+        )
+        _crush_chase = (
+            _loc_spent
+            and (_spent_peak >= 100.0 or used >= 100.0)
+            and _spent_vol in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+            and _spent_iv in ("DECLINING", "CRUSHING")
+            and not (
+                adx >= _spent_adx_min and _px_aligned and _tape_confirmed
+            )
+        )
+        if _hard_sub:
+            _crush_chase = (
+                _wipe_loc
+                and (_spent_peak >= 120.0 or used >= 120.0)
+                and _spent_iv in ("DECLINING", "CRUSHING")
+                and adx < max(
+                    35.0,
+                    float(getattr(cfg, "adx_strong_threshold", 28.0) or 28.0),
+                )
+            )
+        if _crush_chase:
+            return False, (
+                f"momentum_spent_chase_loc_{_spent_loc:.2f}"
+                f"_cap_{_loc_cap:.2f}_peak_{_spent_peak:.0f}"
+            ), 0
+        # Calls after the session range is already spent (Oct16 −₹7k:
+        # day_move~97% at 11:00, then a 11:24 reload after IV left
+        # CRUSHING). Use max(up, peak, total). Fresh bull debits with
+        # light spend (Oct30 ~59%) stay open. Once spend ≥90%, calls are
+        # done for the day regardless of IV flicker.
+        try:
+            _dm_tot = float(signals.get("day_move_used_pct") or 0.0)
+        except (TypeError, ValueError):
+            _dm_tot = 0.0
+        try:
+            _dm_peak = float(
+                signals.get("day_move_used_peak_pct")
+                or self.market_engine.state.get("day_move_used_peak_pct")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _dm_peak = 0.0
+        _call_spend = max(
+            float(used), float(_spent_peak), _dm_tot, _dm_peak
+        )
+        # Spent-day calls: refuse when IV is crushing/declining OR the
+        # tape is not a confirmed strong trend. Confirmed TREND_ON + strong
+        # ADX continuation (Sep11/Oct15) stays open; Oct16 crush+97% does not.
+        # Latch ONLY on crush/decline — a weak-tape refuse earlier in the
+        # session must not permanently ban a later confirmed bull debit.
+        _crush_iv = _spent_iv in ("DECLINING", "CRUSHING")
+        _strong_cont = (
+            _tape_confirmed
+            and adx >= max(
+                35.0,
+                float(getattr(cfg, "adx_strong_threshold", 28.0) or 28.0),
+            )
+            and _px_aligned
+        )
+        # Wipe class under NEUTRAL vol: loc at cap + crush IV + spend≥70.
+        # TREND_STRENGTHENING at the extreme unlocked Oct16 HARD_EXIT
+        # LONG_CALL (vol=NEUTRAL so sell-vol crush chase never fired).
+        if (
+            direction > 0
+            and _loc_spent
+            and _crush_iv
+            and _call_spend >= 70.0
+        ):
+            return False, (
+                f"momentum_spent_crush_loc_{_spent_loc:.2f}"
+                f"_iv_{_spent_iv}_spend_{_call_spend:.0f}"
+            ), 0
+        # Spent-call floors: confirmed trend continuation stays open longer;
+        # bare hard_sub without tape/STRONG still refuses early crush chases
+        # (Oct16), while Sep23-class hard_sub + strong ADX keeps room.
+        if _strong_cont or price == "STRONG_UPTREND":
+            _spent_floor = 120.0
+        elif _hard_sub and (
+            _tape_confirmed
+            or adx >= float(getattr(cfg, "adx_strong_threshold", 28.0) or 28.0)
+        ):
+            _spent_floor = 110.0
+        elif _hard_sub:
+            _spent_floor = 80.0
+        else:
+            _spent_floor = 70.0
+        _spent_call_bad = (
+            direction > 0
+            and _call_spend >= _spent_floor
+            and (_crush_iv or not _strong_cont)
+        )
+        # Hard-invariant bridge: continuation after BCS-into-UPTREND refuse
+        # must not inherit a mid-session spent latch from a weaker tape
+        # (Sep23: 350× DECLINING latch while ADX confirmed the grind).
+        # Only the wipe class (loc≥0.92 + spend≥120 + crush) stays latched.
+        if _hard_sub and direction > 0 and not (
+            _wipe_loc and _call_spend >= 120.0 and _crush_iv
+        ):
+            self.market_engine.state["momentum_calls_spent_latched"] = False
+            _spent_call_bad = False
+        elif direction > 0 and _crush_iv and _call_spend >= _spent_floor:
+            self.market_engine.state["momentum_calls_spent_latched"] = True
+        if direction > 0 and (
+            bool(self.market_engine.state.get("momentum_calls_spent_latched"))
+            or _spent_call_bad
+        ):
+            return False, (
+                f"momentum_no_call_spent_day_used_{_call_spend:.0f}"
+                f"_iv_{_spent_iv}"
+            ), 0
+        # Afternoon debit after 12:30: need confirmed tape + ADX, else late
+        # grind chase (Sep9/Oct7 class). Crash continuation (STRONG + high
+        # ADX) still allowed at the extreme. Hard-invariant bridge with a
+        # labelled trend may express at confirm ADX (Sep23 12:27 path).
+        if cur >= dtime(12, 30):
+            _px_strong = price in ("STRONG_UPTREND", "STRONG_DOWNTREND")
+            _aft_ok = (
+                (_px_strong or _tape_confirmed)
+                and adx >= max(30.0, float(
+                    getattr(cfg, "adx_strong_threshold", 28.0) or 28.0
+                ))
+                and _px_aligned
+            )
+            # Hard-sub afternoon: still need STRONG or confirmed tape —
+            # bare UPTREND + confirm ADX reopened Sep9 12:46 LONG_CALL wipe.
+            if (
+                _hard_sub
+                and _px_aligned
+                and (_px_strong or _tape_confirmed)
+                and adx >= max(
+                    28.0, self._cal_lever("momentum_min_confirm_adx", 22.0)
+                )
+            ):
+                _aft_ok = True
+            # Late puts into a fading afternoon without STRONG: knife-catch
+            # (Oct7 13:21 LONG_PUT −₹3.7k). Require STRONG for put side.
+            if direction < 0 and not _px_strong and not (
+                _hard_sub
+                and price == "STRONG_DOWNTREND"
+                and _tape_confirmed
+            ):
+                _aft_ok = False
+            if not _aft_ok:
+                return False, (
+                    f"momentum_afternoon_no_strong_continuation_"
+                    f"adx_{adx:.0f}_loc_{_spent_loc:.2f}"
+                ), 0
+        # LONG_CALL into rich, crushing premium is inverted — sell the
+        # upside, don't buy it. Hard-sub + strong ADX / TREND_ON may still
+        # express (Sep23); bare sell-vol crush chases stay dark (Oct16).
         _vol_r = str(signals.get("vol_regime") or "")
         _iv_r = str(signals.get("iv_behavior") or "")
+        _life_w = float(dte_blend(_mom_dte if _mom_dte >= 0 else 2))
+        _sell_vol = _vol_r in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+        _quiet_iv = _iv_r in ("STABLE", "DECLINING", "CRUSHING")
+        _call_spend_bar = float(by_dte(_mom_dte if _mom_dte >= 0 else 2, 55.0, 75.0))
+        _strong_adx = float(
+            getattr(cfg, "adx_strong_threshold", 28.0) or 28.0
+        )
+        _hard_cont_ok = (
+            _hard_sub
+            and (
+                _strong_cont
+                or price == "STRONG_UPTREND"
+                or _tape_confirmed
+                or adx >= _strong_adx
+            )
+        )
+        # Hard-sub continuation under sell-vol: allow when ADX already
+        # clears the trend floor (Sep23 11:35 path). Still refuse quiet
+        # IV crush chases that lack even trend-threshold ADX (Oct16).
+        _hard_trend_ok = (
+            _hard_sub
+            and adx >= float(
+                getattr(cfg, "adx_trend_threshold", 20.0) or 20.0
+            )
+            and price in ("UPTREND", "STRONG_UPTREND")
+        )
         if (
-            _mom_dte == 0
+            direction > 0
+            and _sell_vol
+            and _quiet_iv
+            and _call_spend >= _call_spend_bar
+            and not _hard_cont_ok
+            and not _hard_trend_ok
+        ):
+            return False, (
+                f"momentum_no_call_under_{_vol_r}_spent_up_{_call_spend:.0f}"
+            ), 0
+        # Near-expiry (dte_blend≥0.35 ≈ DTE0–1): LONG_CALL into quiet
+        # sell-vol without TREND_ON/STRONG is the Oct16 HARD_EXIT wipe.
+        # Weekly hard-sub (Sep23 DTE4, life_w≈0) stays open.
+        if (
+            direction > 0
+            and _life_w >= 0.35
+            and _sell_vol
+            and _quiet_iv
+            and not (
+                _tape_confirmed
+                or price == "STRONG_UPTREND"
+                or _strong_cont
+            )
+        ):
+            return False, (
+                f"momentum_no_call_near_expiry_sell_vol_{_vol_r}"
+                f"_iv_{_iv_r}_life_{_life_w:.2f}"
+            ), 0
+        # Wide-OR / hard-invariant debit without confirmed tape: false
+        # breakout class (Oct22). Prefer unlocked credit.
+        _br_wo = str(block_reason or "").lower()
+        if (
+            direction > 0
+            and _hard_sub
+            and (
+                "wide_or" in _br_wo
+                or "range_wide_or" in _br_wo
+                or "hard_invariant" in _br_wo
+            )
+            and _mom_dte >= 2
+            and not (
+                _tape_confirmed
+                or price == "STRONG_UPTREND"
+                or _strong_cont
+                or adx >= _strong_adx + 5.0
+            )
+        ):
+            return False, "momentum_wide_or_call_needs_confirmed_tape", 0
+        if (
+            _life_w >= 0.9
             and direction > 0
-            and _vol_r in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+            and _sell_vol
             and used >= 90.0
-            and _iv_r in ("STABLE", "DECLINING", "CRUSHING")
+            and _quiet_iv
+            and not _hard_cont_ok
+            and not _hard_trend_ok
         ):
             return False, (
                 f"momentum_no_call_under_{_vol_r}_spent_up_{used:.0f}"
             ), 0
-        if used >= 100.0 and adx < 50.0:
-            if _mom_dte == 0:
-                # Crash-or-nothing floor, with two narrow continues:
-                # (1) measured-strong HIGH-conf trend (Sep22 2nd LONG_PUT
-                #     reload after a banked TARGET on a still-running dump);
-                # (2) downside-spent mid-range bounce call.
-                # TREND_EXHAUSTED never reaches here — refused above — so the
-                # Oct6 LONG_CALL scratch cannot reopen via this carve-out.
+        _mom_confirm = self._cal_lever("momentum_min_confirm_adx", 22.0)
+        if used >= 100.0 and adx < max(50.0, _mom_confirm + 20.0):
+            if _life_w >= 0.9:
+                # Near-expiry crash-or-nothing floor, continuous life weight.
+                # Continues: HIGH-conf strong trend, or mid-range bounce call
+                # after a spent dump.
                 _hi = str(signals.get("confidence_level") or "") == "HIGH"
                 _trend_px = price in (
                     "UPTREND", "STRONG_UPTREND",
@@ -8333,7 +8761,7 @@ class StrategyEngine:
                         direction > 0
                         and _dn_c >= 100.0
                         and 0.40 <= _loc_c <= 0.80
-                        and adx >= 25.0
+                        and adx >= _mom_confirm
                         and str(signals.get("confidence_level") or "")
                         in ("HIGH", "MEDIUM")
                     )
@@ -8346,7 +8774,7 @@ class StrategyEngine:
                     return False, (
                         f"momentum_exhausted_adx_{adx:.0f}_lt_50"
                     ), 0
-            # Mid-week: only refuse a spent extreme when the tape is weak /
+            # Lower life-weight: only refuse a spent extreme when the tape is weak /
             # two-way / IV-hot (Oct5 LONG_PUT knife-catch). Strong one-way
             # continuation at the highs (Sep23 LONG_CALL, HIGH/STABLE) must
             # stay open — a plain loc-extreme bar delayed that ticket.
@@ -8473,21 +8901,10 @@ class StrategyEngine:
                 _dte_lim = int(_dte_lim if _dte_lim is not None else -1)
             except (TypeError, ValueError):
                 _dte_lim = -1
-            _banked = (
-                _mom_cnt == _mom_max
-                and _prev_pnl > 0.0
-                and (
-                    _prev_xr.startswith("CLOSE_TARGET")
-                    or _prev_xr.startswith("CLOSE_PROFIT")
-                )
-            )
-            _reload_ok = _banked and (
-                self._post_harvest_trend_continuation(signals)
-                or _dte_lim == 0
-            )
-            if not _reload_ok:
-                return False, "momentum_daily_limit_reached", 0
-            # Reload path continues through the rest of the gate.
+            # One momentum harvest per session. A banked TARGET/PROFIT
+            # already expressed the window; second clips were the wipe
+            # class (Oct30 12:15 −₹15k, Sep29 11:30 −₹5.5k).
+            return False, "momentum_daily_limit_reached", 0
 
         _open_n = self._count_open_positions()
         if _open_n > 0:
@@ -8868,6 +9285,77 @@ class StrategyEngine:
             "momentum_late":          bool(late),
         }
 
+    def _hard_invariant_debit_bridge(
+        self, signals: dict, block_reason: str
+    ) -> Optional[int]:
+        """Direction for hard credit-into-trend refuses → early aligned debit.
+
+        Engine-wide (by_dte only): when sell refuses
+        hard_invariant_no_calls_into_UPTREND / no_puts_into_DOWNTREND,
+        the aligned long-premium ticket is the expression — not a late
+        spent chase. Returns +1 (calls), -1 (puts), or None.
+        """
+        br = str(block_reason or "").lower()
+        if "hard_invariant" not in br and "sticky_no_calls" not in br and (
+            "sticky_no_puts" not in br
+        ):
+            # Also bridge wide-OR / BUY_OPTIONS sell refuses when price
+            # already prints a with-trend label (plan: credit refuse → debit).
+            if not any(
+                tok in br
+                for tok in (
+                    "wide_or", "range_wide_or", "buy_options",
+                    "dangerous_to_sell", "condor_requires",
+                    "open_spike_wait", "unresolved_lower_high",
+                    "two_way_auction_wait", "two_way_wait",
+                )
+            ):
+                return None
+        try:
+            adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            adx = 0.0
+        _min = self._cal_lever("momentum_min_confirm_adx", 20.0)
+        px = str(signals.get("price_regime") or "")
+        if "no_calls_into" in br or "sticky_no_calls" in br:
+            if px in ("UPTREND", "STRONG_UPTREND") and adx >= _min:
+                return 1
+        if "no_puts_into" in br or "sticky_no_puts" in br:
+            if px in ("DOWNTREND", "STRONG_DOWNTREND") and adx >= _min:
+                return -1
+        # Wide-OR / BUY_OPTIONS / NEUTRAL-condor: direction from price or lean.
+        if px in ("UPTREND", "STRONG_UPTREND") and adx >= _min:
+            return 1
+        if px in ("DOWNTREND", "STRONG_DOWNTREND") and adx >= _min:
+            return -1
+        _tag = str(signals.get("wide_or_buy_options_trend") or "")
+        if _tag == "BULL" and adx >= _min:
+            return 1
+        if _tag == "BEAR" and adx >= _min:
+            return -1
+        _lean = self._away_side_intent(signals)
+        if _lean == "BULL" and adx >= _min:
+            return 1
+        if _lean == "BEAR" and adx >= _min:
+            return -1
+        # Persistence lag under wide_or: soft OR poke + EMA/VWAP lean.
+        if "wide_or" in br or "range_wide_or" in br:
+            try:
+                _sp = float(signals.get("spot") or 0.0)
+                _oh = float(signals.get("or_high") or 0.0)
+                _ol = float(signals.get("or_low") or 0.0)
+                _ema = str(signals.get("ema_structure") or "")
+                _vd = float(signals.get("vwap_dist_pct") or 0.0)
+            except (TypeError, ValueError):
+                _sp = _oh = _ol = _vd = 0.0
+                _ema = ""
+            if adx >= _min and _oh > _ol > 0:
+                if _sp >= _oh and (_ema == "BULLISH" or _vd >= 0.05):
+                    return 1
+                if _sp <= _ol and (_ema == "BEARISH" or _vd <= -0.05):
+                    return -1
+        return None
+
     def _momentum_decision(self, signals: dict, block_reason: str) -> Optional[dict]:
         """Long-premium substitute for a refused sell-side structure.
 
@@ -8876,6 +9364,23 @@ class StrategyEngine:
         original refusal, unaltered, as the logged reason.
         """
         signals.pop("_momentum_refuse_reason", None)
+        signals.pop("_momentum_hard_trend_sub", None)
+        signals.pop("_momentum_bridge_dir", None)
+        _bridge_dir = self._hard_invariant_debit_bridge(signals, block_reason)
+        if _bridge_dir is not None:
+            signals["_momentum_hard_trend_sub"] = True
+            signals["_momentum_bridge_dir"] = int(_bridge_dir)
+            # Release sticky fade / two_way ownership so the aligned debit
+            # can express early (false high-fade during bull grind).
+            signals["afternoon_high_fade"] = False
+            signals["afternoon_low_fade"] = False
+            if bool(signals.get("two_way_auction")):
+                try:
+                    _adx_br = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_br = 0.0
+                if _adx_br >= self._cal_lever("two_way_trend_release_adx", 22.0):
+                    signals["two_way_auction"] = False
         # P59-08: fade window alone must not own the book when an open soft-
         # lean credit already expresses that extreme (BCS @ low / BPS @ high).
         # Sep22: afternoon_low_fade blocked aligned LONG_PUT for ~10m beside BCS.
@@ -8887,14 +9392,43 @@ class StrategyEngine:
         _hi_fade = bool(signals.get("afternoon_high_fade"))
         _lo_fade = bool(signals.get("afternoon_low_fade"))
         if _hi_fade or _lo_fade:
-            _open_names = self._open_strategy_names()
-            _aligned_credit_owns = (
-                (_lo_fade and BEAR_CALL_SPREAD in _open_names)
-                or (_hi_fade and BULL_PUT_SPREAD in _open_names)
-            )
-            if not _aligned_credit_owns and _open_names:
-                signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
-                return None
+            # Measured with-trend tape clears sticky fade ownership so the
+            # aligned debit can express (false high-fade during bull grind).
+            if self._trend_continuation_clears_fade_latch(signals):
+                signals["afternoon_high_fade"] = False
+                signals["afternoon_low_fade"] = False
+                _hi_fade = False
+                _lo_fade = False
+            else:
+                _open_names = self._open_strategy_names()
+                _aligned_credit_owns = (
+                    (_lo_fade and BEAR_CALL_SPREAD in _open_names)
+                    or (_hi_fade and BULL_PUT_SPREAD in _open_names)
+                )
+                if not _aligned_credit_owns and _open_names:
+                    signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
+                    return None
+                # Flat book + location fade alone must not bury aligned debit
+                # when price already prints UPTREND/DOWNTREND at clear ADX.
+                if not _open_names and self._trend_continuation_clears_fade_latch(signals):
+                    signals["afternoon_high_fade"] = False
+                    signals["afternoon_low_fade"] = False
+                    _hi_fade = False
+                    _lo_fade = False
+                elif not _open_names:
+                    # Flat + fade flags: still allow gate to decide unless
+                    # we are mid-fade without trend clear — stand down.
+                    try:
+                        _adx_f = float(signals.get("adx_15") or 0.0)
+                    except (TypeError, ValueError):
+                        _adx_f = 0.0
+                    if _adx_f < self._cal_lever("fade_clear_adx", 25.0):
+                        signals["_momentum_refuse_reason"] = "momentum_skipped_fade_owns_book"
+                        return None
+                    signals["afternoon_high_fade"] = False
+                    signals["afternoon_low_fade"] = False
+                    _hi_fade = False
+                    _lo_fade = False
         # After a harvested extreme fade the session is a mean-reversion
         # book. Buying directional premium mid-day is the wipe trade
         # (canonical 2026-09-18: BPS low-fade + BCS high-fade then 14:30
@@ -8924,7 +9458,10 @@ class StrategyEngine:
             # momentum_skipped_after_extreme_fade while ADX~54 DOWNTREND
             # dumped another 200pts; replay without the fade booked ~₹5k
             # on puts). Engine-wide: strong ADX + aligned trend/regime.
-            if self._trend_continuation_clears_fade_latch(signals):
+            if (
+                bool(signals.get("_momentum_hard_trend_sub"))
+                or self._trend_continuation_clears_fade_latch(signals)
+            ):
                 _st["session_mean_reversion_book"] = False
                 _fade_latch = False
             else:
@@ -8970,6 +9507,7 @@ class StrategyEngine:
             (not _late_now)
             and (bool(signals.get("two_way_auction"))
                  or self._after_two_way_extreme_scalp())
+            and not bool(signals.get("_momentum_hard_trend_sub"))
         ):
             try:
                 _adx_tw = float(signals.get("adx_15") or 0.0)
@@ -8981,16 +9519,43 @@ class StrategyEngine:
                 _ivb in ("EXPANDING", "SPIKING")
                 and _adx_tw >= 40.0
             )
+            # Use calibrated two_way release ADX (not only strong threshold)
+            # so false auction latches clear during real grinds (Oct22/28).
+            _tw_rel = self._cal_lever("two_way_trend_release_adx", 22.0)
             _one_way_tw = (
-                _adx_tw >= float(
-                    getattr(self.config, "adx_strong_threshold", 25.0) or 25.0
-                )
+                _adx_tw >= _tw_rel
                 and _pr_tw in (
                     "UPTREND", "DOWNTREND",
                     "STRONG_UPTREND", "STRONG_DOWNTREND",
                 )
                 and not bool(signals.get("choppy_detected"))
             )
+            # Persistence lag: RANGE label with sided spend + extreme loc
+            # still releases a false two_way latch (Oct22/28 archetype).
+            if (
+                not _one_way_tw
+                and _adx_tw >= _tw_rel
+                and not bool(signals.get("choppy_detected"))
+            ):
+                try:
+                    _up_rel = float(
+                        signals.get("day_up_used_peak_pct")
+                        or signals.get("day_up_used_pct")
+                        or 0.0
+                    )
+                    _dn_rel = float(
+                        signals.get("day_down_used_peak_pct")
+                        or signals.get("day_down_used_pct")
+                        or 0.0
+                    )
+                    _, _loc_rel, _, _ = self._session_range_pos(signals)
+                    if (
+                        (_up_rel >= 50.0 and _loc_rel >= 0.65)
+                        or (_dn_rel >= 50.0 and _loc_rel <= 0.35)
+                    ):
+                        _one_way_tw = True
+                except (TypeError, ValueError, Exception):
+                    pass
             _post_harv = self._post_harvest_trend_continuation(signals)
             # Expiry: a HIGH-conf directional day with ADX already trending
             # must not stay dark behind a two-way latch (Sep29 dump/bounce
@@ -9216,20 +9781,56 @@ class StrategyEngine:
                         "momentum_skipped_after_credit_stop_wrong_side"
                     )
                     return None
-        # PATCH_V30: never buy calls while the engine is in a bear-credit
-        # regime (or puts in a bull-credit regime) — unless this is
-        # post-harvest with-trend continuation (regime label can lag the
-        # harvested side; Sep23 printed PREMIUM_SELL_BEAR while UPTREND
-        # after BPS and banned LONG_CALL for 257 cycles).
+        # Never buy calls while bear-credit owns the book (or puts vs bull)
+        # unless post-harvest continuation OR price+ADX already falsify the
+        # credit label (false high-fade / sticky two_way during a real grind).
         _final = str(signals.get("final_regime") or "")
+        _px_md = str(signals.get("price_regime") or "")
+        try:
+            _adx_md = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx_md = 0.0
+        _rel_adx = self._cal_lever("two_way_trend_release_adx", 22.0)
+        _tape_md = str(signals.get("tape_state") or "")
+        try:
+            _, _loc_md, _, _ = self._session_range_pos(signals)
+        except Exception:
+            _loc_md = 0.5
+        # Falsify opposing credit on confirmed tape. Loc-cap alone must not
+        # keep a false BEAR map alive at the highs during a real UPTREND
+        # (Sep23: 98× call_vs_bear while hard_invariant refused BCS).
+        _price_falsifies_bear = (
+            _px_md in ("UPTREND", "STRONG_UPTREND")
+            and _adx_md >= _rel_adx
+            and (
+                _tape_md in ("TREND_ON", "TREND_STRENGTHENING", "BREAK_FROM_COIL")
+                or bool(signals.get("_momentum_hard_trend_sub"))
+                or _px_md == "STRONG_UPTREND"
+            )
+        )
+        _price_falsifies_bull = (
+            _px_md in ("DOWNTREND", "STRONG_DOWNTREND")
+            and _adx_md >= _rel_adx
+            and (
+                _tape_md in ("TREND_ON", "TREND_STRENGTHENING", "BREAK_FROM_COIL")
+                or bool(signals.get("_momentum_hard_trend_sub"))
+                or _px_md == "STRONG_DOWNTREND"
+            )
+        )
         if direction > 0 and _final == "PREMIUM_SELL_BEAR":
-            if not self._post_harvest_trend_continuation(signals):
+            if not (
+                self._post_harvest_trend_continuation(signals)
+                or _price_falsifies_bear
+            ):
                 signals["_momentum_refuse_reason"] = (
                     "momentum_skipped_call_vs_bear_credit_regime"
                 )
                 return None
         if direction < 0 and _final == "PREMIUM_SELL_BULL":
-            if not self._post_harvest_trend_continuation(signals):
+            if not (
+                self._post_harvest_trend_continuation(signals)
+                or _price_falsifies_bull
+            ):
                 signals["_momentum_refuse_reason"] = (
                     "momentum_skipped_put_vs_bull_credit_regime"
                 )

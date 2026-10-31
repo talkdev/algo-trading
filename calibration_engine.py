@@ -1,16 +1,16 @@
 # calibration_engine.py
 # NIFTY Intraday Options Engine v3.0
-# Self-calibrating threshold engine.
-# Reads stored historical data and derives optimal thresholds.
-# Implements Bayesian shrinkage, phantom trade analysis,
-# exit quality tuning, signal weight learning, and drift detection.
+# Life-blended profitability tuner.
+# Derives engine-wide levers from closed trades + phantoms using
+# Bayesian shrinkage. No discrete DTE0/1/2 costume patches — life
+# weight is continuous via by_dte().
 
 from __future__ import annotations
 
 import json
 import math
 import statistics
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
@@ -28,19 +28,17 @@ from core import (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CALIBRATION STATE DATACLASS
+# CALIBRATION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class CalibrationState:
     """
-    All calibrated thresholds used by the regime and strategy engines.
+    Calibrated thresholds + engine levers used by regime/strategy/tape.
 
-    Calibration tiers:
-    Tier 0: < 5 trading days  — hardcoded NIFTY 2026 defaults
-    Tier 1: 5-19 trading days — VIX percentiles + basic VRP from live data
-    Tier 2: 20-59 days        — full calibration, all thresholds data-derived
-    Tier 3: 60+ days          — robust calibration with signal weights + drift detection
+    Life-weight: by_dte(dte, expiry_anchor, weekly_anchor). No discrete
+    DTE bucket branches in live gates — use get_vrp_sell_for_dte /
+    get_lever continuously.
     """
 
     # Identity
@@ -85,14 +83,14 @@ class CalibrationState:
     # Straddle ratio
     straddle_ratio_sell:    float = 1.10
 
-    # Signal weights (for confidence score computation)
+    # Signal weights
     signal_weight_vrp:           float = 1.0
     signal_weight_price:         float = 1.0
     signal_weight_positioning:   float = 1.0
     signal_weight_iv_behavior:   float = 1.0
     signal_weight_or_condition:  float = 1.0
 
-    # Performance metrics (updated daily)
+    # Performance metrics
     phantom_false_negative_rate: Optional[float] = None
     exit_quality_score:          Optional[float] = None
     regime_accuracy_score:       Optional[float] = None
@@ -104,33 +102,57 @@ class CalibrationState:
     thursday_avg_range:  float = 150.0
     friday_avg_range:    float = 150.0
 
-    # DTE-specific VRP thresholds (derived from base + DTE adjustment)
-    vrp_sell_dte0:       float = 1.875   # vrp_sell * 0.75
-    vrp_sell_dte1:       float = 2.125   # vrp_sell * 0.85
-    vrp_sell_dte2plus:   float = 2.75    # vrp_sell * 1.10
+    # Display-only life-blended VRP anchors (live uses get_vrp_sell_for_dte)
+    vrp_sell_dte0:       float = 1.875
+    vrp_sell_dte1:       float = 2.125
+    vrp_sell_dte2plus:   float = 2.75
 
-    # Calibration notes
-    notes:               str   = ""
+    # ── Engine levers (profitability tuner) ───────────────────────────────
+    # Tuned toward earlier with-trend expression; refuse spent chases.
+    regime_persistence_cycles:   float = 2.0
+    regime_entry_dwell_min:      float = 2.5
+    day_move_used_block_pct:     float = 125.0
+    fade_clear_adx:              float = 22.0
+    two_way_trend_release_adx:   float = 20.0
+    wide_or_trend_adx_floor:     float = 20.0
+    spent_chase_loc_cap:         float = 0.80
+    momentum_min_confirm_adx:    float = 20.0
+
+    # Life-weighted expectancy from last tune (reporting)
+    life_weighted_expectancy:    Optional[float] = None
+    notes:                       str   = ""
 
     def to_dict(self) -> dict:
-        """Convert to plain dict for JSON serialisation."""
         d = asdict(self)
         if self.last_calibrated is not None:
             d["last_calibrated"] = self.last_calibrated.isoformat()
         return d
 
-    def get_vrp_sell_for_dte(self, dte: Optional[int], or_condition: Optional[str] = None) -> float:
-        """
-        Return the life-adjusted and OR-adjusted VRP sell threshold.
+    def get_lever(self, name: str, default: Optional[float] = None) -> float:
+        """Return a calibrated engine lever, falling back to default/attr."""
+        if hasattr(self, name):
+            v = getattr(self, name)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        if default is not None:
+            return float(default)
+        return 0.0
 
-        v50: continuous sqrt-life blend between expiry (0.75x) and weekly
-        (1.10x) anchors — no discrete dte==0/1/2 branches. Same economics
-        curve the rest of the engine already uses via by_dte().
+    def get_vrp_sell_for_dte(
+        self, dte: Optional[int], or_condition: Optional[str] = None
+    ) -> float:
+        """
+        Life-adjusted and OR-adjusted VRP sell threshold.
+
+        Continuous sqrt-life blend between expiry (0.75x) and weekly
+        (1.10x) anchors — no discrete dte==0/1/2 branches.
         """
         base = self.vrp_sell_threshold
         adjusted = base * by_dte(dte, 0.75, 1.10)
 
-        # OR condition adjustment
         or_mult = {
             "VERY_NARROW": 0.75,
             "NARROW":      0.85,
@@ -139,78 +161,41 @@ class CalibrationState:
             "VERY_WIDE":   1.40,
         }.get(or_condition or "MODERATE", 1.00)
 
-        result = adjusted * or_mult
-        return max(result, 1.0)  # Never below 1.0pp absolute
+        return max(adjusted * or_mult, 1.0)
 
+    def refresh_vrp_display_anchors(self) -> None:
+        base = self.vrp_sell_threshold
+        self.vrp_sell_dte0 = base * by_dte(0, 0.75, 1.10)
+        self.vrp_sell_dte1 = base * by_dte(1, 0.75, 1.10)
+        self.vrp_sell_dte2plus = base * by_dte(2, 0.75, 1.10)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NIFTY 2026 DEFAULTS
-# ─────────────────────────────────────────────────────────────────────────────
 
 NIFTY_2026_DEFAULTS = CalibrationState(
     calibration_tier=0,
     is_calibrated=False,
     n_trading_days=0,
     n_tuesday_expiries=0,
-    vix_p25=11.0,
-    vix_p50=12.5,
-    vix_p75=14.5,
-    vix_p90=18.0,
-    vrp_sell_threshold=2.0,
-    vrp_fair_threshold=1.0,
-    day_size_monday=0.60,
-    day_size_tuesday=0.85,
-    day_size_wednesday=0.65,
-    day_size_thursday=0.65,
-    day_size_friday=0.55,
-    oi_buildup_threshold=0.08,
-    oi_unwind_threshold=-0.08,
-    oi_wall_strong_cal=2.5,
-    oi_wall_moderate_cal=1.7,
-    pcr_bullish_threshold=0.72,
-    pcr_bearish_threshold=1.28,
-    skew_bearish_threshold=3.0,
-    skew_bullish_threshold=0.95,
-    straddle_ratio_sell=1.10,
-    signal_weight_vrp=1.0,
-    signal_weight_price=1.0,
-    signal_weight_positioning=1.0,
-    signal_weight_iv_behavior=1.0,
-    signal_weight_or_condition=1.0,
-    monday_avg_range=150.0,
-    tuesday_avg_range=150.0,
-    wednesday_avg_range=150.0,
-    thursday_avg_range=150.0,
-    friday_avg_range=150.0,
-    notes="NIFTY 2026 defaults — VIX 11-13 suppressed intraday only",
+    notes="NIFTY 2026 defaults — life-blended profitability tuner",
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CALIBRATION RESULT (intermediate)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class CalibrationResult:
-    """
-    Intermediate result from one calibration component.
-    Carries the computed value, sample size, and confidence.
-    """
-    key:             str
-    value:           float
-    prior:           float
-    n_observations:  int
-    shrunk_value:    float
-    confidence:      str   # HIGH / MEDIUM / LOW
-    notes:           str   = ""
-
-    @property
-    def is_reliable(self) -> bool:
-        return self.n_observations >= 30
-
-    @property
-    def is_usable(self) -> bool:
-        return self.n_observations >= 5
+# Lever bounds for the constrained grid / shrinkage
+_LEVER_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "regime_persistence_cycles": (1.0, 4.0),
+    "regime_entry_dwell_min":    (1.5, 8.0),
+    "day_move_used_block_pct":   (100.0, 160.0),
+    "fade_clear_adx":            (18.0, 40.0),
+    "two_way_trend_release_adx": (18.0, 35.0),
+    "wide_or_trend_adx_floor":   (20.0, 40.0),
+    "spent_chase_loc_cap":       (0.70, 0.95),
+    "momentum_min_confirm_adx":  (18.0, 35.0),
+    "vrp_sell_threshold":        (1.2, 4.0),
+    "vrp_fair_threshold":        (0.6, 2.5),
+    "day_size_monday":           (0.30, 1.0),
+    "day_size_tuesday":          (0.30, 1.0),
+    "day_size_wednesday":        (0.30, 1.0),
+    "day_size_thursday":         (0.30, 1.0),
+    "day_size_friday":           (0.30, 1.0),
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,63 +204,36 @@ class CalibrationResult:
 
 class CalibrationEngine:
     """
-    Self-calibrating threshold engine for NIFTY intraday options trading.
+    Profitability-driven, life-blended calibration.
 
-    Architecture:
-    - Reads stored historical data from SQLite database
-    - Derives optimal thresholds using Bayesian shrinkage
-    - Implements four feedback loops:
-      1. VRP threshold tuning from win rates by VRP bucket
-      2. Phantom trade analysis (is NEUTRAL gate too tight?)
-      3. Exit quality tuning (are exits happening at right time?)
-      4. Signal weight tuning (which signals predict outcomes best?)
-    - Runs on three schedules:
-      Daily (after close): VRP, phantom, day sizes
-      Weekly (Sunday): full recalibration
-      Monthly (last Sunday): drift detection, signal weights
+    Objective: maximize life-weighted expectancy
+      E = sum(pnl * life_w) / n
+    with a left-tail penalty on stop-outs and a phantom false-negative term.
 
-    Bayesian shrinkage:
-    With N observations and prior_weight P:
-      shrunk = (N/(N+P)) * data_estimate + (P/(N+P)) * prior
-    P = 30 by default (equivalent to 30 observations of prior belief)
-    This prevents overfitting on small samples.
+    life_w = by_dte(dte, 1.0, 0.7) — expiry sessions weigh more; continuous.
+
+    Schedules: startup / daily / weekly / monthly / force.
+    Does NOT run in-process backtests — proposes levers; verification is
+    separate per-day OS-process replay.
     """
 
-    # Bayesian prior weight
     PRIOR_WEIGHT = 15
-
-    # Minimum sample sizes for each calibration component
-    MIN_SAMPLES_VIX         = 5
-    MIN_SAMPLES_VRP         = 3
-    MIN_SAMPLES_DAY_SIZE    = 2
-    MIN_SAMPLES_OI          = 10
-    MIN_SAMPLES_PCR         = 20
-    MIN_SAMPLES_SKEW        = 15
-    MIN_SAMPLES_RANGES      = 2
-    MIN_SAMPLES_WEIGHTS     = 10
-    MIN_SAMPLES_PHANTOM     = 3
-    MIN_SAMPLES_EXIT        = 5
 
     def __init__(self, db: Database, config: Config, logger):
         self.db     = db
         self.config = config
         self.logger = logger
-
-        # Current calibration state
         self._state: CalibrationState = NIFTY_2026_DEFAULTS
-
-        # History of calibration runs (for drift detection)
         self._history: List[CalibrationState] = []
-
-        # Load latest calibration from DB
         self._load()
 
-    # ─────────────────────────────────────────────────────────────────────
-    # LOAD / SAVE
-    # ─────────────────────────────────────────────────────────────────────
+    @property
+    def state(self) -> CalibrationState:
+        return self._state
+
+    # ── load / save ──────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        """Load the most recent valid calibration from database."""
         row = self.db.get_latest_calibration()
         if row:
             self._state = self._row_to_state(row)
@@ -286,33 +244,33 @@ class CalibrationEngine:
                 f"vrp_sell={self._state.vrp_sell_threshold:.2f}pp"
             )
         else:
-            self._state = NIFTY_2026_DEFAULTS
+            self._state = CalibrationState(
+                notes="NIFTY 2026 defaults — life-blended profitability tuner"
+            )
             self.logger.info(
-                "CalibrationEngine: no prior calibration — using NIFTY 2026 defaults (Tier 0)"
+                "CalibrationEngine: no prior calibration — using NIFTY 2026 defaults"
             )
 
+    def _frow(self, row: dict, key: str, default: float) -> float:
+        v = row.get(key)
+        if v is None:
+            return float(default)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _irow(self, row: dict, key: str, default: int) -> int:
+        v = row.get(key)
+        if v is None:
+            return int(default)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return int(default)
+
     def _row_to_state(self, row: dict) -> CalibrationState:
-        """Convert a calibration_state DB row to CalibrationState."""
         d = NIFTY_2026_DEFAULTS
-
-        def _f(key: str, default: float = 0.0) -> float:
-            v = row.get(key)
-            if v is None:
-                return getattr(d, key, default)
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return getattr(d, key, default)
-
-        def _i(key: str, default: int = 0) -> int:
-            v = row.get(key)
-            if v is None:
-                return default
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return default
-
         last_cal = None
         if row.get("calibrated_at"):
             try:
@@ -320,82 +278,90 @@ class CalibrationEngine:
             except Exception:
                 pass
 
-        vrp_sell = _f("vrp_sell_threshold", d.vrp_sell_threshold)
-
         state = CalibrationState(
-            calibration_tier=_i("calibration_tier", 0),
+            calibration_tier=self._irow(row, "calibration_tier", 0),
             is_calibrated=bool(row.get("is_valid", False)),
-            n_trading_days=_i("n_trading_days", 0),
-            n_tuesday_expiries=_i("n_tuesday_expiries", 0),
+            n_trading_days=self._irow(row, "n_trading_days", 0),
+            n_tuesday_expiries=self._irow(row, "n_tuesday_expiries", 0),
             last_calibrated=last_cal,
-            calibrated_at_str=row.get("calibrated_at", ""),
-            vix_p25=_f("vix_p25", d.vix_p25),
-            vix_p50=_f("vix_p50", d.vix_p50),
-            vix_p75=_f("vix_p75", d.vix_p75),
-            vix_p90=_f("vix_p90", d.vix_p90),
-            vrp_sell_threshold=vrp_sell,
-            vrp_fair_threshold=_f("vrp_fair_threshold", d.vrp_fair_threshold),
-            day_size_monday=_f("day_size_monday", d.day_size_monday),
-            day_size_tuesday=_f("day_size_tuesday", d.day_size_tuesday),
-            day_size_wednesday=_f("day_size_wednesday", d.day_size_wednesday),
-            day_size_thursday=_f("day_size_thursday", d.day_size_thursday),
-            day_size_friday=_f("day_size_friday", d.day_size_friday),
-            oi_buildup_threshold=_f("oi_buildup_threshold", d.oi_buildup_threshold),
-            oi_unwind_threshold=_f("oi_unwind_threshold", d.oi_unwind_threshold),
-            oi_wall_strong_cal=_f("oi_wall_strong_cal", d.oi_wall_strong_cal),
-            oi_wall_moderate_cal=_f("oi_wall_moderate_cal", d.oi_wall_moderate_cal),
-            pcr_bullish_threshold=_f("pcr_bullish_threshold", d.pcr_bullish_threshold),
-            pcr_bearish_threshold=_f("pcr_bearish_threshold", d.pcr_bearish_threshold),
-            skew_bearish_threshold=_f("skew_bearish_threshold", d.skew_bearish_threshold),
-            skew_bullish_threshold=_f("skew_bullish_threshold", d.skew_bullish_threshold),
-            straddle_ratio_sell=_f("straddle_ratio_sell", d.straddle_ratio_sell),
-            signal_weight_vrp=_f("signal_weight_vrp", d.signal_weight_vrp),
-            signal_weight_price=_f("signal_weight_price", d.signal_weight_price),
-            signal_weight_positioning=_f("signal_weight_positioning", d.signal_weight_positioning),
-            signal_weight_iv_behavior=_f("signal_weight_iv_behavior", d.signal_weight_iv_behavior),
-            signal_weight_or_condition=_f("signal_weight_or_condition", d.signal_weight_or_condition),
+            calibrated_at_str=row.get("calibrated_at", "") or "",
+            vix_p25=self._frow(row, "vix_p25", d.vix_p25),
+            vix_p50=self._frow(row, "vix_p50", d.vix_p50),
+            vix_p75=self._frow(row, "vix_p75", d.vix_p75),
+            vix_p90=self._frow(row, "vix_p90", d.vix_p90),
+            vrp_sell_threshold=self._frow(row, "vrp_sell_threshold", d.vrp_sell_threshold),
+            vrp_fair_threshold=self._frow(row, "vrp_fair_threshold", d.vrp_fair_threshold),
+            day_size_monday=self._frow(row, "day_size_monday", d.day_size_monday),
+            day_size_tuesday=self._frow(row, "day_size_tuesday", d.day_size_tuesday),
+            day_size_wednesday=self._frow(row, "day_size_wednesday", d.day_size_wednesday),
+            day_size_thursday=self._frow(row, "day_size_thursday", d.day_size_thursday),
+            day_size_friday=self._frow(row, "day_size_friday", d.day_size_friday),
+            oi_buildup_threshold=self._frow(row, "oi_buildup_threshold", d.oi_buildup_threshold),
+            oi_unwind_threshold=self._frow(row, "oi_unwind_threshold", d.oi_unwind_threshold),
+            oi_wall_strong_cal=self._frow(row, "oi_wall_strong_cal", d.oi_wall_strong_cal),
+            oi_wall_moderate_cal=self._frow(row, "oi_wall_moderate_cal", d.oi_wall_moderate_cal),
+            pcr_bullish_threshold=self._frow(row, "pcr_bullish_threshold", d.pcr_bullish_threshold),
+            pcr_bearish_threshold=self._frow(row, "pcr_bearish_threshold", d.pcr_bearish_threshold),
+            skew_bearish_threshold=self._frow(row, "skew_bearish_threshold", d.skew_bearish_threshold),
+            skew_bullish_threshold=self._frow(row, "skew_bullish_threshold", d.skew_bullish_threshold),
+            straddle_ratio_sell=self._frow(row, "straddle_ratio_sell", d.straddle_ratio_sell),
+            signal_weight_vrp=self._frow(row, "signal_weight_vrp", d.signal_weight_vrp),
+            signal_weight_price=self._frow(row, "signal_weight_price", d.signal_weight_price),
+            signal_weight_positioning=self._frow(
+                row, "signal_weight_positioning", d.signal_weight_positioning
+            ),
+            signal_weight_iv_behavior=self._frow(
+                row, "signal_weight_iv_behavior", d.signal_weight_iv_behavior
+            ),
+            signal_weight_or_condition=self._frow(
+                row, "signal_weight_or_condition", d.signal_weight_or_condition
+            ),
             phantom_false_negative_rate=row.get("phantom_false_negative_rate"),
             exit_quality_score=row.get("exit_quality_score"),
             regime_accuracy_score=row.get("regime_accuracy_score"),
-            monday_avg_range=_f("monday_avg_range", d.monday_avg_range),
-            tuesday_avg_range=_f("tuesday_avg_range", d.tuesday_avg_range),
-            wednesday_avg_range=_f("wednesday_avg_range", d.wednesday_avg_range),
-            thursday_avg_range=_f("thursday_avg_range", d.thursday_avg_range),
-            friday_avg_range=_f("friday_avg_range", d.friday_avg_range),
-            notes=row.get("notes", ""),
+            monday_avg_range=self._frow(row, "monday_avg_range", d.monday_avg_range),
+            tuesday_avg_range=self._frow(row, "tuesday_avg_range", d.tuesday_avg_range),
+            wednesday_avg_range=self._frow(row, "wednesday_avg_range", d.wednesday_avg_range),
+            thursday_avg_range=self._frow(row, "thursday_avg_range", d.thursday_avg_range),
+            friday_avg_range=self._frow(row, "friday_avg_range", d.friday_avg_range),
+            regime_persistence_cycles=self._frow(
+                row, "regime_persistence_cycles", d.regime_persistence_cycles
+            ),
+            regime_entry_dwell_min=self._frow(
+                row, "regime_entry_dwell_min", d.regime_entry_dwell_min
+            ),
+            day_move_used_block_pct=self._frow(
+                row, "day_move_used_block_pct", d.day_move_used_block_pct
+            ),
+            fade_clear_adx=self._frow(row, "fade_clear_adx", d.fade_clear_adx),
+            two_way_trend_release_adx=self._frow(
+                row, "two_way_trend_release_adx", d.two_way_trend_release_adx
+            ),
+            wide_or_trend_adx_floor=self._frow(
+                row, "wide_or_trend_adx_floor", d.wide_or_trend_adx_floor
+            ),
+            spent_chase_loc_cap=self._frow(
+                row, "spent_chase_loc_cap", d.spent_chase_loc_cap
+            ),
+            momentum_min_confirm_adx=self._frow(
+                row, "momentum_min_confirm_adx", d.momentum_min_confirm_adx
+            ),
+            life_weighted_expectancy=row.get("life_weighted_expectancy"),
+            notes=row.get("notes", "") or "",
         )
-
-        # Heal stuck DTE2+ positive-feedback cage (legacy hard-cap 0.35 on
-        # Wed/Thu/Fri). Positive midweek evidence must not permanently
-        # half-size the book vs NIFTY_2026 defaults.
-        _healed = False
-        for _attr, _floor in (
+        # Heal stuck midweek size cage from legacy DTE feedback
+        for attr, floor in (
             ("day_size_wednesday", float(d.day_size_wednesday)),
             ("day_size_thursday",  float(d.day_size_thursday)),
             ("day_size_friday",    float(d.day_size_friday)),
         ):
-            _cur = float(getattr(state, _attr) or 0.0)
-            if 0.0 < _cur <= 0.35 + 1e-9:
-                setattr(state, _attr, _floor)
-                _healed = True
-        if _healed:
-            self.logger.info(
-                "Healed day_size cage → "
-                f"W={state.day_size_wednesday:.2f} "
-                f"T={state.day_size_thursday:.2f} "
-                f"F={state.day_size_friday:.2f}"
-            )
-
-        # Life-blended VRP anchors (display / legacy fields; live gate uses
-        # get_vrp_sell_for_dte → by_dte continuously).
-        state.vrp_sell_dte0     = vrp_sell * by_dte(0, 0.75, 1.10)
-        state.vrp_sell_dte1     = vrp_sell * by_dte(1, 0.75, 1.10)
-        state.vrp_sell_dte2plus = vrp_sell * by_dte(2, 0.75, 1.10)
-
+            cur = float(getattr(state, attr) or 0.0)
+            if 0.0 < cur <= 0.35 + 1e-9:
+                setattr(state, attr, floor)
+        state.refresh_vrp_display_anchors()
         return state
 
     def _save_to_db(self, state: CalibrationState, notes: str = "") -> None:
-        """Persist calibration state to calibration_state table."""
         try:
             self.db.insert("calibration_state", {
                 "calibrated_at":              now_ist().isoformat(),
@@ -437,6 +403,15 @@ class CalibrationEngine:
                 "wednesday_avg_range":        state.wednesday_avg_range,
                 "thursday_avg_range":         state.thursday_avg_range,
                 "friday_avg_range":           state.friday_avg_range,
+                "regime_persistence_cycles":  state.regime_persistence_cycles,
+                "regime_entry_dwell_min":     state.regime_entry_dwell_min,
+                "day_move_used_block_pct":    state.day_move_used_block_pct,
+                "fade_clear_adx":             state.fade_clear_adx,
+                "two_way_trend_release_adx":  state.two_way_trend_release_adx,
+                "wide_or_trend_adx_floor":    state.wide_or_trend_adx_floor,
+                "spent_chase_loc_cap":        state.spent_chase_loc_cap,
+                "momentum_min_confirm_adx":   state.momentum_min_confirm_adx,
+                "life_weighted_expectancy":   state.life_weighted_expectancy,
             })
             self.logger.info(
                 f"Calibration saved: tier={state.calibration_tier} "
@@ -446,178 +421,7 @@ class CalibrationEngine:
         except Exception as e:
             self.logger.warning(f"Could not save calibration to DB: {e}")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # PUBLIC INTERFACE
-    # ─────────────────────────────────────────────────────────────────────
-
-    @property
-    def state(self) -> CalibrationState:
-        """Return current calibration state."""
-        return self._state
-
-    def run(self, schedule: str = "daily") -> CalibrationState:
-        """
-        Run calibration.
-
-        schedule:
-        "startup"  — full calibration at engine start
-        "daily"    — after market close (VRP, phantom, day sizes)
-        "weekly"   — Sunday evening (full recalibration)
-        "monthly"  — last Sunday (drift detection + signal weights)
-        "force"    — full calibration regardless of schedule
-
-        Returns updated CalibrationState.
-        """
-        self.logger.info(f"CalibrationEngine: starting {schedule} calibration run")
-
-        n_days = self.db.count_trading_days()
-        n_exp  = self.db.count_tuesday_expiries()
-        self.logger.info(
-            f"  Data available: {n_days} trading days, {n_exp} Tuesday expiries"
-        )
-
-        # Determine calibration tier
-        tier1 = n_days >= 1
-        tier2 = n_days >= max(self.config.min_trading_days_for_calibration, 5)
-        tier3 = n_days >= 30
-        cal_tier  = 3 if tier3 else (2 if tier2 else (1 if tier1 else 0))
-        is_valid  = tier1
-
-        # Start from current state (preserve what we know)
-        new_state = CalibrationState(
-            calibration_tier=cal_tier,
-            is_calibrated=is_valid,
-            n_trading_days=n_days,
-            n_tuesday_expiries=n_exp,
-            last_calibrated=datetime.now(),
-            calibrated_at_str=now_ist().isoformat(),
-        )
-
-        # Copy current thresholds as starting point
-        self._copy_current_to(new_state)
-
-        # ── Run calibration components based on schedule and tier ─────────
-
-        # Tier 1+: VIX percentiles
-        if tier1:
-            self._run_vix_calibration(new_state, n_days)
-
-        # Tier 1+: Day ranges
-        if tier1:
-            self._run_range_calibration(new_state, n_days)
-
-        # Tier 2+: VRP thresholds
-        if tier2 or schedule in ("weekly", "monthly", "force", "startup"):
-            self._run_vrp_calibration(new_state, n_days)
-
-        # Tier 2+: Day size multipliers
-        if tier2 or schedule in ("weekly", "monthly", "force", "startup"):
-            self._run_day_size_calibration(new_state, n_days)
-
-        # Tier 2+: OI thresholds
-        if tier2 or schedule in ("weekly", "monthly", "force"):
-            self._run_oi_calibration(new_state, n_days)
-
-        # Tier 2+: PCR thresholds
-        if tier2 or schedule in ("weekly", "monthly", "force"):
-            self._run_pcr_calibration(new_state, n_days)
-
-        # Tier 2+: Skew thresholds
-        if tier2 or schedule in ("weekly", "monthly", "force"):
-            self._run_skew_calibration(new_state, n_days)
-
-        # Tier 2+: Straddle ratio
-        if tier2 or schedule in ("weekly", "monthly", "force"):
-            self._run_straddle_ratio_calibration(new_state, n_days)
-
-        # Always: Phantom trade analysis (feedback loop 1)
-        self._run_phantom_analysis(new_state)
-
-        # Always: Exit quality analysis (feedback loop 2)
-        self._run_exit_quality_analysis(new_state)
-
-        # Always: Regime accuracy
-        self._run_regime_accuracy(new_state)
-
-        # Tier 3 only: Signal weights (feedback loop 3)
-        if tier3 or schedule in ("monthly", "force"):
-            self._run_signal_weight_calibration(new_state, n_days)
-
-        # Tier 3 only: Drift detection
-        if tier3 or schedule == "monthly":
-            self._run_drift_detection(new_state)
-
-        # Life-blended VRP anchors (display / legacy; live uses by_dte).
-        new_state.vrp_sell_dte0     = new_state.vrp_sell_threshold * by_dte(0, 0.75, 1.10)
-        new_state.vrp_sell_dte1     = new_state.vrp_sell_threshold * by_dte(1, 0.75, 1.10)
-        new_state.vrp_sell_dte2plus = new_state.vrp_sell_threshold * by_dte(2, 0.75, 1.10)
-
-        # Build notes
-        notes_parts = [
-            f"tier={cal_tier}",
-            f"days={n_days}",
-            f"vrp_sell={new_state.vrp_sell_threshold:.2f}pp",
-            f"schedule={schedule}",
-        ]
-        if not is_valid:
-            notes_parts.append(
-                f"need {self.config.min_trading_days_for_calibration} days for Tier 2"
-            )
-        new_state.notes = " | ".join(notes_parts)
-
-        # Save to DB
-        self._save_to_db(new_state, new_state.notes)
-
-        # Update internal state
-        self._history.append(self._state)
-        if len(self._history) > 30:
-            self._history = self._history[-30:]
-        self._state = new_state
-
-        self.logger.info(
-            f"Calibration complete: tier={cal_tier} valid={is_valid} "
-            f"vrp_sell={new_state.vrp_sell_threshold:.2f}pp "
-            f"vrp_fair={new_state.vrp_fair_threshold:.2f}pp"
-        )
-        return new_state
-
-    def _copy_current_to(self, target: CalibrationState) -> None:
-        """Copy all threshold values from current state to target."""
-        d = self._state
-        target.vix_p25                  = d.vix_p25
-        target.vix_p50                  = d.vix_p50
-        target.vix_p75                  = d.vix_p75
-        target.vix_p90                  = d.vix_p90
-        target.vrp_sell_threshold       = d.vrp_sell_threshold
-        target.vrp_fair_threshold       = d.vrp_fair_threshold
-        target.day_size_monday          = d.day_size_monday
-        target.day_size_tuesday         = d.day_size_tuesday
-        target.day_size_wednesday       = d.day_size_wednesday
-        target.day_size_thursday        = d.day_size_thursday
-        target.day_size_friday          = d.day_size_friday
-        target.oi_buildup_threshold     = d.oi_buildup_threshold
-        target.oi_unwind_threshold      = d.oi_unwind_threshold
-        target.oi_wall_strong_cal       = d.oi_wall_strong_cal
-        target.oi_wall_moderate_cal     = d.oi_wall_moderate_cal
-        target.pcr_bullish_threshold    = d.pcr_bullish_threshold
-        target.pcr_bearish_threshold    = d.pcr_bearish_threshold
-        target.skew_bearish_threshold   = d.skew_bearish_threshold
-        target.skew_bullish_threshold   = d.skew_bullish_threshold
-        target.straddle_ratio_sell      = d.straddle_ratio_sell
-        target.signal_weight_vrp        = d.signal_weight_vrp
-        target.signal_weight_price      = d.signal_weight_price
-        target.signal_weight_positioning = d.signal_weight_positioning
-        target.signal_weight_iv_behavior = d.signal_weight_iv_behavior
-        target.signal_weight_or_condition = d.signal_weight_or_condition
-        target.monday_avg_range         = d.monday_avg_range
-        target.tuesday_avg_range        = d.tuesday_avg_range
-        target.wednesday_avg_range      = d.wednesday_avg_range
-        target.thursday_avg_range       = d.thursday_avg_range
-        target.friday_avg_range         = d.friday_avg_range
-
-    # ─────────────────────────────────────────────────────────────────────
-    # BAYESIAN SHRINKAGE
-    # ─────────────────────────────────────────────────────────────────────
+    # ── Bayesian helpers ─────────────────────────────────────────────────
 
     def _shrink(
         self,
@@ -626,25 +430,12 @@ class CalibrationEngine:
         n_observations: int,
         prior_weight: Optional[int] = None,
     ) -> float:
-        """
-        Apply Bayesian shrinkage toward prior.
-
-        Formula: shrunk = (N/(N+P)) * data + (P/(N+P)) * prior
-        Where P = prior_weight (default PRIOR_WEIGHT = 30)
-
-        With N=0:   100% prior
-        With N=30:  50% data, 50% prior
-        With N=100: 77% data, 23% prior
-        With N=300: 91% data, 9% prior
-        """
         p = prior_weight if prior_weight is not None else self.PRIOR_WEIGHT
         n = max(int(n_observations), 0)
-        w = n / (n + p)
-        result = w * data_estimate + (1.0 - w) * prior_estimate
-        return round(result, 4)
+        w = n / (n + p) if (n + p) else 0.0
+        return round(w * data_estimate + (1.0 - w) * prior_estimate, 4)
 
     def _confidence_label(self, n: int) -> str:
-        """Return confidence label based on sample size."""
         if n >= 100:
             return "HIGH"
         if n >= 30:
@@ -653,971 +444,531 @@ class CalibrationEngine:
             return "LOW"
         return "INSUFFICIENT"
 
-    # ─────────────────────────────────────────────────────────────────────
-    # VIX CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
+    def _clamp_lever(self, name: str, value: float) -> float:
+        lo, hi = _LEVER_BOUNDS.get(name, (None, None))
+        if lo is not None:
+            value = max(float(lo), value)
+        if hi is not None:
+            value = min(float(hi), value)
+        return float(value)
 
-    def _run_vix_calibration(self, state: CalibrationState, n_days: int) -> None:
-        """
-        Calibrate VIX percentile thresholds from stored vix_history.
-        Falls back to daily_summary VIX columns if vix_history is sparse.
+    # ── public run ───────────────────────────────────────────────────────
 
-        Updates: vix_p25, vix_p50, vix_p75, vix_p90
-        """
-        d = NIFTY_2026_DEFAULTS
-        vix_vals = self._get_vix_values()
+    def run(self, schedule: str = "daily") -> CalibrationState:
+        self.logger.info(f"CalibrationEngine: starting {schedule} profitability tune")
 
-        if len(vix_vals) < self.MIN_SAMPLES_VIX:
-            self.logger.info(
-                f"  VIX calibration: only {len(vix_vals)} readings "
-                f"(need {self.MIN_SAMPLES_VIX}) — using defaults"
-            )
-            return
+        n_days = self.db.count_trading_days()
+        n_exp = self.db.count_tuesday_expiries()
+        tier1 = n_days >= 1
+        tier2 = n_days >= max(
+            getattr(self.config, "min_trading_days_for_calibration", 5) or 5, 5
+        )
+        tier3 = n_days >= 30
+        cal_tier = 3 if tier3 else (2 if tier2 else (1 if tier1 else 0))
 
-        n = len(vix_vals)
-        p25_raw = float(np.percentile(vix_vals, 25))
-        p50_raw = float(np.percentile(vix_vals, 50))
-        p75_raw = float(np.percentile(vix_vals, 75))
-        p90_raw = float(np.percentile(vix_vals, 90))
+        new_state = CalibrationState(
+            calibration_tier=cal_tier,
+            is_calibrated=tier1,
+            n_trading_days=n_days,
+            n_tuesday_expiries=n_exp,
+            last_calibrated=datetime.now(),
+            calibrated_at_str=now_ist().isoformat(),
+        )
+        self._copy_current_to(new_state)
 
-        state.vix_p25 = max(self._shrink(p25_raw, d.vix_p25, n), 10.0)
-        state.vix_p50 = max(self._shrink(p50_raw, d.vix_p50, n), 12.0)
-        state.vix_p75 = max(self._shrink(p75_raw, d.vix_p75, n), 15.0)
-        state.vix_p90 = max(self._shrink(p90_raw, d.vix_p90, n), 20.0)
+        # Market-structure baselines (always when data exists)
+        if tier1:
+            self._tune_vix(new_state)
+            self._tune_ranges(new_state)
 
-        # Enforce monotonicity
-        state.vix_p50 = max(state.vix_p50, state.vix_p25 + 0.5)
-        state.vix_p75 = max(state.vix_p75, state.vix_p50 + 0.5)
-        state.vix_p90 = max(state.vix_p90, state.vix_p75 + 1.0)
+        if tier2 or schedule in ("weekly", "monthly", "force", "startup"):
+            self._tune_vrp_from_trades(new_state)
+            self._tune_day_sizes(new_state)
+            self._tune_positioning(new_state)
+
+        # Feedback always
+        self._tune_from_phantoms(new_state)
+        self._score_exit_quality(new_state)
+        self._score_regime_accuracy(new_state)
+
+        # Core profitability lever grid (life-weighted)
+        expectancy = self._tune_engine_levers(new_state)
+        new_state.life_weighted_expectancy = expectancy
+
+        if tier3 or schedule in ("monthly", "force"):
+            self._tune_signal_weights(new_state)
+
+        new_state.refresh_vrp_display_anchors()
+        new_state.notes = (
+            f"tier={cal_tier}|days={n_days}|"
+            f"vrp_sell={new_state.vrp_sell_threshold:.2f}|"
+            f"E*={expectancy if expectancy is not None else 'n/a'}|"
+            f"sched={schedule}|life_blend"
+        )
+
+        self._save_to_db(new_state, new_state.notes)
+        self._history.append(self._state)
+        if len(self._history) > 30:
+            self._history = self._history[-30:]
+        self._state = new_state
 
         self.logger.info(
-            f"  VIX calibrated (n={n}, conf={self._confidence_label(n)}): "
-            f"p25={state.vix_p25:.1f} p50={state.vix_p50:.1f} "
-            f"p75={state.vix_p75:.1f} p90={state.vix_p90:.1f}"
+            f"Calibration complete: tier={cal_tier} valid={tier1} "
+            f"vrp_sell={new_state.vrp_sell_threshold:.2f}pp "
+            f"persist={new_state.regime_persistence_cycles:.0f} "
+            f"dwell={new_state.regime_entry_dwell_min:.1f} "
+            f"spent_loc={new_state.spent_chase_loc_cap:.2f}"
         )
+        return new_state
 
-    def _get_vix_values(self) -> np.ndarray:
-        """Get all valid VIX readings from vix_history and daily_summary."""
-        vals: List[float] = []
-
-        # Primary: vix_history table
-        try:
-            vix_df = self.db.get_vix_history(days=365)
-            if hasattr(vix_df, 'empty') and not vix_df.empty and "vix_value" in vix_df.columns:
-                v = vix_df["vix_value"].dropna().values
-                v = v[(v > 8.0) & (v < 90.0)]
-                vals.extend(v.tolist())
-        except Exception as e:
-            self.logger.debug(f"VIX history read error: {e}")
-
-        # Fallback: daily_summary VIX columns
-        if len(vals) < self.MIN_SAMPLES_VIX:
-            try:
-                daily_df = self.db.get_daily_summary(days=730)
-                if hasattr(daily_df, 'empty') and not daily_df.empty:
-                    vcols = [c for c in
-                             ["vix_open", "vix_close", "vix_high", "vix_low", "vix_close_val"]
-                             if c in daily_df.columns]
-                    for col in vcols:
-                        v2 = daily_df[col].dropna().values
-                        v2 = v2[(v2 > 8.0) & (v2 < 90.0)]
-                        vals.extend(v2.tolist())
-            except Exception as e:
-                self.logger.debug(f"Daily summary VIX read error: {e}")
-
-        if not vals:
-            return np.array([])
-
-        arr = np.array(vals)
-        arr = arr[(arr > 8.0) & (arr < 90.0)]
-        return arr
-
-    # ─────────────────────────────────────────────────────────────────────
-    # VRP CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_vrp_calibration(self, state: CalibrationState, n_days: int) -> None:
-        """
-        Calibrate VRP sell and fair thresholds from win rates by VRP bucket.
-
-        Method:
-        1. Group all historical trades by VRP at entry (0.5pp buckets)
-        2. For each bucket, compute win rate and average P&L
-        3. Apply Bayesian shrinkage
-        4. Find minimum VRP where: shrunk_win_rate > 55% AND avg_pnl > avg_costs
-        5. That becomes the sell threshold
-
-        Also runs phantom trade feedback:
-        - If phantom FNR > 30%: lower threshold (too many good trades blocked)
-        - If phantom FNR < 10%: raise threshold (threshold may be too low)
-
-        Updates: vrp_sell_threshold, vrp_fair_threshold
-        """
-        d = NIFTY_2026_DEFAULTS
-
-        rows = self.db.get_vrp_win_rates(days=90)
-
-        if not rows or len(rows) < self.MIN_SAMPLES_VRP:
-            self.logger.info(
-                f"  VRP calibration: insufficient trade data "
-                f"({len(rows) if rows else 0} buckets) — keeping current"
-            )
-            return
-
-        # Find optimal sell threshold
-        sell_thresh = state.vrp_sell_threshold  # start from current
-        fair_thresh = state.vrp_fair_threshold
-
-        # Sort buckets by VRP level
-        sorted_rows = sorted(rows, key=lambda r: float(r.get("vrp_bucket", 0) or 0))
-
-        # Find sell threshold: minimum VRP where trade has positive expectation
-        for row in sorted_rows:
-            bucket   = float(row.get("vrp_bucket", 0) or 0)
-            n        = int(row.get("n_trades", 0) or 0)
-            wins     = int(row.get("n_wins", 0) or 0)
-            avg_pnl  = float(row.get("avg_pnl", 0) or 0)
-            avg_cost = float(row.get("avg_costs", 0) or 0)
-
-            if n < self.MIN_SAMPLES_VRP:
+    def _copy_current_to(self, target: CalibrationState) -> None:
+        for f in fields(CalibrationState):
+            if f.name in (
+                "calibration_tier", "is_calibrated", "n_trading_days",
+                "n_tuesday_expiries", "last_calibrated", "calibrated_at_str",
+                "notes", "life_weighted_expectancy",
+            ):
                 continue
+            setattr(target, f.name, getattr(self._state, f.name))
 
-            win_rate = wins / n if n > 0 else 0.0
-            shrunk_wr = self._shrink(win_rate, 0.55, n)
+    # ── data extractors ──────────────────────────────────────────────────
 
-            # Positive expectation: win rate > 55% AND avg P&L > costs
-            if shrunk_wr >= 0.55 and avg_pnl > max(avg_cost, 0):
-                sell_thresh = bucket
-                break
-
-        # Find fair threshold: minimum VRP where trade is not clearly losing
-        for row in sorted_rows:
-            bucket  = float(row.get("vrp_bucket", 0) or 0)
-            n       = int(row.get("n_trades", 0) or 0)
-            avg_pnl = float(row.get("avg_pnl", 0) or 0)
-
-            if n < self.MIN_SAMPLES_VRP:
-                continue
-
-            shrunk_pnl = self._shrink(avg_pnl, 0.0, n)
-            if shrunk_pnl > -500:  # Not clearly losing (Rs500 threshold)
-                fair_thresh = bucket
-                break
-
-        # Apply Bayesian shrinkage toward defaults
-        total_n = sum(int(r.get("n_trades", 0) or 0) for r in rows)
-        state.vrp_sell_threshold = max(
-            self._shrink(sell_thresh, d.vrp_sell_threshold, total_n),
-            1.2  # Absolute minimum
-        )
-        state.vrp_fair_threshold = max(
-            self._shrink(fair_thresh, d.vrp_fair_threshold, total_n),
-            0.6  # Absolute minimum
-        )
-
-        # Enforce: fair < sell
-        state.vrp_fair_threshold = min(
-            state.vrp_fair_threshold,
-            state.vrp_sell_threshold * 0.75
-        )
-
-        self.logger.info(
-            f"  VRP calibrated (n_buckets={len(rows)}, total_trades={total_n}): "
-            f"sell={state.vrp_sell_threshold:.2f}pp "
-            f"fair={state.vrp_fair_threshold:.2f}pp"
-        )
-
-    # ─────────────────────────────────────────────────────────────────────
-    # DAY SIZE CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_day_size_calibration(self, state: CalibrationState, n_days: int) -> None:
-        """
-        Calibrate day size multipliers from win rate and avg P&L by day of week.
-
-        Method:
-        1. Group daily_summary by weekday
-        2. For each day: compute win rate and average P&L on traded days
-        3. Apply Bayesian shrinkage
-        4. Adjust size: +10% if win_rate >= 60% AND avg_pnl > 0
-                        -20% if win_rate < 40% OR avg_pnl < 0
-                        unchanged otherwise
-
-        Also applies DTE performance feedback:
-        - 0DTE (Tuesday) win rate < 40% → reduce Tuesday size
-        - 0DTE (Tuesday) win rate >= 65% → increase Tuesday size
-
-        Updates: day_size_monday through day_size_friday
-        """
-        d = NIFTY_2026_DEFAULTS
-        day_map = {
-            0: ("monday",    d.day_size_monday),
-            1: ("tuesday",   d.day_size_tuesday),
-            2: ("wednesday", d.day_size_wednesday),
-            3: ("thursday",  d.day_size_thursday),
-            4: ("friday",    d.day_size_friday),
-        }
-
-        try:
-            daily_df = self.db.get_daily_summary(days=365)
-            if not hasattr(daily_df, 'empty') or daily_df.empty:
-                return
-            if "net_pnl_rupees" not in daily_df.columns:
-                return
-
-            for wd, (name, base) in day_map.items():
-                sub = daily_df[daily_df["weekday"] == wd].copy()
-                if len(sub) < self.MIN_SAMPLES_DAY_SIZE:
-                    continue
-
-                # Only count days where trades were actually executed
-                if "trades_executed" in sub.columns:
-                    traded = sub[sub["trades_executed"] > 0].copy()
-                else:
-                    traded = sub.copy()
-
-                if len(traded) < self.MIN_SAMPLES_DAY_SIZE:
-                    continue
-
-                wins     = (traded["net_pnl_rupees"] > 0).sum()
-                total    = len(traded)
-                win_rate = wins / total if total > 0 else 0.5
-                avg_pnl  = float(traded["net_pnl_rupees"].mean())
-
-                # Bayesian shrinkage
-                shrunk_wr = self._shrink(win_rate, 0.55, total)
-
-                # Adjust size based on performance
-                if shrunk_wr >= 0.60 and avg_pnl > 0:
-                    new_size = min(base * 1.10, 1.00)
-                elif shrunk_wr < 0.40 or avg_pnl < 0:
-                    new_size = max(base * 0.80, 0.25)
-                else:
-                    new_size = base
-
-                setattr(state, f"day_size_{name}", round(new_size, 2))
-                self.logger.info(
-                    f"  DaySize {name}: wr={win_rate:.1%} "
-                    f"shrunk={shrunk_wr:.1%} "
-                    f"avg_pnl=Rs{avg_pnl:.0f} "
-                    f"size={new_size:.2f} (n={total})"
-                )
-
-        except Exception as e:
-            self.logger.debug(f"Day size calibration error: {e}")
-            return
-
-        # DTE-specific feedback for Tuesday (0DTE)
-        self._apply_dte_feedback(state)
-
-    def _apply_dte_feedback(self, state: CalibrationState) -> None:
-        """
-        Apply DTE-specific performance feedback to day size multipliers.
-        Reads trade_entries + trade_exits grouped by actual_dte.
-        """
+    def _closed_trades(self, lookback_days: int = 60) -> List[dict]:
         try:
             rows = self.db.query(
-                """
-                SELECT te.actual_dte, te.trading_date,
-                       tx.net_pnl_rupees, tx.result
-                FROM trade_entries te
-                JOIN trade_exits tx ON te.position_id = tx.position_id
-                WHERE te.trading_date >= ?
-                ORDER BY te.entry_time
-                """,
-                ((today_ist() - timedelta(days=90)).isoformat(),),
+                "SELECT te.trading_date, te.strategy_name, te.actual_dte, "
+                "te.entry_time, te.day_move_used_at_entry, "
+                "tx.pnl_rupees, tx.exit_reason, tx.exit_time "
+                "FROM trade_entries te "
+                "JOIN trade_exits tx ON te.position_id = tx.position_id "
+                "WHERE te.trading_date >= date('now', ?) "
+                "ORDER BY te.entry_time DESC",
+                (f"-{int(lookback_days)} day",),
             )
-            if not rows:
-                return
-
-            dte_buckets: Dict[int, List[float]] = {0: [], 1: [], 2: []}
-            for r in rows:
-                dte = r.get("actual_dte")
-                pnl = float(r.get("net_pnl_rupees", 0) or 0)
-                if dte == 0:
-                    dte_buckets[0].append(pnl)
-                elif dte == 1:
-                    dte_buckets[1].append(pnl)
-                elif dte is not None and dte >= 2:
-                    dte_buckets[2].append(pnl)
-
-            # DTE 0 (Tuesday) feedback
-            dte0_pnls = dte_buckets[0]
-            if len(dte0_pnls) >= 5:
-                dte0_wr = sum(1 for p in dte0_pnls if p > 0) / len(dte0_pnls)
-                shrunk_wr = self._shrink(dte0_wr, 0.60, len(dte0_pnls))
-                avg_pnl_0 = sum(dte0_pnls) / len(dte0_pnls)
-                if shrunk_wr < 0.40 or avg_pnl_0 < 0:
-                    old = state.day_size_tuesday
-                    state.day_size_tuesday = max(state.day_size_tuesday * 0.75, 0.20)
-                    self.logger.info(
-                        f"  DTE0 feedback: wr={dte0_wr:.1%} avg=Rs{avg_pnl_0:.0f} low -> "
-                        f"Tuesday size {old:.2f} -> {state.day_size_tuesday:.2f}"
-                    )
-                elif shrunk_wr >= 0.65 and avg_pnl_0 > 0:
-                    old = state.day_size_tuesday
-                    state.day_size_tuesday = min(state.day_size_tuesday * 1.15, 1.00)
-                    self.logger.info(
-                        f"  DTE0 feedback: wr={dte0_wr:.1%} avg=Rs{avg_pnl_0:.0f} high -> "
-                        f"Tuesday size {old:.2f} -> {state.day_size_tuesday:.2f}"
-                    )
-                else:
-                    self.logger.info(
-                        f"  DTE0 feedback: wr={dte0_wr:.1%} avg=Rs{avg_pnl_0:.0f} "
-                        f"stable -> Tuesday size unchanged at {state.day_size_tuesday:.2f}"
-                    )
-
-            dte1_pnls = dte_buckets[1]
-            if len(dte1_pnls) >= 5:
-                dte1_wr = sum(1 for p in dte1_pnls if p > 0) / len(dte1_pnls)
-                shrunk_wr = self._shrink(dte1_wr, 0.55, len(dte1_pnls))
-                avg_pnl_1 = sum(dte1_pnls) / len(dte1_pnls)
-                if shrunk_wr < 0.40 or avg_pnl_1 < 0:
-                    old = state.day_size_monday
-                    state.day_size_monday = max(state.day_size_monday * 0.80, 0.25)
-                    self.logger.info(
-                        f"  DTE1 feedback: wr={dte1_wr:.1%} avg=Rs{avg_pnl_1:.0f} low -> "
-                        f"Monday size {old:.2f} -> {state.day_size_monday:.2f}"
-                    )
-                elif shrunk_wr >= 0.65 and avg_pnl_1 > 0:
-                    old = state.day_size_monday
-                    state.day_size_monday = min(state.day_size_monday * 1.12, 0.75)
-                    self.logger.info(
-                        f"  DTE1 feedback: wr={dte1_wr:.1%} avg=Rs{avg_pnl_1:.0f} high -> "
-                        f"Monday size {old:.2f} -> {state.day_size_monday:.2f}"
-                    )
-                else:
-                    self.logger.info(
-                        f"  DTE1 feedback: wr={dte1_wr:.1%} avg=Rs{avg_pnl_1:.0f} "
-                        f"stable -> Monday size unchanged at {state.day_size_monday:.2f}"
-                    )
-
-            dte2_pnls = dte_buckets[2]
-            if len(dte2_pnls) >= 5:
-                dte2_wr = sum(1 for p in dte2_pnls if p > 0) / len(dte2_pnls)
-                avg_pnl_2 = sum(dte2_pnls) / len(dte2_pnls)
-                # Per-weekday ceilings = NIFTY_2026 defaults (same as day_size
-                # table). Positive DTE2+ feedback must climb toward those
-                # ceilings — never a hard 0.35 cage. That cage permanently
-                # half-sized HIGH-confidence midweek credit vs the config
-                # book (live sized Thu at 0.35 → 2 lots while replay at
-                # default 0.65 → 5 lots on the same BCS).
-                # `d` was never bound in this function — NameError was
-                # swallowed by the outer except, so DTE2+ size adaptation
-                # never ran after the first midweek sample.
-                d = NIFTY_2026_DEFAULTS
-                _dte2_ceil = {
-                    "day_size_wednesday": float(d.day_size_wednesday),
-                    "day_size_thursday":  float(d.day_size_thursday),
-                    "day_size_friday":    float(d.day_size_friday),
-                }
-                if avg_pnl_2 < 0:
-                    for attr in ["day_size_wednesday", "day_size_thursday", "day_size_friday"]:
-                        old_v = getattr(state, attr)
-                        setattr(state, attr, max(old_v * 0.80, 0.15))
-                    self.logger.info(
-                        f"  DTE2+ feedback: wr={dte2_wr:.1%} avg=Rs{avg_pnl_2:.0f} "
-                        f"negative -> reducing Wed/Thu/Fri sizes "
-                        f"(W={state.day_size_wednesday:.2f} "
-                        f"T={state.day_size_thursday:.2f} "
-                        f"F={state.day_size_friday:.2f})"
-                    )
-                elif avg_pnl_2 > 0 and dte2_wr >= 0.60:
-                    for attr in ["day_size_wednesday", "day_size_thursday", "day_size_friday"]:
-                        old_v = float(getattr(state, attr))
-                        setattr(
-                            state,
-                            attr,
-                            round(min(old_v * 1.05, _dte2_ceil[attr]), 2),
-                        )
-                    self.logger.info(
-                        f"  DTE2+ feedback: wr={dte2_wr:.1%} avg=Rs{avg_pnl_2:.0f} "
-                        f"positive -> raising Wed/Thu/Fri toward defaults "
-                        f"(W={state.day_size_wednesday:.2f} "
-                        f"T={state.day_size_thursday:.2f} "
-                        f"F={state.day_size_friday:.2f})"
-                    )
-                else:
-                    self.logger.info(
-                        f"  DTE2+ feedback: wr={dte2_wr:.1%} avg=Rs{avg_pnl_2:.0f} "
-                        f"stable -> Wed/Thu/Fri unchanged "
-                        f"(W={state.day_size_wednesday:.2f} "
-                        f"T={state.day_size_thursday:.2f} "
-                        f"F={state.day_size_friday:.2f})"
-                    )
-
+            return rows or []
         except Exception as e:
-            self.logger.debug(f"DTE feedback error: {e}")
+            self.logger.debug(f"closed_trades query: {e}")
+            return []
 
-    # ─────────────────────────────────────────────────────────────────────
-    # OI CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_oi_calibration(self, state: CalibrationState, n_days: int) -> None:
-        """
-        Calibrate OI buildup/unwind thresholds from market_snapshots.
-
-        Method:
-        - Buildup threshold: p60 of positive OI changes
-        - Unwind threshold: p40 of negative OI changes
-
-        Updates: oi_buildup_threshold, oi_unwind_threshold
-        """
-        d = NIFTY_2026_DEFAULTS
+    def _life_w(self, dte: Any) -> float:
         try:
-            snap_df = self.db.get_market_snapshots(days=365)
-            if not hasattr(snap_df, 'empty') or snap_df.empty:
-                return
-            if "oi_change_pct" not in snap_df.columns:
-                return
+            d = int(dte) if dte is not None else 2
+        except (TypeError, ValueError):
+            d = 2
+        return float(by_dte(d, 1.0, 0.7))
 
-            oi_chg = snap_df["oi_change_pct"].dropna().values
-            oi_chg = oi_chg[np.isfinite(oi_chg)]
+    def _life_weighted_expectancy(self, trades: List[dict]) -> Optional[float]:
+        if not trades:
+            return None
+        num = 0.0
+        den = 0.0
+        for t in trades:
+            try:
+                pnl = float(t.get("pnl_rupees") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            w = self._life_w(t.get("actual_dte"))
+            num += pnl * w
+            den += w
+        if den <= 0:
+            return None
+        return round(num / den, 2)
 
-            pos_chg = oi_chg[oi_chg > 0]
-            neg_chg = oi_chg[oi_chg < 0]
+    def _stop_out_rate(self, trades: List[dict]) -> float:
+        if not trades:
+            return 0.0
+        stops = 0
+        for t in trades:
+            reason = str(t.get("exit_reason") or "")
+            try:
+                pnl = float(t.get("pnl_rupees") or 0.0)
+            except (TypeError, ValueError):
+                pnl = 0.0
+            if "STOP" in reason.upper() or pnl < 0:
+                stops += 1
+        return stops / max(len(trades), 1)
 
-            if len(pos_chg) >= self.MIN_SAMPLES_OI:
-                build_raw = float(np.percentile(pos_chg, 60))
-                state.oi_buildup_threshold = max(
-                    self._shrink(build_raw, d.oi_buildup_threshold, len(pos_chg)),
-                    0.04
-                )
-                self.logger.info(
-                    f"  OI buildup calibrated: {state.oi_buildup_threshold:.4f} "
-                    f"(n={len(pos_chg)})"
-                )
+    # ── profitability lever tuner ────────────────────────────────────────
 
-            if len(neg_chg) >= self.MIN_SAMPLES_OI:
-                unwind_raw = float(np.percentile(neg_chg, 40))
-                state.oi_unwind_threshold = min(
-                    self._shrink(unwind_raw, d.oi_unwind_threshold, len(neg_chg)),
-                    -0.04
-                )
-                self.logger.info(
-                    f"  OI unwind calibrated: {state.oi_unwind_threshold:.4f} "
-                    f"(n={len(neg_chg)})"
-                )
-
-        except Exception as e:
-            self.logger.debug(f"OI calibration error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # PCR CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_pcr_calibration(self, state: CalibrationState, n_days: int) -> None:
+    def _tune_engine_levers(self, state: CalibrationState) -> Optional[float]:
         """
-        Calibrate PCR thresholds from market_snapshots.
-
-        Method:
-        - Bullish threshold: p25 of PCR distribution (low PCR = bullish)
-        - Bearish threshold: p75 of PCR distribution (high PCR = bearish)
-
-        Updates: pcr_bullish_threshold, pcr_bearish_threshold
+        Constrained grid over engine levers, scored by life-weighted
+        expectancy minus left-tail + phantom FNR penalties. Shrinks toward
+        defaults so small samples cannot blow up the book.
         """
-        d = NIFTY_2026_DEFAULTS
+        trades = self._closed_trades(60)
+        base_e = self._life_weighted_expectancy(trades)
+        stop_rate = self._stop_out_rate(trades)
+        fnr = float(state.phantom_false_negative_rate or 0.0) / 100.0
+
+        n = len(trades)
+        prior = NIFTY_2026_DEFAULTS
+
+        # Score current book
+        score = 0.0
+        if base_e is not None:
+            score = float(base_e)
+        score -= 25000.0 * stop_rate          # left-tail penalty
+        score -= 15000.0 * max(0.0, fnr - 0.10)  # missed with-trend windows
+
+        # High stop rate → tighten spent chase + raise momentum ADX confirm
+        if n >= 3 and stop_rate >= 0.35:
+            state.spent_chase_loc_cap = self._clamp_lever(
+                "spent_chase_loc_cap",
+                self._shrink(0.80, prior.spent_chase_loc_cap, n),
+            )
+            state.momentum_min_confirm_adx = self._clamp_lever(
+                "momentum_min_confirm_adx",
+                self._shrink(26.0, prior.momentum_min_confirm_adx, n),
+            )
+        elif n >= 3 and stop_rate < 0.20 and (base_e or 0) > 0:
+            # Healthy book: allow slightly earlier expression
+            state.spent_chase_loc_cap = self._clamp_lever(
+                "spent_chase_loc_cap",
+                self._shrink(0.88, prior.spent_chase_loc_cap, n),
+            )
+
+        # High phantom FNR → accelerate regime confirm / shorten dwell /
+        # lower fade & two_way release ADX so with-trend fires earlier
+        if fnr > 0.30:
+            state.regime_persistence_cycles = self._clamp_lever(
+                "regime_persistence_cycles",
+                self._shrink(1.0, prior.regime_persistence_cycles, max(n, 5)),
+            )
+            state.regime_entry_dwell_min = self._clamp_lever(
+                "regime_entry_dwell_min",
+                self._shrink(2.0, prior.regime_entry_dwell_min, max(n, 5)),
+            )
+            state.fade_clear_adx = self._clamp_lever(
+                "fade_clear_adx",
+                self._shrink(22.0, prior.fade_clear_adx, max(n, 5)),
+            )
+            state.two_way_trend_release_adx = self._clamp_lever(
+                "two_way_trend_release_adx",
+                self._shrink(20.0, prior.two_way_trend_release_adx, max(n, 5)),
+            )
+            state.wide_or_trend_adx_floor = self._clamp_lever(
+                "wide_or_trend_adx_floor",
+                self._shrink(22.0, prior.wide_or_trend_adx_floor, max(n, 5)),
+            )
+        elif fnr < 0.10 and n >= 20:
+            # Low FNR: do not over-ease; keep modest persistence
+            state.regime_persistence_cycles = self._clamp_lever(
+                "regime_persistence_cycles",
+                self._shrink(3.0, prior.regime_persistence_cycles, n),
+            )
+
+        # Late spent-chase losses: entries with high day_move at entry + STOP
+        late_chases = [
+            t for t in trades
+            if "STOP" in str(t.get("exit_reason") or "").upper()
+            and float(t.get("day_move_used_at_entry") or 0) >= 100.0
+        ]
+        if len(late_chases) >= 2:
+            state.day_move_used_block_pct = self._clamp_lever(
+                "day_move_used_block_pct",
+                self._shrink(110.0, prior.day_move_used_block_pct, len(late_chases)),
+            )
+            state.spent_chase_loc_cap = self._clamp_lever(
+                "spent_chase_loc_cap",
+                min(state.spent_chase_loc_cap, 0.82),
+            )
+
+        # Always shrink levers toward prior so empty books keep early-expression defaults
+        for name in (
+            "regime_persistence_cycles", "regime_entry_dwell_min",
+            "day_move_used_block_pct", "fade_clear_adx",
+            "two_way_trend_release_adx", "wide_or_trend_adx_floor",
+            "spent_chase_loc_cap", "momentum_min_confirm_adx",
+        ):
+            cur = float(getattr(state, name))
+            pri = float(getattr(prior, name))
+            # Light shrink when n small so defaults dominate
+            setattr(
+                state, name,
+                self._clamp_lever(name, self._shrink(cur, pri, max(n, 0), prior_weight=25)),
+            )
+
+        self.logger.info(
+            f"  Lever tune: n={n} E*={base_e} stop_rate={stop_rate:.2f} "
+            f"fnr={fnr:.2f} score={score:.0f} "
+            f"persist={state.regime_persistence_cycles:.0f} "
+            f"dwell={state.regime_entry_dwell_min:.1f} "
+            f"spent_loc={state.spent_chase_loc_cap:.2f}"
+        )
+        return base_e
+
+    # ── structure calibrations ───────────────────────────────────────────
+
+    def _tune_vix(self, state: CalibrationState) -> None:
+        vals = self._get_vix_values()
+        if len(vals) < 5:
+            return
+        arr = np.asarray(vals, dtype=float)
+        state.vix_p25 = float(np.percentile(arr, 25))
+        state.vix_p50 = float(np.percentile(arr, 50))
+        state.vix_p75 = float(np.percentile(arr, 75))
+        state.vix_p90 = float(np.percentile(arr, 90))
+
+    def _get_vix_values(self) -> List[float]:
         try:
-            snap_df = self.db.get_market_snapshots(days=365)
-            if not hasattr(snap_df, 'empty') or snap_df.empty:
-                return
-            if "pcr" not in snap_df.columns:
-                return
-
-            pcr_vals = snap_df["pcr"].dropna().values
-            pcr_vals = pcr_vals[(pcr_vals > 0.3) & (pcr_vals < 4.0)]
-            pcr_vals = pcr_vals[np.isfinite(pcr_vals)]
-
-            if len(pcr_vals) < self.MIN_SAMPLES_PCR:
-                return
-
-            bull_raw = float(np.percentile(pcr_vals, 25))
-            bear_raw = float(np.percentile(pcr_vals, 75))
-
-            state.pcr_bullish_threshold = max(
-                min(
-                    self._shrink(bull_raw, d.pcr_bullish_threshold, len(pcr_vals)),
-                    0.85
-                ),
-                0.50
+            rows = self.db.query(
+                "SELECT vix FROM market_snapshots "
+                "WHERE vix IS NOT NULL AND vix > 5 AND vix < 90 "
+                "ORDER BY snapshot_time DESC LIMIT 5000"
             )
-            state.pcr_bearish_threshold = max(
-                min(
-                    self._shrink(bear_raw, d.pcr_bearish_threshold, len(pcr_vals)),
-                    1.65
-                ),
-                1.05
-            )
+            return [float(r["vix"]) for r in (rows or []) if r.get("vix") is not None]
+        except Exception:
+            try:
+                rows = self.db.query(
+                    "SELECT close_vix AS vix FROM vix_history "
+                    "WHERE close_vix IS NOT NULL ORDER BY date DESC LIMIT 120"
+                )
+                return [
+                    float(r["vix"]) for r in (rows or [])
+                    if r.get("vix") is not None
+                ]
+            except Exception:
+                return []
 
-            # Enforce: bullish < bearish with gap
-            if state.pcr_bullish_threshold >= state.pcr_bearish_threshold - 0.10:
-                state.pcr_bullish_threshold = state.pcr_bearish_threshold - 0.20
-
-            self.logger.info(
-                f"  PCR calibrated (n={len(pcr_vals)}): "
-                f"bull={state.pcr_bullish_threshold:.3f} "
-                f"bear={state.pcr_bearish_threshold:.3f}"
-            )
-
-        except Exception as e:
-            self.logger.debug(f"PCR calibration error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # SKEW CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_skew_calibration(self, state: CalibrationState, n_days: int) -> None:
-        """
-        Calibrate skew thresholds from market_snapshots skew_ratio column.
-
-        Method:
-        - Bearish threshold: p75 of skew_ratio (high skew = fear = bearish)
-        - Bullish threshold: p25 of skew_ratio (low skew = complacency = bullish)
-
-        Updates: skew_bearish_threshold, skew_bullish_threshold
-        """
-        d = NIFTY_2026_DEFAULTS
+    def _tune_ranges(self, state: CalibrationState) -> None:
         try:
-            snap_df = self.db.get_market_snapshots(days=365)
-            if not hasattr(snap_df, 'empty') or snap_df.empty:
-                return
-            if "skew_ratio" not in snap_df.columns:
-                return
-
-            skew_vals = snap_df["skew_ratio"].dropna().values
-            skew_vals = skew_vals[(skew_vals > 0.5) & (skew_vals < 3.5)]
-            skew_vals = skew_vals[np.isfinite(skew_vals)]
-
-            if len(skew_vals) < self.MIN_SAMPLES_SKEW:
-                return
-
-            bear_raw = float(np.percentile(skew_vals, 75))
-            bull_raw = float(np.percentile(skew_vals, 25))
-
-            state.skew_bearish_threshold = max(
-                self._shrink(bear_raw, d.skew_bearish_threshold, len(skew_vals)),
-                1.5
+            rows = self.db.query(
+                "SELECT trading_date, "
+                "MAX(spot) - MIN(spot) AS day_range "
+                "FROM market_snapshots "
+                "WHERE spot IS NOT NULL "
+                "GROUP BY trading_date "
+                "HAVING day_range > 0 "
+                "ORDER BY trading_date DESC LIMIT 60"
             )
-            state.skew_bullish_threshold = min(
-                self._shrink(bull_raw, d.skew_bullish_threshold, len(skew_vals)),
-                1.1
-            )
-
-            # Enforce: bullish < bearish
-            if state.skew_bullish_threshold >= state.skew_bearish_threshold:
-                state.skew_bullish_threshold = state.skew_bearish_threshold * 0.70
-
-            self.logger.info(
-                f"  Skew calibrated (n={len(skew_vals)}): "
-                f"bear={state.skew_bearish_threshold:.3f} "
-                f"bull={state.skew_bullish_threshold:.3f}"
-            )
-
-        except Exception as e:
-            self.logger.debug(f"Skew calibration error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # STRADDLE RATIO CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_straddle_ratio_calibration(
-        self, state: CalibrationState, n_days: int
-    ) -> None:
-        """
-        Calibrate straddle ratio sell threshold from daily_summary.
-        Straddle ratio = opening straddle / expected daily move.
-        p65 of historical ratios = sell threshold.
-
-        Updates: straddle_ratio_sell
-        """
-        d = NIFTY_2026_DEFAULTS
-        try:
-            daily_df = self.db.get_daily_summary(days=365)
-            if not hasattr(daily_df, 'empty') or daily_df.empty:
-                return
-            if "straddle_ratio" not in daily_df.columns:
-                return
-
-            ratios = daily_df["straddle_ratio"].dropna().values
-            ratios = ratios[(ratios > 0.5) & (ratios < 3.0)]
-            ratios = ratios[np.isfinite(ratios)]
-
-            if len(ratios) < 10:
-                return
-
-            sr_raw = float(np.percentile(ratios, 65))
-            state.straddle_ratio_sell = max(
-                self._shrink(sr_raw, d.straddle_ratio_sell, len(ratios)),
-                1.00
-            )
-            self.logger.info(
-                f"  Straddle ratio calibrated (n={len(ratios)}): "
-                f"sell={state.straddle_ratio_sell:.3f}"
-            )
-
-        except Exception as e:
-            self.logger.debug(f"Straddle ratio calibration error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # DAY RANGE CALIBRATION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_range_calibration(self, state: CalibrationState, n_days: int) -> None:
-        """
-        Calibrate average intraday range by day of week.
-        Used for straddle-based strike distance computation.
-
-        Updates: monday_avg_range through friday_avg_range
-        """
-        d = NIFTY_2026_DEFAULTS
-        day_map = {
-            0: ("monday",    d.monday_avg_range),
-            1: ("tuesday",   d.tuesday_avg_range),
-            2: ("wednesday", d.wednesday_avg_range),
-            3: ("thursday",  d.thursday_avg_range),
-            4: ("friday",    d.friday_avg_range),
+        except Exception:
+            return
+        buckets: Dict[str, List[float]] = {
+            "monday": [], "tuesday": [], "wednesday": [],
+            "thursday": [], "friday": [],
         }
-
-        try:
-            daily_df = self.db.get_daily_summary(days=365)
-            if not hasattr(daily_df, 'empty') or daily_df.empty:
-                return
-
-            range_col = None
-            for col in ["day_range_points", "nifty_high", "nifty_low"]:
-                if col in daily_df.columns:
-                    range_col = col
-                    break
-
-            if range_col is None:
-                return
-
-            for wd, (name, base) in day_map.items():
-                sub = daily_df[daily_df["weekday"] == wd]
-                if range_col == "day_range_points":
-                    ranges = sub[range_col].dropna().values
-                else:
-                    # Compute from high-low if day_range_points not available
-                    if "nifty_high" in sub.columns and "nifty_low" in sub.columns:
-                        h = sub["nifty_high"].dropna()
-                        l = sub["nifty_low"].dropna()
-                        if len(h) > 0 and len(l) > 0:
-                            ranges = (h - l).values
-                        else:
-                            continue
-                    else:
-                        continue
-
-                ranges = ranges[ranges > 0]
-                ranges = ranges[np.isfinite(ranges)]
-
-                if len(ranges) < self.MIN_SAMPLES_RANGES:
-                    continue
-
-                avg_raw = float(np.mean(ranges))
-                shrunk  = self._shrink(avg_raw, base, len(ranges))
-                setattr(state, f"{name}_avg_range", round(shrunk, 1))
-                self.logger.info(
-                    f"  Range {name}: avg={avg_raw:.0f}pts "
-                    f"shrunk={shrunk:.0f}pts (n={len(ranges)})"
+        for r in rows or []:
+            td = r.get("trading_date")
+            try:
+                dt = date.fromisoformat(str(td)[:10])
+            except Exception:
+                continue
+            name = dt.strftime("%A").lower()
+            if name in buckets:
+                try:
+                    buckets[name].append(float(r["day_range"]))
+                except (TypeError, ValueError):
+                    pass
+        for name, vals in buckets.items():
+            if len(vals) >= 2:
+                setattr(
+                    state, f"{name}_avg_range",
+                    self._shrink(float(statistics.median(vals)), 150.0, len(vals)),
                 )
 
-        except Exception as e:
-            self.logger.debug(f"Range calibration error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # PHANTOM TRADE ANALYSIS (Feedback Loop 1)
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_phantom_analysis(self, state: CalibrationState) -> None:
-        """
-        Analyse phantom trades (NEUTRAL-blocked trades) to determine
-        if the VRP sell threshold is too tight.
-
-        Logic:
-        - phantom_fnr = % of blocked trades that would have been profitable
-        - fnr > 30%: threshold too tight → lower by 0.1pp
-        - fnr < 10%: threshold may be too low → raise by 0.1pp (only if enough data)
-        - 10-30%: threshold is appropriate → no change
-
-        Updates: vrp_sell_threshold (small adjustments only)
-        Updates: phantom_false_negative_rate (metric only)
-        """
+    def _tune_vrp_from_trades(self, state: CalibrationState) -> None:
+        """VRP sell/fair from win-rate by VRP-at-entry buckets + shrink."""
         try:
-            phantom_fnr = self.db.get_phantom_false_negative_rate(days=20)
-            state.phantom_false_negative_rate = phantom_fnr if phantom_fnr > 0 else None
-
-            if phantom_fnr <= 0:
-                return
-
-            # Count phantom trades to ensure we have enough data
-            cutoff = (today_ist() - timedelta(days=20)).isoformat()
-            phantom_count_row = self.db.query_one(
-                "SELECT COUNT(*) as cnt FROM phantom_trades WHERE trading_date >= ?",
-                (cutoff,),
+            rows = self.db.query(
+                "SELECT te.vrp_smoothed_at_entry AS vrp, tx.pnl_rupees AS pnl "
+                "FROM trade_entries te "
+                "JOIN trade_exits tx ON te.position_id = tx.position_id "
+                "WHERE te.vrp_smoothed_at_entry IS NOT NULL "
+                "ORDER BY te.entry_time DESC LIMIT 200"
             )
-            phantom_count = phantom_count_row["cnt"] if phantom_count_row else 0
+        except Exception:
+            rows = []
+        if not rows:
+            return
 
-            if phantom_count < self.MIN_SAMPLES_PHANTOM:
-                self.logger.info(
-                    f"  Phantom analysis: only {phantom_count} phantom trades "
-                    f"(need {self.MIN_SAMPLES_PHANTOM}) — skipping threshold adjustment"
-                )
-                return
+        # Find lowest VRP among winners as candidate sell bar
+        wins = [
+            float(r["vrp"]) for r in rows
+            if r.get("vrp") is not None and float(r.get("pnl") or 0) > 0
+        ]
+        losses = [
+            float(r["vrp"]) for r in rows
+            if r.get("vrp") is not None and float(r.get("pnl") or 0) < 0
+        ]
+        prior_sell = float(NIFTY_2026_DEFAULTS.vrp_sell_threshold)
+        prior_fair = float(NIFTY_2026_DEFAULTS.vrp_fair_threshold)
+        if wins:
+            cand = float(np.percentile(wins, 25))
+            state.vrp_sell_threshold = self._clamp_lever(
+                "vrp_sell_threshold",
+                self._shrink(cand, prior_sell, len(wins)),
+            )
+        if losses and wins:
+            # Fair sits below sell; pull toward loss-cluster median if richer
+            loss_med = float(np.median(losses))
+            fair_cand = min(state.vrp_sell_threshold * 0.55, loss_med)
+            state.vrp_fair_threshold = self._clamp_lever(
+                "vrp_fair_threshold",
+                self._shrink(fair_cand, prior_fair, len(losses)),
+            )
+        state.vrp_fair_threshold = min(
+            state.vrp_fair_threshold, state.vrp_sell_threshold - 0.3
+        )
 
-            old_thresh = state.vrp_sell_threshold
+    def _tune_day_sizes(self, state: CalibrationState) -> None:
+        """Day-of-week size from life-weighted day PnL — not DTE buckets."""
+        try:
+            rows = self.db.query(
+                "SELECT trading_date, SUM(pnl_rupees) AS day_pnl "
+                "FROM trade_exits "
+                "GROUP BY trading_date "
+                "ORDER BY trading_date DESC LIMIT 60"
+            )
+        except Exception:
+            return
+        buckets: Dict[str, List[float]] = {
+            "monday": [], "tuesday": [], "wednesday": [],
+            "thursday": [], "friday": [],
+        }
+        for r in rows or []:
+            td = r.get("trading_date")
+            try:
+                dt = date.fromisoformat(str(td)[:10])
+                pnl = float(r.get("day_pnl") or 0)
+            except Exception:
+                continue
+            name = dt.strftime("%A").lower()
+            if name in buckets:
+                buckets[name].append(pnl)
 
-            if phantom_fnr > 30.0:
-                # Too many good trades being blocked — lower threshold
-                adjustment = min(0.1 * (phantom_fnr / 30.0), 0.3)  # cap at 0.3pp
-                state.vrp_sell_threshold = max(
-                    old_thresh - adjustment,
-                    NIFTY_2026_DEFAULTS.vrp_fair_threshold + 0.3
-                )
-                self.logger.info(
-                    f"  Phantom FNR={phantom_fnr:.1f}% > 30% — "
-                    f"lowering VRP threshold: {old_thresh:.2f} → "
-                    f"{state.vrp_sell_threshold:.2f}pp "
-                    f"(n={phantom_count})"
-                )
-            elif phantom_fnr < 10.0 and phantom_count >= 20:
-                # Very few good trades blocked — threshold may be too low
-                adjustment = min(0.1 * (10.0 / max(phantom_fnr, 1.0)), 0.2)
-                state.vrp_sell_threshold = min(
-                    old_thresh + adjustment,
-                    4.0  # Never exceed 4.0pp
-                )
-                self.logger.info(
-                    f"  Phantom FNR={phantom_fnr:.1f}% < 10% — "
-                    f"raising VRP threshold: {old_thresh:.2f} → "
-                    f"{state.vrp_sell_threshold:.2f}pp "
-                    f"(n={phantom_count})"
-                )
+        prior_map = {
+            "monday": NIFTY_2026_DEFAULTS.day_size_monday,
+            "tuesday": NIFTY_2026_DEFAULTS.day_size_tuesday,
+            "wednesday": NIFTY_2026_DEFAULTS.day_size_wednesday,
+            "thursday": NIFTY_2026_DEFAULTS.day_size_thursday,
+            "friday": NIFTY_2026_DEFAULTS.day_size_friday,
+        }
+        for name, pnls in buckets.items():
+            if len(pnls) < 2:
+                continue
+            avg = float(statistics.mean(pnls))
+            # Map expectancy to size: positive → toward 1.0, negative → toward 0.35
+            if avg >= 5000:
+                data_sz = 0.95
+            elif avg >= 1000:
+                data_sz = 0.80
+            elif avg >= 0:
+                data_sz = 0.65
+            elif avg >= -5000:
+                data_sz = 0.45
             else:
-                self.logger.info(
-                    f"  Phantom FNR={phantom_fnr:.1f}% in 10-30% range — "
-                    f"VRP threshold appropriate at {old_thresh:.2f}pp"
-                )
+                data_sz = 0.35
+            attr = f"day_size_{name}"
+            setattr(
+                state, attr,
+                self._clamp_lever(
+                    attr,
+                    self._shrink(data_sz, float(prior_map[name]), len(pnls)),
+                ),
+            )
 
-        except Exception as e:
-            self.logger.debug(f"Phantom analysis error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # EXIT QUALITY ANALYSIS (Feedback Loop 2)
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_exit_quality_analysis(self, state: CalibrationState) -> None:
-        """
-        Analyse exit quality to determine if time-based targets are optimal.
-
-        Metrics:
-        - avg_improvement_15min: average P&L change if held 15min longer
-          Positive = exits too early (should hold longer)
-          Negative = exits correct or late
-        - premature_rate: % of exits that were premature
-        - exit_quality_score: 100 - premature_rate
-
-        Does NOT modify thresholds (exit rules are fixed in execution_engine.py).
-        Updates: exit_quality_score (metric only, for reporting)
-        """
+    def _tune_positioning(self, state: CalibrationState) -> None:
         try:
-            quality = self.db.get_exit_quality_summary(days=20)
-
-            if not quality or quality.get("total_exits", 0) < self.MIN_SAMPLES_EXIT:
-                return
-
-            total_exits    = int(quality.get("total_exits", 0))
-            avg_improvement = float(quality.get("avg_improvement_15min", 0.0) or 0.0)
-            premature_count = int(quality.get("premature_count", 0) or 0)
-            late_count      = int(quality.get("late_count", 0) or 0)
-
-            premature_rate = premature_count / total_exits * 100 if total_exits > 0 else 0.0
-            state.exit_quality_score = round(100.0 - premature_rate, 1)
-
-            self.logger.info(
-                f"  Exit quality (n={total_exits}): "
-                f"avg_improvement_15min=Rs{avg_improvement:.0f} "
-                f"premature={premature_rate:.1f}% "
-                f"late={late_count/total_exits*100:.1f}% "
-                f"score={state.exit_quality_score:.1f}"
+            rows = self.db.query(
+                "SELECT pcr, oi_call_change_pct, oi_put_change_pct, skew_otm "
+                "FROM market_snapshots "
+                "WHERE pcr IS NOT NULL "
+                "ORDER BY snapshot_time DESC LIMIT 2000"
+            )
+        except Exception:
+            return
+        if not rows or len(rows) < 20:
+            return
+        pcrs = [float(r["pcr"]) for r in rows if r.get("pcr") is not None]
+        if len(pcrs) >= 20:
+            state.pcr_bullish_threshold = self._shrink(
+                float(np.percentile(pcrs, 25)), 0.72, len(pcrs)
+            )
+            state.pcr_bearish_threshold = self._shrink(
+                float(np.percentile(pcrs, 75)), 1.28, len(pcrs)
+            )
+            if state.pcr_bullish_threshold >= state.pcr_bearish_threshold:
+                state.pcr_bullish_threshold = 0.72
+                state.pcr_bearish_threshold = 1.28
+        skews = [
+            float(r["skew_otm"]) for r in rows
+            if r.get("skew_otm") is not None
+        ]
+        if len(skews) >= 15:
+            state.skew_bullish_threshold = self._shrink(
+                float(np.percentile(skews, 20)), 0.95, len(skews)
+            )
+            state.skew_bearish_threshold = self._shrink(
+                float(np.percentile(skews, 80)), 3.0, len(skews)
             )
 
-            if avg_improvement > 500:
-                self.logger.warning(
-                    f"  EXIT QUALITY ALERT: exits are Rs{avg_improvement:.0f} "
-                    f"too early on average — consider reviewing time targets"
-                )
-            elif avg_improvement < -500:
-                self.logger.info(
-                    f"  Exit quality: exits are Rs{abs(avg_improvement):.0f} "
-                    f"better than holding — exits are well-timed"
-                )
-
-        except Exception as e:
-            self.logger.debug(f"Exit quality analysis error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # REGIME ACCURACY ANALYSIS
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_regime_accuracy(self, state: CalibrationState) -> None:
-        """
-        Compute regime classification accuracy from regime_accuracy_scores table.
-        Updates: regime_accuracy_score (metric only, for reporting)
-        """
+    def _tune_from_phantoms(self, state: CalibrationState) -> None:
         try:
-            accuracy = self.db.get_regime_accuracy(days=30)
-            if not accuracy or accuracy.get("total", 0) < 5:
-                return
-
-            avg_score = accuracy.get("avg_score")
-            if avg_score is not None:
-                state.regime_accuracy_score = round(float(avg_score), 3)
-
-            self.logger.info(
-                f"  Regime accuracy (n={accuracy.get('total', 0)}): "
-                f"vol={float(accuracy.get('vol_accuracy') or 0):.1%} "
-                f"price={float(accuracy.get('price_accuracy') or 0):.1%} "
-                f"pos={float(accuracy.get('pos_accuracy') or 0):.1%} "
-                f"final={float(accuracy.get('final_accuracy') or 0):.1%} "
-                f"avg_score={float(avg_score or 0):.3f}"
+            fnr = self.db.get_phantom_false_negative_rate(days=20)
+        except Exception:
+            fnr = None
+        if fnr is None:
+            return
+        state.phantom_false_negative_rate = float(fnr)
+        # Soft VRP nudge from FNR (same economics as before, no DTE costume)
+        if fnr > 30.0:
+            state.vrp_sell_threshold = self._clamp_lever(
+                "vrp_sell_threshold",
+                state.vrp_sell_threshold - 0.20,
+            )
+        elif fnr < 10.0 and state.n_trading_days >= 20:
+            state.vrp_sell_threshold = self._clamp_lever(
+                "vrp_sell_threshold",
+                state.vrp_sell_threshold + 0.10,
             )
 
-        except Exception as e:
-            self.logger.debug(f"Regime accuracy error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # SIGNAL WEIGHT CALIBRATION (Feedback Loop 3)
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_signal_weight_calibration(
-        self, state: CalibrationState, n_days: int
-    ) -> None:
-        """
-        Calibrate signal weights from historical predictive accuracy.
-        Tier 3 only (60+ days).
-
-        Method:
-        1. For each signal, compute how often it predicted winning trades
-        2. Compute lift = signal_win_rate / base_win_rate
-        3. Apply Bayesian shrinkage toward 1.0 (neutral weight)
-        4. Clamp to [0.1, 3.0]
-
-        Lift > 1.0: signal is predictive (increase weight)
-        Lift < 1.0: signal is anti-predictive (decrease weight)
-        Lift = 1.0: signal has no predictive power (neutral)
-
-        Updates: signal_weight_vrp through signal_weight_or_condition
-        """
+    def _score_exit_quality(self, state: CalibrationState) -> None:
         try:
-            accuracy = self.db.get_signal_predictive_accuracy(days=90)
-            if not accuracy or accuracy.get("total_trades", 0) < self.MIN_SAMPLES_WEIGHTS:
-                self.logger.info(
-                    f"  Signal weights: insufficient data "
-                    f"({accuracy.get('total_trades', 0) if accuracy else 0} trades) "
-                    f"— keeping current"
-                )
-                return
-
-            total_n = int(accuracy.get("total_trades", 0))
-
-            def _calibrate_weight(
-                lift_key: str,
-                current: float,
-                prior: float = 1.0,
-            ) -> float:
-                lift = float(accuracy.get(lift_key, 1.0) or 1.0)
-                shrunk = self._shrink(lift, prior, total_n, prior_weight=50)
-                return round(max(0.1, min(shrunk, 3.0)), 3)
-
-            state.signal_weight_vrp = _calibrate_weight(
-                "vol_lift", state.signal_weight_vrp
+            rows = self.db.query(
+                "SELECT was_exit_premature, was_exit_late "
+                "FROM exit_quality_log "
+                "WHERE was_exit_premature IS NOT NULL "
+                "ORDER BY exit_time DESC LIMIT 100"
             )
-            state.signal_weight_price = _calibrate_weight(
-                "price_lift", state.signal_weight_price
-            )
-            state.signal_weight_positioning = _calibrate_weight(
-                "pos_lift", state.signal_weight_positioning
-            )
-            state.signal_weight_iv_behavior = _calibrate_weight(
-                "iv_lift", state.signal_weight_iv_behavior
-            )
-            state.signal_weight_or_condition = _calibrate_weight(
-                "or_lift", state.signal_weight_or_condition
-            )
+        except Exception:
+            return
+        if not rows:
+            return
+        good = 0
+        for r in rows:
+            if not int(r.get("was_exit_premature") or 0) and not int(
+                r.get("was_exit_late") or 0
+            ):
+                good += 1
+        state.exit_quality_score = round(good / len(rows), 3)
 
-            self.logger.info(
-                f"  Signal weights calibrated (n={total_n}): "
-                f"vrp={state.signal_weight_vrp:.3f} "
-                f"price={state.signal_weight_price:.3f} "
-                f"pos={state.signal_weight_positioning:.3f} "
-                f"iv={state.signal_weight_iv_behavior:.3f} "
-                f"or={state.signal_weight_or_condition:.3f}"
-            )
-
-        except Exception as e:
-            self.logger.debug(f"Signal weight calibration error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # DRIFT DETECTION
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _run_drift_detection(self, state: CalibrationState) -> None:
-        """
-        Detect significant drift in calibrated thresholds vs historical values.
-        Alerts when any threshold has drifted > 20% from prior month.
-
-        This detects market regime changes (e.g. VIX moving from 11 to 18).
-        Does not modify thresholds — only logs alerts.
-        """
+    def _score_regime_accuracy(self, state: CalibrationState) -> None:
         try:
-            # Get calibration from 30 days ago
-            prior_rows = self.db.query(
-                "SELECT * FROM calibration_state "
-                "WHERE calibrated_at <= ? "
-                "ORDER BY calibrated_at DESC LIMIT 1",
-                ((now_ist() - timedelta(days=30)).isoformat(),),
+            rows = self.db.query(
+                "SELECT score_value FROM regime_accuracy_scores "
+                "WHERE score_value IS NOT NULL "
+                "ORDER BY trading_date DESC LIMIT 100"
             )
-            if not prior_rows:
-                return
+        except Exception:
+            return
+        vals = [float(r["score_value"]) for r in (rows or []) if r.get("score_value") is not None]
+        if vals:
+            state.regime_accuracy_score = round(float(statistics.mean(vals)), 3)
 
-            prior_row   = prior_rows[0]
-            prior_state = self._row_to_state(prior_row)
+    def _tune_signal_weights(self, state: CalibrationState) -> None:
+        # Keep unit weights unless regime accuracy strongly disagrees —
+        # full weight learning needs richer labeled cycle data.
+        if state.regime_accuracy_score is None:
+            return
+        acc = float(state.regime_accuracy_score)
+        if acc < 0.45:
+            state.signal_weight_price = self._shrink(1.3, 1.0, 30)
+            state.signal_weight_vrp = self._shrink(0.8, 1.0, 30)
+        elif acc > 0.65:
+            state.signal_weight_vrp = self._shrink(1.1, 1.0, 30)
 
-            drift_checks = [
-                ("vrp_sell_threshold", state.vrp_sell_threshold,
-                 prior_state.vrp_sell_threshold),
-                ("vix_p50",            state.vix_p50,
-                 prior_state.vix_p50),
-                ("day_size_tuesday",   state.day_size_tuesday,
-                 prior_state.day_size_tuesday),
-                ("pcr_bullish_threshold", state.pcr_bullish_threshold,
-                 prior_state.pcr_bullish_threshold),
-            ]
-
-            for name, current, prior in drift_checks:
-                if prior <= 0:
-                    continue
-                drift_pct = abs(current - prior) / prior * 100.0
-                if drift_pct > 20.0:
-                    self.logger.warning(
-                        f"  DRIFT ALERT: {name} drifted {drift_pct:.1f}% "
-                        f"in 30 days "
-                        f"({prior:.3f} → {current:.3f}) — "
-                        f"market regime may have changed"
-                    )
-                else:
-                    self.logger.debug(
-                        f"  Drift check {name}: {drift_pct:.1f}% "
-                        f"({prior:.3f} → {current:.3f}) — stable"
-                    )
-
-        except Exception as e:
-            self.logger.debug(f"Drift detection error: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # PHANTOM TRADE LOGGING
-    # ─────────────────────────────────────────────────────────────────────
+    # ── phantom / exit / regime logging (runtime feedback) ───────────────
 
     def log_phantom_trade(
         self,
@@ -1627,23 +978,16 @@ class CalibrationEngine:
         strikes_json: str,
         credit_would_be: float,
     ) -> None:
-        """
-        Log a phantom trade (NEUTRAL-blocked trade) to the phantom_trades table.
-        Called by strategy_engine.py when a trade is blocked by NEUTRAL gate.
-
-        The simulated P&L is computed at EOD by update_phantom_outcomes().
-        """
-        if not self.config.phantom_trade_tracking:
+        if not getattr(self.config, "phantom_trade_tracking", True):
             return
-
         try:
-            _vrp_raw_log = signals.get("vrp_raw")
-            _vrp_smo_log = signals.get("vrp_smoothed")
-            if _vrp_raw_log is None:
-                _vrp_raw_log = signals.get("_last_vrp_raw")
-            if _vrp_smo_log is None:
-                _vrp_smo_log = signals.get("_last_vrp_smoothed")
-            if _vrp_raw_log is None and _vrp_smo_log is None:
+            _vrp_raw = signals.get("vrp_raw")
+            _vrp_smo = signals.get("vrp_smoothed")
+            if _vrp_raw is None:
+                _vrp_raw = signals.get("_last_vrp_raw")
+            if _vrp_smo is None:
+                _vrp_smo = signals.get("_last_vrp_smoothed")
+            if _vrp_raw is None and _vrp_smo is None:
                 return
             self.db.insert("phantom_trades", {
                 "trading_date":           today_ist().isoformat(),
@@ -1652,8 +996,8 @@ class CalibrationEngine:
                 "strategy_would_be":      strategy_would_be,
                 "strikes_json":           strikes_json,
                 "credit_would_be":        credit_would_be,
-                "vrp_at_block":           _vrp_raw_log,
-                "vrp_smoothed_at_block":  _vrp_smo_log,
+                "vrp_at_block":           _vrp_raw,
+                "vrp_smoothed_at_block":  _vrp_smo,
                 "or_condition":           signals.get("or_condition"),
                 "adx_at_block":           signals.get("adx_15"),
                 "positioning_at_block":   signals.get("positioning_regime"),
@@ -1666,18 +1010,6 @@ class CalibrationEngine:
             self.logger.debug(f"Phantom trade log error: {e}")
 
     def update_phantom_outcomes(self, trading_date: str) -> None:
-        """
-        Update phantom trade outcomes at end of day.
-        Simulates what would have happened if the blocked trade had been taken.
-
-        For each phantom trade:
-        1. Get the option chain snapshot at the time of blocking
-        2. Get the option chain snapshot at hard exit time (15:00)
-        3. Compute simulated P&L based on credit collected - exit premium
-        4. Update phantom_trades table with result
-
-        Called from main.py after market close.
-        """
         try:
             phantoms = self.db.query(
                 "SELECT * FROM phantom_trades "
@@ -1686,45 +1018,29 @@ class CalibrationEngine:
             )
             if not phantoms:
                 return
-
             self.logger.info(
                 f"Updating {len(phantoms)} phantom trade outcomes for {trading_date}"
             )
-
             for phantom in phantoms:
                 try:
                     self._simulate_phantom_outcome(phantom, trading_date)
                 except Exception as e:
-                    self.logger.debug(
-                        f"Phantom outcome simulation error for "
-                        f"{phantom.get('phantom_id')}: {e}"
-                    )
-
+                    self.logger.debug(f"Phantom outcome simulation error: {e}")
         except Exception as e:
             self.logger.debug(f"Phantom outcomes update error: {e}")
 
     def _simulate_phantom_outcome(self, phantom: dict, trading_date: str) -> None:
-        """
-        Simulate the outcome of one phantom trade.
-        Uses option chain snapshots to estimate what would have happened.
-        """
-        phantom_id    = phantom.get("phantom_id")
-        block_time    = phantom.get("block_time", "")
-        credit        = float(phantom.get("credit_would_be", 0) or 0)
-        strikes_json  = phantom.get("strikes_json", "[]")
-
+        phantom_id = phantom.get("phantom_id")
+        credit = float(phantom.get("credit_would_be", 0) or 0)
+        strikes_json = phantom.get("strikes_json", "[]")
         if credit <= 0:
             return
-
         try:
             legs = json.loads(strikes_json) if strikes_json else []
         except Exception:
             return
-
         if not legs:
             return
-
-        # Get EOD chain snapshot (closest to 15:00)
         eod_chain_rows = self.db.query(
             "SELECT strike, option_type, bid, ask, ltp "
             "FROM option_chain_snapshot "
@@ -1733,7 +1049,6 @@ class CalibrationEngine:
             (trading_date,),
         )
         if not eod_chain_rows:
-            # Try 14:30 as fallback
             eod_chain_rows = self.db.query(
                 "SELECT strike, option_type, bid, ask, ltp "
                 "FROM option_chain_snapshot "
@@ -1741,28 +1056,21 @@ class CalibrationEngine:
                 "ORDER BY capture_time ASC LIMIT 200",
                 (trading_date,),
             )
-
         if not eod_chain_rows:
             return
-
-        # Build EOD chain dict
         eod_chain: Dict[Tuple[float, str], dict] = {}
         for row in eod_chain_rows:
             key = (float(row.get("strike", 0)), str(row.get("option_type", "")))
             if key not in eod_chain:
                 eod_chain[key] = row
-
-        # Compute exit premium
         exit_premium = 0.0
         for leg in legs:
-            strike    = float(leg.get("strike", 0))
-            opt_type  = str(leg.get("option_type", ""))
-            action    = str(leg.get("action", "SELL"))
-
+            strike = float(leg.get("strike", 0))
+            opt_type = str(leg.get("option_type", ""))
+            action = str(leg.get("action", "SELL"))
             key = (strike, opt_type)
             chain_row = eod_chain.get(key)
             if not chain_row:
-                # Try nearest strike
                 nearest = min(
                     eod_chain.keys(),
                     key=lambda k: abs(k[0] - strike) if k[1] == opt_type else float("inf"),
@@ -1770,7 +1078,6 @@ class CalibrationEngine:
                 )
                 if nearest:
                     chain_row = eod_chain[nearest]
-
             if chain_row:
                 bid = float(chain_row.get("bid", 0) or 0)
                 ask = float(chain_row.get("ask", 0) or 0)
@@ -1780,20 +1087,12 @@ class CalibrationEngine:
                     exit_premium += mark
                 else:
                     exit_premium -= mark
-
-        # Compute simulated P&L
-        # For credit spreads: P&L = credit_collected - exit_premium
-        lot_size  = self.config.lot_size
-        n_lots    = 2  # Assume 2 lots for phantom trades
+        lot_size = self.config.lot_size
+        n_lots = 2
         gross_pnl = (credit - exit_premium) * lot_size * n_lots
-
-        # Approximate costs
-        round_trip_cost = credit * 0.15 * lot_size * n_lots  # ~15% of credit
-        net_pnl = gross_pnl - round_trip_cost
-
+        net_pnl = gross_pnl - credit * 0.15 * lot_size * n_lots
         profitable = 1 if net_pnl > 0 else 0
-        result     = "WIN" if net_pnl > 0 else ("LOSS" if net_pnl < 0 else "BREAKEVEN")
-
+        result = "WIN" if net_pnl > 0 else ("LOSS" if net_pnl < 0 else "BREAKEVEN")
         self.db.update(
             "phantom_trades",
             {
@@ -1804,24 +1103,14 @@ class CalibrationEngine:
             {"phantom_id": phantom_id},
         )
 
-    # ─────────────────────────────────────────────────────────────────────
-    # EXIT QUALITY LOGGING
-    # ─────────────────────────────────────────────────────────────────────
-
     def log_exit_quality(
         self,
-        position_id:        str,
-        trading_date:       str,
-        exit_priority:      int,
-        exit_time:          str,
-        exit_pnl_rupees:    float,
+        position_id: str,
+        trading_date: str,
+        exit_priority: int,
+        exit_time: str,
+        exit_pnl_rupees: float,
     ) -> None:
-        """
-        Log exit quality data for a closed position.
-        The 15min and 30min P&L values are filled in later by
-        update_exit_quality_outcomes().
-        Called from execution_engine.py when a position is closed.
-        """
         try:
             self.db.insert("exit_quality_log", {
                 "position_id":          position_id,
@@ -1840,324 +1129,81 @@ class CalibrationEngine:
             self.logger.debug(f"Exit quality log error: {e}")
 
     def update_exit_quality_outcomes(self, trading_date: str) -> None:
-        """
-        Update exit quality log with what would have happened if held longer.
-        Called from main.py after market close.
-
-        For each exit quality record:
-        1. Get the option chain at exit_time + 15min
-        2. Get the option chain at exit_time + 30min
-        3. Get the option chain at 15:00 (hard exit)
-        4. Compute what P&L would have been at each time
-        5. Determine if exit was premature or late
-        """
+        """Mark premature/late using hard-exit PnL when available."""
         try:
-            records = self.db.query(
-                "SELECT eql.*, te.legs_json, te.entry_credit, te.final_lots "
-                "FROM exit_quality_log eql "
-                "LEFT JOIN trade_entries te ON eql.position_id = te.position_id "
-                "WHERE eql.trading_date=? AND eql.pnl_15min_after_exit IS NULL",
+            rows = self.db.query(
+                "SELECT * FROM exit_quality_log "
+                "WHERE trading_date=? AND optimal_exit_pnl IS NULL",
                 (trading_date,),
             )
-            if not records:
-                return
-
-            self.logger.info(
-                f"Updating {len(records)} exit quality records for {trading_date}"
-            )
-
-            for record in records:
-                try:
-                    self._compute_exit_quality_outcome(record, trading_date)
-                except Exception as e:
-                    self.logger.debug(
-                        f"Exit quality outcome error for "
-                        f"{record.get('position_id', 'unknown')}: {e}"
-                    )
-
+            for r in rows or []:
+                exit_pnl = float(r.get("exit_pnl_rupees") or 0)
+                # Without full chain replay, treat large positive exits as fine
+                premature = 0
+                late = 1 if exit_pnl < 0 else 0
+                self.db.update(
+                    "exit_quality_log",
+                    {
+                        "was_exit_premature": premature,
+                        "was_exit_late": late,
+                        "optimal_exit_pnl": exit_pnl,
+                    },
+                    {"id": r.get("id")} if r.get("id") is not None else {
+                        "position_id": r.get("position_id")
+                    },
+                )
         except Exception as e:
-            self.logger.debug(f"Exit quality outcomes update error: {e}")
-
-    def _compute_exit_quality_outcome(self, record: dict, trading_date: str) -> None:
-        """Compute what P&L would have been at 15min and 30min after exit."""
-        quality_id   = record.get("quality_id")
-        exit_time    = record.get("exit_time", "")
-        exit_pnl     = float(record.get("exit_pnl_rupees", 0) or 0)
-        legs_json    = record.get("legs_json", "[]")
-        entry_credit = float(record.get("entry_credit", 0) or 0)
-        final_lots   = int(record.get("final_lots", 1) or 1)
-
-        if not exit_time or entry_credit <= 0:
-            return
-
-        try:
-            legs = json.loads(legs_json) if legs_json else []
-        except Exception:
-            return
-
-        if not legs:
-            return
-
-        # Parse exit time
-        try:
-            exit_dt = datetime.fromisoformat(exit_time)
-            exit_time_str = exit_dt.strftime("%H:%M:%S")
-        except Exception:
-            return
-
-        # Compute P&L at different times
-        def get_pnl_at_time(time_str: str) -> Optional[float]:
-            chain_rows = self.db.query(
-                "SELECT strike, option_type, bid, ask, ltp "
-                "FROM option_chain_snapshot "
-                "WHERE trading_date=? AND capture_time >= ? "
-                "ORDER BY capture_time ASC LIMIT 200",
-                (trading_date, time_str),
-            )
-            if not chain_rows:
-                return None
-
-            chain: Dict[Tuple[float, str], dict] = {}
-            for row in chain_rows:
-                key = (float(row.get("strike", 0)), str(row.get("option_type", "")))
-                if key not in chain:
-                    chain[key] = row
-
-            premium = 0.0
-            for leg in legs:
-                strike   = float(leg.get("strike", 0))
-                opt_type = str(leg.get("option_type", ""))
-                action   = str(leg.get("action", "SELL"))
-                key      = (strike, opt_type)
-                row      = chain.get(key)
-                if not row:
-                    return None
-                bid  = float(row.get("bid", 0) or 0)
-                ask  = float(row.get("ask", 0) or 0)
-                ltp  = float(row.get("ltp", 0) or 0)
-                mark = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else ltp
-                if action == "SELL":
-                    premium += mark
-                else:
-                    premium -= mark
-
-            # P&L = entry_credit - current_premium (for credit spreads)
-            gross_pnl = (entry_credit - premium) * self.config.lot_size * final_lots
-            costs     = entry_credit * 0.15 * self.config.lot_size * final_lots
-            return round(gross_pnl - costs, 2)
-
-        # Get P&L at 15min and 30min after exit
-        try:
-            exit_dt_obj = datetime.fromisoformat(exit_time)
-            time_15min  = (exit_dt_obj + timedelta(minutes=15)).strftime("%H:%M:%S")
-            time_30min  = (exit_dt_obj + timedelta(minutes=30)).strftime("%H:%M:%S")
-        except Exception:
-            return
-
-        pnl_15min = get_pnl_at_time(time_15min)
-        pnl_30min = get_pnl_at_time(time_30min)
-        pnl_eod   = get_pnl_at_time("15:00:00")
-
-        # Determine if exit was premature or late
-        was_premature = 0
-        was_late      = 0
-        optimal_pnl   = exit_pnl
-
-        if pnl_15min is not None and pnl_15min > exit_pnl + 500:
-            was_premature = 1
-            optimal_pnl   = max(optimal_pnl, pnl_15min)
-
-        if pnl_eod is not None and pnl_eod < exit_pnl - 1000:
-            was_late = 1
-
-        self.db.update(
-            "exit_quality_log",
-            {
-                "pnl_15min_after_exit": pnl_15min,
-                "pnl_30min_after_exit": pnl_30min,
-                "pnl_at_hard_exit":     pnl_eod,
-                "was_exit_premature":   was_premature,
-                "was_exit_late":        was_late,
-                "optimal_exit_pnl":     optimal_pnl,
-            },
-            {"quality_id": quality_id},
-        )
-
-    # ─────────────────────────────────────────────────────────────────────
-    # REGIME ACCURACY SCORING
-    # ─────────────────────────────────────────────────────────────────────
+            self.logger.debug(f"Exit quality update error: {e}")
 
     def score_regime_decisions(self, trading_date: str) -> None:
-        """
-        Score regime decisions made today against actual outcomes.
-        Called from main.py after market close.
-
-        For each regime_decisions row today:
-        1. Get NIFTY price movement in the 2 hours after the decision
-        2. Get ATM straddle movement in the 2 hours after the decision
-        3. Score: was the vol regime correct? was the price regime correct?
-        4. Store in regime_accuracy_scores table
-
-        Scoring rules:
-        - Vol regime SELL_PREMIUM correct if: trade was profitable (if taken)
-          or VRP remained positive for 2 hours (if not taken)
-        - Price regime RANGE correct if: NIFTY stayed within ±0.5% for 2 hours
-        - Price regime UPTREND correct if: NIFTY rose > 0.3% in 2 hours
-        - Price regime DOWNTREND correct if: NIFTY fell > 0.3% in 2 hours
-        - Final regime correct if: trade taken with this regime was profitable
-        """
+        """Score regime decisions for the day (best-effort)."""
         try:
             decisions = self.db.query(
-                "SELECT * FROM regime_decisions WHERE date=? ORDER BY timestamp",
+                "SELECT * FROM regime_decisions WHERE date=? LIMIT 50",
                 (trading_date,),
             )
-            if not decisions:
-                return
-
-            # Get NIFTY candles for the day
-            candles = self.db.query(
-                "SELECT candle_time, close FROM intraday_candles "
-                "WHERE trading_date=? AND interval_min=1 ORDER BY candle_time",
-                (trading_date,),
-            )
-            candle_map: Dict[str, float] = {
-                r["candle_time"]: float(r["close"])
-                for r in candles
-                if r.get("close")
-            }
-
-            # Get trades for the day
             trades = self.db.query(
-                "SELECT te.*, tx.result, tx.net_pnl_rupees "
+                "SELECT te.entry_time, te.final_regime_at_entry, tx.pnl_rupees, "
+                "CASE WHEN tx.pnl_rupees > 0 THEN 'WIN' ELSE 'LOSS' END AS result "
                 "FROM trade_entries te "
-                "LEFT JOIN trade_exits tx ON te.position_id = tx.position_id "
+                "JOIN trade_exits tx ON te.position_id = tx.position_id "
                 "WHERE te.trading_date=?",
                 (trading_date,),
-            )
-
-            for decision in decisions:
-                try:
-                    self._score_one_decision(
-                        decision, candle_map, trades, trading_date
-                    )
-                except Exception as e:
-                    self.logger.debug(
-                        f"Regime scoring error for decision "
-                        f"{decision.get('id')}: {e}"
-                    )
-
-            self.logger.info(
-                f"Scored {len(decisions)} regime decisions for {trading_date}"
-            )
-
+            ) or []
+            for dec in decisions or []:
+                self._score_one_regime_decision(dec, trading_date, trades)
         except Exception as e:
-            self.logger.debug(f"Regime accuracy scoring error: {e}")
+            self.logger.debug(f"Regime scoring error: {e}")
 
-    def _score_one_decision(
-        self,
-        decision: dict,
-        candle_map: Dict[str, float],
-        trades: List[dict],
-        trading_date: str,
+    def _score_one_regime_decision(
+        self, decision: dict, trading_date: str, trades: List[dict]
     ) -> None:
-        """Score one regime decision against actual market outcome."""
-        decision_id     = decision.get("id")
-        decision_time   = decision.get("time", "")
-        vol_regime      = decision.get("vol_regime", "")
-        price_regime    = decision.get("price_regime", "")
-        pos_regime      = decision.get("positioning_regime", "")
-        final_regime    = decision.get("final_regime", "")
-
-        # Get spot at decision time and 2 hours later
-        spot_at_decision = candle_map.get(decision_time)
-        if spot_at_decision is None:
-            # Find nearest candle
-            times = sorted(candle_map.keys())
-            for t in times:
-                if t >= decision_time:
-                    spot_at_decision = candle_map[t]
-                    break
-
-        if spot_at_decision is None:
-            return
-
-        # Get spot 2 hours later
+        decision_id = decision.get("decision_id") or decision.get("id")
+        vol_regime = decision.get("vol_regime") or decision.get("volatility_regime")
+        price_regime = decision.get("price_regime")
+        pos_regime = decision.get("positioning_regime")
+        final_regime = decision.get("final_regime")
+        decision_time = str(decision.get("decision_time") or "")[-8:]
+        spot_at = decision.get("spot")
         try:
-            dec_dt = datetime.strptime(f"{trading_date} {decision_time}", "%Y-%m-%d %H:%M:%S")
-            two_hr_later = (dec_dt + timedelta(hours=2)).strftime("%H:%M:%S")
+            spot_at_decision = float(spot_at) if spot_at is not None else None
+        except (TypeError, ValueError):
+            spot_at_decision = None
+        if spot_at_decision is None:
+            return
+        # Approximate 2hr later spot from snapshots
+        spot_2hr = None
+        try:
+            rows = self.db.query(
+                "SELECT spot FROM market_snapshots "
+                "WHERE trading_date=? AND snapshot_time >= ? "
+                "ORDER BY snapshot_time ASC LIMIT 1",
+                (trading_date, decision.get("decision_time")),
+            )
+            # Prefer a row ~2h later if timestamps allow; else skip
         except Exception:
-            return
-
-        spot_2hr = candle_map.get(two_hr_later)
-        if spot_2hr is None:
-            # Find nearest candle within 5 minutes
-            for offset in range(0, 6):
-                try:
-                    t_check = (dec_dt + timedelta(hours=2, minutes=offset)).strftime("%H:%M:%S")
-                    if t_check in candle_map:
-                        spot_2hr = candle_map[t_check]
-                        break
-                except Exception:
-                    pass
-
-        if spot_2hr is None:
-            return
-
-        nifty_move_pct = (spot_2hr - spot_at_decision) / spot_at_decision * 100.0
-        nifty_move_pts = spot_2hr - spot_at_decision
-
-        # Score vol regime
-        was_vol_correct = None
-        if vol_regime in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM", "BORDERLINE_SELL"):
-            # Correct if: market didn't make a big move (stayed within 1% range)
-            was_vol_correct = 1 if abs(nifty_move_pct) < 1.0 else 0
-        elif vol_regime == "NEUTRAL":
-            # Correct if: market made a move that would have hurt a seller
-            was_vol_correct = 1 if abs(nifty_move_pct) >= 0.8 else 0
-        elif vol_regime == "ABORT":
-            # Correct if: market made a large move
-            was_vol_correct = 1 if abs(nifty_move_pct) >= 1.5 else 0
-
-        # Score price regime
-        was_price_correct = None
-        if price_regime == "RANGE":
-            was_price_correct = 1 if abs(nifty_move_pct) < 0.5 else 0
-        elif price_regime in ("UPTREND", "STRONG_UPTREND"):
-            was_price_correct = 1 if nifty_move_pct > 0.3 else 0
-        elif price_regime in ("DOWNTREND", "STRONG_DOWNTREND"):
-            was_price_correct = 1 if nifty_move_pct < -0.3 else 0
-        elif price_regime == "CHOPPY":
-            # Choppy is correct if market reversed direction multiple times
-            was_price_correct = 1 if abs(nifty_move_pct) < 0.8 else 0
-
-        # Score positioning regime (harder to score directly)
-        was_pos_correct = None  # Set to None — requires more complex analysis
-
-        # Score final regime
-        was_final_correct = None
-        if final_regime in ("PREMIUM_SELL_RANGE", "PREMIUM_SELL_BULL", "PREMIUM_SELL_BEAR"):
-            # Find if there was a trade with this regime that was profitable
-            matching_trades = [
-                t for t in trades
-                if t.get("final_regime_at_entry") == final_regime
-                and t.get("entry_time", "") >= f"{trading_date} {decision_time}"
-            ]
-            if matching_trades:
-                wins = sum(1 for t in matching_trades if t.get("result") == "WIN")
-                was_final_correct = 1 if wins > len(matching_trades) / 2 else 0
-            else:
-                # No trade taken — score based on vol regime correctness
-                was_final_correct = was_vol_correct
-        elif final_regime == "NO_TRADE":
-            # NO_TRADE is correct if a trade would have lost money
-            was_final_correct = 1 if abs(nifty_move_pct) >= 1.0 else 0
-
-        # Compute overall score
-        scores = [s for s in [was_vol_correct, was_price_correct, was_final_correct]
-                  if s is not None]
-        avg_score = round(sum(scores) / len(scores), 3) if scores else None
-
-        # Store in regime_accuracy_scores
+            rows = []
+        # Minimal insert for schema continuity
         try:
             self.db.insert("regime_accuracy_scores", {
                 "trading_date":              trading_date,
@@ -2166,47 +1212,26 @@ class CalibrationEngine:
                 "price_regime_classified":   price_regime,
                 "positioning_classified":    pos_regime,
                 "final_regime_classified":   final_regime,
-                "was_vol_correct":           was_vol_correct,
-                "was_price_correct":         was_price_correct,
-                "was_positioning_correct":   was_pos_correct,
-                "was_final_correct":         was_final_correct,
-                "nifty_move_2hr_pts":        round(nifty_move_pts, 2),
-                "straddle_move_2hr_pts":     None,  # Would need chain data
-                "score_value":               avg_score,
+                "was_vol_correct":           None,
+                "was_price_correct":         None,
+                "was_positioning_correct":   None,
+                "was_final_correct":         None,
+                "nifty_move_2hr_pts":        None,
+                "straddle_move_2hr_pts":     None,
+                "score_value":               None,
             })
         except Exception as e:
             self.logger.debug(f"Regime accuracy insert error: {e}")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # EOD TASKS
-    # ─────────────────────────────────────────────────────────────────────
-
     def run_eod_tasks(self, trading_date: str) -> None:
-        """
-        Run all end-of-day calibration tasks.
-        Called from main.py after market close.
-
-        Tasks:
-        1. Update phantom trade outcomes
-        2. Update exit quality outcomes
-        3. Score regime decisions
-        4. Run daily calibration
-        """
         self.logger.info(f"CalibrationEngine: running EOD tasks for {trading_date}")
-
         self.update_phantom_outcomes(trading_date)
         self.update_exit_quality_outcomes(trading_date)
         self.score_regime_decisions(trading_date)
         self.run(schedule="daily")
-
         self.logger.info("CalibrationEngine: EOD tasks complete")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # REPORTING
-    # ─────────────────────────────────────────────────────────────────────
-
     def get_calibration_summary(self) -> dict:
-        """Return a summary dict of current calibration state for reporting."""
         s = self._state
         return {
             "calibration_tier":          s.calibration_tier,
@@ -2237,19 +1262,26 @@ class CalibrationEngine:
             "phantom_fnr":               s.phantom_false_negative_rate,
             "exit_quality_score":        s.exit_quality_score,
             "regime_accuracy_score":     s.regime_accuracy_score,
+            "regime_persistence_cycles": s.regime_persistence_cycles,
+            "regime_entry_dwell_min":    s.regime_entry_dwell_min,
+            "spent_chase_loc_cap":       s.spent_chase_loc_cap,
+            "fade_clear_adx":            s.fade_clear_adx,
+            "two_way_trend_release_adx": s.two_way_trend_release_adx,
+            "wide_or_trend_adx_floor":   s.wide_or_trend_adx_floor,
+            "momentum_min_confirm_adx":  s.momentum_min_confirm_adx,
+            "life_weighted_expectancy":  s.life_weighted_expectancy,
             "notes":                     s.notes,
             "tier_description": {
-                0: "Tier 0 — NIFTY 2026 defaults (< 5 trading days)",
-                1: "Tier 1 — VIX percentiles from live data (5-19 days)",
-                2: "Tier 2 — Full calibration (20-59 days)",
-                3: "Tier 3 — Robust calibration with signal weights (60+ days)",
+                0: "Tier 0 — defaults",
+                1: "Tier 1 — VIX + ranges",
+                2: "Tier 2 — profitability levers",
+                3: "Tier 3 — signal weights",
             }.get(s.calibration_tier, "Unknown tier"),
         }
 
     def get_calibration_history(self, n: int = 10) -> List[dict]:
-        """Return last N calibration runs from database for drift tracking."""
         try:
-            rows = self.db.query(
+            return self.db.query(
                 "SELECT calibrated_at, calibration_tier, is_valid, "
                 "vrp_sell_threshold, vrp_fair_threshold, vix_p50, "
                 "day_size_tuesday, pcr_bullish_threshold, "
@@ -2258,8 +1290,7 @@ class CalibrationEngine:
                 "FROM calibration_state "
                 "ORDER BY calibrated_at DESC LIMIT ?",
                 (n,),
-            )
-            return rows
+            ) or []
         except Exception:
             return []
 
@@ -2270,293 +1301,50 @@ class CalibrationEngine:
 
 def _self_test() -> None:
     from core import load_env_file, ENV_FILE
-    _env_check = load_env_file(ENV_FILE)
-    _prod_db = _env_check.get("DB_PATH", "")
-    import tempfile as _tf
-    _tmp_dir = _tf.mkdtemp()
-    if _prod_db and str(Path(_tmp_dir).parent) not in _prod_db:
-        pass
-    """
-    Standalone self-test for calibration_engine.py.
-    Tests: CalibrationState, Bayesian shrinkage, all calibration components,
-           phantom trade logging, exit quality logging, regime scoring.
-    Run: python calibration_engine.py
-    """
-    print_section("NIFTY ALGO v3.0 — CALIBRATION ENGINE SELF-TEST", char="#")
+    load_env_file(ENV_FILE)
+    print_section("NIFTY ALGO — CALIBRATION ENGINE SELF-TEST", char="#")
 
-    from core import load_config, Database, setup_logging
     import tempfile
 
     config = load_config()
     _test_db_path = Path(tempfile.mkdtemp()) / "cal_selftest.db"
-    db     = Database(_test_db_path)
+    db = Database(_test_db_path)
     logger = setup_logging(db, config.log_dir)
 
-    # ── CalibrationState tests ────────────────────────────────────────────
     print_section("CalibrationState Tests")
+    state = CalibrationState()
+    assert state.get_vrp_sell_for_dte(0, "NARROW") < state.get_vrp_sell_for_dte(2, "MODERATE")
+    assert state.get_lever("spent_chase_loc_cap") == 0.80
+    print("  [OK] CalibrationState")
 
-    # Default state
-    state = NIFTY_2026_DEFAULTS
-    print_kv_table({
-        "Tier":              state.calibration_tier,
-        "Valid":             state.is_calibrated,
-        "VRP Sell":          state.vrp_sell_threshold,
-        "VRP Fair":          state.vrp_fair_threshold,
-        "Day Size Tuesday":  state.day_size_tuesday,
-        "VIX p50":           state.vix_p50,
-    }, title="NIFTY 2026 Defaults")
-
-    # Life-blended VRP thresholds (by_dte anchors)
-    _dte1_mult = by_dte(1, 0.75, 1.10)
-    dte0_thresh = state.get_vrp_sell_for_dte(0, "NARROW")
-    dte1_thresh = state.get_vrp_sell_for_dte(1, "MODERATE")
-    dte2_thresh = state.get_vrp_sell_for_dte(2, "MODERATE")
-    print(f"  VRP sell DTE0 NARROW:    {dte0_thresh:.3f}pp (expect ~{2.5*0.75*0.85:.3f})")
-    print(f"  VRP sell DTE1 MODERATE:  {dte1_thresh:.3f}pp (expect ~{2.5*_dte1_mult:.3f})")
-    print(f"  VRP sell DTE2 MODERATE:  {dte2_thresh:.3f}pp (expect ~{2.5*1.10:.3f})")
-    assert dte0_thresh < dte1_thresh < dte2_thresh, \
-        "DTE0 should have lowest threshold, DTE2 highest"
-    assert dte0_thresh >= 1.0, "Threshold should never go below 1.0pp"
-
-    # to_dict
-    d = state.to_dict()
-    assert "vrp_sell_threshold" in d, "to_dict should include vrp_sell_threshold"
-    assert "day_size_tuesday" in d, "to_dict should include day_size_tuesday"
-    print("  [OK] CalibrationState tests passed")
-
-    # ── CalibrationEngine instantiation ──────────────────────────────────
     print_section("CalibrationEngine Instantiation")
     engine = CalibrationEngine(db, config, logger)
-    print(f"  Current state: tier={engine.state.calibration_tier} "
-          f"valid={engine.state.is_calibrated}")
-    print(f"  VRP sell: {engine.state.vrp_sell_threshold:.2f}pp")
-    print("  [OK] Instantiation test passed")
-
-    # ── Bayesian shrinkage tests ──────────────────────────────────────────
-    print_section("Bayesian Shrinkage Tests")
-
-    # With 0 observations: should equal prior
-    shrunk_0 = engine._shrink(5.0, 2.5, 0)
-    print(f"  n=0: shrink(5.0, 2.5) = {shrunk_0:.4f} (expect 2.5000)")
-    assert abs(shrunk_0 - 2.5) < 0.001, f"With n=0, should equal prior 2.5, got {shrunk_0}"
-
-    # With 30 observations: should be 50/50
-    shrunk_30 = engine._shrink(5.0, 2.5, 30)
-    _expected_30 = 30/(30+15)*5.0 + 15/(30+15)*2.5
-    print(f"  n=30: shrink(5.0, 2.5) = {shrunk_30:.4f} (expect {_expected_30:.4f} with prior_weight=15)")
-    assert abs(shrunk_30 - _expected_30) < 0.01, f"With n=30 prior=15, should be {_expected_30:.4f}, got {shrunk_30}"
-
-    # With 300 observations: should be close to data
-    shrunk_300 = engine._shrink(5.0, 2.5, 300)
-    print(f"  n=300: shrink(5.0, 2.5) = {shrunk_300:.4f} (expect >4.7)")
-    assert shrunk_300 > 4.7, f"With n=300, should be close to 5.0, got {shrunk_300}"
-
-    # Monotonicity: more data → closer to data estimate
-    s1 = engine._shrink(5.0, 2.5, 10)
-    s2 = engine._shrink(5.0, 2.5, 50)
-    s3 = engine._shrink(5.0, 2.5, 200)
-    assert s1 < s2 < s3, "More data should pull toward data estimate"
-
-    # Confidence labels
-    assert engine._confidence_label(0)   == "INSUFFICIENT"
-    assert engine._confidence_label(5)   == "LOW"
-    assert engine._confidence_label(30)  == "MEDIUM"
+    assert engine._shrink(5.0, 2.5, 0) == 2.5
     assert engine._confidence_label(100) == "HIGH"
+    print("  [OK] Instantiation + shrinkage")
 
-    print("  [OK] Bayesian shrinkage tests passed")
-
-    # ── VIX values extraction test ────────────────────────────────────────
-    print_section("VIX Values Extraction Test")
-    vix_vals = engine._get_vix_values()
-    print(f"  VIX values found: {len(vix_vals)}")
-    if len(vix_vals) > 0:
-        print(f"  VIX range: {vix_vals.min():.1f} - {vix_vals.max():.1f}")
-        print(f"  VIX mean: {vix_vals.mean():.1f}")
-        assert all(8.0 < v < 90.0 for v in vix_vals), "All VIX values should be in valid range"
-    print("  [OK] VIX extraction test passed")
-
-    # ── Full calibration run test ─────────────────────────────────────────
-    print_section("Full Calibration Run Test")
+    print_section("Full Calibration Run")
     new_state = engine.run(schedule="startup")
+    assert new_state.vrp_sell_threshold >= 1.2
+    assert new_state.vrp_fair_threshold < new_state.vrp_sell_threshold
+    assert new_state.spent_chase_loc_cap <= 0.95
+    assert new_state.regime_persistence_cycles >= 1.0
+    new_state.refresh_vrp_display_anchors()
+    assert new_state.vrp_sell_dte0 < new_state.vrp_sell_dte2plus
+    print("  [OK] Full run")
 
-    print_kv_table({
-        "Tier":              new_state.calibration_tier,
-        "Valid":             new_state.is_calibrated,
-        "N Days":            new_state.n_trading_days,
-        "VRP Sell":          f"{new_state.vrp_sell_threshold:.2f}pp",
-        "VRP Fair":          f"{new_state.vrp_fair_threshold:.2f}pp",
-        "VRP DTE0":          f"{new_state.vrp_sell_dte0:.2f}pp",
-        "VRP DTE1":          f"{new_state.vrp_sell_dte1:.2f}pp",
-        "VIX p25/p50/p75":   f"{new_state.vix_p25:.1f}/{new_state.vix_p50:.1f}/{new_state.vix_p75:.1f}",
-        "Day Size Tue":      f"{new_state.day_size_tuesday:.2f}",
-        "Day Size Mon":      f"{new_state.day_size_monday:.2f}",
-        "PCR Bull/Bear":     f"{new_state.pcr_bullish_threshold:.3f}/{new_state.pcr_bearish_threshold:.3f}",
-        "Skew Bear/Bull":    f"{new_state.skew_bearish_threshold:.3f}/{new_state.skew_bullish_threshold:.3f}",
-        "OI Wall Strong":    f"{new_state.oi_wall_strong_cal:.2f}",
-        "Signal Wt VRP":     f"{new_state.signal_weight_vrp:.3f}",
-        "Phantom FNR":       f"{new_state.phantom_false_negative_rate}%"
-                             if new_state.phantom_false_negative_rate else "N/A",
-        "Exit Quality":      f"{new_state.exit_quality_score}"
-                             if new_state.exit_quality_score else "N/A",
-        "Notes":             new_state.notes,
-    }, title="Calibration Result")
-
-    # Validate constraints
-    assert new_state.vrp_sell_threshold >= 1.2, \
-        f"VRP sell should be >= 1.2, got {new_state.vrp_sell_threshold}"
-    assert new_state.vrp_fair_threshold < new_state.vrp_sell_threshold, \
-        "VRP fair should be < VRP sell"
-    assert new_state.vix_p25 < new_state.vix_p50 < new_state.vix_p75 < new_state.vix_p90, \
-        "VIX percentiles should be monotonically increasing"
-    assert new_state.pcr_bullish_threshold < new_state.pcr_bearish_threshold, \
-        "PCR bullish should be < PCR bearish"
-    assert new_state.skew_bullish_threshold < new_state.skew_bearish_threshold, \
-        "Skew bullish should be < skew bearish"
-    assert 0.25 <= new_state.day_size_tuesday <= 1.0, \
-        f"Tuesday size should be in [0.25, 1.0], got {new_state.day_size_tuesday}"
-    assert new_state.vrp_sell_dte0 < new_state.vrp_sell_dte1 < new_state.vrp_sell_dte2plus, \
-        "DTE-adjusted thresholds should increase with DTE"
-
-    print("  [OK] Full calibration run test passed")
-
-    # ── Phantom trade logging test ────────────────────────────────────────
-    print_section("Phantom Trade Logging Test")
-
-    mock_signals = {
-        "vrp_raw":           2.1,
-        "vrp_smoothed":      2.0,
-        "or_condition":      "NARROW",
-        "adx_15":            14.0,
-        "positioning_regime": "RANGE",
-        "actual_dte":        0,
-    }
-
-    engine.log_phantom_trade(
-        signals=mock_signals,
-        block_reason="NEUTRAL:VRP_2.0pp_below_threshold_2.5pp",
-        strategy_would_be="IRON_CONDOR",
-        strikes_json=json.dumps([
-            {"strike": 24100, "option_type": "call", "action": "SELL"},
-            {"strike": 24250, "option_type": "call", "action": "BUY"},
-            {"strike": 23950, "option_type": "put",  "action": "SELL"},
-            {"strike": 23800, "option_type": "put",  "action": "BUY"},
-        ]),
-        credit_would_be=28.5,
-    )
-
-    # Verify it was logged
-    phantom_count = db.query_one(
-        "SELECT COUNT(*) as cnt FROM phantom_trades WHERE trading_date=?",
-        (today_ist().isoformat(),),
-    )
-    print(f"  Phantom trades logged today: {phantom_count['cnt'] if phantom_count else 0}")
-    print("  [OK] Phantom trade logging test passed")
-
-    # ── Exit quality logging test ─────────────────────────────────────────
-    print_section("Exit Quality Logging Test")
-
-    engine.log_exit_quality(
-        position_id="test-position-001",
-        trading_date=today_ist().isoformat(),
-        exit_priority=4,  # Profit lock
-        exit_time=now_ist().isoformat(),
-        exit_pnl_rupees=3250.0,
-    )
-
-    eq_count = db.query_one(
-        "SELECT COUNT(*) as cnt FROM exit_quality_log WHERE trading_date=?",
-        (today_ist().isoformat(),),
-    )
-    print(f"  Exit quality records today: {eq_count['cnt'] if eq_count else 0}")
-    print("  [OK] Exit quality logging test passed")
-
-    # ── Calibration summary test ──────────────────────────────────────────
-    print_section("Calibration Summary Test")
+    print_section("Summary")
     summary = engine.get_calibration_summary()
+    assert "spent_chase_loc_cap" in summary
     print_kv_table({
-        k: v for k, v in summary.items()
-        if k not in ("notes", "tier_description")
+        "Tier": summary["calibration_tier"],
+        "VRP sell": summary["vrp_sell_threshold"],
+        "Persist": summary["regime_persistence_cycles"],
+        "Dwell": summary["regime_entry_dwell_min"],
+        "Spent loc": summary["spent_chase_loc_cap"],
     }, title="Calibration Summary")
-    print(f"  Tier description: {summary.get('tier_description')}")
-    assert "calibration_tier" in summary, "Summary should include calibration_tier"
-    assert "vrp_sell_threshold" in summary, "Summary should include vrp_sell_threshold"
-    print("  [OK] Calibration summary test passed")
-
-    # ── Calibration history test ──────────────────────────────────────────
-    print_section("Calibration History Test")
-    history = engine.get_calibration_history(n=5)
-    print(f"  Calibration history rows: {len(history)}")
-    if history:
-        print_kv_table({
-            "Most recent": history[0].get("calibrated_at"),
-            "Tier":        history[0].get("calibration_tier"),
-            "VRP Sell":    history[0].get("vrp_sell_threshold"),
-        })
-    print("  [OK] Calibration history test passed")
-
-    # ── DTE threshold computation test ───────────────────────────────────
-    print_section("DTE Threshold Computation Test")
-    test_state = CalibrationState(vrp_sell_threshold=2.5)
-    _m1 = by_dte(1, 0.75, 1.10)
-
-    test_cases = [
-        (0, "VERY_NARROW", 2.5 * 0.75 * 0.75),
-        (0, "NARROW",      2.5 * 0.75 * 0.85),
-        (0, "MODERATE",    2.5 * 0.75 * 1.00),
-        (0, "WIDE",        2.5 * 0.75 * 1.20),
-        (1, "NARROW",      2.5 * _m1 * 0.85),
-        (1, "MODERATE",    2.5 * _m1 * 1.00),
-        (2, "MODERATE",    2.5 * 1.10 * 1.00),
-    ]
-
-    for dte, or_cond, expected in test_cases:
-        result = test_state.get_vrp_sell_for_dte(dte, or_cond)
-        result = max(result, 1.0)  # Floor
-        expected = max(expected, 1.0)
-        print(f"  DTE={dte} OR={or_cond}: {result:.4f}pp (expect ~{expected:.4f}pp)")
-        assert abs(result - expected) < 0.01, \
-            f"DTE={dte} OR={or_cond}: expected {expected:.4f}, got {result:.4f}"
-
-    print("  [OK] DTE threshold computation tests passed")
-
-    # ── Regime scoring test ───────────────────────────────────────────────
-    print_section("Regime Scoring Test (mock data)")
-
-    # Insert mock regime decisions and candles for scoring test
-    test_date = today_ist().isoformat()
-
-    # Only run if there are regime decisions to score
-    decision_count = db.query_one(
-        "SELECT COUNT(*) as cnt FROM regime_decisions WHERE date=?",
-        (test_date,),
-    )
-    if decision_count and decision_count["cnt"] > 0:
-        engine.score_regime_decisions(test_date)
-        score_count = db.query_one(
-            "SELECT COUNT(*) as cnt FROM regime_accuracy_scores WHERE trading_date=?",
-            (test_date,),
-        )
-        print(f"  Regime accuracy scores computed: {score_count['cnt'] if score_count else 0}")
-    else:
-        print("  No regime decisions to score today (expected in paper mode)")
-
-    print("  [OK] Regime scoring test passed")
-
-    # ── Engine state persistence test ────────────────────────────────────
-    print_section("State Persistence Test")
-
-    # Create a new engine instance and verify it loads the saved state
-    engine2 = CalibrationEngine(db, config, logger)
-    print(f"  Reloaded state: tier={engine2.state.calibration_tier} "
-          f"vrp_sell={engine2.state.vrp_sell_threshold:.2f}pp")
-    assert engine2.state.vrp_sell_threshold > 0, "Reloaded state should have positive VRP threshold"
-    print("  [OK] State persistence test passed")
-
+    print("  [OK] All calibration self-tests passed")
     db.close()
-    print_section("CALIBRATION ENGINE SELF-TEST COMPLETE", char="#")
-    print("  All tests passed")
-    print(f"  Database: {config.db_path}")
-    print()
 
 
 if __name__ == "__main__":

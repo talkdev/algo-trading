@@ -386,6 +386,42 @@ class MarketDataEngine:
         self._api_auth_fail_count: int               = 0
         self._api_auth_dead: bool                    = False
 
+    def _life_blended_session_window(self, dte) -> tuple:
+        """Entry start/end + hard exit via continuous by_dte clock blend.
+
+        Expiry anchors: 10:30–13:00 entry, 15:00 hard exit.
+        Weekly anchors: config trading_window_* / hard_exit_time.
+        """
+        def _hm_to_min(hm: str) -> float:
+            parts = str(hm).split(":")
+            return int(parts[0]) * 60 + int(parts[1])
+
+        def _min_to_hm(m: float) -> str:
+            mi = int(round(m))
+            mi = max(0, min(mi, 23 * 60 + 59))
+            return f"{mi // 60:02d}:{mi % 60:02d}"
+
+        try:
+            dte_i = int(dte) if dte is not None else 2
+        except (TypeError, ValueError):
+            dte_i = 2
+
+        exp_start, exp_end, exp_exit = "10:30", "13:00", "15:00"
+        wk_start = self.config.trading_window_start.strftime("%H:%M")
+        wk_end = self.config.trading_window_last_entry.strftime("%H:%M")
+        wk_exit = self.config.hard_exit_time.strftime("%H:%M")
+
+        start = _min_to_hm(by_dte(
+            dte_i, _hm_to_min(exp_start), _hm_to_min(wk_start)
+        ))
+        end = _min_to_hm(by_dte(
+            dte_i, _hm_to_min(exp_end), _hm_to_min(wk_end)
+        ))
+        hard = _min_to_hm(by_dte(
+            dte_i, _hm_to_min(exp_exit), _hm_to_min(wk_exit)
+        ))
+        return start, end, hard
+
     # ─────────────────────────────────────────────────────────────────────
     # INITIALISATION HELPERS
     # ─────────────────────────────────────────────────────────────────────
@@ -525,15 +561,9 @@ class MarketDataEngine:
         day_label    = ExpiryCalendar.get_day_label(today_ist())
         dte          = ExpiryCalendar.get_dte(today_ist())
 
-        # Fresh session: window from DTE, not weekday (v58).
-        if dte == 0:
-            entry_start = "10:30"
-            entry_end   = "13:00"
-            hard_exit   = "15:00"
-        else:
-            entry_start = self.config.trading_window_start.strftime("%H:%M")
-            entry_end   = self.config.trading_window_last_entry.strftime("%H:%M")
-            hard_exit   = self.config.hard_exit_time.strftime("%H:%M")
+        # Fresh session: life-blended window (expiry ↔ weekly anchors).
+        # No discrete dte==0 branch — continuous by_dte on clock minutes.
+        entry_start, entry_end, hard_exit = self._life_blended_session_window(dte)
 
         defaults = {
             "trading_date":                today_str,
@@ -3798,34 +3828,22 @@ class MarketDataEngine:
         except Exception as _ev_err:
             self.logger.debug(f"events snapshot skipped: {_ev_err}")
 
-        # ── 26. Expiry-day (DTE 0) entry window adjustment ────────────────
+        # ── 26. Life-blended entry window (expiry ↔ weekly anchors) ───────
         day_label  = self.state.get("day_label")
         actual_dte = dte if dte is not None else self.state.get("actual_dte")
-
-        # PATCH_V14: keyed on DTE, not on the weekday. The session rules
-        # below are about the CONTRACT that expires today - a late entry
-        # window that waits for the 0DTE series to be liquid, and a 15:00
-        # square-off that refuses to hold gamma into the closing auction.
-        # Neither has anything to do with it being a Tuesday. NIFTY weeklies
-        # expire on Tuesday, but when Tuesday is an NSE holiday the exchange
-        # rolls the expiry BACK to Monday, and ExpiryCalendar.get_next_expiry
-        # already does that roll - so on that Monday actual_dte is 0 and this
-        # branch used to be skipped, leaving a genuine 0DTE session running
-        # the weekly window: entries from 09:45 instead of 10:30, and a hard
-        # exit at HARD_EXIT_TIME instead of 15:00. Same defect, same fix, in
-        # strategy_engine._check_hard_gates' "wait for the 0DTE series" gate.
-        if actual_dte == 0:
-            tue_start = "10:30"
-            tue_end   = "13:00"
-            tue_exit  = "15:00"
-            if self.state.get("entry_start") != tue_start:
-                self.state["entry_start"]    = tue_start
-                self.state["entry_end"]      = tue_end
-                self.state["hard_exit_time"] = tue_exit
-                self.logger.info(
-                    f"DTE-0 expiry session ({day_label}): entry window "
-                    f"{tue_start}-{tue_end}, hard exit {tue_exit}"
-                )
+        _es, _ee, _he = self._life_blended_session_window(actual_dte)
+        if (
+            self.state.get("entry_start") != _es
+            or self.state.get("entry_end") != _ee
+            or self.state.get("hard_exit_time") != _he
+        ):
+            self.state["entry_start"] = _es
+            self.state["entry_end"] = _ee
+            self.state["hard_exit_time"] = _he
+            self.logger.info(
+                f"Session window ({day_label} dte={actual_dte}): "
+                f"entry {_es}-{_ee}, hard exit {_he}"
+            )
 
         # v3.1: a flat 35pt/3min abort is 0.19% at an 18,000 index but only
         # 0.13% at 26,000 — ordinary noise, so the gate fires constantly and

@@ -1185,6 +1185,14 @@ class Config:
         # spent_downside_bounce_no_puts left momentum_sell_side_open).
         "spent_upside", "spent_downside", "day_up_spent", "day_down_spent",
         "morning_pullback_no_calls", "post_condor_no_vertical",
+        # NEUTRAL-vol range tree refuses condors without SELL_PREMIUM —
+        # that is a sell-expression fence, not a trend stand-down
+        # (Sep23/29/Oct22: RANGE_*_CONDOR_REQUIRES_SELL_PREMIUM_GOT_NEUTRAL
+        # left momentum_sell_side_open for the whole window).
+        "condor_requires", "got_neutral", "requires_sell_premium",
+        # Wide-OR range stand-down still reaches the debit substitute so
+        # a with-trend OR break can express (Sep29/Oct22/28 archetype).
+        "range_wide_or", "wide_or_wide", "wide_or_very",
     )
 
     # ══ PATCH_V13: closing-hour trend continuation ══════════════════════
@@ -3087,6 +3095,15 @@ MIGRATION_SQL: List[str] = [
     "ALTER TABLE calibration_state ADD COLUMN regime_accuracy_score REAL",
     "ALTER TABLE calibration_state ADD COLUMN pcr_bullish_threshold REAL DEFAULT 0.72",
     "ALTER TABLE calibration_state ADD COLUMN pcr_bearish_threshold REAL DEFAULT 1.28",
+    "ALTER TABLE calibration_state ADD COLUMN regime_persistence_cycles REAL DEFAULT 2.0",
+    "ALTER TABLE calibration_state ADD COLUMN regime_entry_dwell_min REAL DEFAULT 3.0",
+    "ALTER TABLE calibration_state ADD COLUMN day_move_used_block_pct REAL DEFAULT 125.0",
+    "ALTER TABLE calibration_state ADD COLUMN fade_clear_adx REAL DEFAULT 25.0",
+    "ALTER TABLE calibration_state ADD COLUMN two_way_trend_release_adx REAL DEFAULT 22.0",
+    "ALTER TABLE calibration_state ADD COLUMN wide_or_trend_adx_floor REAL DEFAULT 25.0",
+    "ALTER TABLE calibration_state ADD COLUMN spent_chase_loc_cap REAL DEFAULT 0.85",
+    "ALTER TABLE calibration_state ADD COLUMN momentum_min_confirm_adx REAL DEFAULT 22.0",
+    "ALTER TABLE calibration_state ADD COLUMN life_weighted_expectancy REAL",
     "ALTER TABLE market_snapshots ADD COLUMN vrp_raw REAL",
     "ALTER TABLE market_snapshots ADD COLUMN vrp_smoothed REAL",
     "ALTER TABLE market_snapshots ADD COLUMN vol_regime TEXT",
