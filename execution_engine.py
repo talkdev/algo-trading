@@ -1789,6 +1789,10 @@ class ExecutionEngine:
         except Exception:
             entry_start = self.config.trading_window_start
             entry_end   = self.config.trading_window_last_entry
+        # CLEAN_LONG_V1 owns its window (09:45..13:30 bar closes, every day
+        # including expiry); the session's day-label window does not apply.
+        if str(params.get("selection_reason") or "").startswith("clean_long_v1:"):
+            entry_start, entry_end = dtime(9, 45), dtime(13, 35)
 
         if current_time > entry_end:
             return "NO_GO", {"reason": f"past_entry_window_{entry_end}"}
@@ -1825,6 +1829,8 @@ class ExecutionEngine:
         dt2        = datetime.combine(today_ist(), hard_exit)
         mins_to_exit = (dt2 - dt1).total_seconds() / 60.0
 
+        if str(params.get("selection_reason") or "").startswith("clean_long_v1:"):
+            min_buffer = 0.0  # its own 15:00 exit is the time rule
         if mins_to_exit < min_buffer:
             return "NO_GO", {
                 "reason": f"only_{mins_to_exit:.0f}min_before_hard_exit_need_{min_buffer:.0f}"
@@ -3007,6 +3013,87 @@ class ExecutionEngine:
             "entry_value":         entry_value,
         }
 
+    def _monitor_clean_long(
+        self, position: dict, spot: float, liq_premium: float
+    ) -> Tuple[str, int, dict]:
+        """Misc/clean_long_v1_preregistration.md, v1b exits, on spot:
+        stop at the stop-anchor (OR midpoint, or far OR extreme on a
+        failed-breakout mid-flip); once spot is +1R in favour the stop
+        trails at max(entry, best - 1R) (mirrored for puts); flat at
+        15:00. R = |entry spot - stop-anchor|."""
+        reason = str(position.get("selection_reason") or "")
+        try:
+            kv = dict(p.split("=", 1) for p in reason.split(":")[1:] if "=" in p)
+            direction = 1 if int(kv.get("dir", "1")) > 0 else -1
+            or_mid = float(kv["or_mid"])
+            # Prefer explicit stop= (flip trades); fall back to or_mid.
+            stop_anchor = float(kv["stop"]) if "stop" in kv else or_mid
+            es = float(position.get("entry_spot") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            self.logger.error(f"clean_long: unparseable reason {reason!r}")
+            return "HOLD", 0, {"reason_detail": "clean_long_unparseable"}
+        if es <= 0 or spot <= 0:
+            return "HOLD", 0, {"reason_detail": "clean_long_no_spot"}
+        pid = str(position.get("position_id"))
+        st = self.market_engine.state
+        best_map = dict(st.get("clean_long_best") or {})
+        best = float(best_map.get(pid, es))
+        best = max(best, spot) if direction > 0 else min(best, spot)
+        best_map[pid] = best
+        st["clean_long_best"] = best_map
+        R = abs(es - stop_anchor)
+        stop = stop_anchor
+        if R > 0 and (best - es) * direction >= R:
+            trail = best - direction * R
+            stop = (
+                max(stop_anchor, es, trail) if direction > 0
+                else min(stop_anchor, es, trail)
+            )
+        # Breakeven (CLEAN_LONG_BE_R): once spot has gone be_r x R in favour,
+        # the stop is never worse than the entry spot.
+        _be_r = float(getattr(self.config, "clean_long_be_r", 0.0) or 0.0)
+        if _be_r > 0 and R > 0 and (best - es) * direction >= _be_r * R:
+            stop = max(stop, es) if direction > 0 else min(stop, es)
+        # Same sign convention as the debit ladder: a long's liquidation
+        # premium is stored negative, its entry_credit is -debit.
+        try:
+            entry_value = abs(float(position.get("entry_credit") or 0.0))
+            value = -float(liq_premium or 0.0)
+        except (TypeError, ValueError):
+            entry_value, value = 0.0, 0.0
+        winning = entry_value > 0 and value > entry_value
+        ctx = {
+            "stop_spot": round(stop, 2),
+            "best_spot": round(best, 2),
+            "R": round(R, 2),
+            "stop_anchor": round(stop_anchor, 2),
+        }
+        # Per-trade rupee backstop (CLEAN_LONG_RISK_RS): open loss at the
+        # liquidation bid plus entry and estimated exit costs.
+        _risk_rs = float(getattr(self.config, "clean_long_risk_rs", 0.0) or 0.0)
+        if _risk_rs > 0 and entry_value > 0:
+            try:
+                _qty = int(position.get("final_lots") or 0) * float(self.config.lot_size or 65)
+                _costs = 2.0 * float(position.get("entry_costs_rupees") or 0.0)
+            except (TypeError, ValueError):
+                _qty, _costs = 0.0, 0.0
+            _open_loss = (entry_value - value) * _qty + _costs
+            ctx["open_loss_rs"] = round(_open_loss, 0)
+            if _qty > 0 and _open_loss >= _risk_rs:
+                ctx["reason_detail"] = "clean_long_risk_cap"
+                return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, ctx
+        if (spot - stop) * direction <= 0:
+            ctx["reason_detail"] = (
+                "clean_long_trail_stop" if stop != stop_anchor else "clean_long_or_mid_stop"
+            )
+            if winning:
+                return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, ctx
+            return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, ctx
+        if now_ist().time() >= dtime(15, 0):
+            ctx["reason_detail"] = "clean_long_time_15:00"
+            return ("CLOSE_TARGET" if winning else "CLOSE_STOP"), EXIT_PRIORITY_TIME_TARGET, ctx
+        return "HOLD", 0, ctx
+
     def monitor_position(
         self, position: dict, signals: dict
     ) -> Tuple[str, int, dict]:
@@ -3134,6 +3221,10 @@ class ExecutionEngine:
         opening_straddle = float(position.get("opening_straddle_at_entry") or 0)
         profit_lock_activated = bool(position.get("profit_lock_activated"))
         profit_lock_stop_level = position.get("profit_lock_stop_level")
+
+        # CLEAN_LONG_V1 positions run only the pre-registered exits.
+        if str(position.get("selection_reason") or "").startswith("clean_long_v1:"):
+            return self._monitor_clean_long(position, spot, liq_premium)
 
         _hard_take = self._hard_profit_take_exit(
             position, liq_premium, current_premium)

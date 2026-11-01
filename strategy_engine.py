@@ -9058,8 +9058,14 @@ class StrategyEngine:
         signals:          dict,
         size_mult:        float,
         late:             bool = False,
+        strike_override:  Optional[float] = None,
+        clean:            bool = False,
     ) -> dict:
         """Build a single-leg long-premium breakout position.
+
+        clean=True (CLEAN_LONG_V1): the strike is given and the momentum edge
+        and risk-budget refusals are skipped — the pre-registered rules own
+        the trade; FORCE_LOTS still sets the size.
 
         Deliberately separate from compute_params(): that function is a
         credit-structure pipeline — it rejects non-positive net credit, gates
@@ -9091,9 +9097,14 @@ class StrategyEngine:
 
         opt_type   = "call" if direction > 0 else "put"
         strat_name = LONG_CALL if direction > 0 else LONG_PUT
-        strike, err, _prem = self._momentum_pick_strike(chain, spot, opt_type)
-        if strike is None:
-            return {"valid": False, "reason": err}
+        if strike_override is not None:
+            strike = float(strike_override)
+            if strike not in chain or opt_type not in (chain.get(strike) or {}):
+                return {"valid": False, "reason": f"strike_{strike:.0f}_not_in_chain"}
+        else:
+            strike, err, _prem = self._momentum_pick_strike(chain, spot, opt_type)
+            if strike is None:
+                return {"valid": False, "reason": err}
 
         ok, verr = self._validate_leg(chain, strike, opt_type, "BUY")
         if not ok:
@@ -9137,7 +9148,7 @@ class StrategyEngine:
         target_frac = float(getattr(cfg, "momentum_target_frac", 0.60))
         expected_pts = exec_price * target_frac
         _min_over = float(getattr(cfg, "min_target_over_friction", 1.25))
-        if expected_pts < friction_pts * max(_min_over, 1.0):
+        if not clean and expected_pts < friction_pts * max(_min_over, 1.0):
             return {
                 "valid": False,
                 "reason": (
@@ -9182,7 +9193,7 @@ class StrategyEngine:
         sized = raw_lots * sched
         min_lots = float(getattr(cfg, "momentum_min_lots", 0.60))
         if sized < min_lots:
-            if raw_lots >= 1.0:
+            if raw_lots >= 1.0 or clean:
                 sized = 1.0
             else:
                 return {
@@ -10305,7 +10316,265 @@ class StrategyEngine:
         self._persist_decision(signals, "NONE", reason, None, "NO_TRADE")
         return {"action": "NO_TRADE", "reason": reason}
 
+    # ── CLEAN_LONG_V1: Misc/clean_long_v1_preregistration.md (variant v1b) ──
+    CLEAN_OR_END = "09:44"
+    CLEAN_WIN = ("09:45", "13:30")
+
+    def _clean_long_no_trade(self, signals: dict, reason: str) -> dict:
+        self._log_decision(signals, "NO_TRADE", reason)
+        self._persist_decision(signals, "NONE", reason, None, "NO_TRADE")
+        self.market_engine.finalize_cycle_log(
+            "NO_TRADE", reason, self._count_open_positions()
+        )
+        return {"action": "NO_TRADE", "reason": reason}
+
+    def _clean_long_exhaust_call(self, or_loc: float, or_width: float) -> bool:
+        """True when a CALL breakout is refused: OR closed near its high on a
+        narrow morning range (upside already spent inside the OR). Wide ORs
+        that close high (e.g. 10-13, 10-15) still pass."""
+        loc_cut = float(getattr(self.config, "clean_long_exhaust_or_loc", 0.85) or 0.85)
+        width_cut = float(getattr(self.config, "clean_long_exhaust_or_width", 120.0) or 0.0)
+        if width_cut <= 0:
+            return False
+        return or_loc >= loc_cut and or_width <= width_cut
+
+    def _clean_long_weak_call(
+        self, or_loc: float, or_width: float, ext: float, sig_t: str
+    ) -> bool:
+        """True when a morning CALL is a tiny mid-range OR poke (false-break
+        chop). Afternoon reclaims after a spent put (e.g. 10-28 12:45) are
+        not weak — they often carry the real trend."""
+        if sig_t > "11:00":
+            return False
+        frac = float(getattr(self.config, "clean_long_weak_ext_frac", 0.05) or 0.0)
+        lo = float(getattr(self.config, "clean_long_weak_or_loc_lo", 0.40) or 0.0)
+        hi = float(getattr(self.config, "clean_long_weak_or_loc_hi", 0.60) or 1.0)
+        if frac <= 0 or or_width <= 0:
+            return False
+        return lo <= or_loc <= hi and (ext / or_width) < frac
+
+    def _clean_long_spent_put(self, or_width: float, sig_t: str) -> bool:
+        """True when a PUT is a late breakdown after a very wide OR — the
+        move is already spent inside the morning range and often reclaims
+        (2026-10-28). Early wide-OR puts (09-15 09:50) and afternoon
+        continuations stay open."""
+        if or_width < 150.0:
+            return False
+        return "10:15" <= sig_t <= "11:00"
+
+    def _clean_long_decide(self, signals: dict) -> dict:
+        """30-min opening-range breakout with EMA9/EMA21 agreement on closed
+        5-minute bars; ATM weekly option; one trade a day. Exits live in
+        ExecutionEngine._monitor_clean_long. No other entry gate applies."""
+        if (
+            bool(signals.get("block_new_entries"))
+            or bool(signals.get("api_auth_dead"))
+            or bool(signals.get("_feed_stale"))
+            or signals.get("spot") is None
+        ):
+            return self._clean_long_no_trade(signals, "clean_long_stand_down")
+        today = today_ist().isoformat()
+        prior = self.db.query(
+            "SELECT status, selection_reason, net_pnl_rupees, exit_time, exit_reason "
+            "FROM positions "
+            "WHERE trading_date=? AND status IN ('OPEN','PENDING_ENTRY','CLOSED') "
+            "ORDER BY entry_time",
+            (today,),
+        ) or []
+        # v2 (in-sample tuned, 2026-11-01): one stop-and-reverse. After the
+        # day's first clean trade closes at a loss, the opposite-side
+        # breakout may be taken once, with the same exits.
+        only_dir = None
+        after_hm = ""
+        # Mid-reclaim flip is only offered when reversing into a CALL after a
+        # failed PUT. The mirror (put after failed call) whipsaws on mid-day
+        # chop (2026-09-17); those days still wait for a full ORL break.
+        failed_flip = False
+        if prior:
+            p0 = prior[-1]
+            _rev_ok = (
+                bool(getattr(self.config, "clean_long_reverse", True))
+                and len(prior) == 1
+                and str(p0["status"]) == "CLOSED"
+                and float(p0["net_pnl_rupees"] or 0.0) < 0.0
+                and str(p0["selection_reason"] or "").startswith("clean_long_v1:")
+            )
+            if not _rev_ok:
+                return self._clean_long_no_trade(signals, "clean_long_done_for_day")
+            try:
+                kv0 = dict(
+                    x.split("=", 1) for x in str(p0["selection_reason"]).split(":")[1:]
+                    if "=" in x
+                )
+                only_dir = -1 if int(kv0.get("dir", "1")) > 0 else 1
+                after_hm = str(p0["exit_time"] or "")[11:16]
+                failed_flip = (
+                    bool(getattr(self.config, "clean_long_failed_flip", True))
+                    and only_dir == 1
+                )
+            except (TypeError, ValueError):
+                return self._clean_long_no_trade(signals, "clean_long_done_for_day")
+        now_hm = now_ist().strftime("%H:%M")
+        rows = self.db.query(
+            "SELECT substr(candle_time,1,5) AS t, open, high, low, close "
+            "FROM intraday_candles WHERE trading_date=? AND interval_min=1 "
+            "AND candle_time>='09:15' AND substr(candle_time,1,5)<? "
+            "ORDER BY candle_time",
+            (today, now_hm),
+        ) or []
+        bars_1m: Dict[str, tuple] = {}
+        for r in rows:
+            bars_1m[str(r["t"])] = (
+                float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
+            )
+        orc = [v for t, v in sorted(bars_1m.items()) if t <= self.CLEAN_OR_END]
+        if "09:15" not in bars_1m or now_hm <= self.CLEAN_OR_END or not orc:
+            return self._clean_long_no_trade(signals, "clean_long_no_opening_range")
+        orh = max(v[1] for v in orc)
+        orl = min(v[2] for v in orc)
+        or_mid = (orh + orl) / 2.0
+        or_width = orh - orl
+        or_loc = ((orc[-1][3] - orl) / or_width) if or_width > 0 else 0.5
+        # 5-minute bars aligned to 09:15; a bar counts once its close time
+        # (start + 5 min) is at or before the current minute.
+        five: Dict[int, list] = {}
+        for t, (o, h, l, c) in sorted(bars_1m.items()):
+            m = int(t[:2]) * 60 + int(t[3:5]) - 555
+            k = (m // 5) * 5
+            b = five.get(k)
+            five[k] = [o, h, l, c] if b is None else [b[0], max(b[1], h), min(b[2], l), c]
+        now_m = int(now_hm[:2]) * 60 + int(now_hm[3:5]) - 555
+        e9 = e21 = None
+        first = None
+        flip_mode = False
+        last_close_t = None
+        prev_close_above_mid = False
+        # Once a first-trade CALL is refused as exhaust/weak, later CALL pokes
+        # the same day stay blocked (09-17: 10:10 weak → 10:15 still lost).
+        # Puts remain eligible.
+        call_blocked = False
+        for k in sorted(five):
+            if k + 5 > now_m:
+                break
+            c = five[k][3]
+            e9 = c if e9 is None else e9 + 2.0 / 10.0 * (c - e9)
+            e21 = c if e21 is None else e21 + 2.0 / 22.0 * (c - e21)
+            m_close = k + 5 + 555
+            close_t = f"{m_close // 60:02d}:{m_close % 60:02d}"
+            last_close_t = close_t
+            above_mid = c > or_mid
+            if (
+                first is None
+                and self.CLEAN_WIN[0] <= close_t <= self.CLEAN_WIN[1]
+                and close_t > after_hm
+            ):
+                # Confirmed mid-reclaim flip into CALL after a failed PUT:
+                # two consecutive 5m closes above mid with EMA bullish.
+                # Stop anchor = ORL so R is real near mid. Single-bar tags
+                # (10-28 11:25) are ignored — they whip back into the range.
+                if (
+                    failed_flip
+                    and only_dir == 1
+                    and above_mid
+                    and prev_close_above_mid
+                    and e9 > e21
+                    and c > e21
+                ):
+                    first = (1, close_t)
+                    flip_mode = True
+                elif only_dir in (None, 1) and c > orh and e9 > e21 and c > e21:
+                    ext = c - orh
+                    if only_dir is None and (
+                        call_blocked
+                        or self._clean_long_exhaust_call(or_loc, or_width)
+                        or self._clean_long_weak_call(or_loc, or_width, ext, close_t)
+                    ):
+                        call_blocked = True
+                        prev_close_above_mid = above_mid
+                        continue  # skip bad CALL; keep scanning for puts
+                    first = (1, close_t)
+                elif only_dir in (None, -1) and c < orl and e9 < e21 and c < e21:
+                    if only_dir is None and self._clean_long_spent_put(or_width, close_t):
+                        prev_close_above_mid = above_mid
+                        continue  # skip spent PUT; keep scanning
+                    first = (-1, close_t)
+            prev_close_above_mid = above_mid
+        if first is None:
+            return self._clean_long_no_trade(signals, "clean_long_no_signal")
+        direction, sig_t = first
+        if sig_t != last_close_t:
+            # The day's one signal was on an earlier bar (engine offline or
+            # the entry was refused then); the rules do not chase it.
+            return self._clean_long_no_trade(
+                signals, f"clean_long_signal_passed_{sig_t}"
+            )
+        spot = float(signals.get("spot") or 0.0)
+        strike = float(round(spot / 50.0) * 50)
+        # Stop anchor: OR mid for normal ORB; far OR extreme for mid-flip so
+        # a reclaim near mid still has a defined R for sizing and trail.
+        if flip_mode:
+            stop_anchor = orl if direction > 0 else orh
+        else:
+            stop_anchor = or_mid
+        reason = (
+            f"clean_long_v1:dir={direction}:or_mid={or_mid:.2f}:"
+            f"stop={stop_anchor:.2f}:"
+            f"orh={orh:.2f}:orl={orl:.2f}:sig={sig_t}"
+            f"{':rev=1' if only_dir is not None else ''}"
+            f"{':flip=1' if flip_mode else ''}"
+        )
+        params = self.compute_momentum_params(
+            direction, reason, signals, 1.0, strike_override=strike, clean=True
+        )
+        if not params.get("valid"):
+            return self._clean_long_no_trade(
+                signals, f"clean_long_params_invalid:{params.get('reason')}"
+            )
+        params["selection_reason"] = reason
+        # Fixed-risk sizing: lots so a stop at the stop-anchor costs about
+        # CLEAN_LONG_RISK_RS — R x |delta| + spread from the entry quote,
+        # plus a round trip of costs, per lot. Applied after FORCE_LOTS via
+        # size_scale (FORCE_LOTS stays the ceiling); the execution monitor
+        # backstops the same budget on the live bid.
+        _risk_rs = float(getattr(self.config, "clean_long_risk_rs", 0.0) or 0.0)
+        if _risk_rs > 0:
+            _R = abs(spot - stop_anchor)
+            _leg = (params.get("legs") or [{}])[0]
+            try:
+                _delta = abs(float(_leg.get("delta") or 0.0)) or 0.5
+                _spread = max(float(_leg.get("ask") or 0.0) - float(_leg.get("bid") or 0.0), 0.0)
+            except (TypeError, ValueError):
+                _delta, _spread = 0.5, 0.0
+            try:
+                _cost_lot = 2.0 * float(
+                    self._compute_costs(params.get("legs") or [], 1, "ENTRY")["total_rupees"]
+                )
+            except Exception:
+                _cost_lot = 0.0
+            _lot_sz = float(self.config.lot_size or 65)
+            _per_lot = max((_R * _delta + _spread) * _lot_sz + _cost_lot, 1.0)
+            _lots = int(params.get("final_lots") or 1)
+            _want = max(1, min(_lots, int(_risk_rs / _per_lot)))
+            if _want < _lots:
+                params["size_scale"] = _want / float(_lots)
+                params["final_lots"] = _want
+        strat_name = params["strategy_name"]
+        self._log_decision(signals, "STRATEGY_SELECTED", reason, strat_name, params)
+        self._persist_decision(signals, strat_name, reason, params, "STRATEGY_SELECTED")
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{strat_name}", None, self._count_open_positions()
+        )
+        return {
+            "action":        "ENTER",
+            "strategy_name": strat_name,
+            "reason":        reason,
+            "params":        params,
+        }
+
     def decide(self, signals: dict) -> dict:
+        if bool(getattr(self.config, "clean_long_v1", False)):
+            self._note_price(signals)
+            return self._clean_long_decide(signals)
         _flip = self._trend_first_flip(signals)
         if _flip is not None:
             return _flip

@@ -123,6 +123,10 @@ desktop.ini
 /data/per_day/nifty_algo_2026-10-26.db
 /data/per_day/nifty_algo_2026-10-27.db
 
+# Backtest scratch books (BT_KEEP_SCRATCH_DIR) — often 60–120MB each; GitHub hard-caps 100MB
+/data/scratch*/
+/data/scratch_*/
+
 # Root-level database
 /vramqc_nse_backtest.db
 

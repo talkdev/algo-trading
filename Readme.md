@@ -192,6 +192,91 @@ With the credit book on, `momentum_trend_first` (default true) makes the long pa
 
 Known weakness: the credit book sold bear-call spreads into the 10-28/10-29/10-30 bull legs (−₹31k together). Tape labels at entry (RANGE, ADX 18–27) match the winning credits, so no label filter separates them.
 
+## Clean long-only module (`CLEAN_LONG_V1=true`)
+
+The rules are fixed in `Misc/clean_long_v1_preregistration.md`, written before any run. They were not tuned on the shards. With the switch on, `decide()` calls only `_clean_long_decide`, and none of the momentum gates, regime map or credit book run.
+
+- **Entry:** the first closed 5-minute bar between 09:45 and 13:30 that closes beyond the 09:15–09:44 opening range, with EMA9/EMA21 of 5-minute closes agreeing. It buys the ATM weekly option at the ask, once per day.
+  - The signal must be the latest closed bar. A passed signal (after a feed gap or a refused entry) is not chased: `clean_long_signal_passed_<hh:mm>`.
+- **Params:** `compute_momentum_params(..., strike_override=ATM, clean=True)` skips the momentum edge test and the risk-budget refusal. `FORCE_LOTS` sets the size.
+- **Validation:** a clean entry uses the 09:45–13:35 window and no hard-exit buffer. The session's day-label window, such as 10:30–13:00 on 0 DTE, does not apply.
+- **Exits:** `ExecutionEngine._monitor_clean_long` runs before every other exit rule:
+  - the stop sits at the OR midpoint;
+  - after +1R it trails at max(entry, best − 1R);
+  - the position goes flat at 15:00.
+  - R = |entry spot − OR mid|. The positions row carries the OR midpoint in `selection_reason` (`clean_long_v1:dir=…:or_mid=…`).
+
+The variant was chosen on September only, then October was run once. Engine replay, 34 days, 12 lots:
+
+| | Total | Green | Red | Flat | Worst day |
+|---|---:|---:|---:|---:|---:|
+| September (selection) | ₹235,983 | 7 | 2 | 6 | −₹29,233 |
+| October (single test) | ₹426,677 | 9 | 9 | 1 | −₹48,027 |
+| 34 days | ₹662,660 | 16 | 11 | 7 | −₹48,027 |
+
+The engine matches the standalone replay within ₹270 a day. The exceptions are two feed-gap days, 09-09 and 10-07, where the replay chased a passed signal.
+
+### v2 stop-and-reverse (`CLEAN_LONG_REVERSE`, default true)
+
+If the day's first clean trade closes at a loss, one opposite-side breakout (same OR, same EMA rule, a bar closing after that exit, same exits and no-chase rule) may be taken. The selection reason carries `:rev=1`.
+
+This rule was tuned on the same 34 days to reach the >17 profitable-day target, so it is **in-sample**. On September alone it was no better than v1b, which made more money there (₹234,836 against ₹209,515 in the standalone replay, with the same 7 green days). Engine replay, 12 lots:
+
+| | Total | Green | Red | Flat | Worst day |
+|---|---:|---:|---:|---:|---:|
+| September | ₹235,983 | 7 | 2 | 6 | −₹29,233 |
+| October | ₹530,084 | 11 | 7 | 1 | −₹56,988 |
+| 34 days | ₹766,067 | 18 | 9 | 7 | −₹56,988 |
+
+### Fixed-risk sizing (`CLEAN_LONG_RISK_RS`, default 0 = off)
+
+A per-trade rupee budget, in two parts:
+
+- **Sizing:** lots = risk / ((R × |delta| + ask − bid) × lot size + round-trip costs per lot). The inputs come from the entry quote, and the result is capped at `FORCE_LOTS` through `params["size_scale"]`.
+- **Backstop:** `_monitor_clean_long` closes the trade (`clean_long_risk_cap`) once the open loss at the liquidation bid plus 2 × entry costs reaches the budget, wherever spot is.
+
+The day can still lose two budgets when the reverse trade also loses.
+
+| | Total | Green | Red | Sum of red days | Worst trade | Worst day |
+|---|---:|---:|---:|---:|---:|---:|
+| 12 lots always | ₹766,067 | 18 | 9 | −₹192,962 | −₹48,027 | −₹56,988 |
+| `CLEAN_LONG_RISK_RS=20000` | ₹509,760 | 19 | 8 | −₹105,706 | −₹20,806 | −₹25,310 (10-28: −₹20,806 put, −₹4,504 reverse) |
+
+### Breakeven stop (`CLEAN_LONG_BE_R`, default 0.5)
+
+Once spot has moved 0.5R in favour, the clean stop is never worse than the entry spot. Failed breakouts that first ran 0.6–0.7R (09-30, 10-22) now exit near entry instead of at the OR midpoint.
+
+It was chosen in the replay against time stops (10–30 min, 0.25–0.5R), which cut winners and helped only one month. The breakeven loss reduction held from 0.4R to 0.6R. Only 0.5R also raised October P&L, so the profit part is the fragile part. Engine replay with ₹20k risk:
+
+| | Total | Green | Red | Sum of red days | Worst day |
+|---|---:|---:|---:|---:|---:|
+| Without breakeven | ₹509,760 | 19 | 8 | −₹105,706 | −₹25,310 |
+| `CLEAN_LONG_BE_R=0.5` | ₹533,362 | 19 | 8 | −₹84,838 | −₹19,505 |
+
+September red-day losses go from −₹39,551 to −₹23,553, and October from −₹66,155 to −₹61,285.
+
+For the remaining failed-at-once breakouts (09-17, 10-05, 10-27, 10-28: ≤0.24R in favour), earlier ideas (2-bar OR buffer, scale-in, multi re-entry, tighter BE) were rejected — they cut 37–58% of profit or turned green days red.
+
+### v3 structure filters (2026-11-01)
+
+Three entry filters plus a confirmed mid-reclaim flip, chosen against those four red days without shrinking the big winners:
+
+| Gate | Rule | Days it fixes |
+|---|---|---|
+| Exhausted CALL | Skip CALL when OR close loc ≥ `CLEAN_LONG_EXHAUST_OR_LOC` (0.85) and OR width ≤ `CLEAN_LONG_EXHAUST_OR_WIDTH` (120). Latch: no further first-trade CALLs that day; puts stay open. | 10-05, 10-27 (and 10-06) |
+| Weak morning CALL | Skip CALL before 11:00 when OR loc ∈ [0.40, 0.60] and ext/OR-width < `CLEAN_LONG_WEAK_EXT_FRAC` (0.05). Same call-block latch. | 09-17 |
+| Spent late PUT | Skip PUT when OR width ≥ 150 and signal time ∈ 10:15–11:00. | 10-28 |
+| Failed-put flip | After a losing PUT, a CALL may enter on **two** consecutive 5m closes above mid with EMA bullish (`CLEAN_LONG_FAILED_FLIP`). Stop anchor = ORL (`stop=` in selection_reason). | accelerates 10-28 reclaim when the put was taken |
+
+Engine replay, 12 lots, ₹20k risk, BE 0.5, 34 days:
+
+| | Total | Green | Red | Flat | 09-17 | 10-05 | 10-27 | 10-28 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Before (v2 + BE 0.5) | ₹533,363 | 19 | 8 | 7 | −₹19,505 | −₹17,493 | −₹15,637 | −₹18,129 |
+| After (v3 filters) | ₹611,964 | 19 | 6 | 9 | ₹0 | −₹303 | ₹0 | +₹2,677 |
+
+Collateral: 09-23 goes flat (was +₹3,984) — same weak-morning CALL shape as 09-17. 10-30 improves (flip path). Rejected again: BE ≤ 0.30 (scratches 09-24), single-bar mid flip (whipsaws 10-28 11:25).
+
 ## Where the code lives
 
 ```text

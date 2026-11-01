@@ -1080,6 +1080,26 @@ class Config:
     momentum_counter_regime_size:  float = 0.5
     # Credit book on: a qualifying trend long pre-empts a credit ENTER.
     momentum_trend_first:          bool  = True
+    # Pre-registered clean long-only module (Misc/clean_long_v1_preregistration.md, v1b).
+    clean_long_v1:                 bool  = False
+    # v2 (in-sample tuned): one stop-and-reverse after a losing clean trade.
+    clean_long_reverse:            bool  = True
+    # Rupee risk per clean trade at the OR-mid stop; 0 = always FORCE_LOTS.
+    clean_long_risk_rs:            float = 0.0
+    # Move the clean stop to entry once spot is this many R in favour; 0 = off.
+    clean_long_be_r:               float = 0.50
+    # Skip a CALL breakout when the OR itself closed near the high of a
+    # narrow morning range (exhausted upside already spent in the OR).
+    clean_long_exhaust_or_loc:     float = 0.85
+    clean_long_exhaust_or_width:   float = 120.0
+    # Skip a first-trade CALL whose breakout is a tiny poke through ORH while
+    # the OR itself closed mid-range (false-break chop, e.g. 2026-09-17).
+    clean_long_weak_ext_frac:      float = 0.05
+    clean_long_weak_or_loc_lo:     float = 0.40
+    clean_long_weak_or_loc_hi:     float = 0.60
+    # After a losing PUT, allow the reverse CALL on a confirmed mid-reclaim
+    # (2 closes above mid + EMA) instead of waiting for a full ORH break.
+    clean_long_failed_flip:        bool  = True
     # Sizing: the debit route risks the stop, not the notional, and the
     # weekday/VRP size schedule that disciplines short-premium books is
     # floored here so a high-conviction breakout is not sized into the
@@ -1998,6 +2018,26 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_final_cut_min=min(max(_get_int(env, "MOMENTUM_FINAL_CUT_MIN", 60), 0), 120),
         momentum_counter_regime_size=min(max(_get_float(env, "MOMENTUM_COUNTER_REGIME_SIZE", 0.5), 0.1), 1.0),
         momentum_trend_first=_get_bool(env, "MOMENTUM_TREND_FIRST", True),
+        clean_long_v1=_get_bool(env, "CLEAN_LONG_V1", False),
+        clean_long_reverse=_get_bool(env, "CLEAN_LONG_REVERSE", True),
+        clean_long_risk_rs=max(_get_float(env, "CLEAN_LONG_RISK_RS", 0.0), 0.0),
+        clean_long_be_r=max(_get_float(env, "CLEAN_LONG_BE_R", 0.50), 0.0),
+        clean_long_exhaust_or_loc=min(
+            max(_get_float(env, "CLEAN_LONG_EXHAUST_OR_LOC", 0.85), 0.50), 1.00
+        ),
+        clean_long_exhaust_or_width=max(
+            _get_float(env, "CLEAN_LONG_EXHAUST_OR_WIDTH", 120.0), 0.0
+        ),
+        clean_long_weak_ext_frac=min(
+            max(_get_float(env, "CLEAN_LONG_WEAK_EXT_FRAC", 0.05), 0.0), 0.50
+        ),
+        clean_long_weak_or_loc_lo=min(
+            max(_get_float(env, "CLEAN_LONG_WEAK_OR_LOC_LO", 0.40), 0.0), 1.0
+        ),
+        clean_long_weak_or_loc_hi=min(
+            max(_get_float(env, "CLEAN_LONG_WEAK_OR_LOC_HI", 0.60), 0.0), 1.0
+        ),
+        clean_long_failed_flip=_get_bool(env, "CLEAN_LONG_FAILED_FLIP", True),
         momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
         momentum_risk_frac_of_budget=min(max(_get_float(env, "MOMENTUM_RISK_FRAC_OF_BUDGET", 1.00), 0.10), 1.00),
         momentum_min_lots=min(max(_get_float(env, "MOMENTUM_MIN_LOTS", 0.60), 0.10), 1.00),
