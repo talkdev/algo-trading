@@ -3307,10 +3307,12 @@ def _forced_round_trip(store: "HistoricalStore", cfg: Config,
         _n_open, _open_block = _render_blocks()
         assert _n_open == 1, f"open trade rendered {_n_open} block(s), expected 1"
         for _frag in ("Trade-1", "Strategy: HARNESS_FORCED_CONDOR",
-                      "Trade Start Data: time:", "Trade End Data: time:",
+                      "Trade Start Data: time:", "Trade Mark Data: time:",
                       "Position Status: Open", "Total Investment: Rs",
                       "Total Profit: Rs"):
             assert _frag in _open_block, f"open block missing {_frag!r}"
+        assert "Trade End Data:" not in _open_block, \
+            "open block must not claim Trade End Data while still open"
         assert "\nOpen\n" in _open_block, "open block is missing the 'Open' line"
         assert "unrealised" in _open_block, \
             "an open trade must be marked, not reported as realised"

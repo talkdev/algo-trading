@@ -1249,10 +1249,14 @@ class TelegramReporter:
                 f"(strike {_tr_strike(leg.get('strike'))})"
             )
         reason = position.get("exit_reason") if (closed or aborted) else None
-        out.append(
-            f"  End {_tr_hhmm(position.get('exit_time') if (closed or aborted) else as_of)}"
-            + (f" ({reason})" if reason else "")
-        )
+        if closed or aborted:
+            out.append(
+                f"  End {_tr_hhmm(position.get('exit_time'))}"
+                + (f" ({reason})" if reason else "")
+            )
+        else:
+            # Still open: label as Mark so Telegram does not read like an exit.
+            out.append(f"  Mark {_tr_hhmm(as_of)}")
         for leg in legs:
             leg_closed = str(leg.get("leg_status") or "").upper() == "CLOSED"
             if closed and leg_closed and leg.get("exit_price") not in (None, ""):

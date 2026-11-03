@@ -3020,7 +3020,15 @@ class ExecutionEngine:
         stop at the stop-anchor (OR midpoint, or far OR extreme on a
         failed-breakout mid-flip); once spot is +1R in favour the stop
         trails at max(entry, best - 1R) (mirrored for puts); flat at
-        15:00. R = |entry spot - stop-anchor|."""
+        15:00. R = |entry spot - stop-anchor|.
+
+        v4 premium trail (CLEAN_LONG_PREM_TRAIL): 0DTE only, and only at
+        or after CLEAN_LONG_PREM_AFTER (default 14:00). After the +1R spot
+        trail has armed, also exit when liquidation value gives back
+        CLEAN_LONG_PREM_GIVEBACK of (peak − entry), once peak ≥
+        CLEAN_LONG_PREM_ARM_MULT × entry. Afternoon-only avoids cutting
+        Sep15/Sep22 morning runners; still banks Nov3 expiry bleed.
+        DTE1+ keeps spot-only exits."""
         reason = str(position.get("selection_reason") or "")
         try:
             kv = dict(p.split("=", 1) for p in reason.split(":")[1:] if "=" in p)
@@ -3089,6 +3097,43 @@ class ExecutionEngine:
             if winning:
                 return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, ctx
             return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, ctx
+        # Premium giveback (v4): 0DTE only, at/after CLEAN_LONG_PREM_AFTER
+        # (default 14:00), and only after the +1R spot trail has armed.
+        # Earlier-day evaluation cut Sep15/Sep22 morning runners
+        # (−₹80k vs baseline). Afternoon window still banks Nov3 bleed
+        # while spot held above the trail. DTE1+ stays spot-only.
+        try:
+            _dte = int(position.get("actual_dte") if position.get("actual_dte") is not None else -1)
+        except (TypeError, ValueError):
+            _dte = -1
+        trail_armed = R > 0 and (best - es) * direction >= R
+        _prem_on = bool(getattr(self.config, "clean_long_prem_trail", True))
+        _gb = float(getattr(self.config, "clean_long_prem_giveback", 0.25) or 0.0)
+        _after = str(getattr(self.config, "clean_long_prem_after", "14:00") or "14:00")
+        _now_hm = now_ist().strftime("%H:%M")
+        if (
+            _prem_on and _gb > 0 and _dte == 0 and trail_armed
+            and _now_hm >= _after
+            and entry_value > 0 and value > 0
+        ):
+            try:
+                peak_val = abs(float(position.get("peak_credit_liq") or 0.0))
+            except (TypeError, ValueError):
+                peak_val = 0.0
+            peak_val = max(peak_val, value)
+            _arm = float(getattr(self.config, "clean_long_prem_arm_mult", 1.50) or 1.50)
+            if peak_val >= entry_value * _arm:
+                floor = peak_val - _gb * (peak_val - entry_value)
+                ctx["prem_peak"] = round(peak_val, 2)
+                ctx["prem_floor"] = round(floor, 2)
+                ctx["prem_after"] = _after
+                if value <= floor + 1e-9:
+                    ctx["reason_detail"] = "clean_long_prem_trail"
+                    return (
+                        ("CLOSE_TARGET" if winning else "CLOSE_STOP"),
+                        EXIT_PRIORITY_PROFIT_LOCK,
+                        ctx,
+                    )
         if now_ist().time() >= dtime(15, 0):
             ctx["reason_detail"] = "clean_long_time_15:00"
             return ("CLOSE_TARGET" if winning else "CLOSE_STOP"), EXIT_PRIORITY_TIME_TARGET, ctx

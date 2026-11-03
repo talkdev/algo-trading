@@ -1100,6 +1100,16 @@ class Config:
     # After a losing PUT, allow the reverse CALL on a confirmed mid-reclaim
     # (2 closes above mid + EMA) instead of waiting for a full ORH break.
     clean_long_failed_flip:        bool  = True
+    # Premium giveback on 0DTE only, after the +1R spot trail has armed:
+    # exit when liquidation value gives back this fraction of (peak − entry),
+    # once peak ≥ arm_mult × entry. Expiry-day bleed while spot holds
+    # (2026-11-03). DTE1+ ignores these. Off when giveback is 0.
+    # prem_after: HH:MM — do not evaluate premium trail before this clock
+    # (14:00 keeps Sep15/Sep22 morning runners; still banks Nov3 bleed).
+    clean_long_prem_trail:         bool  = True
+    clean_long_prem_arm_mult:      float = 1.50
+    clean_long_prem_giveback:      float = 0.25
+    clean_long_prem_after:         str   = "14:00"
     # Sizing: the debit route risks the stop, not the notional, and the
     # weekday/VRP size schedule that disciplines short-premium books is
     # floored here so a high-conviction breakout is not sized into the
@@ -2038,6 +2048,18 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
             max(_get_float(env, "CLEAN_LONG_WEAK_OR_LOC_HI", 0.60), 0.0), 1.0
         ),
         clean_long_failed_flip=_get_bool(env, "CLEAN_LONG_FAILED_FLIP", True),
+        clean_long_prem_trail=_get_bool(env, "CLEAN_LONG_PREM_TRAIL", True),
+        clean_long_prem_arm_mult=min(
+            max(_get_float(env, "CLEAN_LONG_PREM_ARM_MULT", 1.50), 1.10), 3.00
+        ),
+        clean_long_prem_giveback=min(
+            max(_get_float(env, "CLEAN_LONG_PREM_GIVEBACK", 0.25), 0.0), 0.60
+        ),
+        clean_long_prem_after=(
+            lambda _s: _s
+            if len(_s) == 5 and _s[2] == ":" and _s[:2].isdigit() and _s[3:].isdigit()
+            else "14:00"
+        )((env.get("CLEAN_LONG_PREM_AFTER", "14:00") or "14:00").strip()),
         momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
         momentum_risk_frac_of_budget=min(max(_get_float(env, "MOMENTUM_RISK_FRAC_OF_BUDGET", 1.00), 0.10), 1.00),
         momentum_min_lots=min(max(_get_float(env, "MOMENTUM_MIN_LOTS", 0.60), 0.10), 1.00),
@@ -4798,7 +4820,8 @@ def print_kv_table(
 #   Trade Start Data: time: <HH:MM>
 #   Bought/Sold: <n> lot of CE with premium: <n> at strike: <n>
 #   --------------------------------------------------------------------
-#   Trade End Data: time: <HH:MM>
+#   Trade End Data: time: <HH:MM>     (closed / aborted)
+#   Trade Mark Data: time: <HH:MM>    (still open — live mark, not an exit)
 #   Bought/Sold: <n> lot of CE with premium: <n> at strike: <n>
 #   Open
 #   --------------------------------------------------------------------
@@ -5299,8 +5322,12 @@ class TradeConsoleReporter:
             out.append("no leg rows persisted for this position")
 
         out.append(TRADE_REPORT_SUB)
-        end_time = position.get("exit_time") if terminal else as_of
-        out.append(f"Trade End Data: time: {_tr_hhmm(end_time)}")
+        if terminal:
+            end_time = position.get("exit_time")
+            out.append(f"Trade End Data: time: {_tr_hhmm(end_time)}")
+        else:
+            # Still open: this is a live mark, not an exit clock.
+            out.append(f"Trade Mark Data: time: {_tr_hhmm(as_of)}")
         for leg in legs:
             leg_closed = str(leg.get("leg_status") or "").upper() == "CLOSED"
             if closed and leg_closed and leg.get("exit_price") not in (None, ""):
