@@ -145,3 +145,7 @@ desktop.ini
 # MISCELLANEOUS
 # ============================================================
 rr.txt
+
+# Per-day shards currently over 100 MB
+/data/per_day/nifty_algo_2026-11-04.db
+/data/per_day/nifty_algo_2026-11-03.db
