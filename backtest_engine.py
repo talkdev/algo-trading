@@ -3754,8 +3754,9 @@ def probe_live_primary(db_path: Path) -> dict:
     try:
         # No PRAGMA quick_check / integrity_check. On the live primary that
         # reads the whole multi-GB file and was most of a batch's startup.
-        # Live startup (Database._assert_file_healthy) still quick_checks
-        # before it writes. Shards were integrity-checked when
+        # Live startup probes the latest chain row only
+        # (DB_STARTUP_FULL_CHECK=true restores quick_check + COUNT).
+        # Shards were integrity-checked when
         # split_db_per_day replaced them. This probe only reads the pages
         # Gate 1 uses: schema, yesterday's VIX, prior close. A corrupt
         # page on that path raises and fails the preflight.

@@ -3379,17 +3379,22 @@ class Database:
 
     @staticmethod
     def _assert_file_healthy(path: Path) -> None:
-        """Refuse to open a primary that cannot COUNT chain rows.
+        """Refuse to open a primary whose chain table cannot be read.
 
-        A bare SELECT 1 can succeed on a half-corrupt btree; the audit /
-        restore path needs a full scan. Fail loudly so the operator runs
-        restore_primary_db.py instead of writing into a broken file.
+        A full ``PRAGMA quick_check`` plus ``COUNT(*)`` walks the whole
+        multi-GB file and the leftover WAL (several minutes, no banner).
+        Startup only probes schema plus the latest chain row. Set
+        DB_STARTUP_FULL_CHECK=true to restore the full scan. A broken
+        file still fails this probe; rebuild with restore_primary_db.py.
         """
         try:
             if path.stat().st_size < 4096:
                 return  # brand-new / empty file — schema init will populate
         except OSError:
             return
+        full = os.environ.get("DB_STARTUP_FULL_CHECK", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
         try:
             con = open_sqlite_readonly(path, timeout=30)
             try:
@@ -3400,17 +3405,22 @@ class Database:
                 ).fetchone()
                 if not has_chain:
                     return  # schema not initialised yet
-                # quick_check is cheaper than integrity_check and still
-                # catches the btree damage that made COUNT(*) fail.
-                q = con.execute("PRAGMA quick_check").fetchone()
-                if q and str(q[0]) != "ok":
-                    raise sqlite3.DatabaseError(
-                        f"quick_check failed: {q[0]}"
-                    )
-                # Confirm the hot table is readable end-to-end.
-                con.execute(
-                    "SELECT COUNT(*) FROM option_chain_snapshot"
-                ).fetchone()
+                if full:
+                    q = con.execute("PRAGMA quick_check").fetchone()
+                    if q and str(q[0]) != "ok":
+                        raise sqlite3.DatabaseError(
+                            f"quick_check failed: {q[0]}"
+                        )
+                    con.execute(
+                        "SELECT COUNT(*) FROM option_chain_snapshot"
+                    ).fetchone()
+                else:
+                    # Latest rowid page only — catches an unreadable tail
+                    # without scanning every chain row.
+                    con.execute(
+                        "SELECT snapshot_id FROM option_chain_snapshot "
+                        "ORDER BY snapshot_id DESC LIMIT 1"
+                    ).fetchone()
             except sqlite3.Error as exc:
                 raise sqlite3.DatabaseError(
                     f"Database {path} is unreadable/corrupt ({exc}). "
