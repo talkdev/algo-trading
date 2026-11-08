@@ -33,13 +33,14 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 | No-trade band                    | 20%                                                                                                                                                                 | W12/W13                                        |
 | Regime scaling (bear halving)    | ON                                                                                                                                                                  | W16, R13G                                      |
 | Drawdown tiers                   | 15% review / 22.5% halve / 30% cash-of-peak (×vol-target), time-release resets peak                                                                                | docs corrected R3 + v10                        |
-| Deploy                           | INVEST_PER_DAY ₹5,000 base, AUTOFILL pace, ≥real-market-session floor, trickle ≤3 sessions to re-plan                                                            | R12, audit v4, v10                             |
+| Deploy                           | INVEST_PER_DAY ₹5,000 strict IST-day buy-notional total; no autofill/lift/trickle; whole-share + minimum-ticket rules may leave budget unspent                   | USER-LOCK 2026-11-08 (supersedes R12/v4/v10 deploy pace) |
+| Portfolio basis                  | Current market value of Upstox ETF holdings (broker last_price marks), excluding broker cash and non-universe assets                                             | USER-LOCK 2026-11-08                           |
 | Stale signal                     | REFRESH (re-pick) if >5 market days                                                                                                                                 | audit v4 user choice                           |
 | Premium tiers                    | GLOBAL cap 20%, domestic band ~0.40/0.75% + lag cushion, corrupt >300%/scale-jump excluded                                                                          | audit v7 (R18A bound)                          |
-| Live mode                        | Paper default; live needs config flip AND `live --confirm`; broker = source of truth; band-limited LIMIT buys ×1.002                                             | v8 + R14/R15 + USER-LOCK                       |
-| Cash                             | LIVE_CASH_SLEEVE=True sweeps to LIQUIDCASE weekly; slab-taxed accruals                                                                                              | R16 #4                                         |
+| Live mode                        | LIVE only; no PAPER_TRADE toggle; interactive y/n confirmation; Upstox = source of truth; band-limited LIMIT buys ×1.002; AMO flag outside market hours              | USER-LOCK 2026-11-08 (supersedes v8 paper default) |
+| Cash                             | Broker cash is read for affordability/risk but excluded from the SIP portfolio; no live cash sleeve, sweep, or interest accrual; CASH_SLEEVE_MODE is offline-backtest only | USER-LOCK 2026-11-08 (supersedes R16 #4 live sleeve) |
 | Taxes engine                     | per-class buckets, per-FY netting, quarterly settle, ₹1.25L LTCG (equity only)                                                                                     | R9                                             |
-| Off-by-default knobs             | SEAT_FILL_RELAXED, PARK_BENCH_TREND, DD_SLEEVE_SCALE, TAX_DEFER_EXITS, DAILY_EXIT_GUARD, ENTRY_OVERLAY_MOM_FLOOR, RANK_BY≠raw, SECTOR_CAP_FRAC>0, ens-lookbacks    | all measured below                             |
+| Off-by-default knobs             | SEAT_FILL_RELAXED, PARK_BENCH_TREND, DD_SLEEVE_SCALE, TAX_DEFER_EXITS, ENTRY_OVERLAY_MOM_FLOOR, RANK_BY≠raw, SECTOR_CAP_FRAC>0, ens-lookbacks    | all measured below                             |
 
 ---
 
@@ -951,3 +952,47 @@ own backtester, OOS at least baseline, risk not worse, delta > bootstrap noise.
 ---
 
 *Last updated: audit v12, 29/30-Oct-2026 (P0-1 peak rebase, P0-2 session-aware freshness, mode-filtered order book, declined-run honesty, sweep-after-n, AUTOFILL_MAX_SESSIONS=3 via R22, + rows 115–121 / actions 108–110). Selftest count: 120.*
+
+---
+
+## 8. USER-LOCK — live SIP conversion (2026-11-08, current)
+
+| #   | Direction / shipped behaviour                                                                                                                             | Status     |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 145 | `INVEST_PER_DAY` is a standalone strict daily buy cap (default ₹5,000). Removed `autofill_budget`, deployment lifts, trickle/replan pacing, and cash-sweep helpers. | USER-LOCK  |
+| 146 | Portfolio value = current Upstox holdings market value, excluding broker cash. Risk drawdown uses account equity (cash + holdings) so ordinary sells are not crashes. | USER-LOCK  |
+| 147 | Every buy, including post-rebalance routing, must fit the remaining daily allowance. Sale proceeds never create extra buying power. Unfilled/ambiguous orders reserve worst-case LIMIT notional until reconciled. | USER-LOCK  |
+| 148 | `DAILY_EXIT_GUARD` is permanently TRUE. Zero allowance pauses buys only; exits, rotation, and risk sells still run.                                          | USER-LOCK  |
+| 149 | Removed `PAPER_TRADE`, live `STARTING_CAPITAL` seeding, `LIVE_CASH_SLEEVE`, reset-paper, and live sleeve accrual/sweep paths. Execution is live-only with y/n confirmation; non-TTY refuses orders. `BACKTEST_STARTING_CAPITAL` is offline research normalization only. | USER-LOCK  |
+| 150 | Order safety: pre-send atomic reservations, single-attempt order POST (no duplicate retry), cumulative-fill reconciliation, broker-marked holdings, fail-closed API reads. | APPLIED    |
+| 151 | Superseded historical directions: row 115 (`INVEST_PER_DAY = STARTING_CAPITAL`), row 119 / action 104 (live cash sweep/sleeve), and autofill pacing rows are retained as history but no longer describe production. | USER-LOCK  |
+
+Validation: `python -m unittest discover -s tests -v` (10 offline fake-client tests) and the script selftest on an isolated DB (122 passed). No real Upstox orders were placed.
+
+*Last updated: live SIP USER-LOCK conversion, 08-Nov-2026 (rows 145–151; strict daily cap, holdings-only portfolio, live-only execution, permanent exit guard). Selftest count: 122; external fake-client tests: 10.*
+
+---
+
+## 9. USER-LOCK — live-only lean engine cleanup (2026-11-08, current)
+
+Scope confirmed by the user as `live_only`: strip the entire offline research
+apparatus and keep the live SIP engine + status/monitor/reconcile + a focused
+selftest. Live SIP behaviour is unchanged (every removed knob was at its
+production default; adopted rules are hardwired, not deleted).
+
+| #   | Direction / shipped behaviour                                                                                                                             | Status     |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 152 | Removed the `Backtester` class and all offline reporting: `print_backtest_result`, `regime_category_report`, `cash_return_series`, `benchmark_report`, `walk_forward`, `bootstrap_ci`, `period_report`, `run_full_backtest`, `load_prices_from_db`. | APPLIED    |
+| 153 | Removed the synthetic demo generator (`generate_synthetic_data`) and the whole tune subsystem (`KnobContext`, `_bench_daily_returns`, `_tune_windows`, `_tune_eval`, `_pick_plateau`, `cmd_tune`) plus tuning grids (`GRID_LOOKBACKS/ENTRIES/SKIPS`, `BASELINE_PARAMS`) and the unused `backtest_runs` table. | APPLIED    |
+| 154 | CLI commands `backtest`, `tune`, `demo` and flags `--quick`, `--seed` removed. Kept: run, scan, update, trade, monitor, status, report, selftest, live, load-data, reconcile, navdiag. User-facing notes that pointed at removed commands now point at `update`. | APPLIED    |
+| 155 | Removed rejected/off experiment knobs and their live branches: `SEAT_FILL_RELAXED` (+`_seat_fill`), `PARK_BENCH_TREND`, `DD_SLEEVE_SCALE` (+`invested_frac` param), `TAX_DEFER_EXITS` (+`tax_defer_blocks_exit`), `ENTRY_OVERLAY_MOM_FLOOR`, `SECTOR_CAP_FRAC` (+`is_sector_thematic`), `ROTATION_RANKFIRST`, `RANK_BY` risk-adjusted branch, `ENSEMBLE_LOOKBACKS`, `LOT_SELECTION` HIFO, `EXECUTION_STYLE` LIMIT_MID, `SPREAD_RECALIBRATED` legacy table. | APPLIED    |
+| 156 | Hardwired always-on adopted rules (logic kept): 200-DMA entry/exit overlay, rotation rule, bear-regime halving, detailed tax buckets, FIFO lots, MARKET-cross slippage, recalibrated spread tiers, single LOOKBACK/SKIP momentum. Strategy A/C selection + equal-weight sizing removed (live uses ranked inverse-vol basket B). | APPLIED    |
+| 157 | Removed dead constants: `CASH_SLEEVE_MODE/SYMBOL`, `CASH_RATE_PRETAX`, `TAX_ON_CASH_ACCRUAL`, `TAX_BUCKET_DETAIL`, `SETTLE_MODE`, `SETTLE_QUARTER_MONTHS`, `LOSS_CARRY_YEARS`, `SLAB_RATE`, `COST_CASES`, `CASH_CASES`, `MIN_TRADE_FRAC`, `MOM_PLAUSIBILITY`, `BACKTEST_STARTING_CAPITAL` (supersedes row 149's last sentence). Kept live guards: `CASH_PROXY_SYMBOLS`, `VOL_BLEND_252`, `VOL_PLAUSIBILITY`/`vol_plausibility`, synthetic-data fail-closed checks, and user-locks `SIP_MODE`/`DAILY_EXIT_GUARD`. | APPLIED    |
+| 158 | Selftest trimmed to the live engine (removed experiment/research blocks); module docstring + SECTION banners renumbered sequentially (1–23). Script reduced from 10,682 lines (post-SIP-refactor) to 7,704. | APPLIED    |
+
+Validation: `py_compile` OK; `pyflakes` clean (no undefined names, no unused
+imports, zero definition-only constants); `python -m unittest discover -s tests`
+(10 offline fake-client tests) OK; script selftest on an isolated temp DB
+(110 passed). No real Upstox orders were placed.
+
+*Last updated: live-only lean cleanup, 08-Nov-2026 (rows 152–158; offline research apparatus removed, adopted defaults hardwired, live SIP behaviour preserved). Selftest count: 110; external fake-client tests: 10.*
