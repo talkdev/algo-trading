@@ -6,6 +6,140 @@
 ================================================================================
  Single-file, start-to-end implementation of the TSMOM algorithm.
 
+================================================================================
+ LOCKED ENGINE CONTRACT - FIXED BEHAVIOUR. DO NOT CHANGE. DO NOT RE-AUDIT.
+================================================================================
+ Contract ID: SIP-LOCK-v1  (user-locked, 08-Nov-2026)
+
+ Everything in this block is a PRODUCT DECISION made by the owner, not a
+ finding. It is frozen. An audit that proposes changing a rule below is out of
+ scope BY DEFINITION: reject the suggestion, do not implement it, and do not
+ re-open it in the next audit. Code may be refactored around these rules; the
+ rules themselves are not negotiable and are not performance-tunable knobs.
+
+ L1.  SIP INSTRUMENT, NOT A PORTFOLIO MANAGER. This engine is a systematic
+      investment plan. It is NOT a manager of a fixed lump sum. Never introduce
+      lump-sum semantics: no absolute target-weight rebalancing that parks a
+      vol-target cash share, no core-satellite split, no "invest the corpus"
+      logic. Target weights are used ONLY as relative routing ratios for each
+      day's contribution.
+ L2.  RUN ANYTIME. The script must be runnable at any hour, on any day,
+      including weekends and NSE holidays. No weekly/monthly ticket cadence,
+      no "only trade on session X" gate, no accumulating or rolling allowance.
+      Outside regular NSE hours eligible orders are flagged AMO for the broker
+      to queue; the exchange still has to accept and execute them.
+ L3.  FULL DAILY CONTRIBUTION. If INVEST_PER_DAY != 0, the run buys eligible
+      ETFs for that TOTAL amount (subject only to eligibility gates, liquidity
+      caps, whole-share rounding and the minimum buy ticket). Existing holdings
+      being at/above target must NOT shrink or cancel today's contribution.
+      Unused allowance never rolls over to another day.
+ L4.  PORTFOLIO = UPSTOX HOLDINGS, VIA API. Portfolio value is always the total
+      investment held in Upstox ETF holdings, read live from the broker API
+      (quantity x broker price). Broker cash and non-universe assets are
+      excluded. The local SQLite DB is a journal/mirror, never a trading wallet
+      and never an alternative source of portfolio truth.
+ L5.  GRADUAL GROWTH. The portfolio grows step by step as SIP contributions
+      accumulate. There is no starting-capital seed, no simulated equity and
+      no fixed corpus assumption anywhere in the live path.
+ L6.  DAILY_EXIT_GUARD IS ALWAYS TRUE. Every run checks every holding's
+      momentum/DMA exit rules and exits the same day they fire. This is a
+      permanent safety rule, not an optional or performance-optimised toggle.
+ L7.  EXITS NEVER STOP. Sells, rotation, queued exit remainders and risk sells
+      run even when INVEST_PER_DAY = 0, and even when the buy configuration is
+      invalid. A buy-side problem may block BUYS ONLY; it must never disable
+      the exit guard or abort the run before exits are checked.
+ L8.  STRICT DAILY CAP, NEVER LIFTED. INVEST_PER_DAY is a hard buy-notional cap
+      per IST calendar day, shared by every buy reason and every rerun. Never
+      lift, top up, or borrow against it to complete a target plan. Sale
+      proceeds and idle broker cash never create extra buying power.
+ L9.  NO BLIND RETRIES; FAIL CLOSED. An order POST is attempted once. An
+      ambiguous submission stays UNCONFIRMED and keeps its budget reservation
+      until reconciled. Unreadable broker holdings/cash disable all orders.
+      Never fabricate a fill, never double-submit an open order.
+ L10. TWO TICKET FLOORS. MIN_BUY_VALUE (Rs 500) is the BUY floor;
+      MIN_TRADE_VALUE (Rs 2,000) is the SELL/TRIM dust floor. They are separate:
+      the sell floor must never be applied to buys, and lowering the buy floor
+      must never lower the sell floor. Full exits always trade regardless.
+ L11. HUMAN CONFIRMATION. Live orders require an interactive 'y' each run.
+      Non-interactive shells cannot place real orders.
+ L12. LIVE ONLY. No paper-trading mode, no synthetic price generation, no
+      backtest/research apparatus in the live engine. Never invent prices.
+ L13. CHARGES ARE BROKER TRUTH. The charge stack models the real Upstox
+      schedule (0.025% brokerage capped at Rs 20/order; Rs 23.60 DP per scrip
+      per sell day). Do not "optimise" charges to make results look better.
+ L14. SELFTEST ISOLATION. 'selftest' runs on a temporary database and must
+      never open or mutate the production journal.
+
+================================================================================
+ AUDIT REGISTER - EXTERNAL AUDIT (08-Nov-2026) AND DISPOSITION
+================================================================================
+ Status legend:
+   FIXED    - implemented and covered by tests.
+   PRESENT  - already implemented before the audit; verified, no change needed.
+   REJECTED - conflicts with the locked contract above. Do not re-propose.
+   MANUAL   - owner action outside the code; the engine cannot do it.
+   DEFERRED - strategy change, not a defect; needs evidence before adoption.
+
+ P0-1  Rs 1,000 SIP could never buy (Rs 2,000 floor applied to buys) .. FIXED
+       Split floors: MIN_BUY_VALUE=500 for buys, MIN_TRADE_VALUE=2000 for
+       sells. This is the defect behind the 08-Nov-2026 zero-order run.
+ P0-2  Wrong brokerage (0.05%) and DP (Rs 15.93) ..................... FIXED
+ P0-3  Route to ABSOLUTE target weights, hold vol-target cash share .. REJECTED
+       Violates L1/L3. Relative routing of the full contribution is used.
+ P0-4  Drawdown measured on cash + holdings .......................... FIXED
+       Flow-adjusted ETF-sleeve NAV; legacy account peaks rebase once.
+ P0-5  Tax lots adopted without a real buy date ...................... MANUAL
+       Engine warns and writes a conservative lot dated today. Restoring true
+       buy dates needs the old tsmom.db / Upstox tradebook (owner action).
+ P0-6  Hard-blocked ETF kept returning to the plan ................... FIXED
+       Removed from BOTH sip_targets and sip_basket.
+ P0-7  selftest opened the production DB ............................. FIXED
+ P1-1  Rotation hysteresis hard-coded to top-5 ....................... FIXED
+       Now 2 x MAX_HOLDINGS.
+ P1-2  Exit-guard whipsaw on a single DMA cross ...................... FIXED
+       EXIT_DMA_CONFIRM_CLOSES=2 consecutive closes; momentum exit immediate.
+ P1-3  Naked MARKET exits cross thin-ETF spreads ..................... FIXED
+       Marketable LIMIT exits (reference - 0.3%).
+ P1-4  Rank on raw momentum, not risk-adjusted ....................... DEFERRED
+       Strategy change, not a defect; no live evidence. Ranking unchanged.
+ P1-5  Tax-aware lot selection on sells .............................. REJECTED
+       Indian demat redemption is FIFO; lot cherry-picking is not available.
+ P1-6  Stale iNAV used as if fresh ................................... PRESENT
+       NAV_MAX_STALE_DAYS + publication-lag cushion already enforced.
+ P1-7  Mid-month re-selection inside sip_targets ..................... FIXED
+       Re-derivation re-runs the real selection filters; hard blocks persist.
+ P1-8  Exit guard counted only FILLED sells .......................... FIXED
+       Accepted PENDING/UNCONFIRMED/SUBMITTING exits now count as handled.
+ P2-1  Block orders on weekends/holidays ............................. REJECTED
+       Violates L2. AMO on a closed market is intentional.
+ P2-2  Weekly/monthly ticket cadence ................................. REJECTED
+       Violates L2.
+ P2-3  Accumulating / rolling unused allowance ....................... REJECTED
+       Violates L3/L8.
+ P2-4  Core-satellite portfolio split ................................ REJECTED
+       Violates L1.
+ P2-5  Park idle cash in a liquid mutual fund ........................ MANUAL
+ P2-6  Enable DDPI to avoid per-sell EDIS/TPIN ....................... MANUAL
+ P2-7  Build a backtest before going live ............................ DEFERRED
+       Conflicts with the live-only scope (L12); tracked outside the engine.
+ Q-1   Stale comments, dead code, duplicated holiday loaders,
+       're' shadowing the stdlib module in selftest .................. FIXED
+ Q-2   Invalid SIP cap only warned ................................... FIXED
+       Loud error that blocks buys; exits still run (L7 carve-out).
+
+ RUN DIAGNOSIS 08-Nov-2026 (zero orders in the Upstox console)
+ -------------------------------------------------------------
+ Root cause: the Windows copy was running the pre-fix build (commit 37803f7),
+ which still applied MIN_TRADE_VALUE = Rs 2,000 to BUY orders. With
+ INVEST_PER_DAY = Rs 1,000 the run printed "below the Rs 2,000.00 minimum
+ order" and idled the whole allowance. It was NOT a broker rejection, not an
+ AMO problem and not an exit-guard problem. Replay of that exact state
+ (PHARMABEES 173 @ 29.22, MOCAPITAL 43 @ 57.84, Rs 7,542 holdings, Rs 2.07 L
+ cash, Rs 1,000 cap, basket of 3, signal 2026-10-30) submits 0 orders on the
+ old build and 1 AMO LIMIT BUY of Rs 995.52 on this build. Fix: run THIS file.
+ deploy_day() now also prints a per-ETF reason whenever it sends zero orders,
+ so a future no-order run explains itself instead of failing silently.
+
  WHAT THIS PROGRAM DOES
  ----------------------
   Live-only ETF momentum SIP. Upstox delivery holdings are the portfolio
@@ -17,7 +151,7 @@
   * Portfolio value = sum(Upstox holding quantity x Upstox last_price),
     including unsettled delivery positions, excluding broker cash and
     instruments outside this ETF universe. Cash is read separately only to
-    check affordability and to measure account-level drawdown.
+    check affordability; drawdown protection is flow-adjusted on the ETF sleeve.
   * Each run refreshes broker holdings/cash/orders, checks exits, updates the
     monthly basket when due, then spends only the unused daily SIP allowance
     on eligible ETFs. Target weights guide purchases; they are NOT a lump-sum
@@ -39,6 +173,9 @@
  ---------------------
   Edit INVEST_PER_DAY below (rupees of buy notional; statutory charges need
   additional available cash). Set it to 0 to pause buying without pausing exits.
+  MIN_BUY_VALUE is the minimum buy reservation; keep it below the daily cap so
+  whole-share LIMIT rounding can still fit. MIN_TRADE_VALUE remains the sell/trim
+  dust floor.
   Put UPSTOX_ACCESS_TOKEN / UPSTOX_API_TOKEN / UPSTOX_API_SECRET in ./env.txt.
 
   python etf-momentum-screener.py          # scan, update, live SIP cycle, status
@@ -130,14 +267,16 @@ REPORT_DIR = DATA_DIR / "reports"
 ENV_PATH = BASE_DIR / "env.txt"
 
 # --- Live execution -----------------------------------------------------------
-LIVE_ORDER_TYPE = "LIMIT"          # buys are price-capped; exits use MARKET
+LIVE_ORDER_TYPE = "LIMIT"          # buys are price-capped; exits use marketable LIMIT
 LIVE_LIMIT_BUFFER = 0.002          # maximum buy price = reference + 0.2%
+LIVE_SELL_LIMIT_BUFFER = 0.003     # marketable exit floor = reference - 0.3%
 
 # --- Signal parameters (Step 2/3) ---------------------------------------------
 LOOKBACK = 252                     # momentum lookback in trading sessions
 SKIP = 21                          # skip the most recent 21 sessions
 ENTRY_THRESHOLD = 0.02             # enter when momentum > +2%
 EXIT_THRESHOLD = 0.00              # exit when momentum <= 0%
+EXIT_DMA_CONFIRM_CLOSES = 2        # DMA exit needs this many consecutive closes below the 200-DMA
 MIN_HISTORY_BARS = 252             # a fund needs >= 252 sessions to signal
 
 # --- Risk / sizing parameters (Step 4/6) --------------------------------------
@@ -381,10 +520,11 @@ REENTRY_BAND = 0.05                # re-enter when within 5% of prior peak
 #        at all for Gold / Liquid / Gilt ETFs (and some international ETFs).
 #   Stamp duty: 0.015% on the BUYER for delivery (NSE). Verify against your
 #        contract note if your broker charges differently.
+#   Upstox equity/ETF brokerage: 0.025% or Rs 20/order, whichever is lower.
 #   Exchange 0.00297%, SEBI 0.0001%, IPFT 0.0001%, GST 18% on brokerage+exchange+SEBI.
 CHARGES = {
-    "brokerage_pct": 0.0005,       # 0.05% per order ...
-    "brokerage_cap": 20.0,         # ... capped at Rs 20 (discount broker)
+    "brokerage_pct": 0.00025,      # 0.025% per executed order (Upstox equity/ETF)
+    "brokerage_cap": 20.0,         # ... capped at Rs 20 per order
     "stt_buy_pct": 0.0,            # no STT on ETF purchase
     "stt_sell_pct": 0.00001,       # 0.001% sell side (equity ETFs only)
     "stamp_buy_pct": 0.00015,      # 0.015% on buy (delivery)
@@ -392,10 +532,10 @@ CHARGES = {
     "sebi_pct": 0.000001,          # 0.0001%
     "ipft_pct": 0.000001,          # 0.0001%
     "gst_pct": 0.18,               # 18% on brokerage+exchange+SEBI
-    "dp_sell_flat": 15.93,         # demat (DP) charge, SELL side only: flat Rs
-                                   # 13.50 + 18% GST per scrip per day (discount-
-                                   # broker schedule; audit v13 #4; verify your
-                                   # plan vs contract note — ledger #103)
+    "dp_sell_flat": 23.60,         # demat (DP) charge, SELL side only: Rs 20
+                                   # + 18% GST per scrip per sell day (Upstox
+                                   # CDSL schedule; verify against your contract
+                                   # note — audit 2026-11-08 P0-2)
 }
 STT_EXEMPT_CATEGORIES = {"COMMODITY", "DEBT"}   # gold/silver/liquid/gilt: no STT
 
@@ -431,7 +571,7 @@ INTEG_MAX_MOM = 3.00           #   silently adopted)
 
 # --- Audit fixes: cash proxies, selection quality, risk release ----------------
 # Liquid/overnight/gilt/bond funds are CASH PROXIES: they win rankings on tiny
-# vol and eat a top-3 slot, so they are excluded from the ranked pool (audit #3).
+# vol and eat a top-N slot, so they are excluded from the ranked pool (audit #3).
 CASH_PROXY_SYMBOLS = {"LIQUIDCASE", "LTGILTBEES", "EBBETF0430"}
 ONE_PER_INDEX_FAMILY = True        # original rulebook rule
 PAIRWISE_CORR_CAP = 0.70           # skip candidate if 120-day correlation with a
@@ -445,7 +585,9 @@ RISK_RELEASE_DAYS = 92             # release 15%/20% risk locks after ~3 months 
 # --- Tuning knobs (each has a default = current/conservative behaviour) --------
 NO_TRADE_BAND = 0.20               # skip rebalancing a position when |tgt-have| /
                                    #   max(tgt,have) < band (exits ALWAYS trade)
-MIN_TRADE_VALUE = 2_000.0          # skip dust trades; brokerage makes them poor value
+MIN_TRADE_VALUE = 2_000.0          # sell/trim dust floor; exits always trade
+MIN_BUY_VALUE = 500.0              # minimum BUY reservation; keep below the daily
+                                   #   cap so whole-share LIMIT rounding can fit
 MIN_LIQ_WEIGHT = 0.10              # audit 2.6: 15% x p25 must allow at least this
                                    #   fraction of portfolio equity, else no ranking
 VOL_BLEND_252 = 0.30               # 0..1 weight of the 252d vol blended into 60d vol.
@@ -485,6 +627,41 @@ SIP_TREND_GUARD = True             # daily buy pauses for a name whose EXIT rule
 # Historical R12A results remain in AUDIT_LEDGER.md; this is a user-locked
 # safety choice, not a performance-optimized optional knob.
 DAILY_EXIT_GUARD = True
+
+
+LOCKED_CONTRACT_ID = "SIP-LOCK-v1"   # see LOCKED ENGINE CONTRACT at the top of this file
+
+
+def config_errors() -> list:
+    """Fatal violations of the locked contract. These abort startup because
+    the engine would no longer be the instrument the owner specified."""
+    errs = []
+    if not SIP_MODE:
+        errs.append("SIP_MODE must remain True for the live SIP instrument.")
+    if not DAILY_EXIT_GUARD:
+        errs.append("DAILY_EXIT_GUARD must remain True (user-locked safety rule).")
+    if INVEST_PER_DAY < 0:
+        errs.append("INVEST_PER_DAY cannot be negative; use 0 to pause buys.")
+    if MIN_BUY_VALUE <= 0 or MIN_TRADE_VALUE < MIN_BUY_VALUE:
+        errs.append("Require 0 < MIN_BUY_VALUE <= MIN_TRADE_VALUE.")
+    if MAX_HOLDINGS < 1:
+        errs.append("MAX_HOLDINGS must be at least 1.")
+    return errs
+
+
+def buy_config_blocked() -> str:
+    """Reason buying is misconfigured, or '' when the buy config is sane.
+
+    Locked rule L7: a buy-side problem blocks BUYS ONLY. It is reported loudly
+    but must never abort the run, because DAILY_EXIT_GUARD is permanently on
+    and exits have to be checked even with a broken buy configuration.
+    """
+    if 0 < INVEST_PER_DAY < MIN_BUY_VALUE:
+        return (f"INVEST_PER_DAY={fmt_rs(INVEST_PER_DAY)} is below the "
+                f"{fmt_rs(MIN_BUY_VALUE)} minimum buy ticket, so no whole-share BUY "
+                "can fit. Raise INVEST_PER_DAY to at least the minimum ticket, or "
+                "set it to 0 to pause buys deliberately. Exits still run.")
+    return ""
 
 # --- Drawdown thresholds SCALE WITH THE VOL TARGET (audit: tuning section) -----
 DD_REVIEW_MULT = 1.00              # e.g. 15% target -> 15% review
@@ -713,6 +890,11 @@ class Printer:
         self.raw(paint("  " + "=" * (w - 4), _C.CYAN, _C.BOLD))
         self.raw(paint(f"  Today: {parse_date(today_str()).strftime('%A, %d %B %Y')}   Mode: LIVE TRADING",
                      _C.RED, _C.BOLD))
+        # Build fingerprint: if this line is missing, the copy being run is an
+        # older build (that was the 08-Nov-2026 zero-order cause).
+        self.raw(paint(f"  Contract: {LOCKED_CONTRACT_ID}  |  buy floor Rs {MIN_BUY_VALUE:,.0f}"
+                       f"  |  sell floor Rs {MIN_TRADE_VALUE:,.0f}"
+                       f"  |  daily cap Rs {INVEST_PER_DAY:,.0f}", _C.GREY))
         self.raw()
 
     def section(self, title: str, icon: str = ""):
@@ -2611,13 +2793,7 @@ def sessions_to_calendar(today: str, target: str) -> int:
     sessions left and stale-signal age was understated. The strict live SIP
     cap no longer uses deployment pacing, but signal freshness still needs a
     calendar-based market-day count."""
-    hols = set()
-    try:
-        hp = BASE_DIR / "nse_holidays.json"
-        if hp.exists():
-            hols = set(json.loads(hp.read_text()))
-    except Exception:
-        pass
+    hols = _nse_holidays()
     t = parse_date(today); n = parse_date(target)
     cnt = 0
     d = t + dt.timedelta(days=1)
@@ -2633,6 +2809,13 @@ def live_buy_order_px(px: float):
     if LIVE_ORDER_TYPE == "LIMIT":
         return "LIMIT", round(float(px) * (1.0 + LIVE_LIMIT_BUFFER), 2)
     return "MARKET", float(px)
+
+
+def live_sell_order_px(px: float):
+    """(order_type, minimum price) for a live exit. A marketable LIMIT slightly
+    below the reference avoids crossing a thin ETF's full spread with a naked
+    MARKET order, while still prioritising execution over price improvement."""
+    return "LIMIT", round(float(px) * (1.0 - LIVE_SELL_LIMIT_BUFFER), 2)
 
 
 def sip_orphan_should_sell(sym: str, target: dict, chosen_syms: set,
@@ -2668,12 +2851,12 @@ def day_slices(gaps: dict, budget: float, caps: dict = None) -> dict:
     (fairness: no order-of-iteration bias), clips at gaps and per-day caps,
     drops filled/cap-exhausted names, and redistributes only the clipped
     slack. Whatever cannot fill waits for a later run or the next IST day."""
-    todo = {s: float(g) for s, g in (gaps or {}).items() if g >= MIN_TRADE_VALUE}
+    todo = {s: float(g) for s, g in (gaps or {}).items() if g >= MIN_BUY_VALUE}
     caps = {s: max(0.0, min(float(c), todo[s]))
             for s, c in (caps or {}).items() if c is not None and s in todo}
     out = {}
     remaining = min(float(budget), sum(todo.values()))
-    while remaining >= MIN_TRADE_VALUE and todo:
+    while remaining >= MIN_BUY_VALUE and todo:
         pool = sum(todo.values())
         if pool <= 0:
             break
@@ -2683,7 +2866,7 @@ def day_slices(gaps: dict, budget: float, caps: dict = None) -> dict:
             if s in caps:
                 share = min(share, caps[s] - out.get(s, 0.0))
             share = max(0.0, share)
-            if share < MIN_TRADE_VALUE:
+            if share < MIN_BUY_VALUE:
                 continue
             out[s] = out.get(s, 0.0) + share
             todo[s] -= share
@@ -2693,30 +2876,30 @@ def day_slices(gaps: dict, budget: float, caps: dict = None) -> dict:
         # next redistribution pass
         for s in list(todo):
             room = caps.get(s, float("inf")) - out.get(s, 0.0)
-            if todo[s] < MIN_TRADE_VALUE or room < MIN_TRADE_VALUE:
+            if todo[s] < MIN_BUY_VALUE or room < MIN_BUY_VALUE:
                 del todo[s]
-        if applied < MIN_TRADE_VALUE:
+        if applied < MIN_BUY_VALUE:
             # audit v11 P0-2 (2026-10-28 console audit): when the daily budget
-            # split across N plan names drops EVERY share under MIN_TRADE_VALUE
+            # split across N plan names drops EVERY share under MIN_BUY_VALUE
             # (5000/3 = 1667 on the 2026-10-28 run), the loop applied nothing
             # and bought ZERO into a half-empty Rs 5.3 L plan.  Concentrate the
             # whole remainder on the single largest-gap name instead — one
             # order, one round-trip (audit v5 #3's one-order-per-day and the
-            # min-trade floor both stay intact).  Tomorrow's run then fills the
+            # min-buy floor both stay intact).  Tomorrow's run then fills the
             # next-largest gap; the basket completes over a few runs.
-            if todo and remaining >= MIN_TRADE_VALUE:
+            if todo and remaining >= MIN_BUY_VALUE:
                 for _big in sorted(todo, key=lambda s: -todo[s]):
                     _room = caps.get(_big, float("inf")) - out.get(_big, 0.0)
                     _alloc = min(todo[_big], remaining, _room)
-                    if _alloc >= MIN_TRADE_VALUE:
+                    if _alloc >= MIN_BUY_VALUE:
                         out[_big] = out.get(_big, 0.0) + _alloc
                         todo[_big] -= _alloc
                         remaining -= _alloc
                         applied = _alloc
                         break
-            if applied < MIN_TRADE_VALUE:
+            if applied < MIN_BUY_VALUE:
                 break                            # dust remainder stops
-    return {s: v for s, v in out.items() if v >= MIN_TRADE_VALUE}
+    return {s: v for s, v in out.items() if v >= MIN_BUY_VALUE}
 
 
 def deploy_budget_remaining(meta_val: str, today: str, amount: float):
@@ -2743,7 +2926,9 @@ def exit_rules_fire(adj):
         return True
     if len(adj) >= 200:
         seg = adj[-200:]
-        if adj[t] < sum(seg) / len(seg):
+        dma = sum(seg) / len(seg)
+        n = max(1, int(EXIT_DMA_CONFIRM_CLOSES))
+        if len(adj) >= n and all(x < dma for x in adj[-n:]):
             return True
     return False
 
@@ -2981,13 +3166,7 @@ def next_month_end_hint(today: Optional[str] = None) -> str:
     t = parse_date(today) if today else parse_date(today_str())
     last_day = _cal.monthrange(t.year, t.month)[1]
     d = dt.date(t.year, t.month, last_day)
-    hols = set()
-    try:
-        hp = BASE_DIR / "nse_holidays.json"
-        if hp.exists():
-            hols = set(json.loads(hp.read_text()))
-    except Exception:
-        pass
+    hols = _nse_holidays()
     while d.weekday() >= 5 or date_str(d) in hols:
         d -= dt.timedelta(days=1)
     return date_str(d)
@@ -3445,31 +3624,9 @@ class PortfolioBuilder:
                 and self.filters.tradable_enough(st.get("liq_p25", 0.0), gate_eq)]
         pool.sort(key=self.rank_metric, reverse=True)
         self.last_pool = list(pool)
-        chosen = self._pick_with_incumbency(pool, holding_symbols, MAX_HOLDINGS)
         chosen = self._apply_rotation(pool, holding_symbols, MAX_HOLDINGS)
         return {"chosen": chosen, "decisions": decisions, "exits": exits,
                 "holds": holds, "eligible": eligible}
-
-    def _pick_with_incumbency(self, ranked: list, holding_symbols: set, k: int) -> list:
-        """Rank order + family/correlation caps.
-
-        The rotation rule (_apply_rotation) IS the incumbency mechanism: held
-        ETFs ranked inside the top-N keep their seat, stale ones are replaced.
-        This strict rank-order pick is the fallback the rotation pass overrides;
-        the name is kept so call sites stay stable."""
-        rest = list(ranked)
-        out = self._corr_cap(rest, k)
-        for st in rest:
-            if len(out) >= k:
-                break
-            fam = universe_map().get(st["symbol"], {}).get("index_family", st["symbol"])
-            if ONE_PER_INDEX_FAMILY and any(
-                    universe_map().get(s["symbol"], {}).get("index_family") == fam for s in out):
-                continue
-            cand = out + [st]
-            if self._corr_ok(cand):
-                out.append(st)
-        return out
 
     def _corr_cap(self, pool: list, k: int) -> list:
         out = []
@@ -3543,15 +3700,16 @@ class PortfolioBuilder:
     def _apply_rotation(self, pool, holding_symbols, k):
         """
         Audit bug #9: rotation can now BOTH drop stale incumbents AND admit
-        replacements.  Held ETFs ranked beyond 5 are replaced while a stronger
-        eligible ETF exists; held ETFs ranked <= 5 keep their seat.
+        replacements.  Hysteresis band = 2 x MAX_HOLDINGS: held ETFs inside the
+        band keep their seat; stale incumbents beyond it are replaced.
         Correlation/family caps otherwise arbitrate WITH INCUMBENT PRIORITY
         (external audit F3.2).
         """
         ranked = sorted(pool, key=self.rank_metric, reverse=True)
         rank_pos = {st["symbol"]: i + 1 for i, st in enumerate(ranked)}
+        keep_band = max(k, 2 * k)
         kept = [st for st in ranked
-                if st["symbol"] in holding_symbols and rank_pos.get(st["symbol"], 99) <= 5]
+                if st["symbol"] in holding_symbols and rank_pos.get(st["symbol"], 99) <= keep_band]
         out = list(kept)
         for st in ranked:
             if len(out) >= k:
@@ -4213,8 +4371,8 @@ class Broker:
             if order_type != "LIMIT":
                 return {"status": "REJECTED", "reason": "strict SIP cap requires LIMIT buys"}
             reserved = round(qty * float(limit_px), 8)
-            if reserved < MIN_TRADE_VALUE:
-                return {"status": "REJECTED", "reason": "buy below MIN_TRADE_VALUE"}
+            if reserved < MIN_BUY_VALUE:
+                return {"status": "REJECTED", "reason": "buy below MIN_BUY_VALUE"}
             if reserved > self.sip_remaining() + 1e-8:
                 return {"status": "REJECTED", "reason": "daily SIP allowance exhausted"}
             need = reserved + calc_charges("BUY", reserved)["total"] * 1.10
@@ -4222,10 +4380,12 @@ class Broker:
                 return {"status": "REJECTED", "reason": "insufficient Upstox cash for order and charges"}
             send_px = float(limit_px)
         else:
-            order_type, send_px, reserved = "MARKET", 0.0, 0.0
-        row_id = self._insert_submission(symbol, side, qty, limit_px if side == "BUY" else ref_price,
+            order_type, send_px = live_sell_order_px(ref_price)
+            reserved = 0.0
+        row_id = self._insert_submission(symbol, side, qty,
+                                         float(limit_px) if side == "BUY" else float(send_px),
                                          signal_as_of, reason, order_type,
-                                         send_px if side == "BUY" else None, reserved)
+                                         send_px, reserved)
         if row_id is None:
             return {"status": "REJECTED", "reason": "daily SIP allowance exhausted"}
         key_row = self.db.one("SELECT instrument_key FROM etf_universe WHERE symbol=?", (symbol,))
@@ -4355,6 +4515,15 @@ class Broker:
 # ==============================================================================
 
 class RiskEngine:
+    """Flow-adjusted drawdown guard for the ETF sleeve.
+
+    Portfolio truth is Upstox holdings market value, not cash + holdings. SIP
+    buys and strategy sells are treated as subscriptions/redemptions at the
+    current sleeve NAV, so a cash withdrawal cannot manufacture a crash and a
+    fresh SIP contribution cannot erase one. Legacy account-equity peaks are
+    rebased once instead of being interpreted as a live drawdown.
+    """
+
     def __init__(self, db: Db, vol_target: float = None):
         self.db = db
         self.vol_target = float(vol_target if vol_target is not None else VOL_TARGET)
@@ -4363,6 +4532,10 @@ class RiskEngine:
         self.halved = db.meta_get("risk_halved", "0") == "1"
         self.all_cash = db.meta_get("risk_all_cash", "0") == "1"
         self.trigger_date = db.meta_get("risk_trigger_date", "")
+        self.units = float(db.meta_get("risk_sleeve_units", 0.0) or 0.0)
+        self.nav = float(db.meta_get("risk_nav", 1.0) or 1.0)
+        self.nav_peak = float(db.meta_get("risk_nav_peak", 1.0) or 1.0)
+        self.flow_seen = float(db.meta_get("risk_flow_seen", 0.0) or 0.0)
         self.trigger_counts = {
             "REVIEW": int(db.meta_get("risk_count_REVIEW", "0")),
             "SEVERE": int(db.meta_get("risk_count_SEVERE", "0")),
@@ -4375,56 +4548,99 @@ class RiskEngine:
         self.db.meta_set("risk_halved", "1" if self.halved else "0")
         self.db.meta_set("risk_all_cash", "1" if self.all_cash else "0")
         self.db.meta_set("risk_trigger_date", self.trigger_date)
+        self.db.meta_set("risk_sleeve_units", self.units)
+        self.db.meta_set("risk_nav", self.nav)
+        self.db.meta_set("risk_nav_peak", self.nav_peak)
+        self.db.meta_set("risk_flow_seen", self.flow_seen)
         for k, v in self.trigger_counts.items():
             self.db.meta_set(f"risk_count_{k}", v)
 
-    def update(self, equity: float, context: str = "") -> dict:
-        """Daily monitoring of portfolio drawdown."""
+    def _live_flow_total(self) -> float:
+        """Cumulative confirmed live sleeve flow: BUY fills minus SELL fills."""
+        total = 0.0
+        for r in self.db.query("SELECT side, value FROM orders WHERE mode='LIVE' AND filled_qty > 0"):
+            v = float(r["value"] or 0.0)
+            total += v if str(r["side"]).upper() == "BUY" else -v
+        return total
+
+    def _rebase(self, holdings_value: float, legacy_peak: float, mode_stored: str):
+        # Older journals measured cash + holdings. Switching to the ETF sleeve
+        # must rebase to verified holdings, otherwise a normal cash balance looks
+        # like a 90%+ crash and triggers forced selling.
+        if mode_stored or legacy_peak > 0:
+            P.warn(f"Legacy risk peak rebased to verified ETF holdings {fmt_cr(holdings_value)}.")
+        self.units = max(holdings_value, 0.0)
+        self.nav = 1.0
+        self.nav_peak = 1.0
+        self.peak = max(holdings_value, 0.0)
+        self.halved = False
+        self.all_cash = False
+        self.state = "NORMAL"
+        self.trigger_date = ""
+        self.flow_seen = self._live_flow_total()
+        self.db.meta_set("equity_peak_mode", "LIVE_SIP_NAV")
+        self.db.meta_set("risk_peak_rebased_date", today_str())
+        self._save()
+
+    def update(self, holdings_value: float, context: str = "", flow: float = None) -> dict:
+        """Daily monitoring of the flow-adjusted ETF sleeve drawdown."""
         events = []
-        # Legacy journals may contain a fixed-capital or simulated peak. Rebase
-        # once to the verified live account, never interpret that as a crash.
-        # Risk uses cash + holdings so an ordinary sale is not a drawdown;
-        # SIP allocation itself uses holdings market value only.
-        _mode_now = "LIVE_SIP"
-        _mode_stored = self.db.meta_get("equity_peak_mode", "")
-        if _mode_stored != _mode_now:
-            _legacy_meta_peak = float(self.db.meta_get("equity_peak", 0.0) or 0.0)
-            if _mode_stored or _legacy_meta_peak > 0:
-                P.warn(f"Legacy risk peak rebased to live account equity {fmt_cr(equity)}.")
-                self.peak = max(equity, 0.0)
-                self.halved = False
-                self.all_cash = False
-                self.state = "NORMAL"
-                self.trigger_date = ""
-                self.db.meta_set("risk_peak_rebased_date", today_str())
-            self.db.meta_set("equity_peak_mode", _mode_now)
+        hv = max(0.0, float(holdings_value))
+        mode_stored = self.db.meta_get("equity_peak_mode", "")
+        legacy_peak = float(self.db.meta_get("equity_peak", 0.0) or 0.0)
+        if mode_stored != "LIVE_SIP_NAV" or (self.units <= 0 and legacy_peak > 0):
+            self._rebase(hv, legacy_peak, mode_stored)
+        elif self.units <= 0:
+            self.units = hv
+            self.nav = self.nav_peak = 1.0
+            self.peak = hv
+            self.flow_seen = self._live_flow_total()
+            self.db.meta_set("equity_peak_mode", "LIVE_SIP_NAV")
             self._save()
-        if equity > self.peak:
-            self.peak = equity
-        dd = 1.0 - equity / self.peak if self.peak > 0 else 0.0
+
+        if flow is None:
+            total = self._live_flow_total()
+            flow = total - self.flow_seen
+            self.flow_seen = total
+        flow = float(flow)
+        if self.units <= 0:
+            self.units = hv
+            self.nav = 1.0 if hv > 0 else 0.0
+            self.nav_peak = max(self.nav_peak, self.nav)
+        else:
+            pre_flow = max(0.0, hv - flow)
+            nav_pre = pre_flow / self.units if self.units > 0 else 1.0
+            if nav_pre <= 1e-12:
+                self.nav = 0.0 if hv <= 0 else 1.0
+                if hv > 0 and flow > 0:
+                    self.units = hv
+                    self.nav_peak = 1.0
+            else:
+                if abs(flow) > 1e-9:
+                    self.units = max(0.0, self.units + flow / nav_pre)
+                self.nav = hv / self.units if self.units > 0 else 0.0
+        if self.nav > self.nav_peak:
+            self.nav_peak = self.nav
+        self.peak = self.nav_peak * self.units if self.units > 0 else hv
+        dd = 1.0 - self.nav / self.nav_peak if self.nav_peak > 0 else 0.0
         # --- release rules (audit bug #5) ---
-        # (a) classic: recover to within REENTRY_BAND of prior peak
-        # (b) TIME-BASED: after RISK_RELEASE_DAYS the lock is released at the
-        #     next review even without price recovery — sitting in cash cannot
-        #     heal a drawdown, and the old peak would re-trigger instantly —
-        #     so the peak is RESET to current equity on time-based release.
         if self.halved or self.all_cash:
             released = False
             reason = ""
             if dd <= REENTRY_BAND:
                 released, reason = True, (
-                    f"equity recovered to within {fmt_pct(REENTRY_BAND)} of "
-                    f"peak {fmt_rs(self.peak)}")
+                    f"sleeve NAV recovered to within {fmt_pct(REENTRY_BAND)} of "
+                    f"its peak (flow-adjusted)")
             elif self.trigger_date:
                 try:
                     trig = parse_date(self.trigger_date)
                     if (parse_date(today_str()) - trig).days >= RISK_RELEASE_DAYS:
                         released = True
-                        self.peak = equity          # reset the slate
+                        self.nav_peak = self.nav
+                        self.peak = hv
                         reason = (f"{RISK_RELEASE_DAYS} days elapsed since the "
-                                  f"trigger — time-based release; peak reset to "
-                                  f"{fmt_rs(equity)} so the rule can fire again "
-                                  f"on a NEW decline")
+                                  f"trigger — time-based release; sleeve NAV peak "
+                                  f"reset so the rule can fire again on a NEW decline")
                 except Exception:
                     pass
             if released:
@@ -4436,9 +4652,7 @@ class RiskEngine:
                     "INSERT INTO risk_events(ts,level,drawdown,action,detail) VALUES(?,?,?,?,?)",
                     (now_iso(), "RECOVERY", dd, "restore full sizing", reason))
                 events.append(("RECOVERY", f"Risk limits released — {reason}."))
-                # peak may have been reset — recompute dd so the trigger block
-                # below cannot re-lock the account on the OLD drawdown
-                dd = 1.0 - equity / self.peak if self.peak > 0 else 0.0
+                dd = 1.0 - self.nav / self.nav_peak if self.nav_peak > 0 else 0.0
         dd_review, dd_severe, dd_extreme = dd_thresholds(self.vol_target)
         if dd >= dd_extreme and not self.all_cash:
             self.all_cash = True
@@ -4449,7 +4663,7 @@ class RiskEngine:
                 "INSERT INTO risk_events(ts,level,drawdown,action,detail) VALUES(?,?,?,?,?)",
                 (now_iso(), "EXTREME", dd, "move to 100% cash",
                  f"drawdown {fmt_pct(dd)} breached {fmt_pct(dd_extreme)}"))
-            events.append(("EXTREME", f"Portfolio fell {fmt_pct(dd)} from peak — moving 100% to cash "
+            events.append(("EXTREME", f"ETF sleeve fell {fmt_pct(dd)} from its flow-adjusted peak — moving 100% to cash "
                                       f"(protection rule, not a guaranteed stop-loss)."))
         elif dd >= dd_severe and not self.halved and not self.all_cash:
             self.halved = True
@@ -4460,7 +4674,7 @@ class RiskEngine:
                 "INSERT INTO risk_events(ts,level,drawdown,action,detail) VALUES(?,?,?,?,?)",
                 (now_iso(), "SEVERE", dd, "halve target invested fraction",
                  f"drawdown {fmt_pct(dd)} breached {fmt_pct(dd_severe)}"))
-            events.append(("SEVERE", f"Portfolio fell {fmt_pct(dd)} from peak — target invested "
+            events.append(("SEVERE", f"ETF sleeve fell {fmt_pct(dd)} from its flow-adjusted peak — target invested "
                                      f"amount is HALVED until recovery."))
         elif dd >= dd_review and self.state == "NORMAL":
             self.state = "REVIEW"
@@ -4469,7 +4683,7 @@ class RiskEngine:
                 "INSERT INTO risk_events(ts,level,drawdown,action,detail) VALUES(?,?,?,?,?)",
                 (now_iso(), "REVIEW", dd, "risk review",
                  f"drawdown {fmt_pct(dd)} breached {fmt_pct(dd_review)}; holdings documented"))
-            events.append(("REVIEW", f"Portfolio fell {fmt_pct(dd)} from peak — risk review triggered."))
+            events.append(("REVIEW", f"ETF sleeve fell {fmt_pct(dd)} from its flow-adjusted peak — risk review triggered."))
         self.db.meta_set("risk_last_eval", today_str())
         self._save()
         return {"drawdown": dd, "peak": self.peak, "state": self.state,
@@ -4484,7 +4698,7 @@ class RiskEngine:
 
     def snapshot(self, date: str, cash: float, holdings_value: float, equity: float):
         inv = safe_div(holdings_value, equity, 0.0)
-        dd = 1.0 - equity / self.peak if self.peak > 0 else 0.0
+        dd = 1.0 - self.nav / self.nav_peak if self.nav_peak > 0 else 0.0
         self.db.execute(
             "INSERT INTO portfolio_snapshots(date,cash,holdings_value,equity,invested_frac,peak,drawdown,mode) "
             "VALUES(?,?,?,?,?,?,?,?) "
@@ -4771,6 +4985,11 @@ class TradingCycle:
             P.info("INVEST_PER_DAY=0: buying is paused. Exit checks, rotation and "
                    "risk sells still run; sale proceeds remain as broker cash.")
             return 0
+        blocked = buy_config_blocked()
+        if blocked:
+            P.err(blocked)
+            P.note("No SIP buys this run. Exit checks and risk sells are unaffected.")
+            return 0
         if not self.broker.live_book_ok():
             P.warn("No SIP buys: Upstox holdings/cash are not verified.")
             return 0
@@ -4779,9 +4998,14 @@ class TradingCycle:
         P.kv("Daily SIP cap", fmt_rs(INVEST_PER_DAY))
         P.kv("Already filled / reserved today", fmt_rs(committed))
         P.kv("Available to invest this run", fmt_rs(remaining))
-        if remaining < MIN_TRADE_VALUE:
-            P.info(f"Unused allowance is below the {fmt_rs(MIN_TRADE_VALUE)} minimum "
-                   "order (or the cap is exhausted). No additional buys.")
+        P.kv("Minimum buy ticket", fmt_rs(MIN_BUY_VALUE))
+        if remaining < MIN_BUY_VALUE:
+            if committed >= INVEST_PER_DAY - 1e-8:
+                P.info(f"Today's {fmt_rs(INVEST_PER_DAY)} SIP allowance is already fully "
+                       f"filled/reserved ({fmt_rs(committed)}). No additional buys today.")
+            else:
+                P.info(f"Only {fmt_rs(remaining)} of today's allowance is unused — below the "
+                       f"{fmt_rs(MIN_BUY_VALUE)} minimum buy ticket. No additional buys.")
             return 0
 
         basket = self.sip_basket()
@@ -4810,7 +5034,6 @@ class TradingCycle:
 
         prices = self.latest_prices()
         eq0 = self.broker.holdings_value()
-        holdings0 = self.broker.holdings()
         targets = self.sip_targets(basket, eq0)
         if not targets:
             P.warn("No eligible target weights; no SIP buys.")
@@ -4828,6 +5051,7 @@ class TradingCycle:
         except Exception:
             hard_blocks = {}
         plan, parked, hard_dropped = {}, [], []
+        skipped = {}          # sym -> why no order; printed when a run sends nothing
         for sym in basket:
             try:
                 raw = self.data.series(sym, today_str(), 300, "adj_close") or []
@@ -4837,23 +5061,30 @@ class TradingCycle:
                 adj, issue = [], "price history unreadable"
             if issue:
                 P.warn(f"Not buying {sym}: {issue}")
+                skipped[sym] = issue
                 hard_blocks[sym] = int(hard_blocks.get(sym, 0)) + 1
                 continue
             if SIP_TREND_GUARD and exit_rules_fire(adj):
                 P.warn(f"Not buying {sym}: current momentum/DMA exit rules fire.")
+                skipped[sym] = "trend guard: momentum/DMA exit rules currently fire"
                 parked.append(sym)
                 continue
             if int(hard_blocks.get(sym, 0)) >= DEPLOY_HARD_BLOCK_DAYS:
                 hard_dropped.append(sym)
+                skipped[sym] = (f"hard-blocked {hard_blocks.get(sym, 0)} runs in a row "
+                                "(broken data or premium); waits for the re-plan")
                 continue
             if targets.get(sym, 0.0) <= 0:
+                skipped[sym] = "no positive target weight in the stored plan"
                 continue
             px = qmap.get(sym) if market_open and tflag.get(sym) is True else prices.get(sym)
             if market_open and tflag.get(sym) is not True:
                 P.warn(f"Not buying {sym}: a fresh same-day Upstox quote is required while market is open.")
+                skipped[sym] = "no fresh same-day quote while the market is open"
                 continue
             if not px or px <= 0:
                 P.warn(f"Not buying {sym}: no valid reference price.")
+                skipped[sym] = "no valid reference price"
                 continue
             if qmap.get(sym) and prices.get(sym):
                 dev = qmap[sym] / prices[sym] - 1.0
@@ -4862,42 +5093,57 @@ class TradingCycle:
                            "using the live quote, subject to the premium gate.")
             plan[sym] = {"px": float(px)}
 
-        # Route the contribution by relative target weights. Projecting the
-        # portfolio by the unused allowance lets an empty book start AND lets
-        # an already-balanced book keep growing on later SIP days.
+        # SIP contribution routing: the unused daily allowance is split by
+        # RELATIVE target weights, not by gaps to a fixed lump-sum portfolio.
+        # Existing holdings do not shrink today's contribution; the book grows
+        # gradually with each SIP day. Absolute target-weight/cash-share rules
+        # are intentionally not used here (user direction 2026-11-08).
         weight_sum = sum(targets[s] for s in plan)
         if weight_sum <= 0:
             P.warn("No buyable ETF has a positive target weight.")
+            self._print_no_buy_reasons(basket, skipped)
             return 0
-        projected = eq0 + remaining
-        gaps = {}
-        for sym, item in plan.items():
-            desired = targets[sym] / weight_sum * projected
-            current = holdings0.get(sym, {}).get("qty", 0.0) * item["px"]
-            gaps[sym] = max(0.0, desired - current)
+        shares = {sym: remaining * targets[sym] / weight_sum for sym in plan}
+        if shares and max(shares.values()) <= MIN_BUY_VALUE:
+            # Every proportional share is below the minimum ticket. Keep the
+            # full-cap SIP instruction by concentrating on the highest-weight
+            # buyable name instead of idling the whole allowance.
+            shares = {sym: remaining + targets[sym] for sym in plan}
         caps = {}
         for sym in plan:
             p25 = self.filters.liquidity_p25(sym, today_str()) or 0.0
             if p25 > 0:
                 caps[sym] = POS_CAP_LIQ_FRAC * p25
-        slices = day_slices(gaps, remaining, caps)
+        slices = day_slices(shares, remaining, caps)
         if not slices:
-            P.info("No allocatable SIP slice after target gaps, liquidity caps and minimum-ticket checks.")
+            P.info("No allocatable SIP slice after contribution routing, liquidity caps and minimum-ticket checks.")
+            self._print_no_buy_reasons(basket, skipped)
             slices = {}
         submitted = filled = 0
         for sym, slice_val in sorted(slices.items(), key=lambda kv: (-kv[1], kv[0])):
             left = self.broker.sip_remaining()
-            if left < MIN_TRADE_VALUE:
+            if left < MIN_BUY_VALUE:
                 break
             if self.broker.live_open_qty(sym, "BUY") > 0:
                 P.info(f"{sym}: an earlier buy is still open/unconfirmed; not stacking another order.")
+                skipped[sym] = "an earlier BUY is still open/unconfirmed at the broker"
                 continue
             px = plan[sym]["px"]
             order_type, limit_px = live_buy_order_px(px)
             qty = int(min(slice_val, left) / limit_px)
             reserved = qty * limit_px
-            if qty <= 0 or reserved < MIN_TRADE_VALUE:
-                continue
+            if qty <= 0 or reserved < MIN_BUY_VALUE:
+                # Whole-share rounding can put a >=MIN_BUY_VALUE slice just
+                # below the ticket floor. Allow at most one extra share so a
+                # valid SIP contribution is not idled, never above the cap.
+                min_qty = int(math.ceil(MIN_BUY_VALUE / limit_px))
+                bumped = min_qty * limit_px
+                if bumped <= left + 1e-8 and bumped <= slice_val + limit_px + 1e-8:
+                    qty, reserved = min_qty, bumped
+                else:
+                    skipped[sym] = (f"whole-share slice {fmt_rs(reserved)} is below the "
+                                    f"{fmt_rs(MIN_BUY_VALUE)} minimum buy ticket")
+                    continue
             ok, why, _ = self.filters.check_execution(sym, today_str(), reserved)
             if ok:
                 blocked, dev, lim = self.filters.inav_premium_block(sym, today_str(), price=px)
@@ -4907,6 +5153,7 @@ class TradingCycle:
                            f"(allowed {fmt_pct(lim)})")
             if not ok:
                 P.warn(f"Not buying {sym}: {why}")
+                skipped[sym] = why
                 if "NAV" in why or "fair value" in why:
                     hard_blocks[sym] = int(hard_blocks.get(sym, 0)) + 1
                 self.db.execute(
@@ -4928,6 +5175,9 @@ class TradingCycle:
                 submitted += 1
                 filled += res.get("status") == "FILLED"
                 hard_blocks.pop(sym, None)
+            else:
+                skipped[sym] = (f"broker {res.get('status')}: "
+                                f"{res.get('reason') or res.get('note') or 'not accepted'}")
 
         try:
             self.db.meta_set(DEPLOY_SKIP_KEY, json.dumps({s: n for s, n in hard_blocks.items() if n > 0}))
@@ -4938,6 +5188,9 @@ class TradingCycle:
                 for s in offenders:
                     tk.pop(s, None)
                 self.db.meta_set(SIP_TARGETS_KEY, json.dumps(tk))
+                kept_basket = [s for s in (self.db.meta_get(SIP_BASKET_KEY, "") or "").split(",")
+                               if s.strip() and s.strip() not in offenders]
+                self.db.meta_set(SIP_BASKET_KEY, ",".join(kept_basket))
                 P.warn("Dropped until re-plan after repeated hard blocks: " + ", ".join(offenders))
         except Exception as e:
             P.note(f"Could not update hard-block journal: {e}")
@@ -4952,7 +5205,20 @@ class TradingCycle:
              f"of {fmt_rs(INVEST_PER_DAY)}; unused {fmt_rs(self.broker.sip_remaining())}.")
         if parked:
             P.info("Trend guard paused buys in: " + ", ".join(parked))
+        if submitted == 0:
+            self._print_no_buy_reasons(basket, skipped)
         return submitted
+
+    def _print_no_buy_reasons(self, basket: list, skipped: dict):
+        """A zero-order SIP run must explain itself (audit run-diagnosis
+        08-Nov-2026: the console showed no orders and no per-ETF reason)."""
+        P.warn("No SIP buy orders were sent to Upstox this run. Reason per basket ETF:")
+        for sym in basket:
+            P.note(f"  {sym}: {skipped.get(sym, 'no allocatable slice after routing/liquidity caps')}")
+        P.note(f"Allowance: cap {fmt_rs(INVEST_PER_DAY)} | filled+reserved "
+               f"{fmt_rs(self.broker.sip_committed())} | unused "
+               f"{fmt_rs(self.broker.sip_remaining())} | minimum buy ticket "
+               f"{fmt_rs(MIN_BUY_VALUE)}.")
 
     def daily_exit_guard(self):
         """Exit a holding the DAY its rules fire instead of waiting for the
@@ -4991,11 +5257,11 @@ class TradingCycle:
                 reason="EXIT-GUARD: trend broke before the month-end check")
             self.broker.print_order_ticket(
                 res, sym, universe_map().get(sym, {}).get("name", sym), "SELL")
-            if res.get("status") == "FILLED":
+            if res.get("status") in ("FILLED", "PENDING", "UNCONFIRMED", "SUBMITTING"):
                 fired += 1
         if fired:
-            P.warn(f"EXIT-GUARD sold {fired} holding(s) whose trend broke today "
-                   f"(did not wait for month-end).")
+            P.warn(f"EXIT-GUARD submitted exits for {fired} holding(s) whose trend broke today "
+                   f"(accepted/pending orders count; did not wait for month-end).")
         else:
             P.ok("EXIT-GUARD: everything held is still trending up — nothing to "
                  "sell today.")
@@ -5015,9 +5281,10 @@ class TradingCycle:
             P.err(f"Price data stale (newest {dp_max or 'none'}, last completed {lcs}). "
                   "Run update before trading; no orders placed.")
             return 0.0
-        if 0 < INVEST_PER_DAY < MIN_TRADE_VALUE:
-            P.warn(f"INVEST_PER_DAY={fmt_rs(INVEST_PER_DAY)} is below the "
-                   f"{fmt_rs(MIN_TRADE_VALUE)} minimum order: no buys can fit. Exits still run.")
+        blocked = buy_config_blocked()
+        if blocked:
+            # L7: never return here — the exit guard below must still run.
+            P.err(blocked)
         try:
             resolve_pending_live_orders(self.db, self.broker)
         except Exception as e:
@@ -5027,9 +5294,8 @@ class TradingCycle:
             return 0.0
 
         prices = self.latest_prices()
-        account_eq = self.broker.account_equity()
         hv = self.broker.holdings_value()
-        ctx = self.risk.update(account_eq, "daily")
+        ctx = self.risk.update(hv, "daily")
         for level, msg in ctx["events"]:
             P.warn(f"SAFETY ALERT ({level}): {msg}")
         self.apply_derisk(ctx, prices)
@@ -5390,8 +5656,7 @@ class TradingCycle:
         self.db.execute("UPDATE pending_trades SET status='DONE' WHERE status='PENDING' "
                         "AND symbol='*'")   # sliced SELL remainders survive for the daily worker
         eq_before = self.broker.equity()  # ETF market value, no cash or fixed seed
-        _account0 = self.broker.account_equity()
-        risk_ctx = self.risk.update(_account0, "cycle-start")
+        risk_ctx = self.risk.update(eq_before, "cycle-start")
         for level, msg in risk_ctx["events"]:
             P.warn(f"RISK [{level}]: {msg}")
         if risk_ctx["all_cash"]:
@@ -5463,7 +5728,7 @@ class TradingCycle:
                                              "spread_bps": st["spread_bps"], "name": st["name"]})
             target[st["symbol"]]["weight"] = 0.0
         # audit bug #2: EVERY held symbol must appear in the target map — a held
-        # ETF that fell out of the top-3 (or lost its data) is sold, so the
+        # ETF that fell out of the top-N (or lost its data) is sold, so the
         # portfolio never silently accumulates orphans.
         for sym, h in self.broker.holdings().items():
             if sym not in target:
@@ -5600,7 +5865,7 @@ class TradingCycle:
         cash = self.broker.cash()
         hv = self.broker.holdings_value()
         account_eq = cash + hv
-        self.risk.update(account_eq, "cycle-end")
+        self.risk.update(hv, "cycle-end")
         self.risk.snapshot(today_str(), cash, hv, account_eq)
         if signal_closeable(exits_outstanding, exits_failed):
             # audit v4 L4: a re-derived (override) basket must ALSO satisfy the
@@ -5646,7 +5911,7 @@ class TradingCycle:
         P.kv("ETFs you hold (worth now)", fmt_cr(hv))
         P.kv("ETF portfolio market value", fmt_cr(hv), val_color=_C.GREEN)
         P.kv("Account invested fraction", fmt_pct(safe_div(hv, account_eq, 0.0)))
-        dd = 1 - account_eq / self.risk.peak if self.risk.peak else 0.0
+        dd = max(0.0, 1.0 - self.risk.nav / self.risk.nav_peak) if self.risk.nav_peak > 0 else 0.0
         P.kv("Drawdown from peak", fmt_pct(dd, signed=False),
              val_color=_C.RED if dd > 0.05 else _C.WHITE)
         P.kv("Risk state", self.risk.state)
@@ -5679,10 +5944,10 @@ def cmd_status(db: Db):
     P.kv("Filled + reserved today", fmt_rs(broker.sip_committed()))
     P.kv("Unused SIP allowance", fmt_rs(broker.sip_remaining()))
     P.kv("Daily exit guard", "ON")
-    P.kv("Account equity (risk only)", fmt_cr(account_eq))
-    P.kv("Account peak (risk only)", fmt_cr(risk.peak))
-    dd = max(1 - account_eq / risk.peak, 0.0) if risk.peak else 0.0
-    P.kv("Account drawdown", fmt_pct(dd, signed=False), val_color=_C.RED if dd > 0.05 else _C.WHITE)
+    P.kv("Account equity (cash + ETFs)", fmt_cr(account_eq))
+    P.kv("ETF sleeve NAV peak (flow-adjusted)", fmt_cr(risk.peak))
+    dd = max(0.0, 1.0 - risk.nav / risk.nav_peak) if risk.nav_peak > 0 else 0.0
+    P.kv("ETF sleeve drawdown", fmt_pct(dd, signed=False), val_color=_C.RED if dd > 0.05 else _C.WHITE)
     P.kv("Risk state / last evaluated", f"{risk.state} / {db.meta_get('risk_last_eval', 'not yet')}")
     P.note("Portfolio = Upstox ETF quantity x broker market price. Cash and non-universe "
            "assets are excluded. Status does not move risk peaks or place orders.")
@@ -6020,10 +6285,10 @@ def cmd_selftest(db: Db):
 
     # v13 #4: demat (DP) charge — flat on SELL only, never on BUY
     check("audit v13: demat (DP) charge applies per SELL order, not on BUY",
-          abs(ch_e["dp"] - 15.93) < 1e-9 and ch_b["dp"] == 0.0
+          abs(ch_e["dp"] - 23.60) < 1e-9 and ch_b["dp"] == 0.0
           and abs(ch_e["total"] - (ch_e["brokerage"] + ch_e["stt"] + ch_e["stamp"]
                                    + ch_e["exchange"] + ch_e["sebi"] + ch_e["ipft"]
-                                   + ch_e["gst"] + 15.93)) < 1e-6,
+                                   + ch_e["gst"] + 23.60)) < 1e-6,
           f"dp={ch_e['dp']}")
 
     # v13 #1: instrument-master misses are retried by ISIN (SBIBPB/SBINEQWETF)
@@ -6134,10 +6399,18 @@ def cmd_selftest(db: Db):
     check("v15 P0-3: failed exits keep the signal open for retry",
           signal_closeable(0, []) is True and signal_closeable(1, []) is False
           and signal_closeable(0, ["PHARMABEES"]) is False, "closeable gate")
-    # P0-1: config sanity — the daily budget must be >= one minimum order.
-    check("v15 P0-1: INVEST_PER_DAY >= MIN_TRADE_VALUE (else zero buys ever)",
-          INVEST_PER_DAY >= MIN_TRADE_VALUE,
-          f"INVEST_PER_DAY={INVEST_PER_DAY} MIN_TRADE_VALUE={MIN_TRADE_VALUE}")
+    # P0-1: config sanity — the daily budget must be zero or >= one minimum buy.
+    check("v15 P0-1: INVEST_PER_DAY is zero or >= MIN_BUY_VALUE (else zero buys ever)",
+          INVEST_PER_DAY == 0 or INVEST_PER_DAY >= MIN_BUY_VALUE,
+          f"INVEST_PER_DAY={INVEST_PER_DAY} MIN_BUY_VALUE={MIN_BUY_VALUE}")
+    check("SIP-LOCK-v1: locked engine contract is intact (see file header)",
+          LOCKED_CONTRACT_ID == "SIP-LOCK-v1" and SIP_MODE is True
+          and DAILY_EXIT_GUARD is True and not config_errors(),
+          f"contract={LOCKED_CONTRACT_ID} errors={config_errors()}")
+    _buy_block = buy_config_blocked()
+    check("SIP-LOCK-v1 L7: a too-small buy cap blocks buys only, never aborts",
+          bool(_buy_block) == (0 < INVEST_PER_DAY < MIN_BUY_VALUE) and not config_errors(),
+          f"blocked={_buy_block!r}")
 
     # A8: impact grows with order size (no more flat 2 bps)
     small = impact_bps(10_000.0, 1_000_000.0)
@@ -6178,7 +6451,7 @@ def cmd_selftest(db: Db):
     except Exception:
         pass
 
-    # A4: illiquid ETF cannot take a top-3 slot (pre-ranking filter)
+    # A4: illiquid ETF cannot take a top-N slot (pre-ranking filter)
     dbsub2 = Db(DATA_DIR / "selftest_liq.db")
     fe4 = FilterEngine(dbsub2)
     pb4 = PortfolioBuilder(dbsub2, fe4)
@@ -6506,14 +6779,17 @@ def cmd_selftest(db: Db):
     # A5: time-based release from the 20% cash lock
     dbr = Db(DATA_DIR / "selftest_risk.db")
     dbr.meta_set("equity_peak", "100000")
-    dbr.meta_set("equity_peak_mode", "LIVE_SIP")
-    re = RiskEngine(dbr, vol_target=0.08)   # rule semantics at the 8% rulebook target
-    re.update(100000.0 * 0.75)          # -25% -> EXTREME lock
-    check("audit A5: 25% drop locks to cash", re.all_cash is True)
-    re.trigger_date = (parse_date(today_str()) - dt.timedelta(days=RISK_RELEASE_DAYS + 1)).isoformat()
-    re.update(100000.0 * 0.75)          # no price recovery, but time passed
+    dbr.meta_set("equity_peak_mode", "LIVE_SIP_NAV")
+    dbr.meta_set("risk_sleeve_units", "100000")
+    dbr.meta_set("risk_nav_peak", "1")
+    dbr.meta_set("risk_nav", "1")
+    risk_a5 = RiskEngine(dbr, vol_target=0.08)   # rule semantics at the 8% rulebook target
+    risk_a5.update(100000.0 * 0.75)          # -25% -> EXTREME lock
+    check("audit A5: 25% drop locks to cash", risk_a5.all_cash is True)
+    risk_a5.trigger_date = (parse_date(today_str()) - dt.timedelta(days=RISK_RELEASE_DAYS + 1)).isoformat()
+    risk_a5.update(100000.0 * 0.75)          # no price recovery, but time passed
     check("audit A5: time-based release fires without recovery",
-          re.all_cash is False and re.halved is False)
+          risk_a5.all_cash is False and risk_a5.halved is False)
     dbr.close()
     try:
         os.remove(DATA_DIR / "selftest_risk.db")
@@ -7047,9 +7323,9 @@ def cmd_selftest(db: Db):
     _s3b = day_slices({"A": 100000, "B": 100000, "C": 100000}, 90000,
                       {"B": 20000})
     _s3c = day_slices({"A": 10000, "B": 10000}, 90000)      # gaps clip total
-    _s3d = day_slices({"A": 99999, "B": 99999, "C": 99999}, 1500)  # true dust budget
+    _s3d = day_slices({"A": 99999, "B": 99999, "C": 99999}, 300)  # true dust budget
     check("v5#3: day_slices — one slice/ETF, proportional, caps clip and "
-          "redistribute, gaps clip; a budget under MIN_TRADE_VALUE idles "
+          "redistribute, gaps clip; a budget under MIN_BUY_VALUE idles "
           "(a merely UNSPLITTABLE budget concentrates per audit v11 P0-2 "
           "— covered by the v11 test below)",
           _s3a == {"A": 50000.0, "B": 50000.0, "C": 50000.0}
@@ -7125,17 +7401,17 @@ def cmd_selftest(db: Db):
           "the weekday-minus-holiday count (the v10 DB-count bug it fixes)",
           _cal == _exp and _cal >= 2, f"cal={_cal} expected={_exp}")
 
-    # P0-2: a budget below MIN_TRADE_VALUE x basket size must CONCENTRATE on
-    # the largest gap, not buy nothing (2026-10-28: 5000 over 3x 175k gaps
-    # produced zero orders into a half-empty Rs 5.3 L plan).
-    _c1 = day_slices({"A": 175000, "B": 175000, "C": 175000}, 5000)
-    _c2 = day_slices({"A": 175000, "B": 175000, "C": 175000}, 5000,
-                     caps={"A": 1000, "B": 1000})  # caps block: still buys C
-    _c3 = day_slices({"A": 1000, "B": 900}, 5000)   # sub-min GAPS: still nothing
+    # P0-2: a budget below MIN_BUY_VALUE x basket size must CONCENTRATE on
+    # the largest gap, not buy nothing (1200 over 3x 175k gaps splits into
+    # 400 shares, all below the 500 buy floor).
+    _c1 = day_slices({"A": 175000, "B": 175000, "C": 175000}, 1200)
+    _c2 = day_slices({"A": 175000, "B": 175000, "C": 175000}, 1200,
+                     caps={"A": 400, "B": 400})  # caps block: still buys C
+    _c3 = day_slices({"A": 400, "B": 300}, 5000)   # sub-min GAPS: still nothing
     check("v11: day_slices concentrates a too-small-to-split budget on the "
           "largest uncapped gap; sub-min gaps honestly stay unfilled",
-          sum(_c1.values()) == 5000 and len(_c1) == 1
-          and sum(_c2.values()) == 5000 and list(_c2) == ["C"]
+          sum(_c1.values()) == 1200 and len(_c1) == 1
+          and sum(_c2.values()) == 1200 and list(_c2) == ["C"]
           and _c3 == {},
           f"c1={_c1} c2={_c2} c3={_c3}")
 
@@ -7572,11 +7848,11 @@ def cmd_monitor(db: Db):
     risk = RiskEngine(db)
     hv, cash = broker.holdings_value(), broker.cash()
     account_eq = cash + hv
-    ctx = risk.update(account_eq)
+    ctx = risk.update(hv)
     risk.snapshot(today_str(), cash, hv, account_eq)
     P.kv("ETF portfolio market value", fmt_cr(hv))
     P.kv("Broker cash (separate)", fmt_cr(cash))
-    P.kv("Account drawdown", fmt_pct(ctx["drawdown"]))
+    P.kv("ETF sleeve drawdown (flow-adjusted)", fmt_pct(ctx["drawdown"]))
     P.kv("Risk state", ctx["state"])
     for level, msg in ctx["events"]:
         P.warn(f"RISK [{level}] {msg}")
@@ -7620,13 +7896,37 @@ def main(argv=None):
                              "stock-data/nav/*.csv files from Groww/AMFI + mfapi")
     args = parser.parse_args(argv)
 
+    errs = config_errors()
+    if errs:
+        for e in errs:
+            P.err(e)
+        raise SystemExit(2)
+    blocked = buy_config_blocked()
+    if blocked:
+        P.err(blocked)      # buys only; exits must still run (locked rule L7)
+
+    if args.command == "selftest":
+        # P0-7: selftests must never open or mutate the production journal.
+        import tempfile
+        global DATA_DIR, DB_PATH
+        old_data_dir, old_db_path = DATA_DIR, DB_PATH
+        with tempfile.TemporaryDirectory(prefix="etf-selftest-") as td:
+            DATA_DIR = Path(td)
+            DB_PATH = DATA_DIR / "tsmom.db"
+            test_db = Db(DB_PATH)
+            try:
+                ok = cmd_selftest(test_db)
+            finally:
+                test_db.close()
+                DATA_DIR, DB_PATH = old_data_dir, old_db_path
+        if not ok:
+            raise SystemExit(1)
+        return
+
     db = Db()
     log(f"command={args.command}")
     try:
-        if args.command == "selftest":
-            if not cmd_selftest(db):
-                raise SystemExit(1)
-        elif args.command == "scan":
+        if args.command == "scan":
             P.banner()
             cmd_scan(db)
         elif args.command == "update":
@@ -7659,7 +7959,7 @@ def main(argv=None):
             cmd_reconcile(db)
         elif args.command == "live":
             P.banner()
-            if not live_order_ok("Live SIP buys use LIMIT orders; exits use MARKET. Broker fills are reconciled."):
+            if not live_order_ok("Live SIP buys use buffered LIMIT orders; exits use marketable LIMIT orders. Broker fills are reconciled."):
                 P.note("No orders placed.")
                 return
             cmd_trade(db, force_exec=args.force_exec)

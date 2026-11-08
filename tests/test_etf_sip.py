@@ -129,8 +129,8 @@ class TestPortfolioBasis(SipTestCase):
         self.assertEqual(b.equity(), 0.0)
         self.assertAlmostEqual(b.account_equity(), 123456.0)
         risk = m.RiskEngine(self.db)
-        risk.update(b.account_equity(), "first verified live read")
-        self.assertAlmostEqual(risk.peak, 123456.0)
+        risk.update(b.holdings_value(), "first verified live read")
+        self.assertAlmostEqual(risk.peak, 0.0)  # cash is not the ETF sleeve
         self.assertFalse(hasattr(m, "STARTING_CAPITAL"))
         self.assertFalse(hasattr(m, "PAPER_TRADE"))
         self.assertTrue(m.DAILY_EXIT_GUARD)
@@ -225,6 +225,66 @@ class TestStrictDailyAllowance(SipTestCase):
         self.assertEqual(client.placed[0]["symbol"], "OLD")
         self.assertAlmostEqual(b.sip_committed(), 0.0)
 
+    def test_small_daily_cap_uses_buy_floor_and_whole_share_limit_rounding(self):
+        client = FakeUpstox(cash=100000.0)
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "MIN_BUY_VALUE", 500.0), \
+             mock.patch.object(m, "MIN_TRADE_VALUE", 2000.0), quiet():
+            b = self.broker(client)
+            ok = b.execute("A", "BUY", 9, 100.0, reason="small SIP")
+            self.assertEqual(ok["status"], "PENDING")
+            self.assertEqual(len(client.placed), 1)
+            self.assertAlmostEqual(b.sip_committed(), 901.8)
+            tiny = b.execute("B", "BUY", 4, 100.0, reason="below buy floor")
+            self.assertEqual(tiny["status"], "REJECTED")
+            self.assertIn("MIN_BUY_VALUE", tiny["reason"])
+            self.assertEqual(len(client.placed), 1)
+            self.assertEqual(m.day_slices({"A": 1000.0}, 1000.0), {"A": 1000.0})
+            self.assertEqual(m.day_slices({"A": 400.0}, 1000.0), {})
+
+    def test_deploy_day_can_place_a_small_sip_order_under_the_daily_cap(self):
+        client = FakeUpstox(cash=100000.0)
+        b = self.broker(client)
+        c = self.cycle(b)
+        self.seed_price("A", 100.0)
+        self.db.meta_set(m.SIP_BASKET_KEY, "A")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, m.json.dumps({"A": 1.0}))
+        c._live_quotes = lambda symbols: ({}, {}, {})
+        c.filters.check_execution = lambda *a, **k: (True, "", {})
+        c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "MIN_BUY_VALUE", 500.0), \
+             mock.patch.object(m, "market_open_now", return_value=False), quiet():
+            submitted = c.deploy_day()
+        self.assertEqual(submitted, 1)
+        self.assertEqual(len(client.placed), 1)
+        self.assertEqual(client.placed[0]["side"], "BUY")
+        self.assertEqual(client.placed[0]["qty"], 9)
+        self.assertTrue(client.placed[0]["amo"])
+        self.assertAlmostEqual(b.sip_committed(), 901.8)
+
+    def test_sell_trim_dust_floor_is_not_lowered_by_small_buy_floor(self):
+        client = FakeUpstox(holdings=[{"trading_symbol": "A", "quantity": 30,
+                                       "average_price": 100.0, "last_price": 100.0}])
+        b = self.broker(client)
+        c = self.cycle(b)
+        self.seed_price("A", 100.0)
+        st = {"symbol": "A", "name": "A", "close": 100.0, "momentum": 0.2,
+              "vol": 0.1, "liq_p25": 1e9, "spread_bps": 8.0}
+        selection = {"chosen": [st], "exits": [], "decisions": [(st, "HOLD", "test")]}
+        sized = {"weights": {"A": 0.9}, "risk_scale": 1.0, "port_vol": 0.1,
+                 "capped": {}, "delta": 0.0, "cond": 1.0, "vol_reachable": True}
+        c.builder.select = lambda *a, **k: selection
+        c.builder.size = lambda *a, **k: sized
+        c.collect_stats = lambda as_of: [st]
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "MIN_BUY_VALUE", 500.0), \
+             mock.patch.object(m, "MIN_TRADE_VALUE", 2000.0), \
+             mock.patch.object(m, "NO_TRADE_BAND", 0.0), quiet():
+            c.run(force_exec=True, as_of_override=m.today_str(), quiet=True)
+        self.assertEqual(client.placed, [])  # Rs 300 trim stays below the Rs 2,000 sell floor
+
     def test_run_daily_still_runs_exits_and_rebalance_at_zero_cap(self):
         client = FakeUpstox(holdings=[{"trading_symbol": "A", "quantity": 30,
                                        "average_price": 100.0, "last_price": 100.0}])
@@ -244,6 +304,196 @@ class TestStrictDailyAllowance(SipTestCase):
         self.assertIn("exit", calls)
         self.assertEqual(calls[-1], "deploy")
         self.assertEqual(client.placed, [])
+
+
+class TestAuditFixes(SipTestCase):
+    def test_locked_contract_constants_are_enforced(self):
+        self.assertEqual(m.LOCKED_CONTRACT_ID, "SIP-LOCK-v1")
+        self.assertTrue(m.SIP_MODE)
+        self.assertTrue(m.DAILY_EXIT_GUARD)
+        self.assertEqual(m.config_errors(), [])
+        with mock.patch.object(m, "DAILY_EXIT_GUARD", False):
+            self.assertTrue(any("DAILY_EXIT_GUARD" in e for e in m.config_errors()))
+        with mock.patch.object(m, "SIP_MODE", False):
+            self.assertTrue(any("SIP_MODE" in e for e in m.config_errors()))
+
+    def test_small_cap_blocks_buys_only_and_is_not_a_fatal_config_error(self):
+        # Locked rule L7: a buy-side misconfiguration must never kill exits.
+        with mock.patch.object(m, "INVEST_PER_DAY", 100.0):
+            self.assertEqual(m.config_errors(), [])
+            self.assertIn("minimum buy ticket", m.buy_config_blocked())
+        with mock.patch.object(m, "INVEST_PER_DAY", 0.0):
+            self.assertEqual(m.buy_config_blocked(), "")
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0):
+            self.assertEqual(m.buy_config_blocked(), "")
+
+    def test_bad_buy_cap_still_runs_the_daily_exit_guard(self):
+        client = FakeUpstox(holdings=[{"trading_symbol": "A", "quantity": 30,
+                                       "average_price": 100.0, "last_price": 100.0}])
+        b = self.broker(client)
+        c = self.cycle(b)
+        self.seed_price("A", 100.0, date=m.last_completed_session())
+        calls = []
+        c.apply_derisk = lambda ctx, prices: calls.append("derisk")
+        c.consume_pending_sells = lambda prices: calls.append("pending_sells") or 0
+        c.run = lambda **kw: calls.append("rebalance") or 0.0
+        c.daily_exit_guard = lambda: calls.append("exit") or 0
+        c.deploy_day = lambda: calls.append("deploy") or 0
+        with mock.patch.object(m, "INVEST_PER_DAY", 100.0), quiet():
+            c.run_daily(force_exec=True, final_status=False)
+        self.assertIn("exit", calls)
+        self.assertEqual(calls[-1], "deploy")
+
+    def test_zero_order_sip_run_prints_a_reason_for_every_basket_etf(self):
+        client = FakeUpstox(cash=100000.0)
+        b = self.broker(client)
+        c = self.cycle(b)
+        self.seed_price("A", 100.0)
+        self.db.meta_set(m.SIP_BASKET_KEY, "A")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 1.0}))
+        # Declining series: the trend guard parks the only basket name.
+        c.data = types.SimpleNamespace(
+            series=lambda sym, *a, **k: [{"adj_close": 200.0 - i * 0.3} for i in range(300)])
+        c._live_quotes = lambda symbols: ({}, {}, {})
+        out = io.StringIO()
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "market_open_now", return_value=False), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.assertEqual(c.deploy_day(), 0)
+        text = out.getvalue()
+        self.assertIn("Reason per basket ETF", text)
+        self.assertIn("A: trend guard", text)
+        self.assertEqual(client.placed, [])
+
+    def test_replay_of_the_2026_11_08_zero_order_run_now_submits_one_amo_buy(self):
+        # The exact reported Windows state: Rs 7,542 of ETF holdings already
+        # above target, Rs 2.07 L cash, Rs 1,000 cap, three-name basket.
+        for sym, px in (("PHARMABEES", 29.22), ("MOCAPITAL", 57.84), ("SML100CASE", 12.0)):
+            self.db.execute(
+                "INSERT OR REPLACE INTO etf_universe(symbol,name,category,index_family,"
+                "status,instrument_key) VALUES(?,?,?,?,?,?)",
+                (sym, sym, "EQUITY", sym, "ACTIVE", f"NSE_EQ|{sym}"))
+            self.seed_price(sym, px)
+        client = FakeUpstox(cash=207000.0, holdings=[
+            {"trading_symbol": "PHARMABEES", "quantity": 173, "average_price": 27.22, "last_price": 29.22},
+            {"trading_symbol": "MOCAPITAL", "quantity": 43, "average_price": 51.74, "last_price": 57.84}])
+        client.default_details = {"status": "amo req received", "filled_quantity": 0, "average_price": 0.0}
+        b = self.broker(client)
+        self.assertAlmostEqual(b.holdings_value(), 7542.18, places=2)
+        c = self.cycle(b)
+        c.data = types.SimpleNamespace(
+            series=lambda sym, *a, **k: [{"adj_close": 100.0 + i * 0.1} for i in range(300)])
+        self.db.meta_set(m.SIP_BASKET_KEY, "PHARMABEES,MOCAPITAL,SML100CASE")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps(
+            {"PHARMABEES": 0.1735, "MOCAPITAL": 0.1735, "SML100CASE": 0.1735}))
+        c._live_quotes = lambda symbols: ({}, {}, {})
+        c.filters.check_execution = lambda *a, **k: (True, "", {})
+        c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "market_open_now", return_value=False), quiet():
+            submitted = c.deploy_day()
+        self.assertEqual(submitted, 1)
+        self.assertEqual(len(client.placed), 1)
+        order = client.placed[0]
+        self.assertEqual(order["side"], "BUY")
+        self.assertEqual(order["type"], "LIMIT")
+        self.assertTrue(order["amo"])
+        self.assertGreaterEqual(b.sip_committed(), m.MIN_BUY_VALUE)
+        self.assertLessEqual(b.sip_committed(), 1000.0)
+
+    def test_upstox_charge_schedule_small_ticket_and_dp_sell(self):
+        buy = m.calc_charges("BUY", 1000.0)
+        self.assertAlmostEqual(buy["brokerage"], 0.25)
+        self.assertAlmostEqual(buy["dp"], 0.0)
+        sell = m.calc_charges("SELL", 1000.0)
+        self.assertAlmostEqual(sell["dp"], 23.60)
+        self.assertAlmostEqual(sell["brokerage"], 0.25)
+        capped = m.calc_charges("BUY", 1_000_000.0)
+        self.assertAlmostEqual(capped["brokerage"], 20.0)
+
+    def test_sip_contribution_buys_the_daily_cap_even_when_holdings_are_overweight(self):
+        client = FakeUpstox(cash=100000.0, holdings=[
+            {"trading_symbol": "A", "quantity": 1000, "average_price": 100.0, "last_price": 100.0}])
+        b = self.broker(client)
+        c = self.cycle(b)
+        self.seed_price("A", 100.0)
+        self.seed_price("B", 100.0)
+        self.db.meta_set(m.SIP_BASKET_KEY, "A,B")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 0.5, "B": 0.5}))
+        c._live_quotes = lambda symbols: ({}, {}, {})
+        c.filters.check_execution = lambda *a, **k: (True, "", {})
+        c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0),              mock.patch.object(m, "market_open_now", return_value=False), quiet():
+            submitted = c.deploy_day()
+        self.assertEqual(submitted, 1)
+        self.assertEqual(len(client.placed), 1)
+        self.assertGreaterEqual(b.sip_committed(), m.MIN_BUY_VALUE)
+        self.assertLessEqual(b.sip_committed(), 1000.0)
+
+    def test_hard_block_drops_symbol_from_basket_and_targets(self):
+        client = FakeUpstox(cash=100000.0)
+        b = self.broker(client)
+        c = self.cycle(b)
+        self.seed_price("B", 100.0)
+        self.db.meta_set(m.SIP_BASKET_KEY, "A,B")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 0.5, "B": 0.5}))
+        self.db.meta_set(m.DEPLOY_SKIP_KEY, json.dumps({"A": m.DEPLOY_HARD_BLOCK_DAYS}))
+        c.data = types.SimpleNamespace(series=lambda sym, *a, **k: [{"adj_close": 100.0 + i * 0.1} for i in range(300)])
+        c._live_quotes = lambda symbols: ({}, {}, {})
+        c.filters.check_execution = lambda *a, **k: (True, "", {})
+        c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), mock.patch.object(m, "market_open_now", return_value=False), quiet():
+            c.deploy_day()
+        self.assertEqual(self.db.meta_get(m.SIP_BASKET_KEY, ""), "B")
+        self.assertNotIn("A", json.loads(self.db.meta_get(m.SIP_TARGETS_KEY, "{}")))
+
+    def test_exit_guard_counts_accepted_pending_sells_and_dma_exit_needs_confirmation(self):
+        client = FakeUpstox(holdings=[{"trading_symbol": "A", "quantity": 30,
+                                       "average_price": 100.0, "last_price": 100.0}])
+        client.default_details = {"status": "open", "filled_quantity": 0, "average_price": 0.0}
+        b = self.broker(client)
+        c = self.cycle(b)
+        c.data = types.SimpleNamespace(series=lambda *a, **k: [200.0] * 260 + [100.0] * 40)
+        self.seed_price("A", 100.0)
+        with quiet():
+            self.assertEqual(c.daily_exit_guard(), 1)
+        self.assertEqual(client.placed[0]["side"], "SELL")
+        self.assertEqual(client.placed[0]["type"], "LIMIT")
+        self.assertLess(client.placed[0]["price"], 100.0)
+
+        rise = [100.0 + i * 0.1 for i in range(300)]
+        dma = sum(rise[-200:]) / 200.0
+        one_below = rise[:-1] + [dma - 1.0]
+        two_below = rise[:-2] + [dma - 1.0, dma - 1.0]
+        with mock.patch.object(m, "EXIT_DMA_CONFIRM_CLOSES", 2):
+            self.assertFalse(m.exit_rules_fire(one_below))
+            self.assertTrue(m.exit_rules_fire(two_below))
+
+    def test_old_account_equity_peak_rebases_to_etf_holdings_not_a_false_crash(self):
+        self.db.meta_set("equity_peak", "214000")
+        self.db.meta_set("equity_peak_mode", "LIVE_SIP")
+        risk = m.RiskEngine(self.db)
+        with quiet():
+            ctx = risk.update(7542.0, "switch to sleeve NAV")
+        self.assertEqual(ctx["state"], "NORMAL")
+        self.assertFalse(ctx["all_cash"])
+        self.assertAlmostEqual(risk.peak, 7542.0)
+
+    def test_risk_drawdown_is_sleeve_only_and_flow_adjusted(self):
+        risk = m.RiskEngine(self.db)
+        with quiet():
+            risk.update(1000.0, "opening holdings")
+            ctx = risk.update(2000.0, "SIP buy", flow=1000.0)
+            self.assertAlmostEqual(ctx["drawdown"], 0.0)
+            ctx = risk.update(1800.0, "price decline")
+            self.assertAlmostEqual(ctx["drawdown"], 0.10)
+            ctx = risk.update(1800.0, "cash withdrawal elsewhere")
+            self.assertAlmostEqual(ctx["drawdown"], 0.10)
+            self.assertFalse(ctx["all_cash"])
 
 
 class TestLiveOrderSafety(SipTestCase):

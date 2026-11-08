@@ -1012,3 +1012,48 @@ Deployment note: the reported Windows console showed `INVEST_PER_DAY = 0`, while
 Validation: compile and pyflakes clean; 11 external unittest tests passed, including six mocked-transport endpoint contracts and the single-attempt POST failure regression; all 110 embedded selftests passed on an isolated temporary DB. The new regression failed on the old duplicate URLs/missing header before the fix. No authenticated Upstox request or real order was made in the sandbox.
 
 *Last updated: Upstox v2 route hotfix, 08-Nov-2026 (row 159). External tests: 11; selftests: 110; authenticated live verification pending on the user's machine.*
+
+---
+
+## 11. LIVE SIP — small daily cap buy floor (2026-11-08)
+
+| # | Finding / shipped behaviour | Status |
+| --- | --- | --- |
+| 160 | A Windows run with `INVEST_PER_DAY = 1000` correctly refused buys because the old single `MIN_TRADE_VALUE = 2000` floor applied to buys. Added `MIN_BUY_VALUE = 500` for buy reservations/day-slice routing while preserving `MIN_TRADE_VALUE = 2000` as the sell/trim dust floor. Whole-share LIMIT rounding still applies, so the actual reserved notional can be below the daily cap. The committed default `INVEST_PER_DAY = 5000` is unchanged; a local ₹1,000 cap is now supported when all gates pass. | APPLIED — offline verified |
+
+Validation: compile and pyflakes clean; 14 external unittest tests passed, including a ₹1,000-cap `deploy_day` fake-client order, buy-floor rejection, day-slice routing, and an unchanged ₹2,000 sell/trim floor; all 110 embedded selftests passed on an isolated temporary DB. No authenticated Upstox request or real order was made in the sandbox.
+
+*Last updated: small-cap buy floor, 08-Nov-2026 (row 160). External tests: 14; selftests: 110; authenticated live verification pending on the user's machine.*
+
+---
+
+## 12. LIVE SIP — external audit fixes, SIP-instrument scope (2026-11-08)
+
+| # | Finding / shipped behaviour | Status |
+| --- | --- | --- |
+| 161 | Charge schedule corrected: Upstox equity/ETF brokerage is 0.025% capped at ₹20/order (stored as the fraction `0.00025` because `calc_charges` multiplies notional by the field), and the CDSL DP sell charge is ₹23.60/scrip/sell day (₹20 + 18% GST). The old 0.05% brokerage and ₹15.93 DP values were wrong. | APPLIED — offline verified |
+| 162 | Configuration sanity is now fail-closed at startup: `SIP_MODE` and `DAILY_EXIT_GUARD` must stay True, `INVEST_PER_DAY` must be 0 or at least `MIN_BUY_VALUE`, and `0 < MIN_BUY_VALUE <= MIN_TRADE_VALUE`. A nonzero cap below the buy floor is a startup error, not a warning that silently places zero buys. | APPLIED — offline verified |
+| 163 | Daily SIP routing is contribution-based, not fixed-lump-sum gap filling: the unused `INVEST_PER_DAY` allowance is split by relative target weights across eligible ETFs even when existing holdings are already above target. If every proportional share is at/below the minimum ticket, the run concentrates on the highest-weight buyable name instead of idling the cap. Whole-share LIMIT rounding may still leave a small unusable remainder; the cap is never lifted. Absolute target-weight/cash-share portfolio-manager routing was explicitly NOT adopted. | APPLIED — offline verified |
+| 164 | Drawdown protection now measures the Upstox ETF sleeve, flow-adjusted like a unitised NAV: confirmed live BUY fills subscribe units and SELL fills redeem units at current NAV, so cash withdrawals cannot manufacture a crash and SIP contributions cannot erase one. Legacy account-equity peaks (including old `LIVE_SIP` peaks) rebase once to verified ETF holdings instead of triggering a false 90%+ drawdown. Status/monitor labels now say ETF sleeve drawdown. | APPLIED — offline verified |
+| 165 | Repeated hard blocks now remove the offending ETF from both `sip_targets` and `sip_basket`, so the next SIP run cannot keep re-selecting a data-corrupt/premium-blocked name mid-month. The exit guard counts accepted PENDING/UNCONFIRMED/SUBMITTING sells as handled, not only FILLED sells. | APPLIED — offline verified |
+| 166 | Execution/selection hygiene: rotation hysteresis is `2 × MAX_HOLDINGS` instead of a hard-coded top-5; the discarded `_pick_with_incumbency` call was removed; DMA exits require `EXIT_DMA_CONFIRM_CLOSES = 2` consecutive closes below the 200-DMA (momentum exits remain immediate); exits use marketable LIMIT orders 0.3% below reference instead of naked MARKET orders; duplicate NSE-holiday loaders were consolidated; the selftest `re` shadow was renamed. | APPLIED — offline verified |
+| 167 | `selftest` now runs against a fresh temporary `DATA_DIR`/DB from `main()` and never opens the production journal. AMO/run-anytime behaviour is retained by user direction; the audit's weekend/holiday order-blocking suggestion was not adopted. External/manual audit items (liquid-fund cash parking, DDPI, restoring old tax lots/tradebook, contract-note verification) and fixed-lump-sum PM rules (cash-share target weights, weekly/monthly tickets, accumulating allowance, core-satellite) remain out of scope. | APPLIED — offline verified |
+
+Validation: compile and pyflakes clean; 21 external unittest tests passed, including charge schedule, startup config sanity, full-cap contribution routing with overweight holdings, hard-block basket removal, pending exit-guard counting, marketable LIMIT exits, DMA confirmation, sleeve-only flow-adjusted risk, and legacy account-peak rebasing; all 110 embedded selftests passed via the isolated temporary-DB `selftest` command. No authenticated Upstox request or real order was made in the sandbox.
+
+*Last updated: SIP-preserving external audit fixes, 08-Nov-2026 (rows 161–167). External tests: 21; selftests: 110; authenticated live verification pending on the user's machine.*
+
+---
+
+## 13. LOCKED CONTRACT HEADER + zero-order run root cause (2026-11-08)
+
+| # | Finding / shipped behaviour | Status |
+| --- | --- | --- |
+| 168 | The fixed engine behaviour is now written at the very top of `etf-momentum-screener.py` as **LOCKED ENGINE CONTRACT — DO NOT CHANGE. DO NOT RE-AUDIT.** (`SIP-LOCK-v1`, rules L1–L14): SIP instrument not a lump-sum PM, run anytime, full daily contribution, Upstox-holdings portfolio via API, gradual growth, `DAILY_EXIT_GUARD` always True, exits never stop, strict never-lifted daily cap, no blind retries/fail closed, two separate ticket floors, human confirmation, live-only, real broker charges, isolated selftest. The same header carries the **AUDIT REGISTER** for the 08-Nov-2026 external audit with a disposition per item (FIXED / PRESENT / REJECTED / MANUAL / DEFERRED). Enforced at runtime by `LOCKED_CONTRACT_ID`, `config_errors()` and two new selftest checks. | APPLIED — offline verified |
+| 169 | **Zero-order run root cause.** The Windows console was running the pre-fix build (commit `37803f7`), which still applied `MIN_TRADE_VALUE = ₹2,000` to BUY orders, so a ₹1,000 cap printed "below the Rs 2,000.00 minimum order" and idled the allowance. It was not a broker rejection, not an AMO problem and not an exit-guard problem. An offline replay of the exact reported state (PHARMABEES 173 @ ₹29.22, MOCAPITAL 43 @ ₹57.84, ₹7,542 holdings, ₹2.07 L cash, ₹1,000 cap, three-name basket, signal 2026-10-30, Sunday) submits **0 orders on the old build** and **1 AMO LIMIT BUY — PHARMABEES 34 @ ₹29.28 = ₹995.52 reserved, ₹4.48 unused** on this build. The buy-floor fix from row 160 was uncommitted and had never reached the user's machine. | APPLIED — offline verified |
+| 170 | A zero-order SIP run now explains itself: `deploy_day()` records a skip reason for every basket ETF (data integrity, trend guard, hard block, no target weight, stale quote, no price, open order, sub-minimum whole-share slice, filter/premium block, broker rejection) and prints a "Reason per basket ETF" block plus the cap/committed/unused/minimum-ticket arithmetic whenever it sends nothing. Exhausted allowance is now worded differently from a below-floor remainder. The banner prints a build fingerprint (`Contract: SIP-LOCK-v1 | buy floor | sell floor | daily cap`) so a stale copy is immediately visible. | APPLIED — offline verified |
+| 171 | Locked-rule L7 correction to row 162: a nonzero cap below the buy floor is a **buy-blocking loud error, not a startup abort**. The earlier hard `SystemExit`/early `return` would have disabled the permanently-on exit guard for a buy-side misconfiguration, violating L6/L7. Split into `config_errors()` (fatal contract violations) and `buy_config_blocked()` (buys only); `run_daily` continues to exits in both cases. | APPLIED — offline verified |
+
+Validation: compile and pyflakes clean; 25 external unittest tests passed, including a full replay of the 08-Nov-2026 zero-order state now submitting one AMO BUY, the locked-contract constants, buy-only blocking, exits-still-run with a bad cap, and the per-ETF no-buy reason output; all 112 embedded selftests passed on an isolated temporary DB. No authenticated Upstox request or real order was made in the sandbox.
+
+*Last updated: locked contract header + zero-order diagnosis, 08-Nov-2026 (rows 168–171). External tests: 25; selftests: 112; authenticated live verification pending on the user's machine.*
