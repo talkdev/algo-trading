@@ -1057,3 +1057,17 @@ Validation: compile and pyflakes clean; 21 external unittest tests passed, inclu
 Validation: compile and pyflakes clean; 25 external unittest tests passed, including a full replay of the 08-Nov-2026 zero-order state now submitting one AMO BUY, the locked-contract constants, buy-only blocking, exits-still-run with a bad cap, and the per-ETF no-buy reason output; all 112 embedded selftests passed on an isolated temporary DB. No authenticated Upstox request or real order was made in the sandbox.
 
 *Last updated: locked contract header + zero-order diagnosis, 08-Nov-2026 (rows 168–171). External tests: 25; selftests: 112; authenticated live verification pending on the user's machine.*
+
+---
+
+## 14. Upstox API AMO rejection (UDAPI1162) and closed-market SIP behaviour (2026-11-08)
+
+| # | Finding / shipped behaviour | Status |
+| --- | --- | --- |
+| 172 | The previous fix reached Upstox but the broker rejected the Sunday order: `UDAPI1162 — AMO orders are not supported via the API`. The engine had assumed API AMO support. It now **never sends `is_amo=True`**; `UpstoxClient.place_order` refuses an AMO request before any POST, and `Broker.execute` fails closed outside the regular NSE session. The locked contract L2/L3 and audit register were amended to state this broker reality: the script still runs anytime, but live API submissions are regular-session only. | APPLIED — offline verified |
+| 173 | Closed-market SIP runs now defer honestly: `deploy_day` prints the UDAPI1162 reason per basket ETF, stores a non-reserving `sip_deferred_intent` reminder, and leaves the daily allowance unused (no rollover). Added `--wait-for-open` for run/trade/live so a confirmed run can wait until the next regular session and then submit. The closed-market exit guard queues a pending SELL for the next session instead of pretending an exit was accepted. Banner/status show market CLOSED and the next open time. | APPLIED — offline verified |
+| 174 | Failed/rejected pre-submit orders no longer masquerade as filled value: submission rows start with `value=0`, explicit broker rejection/no-instrument-key paths zero `value/filled_qty/charges/reserved_value`, and the SIP summary says “filled value” rather than “confirmed value”. This fixes the Windows log showing a FAILED AMO order with ₹977 “filled value”. Order tags use the submission date (`today_str()`), not the process-start date, so an overnight `--wait-for-open` run tags the correct session. | APPLIED — offline verified |
+
+Validation: compile and pyflakes clean; 30 external unittest tests passed, including closed-market no-AMO/no-POST, client AMO refusal, explicit-rejection zero value/budget release, closed-market deploy deferral, closed-market exit queueing, next-session calendar math, and a regular-session replay of the reported state submitting one non-AMO LIMIT BUY; all 112 embedded selftests passed on an isolated temporary DB with deterministic regular-session order tests. No authenticated Upstox request or real order was made in the sandbox.
+
+*Last updated: UDAPI1162 AMO hotfix + closed-market deferral, 08-Nov-2026 (rows 172–174). External tests: 30; selftests: 112; authenticated live verification pending during the next regular NSE session.*

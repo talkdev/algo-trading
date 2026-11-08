@@ -81,6 +81,9 @@ class SipTestCase(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(m, "INVEST_PER_DAY", 5000.0))
         self.stack.enter_context(mock.patch.object(m, "SIP_MODE", True))
         self.stack.enter_context(mock.patch.object(m, "DAILY_EXIT_GUARD", True))
+        # Order-path tests default to a regular session; closed-market tests
+        # override this explicitly. Upstox API does not support AMO.
+        self.stack.enter_context(mock.patch.object(m, "market_open_now", return_value=True))
 
     def tearDown(self):
         self.stack.close()
@@ -250,18 +253,18 @@ class TestStrictDailyAllowance(SipTestCase):
         self.db.meta_set(m.SIP_BASKET_KEY, "A")
         self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
         self.db.meta_set(m.SIP_TARGETS_KEY, m.json.dumps({"A": 1.0}))
-        c._live_quotes = lambda symbols: ({}, {}, {})
+        c._live_quotes = lambda symbols: ({s: 100.0 for s in symbols}, {}, {s: True for s in symbols})
         c.filters.check_execution = lambda *a, **k: (True, "", {})
         c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
         with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
              mock.patch.object(m, "MIN_BUY_VALUE", 500.0), \
-             mock.patch.object(m, "market_open_now", return_value=False), quiet():
+             mock.patch.object(m, "market_open_now", return_value=True), quiet():
             submitted = c.deploy_day()
         self.assertEqual(submitted, 1)
         self.assertEqual(len(client.placed), 1)
         self.assertEqual(client.placed[0]["side"], "BUY")
         self.assertEqual(client.placed[0]["qty"], 9)
-        self.assertTrue(client.placed[0]["amo"])
+        self.assertFalse(client.placed[0]["amo"])
         self.assertAlmostEqual(b.sip_committed(), 901.8)
 
     def test_sell_trim_dust_floor_is_not_lowered_by_small_buy_floor(self):
@@ -358,7 +361,7 @@ class TestAuditFixes(SipTestCase):
         c._live_quotes = lambda symbols: ({}, {}, {})
         out = io.StringIO()
         with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
-             mock.patch.object(m, "market_open_now", return_value=False), \
+             mock.patch.object(m, "market_open_now", return_value=True), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             self.assertEqual(c.deploy_day(), 0)
         text = out.getvalue()
@@ -366,7 +369,7 @@ class TestAuditFixes(SipTestCase):
         self.assertIn("A: trend guard", text)
         self.assertEqual(client.placed, [])
 
-    def test_replay_of_the_2026_11_08_zero_order_run_now_submits_one_amo_buy(self):
+    def test_replay_of_the_2026_11_08_state_submits_one_regular_session_buy(self):
         # The exact reported Windows state: Rs 7,542 of ETF holdings already
         # above target, Rs 2.07 L cash, Rs 1,000 cap, three-name basket.
         for sym, px in (("PHARMABEES", 29.22), ("MOCAPITAL", 57.84), ("SML100CASE", 12.0)):
@@ -378,7 +381,7 @@ class TestAuditFixes(SipTestCase):
         client = FakeUpstox(cash=207000.0, holdings=[
             {"trading_symbol": "PHARMABEES", "quantity": 173, "average_price": 27.22, "last_price": 29.22},
             {"trading_symbol": "MOCAPITAL", "quantity": 43, "average_price": 51.74, "last_price": 57.84}])
-        client.default_details = {"status": "amo req received", "filled_quantity": 0, "average_price": 0.0}
+        client.default_details = {"status": "open", "filled_quantity": 0, "average_price": 0.0}
         b = self.broker(client)
         self.assertAlmostEqual(b.holdings_value(), 7542.18, places=2)
         c = self.cycle(b)
@@ -388,18 +391,19 @@ class TestAuditFixes(SipTestCase):
         self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
         self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps(
             {"PHARMABEES": 0.1735, "MOCAPITAL": 0.1735, "SML100CASE": 0.1735}))
-        c._live_quotes = lambda symbols: ({}, {}, {})
+        pxmap = {"PHARMABEES": 29.22, "MOCAPITAL": 57.84, "SML100CASE": 12.0}
+        c._live_quotes = lambda symbols: ({s: pxmap[s] for s in symbols}, {}, {s: True for s in symbols})
         c.filters.check_execution = lambda *a, **k: (True, "", {})
         c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
         with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
-             mock.patch.object(m, "market_open_now", return_value=False), quiet():
+             mock.patch.object(m, "market_open_now", return_value=True), quiet():
             submitted = c.deploy_day()
         self.assertEqual(submitted, 1)
         self.assertEqual(len(client.placed), 1)
         order = client.placed[0]
         self.assertEqual(order["side"], "BUY")
         self.assertEqual(order["type"], "LIMIT")
-        self.assertTrue(order["amo"])
+        self.assertFalse(order["amo"])
         self.assertGreaterEqual(b.sip_committed(), m.MIN_BUY_VALUE)
         self.assertLessEqual(b.sip_committed(), 1000.0)
 
@@ -423,10 +427,10 @@ class TestAuditFixes(SipTestCase):
         self.db.meta_set(m.SIP_BASKET_KEY, "A,B")
         self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
         self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 0.5, "B": 0.5}))
-        c._live_quotes = lambda symbols: ({}, {}, {})
+        c._live_quotes = lambda symbols: ({s: 100.0 for s in symbols}, {}, {s: True for s in symbols})
         c.filters.check_execution = lambda *a, **k: (True, "", {})
         c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
-        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0),              mock.patch.object(m, "market_open_now", return_value=False), quiet():
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), mock.patch.object(m, "market_open_now", return_value=True), quiet():
             submitted = c.deploy_day()
         self.assertEqual(submitted, 1)
         self.assertEqual(len(client.placed), 1)
@@ -443,10 +447,10 @@ class TestAuditFixes(SipTestCase):
         self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 0.5, "B": 0.5}))
         self.db.meta_set(m.DEPLOY_SKIP_KEY, json.dumps({"A": m.DEPLOY_HARD_BLOCK_DAYS}))
         c.data = types.SimpleNamespace(series=lambda sym, *a, **k: [{"adj_close": 100.0 + i * 0.1} for i in range(300)])
-        c._live_quotes = lambda symbols: ({}, {}, {})
+        c._live_quotes = lambda symbols: ({s: 100.0 for s in symbols}, {}, {s: True for s in symbols})
         c.filters.check_execution = lambda *a, **k: (True, "", {})
         c.filters.inav_premium_block = lambda *a, **k: (False, None, None)
-        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), mock.patch.object(m, "market_open_now", return_value=False), quiet():
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), mock.patch.object(m, "market_open_now", return_value=True), quiet():
             c.deploy_day()
         self.assertEqual(self.db.meta_get(m.SIP_BASKET_KEY, ""), "B")
         self.assertNotIn("A", json.loads(self.db.meta_get(m.SIP_TARGETS_KEY, "{}")))
@@ -548,19 +552,84 @@ class TestLiveOrderSafety(SipTestCase):
         headers = {key.lower(): value for key, value in request.headers.items()}
         self.assertEqual(headers.get("api-version"), "2.0")
 
-    def test_after_market_orders_are_flagged_amo(self):
+    def test_closed_market_never_sends_amo_and_open_market_sends_regular_order(self):
         client = FakeUpstox()
         b = self.broker(client)
         with mock.patch.object(m, "market_open_now", return_value=False), quiet():
-            b.execute("A", "BUY", 20, 100.0)
-        self.assertTrue(client.placed[0]["amo"])
-        client2 = FakeUpstox()
-        b2 = m.Broker(self.db, m.TaxEngine(self.db), client2)
-        # same symbol already has an open order from b; use a fresh symbol
-        self.assertTrue(b2.sync_live_book())
+            res = b.execute("A", "BUY", 20, 100.0)
+        self.assertEqual(res["status"], "REJECTED")
+        self.assertIn("UDAPI1162", res["reason"])
+        self.assertEqual(client.placed, [])
+        self.assertAlmostEqual(b.sip_committed(), 0.0)
         with mock.patch.object(m, "market_open_now", return_value=True), quiet():
-            b2.execute("B", "BUY", 20, 100.0)
-        self.assertFalse(client2.placed[0]["amo"])
+            res = b.execute("A", "BUY", 20, 100.0)
+        self.assertEqual(res["status"], "PENDING")
+        self.assertFalse(client.placed[0]["amo"])
+
+    def test_upstox_client_refuses_to_send_is_amo_true(self):
+        client = m.UpstoxClient({"UPSTOX_ACCESS_TOKEN": "offline-test"})
+        with mock.patch.object(m.urllib.request, "urlopen") as op:
+            with self.assertRaises(m.UpstoxError):
+                client.place_order("A", "NSE_EQ|A", "BUY", 1, 100.0, "LIMIT", is_amo=True)
+        op.assert_not_called()
+
+    def test_explicit_broker_rejection_journals_zero_filled_value_and_releases_budget(self):
+        client = FakeUpstox()
+        client.submit_error = m.UpstoxError('Upstox HTTP 400: {"errors":[{"errorCode":"UDAPI1162"}]}')
+        b = self.broker(client)
+        with mock.patch.object(m, "market_open_now", return_value=True), quiet():
+            res = b.execute("A", "BUY", 20, 100.0, reason="explicit reject")
+        self.assertEqual(res["status"], "FAILED")
+        row = self.db.one("SELECT status,value,filled_qty,reserved_value FROM orders ORDER BY id DESC LIMIT 1")
+        self.assertEqual(row["status"], "FAILED")
+        self.assertAlmostEqual(row["value"], 0.0)
+        self.assertAlmostEqual(row["filled_qty"], 0.0)
+        self.assertAlmostEqual(row["reserved_value"], 0.0)
+        self.assertAlmostEqual(b.sip_committed(), 0.0)
+
+    def test_closed_market_deploy_defers_without_sending_orders(self):
+        client = FakeUpstox(cash=100000.0)
+        b = self.broker(client)
+        c = self.cycle(b)
+        self.seed_price("A", 100.0)
+        self.db.meta_set(m.SIP_BASKET_KEY, "A")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 1.0}))
+        c._live_quotes = lambda symbols: ({}, {}, {})
+        out = io.StringIO()
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "market_open_now", return_value=False), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.assertEqual(c.deploy_day(), 0)
+        self.assertEqual(client.placed, [])
+        self.assertIn("UDAPI1162", out.getvalue())
+        self.assertTrue(self.db.meta_get(m.SIP_DEFERRED_KEY, ""))
+        self.assertAlmostEqual(b.sip_committed(), 0.0)
+
+    def test_closed_market_exit_guard_queues_pending_sell(self):
+        client = FakeUpstox(holdings=[{"trading_symbol": "A", "quantity": 30,
+                                       "average_price": 100.0, "last_price": 100.0}])
+        b = self.broker(client)
+        c = self.cycle(b)
+        c.data = types.SimpleNamespace(series=lambda *a, **k: [200.0] * 260 + [100.0] * 40)
+        self.seed_price("A", 100.0)
+        with mock.patch.object(m, "market_open_now", return_value=False), quiet():
+            self.assertEqual(c.daily_exit_guard(), 0)
+        self.assertEqual(client.placed, [])
+        row = self.db.one("SELECT symbol,side,target_qty,status FROM pending_trades WHERE symbol='A'")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["side"], "SELL")
+        self.assertAlmostEqual(row["target_qty"], 30.0)
+
+    def test_next_market_open_skips_weekend_and_holidays(self):
+        # 2026-11-08 is a Sunday and in the repo holiday file; next session is Mon 09:15.
+        now = m.dt.datetime(2026, 11, 8, 12, 0)
+        nxt = m.next_market_open(now)
+        self.assertEqual(nxt, m.dt.datetime(2026, 11, 9, 9, 15))
+        friday_after = m.dt.datetime(2026, 11, 6, 16, 0)
+        self.assertEqual(m.next_market_open(friday_after), m.dt.datetime(2026, 11, 9, 9, 15))
+        monday_pre = m.dt.datetime(2026, 11, 9, 8, 0)
+        self.assertEqual(m.next_market_open(monday_pre), m.dt.datetime(2026, 11, 9, 9, 15))
 
 
 if __name__ == "__main__":
