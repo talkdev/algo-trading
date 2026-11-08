@@ -996,3 +996,19 @@ imports, zero definition-only constants); `python -m unittest discover -s tests`
 (110 passed). No real Upstox orders were placed.
 
 *Last updated: live-only lean cleanup, 08-Nov-2026 (rows 152–158; offline research apparatus removed, adopted defaults hardwired, live SIP behaviour preserved). Selftest count: 110; external fake-client tests: 10.*
+
+---
+
+## 10. LIVE API — duplicate v2 route hotfix (2026-11-08)
+
+| # | Finding / shipped behaviour | Status |
+| --- | --- | --- |
+| 159 | A Windows live run failed closed on holdings HTTP 404 / UDAPI100060. `UPSTOX_BASE` already contains `/v2`, but holdings, positions, funds and the order book appended another `/v2`. Removed the duplicate prefix and added the required `Api-Version: 2.0` request header. Order placement/details already used the correct single-prefix path; their transport contract is now explicitly tested too. No fail-closed, SIP-cap, or order-retry relaxation. | APPLIED — offline verified |
+
+Reference: the official Upstox SDK specifies the single-prefix routes and version header in its [portfolio API](https://github.com/upstox/upstox-python/blob/master/upstox_client/api/portfolio_api.py), [user API](https://github.com/upstox/upstox-python/blob/master/upstox_client/api/user_api.py), and [order API](https://github.com/upstox/upstox-python/blob/master/upstox_client/api/order_api.py).
+
+Deployment note: the reported Windows console showed `INVEST_PER_DAY = 0`, while this branch's committed default is `5000`. The hotfix does not change that setting. Zero pauses buys but still permits exits/sells; verify the Windows copy's configuration before a confirmed live run. Start with the read-only `status` command after applying the fix.
+
+Validation: compile and pyflakes clean; 11 external unittest tests passed, including six mocked-transport endpoint contracts and the single-attempt POST failure regression; all 110 embedded selftests passed on an isolated temporary DB. The new regression failed on the old duplicate URLs/missing header before the fix. No authenticated Upstox request or real order was made in the sandbox.
+
+*Last updated: Upstox v2 route hotfix, 08-Nov-2026 (row 159). External tests: 11; selftests: 110; authenticated live verification pending on the user's machine.*

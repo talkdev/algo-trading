@@ -497,7 +497,7 @@ def dd_thresholds(vol_target: float = None):
 
 
 # --- Upstox API ----------------------------------------------------------------
-UPSTOX_BASE = "https://api.upstox.com/v2"
+UPSTOX_BASE = "https://api.upstox.com/v2"  # already versioned; paths below omit /v2
 UPSTOX_INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 HTTP_SLEEP = 0.35                  # politeness delay between API calls
 FETCH_CHUNK_DAYS = 1000            # historical fetch chunk; auto-halves on error
@@ -1159,6 +1159,8 @@ class UpstoxClient:
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Accept": "application/json",
+            # Account/order v2 APIs require this header as well as the URL prefix.
+            "Api-Version": "2.0",
             # Cloudflare blocks python-urllib's default signature (error 1010)
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1335,7 +1337,7 @@ class UpstoxClient:
 
     def positions(self) -> list:
         """Today's Upstox positions. Errors propagate (never fake a flat book)."""
-        resp = self._request(f"{UPSTOX_BASE}/v2/portfolio/short-term-positions")
+        resp = self._request(f"{UPSTOX_BASE}/portfolio/short-term-positions")
         if resp.get("status") not in (None, "success"):
             raise UpstoxError(f"positions API: {resp.get('status')}")
         data = resp.get("data")
@@ -1347,7 +1349,7 @@ class UpstoxClient:
 
     def funds_available(self):
         """Available equity margin; unavailable/invalid data is an error."""
-        resp = self._request(f"{UPSTOX_BASE}/v2/user/get-funds-and-margin?segment=SEC")
+        resp = self._request(f"{UPSTOX_BASE}/user/get-funds-and-margin?segment=SEC")
         if resp.get("status") not in (None, "success"):
             raise UpstoxError(f"funds API: {resp.get('status')}")
         data = resp.get("data") or {}
@@ -1364,7 +1366,7 @@ class UpstoxClient:
 
     def holdings(self):
         """Upstox delivery holdings. Only an explicit empty list means flat."""
-        resp = self._request(f"{UPSTOX_BASE}/v2/portfolio/long-term-holdings")
+        resp = self._request(f"{UPSTOX_BASE}/portfolio/long-term-holdings")
         if resp.get("status") not in (None, "success"):
             raise UpstoxError(f"holdings API: {resp.get('status')}")
         data = resp.get("data")
@@ -1376,7 +1378,7 @@ class UpstoxClient:
 
     def orders_book(self):
         """Today's broker order book; errors propagate to the fail-closed sync."""
-        resp = self._request(f"{UPSTOX_BASE}/v2/order/retrieve-all")
+        resp = self._request(f"{UPSTOX_BASE}/order/retrieve-all")
         if resp.get("status") not in (None, "success"):
             raise UpstoxError(f"order book API: {resp.get('status')}")
         data = resp.get("data")

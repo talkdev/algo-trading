@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import pathlib
 import sys
 import tempfile
@@ -246,12 +247,56 @@ class TestStrictDailyAllowance(SipTestCase):
 
 
 class TestLiveOrderSafety(SipTestCase):
+    def test_account_and_order_http_contracts_use_one_v2_prefix_and_version_header(self):
+        # Exercise the real urllib client, but replace its transport. These
+        # checks must never contact Upstox or submit a real order.
+        client = m.UpstoxClient({"UPSTOX_ACCESS_TOKEN": "offline-test"})
+        base = "https://api.upstox.com/v2"
+        cases = [
+            ("holdings", (), "/portfolio/long-term-holdings", "GET", []),
+            ("positions", (), "/portfolio/short-term-positions", "GET", []),
+            ("funds_available", (), "/user/get-funds-and-margin?segment=SEC", "GET",
+             {"equity": {"available_margin": 12345.0}}),
+            ("orders_book", (), "/order/retrieve-all", "GET", []),
+            ("order_details", ("O1",), "/order/details?order_id=O1", "GET",
+             {"order_id": "O1", "status": "complete"}),
+            ("place_order", ("A", "NSE_EQ|A", "BUY", 20, 100.2, "LIMIT"),
+             "/order/place", "POST", {"order_id": "O1"}),
+        ]
+        for name, args, path, method, data in cases:
+            with self.subTest(endpoint=name):
+                payload = json.dumps({"status": "success", "data": data}).encode("utf-8")
+                with mock.patch.object(m.urllib.request, "urlopen",
+                                       return_value=io.BytesIO(payload)) as op:
+                    getattr(client, name)(*args)
+                self.assertEqual(op.call_count, 1)
+                request = op.call_args.args[0]
+                self.assertEqual(request.full_url, base + path)
+                self.assertEqual(request.get_method(), method)
+                headers = {key.lower(): value for key, value in request.headers.items()}
+                self.assertEqual(headers.get("api-version"), "2.0")
+                self.assertEqual(headers["authorization"], "Bearer offline-test")
+                self.assertEqual(headers["accept"], "application/json")
+                if name == "place_order":
+                    body = json.loads(request.data)
+                    self.assertEqual(body["instrument_token"], "NSE_EQ|A")
+                    self.assertEqual(body["transaction_type"], "BUY")
+                    self.assertEqual(body["quantity"], 20)
+                    self.assertEqual(body["product"], "D")
+                    self.assertEqual(body["order_type"], "LIMIT")
+                    self.assertEqual(body["price"], 100.2)
+                    self.assertFalse(body["is_amo"])
+
     def test_order_submission_is_not_retried_on_network_failure(self):
         client = m.UpstoxClient({"UPSTOX_ACCESS_TOKEN": "offline-test"})
         with mock.patch.object(m.urllib.request, "urlopen", side_effect=TimeoutError("lost response")) as op:
             with self.assertRaises(m.UpstoxError):
                 client.place_order("A", "NSE_EQ|A", "BUY", 20, 100.2, "LIMIT")
         self.assertEqual(op.call_count, 1)
+        request = op.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.upstox.com/v2/order/place")
+        headers = {key.lower(): value for key, value in request.headers.items()}
+        self.assertEqual(headers.get("api-version"), "2.0")
 
     def test_after_market_orders_are_flagged_amo(self):
         client = FakeUpstox()
