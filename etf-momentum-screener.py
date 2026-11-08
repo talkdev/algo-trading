@@ -9,7 +9,7 @@
 ================================================================================
  LOCKED ENGINE CONTRACT - FIXED BEHAVIOUR. DO NOT CHANGE. DO NOT RE-AUDIT.
 ================================================================================
- Contract ID: SIP-LOCK-v1  (user-locked, 08-Nov-2026)
+ Contract ID: SIP-LOCK-v2  (user-locked rules; v3 AMO correction 08-Nov-2026)
 
  Everything in this block is a PRODUCT DECISION made by the owner, not a
  finding. It is frozen. An audit that proposes changing a rule below is out of
@@ -25,21 +25,21 @@
       day's contribution.
  L2.  RUN ANYTIME. The script must be runnable at any hour, on any day,
       including weekends and NSE holidays. No weekly/monthly ticket cadence,
-      no accumulating or rolling allowance. BROKER REALITY: the Upstox API
-      rejects AMO orders (UDAPI1162: "AMO orders are not supported via the
-      API"). Therefore live API submissions are regular-session only. A
-      closed-market run still does everything it can: refreshes data, checks
-      exits, queues closed-market exits for the next session, and records a
-      deferred SIP intent. It NEVER sends is_amo=True and never pretends an
-      order was accepted. Use --wait-for-open to keep the process alive and
-      submit at the next regular session, or run again during market hours.
- L3.  FULL DAILY CONTRIBUTION. If INVEST_PER_DAY != 0 and the market is open,
-      the run buys eligible ETFs for that TOTAL amount (subject only to
-      eligibility gates, liquidity caps, whole-share rounding and the minimum
-      buy ticket). Existing holdings being at/above target must NOT shrink or
-      cancel today's contribution. If the market is closed, the contribution
-      is deferred to the next open run/wait; it does not roll over as extra
-      allowance. Unused allowance never rolls over to another day.
+      no accumulating or rolling allowance. BROKER CONTRACT: Upstox Place
+      Order V3 (/v3/order/place) supports AMO with is_amo=true. AMO is only
+      sent when the regular NSE session is CLOSED; sending AMO during live
+      market hours is forbidden (UDAPI100039). The place-order API window is
+      05:30-24:00 IST. Outside that window the run still refreshes data,
+      checks exits and records a deferred SIP intent; --wait-for-open waits
+      for the next submission window. Regular-session orders use is_amo=false.
+ L3.  FULL DAILY CONTRIBUTION. If INVEST_PER_DAY != 0 and a regular/AMO
+      submission window is open, the run buys eligible ETFs for that TOTAL
+      amount (subject only to eligibility gates, liquidity caps, whole-share
+      rounding and the minimum buy ticket). Existing holdings being at/above
+      target must NOT shrink or cancel today's contribution. If the API
+      window is closed, the contribution is deferred to the next open
+      run/wait; it does not roll over as extra allowance. Unused allowance
+      never rolls over to another day.
  L4.  PORTFOLIO = UPSTOX HOLDINGS, VIA API. Portfolio value is always the total
       investment held in Upstox ETF holdings, read live from the broker API
       (quantity x broker price). Broker cash and non-universe assets are
@@ -84,7 +84,6 @@
    FIXED    - implemented and covered by tests.
    PRESENT  - already implemented before the audit; verified, no change needed.
    REJECTED - conflicts with the locked contract above. Do not re-propose.
-   ADAPTED  - broker/external reality forced a narrower implementation.
    MANUAL   - owner action outside the code; the engine cannot do it.
    DEFERRED - strategy change, not a defect; needs evidence before adoption.
 
@@ -118,10 +117,10 @@
        Re-derivation re-runs the real selection filters; hard blocks persist.
  P1-8  Exit guard counted only FILLED sells .......................... FIXED
        Accepted PENDING/UNCONFIRMED/SUBMITTING exits now count as handled.
- P2-1  Block orders on weekends/holidays ............................. ADAPTED
-       The RUN is never blocked (L2), but live API submission is regular-
-       session only because Upstox rejects AMO via API (UDAPI1162). Closed
-       runs defer/queue honestly; --wait-for-open submits at the next open.
+ P2-1  Block orders on weekends/holidays ............................. FIXED
+       Closed-market submissions use Upstox Place Order V3 AMO (is_amo=true);
+       AMO is never sent during live market hours. The 05:30-24:00 IST
+       place-order window is enforced; outside it the run defers honestly.
  P2-2  Weekly/monthly ticket cadence ................................. REJECTED
        Violates L2.
  P2-3  Accumulating / rolling unused allowance ....................... REJECTED
@@ -137,10 +136,11 @@
  Q-2   Invalid SIP cap only warned ................................... FIXED
        Loud error that blocks buys; exits still run (L7 carve-out).
  R-1   Fixed build reached Upstox but AMO was rejected (UDAPI1162) .... FIXED
-       Engine never sends is_amo=True. Live API submissions are regular-
-       session only; closed runs defer buys/queue exits; --wait-for-open
-       waits for the next session. Failed pre-submit rejections journal
-       zero filled value and release the SIP reservation.
+       Root cause was the v2 place route. Order placement now uses Place
+       Order V3 with explicit is_amo (true only when market closed), slice=false,
+       and order_ids response parsing. AMO during market hours is blocked;
+       05:30-24:00 IST window enforced. Failed zero-fill rejections journal
+       zero value and release the SIP reservation. Default cap is Rs 1,000.
 
  RUN DIAGNOSIS 08-Nov-2026 (zero orders in the Upstox console)
  -------------------------------------------------------------
@@ -154,10 +154,10 @@
  old build and 1 AMO LIMIT BUY of Rs 995.52 on this build. Fix: run THIS file.
  deploy_day() now also prints a per-ETF reason whenever it sends zero orders,
  so a future no-order run explains itself instead of failing silently.
- Follow-up 08-Nov-2026: the fixed build reached Upstox but the broker rejected
- the AMO submission with UDAPI1162. The engine no longer sends AMO. Closed-
- market runs defer buys/queue exits; --wait-for-open waits for the next regular
- session. A failed pre-submit rejection journals zero filled value.
+ Follow-up 08-Nov-2026: the v2 place route rejected AMO with UDAPI1162.
+ Upstox Place Order V3 supports AMO via is_amo=true; the engine now uses v3,
+ sends AMO only when the market is closed and the 05:30-24:00 IST API window
+ is open, and parses order_ids. INVEST_PER_DAY defaults to Rs 1,000.
 
  WHAT THIS PROGRAM DOES
  ----------------------
@@ -181,11 +181,12 @@
   * Re-runs top up the same day's allowance. Accepted but unfilled orders
     reserve budget until filled/cancelled; an ambiguous submission is never
     blindly retried. Broker-read failures stop orders (fail closed).
-  * Buys use buffered LIMIT orders; exits use marketable LIMIT orders. The
-    Upstox API does not support AMO (UDAPI1162), so live submissions happen
-    only during the regular NSE session. Closed-market runs defer buys and
-    queue exits for the next session; --wait-for-open can wait and submit.
-    A fresh quote is required while the market is open.
+  * Buys use buffered LIMIT orders; exits use marketable LIMIT orders. Order
+    placement uses Upstox Place Order V3: is_amo=false during the regular NSE
+    session, is_amo=true when the market is closed (never during market hours;
+    UDAPI100039). The place-order API window is 05:30-24:00 IST; outside it the
+    run defers honestly and --wait-for-open can wait. A fresh quote is required
+    while the market is open.
   * The existing y/n live-order confirmation is retained. Non-interactive
     shells cannot place orders.
 
@@ -620,7 +621,7 @@ REBALANCE_FREQ = "M"               # "M" monthly or "Q" quarterly (month-ends on
 # reasons share this cap. Charges require extra cash but do not consume the
 # investment allowance. Unfilled accepted orders reserve their worst-case
 # notional until broker reconciliation. Never lifted to fill a target plan.
-INVEST_PER_DAY = 5000
+INVEST_PER_DAY = 1000              # user default 2026-11-08: Rs 1,000/day
 SIP_MODE = True                    # fixed: rebalance sells/rotates; SIP buys
 SIP_BASKET_KEY = "sip_basket"      # meta key: comma-separated selected symbols
 SIP_BASKET_DATE_KEY = "sip_basket_date"   # meta key: signal date of the basket
@@ -650,7 +651,7 @@ SIP_TREND_GUARD = True             # daily buy pauses for a name whose EXIT rule
 DAILY_EXIT_GUARD = True
 
 
-LOCKED_CONTRACT_ID = "SIP-LOCK-v1"   # see LOCKED ENGINE CONTRACT at the top of this file
+LOCKED_CONTRACT_ID = "SIP-LOCK-v2"   # see LOCKED ENGINE CONTRACT at the top of this file
 
 
 def config_errors() -> list:
@@ -695,7 +696,8 @@ def dd_thresholds(vol_target: float = None):
 
 
 # --- Upstox API ----------------------------------------------------------------
-UPSTOX_BASE = "https://api.upstox.com/v2"  # already versioned; paths below omit /v2
+UPSTOX_BASE = "https://api.upstox.com/v2"  # account/market/order-read APIs
+UPSTOX_V3_BASE = "https://api.upstox.com/v3"  # Place Order V3 (supports is_amo)
 UPSTOX_INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 HTTP_SLEEP = 0.35                  # politeness delay between API calls
 FETCH_CHUNK_DAYS = 1000            # historical fetch chunk; auto-halves on error
@@ -916,7 +918,7 @@ class Printer:
         self.raw(paint(f"  Contract: {LOCKED_CONTRACT_ID}  |  buy floor Rs {MIN_BUY_VALUE:,.0f}"
                        f"  |  sell floor Rs {MIN_TRADE_VALUE:,.0f}"
                        f"  |  daily cap Rs {INVEST_PER_DAY:,.0f}"
-                       f"  |  market {'OPEN' if market_open_now() else 'CLOSED (no API AMO)'}", _C.GREY))
+                       f"  |  market {'OPEN' if market_open_now() else ('CLOSED (AMO v3 available)' if amo_window_open_now() else 'CLOSED (API opens 05:30)')}", _C.GREY))
         self.raw()
 
     def section(self, title: str, icon: str = ""):
@@ -1144,6 +1146,11 @@ class Db:
         self.conn.execute("UPDATE orders SET reserved_value=value WHERE mode='LIVE' "
                           "AND side='BUY' AND reserved_value IS NULL AND status IN "
                           "('FILLED','PENDING','UNCONFIRMED','SUBMITTING')")
+        # Repair the pre-fix journal bug where a failed/rejected zero-fill row
+        # kept the intended notional in `value` and printed as filled value.
+        self.conn.execute("UPDATE orders SET value=0, charges=0 WHERE mode='LIVE' "
+                          "AND status IN ('FAILED','REJECTED','SKIPPED_FILTER') "
+                          "AND COALESCE(filled_qty,0)=0 AND COALESCE(value,0)<>0")
         self.conn.commit()
 
     @contextmanager
@@ -1351,7 +1358,7 @@ class UpstoxError(Exception):
 
 
 class UpstoxClient:
-    """Minimal Upstox v2 REST client: instrument master, candles, quotes, orders."""
+    """Minimal Upstox REST client: v2 account/market/order-read, v3 order place."""
 
     def __init__(self, env: dict):
         self.access_token = env.get("UPSTOX_ACCESS_TOKEN", "")
@@ -1359,17 +1366,20 @@ class UpstoxClient:
         self.api_secret = env.get("UPSTOX_API_SECRET", "")
 
     # ---------- low-level HTTP ----------
-    def _request(self, url: str, method: str = "GET", body=None, timeout=30, retry: bool = True):
+    def _request(self, url: str, method: str = "GET", body=None, timeout=30,
+                 retry: bool = True, api_version: str = "2.0", accept: str = "application/json"):
         headers = {
             "Authorization": f"Bearer {self.access_token}",
-            "Accept": "application/json",
-            # Account/order v2 APIs require this header as well as the URL prefix.
-            "Api-Version": "2.0",
+            "Accept": accept,
             # Cloudflare blocks python-urllib's default signature (error 1010)
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
                            "Chrome/126.0.0.0 Safari/537.36"),
         }
+        if api_version:
+            # v2 account/order-read APIs require this header. OrderApiV3 does not
+            # use the v2 Api-Version header; the /v3 URL is the contract.
+            headers["Api-Version"] = api_version
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -1596,9 +1606,9 @@ class UpstoxClient:
     def place_order(self, symbol: str, instrument_key: str, side: str,
                     qty: int, price: float, order_type: str = "MARKET",
                     is_amo: bool = False) -> dict:
-        # Upstox API rejects AMO (UDAPI1162). Never send is_amo=True.
-        if bool(is_amo):
-            raise UpstoxError("Upstox API does not support AMO (UDAPI1162); refusing is_amo=True")
+        # Place Order V3 supports AMO via is_amo. The older v2 place route was
+        # the source of UDAPI1162 on the 08-Nov-2026 Windows run. slice=False
+        # keeps one order id per ticket so the strict SIP reservation stays simple.
         body = {
             "quantity": int(qty),
             "product": "D",
@@ -1610,11 +1620,16 @@ class UpstoxClient:
             "transaction_type": side.upper(),
             "disclosed_quantity": 0,
             "trigger_price": 0.0,
-            "is_amo": False,
+            "is_amo": bool(is_amo),
+            "slice": False,
         }
         # Never retry an order submission: a lost response may mean the broker
         # accepted it. Broker reconciles the reserved UNCONFIRMED ticket instead.
-        return self._request(f"{UPSTOX_BASE}/order/place", method="POST", body=body, retry=False)
+        resp = self._request(f"{UPSTOX_V3_BASE}/order/place", method="POST", body=body,
+                             retry=False, api_version=None, accept="*/*")
+        if isinstance(resp, dict) and resp.get("status") == "error":
+            raise UpstoxError(f"Upstox order error: {json.dumps(resp)[:400]}")
+        return resp
 
 
 # ==============================================================================
@@ -2756,6 +2771,32 @@ def market_open_now(now: dt.datetime = None) -> bool:
     return _market_open_at(now or dt.datetime.now(IST).replace(tzinfo=None))
 
 
+def amo_window_open_now(now: dt.datetime = None) -> bool:
+    """Upstox place-order API window: 05:30 IST to 24:00 IST. AMO itself is
+    only valid when the regular market is closed (never during market hours)."""
+    now = now or dt.datetime.now(IST).replace(tzinfo=None)
+    return now.time() >= dt.time(5, 30)
+
+
+def amo_allowed_now(now: dt.datetime = None) -> bool:
+    now = now or dt.datetime.now(IST).replace(tzinfo=None)
+    return (not market_open_now(now)) and amo_window_open_now(now)
+
+
+def order_submission_allowed_now(now: dt.datetime = None) -> bool:
+    now = now or dt.datetime.now(IST).replace(tzinfo=None)
+    return market_open_now(now) or amo_allowed_now(now)
+
+
+def next_order_submission_time(now: dt.datetime = None) -> dt.datetime:
+    """Next instant a live order can be submitted: now if regular/AMO window is
+    open, otherwise today's 05:30 IST place-order API opening."""
+    now = now or dt.datetime.now(IST).replace(tzinfo=None)
+    if order_submission_allowed_now(now):
+        return now
+    return dt.datetime.combine(now.date(), dt.time(5, 30))
+
+
 def next_market_open(now: dt.datetime = None) -> dt.datetime:
     """Next regular NSE session open in naive IST. If the market is open now,
     returns now. Used by --wait-for-open and closed-market deferral messages."""
@@ -2775,20 +2816,20 @@ def next_market_open(now: dt.datetime = None) -> dt.datetime:
 def wait_until_market_open(poll_seconds: float = 30.0) -> None:
     """Block until the next regular session, with a heartbeat. Caller must
     already have human confirmation for real orders."""
-    target = next_market_open()
-    if market_open_now():
+    target = next_order_submission_time()
+    if order_submission_allowed_now():
         return
-    P.warn(f"Market closed. Upstox API does not support AMO (UDAPI1162). Waiting until "
-           f"{target.strftime('%a %d %b %Y %H:%M')} IST to submit regular-session orders.")
+    P.warn(f"Place-order API window is closed. Waiting until "
+           f"{target.strftime('%a %d %b %Y %H:%M')} IST to submit AMO/regular orders.")
     last_note = 0.0
-    while not market_open_now():
+    while not order_submission_allowed_now():
         now = dt.datetime.now(IST).replace(tzinfo=None)
-        left = max(0.0, (next_market_open(now) - now).total_seconds())
+        left = max(0.0, (next_order_submission_time(now) - now).total_seconds())
         if time.time() - last_note >= 300 or last_note == 0.0:
-            P.note(f"Waiting for market open: {int(left // 3600)}h {int((left % 3600) // 60)}m remaining.")
+            P.note(f"Waiting for order window: {int(left // 3600)}h {int((left % 3600) // 60)}m remaining.")
             last_note = time.time()
         time.sleep(min(poll_seconds, max(1.0, left)))
-    P.ok("Market open — proceeding with regular-session live orders.")
+    P.ok("Order window open — proceeding with live orders (AMO if market closed).")
 
 
 def live_order_ok(context: str = "") -> bool:
@@ -4429,10 +4470,13 @@ class Broker:
             return {"status": "REJECTED", "reason": f"an {side} order is already open/unconfirmed for {symbol}"}
         if side == "SELL" and qty > self.sellable_qty(symbol):
             return {"status": "REJECTED", "reason": "quantity exceeds Upstox sellable holdings"}
-        if not market_open_now():
+        now = dt.datetime.now(IST).replace(tzinfo=None)
+        market_open = market_open_now(now)
+        if not market_open and not amo_window_open_now(now):
             return {"status": "REJECTED",
-                    "reason": "market closed: Upstox API does not support AMO (UDAPI1162); order not sent",
+                    "reason": "place-order API window closed (05:30-24:00 IST); order not sent",
                     "qty": qty, "price": ref_price, "value": 0.0, "reserved": 0.0}
+        is_amo = not market_open
         if side == "BUY":
             order_type, limit_px = live_buy_order_px(ref_price)
             if order_type != "LIMIT":
@@ -4462,10 +4506,29 @@ class Broker:
             return {"status": "FAILED", "reason": f"no verified NSE instrument key for {symbol}"}
         oid = ""
         try:
-            resp = self.client.place_order(symbol, key, side, qty, send_px, order_type)
-            oid = str((resp.get("data") or {}).get("order_id") or "")
+            resp = self.client.place_order(symbol, key, side, qty, send_px, order_type,
+                                           is_amo=is_amo)
+            data = (resp.get("data") or {}) if isinstance(resp, dict) else {}
+            oid = str(data.get("order_id") or "")
+            ids = data.get("order_ids") or []
+            if isinstance(ids, list):
+                ids = [str(x) for x in ids if x]
+                if not oid and ids:
+                    oid = ids[0]
             if not oid:
                 raise RuntimeError("broker returned no order_id")
+            if len(ids) > 1:
+                # slice=False should prevent this. If it ever happens, keep the
+                # full reservation and block duplicates; manual reconcile is safer
+                # than pretending one child order represents the whole ticket.
+                self.db.execute("UPDATE orders SET broker_order_id=?,status='UNCONFIRMED',reason=? WHERE id=?",
+                                (oid, (reason or "") + f" | v3 order_ids={json.dumps(ids)}", row_id))
+                P.warn(f"{side} {symbol}: Upstox returned multiple order ids {ids}; "
+                       "budget stays reserved. Reconcile manually before adding another order.")
+                return {"status": "UNCONFIRMED", "qty": qty, "price": ref_price,
+                        "value": 0.0, "reserved": reserved, "broker_order_id": oid,
+                        "order_ids": ids, "is_amo": is_amo,
+                        "note": "multiple v3 order ids; reservation retained"}
             self.db.execute("UPDATE orders SET broker_order_id=?,status='UNCONFIRMED' WHERE id=?",
                             (oid, row_id))
         except Exception as e:
@@ -4492,7 +4555,7 @@ class Broker:
             result = {"status": "UNCONFIRMED", "price": send_px if side == "BUY" else ref_price,
                       "value": 0.0, "filled_qty": 0, "note": f"order {oid} accepted; fill verification failed: {e}"}
         result.update({"qty": qty, "mode": "LIVE", "reason": reason, "reserved": reserved,
-                       "broker_order_id": oid})
+                       "broker_order_id": oid, "is_amo": is_amo})
         log(f"ORDER LIVE {side} {symbol} x{qty} id={oid} status={result['status']}")
         return result
 
@@ -4574,7 +4637,7 @@ class Broker:
                        f"{fmt_rs((res.get('charges') or {}).get('total', 0))} | LIVE",
                        _C.GREEN if side == "BUY" else _C.RED)
         elif status in self.ACTIVE_STATUSES:
-            P.info(f"{side} {symbol}: sent to Upstox, awaiting fill. "
+            P.info(f"{side} {symbol}: sent to Upstox{' as AMO' if res.get('is_amo') else ''}, awaiting fill. "
                    f"{fmt_rs(res.get('reserved', 0))} reserved against today's SIP allowance. "
                    + (res.get("note") or ""))
         else:
@@ -5102,19 +5165,22 @@ class TradingCycle:
             P.warn(f"Risk state {self.risk.state}: new SIP buys paused.")
             return 0
 
-        if not market_open_now():
-            nxt = next_market_open()
-            P.warn("Market closed: Upstox API rejects AMO orders (UDAPI1162). No buy order can be submitted now.")
-            P.note(f"Next regular session opens {nxt.strftime('%a %d %b %Y %H:%M')} IST. "
+        if not order_submission_allowed_now():
+            nxt = next_order_submission_time()
+            P.warn("Place-order API window is closed (05:30-24:00 IST). No buy order can be submitted now.")
+            P.note(f"Next submission window opens {nxt.strftime('%a %d %b %Y %H:%M')} IST. "
                    "Run again then, or use --wait-for-open to wait and submit automatically.")
             self.db.meta_set(SIP_DEFERRED_KEY, json.dumps({
                 "created": now_iso(), "cap": INVEST_PER_DAY, "basket": basket,
-                "next_open": nxt.isoformat(), "reason": "Upstox API AMO unsupported (UDAPI1162)"}))
+                "next_open": nxt.isoformat(), "reason": "place-order API window closed"}))
             self._print_no_buy_reasons(basket, {
-                s: "market closed; Upstox API does not support AMO (UDAPI1162)" for s in basket})
+                s: "place-order API window closed (05:30-24:00 IST)" for s in basket})
             return 0
+        if not market_open_now():
+            P.note("Market closed: submitting After Market Orders via Upstox Place Order V3 (is_amo=true). "
+                   "AMO acceptance/execution still depends on Upstox/exchange rules; this is not a simulated fill.")
         if self.db.meta_get(SIP_DEFERRED_KEY, ""):
-            P.note("Executing with today's allowance after a closed-market deferral (no allowance rollover).")
+            P.note("Executing with today's allowance after a deferral (no allowance rollover).")
             self.db.meta_set(SIP_DEFERRED_KEY, "")
 
         prices = self.latest_prices()
@@ -5124,10 +5190,7 @@ class TradingCycle:
             P.warn("No eligible target weights; no SIP buys.")
             return 0
         qmap, qspread, tflag = self._live_quotes(basket)
-        market_open = market_open_now()   # closed-market deferral already returned above
-        if not market_open:
-            P.warn("Market closed unexpectedly; no AMO is sent (Upstox UDAPI1162).")
-            return 0
+        market_open = market_open_now()   # if closed, Broker.execute submits v3 AMO
         try:
             hard_blocks = json.loads(self.db.meta_get(DEPLOY_SKIP_KEY, "") or "{}")
             if not isinstance(hard_blocks, dict):
@@ -5344,7 +5407,7 @@ class TradingCycle:
                 res, sym, universe_map().get(sym, {}).get("name", sym), "SELL")
             if res.get("status") in ("FILLED", "PENDING", "UNCONFIRMED", "SUBMITTING"):
                 fired += 1
-            elif "market closed" in str(res.get("reason", "")):
+            elif "place-order API window closed" in str(res.get("reason", "")):
                 already = self.db.one(
                     "SELECT id FROM pending_trades WHERE status='PENDING' AND side='SELL' AND symbol=?",
                     (sym,))
@@ -5353,10 +5416,10 @@ class TradingCycle:
                         "INSERT INTO pending_trades(signal_as_of,exec_after,symbol,side,target_qty,reason,status,created) "
                         "VALUES(?,?,?,?,?,?,'PENDING',?)",
                         (today_str(), today_str(), sym, "SELL", qty,
-                         "EXIT-GUARD deferred: market closed; Upstox API does not support AMO", now_iso()))
+                         "EXIT-GUARD deferred: place-order API window closed", now_iso()))
                 deferred += 1
         if deferred:
-            P.warn(f"EXIT-GUARD queued {deferred} exit(s) for the next regular session because the market is closed.")
+            P.warn(f"EXIT-GUARD queued {deferred} exit(s) because the place-order API window is closed.")
         if fired:
             P.warn(f"EXIT-GUARD submitted exits for {fired} holding(s) whose trend broke today "
                    f"(accepted/pending orders count; did not wait for month-end).")
@@ -6182,11 +6245,14 @@ def print_action_panel(db: Db):
             P.info("Buying is paused (INVEST_PER_DAY=0). Sells and rebalancing remain active.")
         else:
             if not market_open_now():
-                P.note(f"Market closed: Upstox API does not support AMO (UDAPI1162). Next regular session opens "
-                       f"{next_market_open().strftime('%a %d %b %Y %H:%M')} IST; run then or use --wait-for-open.")
+                if amo_window_open_now():
+                    P.note("Market closed: eligible SIP buys are submitted as Upstox v3 AMO (is_amo=true).")
+                else:
+                    P.note(f"Place-order API window closed. Next submission window opens "
+                           f"{next_order_submission_time().strftime('%a %d %b %Y %H:%M')} IST; run then or use --wait-for-open.")
             if db.meta_get(SIP_DEFERRED_KEY, ""):
-                P.note("A closed-market SIP intent is stored as a reminder only; it is not a reservation and does not roll allowance.")
-            P.info("Run again any time: only the unused daily allowance can buy during the regular session. "
+                P.note("A deferred SIP intent is stored as a reminder only; it is not a reservation and does not roll allowance.")
+            P.info("Run again any time: only the unused daily allowance can buy in the regular/AMO window. "
                    "Unconfirmed orders keep their reservation until reconciled.")
         n_nav = db.one("SELECT COUNT(*) AS c FROM nav_data")["c"]
         if not n_nav:
@@ -6239,22 +6305,24 @@ def cmd_report(db: Db):
 # ==============================================================================
 
 def _selftest_regular_session(fn):
-    """Offline order-path selftests must not depend on the real clock/calendar.
-    Force the regular-session gate open; closed-market behaviour is covered by
-    the external unittest suite."""
+    """Offline order-path selftests must not depend on the real clock/calendar
+    or the owner's live daily cap. Force a regular session and a test-only
+    Rs 5,000 cap; closed-market/window behaviour is covered by unittest."""
     def wrapper(*args, **kwargs):
-        global market_open_now
-        old = market_open_now
+        global market_open_now, INVEST_PER_DAY
+        old_market, old_cap = market_open_now, INVEST_PER_DAY
         market_open_now = lambda now=None: True
+        INVEST_PER_DAY = 5000.0
         try:
             return fn(*args, **kwargs)
         finally:
-            market_open_now = old
+            market_open_now, INVEST_PER_DAY = old_market, old_cap
     return wrapper
 
 
 @_selftest_regular_session
 def cmd_selftest(db: Db):
+    global INVEST_PER_DAY
     P.section("SELF TESTS / UNIT TESTS", "\u2705")
     # Offline tests: every order-path test injects a fake client. No test
     # constructs an authenticated network client or sends a real order.
@@ -6439,6 +6507,10 @@ def cmd_selftest(db: Db):
             pass
 
     # v14 P0/P1 regression tests ------------------------------------------------
+    # These legacy reservation checks use Rs 2,004 / Rs 4,008 tickets; keep them
+    # independent of the owner's live daily cap (default Rs 1,000).
+    _old_selftest_cap = INVEST_PER_DAY
+    INVEST_PER_DAY = 5000.0
     _dbf = Db(DATA_DIR / "selftest_v14.db")
     try:
         _taxf = TaxEngine(_dbf)
@@ -6498,6 +6570,7 @@ def cmd_selftest(db: Db):
               tax_rules_for("GLOBAL INDICES")["ltcg"] * (1.0 + CESS_RATE)) < 1.0,
               f"tax={_gtax} expect={5000.0 * tax_rules_for('GLOBAL INDICES')['ltcg'] * (1.0 + CESS_RATE)}")
     finally:
+        INVEST_PER_DAY = _old_selftest_cap
         _dbf.close()
         try:
             os.remove(DATA_DIR / "selftest_v14.db")
@@ -6522,12 +6595,12 @@ def cmd_selftest(db: Db):
     check("v15 P0-1: INVEST_PER_DAY is zero or >= MIN_BUY_VALUE (else zero buys ever)",
           INVEST_PER_DAY == 0 or INVEST_PER_DAY >= MIN_BUY_VALUE,
           f"INVEST_PER_DAY={INVEST_PER_DAY} MIN_BUY_VALUE={MIN_BUY_VALUE}")
-    check("SIP-LOCK-v1: locked engine contract is intact (see file header)",
-          LOCKED_CONTRACT_ID == "SIP-LOCK-v1" and SIP_MODE is True
+    check("SIP-LOCK-v2: locked engine contract is intact (see file header)",
+          LOCKED_CONTRACT_ID == "SIP-LOCK-v2" and SIP_MODE is True
           and DAILY_EXIT_GUARD is True and not config_errors(),
           f"contract={LOCKED_CONTRACT_ID} errors={config_errors()}")
     _buy_block = buy_config_blocked()
-    check("SIP-LOCK-v1 L7: a too-small buy cap blocks buys only, never aborts",
+    check("SIP-LOCK-v2 L7: a too-small buy cap blocks buys only, never aborts",
           bool(_buy_block) == (0 < INVEST_PER_DAY < MIN_BUY_VALUE) and not config_errors(),
           f"blocked={_buy_block!r}")
 
@@ -8011,8 +8084,8 @@ def main(argv=None):
                         help="purge stored prices and re-download full history "
                              "(heals synthetic/real splices)")
     parser.add_argument("--wait-for-open", action="store_true",
-                        help="with run/trade/live: if the market is closed, wait until the next "
-                             "regular NSE session before submitting (Upstox API does not support AMO)")
+                        help="with run/trade/live: if the place-order window is closed, wait until "
+                             "the next regular/AMO submission window before submitting")
     parser.add_argument("--fetch-nav", action="store_true",
                         help="with 'load-data': force-refresh the auto-created "
                              "stock-data/nav/*.csv files from Groww/AMFI + mfapi")
@@ -8057,7 +8130,7 @@ def main(argv=None):
             cmd_update(db, years=args.years, force=args.force_data)
         elif args.command == "trade":
             P.banner()
-            if not live_order_ok(f"Live SIP cap {fmt_rs(INVEST_PER_DAY)}; API orders regular-session only (no AMO); exits/rebalance always active."):
+            if not live_order_ok(f"Live SIP cap {fmt_rs(INVEST_PER_DAY)}; v3 AMO outside market hours; exits/rebalance always active."):
                 P.note("No orders placed. Use status for a read-only Upstox portfolio.")
                 return
             if args.wait_for_open:
@@ -8083,7 +8156,7 @@ def main(argv=None):
             cmd_reconcile(db)
         elif args.command == "live":
             P.banner()
-            if not live_order_ok("Live SIP buys use buffered LIMIT orders; exits use marketable LIMIT orders. Upstox API does not support AMO; regular-session only."):
+            if not live_order_ok("Live SIP buys use buffered LIMIT orders; exits use marketable LIMIT orders. Upstox v3 AMO is used outside market hours."):
                 P.note("No orders placed.")
                 return
             if args.wait_for_open:
@@ -8104,7 +8177,7 @@ def main(argv=None):
                 P.note("To fill the database: fix the Upstox token "
                        "(env.txt) and run:  python etf-momentum-screener.py update")
                 return
-            if not live_order_ok(f"Live SIP cap {fmt_rs(INVEST_PER_DAY)}; zero means exits/rebalance only; API orders regular-session only (no AMO)."):
+            if not live_order_ok(f"Live SIP cap {fmt_rs(INVEST_PER_DAY)}; zero means exits/rebalance only; v3 AMO outside market hours."):
                 P.note("Orders declined; no risk locks or orders changed. Running read-only status.")
                 cmd_status(db)
                 return
