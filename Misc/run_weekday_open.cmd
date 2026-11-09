@@ -12,13 +12,18 @@ set "PY=C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.ex
 if not exist "%PY%" set "PY=python"
 
 set "LOCK=%TEMP%\nifty_algo_weekday_open.lock"
+REM Stale lock: if older than ~16h (from a prior day left open), delete it.
 if exist "%LOCK%" (
-  echo Another NiftyAlgo launcher is already running.
-  echo Close that CMD window or delete:
-  echo   %LOCK%
-  echo.
-  pause
-  exit /b 0
+  powershell -NoProfile -Command "if ((Get-Date) - (Get-Item -LiteralPath $env:LOCK).LastWriteTime -gt [TimeSpan]::FromHours(16)) { Remove-Item -LiteralPath $env:LOCK -Force; exit 0 } else { exit 1 }"
+  if errorlevel 1 (
+    echo Another NiftyAlgo launcher is already running.
+    echo Close that CMD window or delete:
+    echo   %LOCK%
+    echo.
+    timeout /t 30 >nul
+    exit /b 0
+  )
+  echo Stale lock removed: %LOCK%
 )
 echo %DATE% %TIME% > "%LOCK%"
 

@@ -10357,10 +10357,22 @@ class StrategyEngine:
         """True when a PUT is a late breakdown after a very wide OR — the
         move is already spent inside the morning range and often reclaims
         (2026-10-28). Early wide-OR puts (09-15 09:50) and afternoon
-        continuations stay open."""
+        continuations stay open. Same-day follow-through after a spent
+        skip is handled by the put_spent_blocked latch in decide(), not by
+        widening this window."""
         if or_width < 150.0:
             return False
         return "10:15" <= sig_t <= "11:00"
+
+    @staticmethod
+    def _clean_long_hm_add(hm: str, add_min: int) -> str:
+        """Add minutes to HH:MM; clamps to 23:59."""
+        try:
+            h, m = int(hm[:2]), int(hm[3:5])
+        except (TypeError, ValueError):
+            return hm
+        tot = min(h * 60 + m + max(int(add_min), 0), 23 * 60 + 59)
+        return f"{tot // 60:02d}:{tot % 60:02d}"
 
     def _clean_long_decide(self, signals: dict) -> dict:
         """30-min opening-range breakout with EMA9/EMA21 agreement on closed
@@ -10373,6 +10385,12 @@ class StrategyEngine:
             or signals.get("spot") is None
         ):
             return self._clean_long_no_trade(signals, "clean_long_stand_down")
+        # Honour the engine daily halt (clean-long previously bypassed it).
+        try:
+            if bool(self.market_engine.state.get("daily_halted")):
+                return self._clean_long_no_trade(signals, "clean_long_daily_halted")
+        except Exception:
+            pass
         today = today_ist().isoformat()
         prior = self.db.query(
             "SELECT status, selection_reason, net_pnl_rupees, exit_time, exit_reason "
@@ -10381,6 +10399,28 @@ class StrategyEngine:
             "ORDER BY entry_time",
             (today,),
         ) or []
+        _risk_rs = float(getattr(self.config, "clean_long_risk_rs", 0.0) or 0.0)
+        _rev_risk_rs = _risk_rs
+        # Closed clean-long day PnL floor (default −2× RISK_RS).
+        _floor_mult = float(
+            getattr(self.config, "clean_long_day_floor_mult", 2.0) or 0.0
+        )
+        if _risk_rs > 0 and _floor_mult > 0:
+            try:
+                _day_pnl = sum(
+                    float(p["net_pnl_rupees"] or 0.0)
+                    for p in prior
+                    if str(p.get("status")) == "CLOSED"
+                    and str(p.get("selection_reason") or "").startswith("clean_long_v1:")
+                )
+            except (TypeError, ValueError):
+                _day_pnl = 0.0
+            if _day_pnl <= -_floor_mult * _risk_rs:
+                self.logger.warning(
+                    f"clean_long: day floor hit PnL=Rs{_day_pnl:.0f} "
+                    f"<= -{_floor_mult:g}×Rs{_risk_rs:.0f}"
+                )
+                return self._clean_long_no_trade(signals, "clean_long_day_floor")
         # v2 (in-sample tuned, 2026-11-01): one stop-and-reverse. After the
         # day's first clean trade closes at a loss, the opposite-side
         # breakout may be taken once, with the same exits.
@@ -10407,11 +10447,85 @@ class StrategyEngine:
                     if "=" in x
                 )
                 only_dir = -1 if int(kv0.get("dir", "1")) > 0 else 1
-                after_hm = str(p0["exit_time"] or "")[11:16]
+                exit_hm = str(p0["exit_time"] or "")[11:16]
+                cool = int(
+                    getattr(self.config, "clean_long_reverse_cooldown_min", 20) or 0
+                )
+                after_hm = (
+                    self._clean_long_hm_add(exit_hm, cool) if exit_hm else ""
+                )
                 failed_flip = (
                     bool(getattr(self.config, "clean_long_failed_flip", True))
                     and only_dir == 1
                 )
+                _loss = abs(float(p0["net_pnl_rupees"] or 0.0))
+                try:
+                    _orh0 = float(kv0.get("orh", "0") or 0)
+                    _orl0 = float(kv0.get("orl", "0") or 0)
+                    _ow0 = _orh0 - _orl0
+                except (TypeError, ValueError):
+                    _ow0 = 0.0
+                _wide = _ow0 >= 150.0
+                _full = _risk_rs > 0 and _loss >= 0.95 * _risk_rs
+                # Wide-OR near-full loser: no reverse of any kind (flip or
+                # ORH). Narrow-OR full losers (10-01 / 10-30) keep reverse.
+                if (
+                    _wide
+                    and _full
+                    and bool(getattr(
+                        self.config,
+                        "clean_long_no_reverse_after_full_wide_loss",
+                        True,
+                    ))
+                ):
+                    self.logger.warning(
+                        "clean_long: no reverse after wide-OR full-budget "
+                        f"loss Rs{_loss:.0f} or_width={_ow0:.0f}"
+                    )
+                    return self._clean_long_no_trade(
+                        signals, "clean_long_wide_or_full_loss_done"
+                    )
+                # Wide-OR partial loser: residual reverse budget only.
+                if (
+                    _wide
+                    and _risk_rs > 0
+                    and bool(getattr(
+                        self.config, "clean_long_wide_or_residual", True
+                    ))
+                ):
+                    _min_frac = float(
+                        getattr(self.config, "clean_long_residual_min_frac", 0.25)
+                        or 0.0
+                    )
+                    _rev_risk_rs = max(0.0, _risk_rs - _loss)
+                    if _rev_risk_rs < _min_frac * _risk_rs:
+                        self.logger.info(
+                            "clean_long: residual reverse too small "
+                            f"Rs{_rev_risk_rs:.0f} after wide-OR loss "
+                            f"Rs{_loss:.0f}"
+                        )
+                        return self._clean_long_no_trade(
+                            signals, "clean_long_residual_too_small"
+                        )
+                    self.logger.info(
+                        f"clean_long: wide-OR residual reverse budget "
+                        f"Rs{_rev_risk_rs:.0f} (was Rs{_risk_rs:.0f})"
+                    )
+                # Flip-only guard (when full reverse-block is off).
+                if (
+                    failed_flip
+                    and _wide
+                    and _full
+                    and bool(getattr(
+                        self.config, "clean_long_no_flip_after_full_loss", True
+                    ))
+                ):
+                    failed_flip = False
+                    self.logger.info(
+                        "clean_long: flip disabled after wide-OR full-budget "
+                        f"loss Rs{_loss:.0f} or_width={_ow0:.0f} "
+                        "(require ORH reverse)"
+                    )
             except (TypeError, ValueError):
                 return self._clean_long_no_trade(signals, "clean_long_done_for_day")
         now_hm = now_ist().strftime("%H:%M")
@@ -10451,8 +10565,11 @@ class StrategyEngine:
         prev_close_above_mid = False
         # Once a first-trade CALL is refused as exhaust/weak, later CALL pokes
         # the same day stay blocked (09-17: 10:10 weak → 10:15 still lost).
-        # Puts remain eligible.
+        # Same latch for spent wide-OR PUTs: skipping one spent breakdown must
+        # not reopen the next ORL poke (mirrors call_blocked; without it the
+        # 10:15–11:00 filter is a no-op whenever a later bar still prints).
         call_blocked = False
+        put_spent_blocked = False
         for k in sorted(five):
             if k + 5 > now_m:
                 break
@@ -10470,8 +10587,7 @@ class StrategyEngine:
             ):
                 # Confirmed mid-reclaim flip into CALL after a failed PUT:
                 # two consecutive 5m closes above mid with EMA bullish.
-                # Stop anchor = ORL so R is real near mid. Single-bar tags
-                # (10-28 11:25) are ignored — they whip back into the range.
+                # Single-bar tags (10-28 11:25) are ignored — they whip back.
                 if (
                     failed_flip
                     and only_dir == 1
@@ -10494,7 +10610,12 @@ class StrategyEngine:
                         continue  # skip bad CALL; keep scanning for puts
                     first = (1, close_t)
                 elif only_dir in (None, -1) and c < orl and e9 < e21 and c < e21:
-                    if only_dir is None and self._clean_long_spent_put(or_width, close_t):
+                    if only_dir is None and (
+                        put_spent_blocked
+                        or self._clean_long_spent_put(or_width, close_t)
+                    ):
+                        if self._clean_long_spent_put(or_width, close_t):
+                            put_spent_blocked = True
                         prev_close_above_mid = above_mid
                         continue  # skip spent PUT; keep scanning
                     first = (-1, close_t)
@@ -10510,18 +10631,36 @@ class StrategyEngine:
             )
         spot = float(signals.get("spot") or 0.0)
         strike = float(round(spot / 50.0) * 50)
-        # Stop anchor: OR mid for normal ORB; far OR extreme for mid-flip so
-        # a reclaim near mid still has a defined R for sizing and trail.
-        if flip_mode:
+        # Stop anchor: OR mid for normal ORB. Flip defaults to OR mid as well
+        # (CLEAN_LONG_FLIP_STOP_AT_MID) so a reclaim cannot bleed to ORL;
+        # set the flag false to restore the far-extreme stop.
+        if flip_mode and not bool(
+            getattr(self.config, "clean_long_flip_stop_at_mid", True)
+        ):
             stop_anchor = orl if direction > 0 else orh
         else:
             stop_anchor = or_mid
+        # Event day / material open gap: cut first-trade (and reverse) risk.
+        _eff_risk = float(_rev_risk_rs if only_dir is not None else _risk_rs)
+        try:
+            _gap_mat = bool(self.market_engine.state.get("gap_is_material"))
+        except Exception:
+            _gap_mat = False
+        _event = bool(signals.get("event_day") or signals.get("event_announced"))
+        if _eff_risk > 0 and (_event or _gap_mat):
+            _eg = float(getattr(self.config, "clean_long_event_gap_size", 0.50) or 0.50)
+            _eff_risk = max(0.0, _eff_risk * _eg)
+            self.logger.info(
+                f"clean_long: event/gap size ×{_eg:g} → risk Rs{_eff_risk:.0f} "
+                f"(event={_event} gap_material={_gap_mat})"
+            )
         reason = (
             f"clean_long_v1:dir={direction}:or_mid={or_mid:.2f}:"
             f"stop={stop_anchor:.2f}:"
             f"orh={orh:.2f}:orl={orl:.2f}:sig={sig_t}"
             f"{':rev=1' if only_dir is not None else ''}"
             f"{':flip=1' if flip_mode else ''}"
+            f"{':risk=' + str(int(round(_eff_risk))) if _eff_risk > 0 else ''}"
         )
         params = self.compute_momentum_params(
             direction, reason, signals, 1.0, strike_override=strike, clean=True
@@ -10531,13 +10670,17 @@ class StrategyEngine:
                 signals, f"clean_long_params_invalid:{params.get('reason')}"
             )
         params["selection_reason"] = reason
+        if only_dir is not None:
+            self.logger.warning(
+                f"clean_long REVERSE entry dir={direction} sig={sig_t} "
+                f"risk_rs={_eff_risk:.0f} flip={int(flip_mode)}"
+            )
         # Fixed-risk sizing: lots so a stop at the stop-anchor costs about
         # CLEAN_LONG_RISK_RS — R x |delta| + spread from the entry quote,
         # plus a round trip of costs, per lot. Applied after FORCE_LOTS via
         # size_scale (FORCE_LOTS stays the ceiling); the execution monitor
         # backstops the same budget on the live bid.
-        _risk_rs = float(getattr(self.config, "clean_long_risk_rs", 0.0) or 0.0)
-        if _risk_rs > 0:
+        if _eff_risk > 0:
             _R = abs(spot - stop_anchor)
             _leg = (params.get("legs") or [{}])[0]
             try:
@@ -10554,7 +10697,7 @@ class StrategyEngine:
             _lot_sz = float(self.config.lot_size or 65)
             _per_lot = max((_R * _delta + _spread) * _lot_sz + _cost_lot, 1.0)
             _lots = int(params.get("final_lots") or 1)
-            _want = max(1, min(_lots, int(_risk_rs / _per_lot)))
+            _want = max(1, min(_lots, int(_eff_risk / _per_lot)))
             if _want < _lots:
                 params["size_scale"] = _want / float(_lots)
                 params["final_lots"] = _want

@@ -1100,6 +1100,32 @@ class Config:
     # After a losing PUT, allow the reverse CALL on a confirmed mid-reclaim
     # (2 closes above mid + EMA) instead of waiting for a full ORH break.
     clean_long_failed_flip:        bool  = True
+    # Minutes to wait after a losing clean exit before any reverse signal
+    # bar may fire (blocks 6-minute stop-and-reverse whipsaws).
+    clean_long_reverse_cooldown_min: int = 20
+    # After a near-full CLEAN_LONG_RISK_RS loss on a wide OR (>=150), refuse
+    # the mid-reclaim flip (still allow a full ORH/ORL reverse). Stops
+    # stacking a second budget on spent wide-OR failures (2026-11-09).
+    clean_long_no_flip_after_full_loss: bool = True
+    # Stronger form: refuse ANY reverse (flip and ORH) after a wide-OR
+    # near-full-budget loser. Narrow-OR reverse winners (10-01 / 10-30)
+    # keep a full second budget.
+    clean_long_no_reverse_after_full_wide_loss: bool = True
+    # On a wide-OR partial first loss, size the reverse with leftover budget
+    # only; refuse if leftover < residual_min_frac × RISK_RS. Narrow OR
+    # ignores residual (full RISK_RS reverse).
+    clean_long_wide_or_residual:   bool  = True
+    clean_long_residual_min_frac:  float = 0.25
+    # Stand down when closed clean-long day PnL ≤ −day_floor_mult × RISK_RS.
+    # Default 2.0 allows one full reverse after a single ₹20k stop.
+    clean_long_day_floor_mult:     float = 2.0
+    # First-trade size multiplier on event days or material open gaps.
+    # Default 1.0 (off): 0.50 cut Sep15/Oct15/Oct21-class winners hard
+    # (−₹137k on Sep9–Nov6). Keep the knob for live experiment only.
+    clean_long_event_gap_size:     float = 1.0
+    # Flip stop uses OR mid (not far OR extreme) so reclaim failures cannot
+    # bleed all the way to ORL/ORH (2026-11-09 CALL).
+    clean_long_flip_stop_at_mid:   bool  = True
     # Premium giveback on 0DTE only, after the +1R spot trail has armed:
     # exit when liquidation value gives back this fraction of (peak − entry),
     # once peak ≥ arm_mult × entry. Expiry-day bleed while spot holds
@@ -2048,6 +2074,30 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
             max(_get_float(env, "CLEAN_LONG_WEAK_OR_LOC_HI", 0.60), 0.0), 1.0
         ),
         clean_long_failed_flip=_get_bool(env, "CLEAN_LONG_FAILED_FLIP", True),
+        clean_long_reverse_cooldown_min=max(
+            _get_int(env, "CLEAN_LONG_REVERSE_COOLDOWN_MIN", 20), 0
+        ),
+        clean_long_no_flip_after_full_loss=_get_bool(
+            env, "CLEAN_LONG_NO_FLIP_AFTER_FULL_LOSS", True
+        ),
+        clean_long_no_reverse_after_full_wide_loss=_get_bool(
+            env, "CLEAN_LONG_NO_REVERSE_AFTER_FULL_WIDE_LOSS", True
+        ),
+        clean_long_wide_or_residual=_get_bool(
+            env, "CLEAN_LONG_WIDE_OR_RESIDUAL", True
+        ),
+        clean_long_residual_min_frac=min(
+            max(_get_float(env, "CLEAN_LONG_RESIDUAL_MIN_FRAC", 0.25), 0.0), 1.0
+        ),
+        clean_long_day_floor_mult=max(
+            _get_float(env, "CLEAN_LONG_DAY_FLOOR_MULT", 2.0), 0.0
+        ),
+        clean_long_event_gap_size=min(
+            max(_get_float(env, "CLEAN_LONG_EVENT_GAP_SIZE", 1.0), 0.10), 1.0
+        ),
+        clean_long_flip_stop_at_mid=_get_bool(
+            env, "CLEAN_LONG_FLIP_STOP_AT_MID", True
+        ),
         clean_long_prem_trail=_get_bool(env, "CLEAN_LONG_PREM_TRAIL", True),
         clean_long_prem_arm_mult=min(
             max(_get_float(env, "CLEAN_LONG_PREM_ARM_MULT", 1.50), 1.10), 3.00

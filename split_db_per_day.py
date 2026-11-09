@@ -47,10 +47,13 @@
 #       the writer lock.
 #    2. This script refuses to start while nifty_algo_v3.db.writer.lock
 #       is held (--allow-live to snapshot a running engine anyway).
-#    3. A read-only SQLite backup() snapshot is taken. The live file is
-#       never written. journal_mode=OFF applies only to the per-day temp
-#       shard. Source connections set NO_CKPT_ON_CLOSE so close cannot
-#       TRUNCATE the live WAL.
+#    3. A read-only work copy is used for all reads:
+#         • large WAL or --allow-live → backup() snapshot (one copy, then
+#           fast indexed reads; workers never share a live writer)
+#         • small WAL + lock free → read primary in place (no multi-GB copy)
+#       Source opens are query_only + NO_CKPT_ON_CLOSE; ATTACH uses mode=ro.
+#       journal_mode=OFF applies only to the per-day temp shard. The live
+#       file is never written.
 #
 #  Hook it after main.py in Misc/run_weekday_open.cmd, not inside the
 #  trading process and not as a 15:40 Scheduled Task that can overlap EOD.
@@ -67,7 +70,7 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -75,8 +78,12 @@ from core import live_writer_lock_held, open_sqlite_readonly, protect_sqlite_con
 
 # Concurrent rebuilds of independent day shards (one process per day).
 # Source is a read-only snapshot; each worker writes only its own temp→final
-# path via atomic replace after integrity_check.
+# path via atomic replace after quick_check / integrity_check.
 DEFAULT_SPLIT_WORKERS = 8
+
+# Above this many bytes of -wal, prefer backup() snapshot over in-place
+# reads (N workers thrashing a multi-GB WAL is slower than one copy).
+SNAPSHOT_WAL_THRESHOLD_BYTES = 256 * 1024 * 1024
 
 
 # GitHub rejects individual files at 100,000,000 bytes (100 MB decimal).
@@ -175,7 +182,7 @@ def update_gitignore_for_large_shards(out_dir: Path) -> List[Tuple[str, int]]:
 # ─────────────────────────────────────────────────────────────────────────────
 #  TABLE MAP
 # ─────────────────────────────────────────────────────────────────────────────
-#  BY_DATE  — filter WHERE substr(date_col,1,10) = trading_date
+#  BY_DATE  — filter WHERE date_col >= day AND date_col < next_day
 #  BY_FK    — copy rows whose parent key landed in the day shard
 #  GLOBAL   — optional whole-table copy (--include-global); not required for BT
 #  SKIP     — never copied (diagnostics / auto)
@@ -302,28 +309,67 @@ def table_columns(con: sqlite3.Connection, table: str) -> List[str]:
     return [c[1] for c in con.execute(f'PRAGMA table_info("{table}")').fetchall()]
 
 
+def date_range_params(date: str) -> Tuple[str, str]:
+    """Inclusive start / exclusive next-day bound for date_predicate."""
+    start = date[:10]
+    nxt = (
+        datetime.strptime(start, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    return start, nxt
+
+
 def date_predicate(col: str, alias: str = "") -> str:
-    """Match YYYY-MM-DD whether the column is a bare date or a timestamp."""
+    """Match YYYY-MM-DD (bare or timestamp) using the date index.
+
+    Range bounds beat ``substr(col,1,10)=?``, which cannot use
+    ``idx_chain_date`` / ``idx_candles_date`` and full-scans multi-GB
+    ``option_chain_snapshot`` tables (minutes per day).
+    """
     prefix = f'{alias}.' if alias else ""
-    return f'substr({prefix}"{col}", 1, 10) = ?'
+    return f'{prefix}"{col}" >= ? AND {prefix}"{col}" < ?'
 
 
 def discover_dates(src: sqlite3.Connection) -> List[str]:
+    """Collect trading dates from small date-keyed tables only.
+
+    Never DISTINCT-scan ``option_chain_snapshot`` — that alone can take
+    a minute+ on a large primary and every date is already in
+    ``session_state`` / candles when the day traded.
+    """
+    preferred: Sequence[Tuple[str, str]] = (
+        ("session_state", "trading_date"),
+        ("daily_summary", "trading_date"),
+        ("intraday_candles", "trading_date"),
+        ("positions", "trading_date"),
+        ("vix_history", "date"),
+    )
     dates: Set[str] = set()
-    for table, col in BY_DATE:
+
+    def _harvest(table: str, col: str) -> None:
         if not table_exists(src, table):
-            continue
+            return
         try:
             rows = src.execute(
                 f'SELECT DISTINCT substr("{col}", 1, 10) AS d FROM "{table}" '
                 f'WHERE "{col}" IS NOT NULL'
             ).fetchall()
         except sqlite3.Error:
-            continue
+            return
         for r in rows:
             d = str(r["d"] or "")
             if len(d) >= 10:
                 dates.add(d[:10])
+
+    for table, col in preferred:
+        _harvest(table, col)
+    if dates:
+        return sorted(dates)
+
+    # Fallback if preferred tables are empty/missing (exotic DBs).
+    for table, col in BY_DATE:
+        if table == "option_chain_snapshot":
+            continue
+        _harvest(table, col)
     return sorted(dates)
 
 
@@ -331,8 +377,13 @@ def schema_sql(
     src: sqlite3.Connection,
     *,
     include_global: bool,
-) -> List[str]:
-    """CREATE TABLE / INDEX for tables we will populate."""
+) -> Tuple[List[str], List[str]]:
+    """Return (CREATE TABLE stmts, CREATE INDEX stmts) for shard tables.
+
+    Callers create tables, bulk-load rows, then create indexes — indexes
+    built up-front make every INSERT maintain the btree and dominate
+    day-shard build time.
+    """
     keep: Set[str] = {t for t, _ in BY_DATE} | {t for t, *_ in BY_FK}
     if include_global:
         keep |= set(GLOBAL)
@@ -357,7 +408,7 @@ def schema_sql(
             if tbl in SKIP or tbl not in keep:
                 continue
             indexes.append(row["sql"])
-    return tables + indexes
+    return tables, indexes
 
 
 # ── fingerprints ────────────────────────────────────────────────────────────
@@ -367,8 +418,15 @@ def _scalar_checksum(
     table: str,
     where_sql: str,
     params: tuple,
+    *,
+    light: bool = False,
 ) -> Dict[str, Any]:
-    """Compact content stamp: count + extrema + numeric sums on known cols."""
+    """Compact content stamp: count + extrema (+ numeric sums unless light).
+
+    ``light=True`` skips SUM(strike/ltp/…) so skip-if-unchanged can stamp a
+    day without reading every chain row. Append-only live sessions change
+    n / max_ct when new snapshots arrive; full sums still gate build_day.
+    """
     if not table_exists(con, table):
         return {"n": 0}
     cols = set(table_columns(con, table))
@@ -383,20 +441,21 @@ def _scalar_checksum(
             "MIN(candle_time) AS min_ct",
             "MAX(candle_time) AS max_ct",
         ]
-    if "strike" in cols:
-        parts.append("COALESCE(SUM(CAST(strike AS REAL)), 0) AS sum_strike")
-    if "ltp" in cols:
-        parts.append("COALESCE(SUM(CAST(ltp AS REAL)), 0) AS sum_ltp")
-    if "close" in cols:
-        parts.append("COALESCE(SUM(CAST(close AS REAL)), 0) AS sum_close")
-    if "bid" in cols:
-        parts.append("COALESCE(SUM(CAST(bid AS REAL)), 0) AS sum_bid")
-    if "ask" in cols:
-        parts.append("COALESCE(SUM(CAST(ask AS REAL)), 0) AS sum_ask")
-    if "spot_at_capture" in cols:
-        parts.append(
-            "COALESCE(SUM(CAST(spot_at_capture AS REAL)), 0) AS sum_spot"
-        )
+    if not light:
+        if "strike" in cols:
+            parts.append("COALESCE(SUM(CAST(strike AS REAL)), 0) AS sum_strike")
+        if "ltp" in cols:
+            parts.append("COALESCE(SUM(CAST(ltp AS REAL)), 0) AS sum_ltp")
+        if "close" in cols:
+            parts.append("COALESCE(SUM(CAST(close AS REAL)), 0) AS sum_close")
+        if "bid" in cols:
+            parts.append("COALESCE(SUM(CAST(bid AS REAL)), 0) AS sum_bid")
+        if "ask" in cols:
+            parts.append("COALESCE(SUM(CAST(ask AS REAL)), 0) AS sum_ask")
+        if "spot_at_capture" in cols:
+            parts.append(
+                "COALESCE(SUM(CAST(spot_at_capture AS REAL)), 0) AS sum_spot"
+            )
     sql = f'SELECT {", ".join(parts)} FROM "{table}"{where_sql}'
     try:
         row = con.execute(sql, params).fetchone()
@@ -421,11 +480,12 @@ def _prev_context(con: sqlite3.Connection, date: str) -> Dict[str, Any]:
     if not table_exists(con, "intraday_candles"):
         return {"ctx_date": None, "ctx_time": None, "ctx_close": None}
     try:
+        # Bare inequality uses idx_candles_date; substr(<) cannot.
         row = con.execute(
             'SELECT trading_date, candle_time, close FROM "intraday_candles" '
-            'WHERE substr(trading_date, 1, 10) < ? AND interval_min = 1 '
+            "WHERE trading_date < ? AND interval_min = 1 "
             "ORDER BY trading_date DESC, candle_time DESC LIMIT 1",
-            (date,),
+            (date[:10],),
         ).fetchone()
     except sqlite3.Error:
         return {"ctx_date": None, "ctx_time": None, "ctx_close": None}
@@ -487,7 +547,7 @@ def shard_fidelity(
             if "prev_day_vix_close" in cols:
                 sql = (
                     "SELECT prev_day_vix_close FROM session_state "
-                    "WHERE substr(trading_date,1,10)=? "
+                    f"WHERE {date_predicate('trading_date')} "
                     "AND prev_day_vix_close IS NOT NULL "
                     "AND prev_day_vix_close > 0"
                 )
@@ -495,7 +555,7 @@ def shard_fidelity(
                     sql += " ORDER BY updated_at DESC LIMIT 1"
                 else:
                     sql += " LIMIT 1"
-                row = con.execute(sql, (date,)).fetchone()
+                row = con.execute(sql, date_range_params(date)).fetchone()
                 if row is not None:
                     try:
                         prev_vix = float(row["prev_day_vix_close"])
@@ -534,19 +594,27 @@ def format_fidelity(fid: Dict[str, Any]) -> str:
     )
 
 
-def fingerprint_source(src: sqlite3.Connection, date: str) -> Dict[str, Any]:
+def fingerprint_source(
+    src: sqlite3.Connection,
+    date: str,
+    *,
+    light: bool = False,
+) -> Dict[str, Any]:
     """What a fresh split of `date` from the live DB would contain."""
     fp: Dict[str, Any] = {"date": date, "tables": {}}
+    dparams = date_range_params(date)
     for table, col in BY_DATE:
         if not table_exists(src, table):
             fp["tables"][table] = {"n": 0}
             continue
         where = f" WHERE {date_predicate(col)}"
         if table in CRITICAL_FINGERPRINT:
-            fp["tables"][table] = _scalar_checksum(src, table, where, (date,))
+            fp["tables"][table] = _scalar_checksum(
+                src, table, where, dparams, light=light
+            )
         else:
             n = src.execute(
-                f'SELECT COUNT(*) AS n FROM "{table}"{where}', (date,)
+                f'SELECT COUNT(*) AS n FROM "{table}"{where}', dparams
             ).fetchone()["n"]
             fp["tables"][table] = {"n": int(n or 0)}
 
@@ -558,7 +626,7 @@ def fingerprint_source(src: sqlite3.Connection, date: str) -> Dict[str, Any]:
             for r in src.execute(
                 f'SELECT position_id FROM "positions" '
                 f"WHERE {date_predicate('trading_date')}",
-                (date,),
+                dparams,
             ).fetchall()
             if r[0]
         ]
@@ -587,7 +655,12 @@ def fingerprint_source(src: sqlite3.Connection, date: str) -> Dict[str, Any]:
     return fp
 
 
-def fingerprint_shard(path: Path, date: str) -> Optional[Dict[str, Any]]:
+def fingerprint_shard(
+    path: Path,
+    date: str,
+    *,
+    light: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Fingerprint of an existing per-day file (same shape as source)."""
     if not path.exists():
         return None
@@ -597,6 +670,7 @@ def fingerprint_shard(path: Path, date: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         fp: Dict[str, Any] = {"date": date, "tables": {}}
+        dparams = date_range_params(date)
         for table, col in BY_DATE:
             if not table_exists(con, table):
                 fp["tables"][table] = {"n": 0}
@@ -605,11 +679,11 @@ def fingerprint_shard(path: Path, date: str) -> Optional[Dict[str, Any]]:
             where = f" WHERE {date_predicate(col)}"
             if table in CRITICAL_FINGERPRINT:
                 fp["tables"][table] = _scalar_checksum(
-                    con, table, where, (date,)
+                    con, table, where, dparams, light=light
                 )
             else:
                 n = con.execute(
-                    f'SELECT COUNT(*) AS n FROM "{table}"{where}', (date,)
+                    f'SELECT COUNT(*) AS n FROM "{table}"{where}', dparams
                 ).fetchone()["n"]
                 fp["tables"][table] = {"n": int(n or 0)}
 
@@ -620,7 +694,7 @@ def fingerprint_shard(path: Path, date: str) -> Optional[Dict[str, Any]]:
                 for r in con.execute(
                     f'SELECT position_id FROM "positions" '
                     f"WHERE {date_predicate('trading_date')}",
-                    (date,),
+                    dparams,
                 ).fetchall()
                 if r[0]
             ]
@@ -673,7 +747,7 @@ def fingerprints_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 
 def _copy_via_attach(
     dst: sqlite3.Connection,
-    src_path: Path,
+    _src_path: Path,
     table: str,
     where_sql: str,
     params: tuple,
@@ -685,14 +759,12 @@ def _copy_via_attach(
     if not cols:
         return 0
     colq = ", ".join(f'"{c}"' for c in cols)
-    before = dst.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
     dst.execute(
         f'INSERT INTO "{table}" ({colq}) '
         f'SELECT {colq} FROM src."{table}"{where_sql}',
         params,
     )
-    after = dst.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-    return int(after - before)
+    return int(dst.execute("SELECT changes()").fetchone()[0] or 0)
 
 
 def build_day(
@@ -702,14 +774,16 @@ def build_day(
     *,
     include_global: bool = False,
     vacuum: bool = False,
+    full_integrity: bool = False,
 ) -> Dict[str, Any]:
     """
     Atomically write one per-day database.
 
-    Writes to a temp file first; only replaces `out_path` after integrity
-    check + fingerprint match against the source. Never deletes an existing
-    shard until the replacement is ready. Optional VACUUM (off by default)
-    shrinks the file but is not required for correctness.
+    Writes to a temp file first; only replaces `out_path` after quick_check
+    (or integrity_check) + fingerprint match against the source. Never
+    deletes an existing shard until the replacement is ready. Optional
+    VACUUM (off by default) shrinks the file but is not required for
+    correctness.
     """
     # Unique temp name so parallel workers never collide on the same path.
     tmp_path = out_path.parent / (
@@ -720,6 +794,9 @@ def build_day(
 
     counts: Dict[str, int] = {}
     integrity = "unknown"
+    check_pragma = (
+        "PRAGMA integrity_check" if full_integrity else "PRAGMA quick_check"
+    )
 
     # Pre-read fingerprint / schema / context on a single RO handle, then
     # CLOSE it before ATTACH. On Windows, EXCLUSIVE (or even a second open)
@@ -733,7 +810,11 @@ def build_day(
         except sqlite3.Error:
             pass
         src_fp = fingerprint_source(src_ro, date)
-        schema_stmts = list(schema_sql(src_ro, include_global=include_global))
+        # Context is already inside src_fp; reuse to avoid a second scan.
+        ctx = src_fp.get("context") or _prev_context(src_ro, date)
+        table_stmts, index_stmts = schema_sql(
+            src_ro, include_global=include_global
+        )
         src_tables = {
             t for t, _ in BY_DATE if table_exists(src_ro, t)
         } | {
@@ -741,11 +822,13 @@ def build_day(
         } | {
             t for t in GLOBAL if table_exists(src_ro, t)
         }
-        ctx = _prev_context(src_ro, date)
     finally:
         src_ro.close()
 
-    dst = sqlite3.connect(str(tmp_path), timeout=60)
+    # Open the temp shard with uri=True so ATTACH can use mode=ro on the
+    # source (live primary or snapshot). Never open the primary writable.
+    tmp_uri = f"file:{tmp_path.resolve().as_posix()}?mode=rwc"
+    dst = sqlite3.connect(tmp_uri, uri=True, timeout=60)
     # journal_mode=OFF / synchronous=OFF apply ONLY to this temp shard.
     # The live primary is never opened writable from this script.
     dst.execute("PRAGMA journal_mode=OFF")
@@ -754,25 +837,23 @@ def build_day(
     dst.execute("PRAGMA cache_size=-131072")  # ~128 MB page cache
     dst.execute("PRAGMA busy_timeout=60000")
     # Do NOT set locking_mode=EXCLUSIVE before ATTACH — that tries to
-    # exclusively lock the attached snapshot and deadlocks on Windows.
+    # exclusively lock the attached source and deadlocks on Windows.
+    dparams = date_range_params(date)
     try:
         with dst:
-            for stmt in schema_stmts:
+            for stmt in table_stmts:
                 try:
                     dst.execute(stmt)
                 except sqlite3.Error as exc:
                     if "already exists" not in str(exc).lower():
                         raise
 
-            # ATTACH the snapshot by filesystem path. A file: URI here
-            # is treated as a literal filename because this connection
-            # is not opened with uri=True (Windows: "unable to open
-            # database: file:C:/...?mode=ro"). The snapshot is a
-            # private copy — not the live primary. Multiple workers may
-            # ATTACH the same snapshot read-only concurrently.
+            # ATTACH source read-only. mode=ro is required when work_src is
+            # the live primary (no snapshot); also prevents accidental
+            # writes / close-checkpoint against a disposable snapshot.
             dst.execute(
                 "ATTACH DATABASE ? AS src",
-                (str(Path(src_path).resolve()),),
+                (_as_ro_uri(src_path),),
             )
             try:
                 for table, col in BY_DATE:
@@ -781,7 +862,7 @@ def build_day(
                         continue
                     where = f" WHERE {date_predicate(col)}"
                     counts[table] = _copy_via_attach(
-                        dst, src_path, table, where, (date,)
+                        dst, src_path, table, where, dparams
                     )
 
                 pos_ids = (
@@ -834,13 +915,14 @@ def build_day(
                 ):
                     cols = table_columns(dst, "intraday_candles")
                     colq = ", ".join(f'"{c}"' for c in cols)
+                    ctx_lo, ctx_hi = date_range_params(str(ctx["ctx_date"]))
                     dst.execute(
                         f'INSERT INTO "intraday_candles" ({colq}) '
                         f'SELECT {colq} FROM src."intraday_candles" '
-                        f"WHERE substr(trading_date, 1, 10) = ? "
+                        f"WHERE trading_date >= ? AND trading_date < ? "
                         f"AND interval_min = 1 AND candle_time = ? "
                         f"LIMIT 1",
-                        (ctx["ctx_date"], ctx["ctx_time"]),
+                        (ctx_lo, ctx_hi, ctx["ctx_time"]),
                     )
                     counts["intraday_candles:context"] = int(
                         dst.execute("SELECT changes()").fetchone()[0] or 0
@@ -848,11 +930,11 @@ def build_day(
                     if counts["intraday_candles:context"] == 0:
                         row = dst.execute(
                             'SELECT * FROM src."intraday_candles" '
-                            "WHERE substr(trading_date,1,10) < ? "
+                            "WHERE trading_date < ? "
                             "AND interval_min = 1 "
                             "ORDER BY trading_date DESC, candle_time DESC "
                             "LIMIT 1",
-                            (date,),
+                            (date[:10],),
                         ).fetchone()
                         if row is not None:
                             ph = ", ".join("?" for _ in cols)
@@ -868,13 +950,25 @@ def build_day(
                 except sqlite3.Error:
                     pass
 
-            # Exclusive only on the temp shard after the snapshot is detached.
+            # Build indexes after bulk load (much faster than insert-with-index).
+            for stmt in index_stmts:
+                try:
+                    dst.execute(stmt)
+                except sqlite3.Error as exc:
+                    if "already exists" not in str(exc).lower():
+                        raise
+
+            # Exclusive only on the temp shard after the source is detached.
             try:
                 dst.execute("PRAGMA locking_mode=EXCLUSIVE")
             except sqlite3.Error:
                 pass
 
-        integrity = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        # quick_check validates pages without the full index↔table cross
+        # walk. Content correctness is gated by the fingerprint match below;
+        # atomic replace still keeps any existing shard intact on failure.
+        # Use --full-integrity for PRAGMA integrity_check (much slower).
+        integrity = dst.execute(check_pragma).fetchone()[0]
         # VACUUM is optional compaction — integrity already gates replace.
         if integrity == "ok" and vacuum:
             dst.execute("VACUUM")
@@ -884,7 +978,7 @@ def build_day(
     if integrity != "ok":
         remove_db_trio(tmp_path)
         raise RuntimeError(
-            f"{date}: integrity_check failed ({integrity}); shard not replaced"
+            f"{date}: {check_pragma} failed ({integrity}); shard not replaced"
         )
 
     new_fp = fingerprint_shard(tmp_path, date)
@@ -917,6 +1011,7 @@ def _rebuild_day_worker(job: Dict[str, Any]) -> Dict[str, Any]:
             date,
             include_global=bool(job.get("include_global")),
             vacuum=bool(job.get("vacuum")),
+            full_integrity=bool(job.get("full_integrity")),
         )
         fid = shard_fidelity(
             out_path,
@@ -977,6 +1072,34 @@ def _trading_dates(
     return out
 
 
+def _weekday_span(
+    start: str,
+    end: str,
+    holiday_dates: Set[str],
+) -> List[str]:
+    """Every NSE weekday from start..end inclusive (holidays excluded).
+
+    Used so gaps in the live DB (e.g. 2026-10-09..10-14 wiped from
+    primary while shards remain) still appear in the split report instead
+    of being silently omitted between discovered dates.
+    """
+    try:
+        d0 = datetime.strptime(start[:10], "%Y-%m-%d")
+        d1 = datetime.strptime(end[:10], "%Y-%m-%d")
+    except ValueError:
+        return []
+    if d1 < d0:
+        d0, d1 = d1, d0
+    out: List[str] = []
+    cur = d0
+    while cur <= d1:
+        ds = cur.strftime("%Y-%m-%d")
+        if cur.weekday() < 5 and ds not in holiday_dates:
+            out.append(ds)
+        cur += timedelta(days=1)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
@@ -1016,6 +1139,18 @@ def main() -> int:
         help="compare fingerprints only; do not write or delete anything",
     )
     ap.add_argument(
+        "--check-fidelity",
+        action="store_true",
+        help="on UNCHANGED days, open each shard for prev_vix/prev_close "
+             "fidelity (slow on large libraries). Default skips that I/O.",
+    )
+    ap.add_argument(
+        "--full-fingerprint",
+        action="store_true",
+        help="skip decision uses full SUM checksums (slow). Default uses "
+             "light stamps (n + min/max capture_time) for skip-if-unchanged.",
+    )
+    ap.add_argument(
         "--include-global",
         action="store_true",
         help="also copy calibration_state / expiry_results (not needed for BT)",
@@ -1028,8 +1163,9 @@ def main() -> int:
     ap.add_argument(
         "--allow-live",
         action="store_true",
-        help="snapshot even if the live engine holds the writer lock "
-             "(not recommended; wait for main.py to exit)",
+        help="allow a backup() snapshot while the writer lock is held "
+             "(not recommended; wait for main.py to exit). Also forces "
+             "the snapshot path even if the lock is free.",
     )
     ap.add_argument(
         "--workers",
@@ -1044,8 +1180,15 @@ def main() -> int:
     ap.add_argument(
         "--vacuum",
         action="store_true",
-        help="VACUUM each new shard after integrity_check (slower, smaller files). "
-             "Default skips VACUUM — correctness uses integrity_check + atomic replace.",
+        help="VACUUM each new shard after integrity check (slower, smaller files). "
+             "Default skips VACUUM — correctness uses quick_check + fingerprint "
+             "+ atomic replace.",
+    )
+    ap.add_argument(
+        "--full-integrity",
+        action="store_true",
+        help="use PRAGMA integrity_check instead of quick_check (slower). "
+             "Default quick_check + fingerprint match is sufficient.",
     )
     args = ap.parse_args()
     args.workers = max(1, int(args.workers or DEFAULT_SPLIT_WORKERS))
@@ -1086,57 +1229,131 @@ def main() -> int:
     snap_path: Optional[Path] = None
     src: Optional[sqlite3.Connection] = None
     try:
-        print(
-            "\n  Snapshotting source with a read-only backup "
-            "(live file is not written) ..."
+        # Prefer a backup() snapshot when the WAL is large or --allow-live:
+        # one sequential copy beats N workers random-reading a multi-GB WAL.
+        # With a small WAL and a free writer lock, read the primary in place.
+        wal_path = Path(str(live_src) + "-wal")
+        try:
+            wal_bytes = wal_path.stat().st_size if wal_path.is_file() else 0
+        except OSError:
+            wal_bytes = 0
+        need_snapshot = bool(args.allow_live) or (
+            wal_bytes >= SNAPSHOT_WAL_THRESHOLD_BYTES
         )
-        snap_path = snapshot_readonly(live_src)
-        work_src = snap_path
-        print(f"  Snapshot : {work_src.name}")
+        if need_snapshot:
+            why = (
+                "--allow-live"
+                if args.allow_live
+                else f"WAL {wal_bytes / (1024 * 1024):.0f} MB >= "
+                     f"{SNAPSHOT_WAL_THRESHOLD_BYTES // (1024 * 1024)} MB"
+            )
+            print(
+                f"\n  Snapshotting with read-only backup() ({why}; "
+                f"live file is not written) ..."
+            )
+            t_snap = time.time()
+            snap_path = snapshot_readonly(live_src)
+            work_src = snap_path
+            print(
+                f"  Snapshot : {work_src.name}  "
+                f"({time.time() - t_snap:.1f}s)"
+            )
+        else:
+            work_src = live_src
+            print(
+                "\n  Reading quiescent primary in place "
+                f"(WAL {wal_bytes / (1024 * 1024):.1f} MB; "
+                f"query_only + ATTACH mode=ro; no snapshot copy)"
+            )
         src = open_db(work_src, readonly=True)
-        dates = discover_dates(src)
+        try:
+            src.execute("PRAGMA cache_size=-65536")
+            src.execute("PRAGMA mmap_size=268435456")
+        except sqlite3.Error:
+            pass
+        discovered = discover_dates(src)
         if args.dates:
             wanted = {d[:10] for d in args.dates}
-            dates = [d for d in dates if d in wanted]
-            missing = sorted(wanted - set(dates))
-            if missing:
+            discovered = [d for d in discovered if d in wanted]
+            missing_wanted = sorted(wanted - set(discovered))
+            if missing_wanted:
                 print(
-                    f"  Warning: no source rows for: {', '.join(missing)}"
+                    f"  Warning: no source rows for: {', '.join(missing_wanted)}"
                 )
-        dates = _trading_dates(dates, holiday_dates)
+        discovered = _trading_dates(discovered, holiday_dates)
+        if not discovered and not args.dates:
+            print("\n  No valid trading dates found to process.\n")
+            return 1
+
+        # Fill weekday gaps between first and last discovered session so
+        # wiped/missing source days still appear in the report (MISSING /
+        # ORPHAN) instead of vanishing between e.g. 10-08 and 10-15.
+        if args.dates:
+            dates = _trading_dates(
+                sorted({d[:10] for d in args.dates}), holiday_dates
+            )
+        elif discovered:
+            dates = _weekday_span(discovered[0], discovered[-1], holiday_dates)
+        else:
+            dates = []
         if not dates:
             print("\n  No valid trading dates found to process.\n")
             return 1
 
+        gap_days = [d for d in dates if d not in set(discovered)]
         print(f"\n  Source : {live_src}  (work copy {work_src.name})")
         print(f"  Output : {out_dir}/")
-        print(f"  Dates  : {len(dates)}  ({dates[0]} .. {dates[-1]})")
+        print(
+            f"  Dates  : {len(dates)} weekdays  ({dates[0]} .. {dates[-1]})  "
+            f"source_has_rows={len(discovered)}  "
+            f"calendar_gaps={len(gap_days)}"
+        )
+        if gap_days:
+            print(f"  Gaps   : {', '.join(gap_days)}")
         print(
             f"  Mode   : "
             f"{'verify-only' if args.verify_only else ('force-rebuild' if args.force else 'skip-if-unchanged')}"
             f"{' +global' if args.include_global else ''}"
             f"{' +vacuum' if args.vacuum else ''}"
+            f"{' +full-integrity' if args.full_integrity else ''}"
             f"  workers={args.workers}\n"
         )
 
-        skipped = rebuilt = failed = verified_ok = verified_bad = 0
+        unchanged = empty_source = orphan_kept = missing_source = 0
+        rebuilt = failed = verified_ok = verified_bad = 0
         fidelity_bad = 0
         total_bytes = 0
         t0 = time.time()
         rebuild_jobs: List[Dict[str, Any]] = []
 
+        use_light = not bool(args.full_fingerprint)
         for d in dates:
             out_path = out_dir / f"nifty_algo_{d}.db"
-            src_fp = fingerprint_source(src, d)
+            src_fp = fingerprint_source(src, d, light=use_light)
             chain_n = (src_fp.get("tables") or {}).get(
                 "option_chain_snapshot", {}
             ).get("n", 0)
             if int(chain_n or 0) == 0:
-                print(f"  {d}: SKIP  (no option_chain_snapshot rows in source)")
-                skipped += 1
+                # No chain in primary: cannot rebuild. Keep any existing
+                # shard (orphan from a prior split) and report clearly.
+                if out_path.is_file():
+                    size_kb = out_path.stat().st_size / 1024
+                    total_bytes += out_path.stat().st_size
+                    print(
+                        f"  {d}: ORPHAN   {size_kb:>10,.1f} KB  "
+                        f"(no source chain — keeping existing shard)"
+                    )
+                    orphan_kept += 1
+                else:
+                    print(
+                        f"  {d}: MISSING  (no option_chain_snapshot in source, "
+                        f"no shard on disk)"
+                    )
+                    missing_source += 1
+                empty_source += 1
                 continue
 
-            existing_fp = fingerprint_shard(out_path, d)
+            existing_fp = fingerprint_shard(out_path, d, light=use_light)
             same = fingerprints_equal(src_fp, existing_fp or {})
             expect_prev = (
                 (src_fp.get("context") or {}).get("ctx_close") is not None
@@ -1163,16 +1380,20 @@ def main() -> int:
             if same and not args.force:
                 size_kb = out_path.stat().st_size / 1024
                 total_bytes += out_path.stat().st_size
-                fid = shard_fidelity(
-                    out_path, d, expect_prev_close=expect_prev
-                )
-                if not fid.get("ok"):
-                    fidelity_bad += 1
+                if args.check_fidelity:
+                    fid = shard_fidelity(
+                        out_path, d, expect_prev_close=expect_prev
+                    )
+                    if not fid.get("ok"):
+                        fidelity_bad += 1
+                    fid_s = format_fidelity(fid)
+                else:
+                    fid_s = "FIDELITY skipped (pass --check-fidelity)"
                 print(
                     f"  {d}: UNCHANGED  {size_kb:>10,.1f} KB  "
-                    f"(fingerprint match — kept)  {format_fidelity(fid)}"
+                    f"(fingerprint match — kept)  {fid_s}"
                 )
-                skipped += 1
+                unchanged += 1
                 continue
 
             rebuild_jobs.append(
@@ -1182,6 +1403,7 @@ def main() -> int:
                     "out_path": str(out_path),
                     "include_global": bool(args.include_global),
                     "vacuum": bool(args.vacuum),
+                    "full_integrity": bool(args.full_integrity),
                     "expect_prev_close": expect_prev,
                     "had_existing": existing_fp is not None,
                     "action": "REPLACED" if existing_fp is not None else "CREATED",
@@ -1190,10 +1412,22 @@ def main() -> int:
 
         # Rebuilds only — fingerprint decisions already made above. Each
         # worker writes a unique temp file then atomically replaces its
-        # own out_path; the shared snapshot is read-only.
+        # own out_path; the shared source is attached read-only.
         if rebuild_jobs and not args.verify_only:
-            # Drop the parent's RO handle on the snapshot before workers
-            # ATTACH it (same Windows lock class as src_ro+ATTACH in-process).
+            # Re-check writer lock before mutating shards when reading the
+            # live primary in place (no isolating snapshot).
+            if snap_path is None and not args.allow_live and writer_lock_held(
+                live_src
+            ):
+                print(
+                    f"\n  Aborting rebuilds: {live_src.name}.writer.lock "
+                    f"appeared after fingerprinting.\n"
+                    f"  Existing shards were not replaced.\n",
+                    file=sys.stderr,
+                )
+                return 1
+            # Drop the parent's RO handle before workers ATTACH the same
+            # file (Windows lock class as src_ro+ATTACH in-process).
             if src is not None:
                 try:
                     src.close()
@@ -1265,7 +1499,8 @@ def main() -> int:
         if args.verify_only:
             print(
                 f"  Verify: {verified_ok} match, {verified_bad} drift, "
-                f"{skipped} empty-source, fidelity_fail={fidelity_bad}  "
+                f"empty_source={empty_source} (orphan={orphan_kept} "
+                f"missing={missing_source}), fidelity_fail={fidelity_bad}  "
                 f"({elapsed:.1f}s)\n"
             )
             if verified_bad:
@@ -1275,10 +1510,22 @@ def main() -> int:
             return 0
 
         print(
-            f"  Done. rebuilt={rebuilt} unchanged={skipped} failed={failed}  "
+            f"  Done. rebuilt={rebuilt} unchanged={unchanged} failed={failed}  "
+            f"orphan_kept={orphan_kept} missing={missing_source}  "
             f"fidelity_fail={fidelity_bad}  "
             f"{total_bytes / (1024 * 1024):,.1f} MB on disk  ({elapsed:.1f}s)\n"
         )
+        if missing_source:
+            print(
+                "  Note: MISSING days have no chain in the live DB and no "
+                "shard — the engine never recorded those sessions (or they "
+                "were purged). Split cannot invent them.\n"
+            )
+        if orphan_kept:
+            print(
+                "  Note: ORPHAN shards are kept on disk for backtest but "
+                "cannot be refreshed until the live DB has those days again.\n"
+            )
         if failed:
             return 1
         if fidelity_bad and not args.allow_unfaithful:

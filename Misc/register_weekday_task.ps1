@@ -10,7 +10,7 @@
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $WorkDir   = Split-Path -Parent $ScriptDir
-$Launcher  = Join-Path $WorkDir "run_weekday_open.cmd"
+$Launcher  = Join-Path $ScriptDir "run_weekday_open.cmd"
 $TaskName  = "NiftyAlgo-WeekdayInteractive"
 $UserId    = "$env:USERDOMAIN\$env:USERNAME"
 
@@ -40,9 +40,10 @@ $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
-    -MultipleInstances IgnoreNew `
+    -MultipleInstances Parallel `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -RestartCount 0
+    -RestartCount 0 `
+    -WakeToRun
 
 Register-ScheduledTask `
     -TaskName $TaskName `

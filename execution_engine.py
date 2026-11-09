@@ -2163,6 +2163,13 @@ class ExecutionEngine:
         self._persist_filled_legs(position_id, filled_legs, lots)
 
         # ── Promote PENDING_ENTRY → OPEN ──────────────────────────────────
+        _sel = str(params.get("selection_reason") or "")
+        if _sel.startswith("clean_long_v1:") and ":rev=1" in _sel:
+            self._alert(
+                "WARNING",
+                f"clean_long REVERSE OPEN {_sel} lots={lots} "
+                f"{params.get('strategy_name')} — second budget of the day",
+            )
         self.db.update("positions", {
             "trading_date":             today_ist().isoformat(),
             "strategy_name":            params["strategy_name"],
@@ -3077,8 +3084,17 @@ class ExecutionEngine:
             "stop_anchor": round(stop_anchor, 2),
         }
         # Per-trade rupee backstop (CLEAN_LONG_RISK_RS): open loss at the
-        # liquidation bid plus entry and estimated exit costs.
+        # liquidation bid plus entry and estimated exit costs. Prefer the
+        # per-ticket :risk= stamped at entry (residual / event-gap size).
         _risk_rs = float(getattr(self.config, "clean_long_risk_rs", 0.0) or 0.0)
+        try:
+            _rk = dict(
+                x.split("=", 1) for x in reason.split(":")[1:] if "=" in x
+            ).get("risk")
+            if _rk is not None:
+                _risk_rs = max(float(_rk), 0.0)
+        except (TypeError, ValueError):
+            pass
         if _risk_rs > 0 and entry_value > 0:
             try:
                 _qty = int(position.get("final_lots") or 0) * float(self.config.lot_size or 65)
@@ -3089,6 +3105,13 @@ class ExecutionEngine:
             ctx["open_loss_rs"] = round(_open_loss, 0)
             if _qty > 0 and _open_loss >= _risk_rs:
                 ctx["reason_detail"] = "clean_long_risk_cap"
+                _msg = (
+                    f"clean_long RISK_CAP: open_loss=Rs{_open_loss:.0f} "
+                    f">= budget=Rs{_risk_rs:.0f} pid={pid} "
+                    f"{str(position.get('strategy_name') or '')} "
+                    f"— reverse only if narrow-OR / residual allows"
+                )
+                self._alert("WARNING", _msg)
                 return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, ctx
         if (spot - stop) * direction <= 0:
             ctx["reason_detail"] = (
