@@ -268,6 +268,64 @@ class TestStrictDailyAllowance(SipTestCase):
         self.assertFalse(client.placed[0]["amo"])
         self.assertAlmostEqual(b.sip_committed(), 901.8)
 
+    def test_premium_blocked_primary_reroutes_sip_to_next_eligible_etf(self):
+        # Rs 1,000 cap / Rs 500 floor cannot split across three names, so the
+        # router concentrates on the highest-weight name. If that name is
+        # premium-blocked, the allowance must fall through to the next eligible
+        # basket ETF instead of idling the whole SIP day.
+        client = FakeUpstox(cash=100000.0)
+        b = self.broker(client)
+        c = self.cycle(b)
+        for sym in ("A", "B", "C"):
+            self.seed_price(sym, 100.0)
+        self.db.meta_set(m.SIP_BASKET_KEY, "A,B,C")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 0.4, "B": 0.3, "C": 0.3}))
+        c.data = types.SimpleNamespace(
+            series=lambda sym, *a, **k: [{"adj_close": 100.0 + i * 0.1} for i in range(300)])
+        c._live_quotes = lambda symbols: ({s: 100.0 for s in symbols}, {}, {s: True for s in symbols})
+        c.filters.check_execution = lambda *a, **k: (True, "", {})
+        c.filters.inav_premium_block = lambda sym, *a, **k: (
+            (True, 0.0462, 0.015) if sym == "A" else (False, None, None))
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "MIN_BUY_VALUE", 500.0), \
+             mock.patch.object(m, "market_open_now", return_value=True), quiet():
+            submitted = c.deploy_day()
+        self.assertEqual(submitted, 1)
+        self.assertEqual(len(client.placed), 1)
+        self.assertEqual(client.placed[0]["symbol"], "B")
+        self.assertAlmostEqual(b.sip_committed(), 901.8)
+        row = self.db.one("SELECT status,reason FROM orders WHERE symbol='A' AND side='BUY'")
+        self.assertEqual(row["status"], "SKIPPED_FILTER")
+        self.assertIn("NAV/fair value", row["reason"])
+        self.assertEqual(json.loads(self.db.meta_get(m.DEPLOY_SKIP_KEY, "{}")).get("A"), 1)
+
+    def test_premium_blocked_basket_does_not_force_a_buy(self):
+        client = FakeUpstox(cash=100000.0)
+        b = self.broker(client)
+        c = self.cycle(b)
+        for sym in ("A", "B"):
+            self.seed_price(sym, 100.0)
+        self.db.meta_set(m.SIP_BASKET_KEY, "A,B")
+        self.db.meta_set(m.SIP_BASKET_DATE_KEY, m.today_str())
+        self.db.meta_set(m.SIP_TARGETS_KEY, json.dumps({"A": 0.6, "B": 0.4}))
+        c.data = types.SimpleNamespace(
+            series=lambda sym, *a, **k: [{"adj_close": 100.0 + i * 0.1} for i in range(300)])
+        c._live_quotes = lambda symbols: ({s: 100.0 for s in symbols}, {}, {s: True for s in symbols})
+        c.filters.check_execution = lambda *a, **k: (True, "", {})
+        c.filters.inav_premium_block = lambda *a, **k: (True, 0.05, 0.015)
+        out = io.StringIO()
+        with mock.patch.object(m, "INVEST_PER_DAY", 1000.0), \
+             mock.patch.object(m, "market_open_now", return_value=True), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            submitted = c.deploy_day()
+        self.assertEqual(submitted, 0)
+        self.assertEqual(client.placed, [])
+        self.assertAlmostEqual(b.sip_committed(), 0.0)
+        text = out.getvalue()
+        self.assertIn("A: buy price is", text)
+        self.assertIn("B: buy price is", text)
+
     def test_sell_trim_dust_floor_is_not_lowered_by_small_buy_floor(self):
         client = FakeUpstox(holdings=[{"trading_symbol": "A", "quantity": 30,
                                        "average_price": 100.0, "last_price": 100.0}])
@@ -312,7 +370,7 @@ class TestStrictDailyAllowance(SipTestCase):
 
 class TestAuditFixes(SipTestCase):
     def test_locked_contract_constants_are_enforced(self):
-        self.assertEqual(m.LOCKED_CONTRACT_ID, "SIP-LOCK-v2")
+        self.assertEqual(m.LOCKED_CONTRACT_ID, "SIP-LOCK-v3")
         self.assertTrue(m.SIP_MODE)
         self.assertTrue(m.DAILY_EXIT_GUARD)
         self.assertEqual(m.config_errors(), [])

@@ -9,7 +9,7 @@
 ================================================================================
  LOCKED ENGINE CONTRACT - FIXED BEHAVIOUR. DO NOT CHANGE. DO NOT RE-AUDIT.
 ================================================================================
- Contract ID: SIP-LOCK-v2  (user-locked rules; v3 AMO correction 08-Nov-2026)
+ Contract ID: SIP-LOCK-v3  (user-locked rules; v3 AMO + SIP fallback router, 09-Nov-2026)
 
  Everything in this block is a PRODUCT DECISION made by the owner, not a
  finding. It is frozen. An audit that proposes changing a rule below is out of
@@ -141,6 +141,13 @@
        and order_ids response parsing. AMO during market hours is blocked;
        05:30-24:00 IST window enforced. Failed zero-fill rejections journal
        zero value and release the SIP reservation. Default cap is Rs 1,000.
+ R-2   Latest build still sent no order on 09-Nov-2026 .................. FIXED
+       Not an API/AMO failure: the router concentrated the Rs 1,000 cap on
+       PHARMABEES, the iNAV premium gate blocked it (+4.62% vs +1.50% allowed),
+       and the run idled the allowance instead of trying MOCAPITAL/SML100CASE.
+       deploy_day now routes one best slice at a time and falls through to the
+       next eligible basket ETF when a slice is blocked, without lifting the cap
+       or bypassing premium/liquidity/trend gates.
 
  RUN DIAGNOSIS 08-Nov-2026 (zero orders in the Upstox console)
  -------------------------------------------------------------
@@ -158,6 +165,9 @@
  Upstox Place Order V3 supports AMO via is_amo=true; the engine now uses v3,
  sends AMO only when the market is closed and the 05:30-24:00 IST API window
  is open, and parses order_ids. INVEST_PER_DAY defaults to Rs 1,000.
+ Follow-up 09-Nov-2026: market OPEN, no broker rejection; PHARMABEES was
+ premium-blocked and the single-pass router idled the cap. The SIP router now
+ falls through to the next eligible basket ETF when a routed slice is blocked.
 
  WHAT THIS PROGRAM DOES
  ----------------------
@@ -186,7 +196,8 @@
     session, is_amo=true when the market is closed (never during market hours;
     UDAPI100039). The place-order API window is 05:30-24:00 IST; outside it the
     run defers honestly and --wait-for-open can wait. A fresh quote is required
-    while the market is open.
+    while the market is open. If a routed SIP slice is blocked, the unused
+    allowance falls through to the next eligible basket ETF (same strict cap).
   * The existing y/n live-order confirmation is retained. Non-interactive
     shells cannot place orders.
 
@@ -651,7 +662,7 @@ SIP_TREND_GUARD = True             # daily buy pauses for a name whose EXIT rule
 DAILY_EXIT_GUARD = True
 
 
-LOCKED_CONTRACT_ID = "SIP-LOCK-v2"   # see LOCKED ENGINE CONTRACT at the top of this file
+LOCKED_CONTRACT_ID = "SIP-LOCK-v3"   # see LOCKED ENGINE CONTRACT at the top of this file
 
 
 def config_errors() -> list:
@@ -5245,29 +5256,52 @@ class TradingCycle:
         # Existing holdings do not shrink today's contribution; the book grows
         # gradually with each SIP day. Absolute target-weight/cash-share rules
         # are intentionally not used here (user direction 2026-11-08).
-        weight_sum = sum(targets[s] for s in plan)
-        if weight_sum <= 0:
+        #
+        # 2026-11-09 fix: route ONE best slice at a time and fall through to the
+        # next eligible basket ETF when a slice is blocked (premium/NAV, execution
+        # filter, open order, whole-share floor or broker rejection). The old
+        # single-pass router concentrated the whole Rs 1,000 cap on one name and
+        # then idled the allowance if that name was premium-blocked, printing the
+        # misleading "no allocatable slice" for the untouched alternatives.
+        if not plan or sum(targets[s] for s in plan) <= 0:
             P.warn("No buyable ETF has a positive target weight.")
             self._print_no_buy_reasons(basket, skipped)
             return 0
-        shares = {sym: remaining * targets[sym] / weight_sum for sym in plan}
-        if shares and max(shares.values()) <= MIN_BUY_VALUE:
-            # Every proportional share is below the minimum ticket. Keep the
-            # full-cap SIP instruction by concentrating on the highest-weight
-            # buyable name instead of idling the whole allowance.
-            shares = {sym: remaining + targets[sym] for sym in plan}
-        caps = {}
+        liq_caps = {}
         for sym in plan:
             p25 = self.filters.liquidity_p25(sym, today_str()) or 0.0
             if p25 > 0:
-                caps[sym] = POS_CAP_LIQ_FRAC * p25
-        slices = day_slices(shares, remaining, caps)
-        if not slices:
-            P.info("No allocatable SIP slice after contribution routing, liquidity caps and minimum-ticket checks.")
-            self._print_no_buy_reasons(basket, skipped)
-            slices = {}
+                liq_caps[sym] = POS_CAP_LIQ_FRAC * p25
         submitted = filled = 0
-        for sym, slice_val in sorted(slices.items(), key=lambda kv: (-kv[1], kv[0])):
+        candidates = dict(plan)
+        while candidates and self.broker.sip_remaining() >= MIN_BUY_VALUE:
+            remaining = self.broker.sip_remaining()
+            weight_sum = sum(targets[s] for s in candidates)
+            if weight_sum <= 0:
+                for sym in candidates:
+                    skipped.setdefault(sym, "no positive target weight in the stored plan")
+                break
+            shares = {sym: remaining * targets[sym] / weight_sum for sym in candidates}
+            caps = {s: c for s, c in liq_caps.items() if s in candidates}
+            if shares and max(shares.values()) <= MIN_BUY_VALUE:
+                # Every proportional share is at/below the minimum ticket. Keep
+                # the full-cap SIP instruction by concentrating on the highest-
+                # weight buyable name instead of idling the whole allowance.
+                best = sorted(candidates, key=lambda s: (-targets[s], s))[0]
+                slices = day_slices({best: remaining}, remaining,
+                                    {best: caps[best]} if best in caps else None)
+                if not slices:
+                    candidates.pop(best, None)
+                    skipped[best] = "liquidity cap is below the minimum buy ticket"
+                    continue
+            else:
+                slices = day_slices(shares, remaining, caps)
+            if not slices:
+                for sym in candidates:
+                    skipped.setdefault(sym, "no allocatable slice after routing/liquidity caps")
+                break
+            sym, slice_val = sorted(slices.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+            candidates.pop(sym, None)   # at most one attempted BUY per symbol/run
             left = self.broker.sip_remaining()
             if left < MIN_BUY_VALUE:
                 break
@@ -5308,6 +5342,9 @@ class TradingCycle:
                     "slippage,charges,status,mode,order_type,reason) "
                     "VALUES(?,?,?,?,?,?,?,?,0,0,'SKIPPED_FILTER','LIVE','LIMIT',?)",
                     (now_iso(), today_str(), today_str(), sym, "BUY", qty, px, 0.0, why))
+                if candidates and self.broker.sip_remaining() >= MIN_BUY_VALUE:
+                    P.note(f"Re-routing the unused {fmt_rs(self.broker.sip_remaining())} SIP allowance "
+                           "to the remaining eligible basket ETFs.")
                 continue
             spread = qspread.get(sym)
             if spread is None:
@@ -6595,12 +6632,12 @@ def cmd_selftest(db: Db):
     check("v15 P0-1: INVEST_PER_DAY is zero or >= MIN_BUY_VALUE (else zero buys ever)",
           INVEST_PER_DAY == 0 or INVEST_PER_DAY >= MIN_BUY_VALUE,
           f"INVEST_PER_DAY={INVEST_PER_DAY} MIN_BUY_VALUE={MIN_BUY_VALUE}")
-    check("SIP-LOCK-v2: locked engine contract is intact (see file header)",
-          LOCKED_CONTRACT_ID == "SIP-LOCK-v2" and SIP_MODE is True
+    check("SIP-LOCK-v3: locked engine contract is intact (see file header)",
+          LOCKED_CONTRACT_ID == "SIP-LOCK-v3" and SIP_MODE is True
           and DAILY_EXIT_GUARD is True and not config_errors(),
           f"contract={LOCKED_CONTRACT_ID} errors={config_errors()}")
     _buy_block = buy_config_blocked()
-    check("SIP-LOCK-v2 L7: a too-small buy cap blocks buys only, never aborts",
+    check("SIP-LOCK-v3 L7: a too-small buy cap blocks buys only, never aborts",
           bool(_buy_block) == (0 < INVEST_PER_DAY < MIN_BUY_VALUE) and not config_errors(),
           f"blocked={_buy_block!r}")
 

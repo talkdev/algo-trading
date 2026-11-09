@@ -1088,3 +1088,17 @@ Validation: compile and pyflakes clean; **34 external unittest tests** passed, i
 **Guarantee boundary:** the code now guarantees the correct v3 endpoint/payload, explicit `is_amo`, timing gates, single-attempt submission, budget reservation and honest journaling. It cannot guarantee Upstox/exchange acceptance or a fill from this sandbox; broker-side algo/segment restrictions, token validity, margins/EDIS and exchange rules still apply. The user must run the updated file with a fresh token and confirm `y`.
 
 *Last updated: Place Order V3 AMO correction + ₹1,000 default, 08-Nov-2026 (rows 175–178). External tests: 34; selftests: 112; authenticated live verification pending on the user's machine.*
+
+---
+
+## 16. 09-Nov-2026 zero-order diagnosis: premium-blocked primary + SIP fallback router (2026-11-09)
+
+| # | Finding / shipped behaviour | Status |
+| --- | --- | --- |
+| 179 | **The latest code did not fail at the broker/API layer.** The Windows banner showed `SIP-LOCK-v2`, market OPEN, cap ₹1,000, and the run reached the SIP buy stage. No POST was sent because the only allocated ETF, **PHARMABEES**, was blocked by the iNAV premium gate: live buy price was **+4.62% above NAV/fair value** while the effective allowed band was **+1.50%**. The other basket names printed the generic “no allocatable slice” because the old single-pass router had already concentrated the whole ₹1,000 allowance on PHARMABEES (₹1,000 split across 3 names is ₹333 each, below the ₹500 minimum buy ticket). | APPLIED — offline verified |
+| 180 | **Router defect fixed:** `deploy_day()` now routes one best slice at a time and, when that slice is blocked by premium/NAV, execution filters, an open order, whole-share flooring or an explicit broker rejection, falls through to the next eligible basket ETF with the still-unused allowance. It never lifts `INVEST_PER_DAY`, never bypasses trend/liquidity/premium gates, and attempts at most one BUY per symbol per run. When every proportional share is at/below the minimum ticket it concentrates on the highest-weight buyable name; if that name is blocked, the next name is tried instead of idling the day. Contract fingerprint bumped to `SIP-LOCK-v3`. | APPLIED — offline verified |
+| 181 | Safety boundary remains: if **all** basket ETFs are ineligible (premium, trend, liquidity, data, risk pause, cash/holdings unreadable, or API window closed), the correct result is still zero orders with a reason per ETF. The engine cannot guarantee a fill or guarantee an order every day without disabling the owner-locked safety gates. | APPLIED — offline verified |
+
+Validation: compile and pyflakes clean; **36 external unittest tests** passed, including premium-blocked primary rerouting to the next basket ETF, all-premium-blocked basket still refusing to force a buy, v3 AMO/regular HTTP contracts, closed-window deferral, strict cap/no blind retry, and the reported 08-Nov state replay; all **112 embedded selftests** passed on an isolated temporary DB. No authenticated Upstox request or real order was made in the sandbox.
+
+*Last updated: 09-Nov-2026 premium-block diagnosis + SIP fallback router (rows 179–181). External tests: 36; selftests: 112; authenticated live verification pending on the user's machine.*
