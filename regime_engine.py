@@ -1188,32 +1188,21 @@ class RegimeClassifier:
             details["trigger"] = f"IV_{iv_behavior}_HARD_BLOCK"
             return VolatilityRegime.NEUTRAL, details
 
-        # ── Gate 4: Day-move stamps NEUTRAL unless the tape is a measured
-        # wide-range trend. Exhausted session range is a strategy question
-        # (threat-side + with-trend exemption in _check_hard_gates). Using
-        # it as a vol fact zeroed VRP on the engine's best harvest days
-        # (live: VRP ~8.7pp, day_move 141%, OR VERY_WIDE, vol=NEUTRAL, then
-        # EV killed the with-trend BCS). A NARROW/MODERATE morning that
-        # merely outran the straddle still stamps NEUTRAL — that wait is
-        # what kept Sep17 from booking a 10:06 flicker BPS.
+        # ── Gate 4: Day-move is a STRATEGY risk flag, not a vol fact.
+        # Stamping NEUTRAL here zeroed sellable VRP on harvest days and left
+        # wide-OR sessions dark. Emit session_range_spent for gates/sizing;
+        # keep classifying vol from VRP/IV below.
         if day_move_used >= self.config.day_move_used_block_pct:
-            _px_dm = str(signals.get("price_regime") or "")
-            _or_dm = str(or_condition or "")
-            _wide_trend = (
-                _or_dm in ("WIDE", "VERY_WIDE")
-                and _px_dm in (
-                    "DOWNTREND", "STRONG_DOWNTREND",
-                    "UPTREND", "STRONG_UPTREND",
-                )
-            )
             details["day_move_used_pct"] = day_move_used
-            if _wide_trend:
-                details["day_move_note"] = (
-                    f"DAY_MOVE_{day_move_used:.0f}PCT_WIDE_TREND_NOT_A_VOL_STAMP"
-                )
-            else:
-                details["trigger"] = f"DAY_MOVE_USED_{day_move_used:.0f}PCT"
-                return VolatilityRegime.NEUTRAL, details
+            details["session_range_spent"] = True
+            signals["session_range_spent"] = True
+            details["day_move_note"] = (
+                f"DAY_MOVE_{day_move_used:.0f}PCT_SPENT_FLAG_NOT_VOL"
+            )
+        else:
+            signals["session_range_spent"] = bool(
+                signals.get("session_range_spent") or False
+            )
 
         # ── Gate 5: Chain stale ───────────────────────────────────────────
         if chain_stale:
@@ -1374,6 +1363,30 @@ class RegimeClassifier:
         if not or_computed:
             return PriceRegime.OBSERVING
 
+        # ── Step 1b: structural trend (price-only, no ADX maturity wait) ──
+        # True market behaviour: a trend label requires price THROUGH the OR.
+        # Displacement alone (gap / open efficiency) without an OR break is
+        # still an inside-auction tape — labelling it UPTREND/DOWNTREND sold
+        # the wrong side and invited knife debits.
+        if bool(getattr(self.config, "struct_trend_enabled", True)):
+            try:
+                _st_dir = int(signals.get("struct_trend") or 0)
+                _st_str = int(signals.get("struct_strength") or 0)
+            except (TypeError, ValueError):
+                _st_dir, _st_str = 0, 0
+            _or_brk_up = (
+                or_high > 0 and spot > or_high + 20
+            )
+            _or_brk_dn = (
+                or_low > 0 and spot < or_low - 20
+            )
+            if _st_dir > 0 and _or_brk_up:
+                return (PriceRegime.STRONG_UPTREND if _st_str >= 2
+                        else PriceRegime.UPTREND)
+            if _st_dir < 0 and _or_brk_dn:
+                return (PriceRegime.STRONG_DOWNTREND if _st_str >= 2
+                        else PriceRegime.DOWNTREND)
+
         # ── Step 2: CHOPPY ────────────────────────────────────────────────
         # Fake-breakout chop is a stand-aside only while price is still
         # inside the opening range. A mature ADX print that has already
@@ -1476,21 +1489,31 @@ class RegimeClassifier:
             _dh_pr = 0.0
         _above_low = (spot - _dl_pr) if _dl_pr > 0 else 0.0
         _below_high = (_dh_pr - spot) if _dh_pr > 0 else 0.0
-        # Strong dumps/rallies with only a shallow <40pt pause still count.
+        # Stale-extreme kill scales with OR width: a 35pt pause on a 300pt
+        # OR is noise; the same pause on a 80pt OR is a real reclaim. Cap so
+        # wide days still release false trends before debit substitutes fire.
+        _or_w_pr = (
+            (or_high - or_low) if (or_high > 0 and or_low > 0 and or_high > or_low)
+            else 0.0
+        )
+        _stale_bar = 35.0
+        if _or_w_pr > 0:
+            _stale_bar = max(35.0, min(80.0, 0.22 * _or_w_pr))
+        _shallow_hold = _stale_bar + 5.0
         _stale_dn = (
-            _above_low >= 35.0
+            _above_low >= _stale_bar
             and not (
                 adx_15 > adx_strong
                 and ema_structure == "BEARISH"
-                and _above_low < 40.0
+                and _above_low < _shallow_hold
             )
         )
         _stale_up = (
-            _below_high >= 35.0
+            _below_high >= _stale_bar
             and not (
                 adx_15 > adx_strong
                 and ema_structure == "BULLISH"
-                and _below_high < 40.0
+                and _below_high < _shallow_hold
             )
         )
 
@@ -1509,24 +1532,37 @@ class RegimeClassifier:
             return PriceRegime.STRONG_UPTREND
 
         # ── Step 6: DOWNTREND ─────────────────────────────────────────────
+        # Plain trend needs confirmation stack: ADX + EMA side + OR break.
+        # TRANSITIONAL alone minted flicker trends; require BEARISH EMA, or
+        # TRANSITIONAL only with same-side VWAP.
+        _vwap_tr = signals.get("vwap_signal", "UNKNOWN")
         if (adx_15 >= adx_trend and
-                ema_structure in ("BEARISH", "TRANSITIONAL") and
                 or_low > 0 and spot < or_low - 20
-                and not _stale_dn):
-            # Confirm with HH/HL if available
+                and not _stale_dn
+                and (
+                    ema_structure == "BEARISH"
+                    or (
+                        ema_structure == "TRANSITIONAL"
+                        and _vwap_tr in ("BEARISH", "BEARISH_EXTENDED")
+                    )
+                )):
             if hh_hl in ("DOWNTREND", "NEUTRAL", "INSUFFICIENT_DATA"):
                 return PriceRegime.DOWNTREND
-            # HH/HL says UPTREND but ADX+EMA say DOWNTREND — use ADX+EMA
             if adx_15 >= adx_strong:
                 return PriceRegime.DOWNTREND
-            # Conflicting signals at moderate ADX — stay RANGE
             return PriceRegime.RANGE
 
         # ── Step 7: UPTREND ───────────────────────────────────────────────
         if (adx_15 >= adx_trend and
-                ema_structure in ("BULLISH", "TRANSITIONAL") and
                 or_high > 0 and spot > or_high + 20
-                and not _stale_up):
+                and not _stale_up
+                and (
+                    ema_structure == "BULLISH"
+                    or (
+                        ema_structure == "TRANSITIONAL"
+                        and _vwap_tr in ("BULLISH", "BULLISH_EXTENDED")
+                    )
+                )):
             if hh_hl in ("UPTREND", "NEUTRAL", "INSUFFICIENT_DATA"):
                 return PriceRegime.UPTREND
             if adx_15 >= adx_strong:
@@ -1535,14 +1571,19 @@ class RegimeClassifier:
 
         vwap_signal_pr = signals.get("vwap_signal", "UNKNOWN")
         vwap_dist_pr   = float(signals.get("vwap_dist_pct") or 0.0)
+        # VWAP displacement is confirmation of an OR break — never a
+        # stand-alone trend while spot is still inside the opening range
+        # (Sep29: inside-OR + BULLISH VWAP minted false UPTREND).
         if (adx_15 >= (adx_trend - 3)
                 and vwap_signal_pr in ("BULLISH", "BULLISH_EXTENDED")
                 and vwap_dist_pr > 0.20
+                and or_high > 0 and spot > or_high + 20
                 and not _stale_up):
             return PriceRegime.UPTREND
         if (adx_15 >= (adx_trend - 3)
                 and vwap_signal_pr in ("BEARISH", "BEARISH_EXTENDED")
                 and vwap_dist_pr < -0.20
+                and or_low > 0 and spot < or_low - 20
                 and not _stale_dn):
             return PriceRegime.DOWNTREND
         return PriceRegime.RANGE
@@ -2071,11 +2112,13 @@ class RegimeClassifier:
             )
             if _two_way:
                 signals["two_way_auction"] = True
+                signals["auction_type"] = "TWO_WAY"
                 _floor = min(_floor, float(
                     getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
                 ))
             elif bool(signals.get("two_way_auction")) and not _spike_hi:
                 _two_way = True
+                signals["auction_type"] = "TWO_WAY"
                 _floor = min(_floor, float(
                     getattr(self.config, "two_way_min_range_pts", 85.0) or 85.0
                 ))
@@ -2085,12 +2128,34 @@ class RegimeClassifier:
                 # extreme still unlock via _after_two_way_extreme_scalp.
                 signals["two_way_auction"] = False
                 _two_way = False
+            if not signals.get("auction_type"):
+                _px_a = getattr(price, "value", None) or str(price)
+                _or_a = str(signals.get("or_condition") or "")
+                if _px_a in (
+                    "UPTREND", "STRONG_UPTREND",
+                    "DOWNTREND", "STRONG_DOWNTREND",
+                ):
+                    signals["auction_type"] = "ONE_WAY"
+                elif (
+                    _px_a == "CHOPPY"
+                    and not _two_way
+                ):
+                    signals["auction_type"] = "CHAOS"
+                elif (
+                    _px_a in ("RANGE",)
+                    and _or_a in ("NARROW", "VERY_NARROW", "MODERATE", "")
+                ):
+                    signals["auction_type"] = "PIN"
+                else:
+                    signals["auction_type"] = "RANGE"
         except (TypeError, ValueError, ZeroDivisionError):
             _fh = _fl = _fspot = _frng = _raw_rng = 0.0
             _fpos = 0.5
             _floor = 100.0
             _two_way = False
             _spike = False
+            if not signals.get("auction_type"):
+                signals["auction_type"] = "RANGE"
 
         # Earlier fade window on two-way tapes (professional NIFTY book).
         _max_dte_fade = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
@@ -2155,9 +2220,16 @@ class RegimeClassifier:
                     _hi_th = 0.85
                     _lo_th = 0.20
                 if _fpos >= _hi_th:
-                    if (not _two_way) and _measured_up and not _struct_bear:
+                    # Always veto a live measured uptrend — including
+                    # two-way tapes. The prior `not _two_way` carve-out
+                    # forced AFTERNOON_DAY_HIGH_FADE → PREMIUM_SELL_BEAR
+                    # while price was UPTREND (Sep23-class: BCS refused by
+                    # hard invariant, debit blocked as call_vs_bear, day
+                    # flat). Matches the measured-downtrend low-fade veto.
+                    if _measured_up and not _struct_bear:
                         signals["fade_vetoed_by_trend"] = (
-                            f"high_fade_vetoed_one_way_uptrend_adx_{_adx_f:.0f}"
+                            f"high_fade_vetoed_measured_uptrend_adx_{_adx_f:.0f}"
+                            + ("_two_way" if _two_way else "")
                         )
                     else:
                         signals["afternoon_high_fade"] = True
@@ -2245,22 +2317,29 @@ class RegimeClassifier:
                             )
 
         if price == PriceRegime.CHOPPY:
-            # PATCH_V31: CHOPPY at a day extreme on a two-way auction is
-            # the fade setup, not a stand-aside. Mid-range chop still
-            # blocks — that is where premium sellers get chopped up.
-            if (_two_way and _fspot > 0 and conf != ConfidenceLevel.NONE
+            # CHOPPY at a day extreme is a fade setup when the session has
+            # already built range (two-way OR a material day range). Mid-range
+            # chop still blocks — that is where premium sellers get chopped.
+            _chop_fade_ok = _two_way or (_raw_rng >= 70.0 and _fade_t >= time(11, 30))
+            if (_chop_fade_ok and _fspot > 0 and conf != ConfidenceLevel.NONE
                     and _fade_t <= time(14, 0)
                     and 0 <= _dte_fade <= _max_dte_fade
                     and not bool(event_day)
                     and vol != VolatilityRegime.ABORT):
                 if _fpos >= 0.80:
-                    signals["afternoon_high_fade"] = True
-                    signals["weekly_range_size_discount"] = 1.0
-                    return (
-                        FinalRegime.PREMIUM_SELL_BEAR,
-                        "TWO_WAY_CHOPPY_HIGH_FADE",
-                        False,
-                    )
+                    if _measured_up and not _struct_bear:
+                        signals["fade_vetoed_by_trend"] = (
+                            f"choppy_high_fade_vetoed_measured_uptrend_"
+                            f"adx_{_adx_f:.0f}"
+                        )
+                    else:
+                        signals["afternoon_high_fade"] = True
+                        signals["weekly_range_size_discount"] = 1.0
+                        return (
+                            FinalRegime.PREMIUM_SELL_BEAR,
+                            "TWO_WAY_CHOPPY_HIGH_FADE",
+                            False,
+                        )
                 if _fpos <= 0.20:
                     # Unreclaimed prior close vetoes choppy low fades —
                     # including FLAT "micro-gaps" the 0.4% detector misses.
@@ -2316,6 +2395,30 @@ class RegimeClassifier:
                                 "TWO_WAY_CHOPPY_LOW_FADE",
                                 False,
                             )
+            # Late CHOPPY + rich vol mid-box is a pin, not a hard blank.
+            _chop_vol = vol in (
+                VolatilityRegime.SELL_PREMIUM,
+                VolatilityRegime.STRONG_SELL_PREMIUM,
+            )
+            if (
+                _chop_vol
+                and _fade_t >= time(14, 0)
+                and 0.28 <= _fpos <= 0.72
+                and _raw_rng >= 50.0
+                and _adx_f < 28.0
+                and conf != ConfidenceLevel.NONE
+                and vol != VolatilityRegime.ABORT
+            ):
+                signals["wide_or_containment"] = True
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    0.50,
+                )
+                return (
+                    FinalRegime.PREMIUM_SELL_RANGE,
+                    "CHOPPY_RICH_VOL_MID_PIN",
+                    False,
+                )
             return FinalRegime.NO_TRADE, "NO_TRADE:CHOPPY_MARKET", False
 
         # ── Hard Block 3: Volatility blocks ───────────────────────────────
@@ -2330,9 +2433,8 @@ class RegimeClassifier:
         # confirmation — not rich vol. NEUTRAL vol therefore no longer
         # blanket-blocks the decision; the delta-neutral structures are
         # re-gated by vol inside _classify_range. BUY_OPTIONS still blocks
-        # all selling (realised vol already exceeds implied — selling into
-        # it is paying the market to be right, and the debit side this
-        # engine does not trade).
+        # all selling (realised vol already exceeds implied) but dual-rail
+        # routes that NO_TRADE into the debit peer in strategy_engine.
         if vol == VolatilityRegime.BUY_OPTIONS:
             return FinalRegime.NO_TRADE, f"NO_TRADE:VOL_{vol.value}", False
 
@@ -2340,9 +2442,21 @@ class RegimeClassifier:
         if conf == ConfidenceLevel.NONE:
             return FinalRegime.NO_TRADE, "NO_TRADE:CONFIDENCE_NONE", False
 
-        # ── Time Gate 1: Before 09:45 ─────────────────────────────────────
-        if current_time < time(9, 45):
-            return FinalRegime.NO_TRADE, "NO_TRADE:BEFORE_09:45", False
+        # ── Time Gate 1: Before trading_window_start (default 09:30) ─────
+        try:
+            _tw_start = getattr(
+                self.config, "trading_window_start", time(9, 30)
+            )
+            if not isinstance(_tw_start, time):
+                _tw_start = time(9, 30)
+        except Exception:
+            _tw_start = time(9, 30)
+        if current_time < _tw_start:
+            return (
+                FinalRegime.NO_TRADE,
+                f"NO_TRADE:BEFORE_{_tw_start.strftime('%H:%M')}",
+                False,
+            )
 
         # ── Time Gate 2: After sell-regime cutoff (default 14:30) ─────────
         # PATCH_V45: configurable so the afternoon credit window and the
@@ -2374,7 +2488,17 @@ class RegimeClassifier:
         # by name, instead of being passed through the regime layer to die in
         # compute_params with a different reason.
         _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
-        if dte is not None and dte > _max_dte:
+        # Holiday-shifted expiry with only next weekly listed: allow.
+        try:
+            _dte_i = int(dte) if dte is not None else -1
+            if (
+                int(ExpiryCalendar.get_dte(today_ist())) == 0
+                and 0 < _dte_i <= _max_dte + 2
+            ):
+                _max_dte = max(_max_dte, _dte_i)
+        except Exception:
+            pass
+        if dte is not None and int(dte) > _max_dte:
             return (
                 FinalRegime.NO_TRADE,
                 f"NO_TRADE:DTE_{dte}_ABOVE_MAX_{_max_dte}",
@@ -2656,9 +2780,9 @@ class RegimeClassifier:
         # OR edge is broken with-trend, unlock the directional vertical —
         # condors stay banned, with-trend credit must not stay dark
         # (Sep29/Oct22/28: RANGE_WIDE_OR_*_NO_TRADE blanketed the window).
-        if or_condition in ("WIDE", "VERY_WIDE") and pos not in (
-            PositioningRegime.STRONG_RANGE,
-        ):
+        # STRONG_RANGE must enter this tree too: routing it past WIDE into
+        # the rich-vol condor gate blanked NEUTRAL mid-box pins (Oct22).
+        if or_condition in ("WIDE", "VERY_WIDE"):
             _wide_floor = 20.0
             try:
                 _wide_floor = float(
@@ -2683,11 +2807,15 @@ class RegimeClassifier:
             _need = max(5.0, 0.15 * _orw) if _orw > 0 else 5.0
             _brk_hi = _orh > 0 and spot >= _orh + _need
             _brk_lo = _orl > 0 and spot <= _orl - _need
-            # Soft poke (any print past the OR edge). This tree only runs
-            # while price_regime is still RANGE — lean comes from EMA /
-            # sided spend / VWAP, not an UPTREND label (Oct22/28).
-            _soft_hi = _orh > 0 and spot >= _orh
-            _soft_lo = _orl > 0 and spot <= _orl
+            # Soft poke (any print past the OR edge). Afternoon near-edge
+            # counts too — VERY_WIDE grinds that hug OR high never print
+            # a clean touch (Nov4) but behave as upper-box credit.
+            _aft_soft = current_time >= time(13, 0)
+            _edge_buf = (
+                max(5.0, 0.05 * _orw) if (_aft_soft and _orw > 0) else 0.0
+            )
+            _soft_hi = _orh > 0 and spot >= (_orh - _edge_buf)
+            _soft_lo = _orl > 0 and spot <= (_orl + _edge_buf)
             _ema = str(signals.get("ema_structure") or "")
             try:
                 _up_sp = float(
@@ -2721,28 +2849,63 @@ class RegimeClassifier:
                 VolatilityRegime.STRONG_SELL_PREMIUM,
                 VolatilityRegime.NEUTRAL,
             )
+            # Unlock only when the auction has actually touched / broken the
+            # OR edge on the lean side. Inside-OR sided-spend alone is still
+            # RANGE — selling verticals there was not true trend behaviour.
+            # Afternoon unbanked: unlock on soft OR poke + lean at a
+            # slightly softer ADX so WIDE grind days are not blank NO_TRADE.
+            _unlock_adx = (
+                max(15.0, _wide_floor - 3.0) if _aft_soft else _wide_floor
+            )
+            # Far-week (chain DTE≥4): only a held OR break unlocks
+            # directional credit — soft edge pokes were knives (Nov9 BCS).
+            try:
+                _dte_un = int(signals.get("actual_dte")) if signals.get(
+                    "actual_dte"
+                ) is not None else -1
+            except (TypeError, ValueError):
+                _dte_un = -1
+            _far_un = _dte_un >= 4
             _bull_unlock = (
-                adx_15 >= _wide_floor
+                adx_15 >= _unlock_adx
                 and not _brk_lo
                 and not _soft_lo
                 and (
                     _brk_hi
-                    or (_soft_hi and _bull_lean)
-                    or (_soft_hi and adx_15 >= _wide_floor + 5.0)
-                    # Gradual grind inside a wide OR: sided spend + lean
-                    # without a fresh edge poke (Oct28 bull window).
-                    or (_bull_lean and _up_sp >= 35.0)
+                    or (
+                        not _far_un
+                        and (
+                            (_soft_hi and _bull_lean)
+                            or (_soft_hi and adx_15 >= _wide_floor + 5.0)
+                            or (
+                                _aft_soft
+                                and _bull_lean
+                                and _soft_hi
+                                and adx_15 >= _unlock_adx
+                            )
+                        )
+                    )
                 )
             )
             _bear_unlock = (
-                adx_15 >= _wide_floor
+                adx_15 >= _unlock_adx
                 and not _brk_hi
                 and not _soft_hi
                 and (
                     _brk_lo
-                    or (_soft_lo and _bear_lean)
-                    or (_soft_lo and adx_15 >= _wide_floor + 5.0)
-                    or (_bear_lean and _dn_sp >= 35.0)
+                    or (
+                        not _far_un
+                        and (
+                            (_soft_lo and _bear_lean)
+                            or (_soft_lo and adx_15 >= _wide_floor + 5.0)
+                            or (
+                                _aft_soft
+                                and _bear_lean
+                                and _soft_lo
+                                and adx_15 >= _unlock_adx
+                            )
+                        )
+                    )
                 )
             )
             if _bull_unlock and _vol_ok:
@@ -2772,7 +2935,146 @@ class RegimeClassifier:
                 signals["wide_or_buy_options_trend"] = (
                     "BULL" if _bull_unlock else "BEAR"
                 )
-            return FinalRegime.NO_TRADE, f"RANGE_WIDE_OR_{or_condition}_NO_TRADE"
+            # Containment: wide open already spent both sides, ADX cooled,
+            # price mid-box, sellable vol — true behaviour is pin, not
+            # directional knife or blank NO_TRADE (flat zeros).
+            try:
+                _dh_c = float(
+                    signals.get("day_high_so_far")
+                    or signals.get("day_high")
+                    or 0.0
+                )
+                _dl_c = float(
+                    signals.get("day_low_so_far")
+                    or signals.get("day_low")
+                    or 0.0
+                )
+                _rng_c = (
+                    (_dh_c - _dl_c)
+                    if (_dh_c > 0 and _dl_c > 0 and _dh_c > _dl_c)
+                    else 0.0
+                )
+                _loc_c = (
+                    (spot - _dl_c) / _rng_c if _rng_c > 0 else 0.5
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                _loc_c = 0.5
+                _rng_c = 0.0
+            # Inside the opening box, OR-relative loc is the true pin
+            # geometry — day-loc after a morning spike mis-labels pins.
+            if (
+                _orl > 0 and _orh > _orl
+                and _orl <= spot <= _orh
+            ):
+                try:
+                    _loc_c = (spot - _orl) / (_orh - _orl)
+                except ZeroDivisionError:
+                    pass
+            try:
+                _dm_c = float(signals.get("day_move_used_pct") or 0.0)
+            except (TypeError, ValueError):
+                _dm_c = 0.0
+            _two_way_c = bool(signals.get("two_way_auction")) or (
+                _up_sp >= 25.0 and _dn_sp >= 25.0
+            )
+            # Wide open that already printed nearly the full OR as the
+            # day box is contained even without a formal two-way flag.
+            # Prefer OR width when day-hi/lo are thin/unprinted in replay.
+            _span_c = max(_rng_c, _orw if _orw > 0 else 0.0)
+            _box_spent = (
+                _orw > 0 and _span_c >= max(60.0, 0.80 * _orw)
+            ) or _span_c >= 80.0
+            _vol_pin = vol in (
+                VolatilityRegime.SELL_PREMIUM,
+                VolatilityRegime.STRONG_SELL_PREMIUM,
+                VolatilityRegime.BORDERLINE_SELL,
+                VolatilityRegime.NEUTRAL,
+            )
+            # Cool relative to trend unlock floor — afternoon allows a
+            # slightly hotter ADX so spent two-way boxes still pin.
+            try:
+                _strong_c = float(
+                    getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+                )
+            except (TypeError, ValueError):
+                _strong_c = 28.0
+            _adx_cool = max(_wide_floor + 8.0, min(_strong_c + 4.0, 32.0))
+            if current_time >= time(13, 30):
+                _adx_cool = max(_adx_cool, min(_strong_c + 8.0, 36.0))
+            # OR-inside mid uses a wider band; day-loc mid stays tighter.
+            _loc_lo, _loc_hi = 0.20, 0.80
+            _inside_or = (
+                _orl > 0 and _orh > _orl and _orl <= spot <= _orh
+            )
+            # Afternoon inside-OR on a wide open is itself the pin tape
+            # when ADX has cooled — do not require a formal two-way flag.
+            _pin_auction = (
+                _two_way_c
+                or _box_spent
+                or (_aft_soft and _inside_or and _span_c >= 50.0)
+            )
+            # Afternoon STRONG_SELL may keep ADX warm while the box is spent.
+            _adx_pin_max = _adx_cool
+            if (
+                vol == VolatilityRegime.STRONG_SELL_PREMIUM
+                and current_time >= time(13, 30)
+            ):
+                _adx_pin_max = max(_adx_cool, min(_strong_c + 8.0, 36.0))
+            if (
+                current_time >= time(12, 30)
+                and _vol_pin
+                and adx_15 < _adx_pin_max
+                and not _brk_hi
+                and not _brk_lo
+                and _loc_lo <= _loc_c <= _loc_hi
+                and _pin_auction
+                and _span_c >= 50.0
+                and _dm_c < 120.0
+            ):
+                signals["wide_or_containment"] = True
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    0.55,
+                )
+                return (
+                    FinalRegime.PREMIUM_SELL_RANGE,
+                    f"RANGE_WIDE_OR_{or_condition}_CONTAINMENT_PIN",
+                )
+            # Late rich-vol mid-box: true pin when cool containment missed
+            # (spot just outside OR). After 13:30 only — midday knives red.
+            _rich_vol = vol in (
+                VolatilityRegime.SELL_PREMIUM,
+                VolatilityRegime.STRONG_SELL_PREMIUM,
+            )
+            _mid_box = 0.25 <= _loc_c <= 0.80
+            if (
+                current_time >= time(14, 0)
+                and _rich_vol
+                and _mid_box
+                and not (_brk_hi and _brk_lo)
+                and _span_c >= 50.0
+                and _dm_c < 120.0
+                and adx_15 < 28.0
+                and not (_brk_hi and spot >= _orh + max(25.0, 0.25 * _orw))
+                and not (_brk_lo and spot <= _orl - max(25.0, 0.25 * _orw))
+            ):
+                signals["wide_or_containment"] = True
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    0.50,
+                )
+                return (
+                    FinalRegime.PREMIUM_SELL_RANGE,
+                    f"RANGE_WIDE_OR_{or_condition}_RICH_VOL_PIN",
+                )
+            # Rich-vol STRONG_RANGE still deserves the condor path below
+            # (was excluded from this tree entirely). Other positioning that
+            # failed unlock/containment stays blank WIDE NO_TRADE.
+            if pos != PositioningRegime.STRONG_RANGE:
+                return (
+                    FinalRegime.NO_TRADE,
+                    f"RANGE_WIDE_OR_{or_condition}_NO_TRADE",
+                )
 
         # ── UNCLEAR positioning ───────────────────────────────────────────
         # Rich VRP is the condor's edge; OI not having a side is not a
@@ -2812,16 +3114,39 @@ class RegimeClassifier:
                 _vrp_s = float(signals.get("vrp_smoothed"))
             except (TypeError, ValueError):
                 _vrp_s = None
+            _exh_dmu = 80.0
+            _exh_vrp = 1.0
+            if (
+                or_condition in ("WIDE", "VERY_WIDE")
+                and current_time >= time(13, 30)
+            ):
+                # Afternoon spent WIDE box: mid-60s DMU is already a pin
+                # tape under NEUTRAL (Oct22 dmu~69 never cleared 80).
+                _exh_dmu = 55.0
+                _exh_vrp = 0.0
             _exhausted_harvest = (
                 vol == VolatilityRegime.NEUTRAL
                 and _vrp_s is not None
-                and _vrp_s >= 1.0
-                and _dmu >= 80.0
-                and or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
+                and _vrp_s >= _exh_vrp
+                and _dmu >= _exh_dmu
                 and not bool(signals.get("event_day"))
+                and (
+                    or_condition in ("VERY_NARROW", "NARROW", "MODERATE")
+                    or (
+                        or_condition in ("WIDE", "VERY_WIDE")
+                        and current_time >= time(13, 0)
+                        and adx_15 < float(
+                            getattr(self.config, "adx_strong_threshold", 28.0)
+                            or 28.0
+                        )
+                    )
+                )
             )
-            if vol not in (VolatilityRegime.SELL_PREMIUM,
-                           VolatilityRegime.STRONG_SELL_PREMIUM):
+            if vol not in (
+                VolatilityRegime.SELL_PREMIUM,
+                VolatilityRegime.STRONG_SELL_PREMIUM,
+                VolatilityRegime.BORDERLINE_SELL,
+            ):
                 if not _exhausted_harvest:
                     return (
                         FinalRegime.NO_TRADE,
@@ -2832,6 +3157,8 @@ class RegimeClassifier:
                     getattr(self.config, "exhausted_move_condor_size", 0.60)
                 )
                 signals["exhausted_move_condor"] = True
+                if or_condition in ("WIDE", "VERY_WIDE"):
+                    signals["wide_or_containment"] = True
             # Elevated-but-not-strong ADX: still a range tape, sell a
             # wider condor at a size discount. Tape rule, every DTE.
             _adx_wide = (
@@ -2858,6 +3185,14 @@ class RegimeClassifier:
                 return (
                     FinalRegime.PREMIUM_SELL_RANGE,
                     f"RANGE_{pos.value}_{or_condition}_EXHAUSTED_MOVE_HARVEST",
+                )
+            # WIDE/VERY_WIDE pin is a containment book — tag so IC uses the
+            # afternoon 25m rule, not the quiet-OR 90m gate (Oct22 flat).
+            if or_condition in ("WIDE", "VERY_WIDE"):
+                signals["wide_or_containment"] = True
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    0.55,
                 )
             return (
                 FinalRegime.PREMIUM_SELL_RANGE,
@@ -4625,6 +4960,30 @@ def _self_test() -> None:
         f"stale dump bounce must be RANGE not DOWNTREND, got {_px_stale}"
     )
     print(f"  stale dump reclaim → {_px_stale.value}")
+
+    # Inside-OR VWAP displacement is not a trend (Sep29-class).
+    _px_inside = classifier.classify_price(make_signals(
+        adx_15=43.0,
+        adx_15_mature=True,
+        ema_structure="BULLISH",
+        spot=22720.0,
+        or_high=22753.0,
+        or_low=22650.0,
+        or_width=103.0,
+        or_computed=True,
+        day_high_so_far=22753.0,
+        day_low_so_far=22569.0,
+        day_high=22753.0,
+        day_low=22569.0,
+        hh_hl="INSUFFICIENT_DATA",
+        vwap_signal="BULLISH",
+        vwap_dist_pct=0.40,
+        choppy_detected=False,
+    ))
+    assert _px_inside == PriceRegime.RANGE, (
+        f"inside-OR VWAP must stay RANGE, got {_px_inside}"
+    )
+    print(f"  inside-OR VWAP → {_px_inside.value}")
 
     print("  [OK] Final regime decision tree tests passed")
 

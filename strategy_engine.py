@@ -50,9 +50,9 @@ BUY  = "BUY"
 # DTE 3/4 explicitly and strictly (see regime_engine._classify_range).
 DTE_REQUIREMENTS: Dict[str, Tuple[int, int]] = {
     IRON_BUTTERFLY:   (0, 1),
-    IRON_CONDOR:      (0, 4),
-    BULL_PUT_SPREAD:  (0, 4),
-    BEAR_CALL_SPREAD: (0, 4),
+    IRON_CONDOR:      (0, 5),
+    BULL_PUT_SPREAD:  (0, 5),
+    BEAR_CALL_SPREAD: (0, 5),
 }
 
 MIN_CREDIT_RATIO: Dict[str, float] = {
@@ -277,28 +277,43 @@ class StrategyEngine:
         by a blanket mature-trend reload). The mature-trend ADX latch is
         removed; location + pullback decide.
 
-        After CLOSE_STOP the bar is tighter: soft-lean location
-        (loc ≥ 0.58 puts / ≤ 0.42 calls) is already a reload into the
-        same grind (live 2026-09-30: −₹914 stop → BPS again at loc~0.65).
-        Tagged opposite-extreme fades still clear.
+        After CLOSE_STOP: never re-sell the same credit side. Soft-lean loc
+        alone still let 09-18 re-fire BPS mid-range 15s after a flip-stop
+        (trend-first restore clears last_exit_*, so chase also reads
+        last_flat_credit_* crumbs stamped on that flatten). Tagged
+        opposite-extreme fades still clear only after a harvest, not a stop.
         """
         state = self.market_engine.state
-        last_side = str(state.get("last_exit_strategy_side") or "")
+        last_side = str(
+            state.get("last_exit_strategy_side")
+            or state.get("last_flat_credit_side")
+            or ""
+        )
+        last_xr = str(
+            state.get("last_exit_reason")
+            or state.get("last_flat_credit_reason")
+            or ""
+        )
         if last_side not in ("BULL", "BEAR"):
             return None
-        if not state.get("last_exit_time"):
+        # Flip crumbs have side/reason but no last_exit_time (so the long
+        # that asked for flatten is not cooldown-blocked). That is enough.
+        if not (state.get("last_exit_time") or last_xr):
             return None
         if strategy_name in MOMENTUM_STRATEGIES:
             return None
         new_sides = self._sides_of(strategy_name)
-        last_xr = str(state.get("last_exit_reason") or "")
         _harvested = last_xr.startswith("CLOSE_TARGET") or last_xr.startswith(
             "CLOSE_PROFIT"
         )
         _stopped = last_xr.startswith("CLOSE_STOP")
         try:
             _spot = float(signals.get("spot") or 0.0)
-            _xspot = float(state.get("last_exit_spot") or 0.0)
+            _xspot = float(
+                state.get("last_exit_spot")
+                or state.get("last_flat_credit_spot")
+                or 0.0
+            )
         except (TypeError, ValueError):
             _spot = _xspot = 0.0
         # Pullback through the harvest print = re-sell, not a chase.
@@ -314,6 +329,10 @@ class StrategyEngine:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
+            # After a same-side STOP, never waive — 09-18 re-sold BPS at the
+            # low because sticky afternoon_low_fade + loc≤0.20 cleared the gate.
+            if _stopped:
+                return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             # Fade tag only waives while price is still at that extreme.
             # A sticky afternoon_low_fade after the flush must not re-arm
             # puts mid-range / at highs.
@@ -322,8 +341,6 @@ class StrategyEngine:
                 and _loc <= float(getattr(self, "TWO_WAY_FADE_LO", 0.20))
             ):
                 return None
-            if _stopped and _loc >= self.RANGE_SOFT_LEAN_HI:
-                return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             if _loc >= 0.80 and not _pullback_resell:
                 return f"same_side_chase_puts_at_high_loc_{_loc:.2f}"
             return None
@@ -332,6 +349,8 @@ class StrategyEngine:
                 _rng, _loc, _, _ = self._session_range_pos(signals)
             except Exception:
                 _loc = 0.5
+            if _stopped:
+                return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             # After a banked BEAR credit, only a fresh high-extreme fade is
             # a new trade. Mid/low reloads (Oct14 13:29 BCS after 13:00
             # TARGET while sticky afternoon_high_fade was still true) are
@@ -346,8 +365,6 @@ class StrategyEngine:
                         f"same_side_reload_after_bear_harvest_loc_{_loc:.2f}"
                     )
                 return None
-            if _stopped and _loc <= self.RANGE_SOFT_LEAN_LO:
-                return f"same_side_reload_after_stop_loc_{_loc:.2f}"
             if _loc <= 0.20 and not _pullback_resell:
                 return f"same_side_chase_calls_at_low_loc_{_loc:.2f}"
             return None
@@ -494,6 +511,10 @@ class StrategyEngine:
         )
         if isinstance(_params, dict):
             _params["_intent"] = signals.get("_intent")
+        if self._bootstrap_hot_credit_refusal(IRON_CONDOR, signals):
+            return None
+        if self._apply_day_pnl_risk_envelope(_params, signals):
+            return None
         self.logger.info(
             f"Abort-storm fallback: {blocked_strategy} cooled → "
             f"IRON_CONDOR (vol={_vol} price={_price})"
@@ -553,6 +574,10 @@ class StrategyEngine:
                 # signal stream saying the trend is real. Immature /
                 # preview ADX stays refused so a morning 5-min tease
                 # cannot stack a debit on the first credit.
+                # Never stack same-side debit beside an open credit — the
+                # correlated wipe (Sep28/Oct12 LONG_PUT beside BCS) outruns
+                # any ADX exception. Sequential debit after credit closes
+                # remains available via the normal dual-rail.
                 if new_sides & o_sides and not bool(
                     getattr(
                         self.config,
@@ -560,50 +585,9 @@ class StrategyEngine:
                         False,
                     )
                 ):
-                    _adx = 0.0
-                    _mature = False
-                    if signals:
-                        try:
-                            _adx = float(signals.get("adx_15") or 0.0)
-                        except (TypeError, ValueError):
-                            _adx = 0.0
-                        _mature = bool(signals.get("adx_15_mature"))
-                    # Stack debit beside same-side credit once ADX is a
-                    # strong trend. The old 45 bar sat above the 15-min
-                    # print a dump actually produces (Sep24 peaked 39.8
-                    # while BCS was still open, so LONG_PUT never stacked).
-                    # Floor at 36 on normal sessions; event days keep 45
-                    # so a CPI tease cannot replace a later full-size
-                    # sequential debit (Sep11 11:31 2-lot vs 12:00 3-lot).
-                    _event_stack = bool(
-                        (signals or {}).get("event_day")
-                        or (signals or {}).get("event_announced")
+                    return (
+                        f"slot_conflict_correlated_debit_beside_credit:{o}"
                     )
-                    # Measured trend uses the same ADX evidence the
-                    # momentum path already trusts: mature at the floor,
-                    # or an extreme print (ADX>=50) even if the 15-min
-                    # flag is still preview. Requiring the flag alone
-                    # blocked stacking while preview ADX printed 75
-                    # (live Sep28 10:55–11:22 BCS on, LONG_PUT never
-                    # reached the slot). Event days stay at 45.
-                    _need = max(
-                        45.0 if _event_stack else 36.0,
-                        float(
-                            getattr(self.config, "adx_strong_threshold", 28.0)
-                            or 28.0
-                        ),
-                    )
-                    _measured = (
-                        _adx >= _need
-                        and (
-                            _mature
-                            or _adx >= 50.0
-                        )
-                    )
-                    if not _measured:
-                        return (
-                            f"slot_conflict_correlated_debit_beside_credit:{o}"
-                        )
                 continue
             if o in MOMENTUM_STRATEGIES:
                 # a credit vertical beside an open long option: same side only
@@ -710,6 +694,507 @@ class StrategyEngine:
         if n != cur:
             self.logger.info(f"FORCE_LOTS: sizing {cur} → {n} (post-decision clamp)")
         return n
+
+    def _soft_halt_budget_rs(self) -> float:
+        """Rupee soft-halt budget for the session (capital × daily × soft_frac)."""
+        try:
+            capital = float(
+                self.market_engine.state.get("current_capital")
+                or getattr(self.config, "starting_capital", 1_000_000.0)
+                or 1_000_000.0
+            )
+        except (TypeError, ValueError):
+            capital = float(
+                getattr(self.config, "starting_capital", 1_000_000.0) or 1_000_000.0
+            )
+        try:
+            daily = float(getattr(self.config, "max_daily_loss_pct", 0.08) or 0.08)
+        except (TypeError, ValueError):
+            daily = 0.08
+        try:
+            soft = float(getattr(self.config, "soft_halt_frac", 0.50) or 0.50)
+        except (TypeError, ValueError):
+            soft = 0.50
+        return max(0.0, capital * daily * soft)
+
+    def _resize_params_to_risk_cap(
+        self,
+        params: dict,
+        risk_cap: float,
+        tag: str,
+    ) -> Optional[str]:
+        """Clamp final_lots so total_max_risk ≤ risk_cap. Refuse if 1 lot exceeds."""
+        if not isinstance(params, dict) or not params.get("valid"):
+            return None
+        if risk_cap <= 0:
+            return f"{tag}_refused_cap_nonpositive"
+        try:
+            lots = max(1, int(params.get("final_lots") or 1))
+        except (TypeError, ValueError):
+            lots = 1
+        try:
+            risk = float(
+                params.get("total_max_risk")
+                or params.get("total_structural_risk")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            risk = 0.0
+        if risk <= 0 or lots < 1:
+            return None
+        per_lot = risk / float(lots)
+        if per_lot <= 0:
+            return None
+        max_lots = max(0, int(risk_cap // per_lot))
+        if max_lots < 1:
+            return (
+                f"{tag}_refused_risk_{risk:.0f}_gt_cap_{risk_cap:.0f}"
+            )
+        if max_lots < lots:
+            params["final_lots"] = max_lots
+            params["total_max_risk"] = round(per_lot * max_lots, 2)
+            if params.get("total_structural_risk") is not None:
+                try:
+                    _s = float(params["total_structural_risk"]) / float(lots)
+                    params["total_structural_risk"] = round(_s * max_lots, 2)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+            params["selection_reason"] = (
+                f"{params.get('selection_reason') or ''}:"
+                f"{tag}_lots_{lots}_to_{max_lots}"
+            ).lstrip(":")
+            self.logger.info(
+                f"{tag.upper()}: lots {lots} → {max_lots} "
+                f"(cap ₹{risk_cap:.0f}, risk/lot ₹{per_lot:.0f})"
+            )
+        return None
+
+    def _apply_day_pnl_risk_envelope(
+        self,
+        params: dict,
+        signals: dict,
+    ) -> Optional[str]:
+        """Session solvency: micro-size when flat/red; never risk bank back to red.
+
+        daily_pnl > 0  → total_max_risk ≤ banked PnL (post-bank envelope).
+        daily_pnl ≤ 0  → total_max_risk ≤ soft_halt_budget / 3 (pre-bank micro).
+        """
+        if not isinstance(params, dict) or not params.get("valid"):
+            return None
+        try:
+            day_pnl = float(self.market_engine.state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            day_pnl = 0.0
+        if day_pnl > 0:
+            _env_floor = float(
+                getattr(self.config, "day_pnl_envelope_floor_rs", 0.0) or 0.0
+            )
+            return self._resize_params_to_risk_cap(
+                params, max(day_pnl, _env_floor), "day_pnl_envelope"
+            )
+        # Pre-bank micro: soft-halt/3. Floor paths set 1-lot themselves.
+        soft_budget = self._soft_halt_budget_rs()
+        micro_cap = soft_budget / 3.0
+        return self._resize_params_to_risk_cap(
+            params, micro_cap, "prebank_micro"
+        )
+
+    def _bootstrap_hot_credit_refusal(
+        self,
+        strategy_name: str,
+        signals: dict,
+    ) -> Optional[str]:
+        """Unbanked credit: soft-tape structures only; debit peer covers trends.
+
+        Verticals: ADX in [10, trend), RANGE/CHOPPY (or unlabeled), day-move
+        not spent. Condor/fly: ADX below strong, day-move not spent. Afternoon
+        verticals are allowed (dual-rail sizes them) — the old afternoon kill
+        blanked both rails. Once banked, this gate stands down.
+        """
+        if strategy_name not in (
+            BEAR_CALL_SPREAD, BULL_PUT_SPREAD, IRON_CONDOR, IRON_BUTTERFLY,
+        ):
+            return None
+        try:
+            day_pnl = float(self.market_engine.state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            day_pnl = 0.0
+        if day_pnl > 0:
+            return None
+        try:
+            adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            adx = 0.0
+        _is_vertical = strategy_name in (BEAR_CALL_SPREAD, BULL_PUT_SPREAD)
+        if _is_vertical:
+            try:
+                _hh_v = int(now_ist().time().hour)
+            except Exception:
+                _hh_v = -1
+            # Afternoon unbanked: allow with-regime / fade verticals (solvency);
+            # refuse only counter-trend or unlabeled soft tape after 13:00.
+            if _hh_v >= 13:
+                _fr_pm = str(
+                    getattr(signals.get("final_regime"), "value", None)
+                    or signals.get("final_regime")
+                    or ""
+                )
+                _fade_ok = bool(
+                    signals.get("afternoon_high_fade")
+                    or signals.get("afternoon_low_fade")
+                )
+                _with_pm = (
+                    (
+                        strategy_name == BULL_PUT_SPREAD
+                        and _fr_pm == "PREMIUM_SELL_BULL"
+                    )
+                    or (
+                        strategy_name == BEAR_CALL_SPREAD
+                        and _fr_pm == "PREMIUM_SELL_BEAR"
+                    )
+                )
+                _floor_pm = (
+                    bool(signals.get("_session_floor"))
+                    and bool(signals.get("wide_or_containment"))
+                )
+                # WIDE containment pin is mid-box theta — afternoon
+                # vertical soft-cap must not blank the pin vertical.
+                _contain_pm = (
+                    bool(signals.get("wide_or_containment"))
+                    and _hh_v >= 13
+                    and str(
+                        getattr(signals.get("final_regime"), "value", None)
+                        or signals.get("final_regime")
+                        or ""
+                    ) in (
+                        "PREMIUM_SELL_RANGE",
+                        "PREMIUM_SELL_BULL",
+                        "PREMIUM_SELL_BEAR",
+                    )
+                )
+                if not (_with_pm or _fade_ok or _floor_pm or _contain_pm):
+                    return "bootstrap_credit_afternoon_vertical"
+            if adx < 10.0:
+                return f"bootstrap_credit_adx_{adx:.0f}_unformed"
+            soft_cap = float(
+                getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+            )
+            # Unbanked verticals: refuse COUNTER-trend only. With-trend
+            # harvest (BPS into UPTREND / BCS into DOWNTREND) is the dual-rail
+            # credit expression — blanking all trend regimes left 0DTE days
+            # dark because momentum_min_dte blocks the debit peer (Oct6-class
+            # TREND_EXHAUSTED + PREMIUM_SELL_BULL stayed flat all session).
+            regime = str(signals.get("price_regime") or "").upper()
+            if strategy_name == BULL_PUT_SPREAD and regime in (
+                "DOWNTREND", "STRONG_DOWNTREND",
+            ):
+                return f"bootstrap_credit_regime_{regime}"
+            if strategy_name == BEAR_CALL_SPREAD and regime in (
+                "UPTREND", "STRONG_UPTREND",
+            ):
+                return f"bootstrap_credit_regime_{regime}"
+            if regime not in (
+                "RANGE", "CHOPPY", "",
+                "UPTREND", "DOWNTREND",
+                "STRONG_UPTREND", "STRONG_DOWNTREND",
+            ):
+                return f"bootstrap_credit_regime_{regime}"
+        else:
+            soft_cap = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+            try:
+                _hh_ic = int(now_ist().time().hour)
+            except Exception:
+                _hh_ic = -1
+            # Unbanked afternoon condors: allow PIN/RANGE rich-vol solvency
+            # after 12:00; refuse when auction is ONE_WAY or CHAOS.
+            if _hh_ic >= 12:
+                _auc = str(signals.get("auction_type") or "")
+                _px_ic = str(signals.get("price_regime") or "")
+                if _auc in ("ONE_WAY", "CHAOS") or _px_ic in (
+                    "UPTREND", "STRONG_UPTREND",
+                    "DOWNTREND", "STRONG_DOWNTREND",
+                ):
+                    return "bootstrap_credit_afternoon_condor"
+        if adx >= soft_cap:
+            # With-trend harvest must survive ADX≥trend: the soft_cap was
+            # blanking PREMIUM_SELL_BULL/BEAR verticals on the exact days
+            # the debit peer is also IV-crush blocked (Oct6: 495×
+            # bootstrap_credit_adx_ge_soft + momentum iv_crushing).
+            # Blind with-trend under WIDE/NEUTRAL or unspent straddle
+            # stopped red (Sep29 BCS, Nov2 BPS) — require Oct6-class
+            # spent + moderate-or-quieter OR + rich vol.
+            _fr_adx = str(
+                getattr(signals.get("final_regime"), "value", None)
+                or signals.get("final_regime")
+                or ""
+            )
+            _with_adx = (
+                (
+                    strategy_name == BULL_PUT_SPREAD
+                    and _fr_adx == "PREMIUM_SELL_BULL"
+                )
+                or (
+                    strategy_name == BEAR_CALL_SPREAD
+                    and _fr_adx == "PREMIUM_SELL_BEAR"
+                )
+            )
+            try:
+                _dm_adx = float(signals.get("day_move_used_pct") or 0.0)
+            except (TypeError, ValueError):
+                _dm_adx = 0.0
+            _or_adx = str(signals.get("or_condition") or "")
+            _vol_adx = str(
+                getattr(signals.get("vol_regime"), "value", None)
+                or signals.get("vol_regime")
+                or ""
+            ).upper()
+            # Quiet/moderate OR is the Oct6 shape. WIDE/VERY_WIDE only when
+            # tape is already TREND_EXHAUSTED (Sep28 BCS harvest); plain WIDE
+            # + rich-vol with-trend stopped red on Sep29 bounce.
+            _tape_adx = str(signals.get("tape_state") or "")
+            _exh_adx = _tape_adx == "TREND_EXHAUSTED"
+            _or_ok_adx = _or_adx in (
+                "NARROW", "VERY_NARROW", "MODERATE", "",
+            ) or _exh_adx
+            # Spent-straddle bar is the quiet-OR Oct6 shape; TREND_EXHAUSTED
+            # already certifies the move (Sep28 early BCS under VERY_WIDE).
+            _spent_ok_adx = _dm_adx >= 85.0 or _exh_adx
+            _oct6_shape = (
+                _with_adx
+                and _spent_ok_adx
+                and _or_ok_adx
+                and _vol_adx in ("SELL_PREMIUM", "STRONG_SELL_PREMIUM")
+            )
+            # Session-floor containment vertical only (late cool pin).
+            _floor_pin = (
+                bool(signals.get("_session_floor"))
+                and bool(signals.get("wide_or_containment"))
+                and _with_adx
+            )
+            # Pullback with-trend BPS after spent upside (WIDE flats).
+            # Allow NEUTRAL vol here — rich-vol-only left weekly exhausted
+            # days dark while IV was quiet.
+            _pull_bps = False
+            if strategy_name == BULL_PUT_SPREAD:
+                _pull_bps = self._spent_upside_pullback_bps_ok(signals, adx)
+                if _pull_bps:
+                    signals["final_regime"] = "PREMIUM_SELL_BULL"
+            if not _oct6_shape and not _floor_pin and not _pull_bps:
+                return (
+                    f"bootstrap_credit_adx_{adx:.0f}_ge_soft_{soft_cap:.0f}"
+                )
+        try:
+            dm = float(signals.get("day_move_used_pct") or 0.0)
+        except (TypeError, ValueError):
+            dm = 0.0
+        if dm >= 85.0:
+            # With-trend vertical harvest after the straddle is spent is the
+            # dual-rail credit expression (Oct6: dm~88 + PREMIUM_SELL_BULL
+            # + UPTREND stayed flat behind day_move_spent while 0DTE debit
+            # is DTE-gated). Counter-trend / IC still refuse. WIDE OR or
+            # non-rich vol under a spent straddle is bounce-prone (Sep29).
+            _fr_dm = str(
+                getattr(signals.get("final_regime"), "value", None)
+                or signals.get("final_regime")
+                or ""
+            )
+            _px_dm = str(
+                getattr(signals.get("price_regime"), "value", None)
+                or signals.get("price_regime")
+                or ""
+            ).upper()
+            _or_dm = str(signals.get("or_condition") or "")
+            _vol_dm = str(
+                getattr(signals.get("vol_regime"), "value", None)
+                or signals.get("vol_regime")
+                or ""
+            ).upper()
+            _tape_dm = str(signals.get("tape_state") or "")
+            _or_ok_dm = _or_dm in (
+                "NARROW", "VERY_NARROW", "MODERATE", "",
+            ) or _tape_dm == "TREND_EXHAUSTED"
+            _with_trend_harvest = (
+                (
+                    strategy_name == BULL_PUT_SPREAD
+                    and _fr_dm == "PREMIUM_SELL_BULL"
+                    and _px_dm in ("UPTREND", "STRONG_UPTREND", "")
+                )
+                or (
+                    strategy_name == BEAR_CALL_SPREAD
+                    and _fr_dm == "PREMIUM_SELL_BEAR"
+                    and _px_dm in ("DOWNTREND", "STRONG_DOWNTREND", "")
+                )
+            ) and _or_ok_dm and _vol_dm in (
+                "SELL_PREMIUM", "STRONG_SELL_PREMIUM",
+            )
+            _pull_dm = (
+                strategy_name == BULL_PUT_SPREAD
+                and self._spent_upside_pullback_bps_ok(signals, adx)
+            )
+            if not _with_trend_harvest and not _pull_dm:
+                return f"bootstrap_credit_day_move_spent_{dm:.0f}"
+        # Unbanked IC only on a quiet opening range — wide OR + soft ADX
+        # still stopped (09-24 morning IC red).
+        if not _is_vertical:
+            _or = str(signals.get("or_condition") or "")
+            if _or not in ("NARROW", "VERY_NARROW", "MODERATE", ""):
+                return f"bootstrap_credit_ic_or_{_or or 'unknown'}"
+        return None
+
+    def _solvency_ic_bootstrap(
+        self,
+        signals: dict,
+        selection_reason: str,
+        size_mult: float,
+    ) -> Optional[dict]:
+        """Unbanked vertical soft-refused → try a range condor before debit rail.
+
+        Soft RANGE mornings that map to a one-sided vertical with dead ADX
+        can still harvest a two-sided condor. None = caller continues to momentum.
+        """
+        try:
+            day_pnl = float(self.market_engine.state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            day_pnl = 0.0
+        if day_pnl > 0:
+            return None
+        # Afternoon unbanked condors stopped/hard-exited red — morning only.
+        try:
+            _hh = int(now_ist().time().hour)
+        except Exception:
+            _hh = -1
+        if _hh >= 12:
+            return None
+        _pr = str(signals.get("price_regime") or "").upper()
+        _vol_s = str(signals.get("vol_regime") or "").upper()
+        _or_s = str(signals.get("or_condition") or "")
+        _rich = _vol_s in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM")
+        _quiet_or = _or_s in ("NARROW", "VERY_NARROW", "MODERATE", "")
+        # Strong trends stay refused; mild UPTREND/DOWNTREND may still pin
+        # a rich-vol quiet-OR condor when the vertical was bootstrap-refused.
+        if _pr in ("STRONG_UPTREND", "STRONG_DOWNTREND"):
+            return None
+        if _pr in ("UPTREND", "DOWNTREND") and not (_rich and _quiet_or):
+            return None
+        try:
+            _adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx = 0.0
+        if _rich:
+            _soft = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+        else:
+            _soft = float(
+                getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+            )
+        if _adx >= _soft:
+            return None
+        try:
+            _dm = float(signals.get("day_move_used_pct") or 0.0)
+        except (TypeError, ValueError):
+            _dm = 0.0
+        if _dm >= 85.0:
+            return None
+        if _or_s in ("WIDE", "VERY_WIDE"):
+            return None
+        if self._slot_conflict(IRON_CONDOR, signals):
+            return None
+        _reason = f"{selection_reason}:solvency_ic_bootstrap"
+        _params = self.compute_params(
+            IRON_CONDOR, _reason, signals, size_mult
+        )
+        if not _params.get("valid"):
+            return None
+        if self._bootstrap_hot_credit_refusal(IRON_CONDOR, signals):
+            return None
+        if self._apply_day_pnl_risk_envelope(_params, signals):
+            return None
+        signals["_intent"] = self._build_decision_intent(
+            IRON_CONDOR, signals, _reason
+        )
+        if isinstance(_params, dict):
+            _params["_intent"] = signals.get("_intent")
+        self._clear_construct_fail()
+        self.logger.info(
+            f"Solvency IC bootstrap (was vertical under {_pr} adx={_adx:.0f})"
+        )
+        self._log_decision(
+            signals, "STRATEGY_SELECTED", _reason, IRON_CONDOR, _params
+        )
+        self._persist_decision(
+            signals, IRON_CONDOR, _reason, _params, "STRATEGY_SELECTED"
+        )
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{IRON_CONDOR}",
+            None, self._count_open_positions(),
+        )
+        return {
+            "action":        "ENTER",
+            "strategy_name": IRON_CONDOR,
+            "reason":        _reason,
+            "params":        _params,
+            "intent":        signals.get("_intent"),
+        }
+
+    def _bootstrap_momentum_refusal(
+        self,
+        signals: dict,
+    ) -> Optional[str]:
+        """Unbanked debit peer: need real trend ADX; refuse IV crush only.
+
+        DECLINING IV is compatible with a measured debit (theta already
+        paid); CRUSHING still blanks unbanked longs unless opposite-rail
+        retry is armed.
+        """
+        try:
+            day_pnl = float(self.market_engine.state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            day_pnl = 0.0
+        # Banked day: never open a debit that can wipe the credit harvest
+        # (Oct23 LONG_PUT −₹1.8k after BCS target).
+        if day_pnl > 0 and not bool(signals.get("_session_floor")):
+            return "bootstrap_momentum_protect_banked_day"
+        _retry = bool(signals.get("_prefer_opposite_rail"))
+        # Structural trend confirmed by the tape itself (efficient travel,
+        # material displacement, right side of the session mean): the ADX
+        # floor lags it by ~100 minutes and IV normally FALLS on a rally, so
+        # neither is a valid veto while the structure holds.
+        try:
+            _st_b = int(signals.get("struct_trend") or 0)
+            if (
+                bool(getattr(self.config, "struct_trend_enabled", True))
+                and (
+                    (_st_b == -1 and bool(
+                        getattr(self.config, "struct_boot_waive_puts", True)))
+                    or (_st_b == 1 and bool(
+                        getattr(self.config, "struct_boot_waive_calls", True)))
+                )
+            ):
+                return None
+        except (TypeError, ValueError):
+            pass
+        try:
+            adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            adx = 0.0
+        floor = 12.0 if _retry else float(
+            getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+        )
+        if adx < floor:
+            return f"bootstrap_momentum_adx_{adx:.0f}_lt_{floor:.0f}"
+        ivb = str(signals.get("iv_behavior") or "").upper()
+        # CRUSHING/DECLINING: allow when hard-trend sub is armed (flat-book
+        # labelled trend after 11:00) or opposite-rail retry. Blind CRUSHING
+        # blank left Oct6 debit dark behind the credit adx soft-cap.
+        _hard = bool(signals.get("_momentum_hard_trend_sub"))
+        if ivb == "CRUSHING" and not _retry and not _hard:
+            return f"bootstrap_momentum_iv_{ivb.lower()}"
+        if ivb == "DECLINING" and not _retry and not _hard:
+            return f"bootstrap_momentum_iv_{ivb.lower()}"
+        return None
 
     def _get_calibration(self) -> Optional[CalibrationState]:
         return self.cal_engine.state
@@ -912,6 +1397,20 @@ class StrategyEngine:
     ) -> Optional[Tuple[str, str]]:
         state        = self.market_engine.state
         current_time = _test_time if _test_time is not None else now_ist().time()
+        # ── Session P&L lock (principle, not a day patch) ────────────────
+        # Flat book + realised P&L already nonzero → no new risk.
+        # Green lock protects banked wins (floor may still seek solvency
+        # only when flat/unbanked). Loss lock never bypasses — revenge
+        # tickets after a red close were the wipeout path.
+        try:
+            _gp = float(state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            _gp = 0.0
+        if _gp != 0.0 and self._count_open_positions() == 0:
+            if _gp < 0:
+                return "NO_TRADE", "loss_day_lock_no_revenge_entries"
+            if not bool(signals.get("_session_floor")):
+                return "NO_TRADE", "green_day_lock_no_new_entries"
         self._apply_two_way_location(signals, current_time)
         self._pre_tag_or_extreme_fades(signals, current_time)
         # After banked LONG_PUT: if a real lift off the low exists, tag the
@@ -1520,15 +2019,34 @@ class StrategyEngine:
             f"{signals.get('vol_regime', '')}_{signals.get('price_regime', '')}"
             f"_{signals.get('direction', '')}"
         )
+        # After one unbanked stop, opposite-rail micro retry is allowed:
+        # same-combo / long cooldown apply only to re-selling the SAME rail.
+        _retry_armed = (
+            _stop_streak == 1
+            and bool(state.get("unbanked_stop_retry_armed"))
+        )
+        try:
+            _dp_stop = float(state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            _dp_stop = 0.0
+        if _retry_armed and _dp_stop <= 0:
+            signals["_prefer_opposite_rail"] = True
+            signals["_opposite_of_rail"] = str(
+                state.get("last_stop_rail") or "credit"
+            )
         if (last_stop_reason == "CLOSE_STOP" and
                 last_stop_combo == current_combo and
-                _stop_streak >= 1):
+                _stop_streak >= 1 and
+                not signals.get("_prefer_opposite_rail")):
             return "NO_TRADE", f"same_signal_combo_caused_last_stop:{current_combo}"
 
         last_stop_time = state.get("last_stop_time")
         if last_stop_time and last_stop_reason and _stop_streak >= 1:
             iv_extra = 20 if iv_behavior in ("EXPANDING", "SPIKING") else 0
             required = STOP_COOLDOWN_MAP.get(last_stop_reason, 30) + iv_extra
+            # Opposite-rail retry: no long cooldown — fire next eligible cycle.
+            if signals.get("_prefer_opposite_rail"):
+                required = min(required, 1)
             try:
                 mins = (
                     now_ist() - datetime.fromisoformat(last_stop_time)
@@ -1742,95 +2260,118 @@ class StrategyEngine:
                 "PREMIUM_SELL_BEAR", "PREMIUM_SELL_RANGE",
             )
         ):
+            # Rich-vol mid-box pin is not a lower-high fade wait — do not
+            # blank PREMIUM_SELL_RANGE while STRONG_SELL is printing mid.
+            _os_skip = False
             try:
-                _os_until = datetime.strptime(
-                    str(getattr(self.config, "open_spike_wait_until_hhmm", "12:15")),
-                    "%H:%M",
-                ).time()
+                _os_vol = str(
+                    getattr(signals.get("vol_regime"), "value", None)
+                    or signals.get("vol_regime")
+                    or ""
+                )
+                _os_rng0, _os_loc0, _, _ = self._session_range_pos(signals)
             except Exception:
-                _os_until = dtime(12, 15)
-            _os_rng, _os_loc, _, _ = self._session_range_pos(signals)
-            try:
-                _lh_after = datetime.strptime(
-                    str(getattr(self.config, "open_spike_lower_high_after_hhmm", "10:45")),
-                    "%H:%M",
-                ).time()
-            except Exception:
-                _lh_after = dtime(10, 45)
-            _lh_loc = float(
-                getattr(self.config, "open_spike_lower_high_loc_min", 0.70) or 0.70
-            )
-            _lower_high_ready = (
-                current_time >= _lh_after
-                and _os_rng >= 50.0
-                and _os_loc >= _lh_loc
-            )
+                _os_vol, _os_rng0, _os_loc0 = "", 0.0, 0.5
             if (
-                current_time < _os_until
-                and not signals.get("afternoon_high_fade")
-                and not _lower_high_ready
+                _os_vol in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM")
+                and current_time >= dtime(11, 0)
+                and _os_rng0 >= 50.0
+                and 0.25 <= _os_loc0 <= 0.75
+                and (
+                    bool(signals.get("wide_or_containment"))
+                    or str(signals.get("final_regime") or "")
+                    == "PREMIUM_SELL_RANGE"
+                )
             ):
-                # Structure-bearish dump already at the lows: deferring to
-                # 12:15 only protects the lower-high fade book. When location
-                # is already ≤0.15 with day-structure bearish after 11:30,
-                # the sell-call vertical IS the structure lean (Sep24 BCS
-                # waited until 12:19 → baseline ₹1,931 at 11:32). Still
-                # blocks soft mid-morning knives at loc≈0.20 (10/23 wipe).
-                _struct_lo = False
+                _os_skip = True
+            if not _os_skip:
                 try:
-                    _ds_b, _ = self._day_structure_bearish(signals)
-                    _struct_lo = (
-                        _ds_b
-                        and current_time >= dtime(11, 30)
-                        and _os_loc <= 0.15
-                        and _os_rng >= 50.0
-                    )
+                    _os_until = datetime.strptime(
+                        str(getattr(
+                            self.config, "open_spike_wait_until_hhmm", "12:15"
+                        )),
+                        "%H:%M",
+                    ).time()
                 except Exception:
-                    _struct_lo = False
-                # Confirmed dump under an unretested open-HIGH wick:
-                # selling calls is the structure, not a lower-high fade.
-                # The loc>=0.70 retest never arrives on a one-way dump, so
-                # the wait kept the only credit dark (replay 24-Sep 10:26
-                # PREMIUM_SELL_BEAR adx≈27 vd≈−0.12 sat until 11:32).
-                # Still refuse mid-location knives (loc>0.15) and soft ADX.
-                _dump_ready = False
+                    _os_until = dtime(12, 15)
+                _os_rng, _os_loc = _os_rng0, _os_loc0
                 try:
-                    _adx_os = float(signals.get("adx_15") or 0.0)
-                    _vd_os = float(signals.get("vwap_dist_pct") or 0.0)
-                except (TypeError, ValueError):
-                    _adx_os = 0.0
-                    _vd_os = 0.0
-                _adx_tr = float(
-                    getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+                    _lh_after = datetime.strptime(
+                        str(getattr(
+                            self.config,
+                            "open_spike_lower_high_after_hhmm",
+                            "10:45",
+                        )),
+                        "%H:%M",
+                    ).time()
+                except Exception:
+                    _lh_after = dtime(10, 45)
+                _lh_loc = float(
+                    getattr(
+                        self.config, "open_spike_lower_high_loc_min", 0.70
+                    ) or 0.70
                 )
-                _dump_ready = (
-                    current_time >= dtime(10, 15)
-                    and _os_loc <= 0.20
+                _lower_high_ready = (
+                    current_time >= _lh_after
                     and _os_rng >= 50.0
-                    and _vd_os <= -0.08
-                    and _adx_os >= _adx_tr
-                    and str(signals.get("final_regime") or "")
-                    == "PREMIUM_SELL_BEAR"
-                )
-                # P3.9: unretested open-HIGH wick must not block a clean
-                # dump until 12:15. After 11:00 with mature ADX + large
-                # range + loc already away from the spike, release.
-                # Soft mid-loc BEAR before 11:00 still waits (Sep10/23).
-                _non_retest_release = (
-                    current_time >= dtime(11, 0)
-                    and _os_rng >= 90.0
-                    and _os_loc <= 0.40
-                    and _adx_os >= _adx_tr
-                    and bool(signals.get("adx_15_mature"))
-                    and str(signals.get("final_regime") or "")
-                    == "PREMIUM_SELL_BEAR"
+                    and _os_loc >= _lh_loc
                 )
                 if (
-                    not _struct_lo
-                    and not _dump_ready
-                    and not _non_retest_release
+                    current_time < _os_until
+                    and not signals.get("afternoon_high_fade")
+                    and not _lower_high_ready
                 ):
-                    return "NO_TRADE", "open_spike_wait_unresolved_lower_high"
+                    # Structure-bearish dump already at the lows: deferring
+                    # to 12:15 only protects the lower-high fade book.
+                    _struct_lo = False
+                    try:
+                        _ds_b, _ = self._day_structure_bearish(signals)
+                        _struct_lo = (
+                            _ds_b
+                            and current_time >= dtime(11, 30)
+                            and _os_loc <= 0.15
+                            and _os_rng >= 50.0
+                        )
+                    except Exception:
+                        _struct_lo = False
+                    _dump_ready = False
+                    try:
+                        _adx_os = float(signals.get("adx_15") or 0.0)
+                        _vd_os = float(signals.get("vwap_dist_pct") or 0.0)
+                    except (TypeError, ValueError):
+                        _adx_os = 0.0
+                        _vd_os = 0.0
+                    _adx_tr = float(
+                        getattr(self.config, "adx_trend_threshold", 20.0)
+                        or 20.0
+                    )
+                    _dump_ready = (
+                        current_time >= dtime(10, 15)
+                        and _os_loc <= 0.20
+                        and _os_rng >= 50.0
+                        and _vd_os <= -0.08
+                        and _adx_os >= _adx_tr
+                        and str(signals.get("final_regime") or "")
+                        == "PREMIUM_SELL_BEAR"
+                    )
+                    _non_retest_release = (
+                        current_time >= dtime(11, 0)
+                        and _os_rng >= 90.0
+                        and _os_loc <= 0.40
+                        and _adx_os >= _adx_tr
+                        and bool(signals.get("adx_15_mature"))
+                        and str(signals.get("final_regime") or "")
+                        == "PREMIUM_SELL_BEAR"
+                    )
+                    if (
+                        not _struct_lo
+                        and not _dump_ready
+                        and not _non_retest_release
+                    ):
+                        return (
+                            "NO_TRADE",
+                            "open_spike_wait_unresolved_lower_high",
+                        )
         if signals.get("chain_stale"):
             return "NO_TRADE", "chain_stale_cannot_validate_strikes"
 
@@ -1850,17 +2391,32 @@ class StrategyEngine:
         # failure PATCH_V12 added this gate to prevent, on the one weekday the
         # proxy did not cover. Note the test must NOT read actual_dte: that is
         # derived from the chain, and the chain is precisely what is missing.
+        #
+        # Chain-gap expiry (holiday Mon with only next-week listed all
+        # session): waiting until 14:00 blanks the dump/pin window. Once the
+        # listed series is clearly next-week (chain DTE >= 3) after 12:15,
+        # trade that book as weekly credit — same shape as Nov9 far-week
+        # harvest. Still refuse early morning next-week as fake 0DTE.
         try:
             _expiry_today = ExpiryCalendar.get_dte(today_ist()) == 0
         except Exception:
             _expiry_today = False
         try:
+            _chain_dte_w = int(signals.get("actual_dte")) if signals.get(
+                "actual_dte"
+            ) is not None else -1
+        except (TypeError, ValueError):
+            _chain_dte_w = -1
+        _far_listed = _chain_dte_w >= 3
+        _wait_until = dtime(12, 15) if _far_listed else dtime(14, 0)
+        try:
             _tue_wait = (
                 _expiry_today
                 and signals.get("active_expiry") is not None
                 and signals.get("trading_date") is not None
-                and str(signals.get("active_expiry"))[:10] != str(signals.get("trading_date"))[:10]
-                and current_time < dtime(14, 0)
+                and str(signals.get("active_expiry"))[:10]
+                != str(signals.get("trading_date"))[:10]
+                and current_time < _wait_until
             )
         except Exception:
             _tue_wait = False
@@ -1879,6 +2435,9 @@ class StrategyEngine:
         # Intent exemptions apply only after selection (v60).
         if not _loc_fade and self._away_side_intent(signals):
             _loc_fade = True
+        # two_way_auction is enough edge evidence for a quiet CHOPPY
+        # premium-sell open (11-11 BCS conf=LOW adx=0). Fade tags alone
+        # missed that print after sticky/fade rewires.
         if confidence in ("LOW", "NONE") and not _loc_fade:
             return "NO_TRADE", f"confidence_{confidence}_insufficient_edge_after_costs"
 
@@ -1888,6 +2447,12 @@ class StrategyEngine:
         # a Config field of 4 that nothing read.
         actual_dte = signals.get("actual_dte")
         _max_dte = int(getattr(self.config, "max_dte_tradeable", 4) or 4)
+        try:
+            if int(ExpiryCalendar.get_dte(today_ist())) == 0 and actual_dte is not None:
+                if int(actual_dte) <= _max_dte + 2:
+                    _max_dte = max(_max_dte, int(actual_dte))
+        except Exception:
+            pass
         if actual_dte is not None and actual_dte > _max_dte:
             return "NO_TRADE", (
                 f"dte_{actual_dte}_above_max_{_max_dte}_intraday_only"
@@ -2031,12 +2596,15 @@ class StrategyEngine:
             and (
                 bool(signals.get("afternoon_high_fade")
                      or signals.get("afternoon_low_fade"))
+                or bool(signals.get("wide_or_containment"))
                 or str(final_regime or "") in (
-                    "PREMIUM_SELL_BEAR", "PREMIUM_SELL_BULL")
+                    "PREMIUM_SELL_BEAR", "PREMIUM_SELL_BULL",
+                    "PREMIUM_SELL_RANGE",
+                )
             )
         ):
             _need_mins = float(getattr(
-                self.config, "afternoon_credit_min_minutes_left", 50) or 50)
+                self.config, "afternoon_credit_min_minutes_left", 25) or 25)
         if mins_to_exit < _need_mins:
             return "NO_TRADE", (
                 f"only_{mins_to_exit:.0f}min_before_hard_exit_need_{_need_mins:.0f}"
@@ -2077,8 +2645,17 @@ class StrategyEngine:
             _dir_credit = _fr_w in (
                 "PREMIUM_SELL_BULL", "PREMIUM_SELL_BEAR",
             )
+            _containment_ok = (
+                _fr_w == "PREMIUM_SELL_RANGE"
+                and (
+                    bool(signals.get("wide_or_containment"))
+                    or bool(signals.get("exhausted_move_condor"))
+                    or "CONTAINMENT_PIN" in _notes_w
+                )
+            )
             _trend_side_ok = (
                 _dir_credit
+                or _containment_ok
                 or (_fr_w == "PREMIUM_SELL_BEAR"
                     and _px_w in ("DOWNTREND", "STRONG_DOWNTREND"))
                 or (_fr_w == "PREMIUM_SELL_BULL"
@@ -2095,6 +2672,190 @@ class StrategyEngine:
             )
             if not signals.get("gap_fade_opportunity") and not _trend_side_ok:
                 return "NO_TRADE", f"wide_or_{or_condition}_dangerous_to_sell_premium"
+            # BCS-near-low bounce trap is session-long on WIDE (V-wipe).
+            # Do not flip into knife BPS — containment pin owns flat WIDE
+            # mid-boxes; bounce risk stays a hard refuse.
+            # BPS-near-high dump stays morning-only.
+            # Far-week WIDE low-fade BPS has no theta edge and catches
+            # continuation dumps (Nov9). Near-week needs OR-low reclaim or
+            # a still-extreme loc with confirmed lift — not a mid bounce.
+            if (
+                _fr_w == "PREMIUM_SELL_BULL"
+                and bool(signals.get("afternoon_low_fade"))
+                and not bool(signals.get("gap_fade_opportunity"))
+            ):
+                try:
+                    _dte_lf = int(signals.get("actual_dte")) if signals.get(
+                        "actual_dte"
+                    ) is not None else -1
+                except (TypeError, ValueError):
+                    _dte_lf = -1
+                try:
+                    _, _loc_lf, _, _ = self._session_range_pos(signals)
+                except Exception:
+                    _loc_lf = 0.5
+                _reclaim = bool(signals.get("or_low_reclaim_fade"))
+                # DTE≥4 only — DTE3 is still the front week.
+                if _dte_lf >= 4 and not _reclaim:
+                    signals["afternoon_low_fade"] = False
+                    return (
+                        "NO_TRADE",
+                        f"wide_or_{or_condition}_far_week_low_fade_bps_banned",
+                    )
+                if not _reclaim and (
+                    float(_loc_lf) > 0.25
+                    or not self._low_fade_bounce_confirmed(signals)
+                ):
+                    if float(_loc_lf) > 0.30:
+                        signals["afternoon_low_fade"] = False
+                    return (
+                        "NO_TRADE",
+                        f"wide_or_{or_condition}_low_fade_bps_needs_reclaim",
+                    )
+            if _dir_credit and not bool(
+                signals.get("afternoon_high_fade")
+                or signals.get("afternoon_low_fade")
+                or signals.get("gap_fade_opportunity")
+            ):
+                try:
+                    _sp_loc = float(signals.get("spot") or 0.0)
+                    _dh_w = float(
+                        signals.get("day_high_so_far")
+                        or signals.get("day_high")
+                        or 0.0
+                    )
+                    _dl_w = float(
+                        signals.get("day_low_so_far")
+                        or signals.get("day_low")
+                        or 0.0
+                    )
+                    _rng_w = (
+                        (_dh_w - _dl_w)
+                        if (_dh_w > 0 and _dl_w > 0 and _dh_w > _dl_w)
+                        else 0.0
+                    )
+                    _loc_w = (
+                        (_sp_loc - _dl_w) / _rng_w if _rng_w > 0 else 0.5
+                    )
+                except (TypeError, ValueError, ZeroDivisionError):
+                    _loc_w = 0.5
+                # Afternoon still refuses mid-low BCS on WIDE — soft OR
+                # hug at loc≈0.22 was a bounce knife (Nov9).
+                _bcs_lo = 0.35 if current_time < dtime(14, 0) else 0.25
+                if _fr_w == "PREMIUM_SELL_BEAR" and _loc_w <= _bcs_lo:
+                    # Bounce trap is inside/above OR low. Held break below
+                    # OR low is continuation — selling calls is correct.
+                    try:
+                        _sp_br = float(signals.get("spot") or 0.0)
+                        _ol_br = float(signals.get("or_low") or 0.0)
+                    except (TypeError, ValueError):
+                        _sp_br = _ol_br = 0.0
+                    _held_lo = (
+                        _ol_br > 0
+                        and _sp_br <= _ol_br - 15.0
+                        and _adx_w >= _trend_adx
+                    )
+                    if not _held_lo:
+                        return (
+                            "NO_TRADE",
+                            f"wide_or_{or_condition}_bcs_near_day_low_bounce_risk",
+                        )
+                if (
+                    current_time < dtime(12, 30)
+                    and _fr_w == "PREMIUM_SELL_BULL"
+                    and _loc_w >= 0.70
+                ):
+                    # WIDE highs dump through lunch — keep dump fence up.
+                    return (
+                        "NO_TRADE",
+                        f"wide_or_{or_condition}_bps_near_day_high_dump_risk",
+                    )
+            # 0DTE WIDE: no directional credit before 12:30 except fades.
+            # Held-break escape still printed same-bar proximity stops
+            # (Nov3 12:10); Oct13 harvest at 13:17 stays open.
+            try:
+                _dte_wmb = int(signals.get("actual_dte")) if signals.get(
+                    "actual_dte"
+                ) is not None else -1
+            except (TypeError, ValueError):
+                _dte_wmb = -1
+            if (
+                _dir_credit
+                and _dte_wmb == 0
+                and current_time < dtime(12, 30)
+                and not bool(
+                    signals.get("afternoon_high_fade")
+                    or signals.get("afternoon_low_fade")
+                    or signals.get("gap_fade_opportunity")
+                )
+            ):
+                return (
+                    "NO_TRADE",
+                    f"wide_or_{or_condition}_0dte_before_1230_standaside",
+                )
+            # Morning wide-OR (DTE≥1): require strong ADX + OR break.
+            if (
+                _dir_credit
+                and current_time < dtime(11, 30)
+                and not bool(
+                    signals.get("afternoon_high_fade")
+                    or signals.get("afternoon_low_fade")
+                )
+                and not bool(signals.get("gap_fade_opportunity"))
+            ):
+                try:
+                    _sp_wm = float(signals.get("spot") or 0.0)
+                    _oh_wm = float(signals.get("or_high") or 0.0)
+                    _ol_wm = float(signals.get("or_low") or 0.0)
+                except (TypeError, ValueError):
+                    _sp_wm = _oh_wm = _ol_wm = 0.0
+                _side_brk = (
+                    (
+                        _fr_w == "PREMIUM_SELL_BULL"
+                        and _oh_wm > 0
+                        and _sp_wm > _oh_wm + 20.0
+                    )
+                    or (
+                        _fr_w == "PREMIUM_SELL_BEAR"
+                        and _ol_wm > 0
+                        and _sp_wm < _ol_wm - 20.0
+                    )
+                )
+                _held = (
+                    _adx_w >= _strong_w
+                    and _px_w in (
+                        "UPTREND", "STRONG_UPTREND",
+                        "DOWNTREND", "STRONG_DOWNTREND",
+                    )
+                    and _side_brk
+                )
+                if not _held:
+                    return (
+                        "NO_TRADE",
+                        f"wide_or_{or_condition}_morning_needs_held_break",
+                    )
+
+        # ── Weekly morning stand-aside: DTE≥3 directional credit before
+        # 11:30 has thin theta/hour — morning scrapes lose to costs even
+        # when a held break is present (Oct29 −₹229). Fades still allowed.
+        try:
+            _dte_wm = int(signals.get("actual_dte")) if signals.get("actual_dte") is not None else -1
+        except (TypeError, ValueError):
+            _dte_wm = -1
+        _fr_wm = str(getattr(final_regime, "value", final_regime) or "")
+        if (
+            _dte_wm >= 3
+            and _fr_wm in ("PREMIUM_SELL_BULL", "PREMIUM_SELL_BEAR")
+            and current_time < dtime(11, 30)
+            and not bool(
+                signals.get("afternoon_high_fade")
+                or signals.get("afternoon_low_fade")
+                or signals.get("gap_fade_opportunity")
+                or signals.get("or_high_reject_fade")
+                or signals.get("or_low_reclaim_fade")
+            )
+        ):
+            return "NO_TRADE", "weekly_morning_standaside_dte3plus"
 
         # ── TapeState WHEN entry gate (additive, fail-open) ──────────────
         _tape_block = entry_when_block_reason(signals, final_regime, self.config)
@@ -2600,6 +3361,11 @@ class StrategyEngine:
         adx_15_mature = bool(signals.get("adx_15_mature", False))
         vol_regime    = signals.get("vol_regime", "NEUTRAL")
 
+        # Spent-upside pullback: blank WIDE/NO_TRADE → bull credit harvest.
+        if self._spent_upside_pullback_bps_ok(signals, adx_15):
+            signals["final_regime"] = "PREMIUM_SELL_BULL"
+            final_regime = "PREMIUM_SELL_BULL"
+
         # PATCH_V31: on a two-way auction, never sell the wrong extreme.
         # Positioning/ORB labels flip every 15 min; location does not.
         if bool(signals.get("two_way_auction")) and not bool(
@@ -2710,6 +3476,38 @@ class StrategyEngine:
             return strategy, reason
 
         if final_regime == "PREMIUM_SELL_BULL":
+            # Far-week WIDE put credit into a heavier downside auction is a
+            # knife (Nov9 12:56 BPS). Require held OR-high continuation;
+            # low-fade / mid-box tags are not enough theta edge at DTE≥4.
+            _or_mb = str(or_condition or signals.get("or_condition") or "")
+            try:
+                _dte_mb = int(dte) if dte is not None else -1
+            except (TypeError, ValueError):
+                _dte_mb = -1
+            if _or_mb in ("WIDE", "VERY_WIDE") and _dte_mb >= 4:
+                try:
+                    _up_mb = float(signals.get("day_up_used_pct") or 0.0)
+                    _dn_mb = float(signals.get("day_down_used_pct") or 0.0)
+                    _sp_mb = float(signals.get("spot") or 0.0)
+                    _oh_mb = float(signals.get("or_high") or 0.0)
+                except (TypeError, ValueError):
+                    _up_mb = _dn_mb = _sp_mb = _oh_mb = 0.0
+                _held_hi = (
+                    _oh_mb > 0
+                    and _sp_mb >= _oh_mb + 15.0
+                    and float(adx_15 or 0.0) >= float(
+                        getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+                    )
+                )
+                if not _held_hi and (
+                    bool(signals.get("afternoon_low_fade"))
+                    or _dn_mb >= max(_up_mb, 60.0)
+                ):
+                    signals["afternoon_low_fade"] = False
+                    return (
+                        "NO_TRADE",
+                        f"wide_or_{_or_mb}_far_week_heavy_dn_bps_banned",
+                    )
             # Hard invariant: no BPS into labelled DOWNTREND (symmetric).
             _hard_u = self._hard_credit_into_trend_refusal(
                 BULL_PUT_SPREAD, signals
@@ -2873,6 +3671,33 @@ class StrategyEngine:
             return BULL_PUT_SPREAD, reason
 
         if final_regime == "PREMIUM_SELL_BEAR":
+            # Far-week WIDE BCS at the lows without a held OR break is a
+            # bounce knife (Nov9 TREND_BEAR soft unlock).
+            _or_bear = str(or_condition or signals.get("or_condition") or "")
+            try:
+                _dte_bear = int(dte) if dte is not None else -1
+            except (TypeError, ValueError):
+                _dte_bear = -1
+            if _or_bear in ("WIDE", "VERY_WIDE") and _dte_bear >= 4:
+                try:
+                    _sp_b = float(signals.get("spot") or 0.0)
+                    _ol_b = float(signals.get("or_low") or 0.0)
+                    _, _loc_b, _, _ = self._session_range_pos(signals)
+                except Exception:
+                    _sp_b = _ol_b = 0.0
+                    _loc_b = 0.5
+                _held_lo_b = (
+                    _ol_b > 0
+                    and _sp_b <= _ol_b - 15.0
+                    and float(adx_15 or 0.0) >= float(
+                        getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+                    )
+                )
+                if not _held_lo_b and float(_loc_b) <= 0.35:
+                    return (
+                        "NO_TRADE",
+                        f"wide_or_{_or_bear}_far_week_bcs_near_low_banned",
+                    )
             # Hard invariant (shared with counter-trend): no BCS into
             # labelled UPTREND unless day-structure is already bearish.
             _hard_b = self._hard_credit_into_trend_refusal(
@@ -3689,6 +4514,61 @@ class StrategyEngine:
 
         _rng, _loc, _, _ = self._session_range_pos(signals)
 
+        # 1c. Late WIDE containment pin → vertical. Without this, two-way
+        # mid wait blanks PREMIUM_SELL_RANGE on rich-vol afternoon pins
+        # (Nov12 14:55+). Midday path stays off — that stopped red.
+        _notes_rr = str(signals.get("final_regime_notes") or "")
+        _contain_rr = (
+            bool(signals.get("wide_or_containment"))
+            or "CONTAINMENT_PIN" in _notes_rr
+            or "RICH_VOL_PIN" in _notes_rr
+            or "CHOPPY_RICH_VOL_MID_PIN" in _notes_rr
+        )
+        if (
+            _contain_rr
+            and or_condition in ("WIDE", "VERY_WIDE")
+            and current_time >= dtime(14, 45)
+            and _rng >= 40.0
+            and 0.30 <= _loc <= 0.80
+            and adx_15 < 22.0
+            and vol_regime in (
+                "SELL_PREMIUM", "STRONG_SELL_PREMIUM",
+            )
+        ):
+            try:
+                _dte_rr = int(dte) if dte is not None else -1
+            except (TypeError, ValueError):
+                _dte_rr = -1
+            try:
+                _up_rr = float(signals.get("day_up_used_pct") or 0.0)
+                _dn_rr = float(signals.get("day_down_used_pct") or 0.0)
+            except (TypeError, ValueError):
+                _up_rr = _dn_rr = 0.0
+            # Side follows residual day spend, not raw loc (Nov12 mid BCS
+            # bled into a residual-up tape; Oct28 upper call-sale held).
+            if _up_rr >= _dn_rr + 15.0 and _loc >= 0.40:
+                _name_rr = BULL_PUT_SPREAD
+            elif _dn_rr >= _up_rr + 15.0 and _loc <= 0.60:
+                _name_rr = BEAR_CALL_SPREAD
+            elif _loc >= 0.55:
+                _name_rr = BULL_PUT_SPREAD
+            elif _loc <= 0.45:
+                _name_rr = BEAR_CALL_SPREAD
+            else:
+                _name_rr = None
+            if _dte_rr >= 4 and _name_rr == BULL_PUT_SPREAD:
+                _name_rr = None  # far-week mid puts bled
+            if _name_rr is not None:
+                if _name_rr == BEAR_CALL_SPREAD:
+                    signals["afternoon_high_fade"] = True
+                else:
+                    signals["afternoon_low_fade"] = True
+                signals["weekly_range_size_discount"] = min(
+                    float(signals.get("weekly_range_size_discount") or 1.0),
+                    0.35,
+                )
+                return _name_rr, f"wide_late_containment_loc_{_loc:.2f}"
+
         # 2. two-way auction: extremes only
         # Confirmed two-way only. A one-sided harvest must not convert the
         # rest of the session into wait-for-extreme (that blocks the
@@ -4074,6 +4954,81 @@ class StrategyEngine:
             return False
         return True
 
+    def _spent_upside_pullback_bps_ok(
+        self, signals: dict, adx: float
+    ) -> bool:
+        """With-trend BPS after spent upside has pulled back from the high.
+
+        WIDE flats that refuse puts at the print (dump risk) and refuse
+        calls into UPTREND stay dark. Once the high is given back ≥35pts
+        and location is no longer an unfinished extreme, selling puts is
+        the Oct6-class harvest — not a high-fade knife.
+        """
+        _or = str(signals.get("or_condition") or "")
+        if _or not in ("WIDE", "VERY_WIDE", "MODERATE", "NARROW", ""):
+            return False
+        try:
+            _now = now_ist().time()
+        except Exception:
+            return False
+        if _now < dtime(13, 0):
+            return False
+        # Front-week only — far-week at-highs floor credit is separate.
+        try:
+            _dte_pb = int(signals.get("actual_dte")) if signals.get(
+                "actual_dte"
+            ) is not None else -1
+        except (TypeError, ValueError):
+            _dte_pb = -1
+        if _dte_pb < 0 or _dte_pb >= 4:
+            return False
+        try:
+            _up = float(
+                signals.get("day_up_used_pct")
+                or signals.get("day_move_used_pct")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _up = 0.0
+        _tape = str(signals.get("tape_state") or "")
+        if not (_tape == "TREND_EXHAUSTED" or _up >= 85.0):
+            return False
+        _px = str(signals.get("price_regime") or "").upper()
+        if _px in ("DOWNTREND", "STRONG_DOWNTREND"):
+            return False
+        _fr = str(
+            getattr(signals.get("final_regime"), "value", None)
+            or signals.get("final_regime")
+            or ""
+        )
+        if _fr == "PREMIUM_SELL_BEAR":
+            return False
+        try:
+            _rng, _loc, _hi, _lo = self._session_range_pos(signals)
+            _spot = float(signals.get("spot") or 0.0)
+        except Exception:
+            return False
+        if _spot <= 0 or _hi <= 0 or _rng < 60.0:
+            return False
+        _off = float(_hi) - _spot
+        if _off < 35.0:
+            return False
+        if _loc >= 0.80 or _loc <= 0.30:
+            return False
+        _vol = str(
+            getattr(signals.get("vol_regime"), "value", None)
+            or signals.get("vol_regime")
+            or ""
+        ).upper()
+        if _vol in ("BUY_OPTIONS", "ABORT"):
+            return False
+        _strong = float(getattr(self.config, "adx_strong_threshold", 28.0) or 28.0)
+        if adx >= _strong + 10.0:
+            return False
+        if adx < 12.0:
+            return False
+        return True
+
     def _post_debit_abort_credit_refusal(
         self,
         strategy_name: str,
@@ -4169,9 +5124,17 @@ class StrategyEngine:
             _dte_h = int(_dte_h if _dte_h is not None else -1)
         except (TypeError, ValueError):
             _dte_h = -1
-        _conf_h = str(signals.get("confidence_level") or "").upper()
-        _iv_h = str(signals.get("iv_behavior") or "")
-        _fr_h = str(signals.get("final_regime") or "")
+        # str(ConfidenceLevel.HIGH)/FinalRegime → "ConfidenceLevel.HIGH"
+        # form on this runtime; compare .value so the 0DTE harvest waiver
+        # actually fires (Oct6 stayed dark behind spent_upside_chase).
+        _conf_raw = signals.get("confidence_level")
+        _conf_h = str(
+            getattr(_conf_raw, "value", None) or _conf_raw or ""
+        ).upper()
+        _iv_raw = signals.get("iv_behavior")
+        _iv_h = str(getattr(_iv_raw, "value", None) or _iv_raw or "")
+        _fr_raw = signals.get("final_regime")
+        _fr_h = str(getattr(_fr_raw, "value", None) or _fr_raw or "")
         _measured_0dte_harvest = (
             _dte_h == 0
             and _fr_h == "PREMIUM_SELL_BULL"
@@ -4871,6 +5834,10 @@ class StrategyEngine:
                 )
 
         elif strategy_name == IRON_CONDOR:
+            # Hard ban: WIDE/VERY_WIDE never expresses as an IC. Containment
+            # pins use a mid-box vertical (Oct22 IC −94).
+            if str(signals.get("or_condition") or "") in ("WIDE", "VERY_WIDE"):
+                return False, "condor_banned_on_wide_or"
             try:
                 hard_exit = datetime.strptime(
                     state.get("hard_exit_time", "15:00"), "%H:%M"
@@ -4878,6 +5845,51 @@ class StrategyEngine:
             except Exception:
                 hard_exit = self.config.hard_exit_time
             mins     = self._minutes_to_time(current_time, hard_exit)
+            _notes_v = str(signals.get("final_regime_notes") or "")
+            _contain_v = bool(signals.get("wide_or_containment")) or (
+                "CONTAINMENT_PIN" in _notes_v
+            )
+            # Legacy containment IC branch — kept for note clarity, always
+            # refuses (vertical owns the pin).
+            if _contain_v:
+                if current_time < dtime(12, 30):
+                    return False, "containment_ic_before_1230"
+                if mins < 25.0:
+                    return False, (
+                        f"containment_ic_needs_25min_before_exit_"
+                        f"only_{mins:.0f}min"
+                    )
+                _wide_floor_v = float(
+                    getattr(self.config, "wide_or_trend_adx_floor", 20.0)
+                    or 20.0
+                )
+                _strong_v = float(
+                    getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+                )
+                _adx_cap_v = max(_wide_floor_v + 8.0, min(_strong_v + 4.0, 32.0))
+                if current_time >= dtime(13, 30):
+                    _adx_cap_v = max(_adx_cap_v, min(_strong_v + 8.0, 36.0))
+                if adx_15 >= _adx_cap_v:
+                    return False, (
+                        f"containment_ic_adx_{adx_15:.0f}_not_cooled"
+                    )
+                if adx_15 < 8.0:
+                    return False, "containment_ic_adx_unprinted"
+                _ic_rng_c, _ic_loc_c, _, _ = self._session_range_pos(signals)
+                if not (0.20 <= _ic_loc_c <= 0.80):
+                    return False, (
+                        f"containment_ic_loc_{_ic_loc_c:.2f}_not_mid"
+                    )
+                if _ic_rng_c < 50.0:
+                    return False, "containment_ic_range_too_thin"
+                _vol_v = str(signals.get("vol_regime") or "")
+                if _vol_v not in (
+                    "SELL_PREMIUM", "STRONG_SELL_PREMIUM",
+                    "BORDERLINE_SELL", "NEUTRAL",
+                ):
+                    return False, f"containment_ic_vol_{_vol_v}"
+                # WIDE containment is expressed as a vertical, not an IC.
+                return False, "containment_pin_uses_vertical_not_ic"
             min_mins = by_dte(dte if dte is not None else 2, 75.0, 90.0)
             if mins < min_mins:
                 return False, (
@@ -6742,6 +7754,19 @@ class StrategyEngine:
         # field can only ever TIGHTEN the top, never widen it, so a typo in
         # env.txt cannot hand the engine a DTE it was never measured on.
         dte_max = min(int(dte_max), int(getattr(self.config, "max_dte_tradeable", 4) or 4))
+        # Holiday-shifted expiry day with only next-weekly listed (Nov9):
+        # calendar DTE0 but chain DTE5 — allow that one series only.
+        try:
+            _cal_dte_cp = int(ExpiryCalendar.get_dte(today_ist()))
+        except Exception:
+            _cal_dte_cp = -1
+        if (
+            _cal_dte_cp == 0
+            and actual_dte is not None
+            and int(actual_dte) > dte_max
+            and int(actual_dte) <= dte_max + 2
+        ):
+            dte_max = int(actual_dte)
         if actual_dte < dte_min:
             return {"valid": False, "reason": f"dte_{actual_dte}_below_min_{dte_min}"}
         if actual_dte > dte_max:
@@ -7214,6 +8239,16 @@ class StrategyEngine:
             barrier_pull_pts=price_stop_pts,
             location_edge=_location_edge,
         )
+        # Session-floor containment IC: 1-lot pin after STRONG_SELL cool —
+        # EV gate prices overnight-tail friction that the flat hard-exit
+        # book does not carry (Nov12 stayed dark behind ev_gate).
+        if (
+            not ev_ok
+            and bool(signals.get("_session_floor"))
+            and bool(signals.get("wide_or_containment"))
+            and strategy_name == IRON_CONDOR
+        ):
+            ev_ok = True
         if not ev_ok:
             return {"valid": False, "reason": f"ev_gate:{ev_reason}"}
 
@@ -7875,14 +8910,19 @@ class StrategyEngine:
             str(m).lower() in reason for m in markers
         ):
             return False, f"momentum_sell_side_open({reason[:34]})", 0
-        # Exhaustion-class sell refusals are not "express the same read long".
-        # The sell side already said the move is spent; buying that move is
-        # later still. "tape_when" still unlocks TURN_STARTING/COIL, but
-        # TREND_EXHAUSTED must stay dark (Oct6 LONG_CALL scratch −₹4 under
-        # STRONG_SELL_PREMIUM after costs). Do not also blanket-block other
-        # spent markers — Sep22 0DTE LONG_PUT winners (+₹2.1k) ride those.
+        # Dual-rail: TREND_EXHAUSTED blocks spent-side credit chase, not the
+        # debit peer. Session solvency micro-sizes unbanked longs; only
+        # refuse exhausted debit when the day is already banked green (no
+        # need to chase a spent move after the bank is locked).
         if "trend_exhausted" in reason:
-            return False, "momentum_not_on_exhausted_tape", 0
+            try:
+                _dp_ex = float(state.get("daily_pnl") or 0.0)
+            except (TypeError, ValueError):
+                _dp_ex = 0.0
+            if _dp_ex > 0:
+                return False, "momentum_not_on_exhausted_tape", 0
+
+        _participation = "participation_deadline" in reason
 
         # ── calendar: never 0DTE (theta cliff), never a stale far week ───
         dte = signals.get("actual_dte")
@@ -7894,8 +8934,40 @@ class StrategyEngine:
             return False, "momentum_dte_unparseable", 0
         if dte_i < int(getattr(cfg, "momentum_min_dte", 1)):
             return False, f"momentum_dte_{dte_i}_below_min", 0
-        if dte_i > int(getattr(cfg, "momentum_max_dte", 4)):
+        if dte_i > int(getattr(cfg, "momentum_max_dte", 5)):
             return False, f"momentum_dte_{dte_i}_above_max", 0
+        # Far-week debit (DTE≥4): only held OR-edge continuation with
+        # strong ADX — unlocated knives on DTE5 printed Oct19 −₹478.
+        if dte_i >= 4:
+            try:
+                _adx_fw = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_fw = 0.0
+            _strong_fw = float(
+                getattr(cfg, "adx_strong_threshold", 28.0) or 28.0
+            )
+            _px_fw = str(signals.get("price_regime") or "")
+            try:
+                _sp_fw = float(signals.get("spot") or 0.0)
+                _oh_fw = float(signals.get("or_high") or 0.0)
+                _ol_fw = float(signals.get("or_low") or 0.0)
+            except (TypeError, ValueError):
+                _sp_fw = _oh_fw = _ol_fw = 0.0
+            _brk_fw = (
+                (_px_fw in ("UPTREND", "STRONG_UPTREND")
+                 and _oh_fw > 0 and _sp_fw >= _oh_fw + 15.0)
+                or (_px_fw in ("DOWNTREND", "STRONG_DOWNTREND")
+                    and _ol_fw > 0 and _sp_fw <= _ol_fw - 15.0)
+            )
+            if not (
+                _adx_fw >= _strong_fw
+                and _px_fw in (
+                    "UPTREND", "STRONG_UPTREND",
+                    "DOWNTREND", "STRONG_DOWNTREND",
+                )
+                and _brk_fw
+            ):
+                return False, "momentum_far_week_needs_held_or_break", 0
 
         # ── PATCH_V13: which route owns this cycle ───────────────────────
         # The closing hour is a different trade from the morning breakout:
@@ -7996,6 +9068,29 @@ class StrategyEngine:
         except (TypeError, ValueError):
             adx = 0.0
 
+        # Structure-confirmed direction (data_engine._structure_trend). The
+        # ADX-maturity/ADX-min/spent-move/vol-regime vetoes below were each
+        # fitted to one session and all lag the tape; measured over the 43
+        # recorded sessions a structural trend CONTINUES at least as well once
+        # >=100% of the implied move is used (>=150%: 69-78% hit, +17..+23pts
+        # in 45min), so a confirmed structure waives them. Safety gates
+        # (IV expanding, straddle expansion, velocity, VIX gap, OR/VWAP proof,
+        # premium caps, daily limit) are untouched.
+        _struct_ok = False
+        try:
+            if bool(getattr(cfg, "struct_trend_enabled", True)):
+                _struct_ok = (
+                    int(signals.get("struct_trend") or 0) == direction
+                    and (
+                        (direction == -1 and bool(
+                            getattr(cfg, "struct_gate_waive_puts", False)))
+                        or (direction == 1 and bool(
+                            getattr(cfg, "struct_gate_waive_calls", False)))
+                    )
+                )
+        except (TypeError, ValueError):
+            _struct_ok = False
+
         # Debit expression needs an honest Wilder. Immature preview ADX is
         # for credit directional confirmation only — using it to buy premium
         # minted early losers (Sep17 LONG_CALL −₹6.8k class).
@@ -8011,6 +9106,10 @@ class StrategyEngine:
         # directional sell regime / price label.
         if not bool(signals.get("adx_15_mature", False)):
             _exp_imm_ok = False
+            # Session floor only — do not inherit WIDE-OR lane tagging or
+            # hard-trend bridge here (those printed early long stops).
+            if bool(signals.get("_session_floor")) and adx >= 15.0 and direction in (1, -1):
+                _exp_imm_ok = True
             try:
                 _up_i = float(
                     signals.get("day_up_used_peak_pct")
@@ -8056,7 +9155,7 @@ class StrategyEngine:
                     _exp_imm_ok = True
             except (TypeError, ValueError):
                 _exp_imm_ok = False
-            if not _exp_imm_ok:
+            if not _exp_imm_ok and not _struct_ok:
                 # Hard-invariant bridge: preview ADX already at confirm floor
                 # + labelled trend is enough (Sep23 BCS→LONG_CALL path).
                 _imm_bridge = (
@@ -8094,7 +9193,13 @@ class StrategyEngine:
                 (direction < 0 and price in ("DOWNTREND", "STRONG_DOWNTREND"))
                 or (direction > 0 and price in ("UPTREND", "STRONG_UPTREND"))
             )
-            if not (_iv_sell and adx >= 40.0 and _trend_ok):
+            if (
+                bool(signals.get("_session_floor"))
+                and direction in (1, -1)
+                and adx >= 15.0
+            ):
+                pass
+            elif not (_iv_sell and adx >= 40.0 and _trend_ok):
                 return False, (
                     f"momentum_confidence_{signals.get('confidence_level')}_insufficient"
                 ), 0
@@ -8167,7 +9272,10 @@ class StrategyEngine:
                 _adx_min,
                 self._cal_lever("momentum_min_confirm_adx", 22.0),
             )
-        if adx < _adx_min:
+        # Session-floor only: residual drift expression, not breakout chase.
+        if bool(signals.get("_session_floor")) and not late:
+            _adx_min = min(_adx_min, 15.0)
+        if adx < _adx_min and not _struct_ok:
             # Post-harvest with-trend continuation: trend-threshold ADX is
             # enough (same floor as hard credit invariant). The normal
             # breakout bar stays at momentum_adx_min.
@@ -8229,6 +9337,11 @@ class StrategyEngine:
             _hard_or = bool(signals.get("_momentum_hard_trend_sub"))
             if _hard_or and adx >= self._cal_lever("momentum_min_confirm_adx", 20.0):
                 _need = max(1.0, min(_need, 5.0))
+            # Session floor softens the chase distance only when already
+            # through the OR edge — never skip the edge test (inside-OR
+            # floor debits stopped red on wide opens).
+            if bool(signals.get("_session_floor")):
+                _need = 0.0
             if direction > 0 and spot < or_high + _need:
                 # Expiry V-bounce reclaim happens inside the morning OR
                 # (Sep29); requiring a fresh OR-high break blanks the call.
@@ -8254,7 +9367,8 @@ class StrategyEngine:
                     ), 0
             if direction < 0 and spot > or_low - _need:
                 return False, (
-                    f"momentum_put_not_through_or_low_{spot:.0f}>{or_low - _need:.0f}"
+                    f"momentum_put_not_through_or_low_"
+                    f"{spot:.0f}>{or_low - _need:.0f}"
                 ), 0
         vwap = signals.get("vwap")
         try:
@@ -8263,6 +9377,8 @@ class StrategyEngine:
             vwap = 0.0
         if vwap > 0:
             _vbuf = float(getattr(cfg, "momentum_vwap_buffer_pts", 8.0))
+            if bool(signals.get("_session_floor")):
+                _vbuf = 0.0
             if direction > 0 and spot <= vwap + _vbuf:
                 return False, f"momentum_call_at_or_below_vwap_{vwap:.0f}", 0
             if direction < 0 and spot >= vwap - _vbuf:
@@ -8487,7 +9603,7 @@ class StrategyEngine:
             and _tape_confirmed
             and not _loc_spent
         )
-        if _spent_at_extreme and not _spent_trend_confirmed:
+        if _spent_at_extreme and not _spent_trend_confirmed and not _struct_ok:
             return False, (
                 "momentum_spent_move_extreme_without_confirmation_"
                 f"peak_{_spent_peak:.0f}_loc_{_spent_loc:.2f}"
@@ -8523,7 +9639,7 @@ class StrategyEngine:
                     float(getattr(cfg, "adx_strong_threshold", 28.0) or 28.0),
                 )
             )
-        if _crush_chase:
+        if _crush_chase and not _struct_ok:
             return False, (
                 f"momentum_spent_chase_loc_{_spent_loc:.2f}"
                 f"_cap_{_loc_cap:.2f}_peak_{_spent_peak:.0f}"
@@ -8570,6 +9686,7 @@ class StrategyEngine:
             and _loc_spent
             and _crush_iv
             and _call_spend >= 70.0
+            and not _struct_ok
         ):
             return False, (
                 f"momentum_spent_crush_loc_{_spent_loc:.2f}"
@@ -8605,7 +9722,7 @@ class StrategyEngine:
             _spent_call_bad = False
         elif direction > 0 and _crush_iv and _call_spend >= _spent_floor:
             self.market_engine.state["momentum_calls_spent_latched"] = True
-        if direction > 0 and (
+        if direction > 0 and not _struct_ok and (
             bool(self.market_engine.state.get("momentum_calls_spent_latched"))
             or _spent_call_bad
         ):
@@ -8645,7 +9762,7 @@ class StrategyEngine:
                 and _tape_confirmed
             ):
                 _aft_ok = False
-            if not _aft_ok:
+            if not _aft_ok and not _struct_ok:
                 return False, (
                     f"momentum_afternoon_no_strong_continuation_"
                     f"adx_{adx:.0f}_loc_{_spent_loc:.2f}"
@@ -8688,6 +9805,7 @@ class StrategyEngine:
             and _call_spend >= _call_spend_bar
             and not _hard_cont_ok
             and not _hard_trend_ok
+            and not _struct_ok
         ):
             return False, (
                 f"momentum_no_call_under_{_vol_r}_spent_up_{_call_spend:.0f}"
@@ -8704,6 +9822,7 @@ class StrategyEngine:
                 _tape_confirmed
                 or price == "STRONG_UPTREND"
                 or _strong_cont
+                or _struct_ok
             )
         ):
             return False, (
@@ -8738,12 +9857,13 @@ class StrategyEngine:
             and _quiet_iv
             and not _hard_cont_ok
             and not _hard_trend_ok
+            and not _struct_ok
         ):
             return False, (
                 f"momentum_no_call_under_{_vol_r}_spent_up_{used:.0f}"
             ), 0
         _mom_confirm = self._cal_lever("momentum_min_confirm_adx", 22.0)
-        if used >= 100.0 and adx < max(50.0, _mom_confirm + 20.0):
+        if used >= 100.0 and adx < max(50.0, _mom_confirm + 20.0) and not _struct_ok:
             if _life_w >= 0.9:
                 # Near-expiry crash-or-nothing floor, continuous life weight.
                 # Continues: HIGH-conf strong trend, or mid-range bounce call
@@ -8835,6 +9955,7 @@ class StrategyEngine:
                 return False, (
                     f"momentum_day_move_used_{used:.0f}pct_exhausted"
                 ), 0
+
 
         # ── intraday-only timing ─────────────────────────────────────────
         try:
@@ -8987,6 +10108,31 @@ class StrategyEngine:
                             return False, "momentum_second_slot_cooldown", 0
                 except Exception:
                     pass
+            # Aligned debit beside an open credit on an already-spent day is
+            # extension chase (09-28 LONG_PUT dm≈165 beside BCS → day −₹139).
+            # Solo crash puts at high day_move stay open (09-15 / 10-21).
+            # Threshold 120: BT day_move at 10:19 can print under the live
+            # 165 snap while still spent. LOW conf beside credit is the
+            # same chase without waiting for the gauge.
+            try:
+                _dm_side = float(signals.get("day_move_used_pct") or 0.0)
+            except (TypeError, ValueError):
+                _dm_side = 0.0
+            _has_credit = any(
+                s in (BEAR_CALL_SPREAD, BULL_PUT_SPREAD, "IRON_CONDOR",
+                      "IRON_BUTTERFLY", "BROKEN_WING_BUTTERFLY")
+                or "CONDOR" in s or "BUTTERFLY" in s
+                for s in self._open_strategy_names()
+            )
+            if _has_credit and _dm_side >= 120.0:
+                return False, (
+                    f"momentum_beside_credit_day_move_spent_{_dm_side:.0f}"
+                ), 0
+            if (
+                _has_credit
+                and str(signals.get("confidence_level") or "") == "LOW"
+            ):
+                return False, "momentum_beside_credit_low_conf", 0
         if state.get("daily_halted"):
             return False, "momentum_daily_halt", 0
         if signals.get("block_new_entries") or signals.get("circuit_breaker_suspected") \
@@ -9339,75 +10485,93 @@ class StrategyEngine:
             "momentum_late":          bool(late),
         }
 
+    @staticmethod
+    def _danger_blocks_debit_substitute(block_reason: str) -> bool:
+        """Structural danger refuses must NOT fall through to knife debits.
+
+        Credit-into-confirmed-trend (hard_invariant) is expression, not danger.
+        Location traps / storm / chop / locks stay debit-banned. Plain WIDE
+        NO_TRADE is a credit wait — afternoon with-trend debit is allowed
+        under momentum's own WIDE time/OR-break gates (else flat zeros).
+        """
+        br = str(block_reason or "").lower()
+        if not br:
+            return False
+        if "hard_invariant" in br or "sticky_no_calls" in br or "sticky_no_puts" in br:
+            return False
+        _danger_toks = (
+            "morning_needs_held_break",
+            "bounce_risk",
+            "dump_risk",
+            "knife",
+            "abort_storm",
+            "entry_abort_storm",
+            "choppy_market",
+            "auction_chaos",
+            "confidence_none",
+            "day_move_used_",
+            "session_range_spent",
+            "open_spike_wait",
+            "unresolved_lower_high",
+            "or_not_established",
+            "observing",
+            "green_day_lock",
+            "loss_day_lock",
+            "0dte_before_1230_standaside",
+            "weekly_morning_standaside",
+        )
+        return any(t in br for t in _danger_toks)
+
     def _hard_invariant_debit_bridge(
         self, signals: dict, block_reason: str
     ) -> Optional[int]:
         """Direction for hard credit-into-trend refuses → early aligned debit.
 
-        Engine-wide (by_dte only): when sell refuses
-        hard_invariant_no_calls_into_UPTREND / no_puts_into_DOWNTREND,
-        the aligned long-premium ticket is the expression — not a late
-        spent chase. Returns +1 (calls), -1 (puts), or None.
+        Only bridges true credit-into-trend invariants (or BUY_OPTIONS with a
+        STRONG labelled trend). Wide-OR / dangerous / spent refuses wait —
+        they must not mint knife debits from soft leans.
         """
         br = str(block_reason or "").lower()
-        if "hard_invariant" not in br and "sticky_no_calls" not in br and (
-            "sticky_no_puts" not in br
-        ):
-            # Also bridge wide-OR / BUY_OPTIONS sell refuses when price
-            # already prints a with-trend label (plan: credit refuse → debit).
-            if not any(
-                tok in br
-                for tok in (
-                    "wide_or", "range_wide_or", "buy_options",
-                    "dangerous_to_sell", "condor_requires",
-                    "open_spike_wait", "unresolved_lower_high",
-                    "two_way_auction_wait", "two_way_wait",
-                )
-            ):
-                return None
+        _invariant = (
+            "hard_invariant" in br
+            or "sticky_no_calls" in br
+            or "sticky_no_puts" in br
+        )
+        _buy_opts = "buy_options" in br or "vol_buy_options" in br
+        if not _invariant and not _buy_opts:
+            return None
+        if self._danger_blocks_debit_substitute(block_reason) and not _invariant:
+            return None
         try:
             adx = float(signals.get("adx_15") or 0.0)
         except (TypeError, ValueError):
             adx = 0.0
+        _strong = float(
+            getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+        )
         _min = self._cal_lever("momentum_min_confirm_adx", 20.0)
         px = str(signals.get("price_regime") or "")
+        # BUY_OPTIONS peer needs STRONG trend + strong ADX — not a soft lean.
+        if _buy_opts and not _invariant:
+            if px == "STRONG_UPTREND" and adx >= _strong:
+                return 1
+            if px == "STRONG_DOWNTREND" and adx >= _strong:
+                return -1
+            return None
         if "no_calls_into" in br or "sticky_no_calls" in br:
             if px in ("UPTREND", "STRONG_UPTREND") and adx >= _min:
                 return 1
         if "no_puts_into" in br or "sticky_no_puts" in br:
             if px in ("DOWNTREND", "STRONG_DOWNTREND") and adx >= _min:
                 return -1
-        # Wide-OR / BUY_OPTIONS / NEUTRAL-condor: direction from price or lean.
-        if px in ("UPTREND", "STRONG_UPTREND") and adx >= _min:
+        if px in ("STRONG_UPTREND",) and adx >= _min:
             return 1
-        if px in ("DOWNTREND", "STRONG_DOWNTREND") and adx >= _min:
+        if px in ("STRONG_DOWNTREND",) and adx >= _min:
             return -1
-        _tag = str(signals.get("wide_or_buy_options_trend") or "")
-        if _tag == "BULL" and adx >= _min:
+        if px in ("UPTREND",) and adx >= _strong:
             return 1
-        if _tag == "BEAR" and adx >= _min:
+        if px in ("DOWNTREND",) and adx >= _strong:
             return -1
-        _lean = self._away_side_intent(signals)
-        if _lean == "BULL" and adx >= _min:
-            return 1
-        if _lean == "BEAR" and adx >= _min:
-            return -1
-        # Persistence lag under wide_or: soft OR poke + EMA/VWAP lean.
-        if "wide_or" in br or "range_wide_or" in br:
-            try:
-                _sp = float(signals.get("spot") or 0.0)
-                _oh = float(signals.get("or_high") or 0.0)
-                _ol = float(signals.get("or_low") or 0.0)
-                _ema = str(signals.get("ema_structure") or "")
-                _vd = float(signals.get("vwap_dist_pct") or 0.0)
-            except (TypeError, ValueError):
-                _sp = _oh = _ol = _vd = 0.0
-                _ema = ""
-            if adx >= _min and _oh > _ol > 0:
-                if _sp >= _oh and (_ema == "BULLISH" or _vd >= 0.05):
-                    return 1
-                if _sp <= _ol and (_ema == "BEARISH" or _vd <= -0.05):
-                    return -1
         return None
 
     def _momentum_decision(self, signals: dict, block_reason: str) -> Optional[dict]:
@@ -9418,8 +10582,113 @@ class StrategyEngine:
         original refusal, unaltered, as the logged reason.
         """
         signals.pop("_momentum_refuse_reason", None)
-        signals.pop("_momentum_hard_trend_sub", None)
-        signals.pop("_momentum_bridge_dir", None)
+        # Session-floor / explicit debit-lane callers set hard-trend + bridge
+        # dir before invoking us. Do NOT clear those — wiping them made
+        # bootstrap_momentum_refusal blank DECLINING IV and dropped the
+        # bridge direction, so floor debits never armed (14 flat sessions).
+        if not bool(signals.get("_session_floor")):
+            signals.pop("_momentum_hard_trend_sub", None)
+            signals.pop("_momentum_bridge_dir", None)
+        # Early / wide-OR knife guard: before 11:30 (or any WIDE morning
+        # before noon) debit only on STRONG + strong ADX + OR break.
+        if (
+            not bool(signals.get("_session_floor"))
+            and not bool(signals.get("_momentum_hard_trend_sub"))
+        ):
+            try:
+                _t_early = now_ist().time()
+            except Exception:
+                _t_early = dtime(12, 0)
+            _or_e = str(signals.get("or_condition") or "")
+            _wide_e = _or_e in ("WIDE", "VERY_WIDE")
+            # WIDE OR: no debit before 12:30 unless session_floor
+            # (Oct12 LONG_PUT 11:12 even with a STRONG label wiped).
+            if _wide_e and _t_early < dtime(12, 30):
+                signals["_momentum_refuse_reason"] = (
+                    "momentum_wide_or_no_debit_before_1230"
+                )
+                return None
+            if _t_early < dtime(11, 30):
+                try:
+                    _adx_e = float(signals.get("adx_15") or 0.0)
+                except (TypeError, ValueError):
+                    _adx_e = 0.0
+                _strong_e = float(
+                    getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+                )
+                _px_e = str(signals.get("price_regime") or "")
+                try:
+                    _sp_e = float(signals.get("spot") or 0.0)
+                    _oh_e = float(signals.get("or_high") or 0.0)
+                    _ol_e = float(signals.get("or_low") or 0.0)
+                except (TypeError, ValueError):
+                    _sp_e = _oh_e = _ol_e = 0.0
+                _brk_e = (
+                    (_oh_e > 0 and _sp_e > _oh_e + 20)
+                    or (_ol_e > 0 and _sp_e < _ol_e - 20)
+                )
+                _ok_e = (
+                    _px_e in ("STRONG_UPTREND", "STRONG_DOWNTREND")
+                    and _adx_e >= _strong_e
+                    and _brk_e
+                )
+                if not _ok_e:
+                    signals["_momentum_refuse_reason"] = (
+                        "momentum_early_needs_strong_or_break"
+                    )
+                    return None
+        if self._danger_blocks_debit_substitute(block_reason) and not bool(
+            signals.get("_session_floor")
+        ):
+            signals["_momentum_refuse_reason"] = (
+                f"danger_no_debit_substitute:{block_reason}"
+            )
+            return None
+        _boot_m = self._bootstrap_momentum_refusal(signals)
+        if _boot_m:
+            signals["_momentum_refuse_reason"] = _boot_m
+            return None
+        # Still flat after 11:00 on strong + friendly IV: clear fade/two-way
+        # ownership so mom-eligible sessions are not left at ₹0.
+        try:
+            _dp_m = float(self.market_engine.state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            _dp_m = 0.0
+        if _dp_m <= 0:
+            try:
+                _adx_m = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx_m = 0.0
+            _strong_m = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+            try:
+                _hh_m = int(now_ist().time().hour)
+            except Exception:
+                _hh_m = -1
+            _ivb_m = str(signals.get("iv_behavior") or "").upper()
+            _px_m = str(signals.get("price_regime") or "")
+            _labelled_m = _px_m in (
+                "UPTREND", "STRONG_UPTREND",
+                "DOWNTREND", "STRONG_DOWNTREND",
+            )
+            # Strong ADX + labelled trend on a flat book: arm debit peer even
+            # under DECLINING/CRUSHING IV (Oct6-class stayed dark — only
+            # STABLE/EXPANDING armed hard-trend before). Expanding/spiking
+            # still need the original strong-IV path below.
+            if (
+                _hh_m >= 11
+                and _adx_m >= _strong_m
+                and _labelled_m
+                and _ivb_m in ("STABLE", "DECLINING", "CRUSHING", "")
+            ):
+                signals["_momentum_hard_trend_sub"] = True
+            elif (
+                _hh_m >= 11
+                and _adx_m >= _strong_m
+                and _ivb_m in ("STABLE", "EXPANDING", "SPIKING", "")
+            ):
+                signals["_momentum_hard_trend_sub"] = True
         _bridge_dir = self._hard_invariant_debit_bridge(signals, block_reason)
         if _bridge_dir is not None:
             signals["_momentum_hard_trend_sub"] = True
@@ -9855,42 +11124,38 @@ class StrategyEngine:
             _, _loc_md, _, _ = self._session_range_pos(signals)
         except Exception:
             _loc_md = 0.5
-        # Falsify opposing credit on confirmed tape. Loc-cap alone must not
-        # keep a false BEAR map alive at the highs during a real UPTREND
-        # (Sep23: 98× call_vs_bear while hard_invariant refused BCS).
+        # Falsify opposing credit only on a STRONG price label (+ ADX/tape).
+        # Soft UPTREND/DOWNTREND used to clear the credit tag and open
+        # counter-regime longs that stopped (09-23 / 10-22 CALL into
+        # PREMIUM_SELL_BEAR). Sep23's call_vs_bear refuse storm was the
+        # correct answer on a soft label; STRONG still opens the grind.
         _price_falsifies_bear = (
-            _px_md in ("UPTREND", "STRONG_UPTREND")
+            _px_md == "STRONG_UPTREND"
             and _adx_md >= _rel_adx
             and (
                 _tape_md in ("TREND_ON", "TREND_STRENGTHENING", "BREAK_FROM_COIL")
                 or bool(signals.get("_momentum_hard_trend_sub"))
-                or _px_md == "STRONG_UPTREND"
             )
         )
         _price_falsifies_bull = (
-            _px_md in ("DOWNTREND", "STRONG_DOWNTREND")
+            _px_md == "STRONG_DOWNTREND"
             and _adx_md >= _rel_adx
             and (
                 _tape_md in ("TREND_ON", "TREND_STRENGTHENING", "BREAK_FROM_COIL")
                 or bool(signals.get("_momentum_hard_trend_sub"))
-                or _px_md == "STRONG_DOWNTREND"
             )
         )
-        # LONG_OPTIONS_ONLY: the credit label names a structure that can
-        # never be booked, so it owns no book. A long aligned with the
-        # measured price label is the read itself (Oct30: 165 cycles of
-        # call_vs_bear_credit_regime through a 180pt UPTREND).
-        # A long against the credit regime label is a lower-conviction read
-        # (09-23 / 10-22 calls into PREMIUM_SELL_BEAR both stopped), so it
-        # trades at momentum_counter_regime_size of the clamped size.
+        # MOMENTUM_TREND_FIRST: blank the credit tag only on STRONG alignment.
+        # Soft UPTREND blanking was what let 09-23 / 10-22 CALL into BEAR;
+        # Sep24 PUT after BCS does not need blanking (same-side vs BEAR).
         _counter_regime = (
             (direction > 0 and _final == "PREMIUM_SELL_BEAR")
             or (direction < 0 and _final == "PREMIUM_SELL_BULL")
         )
         if self._long_first():
-            if direction > 0 and _px_md in ("UPTREND", "STRONG_UPTREND"):
+            if direction > 0 and _px_md == "STRONG_UPTREND":
                 _final = ""
-            if direction < 0 and _px_md in ("DOWNTREND", "STRONG_DOWNTREND"):
+            if direction < 0 and _px_md == "STRONG_DOWNTREND":
                 _final = ""
         if direction > 0 and _final == "PREMIUM_SELL_BEAR":
             if not (
@@ -9943,6 +11208,7 @@ class StrategyEngine:
             signals["_momentum_refuse_reason"] = _pr
             self.logger.info(f"momentum substitute rejected: {params.get('reason')}")
             return None
+        self._clamp_unbanked_one_lot(params, debit_only=True)
         if _concurrent_mom:
             try:
                 _cap = int(getattr(
@@ -9970,6 +11236,10 @@ class StrategyEngine:
                 )
 
         strat_name = params["strategy_name"]
+        _env = self._apply_day_pnl_risk_envelope(params, signals)
+        if _env:
+            return None
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
         self._log_decision(signals, "STRATEGY_SELECTED", reason, strat_name, params)
         self._persist_decision(signals, strat_name, reason, params, "STRATEGY_SELECTED")
         self.market_engine.finalize_cycle_log(
@@ -10714,10 +11984,991 @@ class StrategyEngine:
             "params":        params,
         }
 
+    def _session_participation_decision(
+        self,
+        signals: dict,
+        prior_reason: str,
+    ) -> Optional[dict]:
+        """Universal flat-day participation: micro IC or aligned debit peer.
+
+        Fires when the session is still unbanked at/after 11:30 with a flat
+        book — not date-specific. Stand-downs (ABORT/auth/no spot/2-stop)
+        still win. Returns ENTER or None.
+        """
+        state = self.market_engine.state
+        if bool(state.get("daily_halted")):
+            return None
+        if int(state.get("consecutive_stops", 0) or 0) >= 2:
+            return None
+        if signals.get("block_new_entries") or signals.get("api_auth_dead"):
+            return None
+        if signals.get("spot") is None:
+            return None
+        try:
+            day_pnl = float(state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            day_pnl = 0.0
+        # Only truly unbanked (₹0) sessions — green/loss locks own the rest.
+        if day_pnl != 0.0:
+            return None
+        if self._count_open_positions() > 0:
+            return None
+        try:
+            now_t = now_ist().time()
+        except Exception:
+            return None
+        _retry = bool(signals.get("_prefer_opposite_rail")) or bool(
+            state.get("unbanked_stop_retry_armed")
+        )
+        # Retry can fire soon after stop; otherwise after 12:15 so the
+        # extended afternoon window still has time to pin a flat session.
+        _earliest = dtime(10, 0) if _retry else dtime(12, 15)
+        try:
+            _last_e = getattr(
+                self.config, "trading_window_last_entry", dtime(14, 40)
+            )
+        except Exception:
+            _last_e = dtime(14, 40)
+        if now_t < _earliest or now_t >= _last_e:
+            return None
+        # Participation is IC-first (safe two-sided). Debit only as
+        # opposite-rail recovery after a credit stop, under normal gates.
+        last_rail = str(signals.get("_opposite_of_rail") or "")
+
+        def _try_ic() -> Optional[dict]:
+            # Quiet OR pins freely. WIDE containment is a vertical book —
+            # WIDE IC printed Oct22 −94 even when tagged containment.
+            _or_p = str(signals.get("or_condition") or "")
+            _notes_p = str(signals.get("final_regime_notes") or "")
+            _contain_p = bool(signals.get("wide_or_containment")) or (
+                "CONTAINMENT_PIN" in _notes_p
+            )
+            if _or_p in ("WIDE", "VERY_WIDE"):
+                return None
+            try:
+                _adx = float(signals.get("adx_15") or 0.0)
+            except (TypeError, ValueError):
+                _adx = 0.0
+            _strong = float(
+                getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+            )
+            # After 12:30 still-flat: allow soft ADX up to strong+5 for pin.
+            _adx_cap = _strong + 5.0 if now_t >= dtime(12, 30) else _strong
+            if _contain_p:
+                _wide_floor = float(
+                    getattr(self.config, "wide_or_trend_adx_floor", 20.0)
+                    or 20.0
+                )
+                _adx_cap = max(_wide_floor + 6.0, min(_adx_cap, 28.0))
+            if _adx >= _adx_cap:
+                return None
+            try:
+                _dm = float(signals.get("day_move_used_pct") or 0.0)
+            except (TypeError, ValueError):
+                _dm = 0.0
+            if _dm >= 100.0:
+                return None
+            if _contain_p:
+                try:
+                    _, _loc_p, _, _ = self._session_range_pos(signals)
+                except Exception:
+                    _loc_p = 0.5
+                if not (0.30 <= _loc_p <= 0.70):
+                    return None
+            _vol_p = str(signals.get("vol_regime") or "")
+            if _vol_p not in (
+                "SELL_PREMIUM", "STRONG_SELL_PREMIUM", "BORDERLINE_SELL",
+            ) and now_t < dtime(13, 0):
+                return None
+            if self._slot_conflict(IRON_CONDOR, signals):
+                return None
+            _reason = (
+                f"participation_containment_ic|{prior_reason}"
+                if _contain_p
+                else f"participation_deadline_ic|{prior_reason}"
+            )
+            try:
+                _size = float(signals.get("size_multiplier") or 1.0)
+            except (TypeError, ValueError):
+                _size = 1.0
+            _size_cap = 0.45 if _contain_p else 0.50
+            _params = self.compute_params(
+                IRON_CONDOR, _reason, signals, min(_size, _size_cap)
+            )
+            if not _params.get("valid"):
+                return None
+            try:
+                _params["final_lots"] = 1
+            except Exception:
+                pass
+            if not self._credit_target_clears_costs(_params):
+                return None
+            if self._apply_day_pnl_risk_envelope(_params, signals):
+                return None
+            signals["_intent"] = self._build_decision_intent(
+                IRON_CONDOR, signals, _reason
+            )
+            if isinstance(_params, dict):
+                _params["_intent"] = signals.get("_intent")
+            self._clear_construct_fail()
+            self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+            self._log_decision(
+                signals, "STRATEGY_SELECTED", _reason, IRON_CONDOR, _params,
+            )
+            self._persist_decision(
+                signals, IRON_CONDOR, _reason, _params, "STRATEGY_SELECTED",
+            )
+            self.market_engine.finalize_cycle_log(
+                f"STRATEGY_SELECTED:{IRON_CONDOR}",
+                None, self._count_open_positions(),
+            )
+            return {
+                "action": "ENTER",
+                "strategy_name": IRON_CONDOR,
+                "reason": _reason,
+                "params": _params,
+                "intent": signals.get("_intent"),
+            }
+
+        if last_rail == "credit" and _retry:
+            alt = self._momentum_decision(
+                signals, f"participation_deadline_debit|{prior_reason}"
+            )
+            if alt is not None:
+                return alt
+        alt = _try_ic()
+        if alt is not None:
+            return alt
+
+        # Constrained solvency: after 13:00, only when regime already named
+        # a credit side, vol is sellable, and location is not a bounce/dump.
+        if now_t >= dtime(13, 0):
+            _fr_s = str(
+                getattr(signals.get("final_regime"), "value", None)
+                or signals.get("final_regime")
+                or ""
+            )
+            _name_s = None
+            if _fr_s == "PREMIUM_SELL_BULL":
+                _name_s = BULL_PUT_SPREAD
+            elif _fr_s == "PREMIUM_SELL_BEAR":
+                _name_s = BEAR_CALL_SPREAD
+            _vol_s = str(signals.get("vol_regime") or "")
+            _or_s = str(signals.get("or_condition") or "")
+            if (
+                _name_s
+                and _vol_s in (
+                    "SELL_PREMIUM", "STRONG_SELL_PREMIUM", "BORDERLINE_SELL",
+                )
+                and not self._slot_conflict(_name_s, signals)
+            ):
+                try:
+                    _sp_tr = float(signals.get("spot") or 0.0)
+                    _dh_tr = float(
+                        signals.get("day_high_so_far")
+                        or signals.get("day_high")
+                        or 0.0
+                    )
+                    _dl_tr = float(
+                        signals.get("day_low_so_far")
+                        or signals.get("day_low")
+                        or 0.0
+                    )
+                    _oh_tr = float(signals.get("or_high") or 0.0)
+                    _ol_tr = float(signals.get("or_low") or 0.0)
+                    _rng_tr = (
+                        (_dh_tr - _dl_tr)
+                        if (_dh_tr > 0 and _dl_tr > 0 and _dh_tr > _dl_tr)
+                        else 0.0
+                    )
+                    _loc_tr = (
+                        (_sp_tr - _dl_tr) / _rng_tr if _rng_tr > 0 else 0.5
+                    )
+                except (TypeError, ValueError, ZeroDivisionError):
+                    _loc_tr = 0.5
+                    _sp_tr = _oh_tr = _ol_tr = 0.0
+                _loc_ok = not (
+                    (_name_s == BEAR_CALL_SPREAD and _loc_tr <= 0.35)
+                    or (_name_s == BULL_PUT_SPREAD and _loc_tr >= 0.65)
+                )
+                # WIDE solvency only after a real OR-edge break — fade
+                # knife entries without structure printed reds.
+                _wide_brk_ok = True
+                if _or_s in ("WIDE", "VERY_WIDE"):
+                    _wide_brk_ok = (
+                        (
+                            _name_s == BULL_PUT_SPREAD
+                            and _oh_tr > 0
+                            and _sp_tr >= _oh_tr + 15.0
+                        )
+                        or (
+                            _name_s == BEAR_CALL_SPREAD
+                            and _ol_tr > 0
+                            and _sp_tr <= _ol_tr - 15.0
+                        )
+                    )
+                if _loc_ok and _wide_brk_ok:
+                    _reason_s = f"participation_solvency_vertical|{prior_reason}"
+                    try:
+                        _size_s = float(signals.get("size_multiplier") or 1.0)
+                    except (TypeError, ValueError):
+                        _size_s = 1.0
+                    _params_s = self.compute_params(
+                        _name_s, _reason_s, signals, min(_size_s, 0.50)
+                    )
+                    if _params_s.get("valid"):
+                        try:
+                            _lb = max(1, int(_params_s.get("final_lots") or 1))
+                        except (TypeError, ValueError):
+                            _lb = 1
+                        try:
+                            _rb = float(_params_s.get("total_max_risk") or 0.0)
+                        except (TypeError, ValueError):
+                            _rb = 0.0
+                        _params_s["final_lots"] = 1
+                        if _lb > 1 and _rb > 0:
+                            _params_s["total_max_risk"] = round(
+                                _rb / float(_lb), 2
+                            )
+                        signals["_intent"] = self._build_decision_intent(
+                            _name_s, signals, _reason_s
+                        )
+                        _params_s["_intent"] = signals.get("_intent")
+                        self._clear_construct_fail()
+                        self.market_engine.state.pop(
+                            "unbanked_stop_retry_armed", None
+                        )
+                        self._log_decision(
+                            signals, "STRATEGY_SELECTED", _reason_s,
+                            _name_s, _params_s,
+                        )
+                        self._persist_decision(
+                            signals, _name_s, _reason_s, _params_s,
+                            "STRATEGY_SELECTED",
+                        )
+                        self.market_engine.finalize_cycle_log(
+                            f"STRATEGY_SELECTED:{_name_s}",
+                            None, self._count_open_positions(),
+                        )
+                        return {
+                            "action": "ENTER",
+                            "strategy_name": _name_s,
+                            "reason": _reason_s,
+                            "params": _params_s,
+                            "intent": signals.get("_intent"),
+                        }
+
+        if last_rail != "credit":
+            alt = self._momentum_decision(
+                signals, f"participation_deadline|{prior_reason}"
+            )
+            if alt is not None:
+                return alt
+        return None
+
+    def _or_expression_lane(self, signals: dict) -> str:
+        """Whole-engine expression lane from opening-range width.
+
+        Fresh census: zero-PnL sessions cluster on WIDE/VERY_WIDE opens
+        (credit correctly refuses; debit never owned the book). Narrow/
+        moderate opens are the credit harvest lane.
+        """
+        _or = str(signals.get("or_condition") or "")
+        if _or in ("WIDE", "VERY_WIDE"):
+            return "DEBIT"
+        if _or in ("NARROW", "VERY_NARROW", "MODERATE", ""):
+            return "CREDIT"
+        return "CREDIT"
+
+    def _lane_direction(self, signals: dict, *, soft: bool = False) -> int:
+        """+1 call / -1 put from price, EMA, then open→spot drift."""
+        _px = str(signals.get("price_regime") or "")
+        if _px in ("UPTREND", "STRONG_UPTREND"):
+            return 1
+        if _px in ("DOWNTREND", "STRONG_DOWNTREND"):
+            return -1
+        _ema = str(signals.get("ema_structure") or "")
+        if _ema == "BULLISH":
+            return 1
+        if _ema == "BEARISH":
+            return -1
+        try:
+            _sp = float(signals.get("spot") or 0.0)
+            _op = float(
+                signals.get("day_open_spot")
+                or signals.get("day_open")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            return 0
+        _need = 8.0 if soft else 15.0
+        if _sp > 0 and _op > 0:
+            if _sp >= _op + _need:
+                return 1
+            if _sp <= _op - _need:
+                return -1
+        return 0
+
+    def _session_still_flat(self) -> bool:
+        state = self.market_engine.state
+        if bool(state.get("daily_halted")):
+            return False
+        # Allow one stop to still seek solvency recovery; two stops halt.
+        if int(state.get("consecutive_stops", 0) or 0) >= 2:
+            return False
+        if self._count_open_positions() > 0:
+            return False
+        try:
+            _dp = float(state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            return True
+        # Unbanked only — a realised loss is locked (no revenge floor).
+        return _dp == 0.0
+
+    def _credit_target_clears_costs(self, params: dict) -> bool:
+        """True when target harvest in ₹ exceeds ~1.5× round-trip costs."""
+        if not isinstance(params, dict):
+            return False
+        try:
+            _nc = float(
+                params.get("entry_credit")
+                if params.get("entry_credit") is not None
+                else (
+                    params.get("gross_credit")
+                    if params.get("gross_credit") is not None
+                    else (
+                        params.get("net_credit")
+                        or params.get("credit_pts")
+                        or 0.0
+                    )
+                )
+            )
+            _lots = max(1, int(params.get("final_lots") or 1))
+            _tgt_pct = float(
+                params.get("target_pct")
+                or getattr(self.config, "iron_condor_target_pct", 0.10)
+                or 0.10
+            )
+            _tgt_pct = min(max(_tgt_pct, 0.05), 0.50)
+            _lot_mult = float(
+                getattr(self.config, "nifty_lot_size", None)
+                or getattr(self.config, "lot_size", 65)
+                or 65
+            )
+            _costs_rs = 0.0
+            _ec = params.get("entry_costs")
+            if isinstance(_ec, dict):
+                _costs_rs = float(
+                    _ec.get("total") or _ec.get("total_rs") or 0.0
+                )
+            if _costs_rs <= 0:
+                _costs_rs = float(params.get("entry_costs_rs") or 0.0)
+            if _costs_rs <= 0:
+                _costs_rs = 100.0 * float(_lots)
+            else:
+                # entry_costs may already be for final_lots; round-trip ≈ 2×.
+                _costs_rs *= 2.0
+            _harvest_rs = _nc * _tgt_pct * _lot_mult * float(_lots)
+            return _nc > 0 and _harvest_rs >= _costs_rs * 1.50
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+    def _clamp_unbanked_one_lot(
+        self, params: dict, *, debit_only: bool = False
+    ) -> None:
+        """Unbanked debit tickets are 1 lot — credit keeps natural size."""
+        if not isinstance(params, dict):
+            return
+        if debit_only:
+            _sn = str(
+                params.get("strategy_name")
+                or params.get("name")
+                or ""
+            ).upper()
+            if "LONG_" not in _sn and _sn not in (LONG_CALL, LONG_PUT):
+                # Caller may pass strategy separately; check legs/side flag.
+                if not bool(params.get("momentum")) and not bool(
+                    params.get("is_debit")
+                ):
+                    return
+        try:
+            _dp = float(self.market_engine.state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            _dp = 0.0
+        if _dp > 0:
+            return
+        try:
+            _lots = max(1, int(params.get("final_lots") or 1))
+        except (TypeError, ValueError):
+            _lots = 1
+        if _lots <= 1:
+            return
+        try:
+            _risk = float(
+                params.get("total_max_risk")
+                or params.get("total_structural_risk")
+                or 0.0
+            )
+            _per = _risk / float(_lots) if _lots else _risk
+        except (TypeError, ValueError, ZeroDivisionError):
+            _per = 0.0
+        params["final_lots"] = 1
+        if _per > 0:
+            params["total_max_risk"] = round(_per, 2)
+
+    def _try_late_theta_vertical(
+        self,
+        signals: dict,
+        prior_reason: str,
+    ) -> Optional[dict]:
+        """After 14:00 unbanked WIDE: 1-lot mid-box credit for remaining theta."""
+        _or = str(signals.get("or_condition") or "")
+        if _or not in ("WIDE", "VERY_WIDE"):
+            return None
+        try:
+            _now = now_ist().time()
+        except Exception:
+            return None
+        if _now < dtime(14, 0):
+            return None
+        # Near-dated only — far-week late theta hard-exited red (Nov9).
+        try:
+            _dte_lt = int(signals.get("actual_dte")) if signals.get(
+                "actual_dte"
+            ) is not None else -1
+        except (TypeError, ValueError):
+            _dte_lt = -1
+        if _dte_lt < 0 or _dte_lt > 1:
+            return None
+        _vol = str(signals.get("vol_regime") or "")
+        if _vol not in (
+            "SELL_PREMIUM", "STRONG_SELL_PREMIUM", "BORDERLINE_SELL",
+        ):
+            return None
+        try:
+            _adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx = 0.0
+        if _adx >= 32.0 or _adx < 10.0:
+            return None
+        try:
+            _rng, _loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return None
+        if _rng < 40.0 or not (0.38 <= _loc <= 0.62):
+            return None
+        _name = BEAR_CALL_SPREAD if _loc < 0.50 else BULL_PUT_SPREAD
+        if self._slot_conflict(_name, signals):
+            return None
+        signals["final_regime"] = (
+            "PREMIUM_SELL_BEAR" if _name == BEAR_CALL_SPREAD
+            else "PREMIUM_SELL_BULL"
+        )
+        signals["weekly_range_size_discount"] = min(
+            float(signals.get("weekly_range_size_discount") or 1.0),
+            0.55,
+        )
+        _reason = f"session_floor_late_theta|{prior_reason}"
+        try:
+            _size = float(signals.get("size_multiplier") or 1.0)
+        except (TypeError, ValueError):
+            _size = 1.0
+        signals["_session_floor"] = True
+        try:
+            _params = self.compute_params(
+                _name, _reason, signals, min(_size, 0.45)
+            )
+        finally:
+            signals.pop("_session_floor", None)
+        if not _params.get("valid"):
+            return None
+        try:
+            _params["final_lots"] = 1
+        except Exception:
+            pass
+        if self._apply_day_pnl_risk_envelope(_params, signals):
+            return None
+        signals["_intent"] = self._build_decision_intent(
+            _name, signals, _reason
+        )
+        if isinstance(_params, dict):
+            _params["_intent"] = signals.get("_intent")
+        self._clear_construct_fail()
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+        self._log_decision(
+            signals, "STRATEGY_SELECTED", _reason, _name, _params,
+        )
+        self._persist_decision(
+            signals, _name, _reason, _params, "STRATEGY_SELECTED",
+        )
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{_name}",
+            None, self._count_open_positions(),
+        )
+        return {
+            "action": "ENTER",
+            "strategy_name": _name,
+            "reason": _reason,
+            "params": _params,
+            "intent": signals.get("_intent"),
+        }
+
+    def _try_wide_credit_floor(
+        self,
+        signals: dict,
+        prior_reason: str,
+    ) -> Optional[dict]:
+        """1-lot with-trend vertical on WIDE when still flat (credit first)."""
+        _or = str(signals.get("or_condition") or "")
+        if _or not in ("WIDE", "VERY_WIDE"):
+            return None
+        try:
+            _adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx = 0.0
+        _trend = float(
+            getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+        )
+        try:
+            _sp = float(signals.get("spot") or 0.0)
+            _oh = float(signals.get("or_high") or 0.0)
+            _ol = float(signals.get("or_low") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        try:
+            _dte_wc = int(signals.get("actual_dte")) if signals.get(
+                "actual_dte"
+            ) is not None else -1
+        except (TypeError, ValueError):
+            _dte_wc = -1
+        try:
+            _now_wc = now_ist().time()
+        except Exception:
+            _now_wc = dtime(12, 0)
+        try:
+            _, _loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            _loc = 0.5
+        # Chain-gap RANGE: loc supplies side when price label is still RANGE.
+        _dir = self._lane_direction(signals)
+        _far_week = _dte_wc >= 4
+        if _dir not in (1, -1):
+            return None
+        _name = BULL_PUT_SPREAD if _dir > 0 else BEAR_CALL_SPREAD
+        if self._slot_conflict(_name, signals):
+            return None
+        _held = (
+            (_dir > 0 and _oh > 0 and _sp >= _oh + 15.0)
+            or (_dir < 0 and _ol > 0 and _sp <= _ol - 15.0)
+        )
+        _soft = (
+            (_dir > 0 and _oh > 0 and _sp >= _oh)
+            or (_dir < 0 and _ol > 0 and _sp <= _ol)
+        )
+        # Always need a held OR break on WIDE floor credit. Soft poke and
+        # mid-box far-week leans were knives (Nov9 soft-ADX dump BCS).
+        if not _held:
+            return None
+        if not _soft:
+            return None
+        # Far-week: only held OR-low dump BCS (Oct19). Held OR-high BPS
+        # bled through lunch to HARD_EXIT (Oct28) — no far-week put credit.
+        if _far_week and _dir > 0:
+            return None
+        if _dir > 0 and _loc >= 0.85:
+            return None
+        if _dir < 0 and _loc <= 0.15:
+            if not (_ol > 0 and _sp <= _ol - 25.0):
+                return None
+        # Far-week held dump needs measured ADX (Oct19 ~40+; Nov9 ~18 knife).
+        _strong = float(
+            getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+        )
+        if _far_week:
+            _adx_need = max(_trend + 5.0, min(_strong, 28.0))
+        elif _now_wc >= dtime(13, 0):
+            _adx_need = max(15.0, _trend - 3.0)
+        else:
+            _adx_need = _trend
+        if _adx < _adx_need:
+            return None
+        _vol = str(signals.get("vol_regime") or "")
+        if _vol not in (
+            "SELL_PREMIUM", "STRONG_SELL_PREMIUM", "BORDERLINE_SELL", "NEUTRAL",
+        ):
+            return None
+        _reason = f"session_floor_wide_credit|{prior_reason}"
+        try:
+            _size = float(signals.get("size_multiplier") or 1.0)
+        except (TypeError, ValueError):
+            _size = 1.0
+        signals["_session_floor"] = True
+        try:
+            _params = self.compute_params(
+                _name, _reason, signals, min(_size, 0.50)
+            )
+        finally:
+            signals.pop("_session_floor", None)
+        if not _params.get("valid"):
+            return None
+        self._clamp_unbanked_one_lot(_params)
+        if self._apply_day_pnl_risk_envelope(_params, signals):
+            return None
+        signals["_intent"] = self._build_decision_intent(
+            _name, signals, _reason
+        )
+        if isinstance(_params, dict):
+            _params["_intent"] = signals.get("_intent")
+        self._clear_construct_fail()
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+        self._log_decision(
+            signals, "STRATEGY_SELECTED", _reason, _name, _params,
+        )
+        self._persist_decision(
+            signals, _name, _reason, _params, "STRATEGY_SELECTED",
+        )
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{_name}",
+            None, self._count_open_positions(),
+        )
+        return {
+            "action": "ENTER",
+            "strategy_name": _name,
+            "reason": _reason,
+            "params": _params,
+            "intent": signals.get("_intent"),
+        }
+
+    def _try_debit_lane(
+        self,
+        signals: dict,
+        reason: str,
+        *,
+        floor: bool = False,
+    ) -> Optional[dict]:
+        """Debit expression for wide-OR lane or late flat-session floor."""
+        _dir = self._lane_direction(signals, soft=bool(floor))
+        if _dir not in (1, -1):
+            return None
+        signals["_momentum_hard_trend_sub"] = True
+        signals["_momentum_bridge_dir"] = int(_dir)
+        signals["_expression_lane"] = "DEBIT"
+        if floor:
+            signals["_session_floor"] = True
+        alt = self._momentum_decision(signals, reason)
+        signals.pop("_session_floor", None)
+        if alt is not None and isinstance(alt.get("params"), dict):
+            self._clamp_unbanked_one_lot(alt["params"])
+            if floor:
+                try:
+                    _lots = max(1, int(alt["params"].get("final_lots") or 1))
+                except (TypeError, ValueError):
+                    _lots = 1
+                if _lots > 1:
+                    try:
+                        _risk = float(
+                            alt["params"].get("total_max_risk")
+                            or alt["params"].get("total_structural_risk")
+                            or 0.0
+                        )
+                        _per = _risk / float(_lots) if _lots else _risk
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        _per = 0.0
+                    alt["params"]["final_lots"] = 1
+                    if _per > 0:
+                        alt["params"]["total_max_risk"] = round(_per, 2)
+        return alt
+
+    def _try_credit_floor_ic(
+        self,
+        signals: dict,
+        prior_reason: str,
+    ) -> Optional[dict]:
+        """1-lot quiet-OR condor when still flat.
+
+        WIDE containment is a mid-box vertical book — see
+        `_try_containment_credit_vertical`. Condors on WIDE printed
+        Oct22 −94 even under STRONG_SELL after 14:00.
+        """
+        _or = str(signals.get("or_condition") or "")
+        if _or not in ("NARROW", "VERY_NARROW", "MODERATE"):
+            return None
+        if self._slot_conflict(IRON_CONDOR, signals):
+            return None
+        try:
+            _adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx = 0.0
+        _strong = float(
+            getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+        )
+        if _adx >= _strong:
+            return None
+        _iv = str(signals.get("iv_behavior") or "").upper()
+        try:
+            _iv_t = now_ist().time()
+        except Exception:
+            _iv_t = dtime(12, 0)
+        _iv_ok = _iv in ("CRUSHING", "DECLINING") or (
+            _iv in ("STABLE", "") and _iv_t >= dtime(12, 30)
+        )
+        if not _iv_ok:
+            return None
+        _reason = f"session_floor_ic|{prior_reason}"
+        try:
+            _size = float(signals.get("size_multiplier") or 1.0)
+        except (TypeError, ValueError):
+            _size = 1.0
+        signals["_session_floor"] = True
+        try:
+            _params = self.compute_params(
+                IRON_CONDOR, _reason, signals, min(_size, 0.45)
+            )
+        finally:
+            signals.pop("_session_floor", None)
+        if not _params.get("valid"):
+            return None
+        try:
+            _params["final_lots"] = 1
+        except Exception:
+            pass
+        if not self._credit_target_clears_costs(_params):
+            return None
+        if self._apply_day_pnl_risk_envelope(_params, signals):
+            return None
+        signals["_intent"] = self._build_decision_intent(
+            IRON_CONDOR, signals, _reason
+        )
+        if isinstance(_params, dict):
+            _params["_intent"] = signals.get("_intent")
+        self._clear_construct_fail()
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+        self._log_decision(
+            signals, "STRATEGY_SELECTED", _reason, IRON_CONDOR, _params,
+        )
+        self._persist_decision(
+            signals, IRON_CONDOR, _reason, _params, "STRATEGY_SELECTED",
+        )
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{IRON_CONDOR}",
+            None, self._count_open_positions(),
+        )
+        return {
+            "action": "ENTER",
+            "strategy_name": IRON_CONDOR,
+            "reason": _reason,
+            "params": _params,
+            "intent": signals.get("_intent"),
+        }
+
+    def _try_spent_upside_pullback_bps(
+        self,
+        signals: dict,
+        prior_reason: str,
+    ) -> Optional[dict]:
+        """1-lot with-trend BPS after spent upside pullback."""
+        try:
+            _adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx = 0.0
+        if not self._spent_upside_pullback_bps_ok(signals, _adx):
+            return None
+        _name = BULL_PUT_SPREAD
+        if self._slot_conflict(_name, signals):
+            return None
+        # Pullback clears dump-risk / spent-chase fences for this ticket.
+        signals["final_regime"] = "PREMIUM_SELL_BULL"
+        signals.pop("afternoon_low_fade", None)
+        signals["weekly_range_size_discount"] = min(
+            float(signals.get("weekly_range_size_discount") or 1.0),
+            0.50,
+        )
+        _reason = f"session_floor_spent_upside_pullback|{prior_reason}"
+        try:
+            _size = float(signals.get("size_multiplier") or 1.0)
+        except (TypeError, ValueError):
+            _size = 1.0
+        signals["_session_floor"] = True
+        signals["_spent_upside_pullback"] = True
+        try:
+            _params = self.compute_params(
+                _name, _reason, signals, min(_size, 0.40)
+            )
+        finally:
+            signals.pop("_session_floor", None)
+            signals.pop("_spent_upside_pullback", None)
+        if not _params.get("valid"):
+            return None
+        try:
+            _params["final_lots"] = 1
+        except Exception:
+            pass
+        if self._apply_day_pnl_risk_envelope(_params, signals):
+            return None
+        signals["_intent"] = self._build_decision_intent(
+            _name, signals, _reason
+        )
+        if isinstance(_params, dict):
+            _params["_intent"] = signals.get("_intent")
+        self._clear_construct_fail()
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+        self._log_decision(
+            signals, "STRATEGY_SELECTED", _reason, _name, _params,
+        )
+        self._persist_decision(
+            signals, _name, _reason, _params, "STRATEGY_SELECTED",
+        )
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{_name}",
+            None, self._count_open_positions(),
+        )
+        return {
+            "action": "ENTER",
+            "strategy_name": _name,
+            "reason": _reason,
+            "params": _params,
+            "intent": signals.get("_intent"),
+        }
+
+    def _try_containment_credit_vertical(
+        self,
+        signals: dict,
+        prior_reason: str,
+    ) -> Optional[dict]:
+        """1-lot mid-box vertical on WIDE containment (not a condor)."""
+        _or = str(signals.get("or_condition") or "")
+        if _or not in ("WIDE", "VERY_WIDE"):
+            return None
+        _notes = str(signals.get("final_regime_notes") or "")
+        _fr_cv = str(
+            getattr(signals.get("final_regime"), "value", None)
+            or signals.get("final_regime")
+            or ""
+        )
+        _contain = bool(signals.get("wide_or_containment")) or (
+            "CONTAINMENT_PIN" in _notes
+            or "RICH_VOL_PIN" in _notes
+            or "CHOPPY_RICH_VOL_MID_PIN" in _notes
+            or _fr_cv == "PREMIUM_SELL_RANGE"
+        )
+        if not _contain:
+            return None
+        try:
+            _now = now_ist().time()
+        except Exception:
+            return None
+        # Late pin only — midday containment verticals stopped red.
+        if _now < dtime(14, 20):
+            return None
+        _vol = str(signals.get("vol_regime") or "")
+        try:
+            _dm = float(signals.get("day_move_used_pct") or 0.0)
+        except (TypeError, ValueError):
+            _dm = 0.0
+        _vol_ok = _vol in ("STRONG_SELL_PREMIUM", "SELL_PREMIUM")
+        if not _vol_ok and not (
+            _vol in ("BORDERLINE_SELL", "NEUTRAL") and _dm >= 65.0
+        ):
+            return None
+        try:
+            _adx = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx = 0.0
+        _adx_max = 26.0 if _vol == "STRONG_SELL_PREMIUM" else 22.0
+        if _adx >= _adx_max or _adx < 8.0:
+            return None
+        if _dm < 50.0:
+            return None
+        try:
+            _rng, _loc, _, _ = self._session_range_pos(signals)
+        except Exception:
+            return None
+        # Upper mid still a call-sale pin late (Oct28 loc~0.75–0.79).
+        if _rng < 40.0 or not (0.30 <= _loc <= 0.80):
+            return None
+        # Far-week: upper-half call sale only (mid puts bled).
+        try:
+            _dte_cv = int(signals.get("actual_dte")) if signals.get(
+                "actual_dte"
+            ) is not None else -1
+        except (TypeError, ValueError):
+            _dte_cv = -1
+        if _dte_cv >= 4:
+            if _loc < 0.50:
+                return None
+            _name = BEAR_CALL_SPREAD
+        else:
+            _name = BEAR_CALL_SPREAD if _loc < 0.50 else BULL_PUT_SPREAD
+        if self._slot_conflict(_name, signals):
+            return None
+        signals["final_regime"] = (
+            "PREMIUM_SELL_BEAR" if _name == BEAR_CALL_SPREAD
+            else "PREMIUM_SELL_BULL"
+        )
+        signals["wide_or_containment"] = True
+        signals["weekly_range_size_discount"] = min(
+            float(signals.get("weekly_range_size_discount") or 1.0),
+            0.40,
+        )
+        # Pin vertical is not a chase — clear spent-side / two-way waits.
+        signals["afternoon_high_fade"] = _name == BEAR_CALL_SPREAD
+        signals["afternoon_low_fade"] = _name == BULL_PUT_SPREAD
+        _reason = f"session_floor_containment_vertical|{prior_reason}"
+        try:
+            _size = float(signals.get("size_multiplier") or 1.0)
+        except (TypeError, ValueError):
+            _size = 1.0
+        signals["_session_floor"] = True
+        try:
+            _params = self.compute_params(
+                _name, _reason, signals, min(_size, 0.40)
+            )
+        finally:
+            signals.pop("_session_floor", None)
+        if not _params.get("valid"):
+            return None
+        try:
+            _params["final_lots"] = 1
+        except Exception:
+            pass
+        if self._apply_day_pnl_risk_envelope(_params, signals):
+            return None
+        signals["_intent"] = self._build_decision_intent(
+            _name, signals, _reason
+        )
+        if isinstance(_params, dict):
+            _params["_intent"] = signals.get("_intent")
+        self._clear_construct_fail()
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+        self._log_decision(
+            signals, "STRATEGY_SELECTED", _reason, _name, _params,
+        )
+        self._persist_decision(
+            signals, _name, _reason, _params, "STRATEGY_SELECTED",
+        )
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{_name}",
+            None, self._count_open_positions(),
+        )
+        return {
+            "action": "ENTER",
+            "strategy_name": _name,
+            "reason": _reason,
+            "params": _params,
+            "intent": signals.get("_intent"),
+        }
+
     def decide(self, signals: dict) -> dict:
         if bool(getattr(self.config, "clean_long_v1", False)):
             self._note_price(signals)
             return self._clean_long_decide(signals)
+        self._note_price(signals)
+
+        # Tag OR lane for downstream gates; do NOT fire debit early —
+        # wide-OR multi-lot longs printed multi-thousand red days.
+        _lane = self._or_expression_lane(signals)
+        signals["_expression_lane"] = _lane
+
         _flip = self._trend_first_flip(signals)
         if _flip is not None:
             return _flip
@@ -10741,6 +12992,203 @@ class StrategyEngine:
                 signals, str(out.get("strategy_name") or ""),
                 str(out.get("reason") or ""),
             )
+        if out.get("action") != "NO_TRADE":
+            return out
+
+        # Unbanked solvency: participation IC / opposite rail on any flat
+        # NO_TRADE after 11:30 (not only post-stop retry).
+        if self._session_still_flat() or bool(
+            self.market_engine.state.get("unbanked_stop_retry_armed")
+        ):
+            part = self._session_participation_decision(
+                signals, str(out.get("reason") or "NO_TRADE")
+            )
+            if part is not None:
+                return part
+
+        # Session floor: still flat after 11:45 → exactly one 1-lot ticket.
+        if not self._session_still_flat():
+            return out
+        try:
+            _now = now_ist().time()
+        except Exception:
+            return out
+        try:
+            _floor_end = getattr(
+                self.config, "trading_window_last_entry", dtime(14, 40)
+            )
+        except Exception:
+            _floor_end = dtime(14, 40)
+        # Floor after 12:15 — extended session harvest for still-flat books.
+        # Keep WIDE debit edge-break rules below; quiet-OR pin can fire first.
+        if _now < dtime(12, 15) or _now >= _floor_end:
+            return out
+        _prior = str(out.get("reason") or "NO_TRADE")
+        _or = str(signals.get("or_condition") or "")
+        # Measured open→spot drift required for debit floor (no coin-flip).
+        try:
+            _sp = float(signals.get("spot") or 0.0)
+            _op = float(
+                signals.get("day_open_spot")
+                or signals.get("day_open")
+                or 0.0
+            )
+            _drift = abs(_sp - _op) if (_sp > 0 and _op > 0) else 0.0
+        except (TypeError, ValueError):
+            _drift = 0.0
+        _px = str(signals.get("price_regime") or "")
+        _trend_px = _px in (
+            "UPTREND", "STRONG_UPTREND", "DOWNTREND", "STRONG_DOWNTREND",
+        )
+        try:
+            _adx_f = float(signals.get("adx_15") or 0.0)
+        except (TypeError, ValueError):
+            _adx_f = 0.0
+        _strong = float(
+            getattr(self.config, "adx_strong_threshold", 28.0) or 28.0
+        )
+        _trend = float(
+            getattr(self.config, "adx_trend_threshold", 20.0) or 20.0
+        )
+        if _or in ("WIDE", "VERY_WIDE"):
+            # Spent-upside pullback BPS before mid-box pin (with-trend).
+            if _now >= dtime(13, 0):
+                if self._spent_upside_pullback_bps_ok(signals, _adx_f):
+                    alt = self._try_spent_upside_pullback_bps(
+                        signals, f"session_floor_spent_pullback|{_prior}"
+                    )
+                    if alt is not None:
+                        return alt
+            # WIDE flats: containment pin first (true mid-box behaviour),
+            # then participation/solvency, then measured debit floor.
+            if _now >= dtime(13, 30):
+                _notes_f = str(signals.get("final_regime_notes") or "")
+                _fr_f = str(
+                    getattr(signals.get("final_regime"), "value", None)
+                    or signals.get("final_regime")
+                    or ""
+                )
+                _contain_f = (
+                    bool(signals.get("wide_or_containment"))
+                    or bool(signals.get("exhausted_move_condor"))
+                    or "CONTAINMENT_PIN" in _notes_f
+                    or "RICH_VOL_PIN" in _notes_f
+                    or "CHOPPY_RICH_VOL_MID_PIN" in _notes_f
+                    or _fr_f == "PREMIUM_SELL_RANGE"
+                )
+                # Late unbanked mid-box: synthesize containment when regime
+                # stayed NO_TRADE but the auction is spent / rich-vol mid.
+                if not _contain_f and _now >= dtime(14, 20):
+                    try:
+                        _rng_f, _loc_f, _, _ = self._session_range_pos(signals)
+                    except Exception:
+                        _loc_f, _rng_f = 0.5, 0.0
+                    _vol_f = str(signals.get("vol_regime") or "")
+                    _adx_syn = 26.0 if _now < dtime(15, 0) else 20.0
+                    if (
+                        0.30 <= _loc_f <= 0.80
+                        and _rng_f >= 40.0
+                        and _adx_f < _adx_syn
+                        and _vol_f in (
+                            "SELL_PREMIUM", "STRONG_SELL_PREMIUM",
+                            "BORDERLINE_SELL", "NEUTRAL",
+                        )
+                    ):
+                        signals["wide_or_containment"] = True
+                        signals["final_regime"] = "PREMIUM_SELL_RANGE"
+                        _contain_f = True
+                if _contain_f:
+                    alt = self._try_containment_credit_vertical(
+                        signals, f"session_floor_wide_contain|{_prior}"
+                    )
+                    if alt is not None:
+                        return alt
+                    # Front-week: also try pullback BPS under containment.
+                    if self._spent_upside_pullback_bps_ok(signals, _adx_f):
+                        alt = self._try_spent_upside_pullback_bps(
+                            signals, f"session_floor_contain_pullback|{_prior}"
+                        )
+                        if alt is not None:
+                            return alt
+            if _now >= dtime(12, 30) and _drift >= 15.0:
+                part2 = self._session_participation_decision(
+                    signals, f"session_floor_wide|{_prior}"
+                )
+                if part2 is not None:
+                    return part2
+            if _now >= dtime(13, 0):
+                alt = self._try_wide_credit_floor(
+                    signals, f"session_floor_wide_credit|{_prior}"
+                )
+                if alt is not None:
+                    return alt
+            try:
+                _oh = float(signals.get("or_high") or 0.0)
+                _ol = float(signals.get("or_low") or 0.0)
+                _through = (
+                    (_oh > 0 and _sp >= _oh + 5.0)
+                    or (_ol > 0 and _sp <= _ol - 5.0)
+                )
+                _soft = (
+                    (_oh > 0 and _sp >= _oh)
+                    or (_ol > 0 and _sp <= _ol)
+                )
+            except (TypeError, ValueError):
+                _through = _soft = False
+            _adx_floor = _strong if _now < dtime(13, 30) else max(15.0, _trend - 5.0)
+            if (
+                _now >= dtime(13, 0)
+                and (_through or (_now >= dtime(13, 30) and _soft))
+                and _adx_f >= _adx_floor
+                and _drift >= 10.0
+                and self._lane_direction(signals, soft=True) in (1, -1)
+            ):
+                alt = self._try_debit_lane(
+                    signals, f"session_floor_debit|{_prior}", floor=True,
+                )
+                if alt is not None:
+                    return alt
+            # Last-chance WIDE flat after 14:00: mid-box 1-lot credit
+            # theta first; debit only with soft OR touch + drift.
+            if _now >= dtime(14, 0):
+                alt = self._try_late_theta_vertical(
+                    signals, f"session_floor_late_theta|{_prior}"
+                )
+                if alt is not None:
+                    return alt
+            if (
+                _now >= dtime(14, 0)
+                and _drift >= 8.0
+                and _adx_f >= 12.0
+                and self._lane_direction(signals, soft=True) in (1, -1)
+            ):
+                alt = self._try_debit_lane(
+                    signals, f"session_floor_last_chance|{_prior}", floor=True,
+                )
+                if alt is not None:
+                    return alt
+        else:
+            alt = self._try_credit_floor_ic(signals, _prior)
+            if alt is not None:
+                return alt
+            # Quiet-OR debit only on a labelled strong trend.
+            if _trend_px and _adx_f >= _strong and _drift >= 20.0:
+                alt = self._try_debit_lane(
+                    signals, f"session_floor_debit|{_prior}", floor=True,
+                )
+                if alt is not None:
+                    return alt
+            # Quiet flat after 12:45: 1-lot drift debit from open→spot lane.
+            if (
+                _now >= dtime(12, 45)
+                and _drift >= 20.0
+                and self._lane_direction(signals) in (1, -1)
+            ):
+                alt = self._try_debit_lane(
+                    signals, f"session_floor_drift_debit|{_prior}", floor=True,
+                )
+                if alt is not None:
+                    return alt
         return out
 
     def _decide_core(self, signals: dict) -> dict:
@@ -10755,19 +13203,28 @@ class StrategyEngine:
             if action == "NO_TRADE":
                 # Do not consult momentum under hard ABORT / dead auth /
                 # missing spot — those are stand-downs, not sell-side
-                # expression gaps.
+                # expression gaps. Structural danger also waits (no knife
+                # debit substitute).
+                _r_l = str(reason or "").lower()
                 _stand = (
                     bool(signals.get("block_new_entries"))
                     or bool(signals.get("api_auth_dead"))
                     or signals.get("spot") is None
                     or "AUTH_FEED_DEAD" in str(reason or "").upper()
                     or "VIX_EMERGENCY" in str(reason or "").upper()
+                    or "green_day_lock" in _r_l
+                    or "loss_day_lock" in _r_l
                 )
-                if not _stand:
+                if (
+                    not _stand
+                    and not self._danger_blocks_debit_substitute(reason)
+                ):
                     alt = self._momentum_decision(signals, reason)
                     if alt is not None:
                         return alt
                     reason = self._with_momentum_refuse(signals, reason)
+                elif not _stand and self._danger_blocks_debit_substitute(reason):
+                    reason = f"{reason}|danger_no_debit_substitute"
             self._log_decision(signals, action, reason)
             self._persist_decision(signals, "NONE", reason, None, action)
             self.market_engine.finalize_cycle_log(
@@ -10775,21 +13232,64 @@ class StrategyEngine:
             )
             return {"action": action, "reason": reason}
 
+        # Dual-rail: after one unbanked credit stop, try debit peer first
+        # (and vice versa) before re-mapping the same rail.
+        if (
+            signals.get("_prefer_opposite_rail")
+            and str(signals.get("_opposite_of_rail") or "") == "credit"
+        ):
+            alt = self._momentum_decision(
+                signals, "unbanked_stop_opposite_rail_debit"
+            )
+            if alt is not None:
+                self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+                return alt
+
         strategy_name, selection_reason = self._map_regime_to_strategy(signals)
         if strategy_name == "NO_TRADE":
             _stand = (
                 bool(signals.get("api_auth_dead"))
                 or signals.get("spot") is None
             )
-            if not _stand:
+            if (
+                not _stand
+                and not self._danger_blocks_debit_substitute(selection_reason)
+            ):
                 alt = self._momentum_decision(signals, selection_reason)
                 if alt is not None:
+                    self.market_engine.state.pop("unbanked_stop_retry_armed", None)
                     return alt
                 selection_reason = self._with_momentum_refuse(
                     signals, selection_reason
                 )
+            elif (
+                not _stand
+                and self._danger_blocks_debit_substitute(selection_reason)
+            ):
+                selection_reason = (
+                    f"{selection_reason}|danger_no_debit_substitute"
+                )
             else:
                 selection_reason = str(selection_reason or "NO_TRADE")
+            self._log_decision(signals, "NO_TRADE", selection_reason)
+            self._persist_decision(
+                signals, "NO_TRADE", selection_reason, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", selection_reason, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": selection_reason}
+
+        # After a debit stop, refuse re-buying the same rail — stay on credit.
+        if (
+            signals.get("_prefer_opposite_rail")
+            and str(signals.get("_opposite_of_rail") or "") == "debit"
+            and strategy_name in (LONG_CALL, LONG_PUT)
+        ):
+            strategy_name, selection_reason = "NO_TRADE", (
+                f"{selection_reason}:unbanked_stop_skip_same_debit_rail"
+            )
+            alt = None  # credit map already failed into long-only; fall through
             self._log_decision(signals, "NO_TRADE", selection_reason)
             self._persist_decision(
                 signals, "NO_TRADE", selection_reason, None, "NO_TRADE"
@@ -11020,41 +13520,73 @@ class StrategyEngine:
                         _storm_alt = self._entry_abort_storm_blocks(
                             _alt_name, signals
                         )
+                        # CT was evaluated for IRON_CONDOR (no-op for
+                        # vertical gates). Re-run on the demoted BPS/BCS
+                        # so afternoon / NO_TRADE-RANGE / hard invariant
+                        # still bind (10-29 BCS demote skipped them).
+                        _ct_alt = self._counter_trend_entry_refusal(
+                            _alt_name, signals
+                        )
                         if _storm_alt:
                             full_reason = (
                                 f"params_invalid:{fail_reason}"
                                 f"|demote_{_alt_name}_storm:{_storm_alt}"
                             )
+                        elif _ct_alt:
+                            full_reason = (
+                                f"params_invalid:{fail_reason}"
+                                f"|demote_{_alt_name}_ct:{_ct_alt}"
+                            )
                         else:
-                            self._clear_construct_fail()
-                            signals["_intent"] = self._build_decision_intent(
-                                _alt_name, signals, _alt_reason
+                            _boot_d = self._bootstrap_hot_credit_refusal(
+                                _alt_name, signals
                             )
-                            if isinstance(_alt_params, dict):
-                                _alt_params["_intent"] = signals["_intent"]
-                            self.logger.info(
-                                f"IC construct demoted → {_alt_name} "
-                                f"(was {fail_reason[:100]})"
+                            _env_d = (
+                                None if _boot_d
+                                else self._apply_day_pnl_risk_envelope(
+                                    _alt_params, signals
+                                )
                             )
-                            self._log_decision(
-                                signals, "STRATEGY_SELECTED", _alt_reason,
-                                _alt_name, _alt_params,
-                            )
-                            self._persist_decision(
-                                signals, _alt_name, _alt_reason,
-                                _alt_params, "STRATEGY_SELECTED",
-                            )
-                            self.market_engine.finalize_cycle_log(
-                                f"STRATEGY_SELECTED:{_alt_name}",
-                                None, self._count_open_positions(),
-                            )
-                            return {
-                                "action":        "ENTER",
-                                "strategy_name": _alt_name,
-                                "reason":        _alt_reason,
-                                "params":        _alt_params,
-                                "intent":        signals.get("_intent"),
-                            }
+                            if _boot_d:
+                                full_reason = (
+                                    f"params_invalid:{fail_reason}"
+                                    f"|demote_{_alt_name}_boot:{_boot_d}"
+                                )
+                            elif _env_d:
+                                full_reason = (
+                                    f"params_invalid:{fail_reason}"
+                                    f"|demote_{_alt_name}_env:{_env_d}"
+                                )
+                            else:
+                                self._clear_construct_fail()
+                                signals["_intent"] = self._build_decision_intent(
+                                    _alt_name, signals, _alt_reason
+                                )
+                                if isinstance(_alt_params, dict):
+                                    _alt_params["_intent"] = signals["_intent"]
+                                self.logger.info(
+                                    f"IC construct demoted → {_alt_name} "
+                                    f"(was {fail_reason[:100]})"
+                                )
+                                self._log_decision(
+                                    signals, "STRATEGY_SELECTED", _alt_reason,
+                                    _alt_name, _alt_params,
+                                )
+                                self._persist_decision(
+                                    signals, _alt_name, _alt_reason,
+                                    _alt_params, "STRATEGY_SELECTED",
+                                )
+                                self.market_engine.finalize_cycle_log(
+                                    f"STRATEGY_SELECTED:{_alt_name}",
+                                    None, self._count_open_positions(),
+                                )
+                                return {
+                                    "action":        "ENTER",
+                                    "strategy_name": _alt_name,
+                                    "reason":        _alt_reason,
+                                    "params":        _alt_params,
+                                    "intent":        signals.get("_intent"),
+                                }
                     else:
                         full_reason = (
                             f"params_invalid:{fail_reason}"
@@ -11068,10 +13600,13 @@ class StrategyEngine:
             if sticky:
                 full_reason = sticky
 
-            alt = self._momentum_decision(signals, full_reason)
-            if alt is not None:
-                return alt
-            full_reason = self._with_momentum_refuse(signals, full_reason)
+            if not self._danger_blocks_debit_substitute(full_reason):
+                alt = self._momentum_decision(signals, full_reason)
+                if alt is not None:
+                    return alt
+                full_reason = self._with_momentum_refuse(signals, full_reason)
+            else:
+                full_reason = f"{full_reason}|danger_no_debit_substitute"
             if "neutral" in full_reason.lower() or "vrp" in full_reason.lower():
                 self._log_phantom_if_neutral(signals, full_reason)
             self._log_decision(signals, "NO_TRADE", full_reason)
@@ -11099,6 +13634,64 @@ class StrategyEngine:
                 return _tf
         if isinstance(params, dict):
             params["_intent"] = signals.get("_intent")
+        _boot = self._bootstrap_hot_credit_refusal(strategy_name, signals)
+        if _boot:
+            if strategy_name in (BEAR_CALL_SPREAD, BULL_PUT_SPREAD):
+                _ic_alt = self._solvency_ic_bootstrap(
+                    signals, selection_reason, size_mult
+                )
+                if _ic_alt is not None:
+                    return _ic_alt
+            if not self._danger_blocks_debit_substitute(_boot):
+                alt = self._momentum_decision(signals, _boot)
+                if alt is not None:
+                    return alt
+                _boot = self._with_momentum_refuse(signals, _boot)
+            else:
+                _boot = f"{_boot}|danger_no_debit_substitute"
+            self._log_decision(signals, "NO_TRADE", _boot)
+            self._persist_decision(
+                signals, strategy_name, _boot, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _boot, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _boot}
+        # Credit keeps natural size; only clamp if this path built a debit.
+        # Unbanked debit only — credit keeps natural size (1-lot credit
+        # clamp turned green harvest days into thin/red scratches).
+        if strategy_name in (LONG_CALL, LONG_PUT):
+            self._clamp_unbanked_one_lot(params, debit_only=True)
+        if strategy_name == IRON_CONDOR and not self._credit_target_clears_costs(
+            params
+        ):
+            _thin = "ic_target_does_not_clear_roundtrip_costs"
+            alt = self._momentum_decision(signals, _thin)
+            if alt is not None:
+                return alt
+            _thin = self._with_momentum_refuse(signals, _thin)
+            self._log_decision(signals, "NO_TRADE", _thin)
+            self._persist_decision(
+                signals, strategy_name, _thin, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _thin, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _thin}
+        _env = self._apply_day_pnl_risk_envelope(params, signals)
+        if _env:
+            alt = self._momentum_decision(signals, _env)
+            if alt is not None:
+                return alt
+            _env = self._with_momentum_refuse(signals, _env)
+            self._log_decision(signals, "NO_TRADE", _env)
+            self._persist_decision(
+                signals, strategy_name, _env, None, "NO_TRADE"
+            )
+            self.market_engine.finalize_cycle_log(
+                "NO_TRADE", _env, self._count_open_positions()
+            )
+            return {"action": "NO_TRADE", "reason": _env}
         # Latch OR extreme once only when we actually hand ENTER to
         # execution — map/resolve must not burn the day on a failed fill.
         if strategy_name == BEAR_CALL_SPREAD:
@@ -11117,6 +13710,7 @@ class StrategyEngine:
                 or signals.get("post_debit_bounce_fade")
             ):
                 self.market_engine.state.pop("post_bear_debit_bounce_unlock", None)
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
         self._log_decision(
             signals, "STRATEGY_SELECTED", selection_reason, strategy_name, params
         )

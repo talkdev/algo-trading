@@ -3327,6 +3327,12 @@ class ExecutionEngine:
                 return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, _ctx
             return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, _ctx
 
+        # Soft-stop grace disabled: holding micro WIDE stops deepened reds
+        # (Nov3 −₹168 → −₹1,058). Structural stops remain authoritative.
+        _grace_fire = False
+        _grace_age = 99.0
+        _grace_adverse = 0.0
+
         # ── Priority 1: Delta breach ──────────────────────────────────────
         # Short leg delta > 0.40 → close immediately
         for leg in open_legs:
@@ -3381,6 +3387,13 @@ class ExecutionEngine:
                 else:
                     delta_thresh_p1 = _abs_p1
             if cur_delta > delta_thresh_p1:
+                if _grace_fire:
+                    self.logger.info(
+                        f"ENTRY GRACE skip delta breach "
+                        f"{opt_type} {strike:.0f} age={_grace_age:.1f}m "
+                        f"adverse={_grace_adverse:.2f}"
+                    )
+                    continue
                 self.logger.warning(
                     f"PRIORITY 1 DELTA BREACH: {leg['action']} {opt_type} "
                     f"{strike:.0f} delta={cur_delta:.3f} > {delta_thresh_p1}"
@@ -3488,6 +3501,13 @@ class ExecutionEngine:
                                 max((1.0 - _prox_gap_frac) * _gap, 10.0),
                             )
                     if abs(spot - strike) <= _band:
+                        if _grace_fire:
+                            self.logger.info(
+                                f"ENTRY GRACE skip spot proximity "
+                                f"age={_grace_age:.1f}m "
+                                f"adverse={_grace_adverse:.2f}"
+                            )
+                            continue
                         self.logger.warning(
                             f"PRIORITY 2 SPOT PROXIMITY: spot={spot:.0f} "
                             f"within {_band:.0f}pts of {_prox_action} "
@@ -3598,16 +3618,22 @@ class ExecutionEngine:
                         _ti_against = True
                         _ti_detail = f"impulse_dn_{_ti_dn:.0f}_gt_{_ti_lim:.0f}"
                     if _ti_against:
-                        self.logger.warning(
-                            f"TAPE ADVERSE IMPULSE: {_ti_name} {_ti_detail} "
-                            f"hold={_ti_hold:.1f}m state={_ti_state}"
-                        )
-                        return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
-                            "reason_detail": (
-                                f"tape_adverse_impulse_{_ti_detail}"
-                                f"_state_{_ti_state or 'na'}"
-                            ),
-                        }
+                        if _grace_fire:
+                            self.logger.info(
+                                f"SOFT-STOP GRACE skip tape impulse "
+                                f"{_ti_detail} adverse={_grace_adverse:.2f}"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"TAPE ADVERSE IMPULSE: {_ti_name} {_ti_detail} "
+                                f"hold={_ti_hold:.1f}m state={_ti_state}"
+                            )
+                            return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                                "reason_detail": (
+                                    f"tape_adverse_impulse_{_ti_detail}"
+                                    f"_state_{_ti_state or 'na'}"
+                                ),
+                            }
         except Exception as _ti_exc:
             self.logger.debug(f"tape impulse exit skipped: {_ti_exc}")
 
@@ -3726,20 +3752,26 @@ class ExecutionEngine:
                 and liq_premium > _flip_under_need
                 and _flip_hold_min >= _flip_hold_floor
             ):
-                _flip_tag = _flip_sticky_px if _flip_sticky else _flip_px
-                self.logger.warning(
-                    f"PATCH_V12 TREND FLIP: {_flip_name} held into "
-                    f"{_flip_tag} (adx={_flip_adx:.0f} mature"
-                    f"{', sticky' if _flip_sticky else ''}), "
-                    f"liq={liq_premium:.2f} vs credit={entry_credit:.2f} — closing early"
-                )
-                return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
-                    "reason_detail": (
-                        f"trend_flip_exit_{_flip_tag}_adx_{_flip_adx:.0f}_"
-                        f"liq_{liq_premium:.2f}_vs_credit_{entry_credit:.2f}"
-                        f"{'_sticky' if _flip_sticky else ''}"
-                    ),
-                }
+                if _grace_fire:
+                    self.logger.info(
+                        f"SOFT-STOP GRACE skip trend flip "
+                        f"adverse={_grace_adverse:.2f}"
+                    )
+                else:
+                    _flip_tag = _flip_sticky_px if _flip_sticky else _flip_px
+                    self.logger.warning(
+                        f"PATCH_V12 TREND FLIP: {_flip_name} held into "
+                        f"{_flip_tag} (adx={_flip_adx:.0f} mature"
+                        f"{', sticky' if _flip_sticky else ''}), "
+                        f"liq={liq_premium:.2f} vs credit={entry_credit:.2f} — closing early"
+                    )
+                    return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                        "reason_detail": (
+                            f"trend_flip_exit_{_flip_tag}_adx_{_flip_adx:.0f}_"
+                            f"liq_{liq_premium:.2f}_vs_credit_{entry_credit:.2f}"
+                            f"{'_sticky' if _flip_sticky else ''}"
+                        ),
+                    }
             # v65m35/56: winner harvest on adverse labelled trend — require a
             # real peak (≥10% of credit) then ≥25% give-back of that peak
             # (was 45%: waited too long for the flip and lost the max).
@@ -4694,17 +4726,25 @@ class ExecutionEngine:
             )
 
             if _all_cheap or _single_short or _near_max_profit:
-                _detail = ",".join(
-                    f"{t}{s:.0f}={m:.2f}" for s, t, m in cheap_marks
-                )
-                self.logger.info(
-                    f"PRIORITY 5 CHEAP BUYBACK: shorts [{_detail}] "
-                    f"liq={liq_premium:.2f} credit={gross_credit:.2f}"
-                )
-                return "CLOSE_TARGET", EXIT_PRIORITY_CHEAP_BUYBACK, {
-                    "reason_detail": f"cheap_buyback[{_detail}]",
-                    "liquidation_premium": liq_premium,
-                }
+                # Net credit must still be winning on the liquidation mark.
+                # 10-22 BCS printed CLOSE_TARGET at liq 41 > entry 36.8
+                # (−₹384) when a single short looked "cheap".
+                if float(entry_credit or 0.0) > 0 and float(liq_premium) >= float(
+                    entry_credit
+                ):
+                    pass
+                else:
+                    _detail = ",".join(
+                        f"{t}{s:.0f}={m:.2f}" for s, t, m in cheap_marks
+                    )
+                    self.logger.info(
+                        f"PRIORITY 5 CHEAP BUYBACK: shorts [{_detail}] "
+                        f"liq={liq_premium:.2f} credit={gross_credit:.2f}"
+                    )
+                    return "CLOSE_TARGET", EXIT_PRIORITY_CHEAP_BUYBACK, {
+                        "reason_detail": f"cheap_buyback[{_detail}]",
+                        "liquidation_premium": liq_premium,
+                    }
 
         # ── Priority 6: Time-based target ─────────────────────────────────
         if entry_credit > 0:
@@ -4852,7 +4892,13 @@ class ExecutionEngine:
                     if target_premium > 0
                     else _best_target
                 )
-                if liq_premium <= effective_target:
+                if (
+                    liq_premium <= effective_target
+                    and (
+                        float(entry_credit or 0.0) <= 0
+                        or float(liq_premium) < float(entry_credit)
+                    )
+                ):
                     self.logger.info(
                         f"PRIORITY 6 TIME TARGET: {position['strategy_name']} "
                         f"liq={liq_premium:.2f} <= target={effective_target:.2f}"
@@ -4865,7 +4911,14 @@ class ExecutionEngine:
                     }
 
             # Also check stored target_premium (set at entry)
-            if target_premium > 0 and liq_premium <= target_premium:
+            if (
+                target_premium > 0
+                and liq_premium <= target_premium
+                and (
+                    float(entry_credit or 0.0) <= 0
+                    or float(liq_premium) < float(entry_credit)
+                )
+            ):
                 return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
                     "current_premium": current_premium,
                     "liquidation_premium": liq_premium,
@@ -5047,6 +5100,48 @@ class ExecutionEngine:
                     f"({position['position_id'][:16]})"
                 )
                 continue
+
+            # Credit CLOSE_TARGET must be a real harvest. 10-22 BCS exited
+            # CLOSE_TARGET with liq 41 ≥ entry 36.8 (−₹384) via a path that
+            # never checked net P&L.
+            if action == "CLOSE_TARGET":
+                _sn_t = str(position.get("strategy_name") or "")
+                _is_credit_t = (
+                    "BEAR_CALL" in _sn_t
+                    or "BULL_PUT" in _sn_t
+                    or "CONDOR" in _sn_t
+                    or "IRON" in _sn_t
+                    or "BUTTERFLY" in _sn_t
+                )
+                try:
+                    _ec_t = float(position.get("entry_credit") or 0.0)
+                except (TypeError, ValueError):
+                    _ec_t = 0.0
+                try:
+                    _liq_t = float(
+                        (context or {}).get("liquidation_premium")
+                        or (context or {}).get("current_premium")
+                        or 0.0
+                    )
+                except (TypeError, ValueError):
+                    _liq_t = 0.0
+                if _is_credit_t and _ec_t > 0 and _liq_t >= _ec_t:
+                    self.logger.info(
+                        f"Skip underwater CLOSE_TARGET for {_sn_t}: "
+                        f"liq={_liq_t:.2f} >= entry={_ec_t:.2f}"
+                    )
+                    continue
+                # Thin TARGET harvest that cannot clear round-trip costs
+                # prints CLOSE_TARGET reds (Nov13/Sep23 IC class). Hold.
+                if _is_credit_t and _ec_t > 0 and _liq_t > 0:
+                    _harv_pts = _ec_t - _liq_t
+                    if _harv_pts < max(2.0, 0.06 * _ec_t):
+                        self.logger.info(
+                            f"Skip thin CLOSE_TARGET for {_sn_t}: "
+                            f"harvest={_harv_pts:.2f}pts "
+                            f"(<{max(2.0, 0.06 * _ec_t):.2f} min)"
+                        )
+                        continue
 
             if action in (
                 "CLOSE_STOP", "CLOSE_TARGET",
@@ -5514,10 +5609,13 @@ class ExecutionEngine:
     def _update_state_after_close(
         self, reason: str, net_pnl_rs: float, priority: int
     ) -> None:
-        """A trend-first flip close books P&L, capital and halts like any
-        close, but leaves the entry-gate memory as it was: the long that asked
-        for the flip was qualified on that state (Sep18: the flipped BPS
-        re-armed after_extreme_fade and refused the put it made room for)."""
+        """A trend-first flip close books P&L like any close, but restores
+        pre-flip last_exit_*/stop-budget keys so the long that asked for the
+        flatten is not blocked by entry_cooldown / stop clocks (Sep24 put).
+
+        Same-side chase still needs to know which credit was flattened, so
+        after the restore we stamp last_flat_credit_* crumbs only — never
+        last_exit_time (that would re-arm anti-churn and kill the long)."""
         state = self.market_engine.state
         if not state.pop("_tf_flip_closing", False):
             return self._update_state_after_close_core(reason, net_pnl_rs, priority)
@@ -5528,6 +5626,10 @@ class ExecutionEngine:
         try:
             return self._update_state_after_close_core(reason, net_pnl_rs, priority)
         finally:
+            _flat_side = state.get("last_exit_strategy_side")
+            _flat_xr = state.get("last_exit_reason")
+            _flat_name = state.get("last_exit_strategy_name")
+            _flat_spot = state.get("last_exit_spot")
             for k in [
                 k for k in list(state.keys())
                 if (k.startswith(self._FLIP_KEEP_PREFIXES) or k in self._FLIP_KEEP_KEYS)
@@ -5535,6 +5637,17 @@ class ExecutionEngine:
             ]:
                 state.pop(k, None)
             state.update(_keep)
+            # Chase crumbs only after a protective STOP flatten. A TARGET
+            # flip (Sep24 BCS) must not leave a sticky BEAR harvest/stop
+            # memory that blocks the afternoon same-side reload while the
+            # long that asked for the flatten is still working.
+            if _flat_side and str(_flat_xr or "").startswith("CLOSE_STOP"):
+                state["last_flat_credit_side"] = _flat_side
+                state["last_flat_credit_reason"] = _flat_xr
+                if _flat_name:
+                    state["last_flat_credit_name"] = _flat_name
+                if _flat_spot:
+                    state["last_flat_credit_spot"] = _flat_spot
 
     def _update_state_after_close_core(
         self, reason: str, net_pnl_rs: float, priority: int
@@ -5611,6 +5724,28 @@ class ExecutionEngine:
             state["last_exit_strategy_side"] = "RANGE"
         elif _sname_x:
             state["last_exit_strategy_side"] = "OTHER"
+        # Afternoon RANGE verticals need a prior banked credit (see
+        # StrategyEngine._afternoon_range_credit_refusal).
+        try:
+            _banked_credit_tgt = (
+                (
+                    reason == "CLOSE_TARGET"
+                    or str(reason or "").startswith("CLOSE_PROFIT")
+                )
+                and float(net_pnl_rs or 0.0) > 0.0
+                and (
+                    "BULL_PUT" in _sname_x
+                    or "BEAR_CALL" in _sname_x
+                    or "CONDOR" in _sname_x
+                    or "BUTTERFLY" in _sname_x
+                )
+            )
+        except (TypeError, ValueError):
+            _banked_credit_tgt = False
+        if _banked_credit_tgt:
+            state["session_credit_target_count"] = int(
+                state.get("session_credit_target_count", 0) or 0
+            ) + 1
         # After a banked bear debit, clear a burned OR-low latch and arm one
         # opposite put-credit (Oct5: LONG_PUT target at 12:21 then 13:40
         # reclaim was dead because morning false reclaim set used, and LP
@@ -5704,11 +5839,34 @@ class ExecutionEngine:
                 )
                 state["last_stop_signal_combo"] = combo
 
-            # Halt trading after 2 consecutive stops
-            if int(state.get("consecutive_stops", 0) or 0) >= 2:
+            # Dual-rail: record which rail stopped. Hard-halt after the first
+            # protective stop — a second ticket trying to "make it back" is
+            # how green mornings become red days. Opposite-rail retry is
+            # armed only while day_pnl is still ≥ 0 (scratch/near-scratch).
+            _streak_now = int(state.get("consecutive_stops", 0) or 0)
+            if "LONG_" in _sname_x:
+                state["last_stop_rail"] = "debit"
+            elif _sname_x:
+                state["last_stop_rail"] = "credit"
+            try:
+                _dp_halt = float(state.get("daily_pnl") or 0.0)
+            except (TypeError, ValueError):
+                _dp_halt = 0.0
+            if _streak_now >= 1 and _dp_halt < 0:
+                state["daily_halted"] = True
+                self.logger.warning(
+                    "stop left day red — halting trading for the day"
+                )
+            elif _streak_now >= 2:
                 state["daily_halted"] = True
                 self.logger.warning(
                     "2 consecutive stops — halting trading for the day"
+                )
+            elif _streak_now == 1 and _dp_halt >= 0:
+                state["unbanked_stop_retry_armed"] = True
+                self.logger.info(
+                    "1 near-scratch stop — opposite-rail micro retry armed "
+                    f"(rail={state.get('last_stop_rail')})"
                 )
 
         elif reason in (
@@ -6538,7 +6696,11 @@ def _self_test() -> None:
     # Set up valid state
     market_engine.state["daily_pnl"]       = 0.0
     market_engine.state["current_capital"] = config.starting_capital
-    market_engine.state["entry_start"]     = "09:45"
+    market_engine.state["entry_start"]     = (
+        config.trading_window_start.strftime("%H:%M")
+        if getattr(config, "trading_window_start", None) is not None
+        else "09:30"
+    )
     market_engine.state["entry_end"]       = "14:00"
     market_engine.state["hard_exit_time"]  = "15:00"
     market_engine.last_chain               = mock_chain

@@ -2008,6 +2008,31 @@ class BacktestRunner:
         )
         st["daily_pnl"] = 0.0
         st["daily_halted"] = False
+        # Shard session_state / aux_json is the live EOD snapshot. Replay
+        # must not inherit end-of-day sticky refuses or banked-credit
+        # counters — those blanked 10-16 BCS substitutes and 11-11 after
+        # a prior BT wrote session_no_calls_after_uptrend_refuse=1.
+        for _k in (
+            "session_no_calls_after_uptrend_refuse",
+            "session_no_puts_after_downtrend_refuse",
+            "session_range_credit_blocked",
+            "session_credit_target_count",
+            "last_flat_credit_side",
+            "last_flat_credit_reason",
+            "last_flat_credit_name",
+            "last_flat_credit_spot",
+            "last_exit_strategy_side",
+            "last_exit_reason",
+            "last_exit_time",
+            "last_exit_spot",
+            "last_exit_pnl_rs",
+            "consecutive_stops",
+            "entry_count",
+        ):
+            st.pop(_k, None)
+        st["session_credit_target_count"] = 0
+        st["entry_count"] = 0
+        st["consecutive_stops"] = 0
 
         stride = max(1, int(self.cycle_stride or 1))
         n_cycles = len(day.cycles)

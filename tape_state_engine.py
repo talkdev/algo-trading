@@ -420,6 +420,21 @@ def entry_when_block_reason(signals: dict, final_regime: Optional[str], config: 
     # window under CRUSHING IV / ADX~40+ / HIGH). Debit chase on the spent
     # side stays refused in strategy_engine._momentum_gate.
     if state == TREND_EXHAUSTED:
+        # Structure-confirmed with-trend credit: a spread struck away from
+        # price harvests a trend that merely holds, so "implied move used"
+        # is not a reason to refuse it while the structure (efficient travel,
+        # displacement, right side of the session mean) is intact.
+        try:
+            _sd = int(signals.get("struct_trend") or 0)
+        except (TypeError, ValueError):
+            _sd = 0
+        if bool(getattr(config, "struct_trend_enabled", True)) and bool(
+            getattr(config, "struct_credit_waive", True)
+        ):
+            if (fr == "PREMIUM_SELL_BULL" and _sd > 0) or (
+                fr == "PREMIUM_SELL_BEAR" and _sd < 0
+            ):
+                return None
         try:
             exh = float(getattr(config, "exhausted_move_pct", 100.0) or 100.0)
         except (TypeError, ValueError):
@@ -438,8 +453,15 @@ def entry_when_block_reason(signals: dict, final_regime: Optional[str], config: 
             )
         except (TypeError, ValueError):
             _adx_strong = 28.0
-        _conf_h = str(signals.get("confidence_level") or "").upper()
-        _iv_h = str(signals.get("iv_behavior") or "")
+        # str(ConfidenceLevel.HIGH) → "ConfidenceLevel.HIGH" on this
+        # runtime — comparing to "HIGH" silently failed the Oct6 harvest
+        # waiver and left TREND_EXHAUSTED blocking with-trend BPS all day.
+        _conf_raw = signals.get("confidence_level")
+        _conf_h = str(
+            getattr(_conf_raw, "value", None) or _conf_raw or ""
+        ).upper()
+        _iv_raw = signals.get("iv_behavior")
+        _iv_h = str(getattr(_iv_raw, "value", None) or _iv_raw or "")
         try:
             _dte_h = signals.get("actual_dte")
             if _dte_h is None:
@@ -447,26 +469,74 @@ def entry_when_block_reason(signals: dict, final_regime: Optional[str], config: 
             _dte_h = int(_dte_h if _dte_h is not None else -1)
         except (TypeError, ValueError):
             _dte_h = -1
-        # Near-expiry life weight only — weekly at-highs chase stays refused.
+        # Near-expiry life weight — OR a real pullback from the spent
+        # extreme (weekly WIDE flats were dark: at-highs chase refused,
+        # but off-high ≥35pts is harvest, not chase).
         from core import dte_blend as _dte_blend_h
+        from core import now_ist as _now_ist_h
+        from datetime import time as _time_h
         _harvest_ok = (
             float(_dte_blend_h(_dte_h if _dte_h >= 0 else 2)) >= 0.9
             and _conf_h == "HIGH"
             and _adx_h >= _adx_strong
             and _iv_h in ("STABLE", "DECLINING", "CRUSHING", "")
         )
+        try:
+            _t_h = _now_ist_h().time()
+        except Exception:
+            _t_h = _time_h(0, 0)
+        try:
+            _sp_h = float(signals.get("spot") or 0.0)
+            _hi_h = float(
+                signals.get("day_high_so_far") or signals.get("day_high") or 0.0
+            )
+            _lo_h = float(
+                signals.get("day_low_so_far") or signals.get("day_low") or 0.0
+            )
+        except (TypeError, ValueError):
+            _sp_h = _hi_h = _lo_h = 0.0
+        _pull_bull = (
+            _t_h >= _time_h(13, 0)
+            and _sp_h > 0
+            and _hi_h > 0
+            and (_hi_h - _sp_h) >= 35.0
+            and _iv_h in ("STABLE", "DECLINING", "CRUSHING", "")
+        )
+        _pull_bear = (
+            _t_h >= _time_h(13, 0)
+            and _sp_h > 0
+            and _lo_h > 0
+            and (_sp_h - _lo_h) >= 35.0
+            and _iv_h in ("STABLE", "DECLINING", "CRUSHING", "")
+        )
         if fr == "PREMIUM_SELL_BEAR" and px_s <= 0 and day_dn >= exh:
-            if not _harvest_ok:
+            if not (_harvest_ok or _pull_bear):
                 return f"tape_when_{state}_{detail or 'exhausted_bear_chase'}"
             return None
         if fr == "PREMIUM_SELL_BULL" and px_s >= 0 and day_up >= exh:
-            if not _harvest_ok:
+            if not (_harvest_ok or _pull_bull):
                 return f"tape_when_{state}_{detail or 'exhausted_bull_chase'}"
             return None
         return None
 
+    # COIL: delay directional credit, do not erase the whole session.
+    # After OR is ready and dwell has matured, dual-rail lets micro credit
+    # or the debit peer express; a permanent coil ban produced all-day flats.
     if state == COIL and directional:
-        return f"tape_when_{state}_{detail or 'coil_no_directional'}"
+        try:
+            dwell = float(signals.get("tape_dwell_min") or 0.0)
+        except (TypeError, ValueError):
+            dwell = 0.0
+        try:
+            dwell_need = float(
+                getattr(config, "regime_entry_dwell_min", 5.0) or 5.0
+            )
+        except (TypeError, ValueError):
+            dwell_need = 5.0
+        # Short dwell still waits; once dwell clears, fail-open for dual-rail.
+        if dwell < max(2.0, dwell_need * 0.5):
+            return f"tape_when_{state}_{detail or 'coil_no_directional'}"
+        return None
 
     return None
 
@@ -586,6 +656,11 @@ def _self_test() -> None:
     # Oct6-class: TREND_EXHAUSTED + HIGH + strong ADX + crushing IV → allow
     # with-trend BPS harvest on 0DTE (spent upside is not a chase for put
     # credit). Weeklies stay refused.
+    try:
+        from regime_engine import ConfidenceLevel as _CL
+        _conf_enum = _CL.HIGH
+    except Exception:
+        _conf_enum = "HIGH"
     s5 = {
         "tape_state": TREND_EXHAUSTED,
         "tape_state_reason": "side_move_167_up=167_dn=17_adx_41_dte_0",
@@ -597,7 +672,8 @@ def _self_test() -> None:
         "day_move_used_pct": 98.0,
         "price_regime": "UPTREND",
         "adx_15": 41.0,
-        "confidence_level": "HIGH",
+        # Enum form is what live/BT merge into signals — must waive.
+        "confidence_level": _conf_enum,
         "iv_behavior": "CRUSHING",
         "actual_dte": 0,
     }

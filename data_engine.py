@@ -564,7 +564,9 @@ class MarketDataEngine:
         except (TypeError, ValueError):
             dte_i = 2
 
-        exp_start, exp_end, exp_exit = "10:30", "13:00", "15:00"
+        exp_start = str(getattr(self.config, "expiry_entry_start", "10:30"))
+        exp_end = str(getattr(self.config, "expiry_entry_end", "13:00"))
+        exp_exit = "15:00"
         wk_start = self.config.trading_window_start.strftime("%H:%M")
         wk_end = self.config.trading_window_last_entry.strftime("%H:%M")
         wk_exit = self.config.hard_exit_time.strftime("%H:%M")
@@ -869,6 +871,12 @@ class MarketDataEngine:
                 "last_exit_is_stale_weekly",
                 "last_exit_is_regime_rotation",
                 "last_exit_strategy_side",
+                # Trend-first flip crumbs (chase only; no last_exit_time)
+                "last_flat_credit_side",
+                "last_flat_credit_reason",
+                "last_flat_credit_name",
+                "last_flat_credit_spot",
+                "session_credit_target_count",
                 # v58: fade unlocks must survive mid-session restart
                 "last_exit_is_afternoon_low_fade",
                 "last_exit_is_afternoon_high_fade",
@@ -879,8 +887,9 @@ class MarketDataEngine:
                 "tape_adx_hist",
                 "tape_px_hist",
                 "session_mean_reversion_book",
-                "session_no_calls_after_uptrend_refuse",
-                "session_no_puts_after_downtrend_refuse",
+                # Sticky trend refuses are in-memory only. Persisting them
+                # into aux_json poisoned same-day BT reloads (10-16/11-11
+                # inherited EOD session_no_calls_*=1 and stayed flat).
                 "events_calendar_hash",
                 "events_calendar_snapshot",
                 "day_mode_latched",
@@ -1540,6 +1549,83 @@ class MarketDataEngine:
             "or_score":     or_score,
             "partial":      False,
         }
+
+    def _structure_trend(self, df5, spot, vix) -> dict:
+        """Price-only trend read that does not wait for ADX/EMA maturity.
+
+        A trend is present when the last N 5-minute closes travelled
+        efficiently (Kaufman efficiency ratio >= struct_er_min), the day's
+        displacement from the open is material against the VIX-implied
+        daily sigma (>= struct_disp_sig), and price sits on the same side
+        of the session mean as the move. Once established the read is held
+        (hysteresis) until price closes back through the session mean, so
+        one pullback bar cannot flip the label RANGE<->TREND (the ADX
+        route printed UPTREND/RANGE/UPTREND inside a single +1.7% day).
+
+        Returns {"dir": +1/-1/0, "strength": 0/1/2, "er", "disp_sig"}.
+        """
+        out = {"dir": 0, "strength": 0, "er": 0.0, "disp_sig": 0.0}
+        try:
+            if df5 is None or df5.empty or "close" not in df5.columns:
+                return out
+            d = df5
+            if "datetime" in d.columns:
+                _last_day = d["datetime"].iloc[-1].date()
+                d = d[d["datetime"].dt.date == _last_day]
+            closes = [float(x) for x in d["close"].tolist() if x == x]
+            if len(closes) < 7:
+                return out
+            _day_open = float(d["open"].iloc[0]) if "open" in d.columns else closes[0]
+            if spot:
+                closes[-1] = float(spot)
+            n = min(12, len(closes) - 1)
+            net = closes[-1] - closes[-1 - n]
+            path = sum(abs(closes[j] - closes[j - 1])
+                       for j in range(len(closes) - n, len(closes)))
+            er = abs(net) / path if path > 0 else 0.0
+            disp = closes[-1] - _day_open
+            _v = float(vix) if vix else 15.0
+            sig = closes[-1] * _v / 100.0 / math.sqrt(252.0)
+            twap = sum(closes) / len(closes)
+            side = closes[-1] - twap
+            disp_sig = disp / sig if sig > 0 else 0.0
+            out["er"] = round(er, 3)
+            out["disp_sig"] = round(disp_sig, 3)
+
+            er_min = float(getattr(self.config, "struct_er_min", 0.35))
+            disp_min = float(getattr(self.config, "struct_disp_sig", 0.30))
+            hold_buf = float(getattr(self.config, "struct_release_sig", 0.05))
+            strong_er = float(getattr(self.config, "struct_strong_er", 0.45))
+            strong_disp = float(getattr(self.config, "struct_strong_disp_sig", 0.80))
+
+            cand = 0
+            if er >= er_min and abs(disp_sig) >= disp_min:
+                s = 1 if net > 0 else -1
+                if (disp > 0) == (s > 0) and (side > 0) == (s > 0):
+                    cand = s
+
+            _day = str(_last_day) if "datetime" in df5.columns else ""
+            latch = self.state.get("struct_latch")
+            if not isinstance(latch, dict) or latch.get("day") != _day:
+                latch = {"day": _day, "dir": 0}
+            if cand != 0:
+                latch["dir"] = cand
+            elif latch["dir"] != 0:
+                # release when the session mean is lost, or the day's net
+                # displacement has flipped sign
+                lost = (side * latch["dir"]) < -hold_buf * sig
+                flipped = (disp * latch["dir"]) <= 0
+                if lost or flipped:
+                    latch["dir"] = 0
+            self.state["struct_latch"] = latch
+            out["dir"] = int(latch["dir"])
+            if out["dir"] != 0:
+                out["strength"] = 2 if (
+                    er >= strong_er and abs(disp_sig) >= strong_disp
+                ) else 1
+        except Exception:
+            return {"dir": 0, "strength": 0, "er": 0.0, "disp_sig": 0.0}
+        return out
 
     def classify_orb_price_structure(
         self,
@@ -2940,23 +3026,24 @@ class MarketDataEngine:
             except Exception:
                 should_refresh = True
 
-        # Tuesday is the 0DTE day by design (section 26 entry window). On
-        # 2026-09-08 the morning contract list lacked the same-day series,
-        # discovery fell through to the next weekly, and the engine then
-        # sat on DTE5 for three hours because the TTL said the (wrong)
-        # answer was fresh. A cached expiry that is not today on a Tuesday
-        # is never fresh: bypass the TTL and re-discover every cycle until
-        # the 0DTE series appears. (No hard entry block here — MAX_DTE and
-        # the DTE-indexed sizing already refuse to trade the wrong series
-        # as if it were the expiry contract; this just shortens the blind
-        # window from hours to one cycle.)
+        # Expiry day (Tuesday or holiday-shifted Monday) must trade today's
+        # series. A cached next-week expiry on calendar DTE0 left Nov9 on
+        # DTE5 all session (solvency/credit refused as above max_dte).
         try:
-            if (today_ist().weekday() == 1 and cached_expiry is not None
-                    and now_ist().time() < dtime(15, 30)):
-                if str(cached_expiry)[:10] != today_ist().isoformat():
+            _today = today_ist()
+            try:
+                _cal0 = int(ExpiryCalendar.get_dte(_today)) == 0
+            except Exception:
+                _cal0 = _today.weekday() == 1
+            if (
+                _cal0
+                and cached_expiry is not None
+                and now_ist().time() < dtime(15, 30)
+            ):
+                if str(cached_expiry)[:10] != _today.isoformat():
                     if not should_refresh:
                         self.logger.warning(
-                            f"Tuesday active expiry {cached_expiry} is not "
+                            f"Expiry-day active series {cached_expiry} is not "
                             f"today — forcing re-discovery (TTL bypassed)"
                         )
                     should_refresh = True
@@ -2970,8 +3057,13 @@ class MarketDataEngine:
                 )
                 today    = today_ist()
                 now_time = now_ist().time()
-                is_tue   = today.weekday() == 1
-                is_0dte  = is_tue
+                # Calendar DTE 0 includes holiday-shifted Monday expiries
+                # (e.g. 2026-11-09): never skip today's series for next week.
+                try:
+                    _cal_dte = int(ExpiryCalendar.get_dte(today))
+                except Exception:
+                    _cal_dte = 1 if today.weekday() != 1 else 0
+                is_0dte = (_cal_dte == 0) or (today.weekday() == 1)
 
                 future: List[Tuple[int, date]] = []
                 seen: set = set()
@@ -2992,25 +3084,44 @@ class MarketDataEngine:
                 if future:
                     future.sort(key=lambda x: x[0])
                     if is_0dte:
-                        zero_dte = [f for f in future if f[0] == 0]
-                        expiry   = zero_dte[0][1] if zero_dte else future[0][1]
-                    else:
-                        preferred = [f for f in future if f[0] >= 1]
-                        expiry    = preferred[0][1] if preferred else future[0][1]
-
-                    is_tue_full = today.weekday() == 1
-                    if is_tue_full:
                         zero_dte_today = [f for f in future if f[0] == 0]
-                        expiry = zero_dte_today[0][1] if zero_dte_today else future[0][1]
+                        expiry = (
+                            zero_dte_today[0][1]
+                            if zero_dte_today
+                            else future[0][1]
+                        )
                     else:
                         preferred = [f for f in future if f[0] >= 1]
-                        expiry = preferred[0][1] if preferred else future[0][1]
-                    expiry_dte = 0
-                    _d = today + timedelta(days=1)
-                    while _d <= expiry:
-                        if not ExpiryCalendar.is_holiday(_d):
-                            expiry_dte += 1
-                        _d += timedelta(days=1)
+                        expiry = (
+                            preferred[0][1] if preferred else future[0][1]
+                        )
+
+                    def _trading_dte(exp: date) -> int:
+                        _n = 0
+                        _d0 = today + timedelta(days=1)
+                        while _d0 <= exp:
+                            if not ExpiryCalendar.is_holiday(_d0):
+                                _n += 1
+                            _d0 += timedelta(days=1)
+                        return _n
+
+                    # Prefer nearest listed series within the tradeable DTE
+                    # ceiling so holiday gaps do not park the book on DTE5+
+                    # when a nearer contract exists.
+                    try:
+                        _max_td = int(
+                            getattr(self.config, "max_dte_tradeable", 5) or 5
+                        )
+                    except (TypeError, ValueError):
+                        _max_td = 5
+                    if not is_0dte and preferred:
+                        _in_cap = [
+                            f for f in preferred
+                            if _trading_dte(f[1]) <= _max_td
+                        ]
+                        if _in_cap:
+                            expiry = _in_cap[0][1]
+                    expiry_dte = _trading_dte(expiry)
                     self.state["actual_expiry"]       = expiry.isoformat()
                     self.state["actual_dte"]          = expiry_dte
                     self.state["expiry_last_checked"] = now_ist().isoformat()
@@ -3958,6 +4069,11 @@ class MarketDataEngine:
         )
         hh_hl = TechnicalEngine.detect_hh_hl(market_df15)
 
+        # Structural trend read (price-only, causal, available from the
+        # first 5-minute bars - no ADX/EMA maturity wait). See
+        # _structure_trend for the definition.
+        _struct = self._structure_trend(df5, spot, vix)
+
         # ADX condition label
         adx_condition = "INSUFFICIENT_DATA"
         if adx_15 > 0:
@@ -4351,6 +4467,10 @@ class MarketDataEngine:
             "day_low":                  float(_day_low or 0.0),
 
             # Technical
+            "struct_trend":             _struct["dir"],
+            "struct_strength":          _struct["strength"],
+            "struct_er":                _struct["er"],
+            "struct_disp_sig":          _struct["disp_sig"],
             "adx_15":                   adx_15,
             "adx_15_raw":               adx_15_raw,
             "adx_5":                    adx_5,

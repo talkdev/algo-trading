@@ -266,18 +266,13 @@ ENV_TEMPLATE = """# ────────────────────
 # `load_config()` in core.py. Those defaults reproduce the previously
 # shipped env.txt values exactly, so behaviour is unchanged.
 #
-# Optional master switch: LONG_OPTIONS_ONLY=true allows only LONG_CALL and
-# LONG_PUT entries; existing position management and all strategy/risk logic
-# remain unchanged. Your API key / secret / redirect URI are NOT needed here.
+# Your API key / secret / redirect URI are NOT needed here.
 #
 # Daily ritual: paste today's token after UPSTOX_ACCESS_TOKEN= and run.
 # ─────────────────────────────────────────────
 
 UPSTOX_ACCESS_TOKEN=
 
-# Optional: block new credit spreads/condors; allow only long calls and puts.
-# Defaults to false (existing strategy behaviour).
-LONG_OPTIONS_ONLY=false
 """
 
 
@@ -830,7 +825,7 @@ class Config:
     # cheap protective wings (Rs 1-3) are not rejected over a 0.10 tick.
     spread_abs_tolerance:    float = 0.85
     # Highest DTE at which the credit structures may be opened.
-    max_dte_tradeable:       int   = 4
+    max_dte_tradeable:       int   = 5
 
     # ── v3.2 profitability calibration ────────────────────────────────
     # Premium stop as a multiple of the NET credit, by DTE. The v3.1
@@ -916,7 +911,6 @@ class Config:
     # that many lots on fills after all gates/sizing have already run.
     force_lots:                Optional[int] = None
     # Master entry filter: allow only LONG_CALL / LONG_PUT when enabled.
-    long_options_only:         bool = False
     # Structure economics.
     wing_cost_frac_max:        float = 0.50
     condor_weak_side_min_frac: float = 0.30
@@ -1001,7 +995,9 @@ class Config:
     # board; banning it left 15-Sep (a -458 crash) with no long-
     # premium route at all. Half risk + 2-lot cap, see below.
     momentum_min_dte:              int   = 0
-    momentum_max_dte:              int   = 7
+    # Debit beyond ~3 DTE has weak intraday edge on NIFTY weeklies;
+    # far-week longs (DTE 5+) were lottery tickets that printed red days.
+    momentum_max_dte:              int   = 3
     # Trend confirmation: the fast (5m) ADX the strategy layer actually
     # consumes, and the OR/VWAP structure that proves it is a breakout and
     # not a drift inside a range.
@@ -1080,62 +1076,32 @@ class Config:
     momentum_counter_regime_size:  float = 0.5
     # Credit book on: a qualifying trend long pre-empts a credit ENTER.
     momentum_trend_first:          bool  = True
-    # Pre-registered clean long-only module (Misc/clean_long_v1_preregistration.md, v1b).
-    clean_long_v1:                 bool  = False
-    # v2 (in-sample tuned): one stop-and-reverse after a losing clean trade.
-    clean_long_reverse:            bool  = True
-    # Rupee risk per clean trade at the OR-mid stop; 0 = always FORCE_LOTS.
-    clean_long_risk_rs:            float = 0.0
-    # Move the clean stop to entry once spot is this many R in favour; 0 = off.
-    clean_long_be_r:               float = 0.50
-    # Skip a CALL breakout when the OR itself closed near the high of a
-    # narrow morning range (exhausted upside already spent in the OR).
-    clean_long_exhaust_or_loc:     float = 0.85
-    clean_long_exhaust_or_width:   float = 120.0
-    # Skip a first-trade CALL whose breakout is a tiny poke through ORH while
-    # the OR itself closed mid-range (false-break chop, e.g. 2026-09-17).
-    clean_long_weak_ext_frac:      float = 0.05
-    clean_long_weak_or_loc_lo:     float = 0.40
-    clean_long_weak_or_loc_hi:     float = 0.60
-    # After a losing PUT, allow the reverse CALL on a confirmed mid-reclaim
-    # (2 closes above mid + EMA) instead of waiting for a full ORH break.
-    clean_long_failed_flip:        bool  = True
-    # Minutes to wait after a losing clean exit before any reverse signal
-    # bar may fire (blocks 6-minute stop-and-reverse whipsaws).
-    clean_long_reverse_cooldown_min: int = 20
-    # After a near-full CLEAN_LONG_RISK_RS loss on a wide OR (>=150), refuse
-    # the mid-reclaim flip (still allow a full ORH/ORL reverse). Stops
-    # stacking a second budget on spent wide-OR failures (2026-11-09).
-    clean_long_no_flip_after_full_loss: bool = True
-    # Stronger form: refuse ANY reverse (flip and ORH) after a wide-OR
-    # near-full-budget loser. Narrow-OR reverse winners (10-01 / 10-30)
-    # keep a full second budget.
-    clean_long_no_reverse_after_full_wide_loss: bool = True
-    # On a wide-OR partial first loss, size the reverse with leftover budget
-    # only; refuse if leftover < residual_min_frac × RISK_RS. Narrow OR
-    # ignores residual (full RISK_RS reverse).
-    clean_long_wide_or_residual:   bool  = True
-    clean_long_residual_min_frac:  float = 0.25
-    # Stand down when closed clean-long day PnL ≤ −day_floor_mult × RISK_RS.
-    # Default 2.0 allows one full reverse after a single ₹20k stop.
-    clean_long_day_floor_mult:     float = 2.0
-    # First-trade size multiplier on event days or material open gaps.
-    # Default 1.0 (off): 0.50 cut Sep15/Oct15/Oct21-class winners hard
-    # (−₹137k on Sep9–Nov6). Keep the knob for live experiment only.
-    clean_long_event_gap_size:     float = 1.0
-    # Flip stop uses OR mid (not far OR extreme) so reclaim failures cannot
-    # bleed all the way to ORL/ORH (2026-11-09 CALL).
-    clean_long_flip_stop_at_mid:   bool  = True
-    # Premium giveback on 0DTE only, after the +1R spot trail has armed:
-    # exit when liquidation value gives back this fraction of (peak − entry),
-    # once peak ≥ arm_mult × entry. Expiry-day bleed while spot holds
-    # (2026-11-03). DTE1+ ignores these. Off when giveback is 0.
-    # prem_after: HH:MM — do not evaluate premium trail before this clock
-    # (14:00 keeps Sep15/Sep22 morning runners; still banks Nov3 bleed).
-    clean_long_prem_trail:         bool  = True
-    clean_long_prem_arm_mult:      float = 1.50
-    clean_long_prem_giveback:      float = 0.25
-    clean_long_prem_after:         str   = "14:00"
+    # Structural trend read (data_engine._structure_trend): price-only,
+    # causal, no ADX/EMA maturity wait. Used as the primary price-regime
+    # trend label and to waive the lagging ADX / IV-behaviour vetoes on
+    # the long-premium route while the structure confirms the direction.
+    struct_trend_enabled:          bool  = True
+    # Momentum-gate ADX/spent-move vetoes waived on a structure-confirmed
+    # trend, per side (puts earn vega on a drop; call premium decays on a
+    # rally as IV falls, so the call side is judged separately).
+    struct_gate_waive_puts:        bool  = False
+    struct_gate_waive_calls:       bool  = False
+    # Bootstrap (unbanked debit) ADX floor / IV-behaviour veto waived on a
+    # structure-confirmed trend, per side.
+    struct_boot_waive_puts:        bool  = True
+    struct_boot_waive_calls:       bool  = True
+    # Waive the TREND_EXHAUSTED refusal of with-trend credit (BPS in a
+    # structural up-trend, BCS in a down-trend).
+    struct_credit_waive:           bool  = True
+    struct_er_min:                 float = 0.35
+    struct_disp_sig:               float = 0.30
+    struct_release_sig:            float = 0.05
+    struct_strong_er:              float = 0.45
+    struct_strong_disp_sig:        float = 0.80
+    # Expiry-day (DTE0) entry window anchors (blended by DTE toward the
+    # weekly window). Previously hard-coded 10:30 / 13:00.
+    expiry_entry_start:            str   = "09:45"
+    expiry_entry_end:              str   = "14:15"
     # Sizing: the debit route risks the stop, not the notional, and the
     # weekday/VRP size schedule that disciplines short-premium books is
     # floored here so a high-conviction breakout is not sized into the
@@ -1144,9 +1110,17 @@ class Config:
     momentum_risk_frac_of_budget:  float = 1.00
     momentum_min_lots:             float = 0.60
     momentum_max_trades_per_day:   int   = 1
+    # Post-bank risk envelope floor (₹). With day P&L > 0 the next ticket's
+    # max risk was capped at the banked P&L alone, so a ₹19 win left a
+    # ₹19 envelope — 28x tighter than the ₹13k pre-bank micro cap used when
+    # the day is FLAT. 0 keeps the legacy "risk <= bank" rule (a second
+    # ticket can never turn a green day red, but one-trade days stay tiny).
+    # 43-day replay: 0 -> ₹161.1k 33/6/4; 3000 -> ₹164.2k 33/6/4 (no new
+    # red day); 6000 -> ₹179.9k but two new small reds (-₹899, -₹245).
+    day_pnl_envelope_floor_rs:     float = 3000.0
     # Continuation clips allowed after banked winners (see _momentum_gate).
     momentum_reload_after_win:     int   = 1
-    momentum_min_minutes_left:     int   = 90
+    momentum_min_minutes_left:     int   = 60
     # Cap on the cash actually committed, as a multiple of the per-trade
     # risk budget: a long option's worst case is its premium, and that is
     # only realised if it is carried to expiry, which the hard exit forbids.
@@ -1245,10 +1219,14 @@ class Config:
         # open_spike_wait cycles with structure lean while ADX matured).
         "open_spike_wait", "unresolved_lower_high",
         # TapeState WHEN-layer refusals still reach the debit substitute so
-        # TURN_STARTING / COIL can express long. TREND_EXHAUSTED also matches
-        # via the "tape_when" prefix, but _momentum_gate hard-refuses that
-        # label — unlocking it minted the Oct6 LONG_CALL scratch (−₹4).
-        "tape_when", "turn_starting",
+        # TURN_STARTING / COIL / TREND_EXHAUSTED can express long under
+        # dual-rail (session solvency micro-sizes the ticket).
+        "tape_when", "turn_starting", "trend_exhausted", "coil",
+        # Session solvency / dual-rail: credit micro-refuses and envelope
+        # caps must reach the debit peer, not die as sell_side_open.
+        "bootstrap", "prebank_micro", "day_pnl_envelope",
+        "unbanked_stop", "opposite_rail", "participation_deadline",
+        "dual_rail_ema_peer",
         # Spent-side chase / bounce credit refuses are sell-expression
         # fences — the debit substitute must see them (Sep29: 86×
         # spent_downside_bounce_no_puts left momentum_sell_side_open).
@@ -1259,9 +1237,17 @@ class Config:
         # (Sep23/29/Oct22: RANGE_*_CONDOR_REQUIRES_SELL_PREMIUM_GOT_NEUTRAL
         # left momentum_sell_side_open for the whole window).
         "condor_requires", "got_neutral", "requires_sell_premium",
+        # Dual-rail: regime NO_TRADE that blocks SELLING must still reach
+        # the debit peer (VOL_NEUTRAL / CHOPPY / thin VRP / observing).
+        # ABORT / auth / no-spot stay stand-downs in _momentum_gate.
+        "vol_neutral", "no_trade:vol", "choppy", "observing",
+        "confidence_none", "before_09", "vrp_",
         # Wide-OR range stand-down still reaches the debit substitute so
         # a with-trend OR break can express (Sep29/Oct22/28 archetype).
         "range_wide_or", "wide_or_wide", "wide_or_very",
+        "quiet_pin",
+        # OR-lane / session-floor whole-engine expression.
+        "or_lane_debit", "session_floor",
     )
 
     # ══ PATCH_V13: closing-hour trend continuation ══════════════════════
@@ -1275,9 +1261,9 @@ class Config:
     # (v58 closed the 14:15–14:30 dead zone when cutoff was 14:15 and late
     # started at 14:30). PATCH_V45: not earlier than 14:30 — midday trend
     # residue before then bought losers (2026-09-09).
-    momentum_late_window_start:          str   = "14:30"
-    momentum_late_window_end:            str   = "14:57"
-    momentum_late_min_minutes_left:      int   = 25
+    momentum_late_window_start:          str   = "15:05"
+    momentum_late_window_end:            str   = "15:10"
+    momentum_late_min_minutes_left:      int   = 10
     # A closing-hour ticket is paid for out of a session that is nearly
     # over: it needs a MEASURED-STRONG trend, not merely a present one. This
     # reuses adx_strong_threshold's meaning rather than inventing a number.
@@ -1357,10 +1343,9 @@ class Config:
     # cut + 90-minute floor had made untradeable by construction.
     credit_min_minutes_left:             float = 90.0
     afternoon_credit_after_hhmm:         str   = "13:00"
-    afternoon_credit_min_minutes_left:   float = 50.0
-    # Sell-regime classification cutoff; MUST equal momentum_late_window_start
-    # (v58). Was 14:15 while late started 14:30 → 15m dead zone.
-    sell_regime_cutoff_hhmm:             str   = "14:30"
+    afternoon_credit_min_minutes_left:   float = 15.0
+    # Sell-regime classification cutoff; MUST equal momentum_late_window_start.
+    sell_regime_cutoff_hhmm:             str   = "15:05"
 
     # ══ PATCH_V13: entry/exit trend symmetry ════════════════════════════
     # The exit ladder already ejects a credit vertical that a measured trend
@@ -1784,12 +1769,11 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         stamp_duty_buy_options=_get_float(env, "STAMP_DUTY_BUY_OPTIONS", 0.00003),
 
         # Windows
-        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 45)),
-        # PATCH_V45: 14:00 -> 14:15. With the afternoon 50-minute hard-exit
-        # buffer this unlocks credit through ~14:15 on a 15:15 weekly flat
-        # (was ~13:45 under the old flat 90-minute floor). Stops short of
-        # momentum_late at 14:30 so the routes abut rather than compete.
-        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(14, 15)),
+        # Extended session: open 09:30 (OR still gates real risk), last
+        # entry 14:50 with afternoon buffer into the 15:15 weekly flat.
+        trading_window_start=_get_time(env, "TRADING_WINDOW_START", dtime(9, 30)),
+        # Last entry 15:05 — 10m buffer into 15:15 weekly flat (extended).
+        trading_window_last_entry=_get_time(env, "TRADING_WINDOW_LAST_ENTRY", dtime(15, 5)),
         # Defined-risk, non-expiry NIFTY positions may remain open past the
         # 15:00 expiry-day square-off, leaving a small but tradeable
         # final-theta window while deliberately flattening before the
@@ -1864,14 +1848,18 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         vix_fail_limit=_get_int(env, "VIX_FAIL_LIMIT", 5),
 
         # VRP
-        vrp_sell_threshold_default=_get_float(env, "VRP_SELL_THRESHOLD", 2.0),
+        # Dual-rail: slightly lower sell bar so borderline rich days express
+        # credit instead of sitting NEUTRAL→flat (was 2.0).
+        vrp_sell_threshold_default=_get_float(env, "VRP_SELL_THRESHOLD", 1.5),
         vrp_fair_threshold_default=_get_float(env, "VRP_FAIR_THRESHOLD", 1.0),
         vrp_smoothing_cycles=_get_int(env, "VRP_SMOOTHING_CYCLES", 5),
 
         # Regime
         regime_calc_interval_sec=_get_int(env, "REGIME_CALC_INTERVAL_SEC", 15),
         regime_persistence_cycles=_get_int(env, "REGIME_PERSISTENCE_CYCLES", 3),
-        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 125.0),
+        # Dual-rail: spent-move NEUTRAL stamp was blanking sell days that still
+        # had harvest left; 150 leaves threat-side strategy gates in charge.
+        day_move_used_block_pct=_get_float(env, "DAY_MOVE_USED_BLOCK_PCT", 150.0),
         day_move_range_factor=min(max(
             _get_float(env, "DAY_MOVE_RANGE_FACTOR", 1.93), 1.0), 2.5),
 
@@ -1942,7 +1930,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         entry_slippage_mult=_get_float(env, "ENTRY_SLIPPAGE_MULT", 0.35),
         exit_slippage_mult=_get_float(env, "EXIT_SLIPPAGE_MULT", 2.25),
         spread_abs_tolerance=_get_float(env, "SPREAD_ABS_TOLERANCE", 0.85),
-        max_dte_tradeable=_get_int(env, "MAX_DTE_TRADEABLE", 4),
+        max_dte_tradeable=_get_int(env, "MAX_DTE_TRADEABLE", 5),
 
         # v3.2 profitability calibration
         stop_mult_dte0=min(max(_get_float(env, "STOP_MULT_DTE0", 1.60), 1.15), 2.50),
@@ -1989,7 +1977,6 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         force_lots=(
             (lambda _n: _n if _n >= 1 else None)(_get_int(env, "FORCE_LOTS", 0))
         ),
-        long_options_only=_get_bool(env, "LONG_OPTIONS_ONLY", False),
         wing_cost_frac_max=min(max(_get_float(env, "WING_COST_FRAC_MAX", 0.50), 0.10), 0.70),
         condor_weak_side_min_frac=min(max(_get_float(env, "CONDOR_WEAK_SIDE_MIN_FRAC", 0.30), 0.05), 0.50),
         # v4.2 fresh-weekly (DTE >= 2) intraday premium selling
@@ -2012,8 +1999,10 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         # ── v5 long-premium momentum expression ───────────────────────────
         momentum_enabled=_get_bool(env, "MOMENTUM_ENABLED", True),
         momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 0),  # PATCH_V12: was 1
-        momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 7),
-        momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 24.0), 15.0), 60.0),  # PATCH_V12: was 30.0
+        momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 3),
+        # Dual-rail: align debit ADX floor with credit trend threshold so
+        # soft directional days are not credit-refused AND debit-dark.
+        momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 20.0), 15.0), 60.0),
         momentum_event_adx_min=min(max(_get_float(env, "MOMENTUM_EVENT_ADX_MIN", 32.0), 24.0), 60.0),
         momentum_or_break_frac=min(max(_get_float(env, "MOMENTUM_OR_BREAK_FRAC", 0.15), 0.0), 1.00),
         momentum_vwap_buffer_pts=min(max(_get_float(env, "MOMENTUM_VWAP_BUFFER_PTS", 8.0), 0.0), 60.0),
@@ -2054,69 +2043,27 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_final_cut_min=min(max(_get_int(env, "MOMENTUM_FINAL_CUT_MIN", 60), 0), 120),
         momentum_counter_regime_size=min(max(_get_float(env, "MOMENTUM_COUNTER_REGIME_SIZE", 0.5), 0.1), 1.0),
         momentum_trend_first=_get_bool(env, "MOMENTUM_TREND_FIRST", True),
-        clean_long_v1=_get_bool(env, "CLEAN_LONG_V1", False),
-        clean_long_reverse=_get_bool(env, "CLEAN_LONG_REVERSE", True),
-        clean_long_risk_rs=max(_get_float(env, "CLEAN_LONG_RISK_RS", 0.0), 0.0),
-        clean_long_be_r=max(_get_float(env, "CLEAN_LONG_BE_R", 0.50), 0.0),
-        clean_long_exhaust_or_loc=min(
-            max(_get_float(env, "CLEAN_LONG_EXHAUST_OR_LOC", 0.85), 0.50), 1.00
-        ),
-        clean_long_exhaust_or_width=max(
-            _get_float(env, "CLEAN_LONG_EXHAUST_OR_WIDTH", 120.0), 0.0
-        ),
-        clean_long_weak_ext_frac=min(
-            max(_get_float(env, "CLEAN_LONG_WEAK_EXT_FRAC", 0.05), 0.0), 0.50
-        ),
-        clean_long_weak_or_loc_lo=min(
-            max(_get_float(env, "CLEAN_LONG_WEAK_OR_LOC_LO", 0.40), 0.0), 1.0
-        ),
-        clean_long_weak_or_loc_hi=min(
-            max(_get_float(env, "CLEAN_LONG_WEAK_OR_LOC_HI", 0.60), 0.0), 1.0
-        ),
-        clean_long_failed_flip=_get_bool(env, "CLEAN_LONG_FAILED_FLIP", True),
-        clean_long_reverse_cooldown_min=max(
-            _get_int(env, "CLEAN_LONG_REVERSE_COOLDOWN_MIN", 20), 0
-        ),
-        clean_long_no_flip_after_full_loss=_get_bool(
-            env, "CLEAN_LONG_NO_FLIP_AFTER_FULL_LOSS", True
-        ),
-        clean_long_no_reverse_after_full_wide_loss=_get_bool(
-            env, "CLEAN_LONG_NO_REVERSE_AFTER_FULL_WIDE_LOSS", True
-        ),
-        clean_long_wide_or_residual=_get_bool(
-            env, "CLEAN_LONG_WIDE_OR_RESIDUAL", True
-        ),
-        clean_long_residual_min_frac=min(
-            max(_get_float(env, "CLEAN_LONG_RESIDUAL_MIN_FRAC", 0.25), 0.0), 1.0
-        ),
-        clean_long_day_floor_mult=max(
-            _get_float(env, "CLEAN_LONG_DAY_FLOOR_MULT", 2.0), 0.0
-        ),
-        clean_long_event_gap_size=min(
-            max(_get_float(env, "CLEAN_LONG_EVENT_GAP_SIZE", 1.0), 0.10), 1.0
-        ),
-        clean_long_flip_stop_at_mid=_get_bool(
-            env, "CLEAN_LONG_FLIP_STOP_AT_MID", True
-        ),
-        clean_long_prem_trail=_get_bool(env, "CLEAN_LONG_PREM_TRAIL", True),
-        clean_long_prem_arm_mult=min(
-            max(_get_float(env, "CLEAN_LONG_PREM_ARM_MULT", 1.50), 1.10), 3.00
-        ),
-        clean_long_prem_giveback=min(
-            max(_get_float(env, "CLEAN_LONG_PREM_GIVEBACK", 0.25), 0.0), 0.60
-        ),
-        clean_long_prem_after=(
-            lambda _s: _s
-            if len(_s) == 5 and _s[2] == ":" and _s[:2].isdigit() and _s[3:].isdigit()
-            else "14:00"
-        )((env.get("CLEAN_LONG_PREM_AFTER", "14:00") or "14:00").strip()),
+        struct_trend_enabled=_get_bool(env, "STRUCT_TREND_ENABLED", True),
+        struct_gate_waive_puts=_get_bool(env, "STRUCT_GATE_WAIVE_PUTS", False),
+        struct_gate_waive_calls=_get_bool(env, "STRUCT_GATE_WAIVE_CALLS", False),
+        struct_boot_waive_puts=_get_bool(env, "STRUCT_BOOT_WAIVE_PUTS", True),
+        struct_boot_waive_calls=_get_bool(env, "STRUCT_BOOT_WAIVE_CALLS", True),
+        struct_credit_waive=_get_bool(env, "STRUCT_CREDIT_WAIVE", True),
+        struct_er_min=_get_float(env, "STRUCT_ER_MIN", 0.35),
+        struct_disp_sig=_get_float(env, "STRUCT_DISP_SIG", 0.30),
+        struct_release_sig=_get_float(env, "STRUCT_RELEASE_SIG", 0.05),
+        struct_strong_er=_get_float(env, "STRUCT_STRONG_ER", 0.45),
+        struct_strong_disp_sig=_get_float(env, "STRUCT_STRONG_DISP_SIG", 0.80),
+        expiry_entry_start=env.get("EXPIRY_ENTRY_START", "09:45"),
+        expiry_entry_end=env.get("EXPIRY_ENTRY_END", "14:15"),
         momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
         momentum_risk_frac_of_budget=min(max(_get_float(env, "MOMENTUM_RISK_FRAC_OF_BUDGET", 1.00), 0.10), 1.00),
         momentum_min_lots=min(max(_get_float(env, "MOMENTUM_MIN_LOTS", 0.60), 0.10), 1.00),
         momentum_max_trades_per_day=_get_int(env, "MOMENTUM_MAX_TRADES_PER_DAY", 1),
+        day_pnl_envelope_floor_rs=max(_get_float(env, "DAY_PNL_ENVELOPE_FLOOR_RS", 3000.0), 0.0),
         momentum_spot_stop_pct=min(max(_get_float(env, "MOMENTUM_SPOT_STOP_PCT", 0.0033), 0.0), 0.02),
         momentum_reload_after_win=min(max(_get_int(env, "MOMENTUM_RELOAD_AFTER_WIN", 1), 0), 3),
-        momentum_min_minutes_left=_get_int(env, "MOMENTUM_MIN_MINUTES_LEFT", 90),
+        momentum_min_minutes_left=_get_int(env, "MOMENTUM_MIN_MINUTES_LEFT", 60),
         momentum_structural_risk_cap_mult=min(
             max(_get_float(env, "MOMENTUM_STRUCTURAL_RISK_CAP_MULT", 2.5), 1.0), 5.0
         ),
@@ -2137,20 +2084,24 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         # v58: late window + sell cutoff (were dataclass-only; env ignored)
         momentum_late_enabled=_get_bool(env, "MOMENTUM_LATE_ENABLED", True),
         momentum_late_window_start=(
-            env.get("MOMENTUM_LATE_WINDOW_START", "14:30").strip() or "14:30"
+            env.get("MOMENTUM_LATE_WINDOW_START", "15:05").strip() or "15:05"
         ),
         momentum_late_window_end=(
-            env.get("MOMENTUM_LATE_WINDOW_END", "14:57").strip() or "14:57"
+            env.get("MOMENTUM_LATE_WINDOW_END", "15:10").strip() or "15:10"
         ),
         momentum_late_min_minutes_left=min(
-            max(_get_int(env, "MOMENTUM_LATE_MIN_MINUTES_LEFT", 25), 5), 60
+            max(_get_int(env, "MOMENTUM_LATE_MIN_MINUTES_LEFT", 10), 5), 60
         ),
         momentum_late_adx_min=min(
             max(_get_float(env, "MOMENTUM_LATE_ADX_MIN", 28.0), 15.0), 60.0
         ),
-        # v58: always equal to late window start (no 14:15–14:30 dead zone)
+        afternoon_credit_min_minutes_left=min(
+            max(_get_float(env, "AFTERNOON_CREDIT_MIN_MINUTES_LEFT", 12.0), 8.0),
+            90.0,
+        ),
+        # Always equal to late window start (credit / late debit abut)
         sell_regime_cutoff_hhmm=(
-            env.get("MOMENTUM_LATE_WINDOW_START", "14:30").strip() or "14:30"
+            env.get("MOMENTUM_LATE_WINDOW_START", "15:05").strip() or "15:05"
         ),
         orphan_flatten_at_broker=_get_bool(env, "ORPHAN_FLATTEN_AT_BROKER", True),
         allow_same_cycle_reentry=_get_bool(env, "ALLOW_SAME_CYCLE_REENTRY", True),
