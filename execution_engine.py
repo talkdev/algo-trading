@@ -1857,6 +1857,35 @@ class ExecutionEngine:
                 )
             final_lots = _scaled
 
+        # LONG_MIN_REWARD_RISK: the expected rest-of-day move must pay for the
+        # stop. Off (0) by default.
+        try:
+            _rr_min = float(getattr(self.config, "long_min_reward_risk", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _rr_min = 0.0
+        if (
+            _rr_min > 0
+            and str(params.get("strategy_name") or "") in ("LONG_CALL", "LONG_PUT")
+        ):
+            try:
+                _leg0 = (params.get("legs") or [{}])[0]
+                _px0 = float(_leg0.get("exec_price") or 0.0)
+                _dl0 = abs(float(_leg0.get("delta") or 0.0))
+                _stp = float(params.get("stop_premium") or 0.0)
+                _em0 = float((signals or {}).get("expected_move_remaining_pts") or 0.0)
+            except (TypeError, ValueError):
+                _px0 = _dl0 = _stp = _em0 = 0.0
+            _risk_pts = _px0 - _stp
+            if _px0 > 0 and _risk_pts > 0 and _em0 > 0 and _dl0 > 0:
+                _rr = _em0 * _dl0 / _risk_pts
+                if _rr < _rr_min:
+                    return "NO_GO", {
+                        "reason": (
+                            f"long_reward_risk_{_rr:.2f}_lt_{_rr_min:.2f}"
+                            f"(em={_em0:.0f},delta={_dl0:.2f},stop={_risk_pts:.1f})"
+                        )
+                    }
+
         # LONG_FIXED_LOTS: long tickets trade a fixed size, applied last.
         try:
             _fixed_long = int(getattr(self.config, "long_fixed_lots", 0) or 0)

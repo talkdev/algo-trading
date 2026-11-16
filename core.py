@@ -1140,6 +1140,10 @@ class Config:
     # Fixed execution size for LONG_CALL/LONG_PUT entries (0 = engine
     # sizing). Applied last in execution validation, after every clamp.
     long_fixed_lots:               int   = 10
+    # Refuse a LONG_CALL/LONG_PUT whose expected rest-of-day reward
+    # (expected_move_remaining_pts × |delta|) is below this multiple of its
+    # stop distance (exec_price − stop_premium). 0 = off.
+    long_min_reward_risk:          float = 0.0
     # Momentum knife guards (HH:MM): before EARLY_UNTIL a debit needs STRONG
     # label + strong ADX + OR break; on a WIDE OR no debit before WIDE_UNTIL.
     # 43-day replay (natural size): EARLY 11:30 ₹95,796 7 longs; 10:45
@@ -2094,6 +2098,7 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         green_press_long=_get_bool(env, "GREEN_PRESS_LONG", False),
         long_only_mode=_get_bool(env, "LONG_ONLY_MODE", True),
         long_fixed_lots=max(int(_get_float(env, "LONG_FIXED_LOTS", 10)), 0),
+        long_min_reward_risk=max(_get_float(env, "LONG_MIN_REWARD_RISK", 0.0), 0.0),
         green_press_risk_banked_frac=max(_get_float(env, "GREEN_PRESS_RISK_BANKED_FRAC", 0.0), 0.0),
         momentum_early_gate_until=str(env.get("MOMENTUM_EARLY_GATE_UNTIL", "10:30") or "10:30").strip(),
         momentum_wide_or_gate_until=str(env.get("MOMENTUM_WIDE_OR_GATE_UNTIL", "12:30") or "12:30").strip(),
