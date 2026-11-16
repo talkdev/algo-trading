@@ -1118,6 +1118,17 @@ class Config:
     # 43-day replay: 0 -> ₹161.1k 33/6/4; 3000 -> ₹164.2k 33/6/4 (no new
     # red day); 6000 -> ₹179.9k but two new small reds (-₹899, -₹245).
     day_pnl_envelope_floor_rs:     float = 3000.0
+    # Unbanked (flat-day) LONG_CALL/LONG_PUT tickets clamped to 1 lot when
+    # true. 43-day replay (09-09..11-13): true ₹52,759 43/0; false (natural
+    # size) ₹95,796 43/0 — same 7 longs at ~3-7 lots; planned stop loss per
+    # long ≈ ₹7.5-12.7k, so a losing long now makes a red day.
+    unbanked_debit_one_lot:        bool  = False
+    # When the 1-lot clamp is off: cap the unbanked long's planned stop loss
+    # (total_max_risk) at this many rupees; 0 = natural engine sizing.
+    unbanked_debit_risk_rs:        float = 0.0
+    # After the day has banked green, allow ONE with-trend long (momentum
+    # gate must still qualify it; risk capped by the day-P&L envelope).
+    green_press_long:              bool  = False
     # Continuation clips allowed after banked winners (see _momentum_gate).
     momentum_reload_after_win:     int   = 1
     momentum_min_minutes_left:     int   = 60
@@ -2061,6 +2072,9 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_min_lots=min(max(_get_float(env, "MOMENTUM_MIN_LOTS", 0.60), 0.10), 1.00),
         momentum_max_trades_per_day=_get_int(env, "MOMENTUM_MAX_TRADES_PER_DAY", 1),
         day_pnl_envelope_floor_rs=max(_get_float(env, "DAY_PNL_ENVELOPE_FLOOR_RS", 3000.0), 0.0),
+        unbanked_debit_one_lot=_get_bool(env, "UNBANKED_DEBIT_ONE_LOT", False),
+        green_press_long=_get_bool(env, "GREEN_PRESS_LONG", False),
+        unbanked_debit_risk_rs=max(_get_float(env, "UNBANKED_DEBIT_RISK_RS", 0.0), 0.0),
         momentum_spot_stop_pct=min(max(_get_float(env, "MOMENTUM_SPOT_STOP_PCT", 0.0033), 0.0), 0.02),
         momentum_reload_after_win=min(max(_get_int(env, "MOMENTUM_RELOAD_AFTER_WIN", 1), 0), 3),
         momentum_min_minutes_left=_get_int(env, "MOMENTUM_MIN_MINUTES_LEFT", 60),

@@ -1155,7 +1155,11 @@ class StrategyEngine:
             day_pnl = 0.0
         # Banked day: never open a debit that can wipe the credit harvest
         # (Oct23 LONG_PUT −₹1.8k after BCS target).
-        if day_pnl > 0 and not bool(signals.get("_session_floor")):
+        if (
+            day_pnl > 0
+            and not bool(signals.get("_session_floor"))
+            and not bool(signals.get("_green_press"))
+        ):
             return "bootstrap_momentum_protect_banked_day"
         _retry = bool(signals.get("_prefer_opposite_rail"))
         # Structural trend confirmed by the tape itself (efficient travel,
@@ -1410,7 +1414,16 @@ class StrategyEngine:
             if _gp < 0:
                 return "NO_TRADE", "loss_day_lock_no_revenge_entries"
             if not bool(signals.get("_session_floor")):
-                return "NO_TRADE", "green_day_lock_no_new_entries"
+                # Green press: one with-trend long after a banked green
+                # (decide() refuses anything but LONG_* while pressing).
+                if (
+                    bool(getattr(self.config, "green_press_long", False))
+                    and state.get("green_press_date")
+                    != now_ist().date().isoformat()
+                ):
+                    signals["_green_press"] = True
+                else:
+                    return "NO_TRADE", "green_day_lock_no_new_entries"
         self._apply_two_way_location(signals, current_time)
         self._pre_tag_or_extreme_fades(signals, current_time)
         # After banked LONG_PUT: if a real lift off the low exists, tag the
@@ -12379,6 +12392,23 @@ class StrategyEngine:
         """Unbanked debit tickets are 1 lot — credit keeps natural size."""
         if not isinstance(params, dict):
             return
+        if debit_only and not bool(
+            getattr(self.config, "unbanked_debit_one_lot", False)
+        ):
+            # Size the unbanked long on a fixed rupee stop budget instead.
+            _cap_rs = float(
+                getattr(self.config, "unbanked_debit_risk_rs", 0.0) or 0.0
+            )
+            try:
+                _dp_c = float(self.market_engine.state.get("daily_pnl") or 0.0)
+            except (TypeError, ValueError):
+                _dp_c = 0.0
+            if _cap_rs > 0 and _dp_c <= 0:
+                # A refusal (one lot above the cap) keeps the 1-lot ticket.
+                self._resize_params_to_risk_cap(
+                    params, _cap_rs, "unbanked_debit_risk"
+                )
+            return
         if debit_only:
             _sn = str(
                 params.get("strategy_name")
@@ -12959,6 +12989,30 @@ class StrategyEngine:
         }
 
     def decide(self, signals: dict) -> dict:
+        signals.pop("_green_press", None)
+        out = self._decide_impl(signals)
+        if not signals.get("_green_press"):
+            return out
+        # Green press: after a banked green, only a with-trend LONG may open.
+        if (
+            out.get("action") == "ENTER"
+            and str(out.get("strategy_name") or "") in (LONG_CALL, LONG_PUT)
+        ):
+            self.market_engine.state["green_press_date"] = (
+                now_ist().date().isoformat()
+            )
+            return out
+        if out.get("action") == "ENTER":
+            return {
+                "action": "NO_TRADE",
+                "reason": (
+                    "green_day_lock_no_new_entries:press_non_long:"
+                    f"{out.get('strategy_name')}"
+                ),
+            }
+        return out
+
+    def _decide_impl(self, signals: dict) -> dict:
         if bool(getattr(self.config, "clean_long_v1", False)):
             self._note_price(signals)
             return self._clean_long_decide(signals)
