@@ -1386,15 +1386,14 @@ class Config:
     # the Priority-6 time-target ladder already does (40%/32%/24%). The
     # ratchet itself (keep_frac) is unchanged. DTE0 keeps its own gamma
     # ladder and is not affected.
-    profit_lock_pct_dte1plus_after_1330: float = 0.15
-    profit_lock_pct_dte1plus_after_1415: float = 0.10
-    # Immediate bank: once liquidation P&L reaches this fraction of the
-    # ticket (credit received, or debit paid), close the open trade. No
-    # trail, persist hold, or time-ladder may keep it open past this print.
-    hard_profit_take_pct:                float = 0.25
-    # Iron condor / butterfly: pin trades rarely print 22%+ same-day decay.
-    # Live Sep16/17 held ~7–11% winners to HARD_EXIT with lock never armed.
-    profit_lock_pct_symmetric:           float = 0.10
+    profit_lock_pct_dte1plus_after_1330: float = 0.18
+    profit_lock_pct_dte1plus_after_1415: float = 0.14
+    # Immediate bank (credit structures only unless hard_profit_take_debit_enabled=True):
+    hard_profit_take_pct:                float = 0.45
+    hard_profit_take_debit_enabled:      bool  = False
+    # Iron condor / butterfly: avoid arming trail on +10% spread jitter.
+    profit_lock_pct_symmetric:           float = 0.22
+    green_day_lock_min_banked_rs:        float = 6000.0
     # Trail give-back once armed: stop = credit - keep_frac x peak achieved.
     # v41: the ratchet that re-tightens this as profit grows was inverted
     # (compared in the bought-option direction) and had never fired, so
@@ -1879,8 +1878,13 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         spot_proximity_pts=_get_int(env, "SPOT_PROXIMITY_PTS", 40),
         price_stop_straddle_mult=_get_float(env, "PRICE_STOP_STRADDLE_MULT", 0.42),
         profit_lock_pct_dte0=_get_float(env, "PROFIT_LOCK_PCT_DTE0", 0.40),
-        profit_lock_pct_dte1plus=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS", 0.22),  # PATCH_V12: was 0.25
-        hard_profit_take_pct=min(max(_get_float(env, "HARD_PROFIT_TAKE_PCT", 0.40), 0.05), 1.00),
+        profit_lock_pct_dte1plus=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS", 0.22),
+        profit_lock_pct_dte1plus_after_1330=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS_AFTER_1330", 0.18),
+        profit_lock_pct_dte1plus_after_1415=_get_float(env, "PROFIT_LOCK_PCT_DTE1PLUS_AFTER_1415", 0.14),
+        profit_lock_pct_symmetric=_get_float(env, "PROFIT_LOCK_PCT_SYMMETRIC", 0.22),
+        hard_profit_take_pct=min(max(_get_float(env, "HARD_PROFIT_TAKE_PCT", 0.45), 0.05), 1.00),
+        hard_profit_take_debit_enabled=_get_bool(env, "HARD_PROFIT_TAKE_DEBIT_ENABLED", False),
+        green_day_lock_min_banked_rs=max(_get_float(env, "GREEN_DAY_LOCK_MIN_BANKED_RS", 6000.0), 0.0),
         cheap_buyback_pts=_get_float(env, "CHEAP_BUYBACK_PTS", 5.0),
         cheap_buyback_after_time=_get_time(env, "CHEAP_BUYBACK_AFTER_TIME", dtime(13, 0)),
 
@@ -1998,35 +2002,35 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         adx_fast_resample=env.get("ADX_FAST_RESAMPLE", "300s").strip() or "300s",
         # ── v5 long-premium momentum expression ───────────────────────────
         momentum_enabled=_get_bool(env, "MOMENTUM_ENABLED", True),
-        momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 0),  # PATCH_V12: was 1
-        momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 3),
+        momentum_min_dte=_get_int(env, "MOMENTUM_MIN_DTE", 0),
+        momentum_max_dte=_get_int(env, "MOMENTUM_MAX_DTE", 6),
         # Dual-rail: align debit ADX floor with credit trend threshold so
         # soft directional days are not credit-refused AND debit-dark.
         momentum_adx_min=min(max(_get_float(env, "MOMENTUM_ADX_MIN", 20.0), 15.0), 60.0),
         momentum_event_adx_min=min(max(_get_float(env, "MOMENTUM_EVENT_ADX_MIN", 32.0), 24.0), 60.0),
         momentum_or_break_frac=min(max(_get_float(env, "MOMENTUM_OR_BREAK_FRAC", 0.15), 0.0), 1.00),
         momentum_vwap_buffer_pts=min(max(_get_float(env, "MOMENTUM_VWAP_BUFFER_PTS", 8.0), 0.0), 60.0),
-        momentum_day_move_max_pct=min(max(_get_float(env, "MOMENTUM_DAY_MOVE_MAX_PCT", 200.0), 10.0), 400.0),  # PATCH_V12: was 90.0
+        momentum_day_move_max_pct=min(max(_get_float(env, "MOMENTUM_DAY_MOVE_MAX_PCT", 250.0), 10.0), 400.0),
         momentum_spent_extreme_peak_pct=min(max(_get_float(env, "MOMENTUM_SPENT_EXTREME_PEAK_PCT", 135.0), 100.0), 300.0),
         momentum_vix_gap_max_pct=min(max(_get_float(env, "MOMENTUM_VIX_GAP_MAX_PCT", 12.0), 0.5), 100.0),
-        momentum_prem_min_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MIN_PCT_OF_SPOT", 0.0018), 0.0002), 0.01),
-        momentum_prem_max_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MAX_PCT_OF_SPOT", 0.0090), 0.001), 0.03),
-        momentum_min_prem_pts=min(max(_get_float(env, "MOMENTUM_MIN_PREM_PTS", 20.0), 1.0), 200.0),
-        momentum_stop_frac=min(max(_get_float(env, "MOMENTUM_STOP_FRAC", 0.35), 0.10), 0.70),
-        momentum_lock_trigger=min(max(_get_float(env, "MOMENTUM_LOCK_TRIGGER", 0.25), 0.05), 1.00),
+        momentum_prem_min_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MIN_PCT_OF_SPOT", 0.0004), 0.0002), 0.01),
+        momentum_prem_max_pct_of_spot=min(max(_get_float(env, "MOMENTUM_PREM_MAX_PCT_OF_SPOT", 0.0160), 0.001), 0.03),
+        momentum_min_prem_pts=min(max(_get_float(env, "MOMENTUM_MIN_PREM_PTS", 12.0), 1.0), 200.0),
+        momentum_stop_frac=min(max(_get_float(env, "MOMENTUM_STOP_FRAC", 0.30), 0.10), 0.70),
+        momentum_lock_trigger=min(max(_get_float(env, "MOMENTUM_LOCK_TRIGGER", 0.30), 0.05), 1.00),
         momentum_lock_keep_frac=min(max(_get_float(env, "MOMENTUM_LOCK_KEEP_FRAC", 0.50), 0.10), 0.95),
-        momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 0.60), 0.25), 2.00),
-        momentum_hwm_giveback_frac=min(max(_get_float(env, "MOMENTUM_HWM_GIVEBACK_FRAC", 0.15), 0.05), 0.50),
-        momentum_hwm_soft_frac=min(max(_get_float(env, "MOMENTUM_HWM_SOFT_FRAC", 0.25), 0.10), 1.00),
+        momentum_hwm_large_frac=min(max(_get_float(env, "MOMENTUM_HWM_LARGE_FRAC", 0.85), 0.25), 2.00),
+        momentum_hwm_giveback_frac=min(max(_get_float(env, "MOMENTUM_HWM_GIVEBACK_FRAC", 0.25), 0.05), 0.50),
+        momentum_hwm_soft_frac=min(max(_get_float(env, "MOMENTUM_HWM_SOFT_FRAC", 0.30), 0.10), 1.00),
         momentum_hwm_soft_giveback_frac=min(
-            max(_get_float(env, "MOMENTUM_HWM_SOFT_GIVEBACK_FRAC", 0.32), 0.10), 0.60
+            max(_get_float(env, "MOMENTUM_HWM_SOFT_GIVEBACK_FRAC", 0.35), 0.10), 0.60
         ),
         momentum_hwm_afternoon_partial_frac=min(
             max(_get_float(env, "MOMENTUM_HWM_AFTERNOON_PARTIAL_FRAC", 0.0), 0.0),
             1.00,
         ),
         momentum_hwm_stale_giveback_frac=min(
-            max(_get_float(env, "MOMENTUM_HWM_STALE_GIVEBACK_FRAC", 0.25), 0.10),
+            max(_get_float(env, "MOMENTUM_HWM_STALE_GIVEBACK_FRAC", 0.30), 0.10),
             0.50,
         ),
         momentum_hwm_pullback_frac=min(
@@ -2038,9 +2042,9 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         momentum_hwm_peak_age_min=min(
             max(_get_float(env, "MOMENTUM_HWM_PEAK_AGE_MIN", 10.0), 3.0), 45.0
         ),
-        momentum_target_frac=min(max(_get_float(env, "MOMENTUM_TARGET_FRAC", 0.60), 0.10), 3.00),
-        momentum_final_window_min=_get_int(env, "MOMENTUM_FINAL_WINDOW_MIN", 45),
-        momentum_final_cut_min=min(max(_get_int(env, "MOMENTUM_FINAL_CUT_MIN", 60), 0), 120),
+        momentum_target_frac=min(max(_get_float(env, "MOMENTUM_TARGET_FRAC", 2.00), 0.10), 4.00),
+        momentum_final_window_min=_get_int(env, "MOMENTUM_FINAL_WINDOW_MIN", 5),
+        momentum_final_cut_min=min(max(_get_int(env, "MOMENTUM_FINAL_CUT_MIN", 35), 0), 120),
         momentum_counter_regime_size=min(max(_get_float(env, "MOMENTUM_COUNTER_REGIME_SIZE", 0.5), 0.1), 1.0),
         momentum_trend_first=_get_bool(env, "MOMENTUM_TREND_FIRST", True),
         struct_trend_enabled=_get_bool(env, "STRUCT_TREND_ENABLED", True),
@@ -2055,21 +2059,21 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         struct_strong_er=_get_float(env, "STRUCT_STRONG_ER", 0.45),
         struct_strong_disp_sig=_get_float(env, "STRUCT_STRONG_DISP_SIG", 0.80),
         expiry_entry_start=env.get("EXPIRY_ENTRY_START", "09:45"),
-        expiry_entry_end=env.get("EXPIRY_ENTRY_END", "14:15"),
-        momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.80), 0.20), 1.00),
-        momentum_risk_frac_of_budget=min(max(_get_float(env, "MOMENTUM_RISK_FRAC_OF_BUDGET", 1.00), 0.10), 1.00),
+        expiry_entry_end=env.get("EXPIRY_ENTRY_END", "14:25"),
+        momentum_size_floor=min(max(_get_float(env, "MOMENTUM_SIZE_FLOOR", 0.85), 0.20), 1.00),
+        momentum_risk_frac_of_budget=min(max(_get_float(env, "MOMENTUM_RISK_FRAC_OF_BUDGET", 0.70), 0.10), 1.00),
         momentum_min_lots=min(max(_get_float(env, "MOMENTUM_MIN_LOTS", 0.60), 0.10), 1.00),
-        momentum_max_trades_per_day=_get_int(env, "MOMENTUM_MAX_TRADES_PER_DAY", 1),
-        day_pnl_envelope_floor_rs=max(_get_float(env, "DAY_PNL_ENVELOPE_FLOOR_RS", 3000.0), 0.0),
-        momentum_spot_stop_pct=min(max(_get_float(env, "MOMENTUM_SPOT_STOP_PCT", 0.0033), 0.0), 0.02),
+        momentum_max_trades_per_day=_get_int(env, "MOMENTUM_MAX_TRADES_PER_DAY", 2),
+        day_pnl_envelope_floor_rs=max(_get_float(env, "DAY_PNL_ENVELOPE_FLOOR_RS", 14000.0), 0.0),
+        momentum_spot_stop_pct=min(max(_get_float(env, "MOMENTUM_SPOT_STOP_PCT", 0.0040), 0.0), 0.02),
         momentum_reload_after_win=min(max(_get_int(env, "MOMENTUM_RELOAD_AFTER_WIN", 1), 0), 3),
-        momentum_min_minutes_left=_get_int(env, "MOMENTUM_MIN_MINUTES_LEFT", 60),
+        momentum_min_minutes_left=_get_int(env, "MOMENTUM_MIN_MINUTES_LEFT", 30),
         momentum_structural_risk_cap_mult=min(
-            max(_get_float(env, "MOMENTUM_STRUCTURAL_RISK_CAP_MULT", 2.5), 1.0), 5.0
+            max(_get_float(env, "MOMENTUM_STRUCTURAL_RISK_CAP_MULT", 6.0), 1.0), 10.0
         ),
-        # PATCH_V12: 0DTE momentum economics + event-day floor.
-        momentum_dte0_risk_frac=min(max(_get_float(env, "MOMENTUM_DTE0_RISK_FRAC", 0.50), 0.10), 1.00),
-        momentum_dte0_max_lots=min(max(_get_int(env, "MOMENTUM_DTE0_MAX_LOTS", 2), 1), 10),
+        # 0DTE momentum economics + event-day floor.
+        momentum_dte0_risk_frac=min(max(_get_float(env, "MOMENTUM_DTE0_RISK_FRAC", 0.75), 0.10), 1.00),
+        momentum_dte0_max_lots=min(max(_get_int(env, "MOMENTUM_DTE0_MAX_LOTS", 6), 1), 10),
         momentum_second_slot_max_lots=min(
             max(_get_int(env, "MOMENTUM_SECOND_SLOT_MAX_LOTS", 3), 1), 6
         ),
@@ -3279,20 +3283,13 @@ def protect_sqlite_connection(con: sqlite3.Connection) -> sqlite3.Connection:
 
     A default sqlite3 close of the last connection checkpoints the WAL
     into the main file (historically TRUNCATE). A kill in that window
-    left nifty_algo_v3.db malformed with an empty WAL. Refuses to return
-    an unprotected connection.
+    left nifty_algo_v3.db malformed with an empty WAL.
     """
-    try:
-        con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-    except (AttributeError, sqlite3.Error) as exc:
+    if hasattr(con, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"):
         try:
-            con.close()
-        except Exception:
+            con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        except sqlite3.Error:
             pass
-        raise sqlite3.DatabaseError(
-            "Cannot disable SQLite checkpoint-on-close. Refusing this "
-            "connection because close() would rewrite the main file."
-        ) from exc
     try:
         con.execute("PRAGMA wal_autocheckpoint=0")
     except sqlite3.Error:

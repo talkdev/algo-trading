@@ -590,6 +590,14 @@ class StrategyEngine:
                     )
                 continue
             if o in MOMENTUM_STRATEGIES:
+                if not bool(
+                    getattr(
+                        self.config,
+                        "allow_correlated_debit_beside_credit",
+                        False,
+                    )
+                ):
+                    return f"slot_conflict_debit_open_no_credit_stack:{o}"
                 # a credit vertical beside an open long option: same side only
                 if not (new_sides & o_sides):
                     return f"slot_conflict_credit_against_open_long:{o}"
@@ -10169,17 +10177,13 @@ class StrategyEngine:
                 k = float(strike)
             except (TypeError, ValueError):
                 continue
-            # A breakout ticket is ATM-or-further in the trend direction: a
-            # call below spot on an upside break is intrinsic, i.e. a futures
-            # substitute with theta, which is the worst of both.
-            if opt_type == "call" and k < atm - step:
-                continue
-            if opt_type == "put" and k > atm + step:
-                continue
             opt = (legs or {}).get(opt_type) or {}
             bid = float(opt.get("bid", 0) or 0)
             ask = float(opt.get("ask", 0) or 0)
             if bid <= 0 or ask <= 0:
+                continue
+            spr = max(0.0, ask - bid)
+            if spr > max(3.0, 0.08 * ask):
                 continue
             prem = ask
             if prem < pmin or prem > pmax:
@@ -10188,9 +10192,9 @@ class StrategyEngine:
                 dlt = abs(float(opt.get("delta", 0) or 0))
             except (TypeError, ValueError):
                 dlt = 0.0
-            if dlt < 0.35 or dlt > 0.75:
+            if dlt < 0.38 or dlt > 0.68:
                 continue
-            score = abs(dlt - 0.55) * 1000.0 + abs(k - atm) / step
+            score = abs(dlt - 0.52) * 1000.0 + abs(k - atm) / step
             if best_d is None or score < best_d:
                 best_k, best_d, best_p = k, score, prem
         if best_k is None:
@@ -10282,7 +10286,11 @@ class StrategyEngine:
         entry_costs0 = _costs0["total_rupees"] / max(C02, 1.0)
         friction_pts = self._round_trip_friction(legs, entry_costs0)
 
-        stop_frac = float(getattr(cfg, "momentum_stop_frac", 0.35))
+        try:
+            _is_dte0 = int(actual_dte or 0) == 0
+        except (TypeError, ValueError):
+            _is_dte0 = False
+        stop_frac = 0.40 if _is_dte0 else float(getattr(cfg, "momentum_stop_frac", 0.30))
         stop_pts  = exec_price * stop_frac
         # The real per-lot loss when the stop is taken: the premium
         # give-back plus the round trip that had to be paid to find out.
@@ -10291,7 +10299,7 @@ class StrategyEngine:
             return {"valid": False, "reason": "momentum_non_positive_risk"}
 
         # ── edge test: the planned capture must beat the ticket ─────────
-        target_frac = float(getattr(cfg, "momentum_target_frac", 0.60))
+        target_frac = float(getattr(cfg, "momentum_target_frac", 2.00))
         expected_pts = exec_price * target_frac
         _min_over = float(getattr(cfg, "min_target_over_friction", 1.25))
         if not clean and expected_pts < friction_pts * max(_min_over, 1.0):
@@ -10307,97 +10315,36 @@ class StrategyEngine:
         current_capital = float(
             state.get("current_capital", cfg.starting_capital) or cfg.starting_capital
         )
-        budget  = float(cfg.max_risk_per_trade_pct or 0.006)
-        # PATCH_V12: 0DTE momentum (newly allowed) risks half the
-        # ticket: the theta cliff is real, the stop is the plan.
-        _mom_risk_frac = float(getattr(cfg, "momentum_risk_frac_of_budget", 1.0))
-        try:
-            if int(actual_dte) == 0:
-                _mom_risk_frac = min(_mom_risk_frac, float(getattr(cfg, "momentum_dte0_risk_frac", 0.50)))
-        except (TypeError, ValueError):
-            pass
-        # PATCH_V13: a closing-hour ticket risks half the ticket again. The
-        # edge is the session's last trend leg, but the ride is bounded by a
-        # clock rather than by a thesis, so the budget is halved and the lot
-        # count capped below.
+        budget  = float(cfg.max_risk_per_trade_pct or 0.020)
+        _mom_risk_frac = float(getattr(cfg, "momentum_risk_frac_of_budget", 0.70))
+        if _is_dte0:
+            _mom_risk_frac *= float(getattr(cfg, "momentum_dte0_risk_frac", 0.75))
+        if signals.get("event_day"):
+            _mom_risk_frac *= 0.50
         if late:
-            _mom_risk_frac = min(
-                _mom_risk_frac,
-                float(getattr(cfg, "momentum_late_risk_frac", 0.50)),
-            )
+            _mom_risk_frac *= float(getattr(cfg, "momentum_late_risk_frac", 0.50))
         max_risk = current_capital * budget * _mom_risk_frac
         risk_per_lot  = risk_pts * C02
-        structural_risk_per_lot = exec_price * C02          # premium paid, all of it
+        structural_risk_per_lot = exec_price * C02
         raw_lots = max_risk / max(risk_per_lot, 1.0)
-        # PATCH_V12: the size floor respects event days (0.40): a CPI
-        # breakout is still sized with the schedule's fear, just not
-        # into the ground.
-        _mom_floor = float(getattr(cfg, "momentum_size_floor", 0.80))
-        if signals.get("event_day"):
-            _mom_floor = min(_mom_floor, float(getattr(cfg, "momentum_event_size_floor", 0.40)))
-        sched = max(float(size_mult or 1.0), _mom_floor)
+        sched = max(float(size_mult or 1.0), float(getattr(cfg, "momentum_size_floor", 0.85)))
         sized = raw_lots * sched
-        min_lots = float(getattr(cfg, "momentum_min_lots", 0.60))
-        if sized < min_lots:
-            if raw_lots >= 1.0 or clean:
-                sized = 1.0
-            else:
-                return {
-                    "valid": False,
-                    "reason": (
-                        f"momentum_risk_budget_allows_{sized:.2f}_lots_below_"
-                        f"min_{min_lots:.2f}"
-                    ),
-                }
-        day_label = state.get("day_label", "TUESDAY")
-        _eq = max((current_capital / float(cfg.starting_capital or 1.0)) ** 0.5, 0.35)
-        day_cap = max(1, int(LOT_CAPS_BY_DAY.get(day_label, 3) * _eq))
-        final_lots = max(1, min(int(round(sized)), day_cap))
-        # Expiry-day debit: half-budget already applies. A confirmed
-        # STRONG trend is the one 0DTE debit that should not be clipped
-        # to 2 lots — that is a crash/melt-up, not a cheap gamma ticket.
-        # Life-weighted via dte_blend (not a calendar-DTE maze): near
-        # expiry still caps hard; weeklies use the day_cap above.
-        try:
-            if dte_blend(actual_dte) >= 0.9:
-                _px_m = str(signals.get("price_regime") or "")
-                _cap = int(getattr(cfg, "momentum_dte0_max_lots", 2))
-                try:
-                    _adx_m = float(signals.get("adx_15") or 0.0)
-                except (TypeError, ValueError):
-                    _adx_m = 0.0
-                _strong_adx = _adx_m >= float(
-                    getattr(cfg, "adx_strong_threshold", 28.0)
-                )
-                if _px_m in (
-                    "STRONG_DOWNTREND", "STRONG_UPTREND",
-                    "DOWNTREND", "UPTREND",
-                ) and _strong_adx:
-                    _cap = max(_cap, 3)
-                final_lots = min(final_lots, _cap)
-        except (TypeError, ValueError):
-            pass
-        # PATCH_V13: closing-hour clip cap (see the risk fraction above).
+        final_lots = max(1, min(int(sized), 6))
+        if _is_dte0:
+            final_lots = min(final_lots, int(getattr(cfg, "momentum_dte0_max_lots", 6)))
         if late:
             final_lots = max(
                 1, min(final_lots, int(getattr(cfg, "momentum_late_max_lots", 4)))
             )
-        # The sell side caps a position's STRUCTURAL loss (the margin that
-        # could actually be called if the stop never filled) at 1.5x the
-        # per-trade budget. A long option cannot lose more than the premium
-        # paid, and that premium is only fully lost if the contract is still
-        # open at expiry — which the hard exit forbids — so the tolerance is
-        # wider here, but it is a real cap: it is what stops a Rs 20 far-OTM
-        # ticket from being sized into 20 lots because each lot risks pence.
-        _struct_cap_mult = float(getattr(cfg, "momentum_structural_risk_cap_mult", 2.5))
+        _struct_cap_mult = float(getattr(cfg, "momentum_structural_risk_cap_mult", 6.0))
         if structural_risk_per_lot * final_lots > max_risk * _struct_cap_mult:
             final_lots = max(
                 1, int(max_risk * _struct_cap_mult / max(structural_risk_per_lot, 1.0))
             )
-        # capital outlay: a long option is paid for in full, in cash
+        # capital outlay: keep total premium paid <= 15% of capital
         debit_per_lot = structural_risk_per_lot + entry_costs0 * C02
-        if debit_per_lot * final_lots > current_capital * 0.80:
-            final_lots = max(1, int(current_capital * 0.80 / max(debit_per_lot, 1.0)))
+        if debit_per_lot * final_lots > current_capital * 0.15:
+            final_lots = max(1, int(current_capital * 0.15 / max(debit_per_lot, 1.0)))
         if final_lots < 1:
             return {"valid": False, "reason": "momentum_no_capital_for_one_lot"}
 
@@ -10581,6 +10528,11 @@ class StrategyEngine:
         allowed or does not price up — in which case the caller keeps the
         original refusal, unaltered, as the logged reason.
         """
+        if bool(signals.get("_redesigned_engine_active")) and not bool(
+            signals.get("_allow_legacy_momentum")
+        ):
+            signals["_momentum_refuse_reason"] = "redesigned_long_engine_authoritative"
+            return None
         signals.pop("_momentum_refuse_reason", None)
         # Session-floor / explicit debit-lane callers set hard-trend + bridge
         # dir before invoking us. Do NOT clear those — wiping them made
@@ -11208,7 +11160,6 @@ class StrategyEngine:
             signals["_momentum_refuse_reason"] = _pr
             self.logger.info(f"momentum substitute rejected: {params.get('reason')}")
             return None
-        self._clamp_unbanked_one_lot(params, debit_only=True)
         if _concurrent_mom:
             try:
                 _cap = int(getattr(
@@ -12958,11 +12909,133 @@ class StrategyEngine:
             "intent": signals.get("_intent"),
         }
 
+    def _redesigned_long_decision(self, signals: dict) -> Optional[dict]:
+        """Unified first-principles LONG_CALL / LONG_PUT decision engine.
+
+        Runs before credit selection and green-day lock (up to
+        green_day_lock_min_banked_rs). Uses causal closed-5m trend telemetry
+        (OR breakout + EMA9/21 + TWAP + ER + ADX7/14) and risk-budget sizing.
+        """
+        cfg = self.config
+        state = self.market_engine.state
+        if not bool(getattr(cfg, "momentum_enabled", True)):
+            return None
+        if (
+            signals.get("_feed_stale")
+            or signals.get("block_new_entries")
+            or signals.get("api_auth_dead")
+            or signals.get("circuit_breaker_suspected")
+            or signals.get("vix_spike_detected")
+            or state.get("daily_halted")
+            or not bool(signals.get("or_computed"))
+            or signals.get("spot") is None
+        ):
+            return None
+
+        try:
+            _dp = float(state.get("daily_pnl") or 0.0)
+        except (TypeError, ValueError):
+            _dp = 0.0
+        _flip_pending = bool(state.get("redesigned_flip_for_long"))
+        if _dp < (-1500.0 if _flip_pending else 0.0):
+            state.pop("redesigned_flip_for_long", None)
+            return None
+        _lock_min = float(getattr(cfg, "green_day_lock_min_banked_rs", 6000.0) or 6000.0)
+        if _dp >= _lock_min:
+            state.pop("redesigned_flip_for_long", None)
+            return None
+
+        _t5 = signals.get("trend_5m") if isinstance(signals.get("trend_5m"), dict) else None
+        if not _t5 or not _t5.get("ready"):
+            return None
+        if _t5.get("bull_signal"):
+            direction = 1
+            strat_name = LONG_CALL
+        elif _t5.get("bear_signal"):
+            direction = -1
+            strat_name = LONG_PUT
+        else:
+            return None
+
+        now_t = now_ist().time()
+        try:
+            hard_exit = datetime.strptime(
+                str(state.get("hard_exit_time") or cfg.hard_exit_time.strftime("%H:%M")),
+                "%H:%M",
+            ).time()
+        except Exception:
+            hard_exit = cfg.hard_exit_time
+        mins_left = (
+            datetime.combine(now_ist().date(), hard_exit)
+            - datetime.combine(now_ist().date(), now_t)
+        ).total_seconds() / 60.0
+        min_left_req = float(getattr(cfg, "momentum_min_minutes_left", 30) or 30)
+        if now_t < dtime(9, 45) or mins_left < min_left_req:
+            return None
+
+        try:
+            today_str = today_ist().isoformat()
+            all_today = self.db.query(
+                "SELECT position_id, strategy_name, status FROM positions WHERE trading_date=?",
+                (today_str,),
+            ) or []
+        except Exception:
+            all_today = []
+
+        # Max 1 LONG trade per session to avoid whipsaw churn
+        if any(str(r.get("strategy_name") or "") in MOMENTUM_STRATEGIES for r in all_today):
+            return None
+
+        open_pos = [r for r in all_today if str(r.get("status") or "") == "OPEN"]
+        if open_pos:
+            _pend = [str(x) for x in (state.get("trend_first_flatten") or [])]
+            if _pend and any(str(r.get("position_id")) in _pend for r in open_pos):
+                return {"action": "NO_TRADE", "reason": "redesigned_long_flatten_pending"}
+            # Rotate out of capped open credit spread into high-conviction LONG trend
+            names = ",".join(str(r.get("strategy_name") or "") for r in open_pos)
+            state["trend_first_flatten"] = [str(r["position_id"]) for r in open_pos]
+            state["redesigned_flip_for_long"] = True
+            reason = f"redesigned_long_flip:{names}->{strat_name}"
+            self.logger.info(reason)
+            self._log_decision(signals, "NO_TRADE", reason)
+            self._persist_decision(signals, "NONE", reason, None, "NO_TRADE")
+            return {"action": "NO_TRADE", "reason": reason}
+
+        sig_why = str(_t5.get("signal_reason") or "5m_breakout")
+        sel_reason = f"redesigned_long:{sig_why}"
+        params = self.compute_momentum_params(
+            direction, sel_reason, signals, 1.0, late=False
+        )
+        if not params.get("valid"):
+            self.logger.info(f"REDESIGNED_LONG skip {strat_name}: {params.get('reason')}")
+            return None
+
+        self._clear_construct_fail()
+        self.market_engine.state.pop("unbanked_stop_retry_armed", None)
+        self.market_engine.state.pop("redesigned_flip_for_long", None)
+        self._log_decision(signals, "STRATEGY_SELECTED", sel_reason, strat_name, params)
+        self._persist_decision(signals, strat_name, sel_reason, params, "STRATEGY_SELECTED")
+        self.market_engine.finalize_cycle_log(
+            f"STRATEGY_SELECTED:{strat_name}", None, self._count_open_positions()
+        )
+        return {
+            "action": "ENTER",
+            "strategy_name": strat_name,
+            "reason": sel_reason,
+            "params": params,
+            "intent": None,
+        }
+
     def decide(self, signals: dict) -> dict:
         if bool(getattr(self.config, "clean_long_v1", False)):
             self._note_price(signals)
             return self._clean_long_decide(signals)
         self._note_price(signals)
+
+        _red_long = self._redesigned_long_decision(signals)
+        if _red_long is not None:
+            return _red_long
+        signals["_redesigned_engine_active"] = True
 
         # Tag OR lane for downstream gates; do NOT fire debit early —
         # wide-OR multi-lot longs printed multi-thousand red days.
@@ -13657,11 +13730,6 @@ class StrategyEngine:
                 "NO_TRADE", _boot, self._count_open_positions()
             )
             return {"action": "NO_TRADE", "reason": _boot}
-        # Credit keeps natural size; only clamp if this path built a debit.
-        # Unbanked debit only — credit keeps natural size (1-lot credit
-        # clamp turned green harvest days into thin/red scratches).
-        if strategy_name in (LONG_CALL, LONG_PUT):
-            self._clamp_unbanked_one_lot(params, debit_only=True)
         if strategy_name == IRON_CONDOR and not self._credit_target_clears_costs(
             params
         ):

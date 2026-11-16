@@ -1627,6 +1627,263 @@ class MarketDataEngine:
             return {"dir": 0, "strength": 0, "er": 0.0, "disp_sig": 0.0}
         return out
 
+    def _compute_trend_5m(self, bars, spot, vix) -> dict:
+        """Causal closed-5m trend & breakout structure telemetry for the day.
+
+        Computes strictly from closed 5m bars of the current session (never
+        peeks at the forming bar) combined with the session OR (09:15-09:30).
+        """
+        out = {
+            "ready": False,
+            "bars_count": 0,
+            "last_close": 0.0,
+            "ema9": 0.0,
+            "ema9_prev": 0.0,
+            "ema21": 0.0,
+            "adx7": 0.0,
+            "adx14": 0.0,
+            "er10": 0.0,
+            "twap": 0.0,
+            "disp_sig": 0.0,
+            "daily_sigma": 0.0,
+            "or_high": 0.0,
+            "or_low": 0.0,
+            "or_mid": 0.0,
+            "or_width": 0.0,
+            "seen_or_up": False,
+            "seen_or_dn": False,
+            "two_way_or": False,
+            "failed_or_retest": False,
+            "consec_up": 0,
+            "consec_dn": 0,
+            "bull_bar": False,
+            "bear_bar": False,
+            "struct_bull_ok": False,
+            "struct_bear_ok": False,
+            "bull_signal": False,
+            "bear_signal": False,
+            "signal_reason": "not_ready",
+        }
+        try:
+            df5 = TechnicalEngine.resample_bars(bars, "300s", drop_forming=True)
+            if df5 is None or df5.empty or "close" not in df5.columns:
+                return out
+            if "datetime" in df5.columns:
+                _last_day = df5["datetime"].iloc[-1].date()
+                d = df5[df5["datetime"].dt.date == _last_day].reset_index(drop=True)
+            else:
+                d = df5.reset_index(drop=True)
+            n_bars = len(d)
+            out["bars_count"] = n_bars
+            if n_bars < 4:
+                return out
+
+            if not bool(self.state.get("or_computed")):
+                return out
+
+            closes = pd.to_numeric(d["close"], errors="coerce")
+            highs = pd.to_numeric(d["high"], errors="coerce")
+            lows = pd.to_numeric(d["low"], errors="coerce")
+            opens = pd.to_numeric(d["open"], errors="coerce")
+
+            # Use true 15m closed Opening Range (09:15-09:29 = first 3 closed 5m bars)
+            orh = float(highs.iloc[:3].max())
+            orl = float(lows.iloc[:3].min())
+            if orh <= 0 or orl <= 0 or orh <= orl:
+                return out
+            orw = max(orh - orl, 1.0)
+            orm = 0.5 * (orh + orl)
+            out["or_high"] = orh
+            out["or_low"] = orl
+            out["or_mid"] = orm
+            out["or_width"] = orw
+
+            e9 = closes.ewm(span=9, adjust=False).mean()
+            e21 = closes.ewm(span=21, adjust=False).mean()
+            twap_s = closes.expanding().mean()
+
+            last_c = float(closes.iloc[-1])
+            last_o = float(opens.iloc[-1])
+            last_h = float(highs.iloc[-1])
+            last_l = float(lows.iloc[-1])
+            e9_cur = float(e9.iloc[-1])
+            e9_prev = float(e9.iloc[-2]) if n_bars >= 2 else e9_cur
+            e21_cur = float(e21.iloc[-1])
+            twap_cur = float(twap_s.iloc[-1])
+
+            day_open = float(opens.iloc[0])
+            _v = float(vix) if (vix and float(vix) > 0) else 14.0
+            daily_sig = last_c * (_v / 100.0) / math.sqrt(252.0)
+            disp_sig = (last_c - day_open) / daily_sig if daily_sig > 0 else 0.0
+
+            # Kaufman ER over last min(10, n_bars-1) closed 5m bars
+            k_n = min(10, n_bars - 1)
+            net_mv = last_c - float(closes.iloc[-1 - k_n])
+            path_mv = float(closes.iloc[-1 - k_n:].diff().abs().sum())
+            er10 = abs(net_mv) / path_mv if path_mv > 0 else 0.0
+
+            # Wilder ADX helper on closed 5m bars
+            def _calc_adx(period: int) -> float:
+                if n_bars < 2 * period + 1:
+                    return 0.0
+                h_a = highs.to_numpy(dtype=float)
+                l_a = lows.to_numpy(dtype=float)
+                c_a = closes.to_numpy(dtype=float)
+                tr = np.maximum(
+                    h_a[1:] - l_a[1:],
+                    np.maximum(np.abs(h_a[1:] - c_a[:-1]), np.abs(l_a[1:] - c_a[:-1])),
+                )
+                up = h_a[1:] - h_a[:-1]
+                dn = l_a[:-1] - l_a[1:]
+                pdm = np.where((up > dn) & (up > 0), up, 0.0)
+                mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+                def _smooth(arr):
+                    sm = np.zeros(len(arr) + 1)
+                    sm[period] = arr[:period].sum()
+                    for k in range(period + 1, len(arr) + 1):
+                        sm[k] = sm[k - 1] - sm[k - 1] / period + arr[k - 1]
+                    return sm
+                atr = _smooth(tr)
+                pdi = 100.0 * _smooth(pdm) / np.where(atr > 0, atr, 1.0)
+                mdi = 100.0 * _smooth(mdm) / np.where(atr > 0, atr, 1.0)
+                dx = 100.0 * np.abs(pdi - mdi) / np.where((pdi + mdi) > 0, pdi + mdi, 1.0)
+                val = float(dx[period:2 * period + 1].mean())
+                for k in range(2 * period + 1, n_bars):
+                    val = (val * (period - 1) + float(dx[k])) / period
+                return float(val)
+
+            adx7 = _calc_adx(7)
+            adx14 = _calc_adx(14)
+
+            buf = max(12.0, 0.15 * orw)
+            seen_up = False
+            seen_dn = False
+            consec_up = 0
+            consec_dn = 0
+            failed_retest = False
+            # Scan post-OR closed 5m bars (skip first 3 bars = 09:15-09:29)
+            for idx in range(3, n_bars):
+                bc = float(closes.iloc[idx])
+                if bc > orh + buf:
+                    if seen_up and consec_up == 0 and failed_retest:
+                        pass
+                    seen_up = True
+                    consec_up += 1
+                    consec_dn = 0
+                elif bc < orl - buf:
+                    seen_dn = True
+                    consec_dn += 1
+                    consec_up = 0
+                else:
+                    consec_up = 0
+                    consec_dn = 0
+                    if (seen_up and bc < orm - 5.0) or (seen_dn and bc > orm + 5.0):
+                        failed_retest = True
+
+            two_way_or = bool(seen_up and seen_dn)
+            rng = max(1e-6, last_h - last_l)
+            bull_bar = (
+                (last_c > last_o)
+                and ((last_c - last_l) / rng >= 0.55)
+                and (e9_cur > e9_prev)
+            )
+            bear_bar = (
+                (last_c < last_o)
+                and ((last_h - last_c) / rng >= 0.55)
+                and (e9_cur < e9_prev)
+            )
+
+            spot_now = float(spot) if (spot and float(spot) > 0) else last_c
+            struct_bull_ok = bool((spot_now > twap_cur) and (e9_cur >= e21_cur))
+            struct_bear_ok = bool((spot_now < twap_cur) and (e9_cur <= e21_cur))
+
+            out.update({
+                "ready": True,
+                "last_close": round(last_c, 2),
+                "ema9": round(e9_cur, 2),
+                "ema9_prev": round(e9_prev, 2),
+                "ema21": round(e21_cur, 2),
+                "adx7": round(adx7, 2),
+                "adx14": round(adx14, 2),
+                "er10": round(er10, 3),
+                "twap": round(twap_cur, 2),
+                "disp_sig": round(disp_sig, 3),
+                "daily_sigma": round(daily_sig, 2),
+                "seen_or_up": seen_up,
+                "seen_or_dn": seen_dn,
+                "two_way_or": two_way_or,
+                "failed_or_retest": failed_retest,
+                "consec_up": consec_up,
+                "consec_dn": consec_dn,
+                "bull_bar": bull_bar,
+                "bear_bar": bear_bar,
+                "struct_bull_ok": struct_bull_ok,
+                "struct_bear_ok": struct_bear_ok,
+            })
+
+            # Entry signal evaluation (causal 5m close rules)
+            now_hm = now_ist().strftime("%H:%M")
+            if now_hm < "09:50" or now_hm > "14:30":
+                out["signal_reason"] = "outside_long_window"
+                return out
+            if two_way_or or failed_retest:
+                out["signal_reason"] = "two_way_or_failed_breakout"
+                return out
+            # Avoid chasing morning range already exhausted (>1.20x daily sigma before 11:30)
+            day_rng = float(highs.max() - lows.min())
+            if (now_hm < "11:30") and (day_rng > 1.20 * daily_sig):
+                out["signal_reason"] = "morning_range_exhausted"
+                return out
+            # Avoid chasing wide morning vertical spike (>1.15x daily sigma) before digestion
+            if (orw > 1.15 * daily_sig) and (now_hm < "11:30") and (abs(last_c - orm) > 1.0 * daily_sig):
+                out["signal_reason"] = "wide_or_morning_overextended"
+                return out
+            # ADX filter: mature adx14 >= 22 OR explosive coil break (adx7 >= 26 & er10 >= 0.45)
+            if n_bars >= 28:
+                if adx14 < 22.0 and not (adx7 >= 26.0 and er10 >= 0.45 and abs(disp_sig) >= 0.35):
+                    out["signal_reason"] = f"adx14_low_{adx14:.1f}"
+                    return out
+            elif n_bars >= 15:
+                if adx7 < 20.0:
+                    out["signal_reason"] = f"adx7_low_{adx7:.1f}"
+                    return out
+
+            _prev_c = float(self.state.get("prev_close_spot") or self.state.get("prev_day_close") or 0.0)
+            _gap_pts = float(self.state.get("gap_open_pts") or 0.0)
+            _gap_sup_put = (_prev_c > 0 and _gap_pts > 40.0 and -15.0 <= (last_c - _prev_c) <= 25.0)
+            _gap_res_call = (_prev_c > 0 and _gap_pts < -40.0 and -25.0 <= (last_c - _prev_c) <= 15.0)
+            strong_drive = max(25.0, 0.22 * orw)
+            bull_acc = (consec_up >= 2) or (consec_up >= 1 and last_c > orh + strong_drive and er10 >= 0.45 and disp_sig >= 0.45)
+            bear_acc = (consec_dn >= 2) or (consec_dn >= 1 and last_c < orl - strong_drive and er10 >= 0.45 and disp_sig <= -0.45)
+
+            if (
+                bull_acc
+                and not _gap_res_call
+                and bull_bar
+                and last_c > twap_cur
+                and e9_cur > e21_cur
+                and er10 >= 0.40
+                and disp_sig >= 0.30
+            ):
+                out["bull_signal"] = True
+                out["signal_reason"] = f"5m_orb_bull_er{er10:.2f}_disp{disp_sig:.2f}"
+            elif (
+                bear_acc
+                and not _gap_sup_put
+                and bear_bar
+                and last_c < twap_cur
+                and e9_cur < e21_cur
+                and er10 >= 0.40
+                and disp_sig <= -0.30
+            ):
+                out["bear_signal"] = True
+                out["signal_reason"] = f"5m_orb_bear_er{er10:.2f}_disp{disp_sig:.2f}"
+            else:
+                out["signal_reason"] = "no_5m_breakout"
+        except Exception:
+            pass
+        return out
+
     def classify_orb_price_structure(
         self,
         bars: pd.DataFrame,
@@ -4073,6 +4330,7 @@ class MarketDataEngine:
         # first 5-minute bars - no ADX/EMA maturity wait). See
         # _structure_trend for the definition.
         _struct = self._structure_trend(df5, spot, vix)
+        _trend_5m = self._compute_trend_5m(bars, spot, vix)
 
         # ADX condition label
         adx_condition = "INSUFFICIENT_DATA"
@@ -4471,6 +4729,7 @@ class MarketDataEngine:
             "struct_strength":          _struct["strength"],
             "struct_er":                _struct["er"],
             "struct_disp_sig":          _struct["disp_sig"],
+            "trend_5m":                 _trend_5m,
             "adx_15":                   adx_15,
             "adx_15_raw":               adx_15_raw,
             "adx_5":                    adx_5,

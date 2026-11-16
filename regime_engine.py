@@ -1363,12 +1363,26 @@ class RegimeClassifier:
         if not or_computed:
             return PriceRegime.OBSERVING
 
+        # ── Step 1a: Redesigned causal 5m trend structure ─────────────────
+        _t5 = signals.get("trend_5m") if isinstance(signals.get("trend_5m"), dict) else None
+        if _t5 and _t5.get("ready"):
+            if _t5.get("bull_signal"):
+                return (
+                    PriceRegime.STRONG_UPTREND
+                    if (_t5.get("er10", 0) >= 0.50 or _t5.get("disp_sig", 0) >= 0.60)
+                    else PriceRegime.UPTREND
+                )
+            if _t5.get("bear_signal"):
+                return (
+                    PriceRegime.STRONG_DOWNTREND
+                    if (_t5.get("er10", 0) >= 0.50 or _t5.get("disp_sig", 0) <= -0.60)
+                    else PriceRegime.DOWNTREND
+                )
+
         # ── Step 1b: structural trend (price-only, no ADX maturity wait) ──
-        # True market behaviour: a trend label requires price THROUGH the OR.
-        # Displacement alone (gap / open efficiency) without an OR break is
-        # still an inside-auction tape — labelling it UPTREND/DOWNTREND sold
-        # the wrong side and invited knife debits.
-        if bool(getattr(self.config, "struct_trend_enabled", True)):
+        # Guard against two-way / failed-breakout chop firing a false trend label.
+        _chop_5m = bool(_t5 and (_t5.get("two_way_or") or _t5.get("failed_or_retest")) and float(_t5.get("er10") or 0.0) < 0.48)
+        if bool(getattr(self.config, "struct_trend_enabled", True)) and not _chop_5m:
             try:
                 _st_dir = int(signals.get("struct_trend") or 0)
                 _st_str = int(signals.get("struct_strength") or 0)

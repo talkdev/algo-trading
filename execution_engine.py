@@ -2387,6 +2387,8 @@ class ExecutionEngine:
             or str(position.get("strategy_type") or "").upper() == "BUY"
         )
         if is_debit:
+            if not bool(getattr(self.config, "hard_profit_take_debit_enabled", False)):
+                return None
             entry_value = abs(entry_credit)
             if entry_value <= 0:
                 return None
@@ -2546,302 +2548,98 @@ class ExecutionEngine:
                 "liquidation_premium": liq_premium,
             }
 
-        # ── D2: high-water-mark profit management ────────────────────────
-        # Wrong approaches (both failed Sep22 LONG_PUT):
-        #   * Clamp trail to breakeven while "trend persist" → held through
-        #     ₹13k peak at 14:01, gave it all back, CLOSE_STOP −₹912.
-        #   * Soft mid-trail while trend still alive → scalp-exit mid-climb
-        #     (v65m35: Sep22 LP +₹2.4k at 11:57 / Oct1 +₹9.7k at 13:46,
-        #     both missed the real peak).
-        # Correct shape (v65m36):
-        #   Phase A: while trend persists, free-trade floor only after lock
-        #     so the runner can develop.
-        #   Phase A fade: once soft HWM is in hand AND persist is OFF, trail
-        #     loosely — bank mid-peaks that would otherwise wait for a
-        #     labelled flip (Sep21 LONG_CALL 54% give-back to 14:30 flat).
-        #   Phase B: fat HWM / target → tight trail.
-        #   D3: at planned target, bank on HWM pullback (don't wait for flip).
-        #
-        # Persist = labelled trend STILL WITH US. RANGE is weaken, not
-        # alive — counting RANGE as persist (pre-v65m56) free-traded through
-        # mid-day soften and blocked soft trail until a flip that never
-        # came. Adverse labels clear persist immediately.
-        _persist = False
-        _trend_against = False
+        # ── D1c: OR-midpoint thesis invalidation ─────────────────────────
+        # If spot reverses back across OR midpoint against our breakout while
+        # still below +15% open gain, cut the failed breakout early.
         try:
-            _sig = signals or {}
-            _sname = str(position.get("strategy_name") or "")
-            if "PUT" in _sname:
-                _dir = -1
-            elif "CALL" in _sname:
-                _dir = 1
-            else:
-                _dir = int(
-                    raw.get("momentum_direction")
-                    or position.get("momentum_direction")
-                    or 0
-                )
+            _sig_or = signals or {}
+            _orh_i = float(_sig_or.get("or_high") or 0.0)
+            _orl_i = float(_sig_or.get("or_low") or 0.0)
+            _orm_i = 0.5 * (_orh_i + _orl_i) if (_orh_i > 0 and _orl_i > 0) else 0.0
+        except (TypeError, ValueError):
+            _orm_i = 0.0
+        if (
+            _orm_i > 0 and spot > 0 and _ss_dir != 0
+            and not activated
+            and value < entry_value * 1.15
+            and ((_ss_dir > 0 and spot < _orm_i - 10.0) or (_ss_dir < 0 and spot > _orm_i + 10.0))
+        ):
+            self.logger.warning(
+                f"DEBIT OR-MID THESIS FAIL: {_ss_name} spot={spot:.1f} vs or_mid={_orm_i:.1f}"
+            )
+            return "CLOSE_STOP", EXIT_PRIORITY_PRICE_STOP, {
+                "reason_detail": f"momentum_or_mid_invalidation_{spot:.1f}_vs_{_orm_i:.1f}",
+                "current_premium": current_premium,
+                "liquidation_premium": liq_premium,
+            }
+
+        # ── D2: Adaptive Structural Trailing Ladder (uncapped upside) ───
+        _sig = signals or {}
+        _sname = str(position.get("strategy_name") or "")
+        _dir = -1 if "PUT" in _sname else (1 if "CALL" in _sname else 0)
+        _t5 = _sig.get("trend_5m") if isinstance(_sig.get("trend_5m"), dict) else None
+        if _t5 and _t5.get("ready"):
+            _struct_ok = bool(_t5.get("struct_bull_ok") if _dir > 0 else _t5.get("struct_bear_ok"))
+        else:
             _px = str(_sig.get("price_regime") or "")
-            _adx = float(_sig.get("adx_15") or 0.0)
-            _mat = bool(_sig.get("adx_15_mature", False))
-            _orh = float(_sig.get("or_high") or 0.0)
-            _orl = float(_sig.get("or_low") or 0.0)
-            _ormid = (_orh + _orl) / 2.0 if (_orh > 0 and _orl > 0) else 0.0
-            _trend_side_ok = (
+            _struct_ok = (
                 (_dir > 0 and _px in ("UPTREND", "STRONG_UPTREND"))
                 or (_dir < 0 and _px in ("DOWNTREND", "STRONG_DOWNTREND"))
             )
-            _trend_against = (
-                (_dir > 0 and _px in ("DOWNTREND", "STRONG_DOWNTREND"))
-                or (_dir < 0 and _px in ("UPTREND", "STRONG_UPTREND"))
-            )
-            _brk_ok = (
-                _ormid <= 0
-                or (_dir > 0 and spot >= _ormid)
-                or (_dir < 0 and spot <= _ormid)
-            )
-            _death = float(getattr(cfg, "momentum_trend_death_adx", 15.0))
-            _adx_strong = float(getattr(cfg, "adx_strong_threshold", 28.0) or 28.0)
-            # Strong ADX without the mature flag is still a live trend —
-            # requiring mat alone scalp-exited Oct6 LONG_CALL at +1pt while
-            # ADX printed 41-44 UPTREND and spot ran another +100pt.
-            _mat_ok = _mat or _adx >= _adx_strong
-            try:
-                _dn_used = float(_sig.get("day_down_used_pct") or 0.0)
-            except (TypeError, ValueError):
-                _dn_used = 0.0
-            try:
-                _up_used = float(_sig.get("day_up_used_pct") or 0.0)
-            except (TypeError, ValueError):
-                _up_used = 0.0
-            # Strong ADX + spent session on our side is still the trend even
-            # when the 15-min label flickers RANGE (0DTE dumps were being
-            # peak-faded at +10% with the move unfinished).
-            try:
-                _esp = float(position.get("entry_spot") or 0.0)
-            except (TypeError, ValueError):
-                _esp = 0.0
-            _spent_with_us = (
-                (_dir < 0 and _dn_used >= 50.0)
-                or (_dir > 0 and _up_used >= 50.0)
-            ) and _adx >= 22.0
-            _follow_through = (
-                _adx >= 18.0
-                and _esp > 0
-                and spot > 0
-                and (
-                    (_dir < 0 and spot <= _esp - 20.0)
-                    or (_dir > 0 and spot >= _esp + 20.0)
-                )
-            )
-            _persist = bool(
-                _dir != 0 and _brk_ok and _adx >= _death
-                and (_mat_ok or _follow_through)
-                and (_trend_side_ok or _spent_with_us or _follow_through)
-            )
-        except Exception:
-            _persist = False
-            _trend_against = False
 
         try:
             prev_hwm = float(position.get("peak_debit_value") or 0.0)
         except (TypeError, ValueError):
             prev_hwm = 0.0
-        hwm = max(prev_hwm, float(value_mid or 0.0))
+        # Use liquidation value / mid conservatively for HWM
+        hwm = max(prev_hwm, float(value_mid or 0.0), float(value or 0.0))
         hwm_up = hwm > prev_hwm + 1e-9
-        be_level = entry_value + rt_cost
-        large_frac = float(getattr(cfg, "momentum_hwm_large_frac", 0.60))
-        giveback = float(getattr(cfg, "momentum_hwm_giveback_frac", 0.15))
-        soft_frac = float(getattr(cfg, "momentum_hwm_soft_frac", 0.25))
-        soft_gb = float(getattr(cfg, "momentum_hwm_soft_giveback_frac", 0.40))
-        pull_frac = float(getattr(cfg, "momentum_hwm_pullback_frac", 0.03))
-        fade_pull_frac = float(
-            getattr(cfg, "momentum_hwm_fade_pullback_frac", 0.08)
-        )
-        peak_age_min = float(getattr(cfg, "momentum_hwm_peak_age_min", 10.0))
-        large_frac = min(max(large_frac, 0.25), 2.0)
-        giveback = min(max(giveback, 0.05), 0.50)
-        soft_frac = min(max(soft_frac, 0.10), 1.0)
-        soft_gb = min(max(soft_gb, 0.10), 0.60)
-        pull_frac = min(max(pull_frac, 0.01), 0.15)
-        fade_pull_frac = min(max(fade_pull_frac, 0.03), 0.25)
-        peak_age_min = min(max(peak_age_min, 3.0), 45.0)
-        fat_hwm = entry_value * (1.0 + large_frac)
-        soft_hwm = entry_value * (1.0 + soft_frac)
-        # Never require a fatter HWM than the ticket's own target — otherwise
-        # persist-suppressed D3 + free-trade-only D2 give the peak back.
-        if target > entry_value > 0:
-            fat_hwm = min(fat_hwm, float(target))
-        # Late-afternoon progressive fat: optional via env (default OFF).
-        _aft_partial = float(
-            getattr(cfg, "momentum_hwm_afternoon_partial_frac", 0.0) or 0.0
-        )
-        _aft_partial = min(max(_aft_partial, 0.0), 1.0)
-        if (
-            current_time >= dtime(13, 45)
-            and _aft_partial > 0.0
-            and target > entry_value > 0
-        ):
-            _partial_hwm = entry_value + _aft_partial * (
-                float(target) - entry_value
-            )
-            fat_hwm = min(fat_hwm, _partial_hwm)
-        stale_gb = float(
-            getattr(cfg, "momentum_hwm_stale_giveback_frac", 0.25) or 0.25
-        )
-        stale_gb = min(max(stale_gb, 0.10), 0.50)
-        # After 14:00, lower the soft-HWM bar so modest peaks that never
-        # reached +30% still get stale/soft trail (Sep21 engine HWM sat
-        # ~1.22–1.28× while soft_frac=0.30 required 1.30× — trail never
-        # armed, free-trade gave the spike back). Morning keeps the
-        # higher bar so Sep22 mid-day local peaks stay free-trade.
-        if current_time >= dtime(14, 0) and entry_value > 0:
-            soft_hwm = min(soft_hwm, entry_value * 1.20)
-
         _now = now_ist()
-        _peak_at_raw = position.get("peak_debit_at")
-        if hwm_up or not _peak_at_raw:
-            _peak_at = _now
-        else:
+        _peak_at = _now if hwm_up else position.get("peak_debit_at") or _now
+        if not isinstance(_peak_at, datetime):
             try:
-                _peak_at = datetime.fromisoformat(str(_peak_at_raw))
+                _peak_at = datetime.fromisoformat(str(_peak_at))
                 if getattr(_peak_at, "tzinfo", None) is not None:
                     _peak_at = _peak_at.replace(tzinfo=None)
             except Exception:
                 _peak_at = _now
-        try:
-            _peak_age = max((_now - _peak_at).total_seconds() / 60.0, 0.0)
-        except Exception:
-            _peak_age = 0.0
-        # After 14:00 / adverse flip, age the peak faster so a just-printed
-        # soft HWM is not free-traded for another full 10 minutes.
-        _age_need = peak_age_min
-        if current_time >= dtime(14, 0) or _trend_against:
-            _age_need = min(peak_age_min, 6.0)
-        _peak_aged = _peak_age >= _age_need - 1e-9
 
-        # Soft trail / fade after fat HWM, final stretch, OR thesis dead
-        # (trend weakened to RANGE / flipped / ADX died). Requiring 14:00
-        # or fat alone held soft peaks through mid-day weaken until a
-        # labelled flip that often never printed.
-        _thesis_dead = (not _persist) or _trend_against
-        # Lock-level HWM counts as soft enough to enter management. Soft
-        # frac alone (0.30) left Oct14 LONG_PUT peak +26% (HWM 210 vs soft
-        # 217) outside the ratchet while persist stayed ON — free-trade
-        # giveback. lock trigger and soft_frac are now aligned at 0.25;
-        # keep hwm>=lock here so a future soft raise cannot re-open the hole.
-        _hwm_soft_ok = (
-            hwm >= soft_hwm - 1e-9
-            or (lock > 0 and hwm >= lock - 1e-9)
-        )
-        # Pullback proof before treating a soft peak as mature under persist
-        # (Sep22 mid-climb scalp if age alone matured the trail).
-        _fade_pts_pre = max(fade_pull_frac * hwm, 1.0) if hwm > 0 else 1.0
-        _faded_pre = (
-            hwm > entry_value
-            and float(value_mid or 0.0) <= (hwm - _fade_pts_pre)
-        )
-        _mature = (
-            hwm >= fat_hwm - 1e-9
-            or current_time >= dtime(14, 0)
-            or (
-                _thesis_dead
-                and _hwm_soft_ok
-                and _peak_aged
-            )
-            or (
-                # Aged soft/lock peak that has already given back fade_pull
-                # — bank under persist without waiting for 14:00 / fat
-                # (Oct14 LONG_PUT 13:15 peak → free-trade to 14:00 loss).
-                _hwm_soft_ok
-                and _peak_aged
-                and _faded_pre
-            )
-        )
+        be_level = entry_value + max(float(rt_cost or 0.0), 2.0)
+        peak_gain = max(hwm - entry_value, 0.0)
+        gain_pct = peak_gain / entry_value if entry_value > 0 else 0.0
 
         new_level = None
         ratchet_reason = None
-        peak_gain = max(hwm - entry_value, 0.0)
-        if hwm >= fat_hwm - 1e-9:
-            new_level = hwm - peak_gain * giveback
-            new_level = max(new_level, be_level)
-            ratchet_reason = "momentum_hwm_trail"
-        elif (
-            activated
-            or value_mid >= lock
-            or _hwm_soft_ok
-        ):
-            # Arm from HWM once a soft/lock peak has printed — not only when
-            # *current* mid is still above the lock trigger. Sep21 LONG_CALL
-            # printed ~1.22–1.28× HWM then pulled below the 1.25× trigger;
-            # the old `value_mid >= lock or activated` gate skipped the
-            # entire ratchet and free-traded the giveback.
-            if (
-                _hwm_soft_ok
-                and _peak_aged
-                and _mature
-                and _persist
-                and (not _trend_against)
-            ):
-                # Stale-peak harvest under persist after 14:00 / fat:
-                # medium giveback banks an aged soft HWM without waiting
-                # for trend death (Sep21 LONG_CALL free-traded 104→92
-                # while soft trail required persist OFF).
-                new_level = hwm - peak_gain * stale_gb
-                new_level = max(new_level, be_level)
-                ratchet_reason = "momentum_stale_peak_trail"
-            elif (
-                _thesis_dead
-                and _hwm_soft_ok
-                and _peak_aged
-                and _mature
-            ):
-                new_level = hwm - peak_gain * soft_gb
-                new_level = max(new_level, be_level)
-                ratchet_reason = (
-                    "momentum_adverse_flip_trail"
-                    if _trend_against
-                    else "momentum_soft_hwm_trail"
-                )
-            elif value_mid >= lock or activated:
-                # While trend still persists and we have not printed a soft
-                # HWM, ignore a one-tick lock touch — arming free-trade BE
-                # there scalp-exits runners (Oct6 LONG_CALL +1pt / 17m while
-                # spot continued +100pt). Once soft HWM exists or persist
-                # dies, free-trade BE is correct.
-                # Morning: even an armed BE lock is not allowed to harvest
-                # while the directional thesis is still live — 0DTE dumps
-                # were being scaled out at +10% with 200pts of trend left.
-                if (
-                    _persist
-                    and (not _trend_against)
-                    and current_time < dtime(13, 0)
-                ):
-                    new_level = None
-                    ratchet_reason = None
-                elif (
-                    _persist
-                    and (not activated)
-                    and (not _hwm_soft_ok)
-                    and (not _trend_against)
-                ):
-                    new_level = None
-                    ratchet_reason = None
-                else:
-                    new_level = be_level
-                    ratchet_reason = "momentum_free_trade"
-            else:
-                # Soft HWM seen but not yet mature/aged — hold without
-                # clamping to BE so a brief pullback under the lock
-                # trigger cannot disable management on the next print.
-                new_level = None
-                ratchet_reason = None
+        if _struct_ok:
+            if gain_pct >= 1.50:
+                new_level = entry_value + 0.65 * peak_gain
+                ratchet_reason = "momentum_runner_trail_150"
+            elif gain_pct >= 0.85:
+                new_level = entry_value + 0.45 * peak_gain
+                ratchet_reason = "momentum_runner_trail_85"
+            elif gain_pct >= 0.45:
+                new_level = entry_value + 0.22 * peak_gain
+                ratchet_reason = "momentum_runner_trail_45"
+            elif gain_pct >= 0.30:
+                new_level = be_level
+                ratchet_reason = "momentum_free_trade"
+        else:
+            if gain_pct >= 0.75:
+                new_level = entry_value + 0.65 * peak_gain
+                ratchet_reason = "momentum_struct_break_trail_75"
+            elif gain_pct >= 0.40:
+                new_level = entry_value + 0.35 * peak_gain
+                ratchet_reason = "momentum_struct_break_trail_40"
+            elif gain_pct >= 0.25:
+                new_level = be_level
+                ratchet_reason = "momentum_struct_break_be"
 
         if new_level is not None:
+            new_level = max(new_level, be_level)
             cur_level = float(locked or 0.0)
-            raised = (not activated) or (new_level > cur_level + 1e-9)
-            if raised or hwm_up or not activated:
-                _lock_out = max(new_level, cur_level) if activated else new_level
+            _lock_out = max(new_level, cur_level) if activated else new_level
+            raised = (not activated) or (_lock_out > cur_level + 1e-9)
+            if raised or hwm_up:
                 self.db.update(
                     "positions",
                     {
@@ -2854,34 +2652,18 @@ class ExecutionEngine:
                     },
                     {"position_id": position["position_id"]},
                 )
-                if (
-                    ratchet_reason in (
-                        "momentum_hwm_trail",
-                        "momentum_soft_hwm_trail",
-                        "momentum_stale_peak_trail",
-                        "momentum_adverse_flip_trail",
-                    )
-                    and value <= float(_lock_out) + 1e-9
-                ):
-                    return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
-                        "reason_detail": (
-                            f"{ratchet_reason}_hit_{value:.2f}"
-                            f"<={float(_lock_out):.2f}"
-                        ),
-                        "locked_level": float(_lock_out),
-                        "peak_debit_value": hwm,
-                        "fat_winner": hwm >= fat_hwm - 1e-9,
-                    }
-                return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, {
-                    "reason_detail": ratchet_reason or "momentum_profit_lock",
-                    "new_level": _lock_out,
-                    "peak_debit_value": hwm,
-                    "fat_winner": hwm >= fat_hwm - 1e-9,
-                }
-            if value <= float(locked or new_level):
+            if value <= float(_lock_out) + 1e-9:
                 return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
-                    "reason_detail": "momentum_lock_given_back",
-                    "locked_level": float(locked or new_level),
+                    "reason_detail": f"{ratchet_reason}_hit_{value:.2f}<={float(_lock_out):.2f}",
+                    "locked_level": float(_lock_out),
+                    "peak_debit_value": hwm,
+                    "current_premium": current_premium,
+                    "liquidation_premium": liq_premium,
+                }
+            if raised:
+                return "TIGHTEN_STOP", EXIT_PRIORITY_PROFIT_LOCK, {
+                    "reason_detail": ratchet_reason,
+                    "new_level": _lock_out,
                     "peak_debit_value": hwm,
                 }
         elif hwm_up:
@@ -2894,62 +2676,6 @@ class ExecutionEngine:
                 },
                 {"position_id": position["position_id"]},
             )
-
-        # ── D2b: aged-peak fade harvest ──────────────────────────────────
-        # HWM must sit ≥ peak_age_min without a new high, then pull ≥
-        # fade_pull_frac — blocks mid-climb scalp (Sep22/Oct1).
-        _fade_pts = max(fade_pull_frac * hwm, 1.0) if hwm > 0 else 1.0
-        _pull_pts = max(pull_frac * hwm, 0.50) if hwm > 0 else 0.50
-        _faded = hwm > entry_value and float(value_mid or 0.0) <= (hwm - _fade_pts)
-        _pulled = hwm > entry_value and float(value_mid or 0.0) <= (hwm - _pull_pts)
-        if (
-            activated
-            and hwm >= soft_hwm - 1e-9
-            and value >= be_level - 1e-9
-            and _peak_aged
-            and _faded
-            and _mature
-            and not (
-                _persist
-                and (not _trend_against)
-                and current_time < dtime(13, 0)
-            )
-        ):
-            self.logger.info(
-                f"DEBIT PEAK-FADE HARVEST: {position['strategy_name']} "
-                f"value={value:.2f} hwm={hwm:.2f} age={_peak_age:.0f}m "
-                f"persist={int(_persist)} fade>={_fade_pts:.2f}"
-            )
-            return "CLOSE_TARGET", EXIT_PRIORITY_PROFIT_LOCK, {
-                "reason_detail": (
-                    f"momentum_peak_fade_hwm_{hwm:.2f}"
-                    f"_value_{value:.2f}"
-                    f"_age_{_peak_age:.0f}m"
-                    f"_persist_{int(_persist)}"
-                ),
-                "peak_debit_value": hwm,
-                "persist": _persist,
-            }
-
-        # ── D3: planned target ───────────────────────────────────────────
-        # Persist may still ride fresh highs at/above target under Phase B
-        # trail — but on any measurable pullback from HWM, bank the target
-        # now. Waiting for trend flip is how Oct1/Sep11 gave 21–30% back.
-        if target > 0 and value >= target:
-            _bank_now = (not _persist) or _pulled or (hwm < fat_hwm - 1e-9)
-            if _bank_now:
-                self.logger.info(
-                    f"DEBIT TARGET: {position['strategy_name']} value={value:.2f} "
-                    f">= target={target:.2f} persist={_persist} pulled={_pulled}"
-                )
-                return "CLOSE_TARGET", EXIT_PRIORITY_TIME_TARGET, {
-                    "reason_detail": (
-                        "momentum_target_reached"
-                        + ("_pullback" if _pulled else "")
-                        + ("_persist_off" if not _persist else "")
-                    ),
-                    "value": value,
-                }
 
         # ── D4: never carry a long option into the closing bell ──────────
         try:
