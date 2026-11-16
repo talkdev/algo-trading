@@ -1129,6 +1129,24 @@ class Config:
     # After the day has banked green, allow ONE with-trend long (momentum
     # gate must still qualify it; risk capped by the day-P&L envelope).
     green_press_long:              bool  = False
+    # Green press "house money": cap the press long's planned stop loss at
+    # this fraction of the banked day P&L (0 = envelope only). A press that
+    # cannot fit 1 lot inside the cap is refused.
+    green_press_risk_banked_frac:  float = 0.0
+    # Long-only book: after the engine's FINAL decision, any ENTER that is
+    # not LONG_CALL/LONG_PUT (BPS/BCS/IC/...) is dropped to NO_TRADE. Gates
+    # and decision logic are unchanged.
+    long_only_mode:                bool  = True
+    # Fixed execution size for LONG_CALL/LONG_PUT entries (0 = engine
+    # sizing). Applied last in execution validation, after every clamp.
+    long_fixed_lots:               int   = 10
+    # Momentum knife guards (HH:MM): before EARLY_UNTIL a debit needs STRONG
+    # label + strong ADX + OR break; on a WIDE OR no debit before WIDE_UNTIL.
+    # 43-day replay (natural size): EARLY 11:30 ₹95,796 7 longs; 10:45
+    # ₹97.2k 8 longs; 10:30 = 10:15 ₹100.1k 9/9 long winners, 0 red (adds
+    # 09-22 LONG_PUT, 10-16 LONG_CALL). WIDE 11:30 rejected: 2 red days.
+    momentum_early_gate_until:     str   = "10:30"
+    momentum_wide_or_gate_until:   str   = "12:30"
     # Continuation clips allowed after banked winners (see _momentum_gate).
     momentum_reload_after_win:     int   = 1
     momentum_min_minutes_left:     int   = 60
@@ -2074,6 +2092,11 @@ def load_config(env_file: Path = ENV_FILE) -> Config:
         day_pnl_envelope_floor_rs=max(_get_float(env, "DAY_PNL_ENVELOPE_FLOOR_RS", 3000.0), 0.0),
         unbanked_debit_one_lot=_get_bool(env, "UNBANKED_DEBIT_ONE_LOT", False),
         green_press_long=_get_bool(env, "GREEN_PRESS_LONG", False),
+        long_only_mode=_get_bool(env, "LONG_ONLY_MODE", True),
+        long_fixed_lots=max(int(_get_float(env, "LONG_FIXED_LOTS", 10)), 0),
+        green_press_risk_banked_frac=max(_get_float(env, "GREEN_PRESS_RISK_BANKED_FRAC", 0.0), 0.0),
+        momentum_early_gate_until=str(env.get("MOMENTUM_EARLY_GATE_UNTIL", "10:30") or "10:30").strip(),
+        momentum_wide_or_gate_until=str(env.get("MOMENTUM_WIDE_OR_GATE_UNTIL", "12:30") or "12:30").strip(),
         unbanked_debit_risk_rs=max(_get_float(env, "UNBANKED_DEBIT_RISK_RS", 0.0), 0.0),
         momentum_spot_stop_pct=min(max(_get_float(env, "MOMENTUM_SPOT_STOP_PCT", 0.0033), 0.0), 0.02),
         momentum_reload_after_win=min(max(_get_int(env, "MOMENTUM_RELOAD_AFTER_WIN", 1), 0), 3),

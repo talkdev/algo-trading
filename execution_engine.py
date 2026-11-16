@@ -869,6 +869,109 @@ class LiveOrderExecutor:
             time_module.sleep(0.5)
         return {"state": "UNKNOWN", "status": "cancel not confirmed"}
 
+    def _persist_leg_remaining_qty(
+        self, leg: dict, remaining: int, done_qty: int, done_value: float
+    ) -> None:
+        """After a part-filled exit, shrink the leg's open qty in the book so
+        a later exit sends only what the broker still holds."""
+        avg = (done_value / done_qty) if done_qty > 0 else 0.0
+        msg = (
+            f"leg {leg.get('leg_id')} {leg.get('strike')}"
+            f"{str(leg.get('option_type', '')).upper()}: {done_qty} already "
+            f"exited @ avg {avg:.2f}; open qty now {remaining}"
+        )
+        self.logger.critical(f"[LIVE] EXIT PARTIAL PERSIST: {msg}")
+        self._alert("CRITICAL", f"partial exit — {msg}")
+        db = getattr(self, "db", None)
+        if db is None or not leg.get("leg_id") or remaining < 0:
+            return
+        try:
+            db.update("position_legs", {"qty": int(remaining)},
+                      {"leg_id": leg["leg_id"]})
+        except Exception as e:
+            self.logger.critical(
+                f"could not persist remaining qty for leg {leg.get('leg_id')}: "
+                f"{e} — check the broker before the next exit"
+            )
+
+    def _unwind_partial_entry(
+        self, leg: dict, chain: dict, lots: int, order_id: str,
+        tag: Optional[str], transaction_type: str, qty: int,
+        cause: Exception,
+    ) -> None:
+        """An entry that failed may still have part-filled. The engine books
+        nothing for a failed leg, so any filled piece is flattened here at
+        once rather than left at the broker with no stop."""
+        filled, px, status = self._order_fill_state(order_id)
+        filled = min(max(filled, 0), qty)
+        if filled <= 0:
+            return
+        describe = (
+            f"{transaction_type} {str(leg.get('option_type', '')).upper()} "
+            f"{float(leg.get('strike', 0) or 0):.0f}"
+        )
+        if status not in self._TERMINAL_BAD and status not in self._TERMINAL_OK:
+            # Order may still be live: unwinding now could leave more behind.
+            msg = (
+                f"entry {describe} order {order_id} part-filled {filled}/{qty} "
+                f"and is still '{status or 'unknown'}' after failure ({cause}) "
+                f"— NOT tracked by the engine; cancel and flatten by hand"
+            )
+            self.logger.critical(f"[LIVE] {msg}")
+            self._alert("CRITICAL", msg)
+            return
+        self.logger.critical(
+            f"[LIVE] ENTRY PARTIAL: {describe} order {order_id} filled "
+            f"{filled}/{qty} @ {px:.2f} before failing ({cause}); unwinding"
+        )
+        unwind_leg = {
+            **leg, "qty": filled, "entry_price": px or float(
+                leg.get("exec_price", 0) or 0),
+        }
+        try:
+            out = self.execute_leg_exit(unwind_leg, chain, lots)
+            if tag:
+                self._dispatch_write(
+                    tag, leg, transaction_type, filled, px, "ENTRY",
+                    order_id=order_id, state="PARTIAL_UNWOUND",
+                )
+            self._alert(
+                "CRITICAL",
+                f"entry {describe} part-filled {filled}/{qty} and was unwound "
+                f"@ {float(out.get('fill_price') or 0):.2f} (entry {px:.2f})",
+            )
+        except Exception as ue:
+            msg = (
+                f"entry {describe} part-filled {filled}/{qty} @ {px:.2f}; "
+                f"UNWIND FAILED ({ue}) — {filled} qty held at the broker with "
+                f"no engine stop; flatten by hand"
+            )
+            self.logger.critical(f"[LIVE] {msg}")
+            self._alert("CRITICAL", msg)
+
+    def _order_fill_state(self, order_id: str) -> Tuple[int, float, str]:
+        """(filled_qty, average_price, status) for an order; (0, 0, '') when
+        the broker cannot answer. A cancelled/rejected order may still carry
+        a partial fill — callers must account for it before re-sending."""
+        if not order_id:
+            return 0, 0.0, ""
+        for _ in range(3):
+            try:
+                d = self.client.get_order_details(order_id) or {}
+                st = str(d.get("status") or d.get("order_status") or "").strip().lower()
+                try:
+                    f = int(float(d.get("filled_quantity") or 0))
+                except (TypeError, ValueError):
+                    f = 0
+                try:
+                    px = float(d.get("average_price") or 0.0)
+                except (TypeError, ValueError):
+                    px = 0.0
+                return f, px, st
+            except Exception:
+                time_module.sleep(0.4)
+        return 0, 0.0, ""
+
     def _escalate_exit_price(
         self, chain: dict, leg: dict, transaction_type: str, fallback: float,
         attempt: int,
@@ -935,14 +1038,21 @@ class LiveOrderExecutor:
 
         fill_price = float(placed.get("fill_price") or 0.0)
         if fill_price <= 0:
-            fill_price = self._work_entry_order(
-                order_id=order_id,
-                instrument_key=instrument_key,
-                transaction_type=transaction_type,
-                qty=qty,
-                initial_price=limit_price,
-                fallback=fallback_px,
-            )
+            try:
+                fill_price = self._work_entry_order(
+                    order_id=order_id,
+                    instrument_key=instrument_key,
+                    transaction_type=transaction_type,
+                    qty=qty,
+                    initial_price=limit_price,
+                    fallback=fallback_px,
+                )
+            except Exception as entry_exc:
+                self._unwind_partial_entry(
+                    leg, chain, lots, order_id, placed.get("tag"),
+                    transaction_type, qty, entry_exc,
+                )
+                raise
 
         tag = placed.get("tag")
         if tag and fill_price > 0:
@@ -1009,6 +1119,16 @@ class LiveOrderExecutor:
         )
 
         last_state = ""
+        # Partial fills from cancelled attempts: only the remainder is re-sent,
+        # and the booked price is the quantity-weighted average of all pieces.
+        leg_qty = qty
+        done_qty = 0
+        done_value = 0.0
+
+        def _blend(px: float, q: int) -> float:
+            tot = done_qty + q
+            return round((done_value + px * q) / tot, 2) if tot > 0 else px
+
         for attempt in range(attempts):
             try:
                 placed = self._place_order_reconciled(
@@ -1022,6 +1142,10 @@ class LiveOrderExecutor:
                 # unknown-fate error cannot, so it is left to the caller.
                 fatal = isinstance(e, UpstoxAPIError) and e.status_code != 400
                 if fatal or attempt + 1 >= attempts:
+                    if done_qty > 0:
+                        self._persist_leg_remaining_qty(
+                            leg, qty, done_qty, done_value
+                        )
                     raise
                 limit_price = self._escalate_exit_price(
                     chain, leg, transaction_type, fallback, attempt + 2
@@ -1068,7 +1192,7 @@ class LiveOrderExecutor:
                     )
                 return {
                     "order_id":   order_id,
-                    "fill_price": fill_price,
+                    "fill_price": _blend(fill_price, qty),
                     "status":     "FILLED",
                     "tag":        tag,
                 }
@@ -1097,11 +1221,39 @@ class LiveOrderExecutor:
                         )
                     return {
                         "order_id":   order_id,
-                        "fill_price": price,
+                        "fill_price": _blend(price, qty),
                         "status":     "FILLED",
                         "tag":        tag,
                     }
+            if confirmed.get("state") == "CANCELLED":
+                # A cancelled order can still have part-filled: count it so
+                # the next attempt sends only what is still held.
+                _pf, _ppx, _ = self._order_fill_state(order_id)
+                _pf = min(max(_pf, 0), qty)
+                if _pf > 0:
+                    done_value += (_ppx if _ppx > 0 else limit_price) * _pf
+                    done_qty += _pf
+                    qty -= _pf
+                    self.logger.critical(
+                        f"[LIVE] EXIT PARTIAL: {describe} order {order_id} "
+                        f"filled {_pf} before cancel; {qty} of {leg_qty} "
+                        f"still to exit"
+                    )
+                    self._alert(
+                        "CRITICAL",
+                        f"exit {describe} part-filled {_pf}/{leg_qty}; "
+                        f"re-quoting only the remaining {qty}",
+                    )
+                    if qty <= 0:
+                        return {
+                            "order_id":   order_id,
+                            "fill_price": round(done_value / done_qty, 2),
+                            "status":     "FILLED",
+                            "tag":        placed.get("tag"),
+                        }
             if confirmed.get("state") != "CANCELLED":
+                if done_qty > 0:
+                    self._persist_leg_remaining_qty(leg, qty, done_qty, done_value)
                 raise RuntimeError(
                     f"exit order {order_id} for {describe} is unaccounted for "
                     f"(status={last_state or 'unknown'}, "
@@ -1110,10 +1262,15 @@ class LiveOrderExecutor:
                     f"next cycle"
                 )
             if final_try:
+                if done_qty > 0:
+                    # Persist the smaller open quantity so the next cycle's
+                    # exit cannot re-sell what has already gone.
+                    self._persist_leg_remaining_qty(leg, qty, done_qty, done_value)
                 raise RuntimeError(
                     f"exit for {describe} not filled after {attempts} attempt(s) "
                     f"and cancelled (last status={last_state or 'unknown'}); "
                     f"leg left OPEN for the next cycle"
+                    + (f" with {qty} of {leg_qty} still held" if done_qty > 0 else "")
                 )
 
 
@@ -1699,6 +1856,48 @@ class ExecutionEngine:
                     f"size_scale {_scale:g}: execution sizing {final_lots} → {_scaled}"
                 )
             final_lots = _scaled
+
+        # LONG_FIXED_LOTS: long tickets trade a fixed size, applied last.
+        try:
+            _fixed_long = int(getattr(self.config, "long_fixed_lots", 0) or 0)
+        except (TypeError, ValueError):
+            _fixed_long = 0
+        if (
+            _fixed_long >= 1
+            and str(params.get("strategy_name") or "") in ("LONG_CALL", "LONG_PUT")
+        ):
+            # The daily-loss rules may not shrink a fixed-size long, so they
+            # refuse it instead: no entry inside the soft-limit zone, and no
+            # entry whose full fixed size would breach the projected cap.
+            if size_adj < 1.0:
+                return "NO_GO", {
+                    "reason": "long_fixed_lots_refused_soft_daily_loss_zone"
+                }
+            try:
+                _eng_lots = max(1, int(params.get("final_lots", 1) or 1))
+            except (TypeError, ValueError):
+                _eng_lots = 1
+            _per_lot_loss = (
+                trade_max_loss / float(_eng_lots) if trade_max_loss > 0
+                else float(params.get("max_loss_per_lot", 0) or 0)
+            )
+            if _per_lot_loss > 0:
+                _proj_fixed = (
+                    daily_loss + _per_lot_loss * _fixed_long
+                ) / current_cap
+                if _proj_fixed > max_projected:
+                    return "NO_GO", {
+                        "reason": (
+                            f"long_fixed_lots_{_fixed_long}_would_breach_daily_"
+                            f"loss_cap_{_proj_fixed*100:.1f}pct_gt_"
+                            f"{max_projected*100:.1f}pct"
+                        )
+                    }
+            if final_lots != _fixed_long:
+                self.logger.info(
+                    f"LONG_FIXED_LOTS: execution sizing {final_lots} → {_fixed_long}"
+                )
+            final_lots = _fixed_long
 
         # ── Check 2: Chain availability ───────────────────────────────────
         chain = self.market_engine.last_chain
@@ -2344,6 +2543,21 @@ class ExecutionEngine:
         Returns position_id or None.
         """
         if decision.get("action") != "ENTER":
+            return None
+
+        # LONG_ONLY_MODE: execute only final-approved LONG_CALL / LONG_PUT.
+        # Every other structure (BPS/BCS/IC/...) is skipped at the door; the
+        # decision itself is left exactly as the strategy engine made it.
+        _sname = str(
+            decision.get("strategy_name")
+            or (decision.get("params") or {}).get("strategy_name")
+            or ""
+        )
+        if (
+            bool(getattr(self.config, "long_only_mode", False))
+            and _sname not in ("LONG_CALL", "LONG_PUT")
+        ):
+            self.logger.info(f"ENTER_SKIPPED:long_only_mode:{_sname}")
             return None
 
         go, result = self.validate_pre_trade(decision["params"], signals)

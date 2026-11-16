@@ -10616,12 +10616,26 @@ class StrategyEngine:
             _wide_e = _or_e in ("WIDE", "VERY_WIDE")
             # WIDE OR: no debit before 12:30 unless session_floor
             # (Oct12 LONG_PUT 11:12 even with a STRONG label wiped).
-            if _wide_e and _t_early < dtime(12, 30):
+            def _hm(_s, _d):
+                try:
+                    _h, _m = str(_s).split(":")
+                    return dtime(int(_h), int(_m))
+                except Exception:
+                    return _d
+            _wide_until = _hm(
+                getattr(self.config, "momentum_wide_or_gate_until", "12:30"),
+                dtime(12, 30),
+            )
+            _early_until = _hm(
+                getattr(self.config, "momentum_early_gate_until", "10:30"),
+                dtime(10, 30),
+            )
+            if _wide_e and _t_early < _wide_until:
                 signals["_momentum_refuse_reason"] = (
                     "momentum_wide_or_no_debit_before_1230"
                 )
                 return None
-            if _t_early < dtime(11, 30):
+            if _t_early < _early_until:
                 try:
                     _adx_e = float(signals.get("adx_15") or 0.0)
                 except (TypeError, ValueError):
@@ -12998,6 +13012,24 @@ class StrategyEngine:
             out.get("action") == "ENTER"
             and str(out.get("strategy_name") or "") in (LONG_CALL, LONG_PUT)
         ):
+            _frac = float(
+                getattr(self.config, "green_press_risk_banked_frac", 0.0) or 0.0
+            )
+            if _frac > 0:
+                try:
+                    _bank = float(
+                        self.market_engine.state.get("daily_pnl") or 0.0
+                    )
+                except (TypeError, ValueError):
+                    _bank = 0.0
+                _why = self._resize_params_to_risk_cap(
+                    out.get("params") or {}, _frac * _bank, "green_press_banked"
+                )
+                if _why:
+                    return {
+                        "action": "NO_TRADE",
+                        "reason": f"green_day_lock_no_new_entries:{_why}",
+                    }
             self.market_engine.state["green_press_date"] = (
                 now_ist().date().isoformat()
             )

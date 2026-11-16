@@ -542,7 +542,16 @@ class MainEngine:
                     found, key=lambda r: str(r.get("order_timestamp") or "")
                 )
                 status = str(latest.get("status") or "").strip().lower()
-            if status in ("complete", "completed", "filled", "traded", "executed"):
+            # A cancelled / rejected order can still have part-filled; that
+            # piece is real broker exposure, so treat it like a fill here.
+            try:
+                _part_filled = int(float(latest.get("filled_quantity") or 0)) > 0
+            except (TypeError, ValueError):
+                _part_filled = False
+            if status in ("complete", "completed", "filled", "traded", "executed") or (
+                _part_filled
+                and status in ("cancelled", "canceled", "rejected", "expired", "lapsed")
+            ):
                 price  = float(latest.get("average_price") or 0.0)
                 qty    = int(latest.get("filled_quantity") or latest.get("quantity") or 0)
                 action = str(latest.get("transaction_type") or row.get("transaction_type") or "")
